@@ -879,10 +879,12 @@ fn find_function_definition_node<'a>(node: Node<'a>, name: &str, text: &str) -> 
             let rhs = children[2];
 
             let op_text = node_text(op, text);
-            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
-                if node_text(lhs, text) == name && rhs.kind() == "function_definition" {
-                    return Some(rhs);
-                }
+            if matches!(op_text, "<-" | "=" | "<<-")
+                && lhs.kind() == "identifier"
+                && node_text(lhs, text) == name
+                && rhs.kind() == "function_definition"
+            {
+                return Some(rhs);
             }
         }
     }
@@ -922,7 +924,7 @@ fn find_user_function_signature(state: &WorldState, current_uri: &Url, name: &st
     }
 
     // 3. Search workspace index
-    for (_uri, doc) in &state.workspace_index {
+    for doc in state.workspace_index.values() {
         if let Some(tree) = &doc.tree {
             let text = doc.text();
             if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
