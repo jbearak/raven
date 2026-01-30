@@ -20,26 +20,51 @@ use crate::builtins;
 // Cross-File Scope Helper
 // ============================================================================
 
-/// Get cross-file symbols available at a position
+/// Get cross-file symbols available at a position.
+/// This traverses the source() chain to include symbols from sourced files.
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
     line: u32,
     column: u32,
 ) -> HashMap<String, ScopedSymbol> {
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => return HashMap::new(),
+    // Closure to get artifacts for a URI
+    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+        // Try open documents first
+        if let Some(doc) = state.documents.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                let text = doc.text();
+                return Some(scope::compute_artifacts(target_uri, tree, &text));
+            }
+        }
+        // Try workspace index
+        if let Some(doc) = state.workspace_index.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                let text = doc.text();
+                return Some(scope::compute_artifacts(target_uri, tree, &text));
+            }
+        }
+        None
     };
 
-    let tree = match &doc.tree {
-        Some(t) => t,
-        None => return HashMap::new(),
+    // Closure to resolve paths relative to a file
+    let resolve_path = |path: &str, from_uri: &Url| -> Option<Url> {
+        let from_path = from_uri.to_file_path().ok()?;
+        let parent_dir = from_path.parent()?;
+        let resolved = parent_dir.join(path);
+        let canonical = resolved.canonicalize().ok()?;
+        Url::from_file_path(canonical).ok()
     };
 
-    let text = doc.text();
-    let artifacts = scope::compute_artifacts(uri, tree, &text);
-    let scope = scope::scope_at_position(&artifacts, line, column);
+    let max_depth = state.cross_file_config.max_chain_depth;
+    let scope = scope::scope_at_position_with_deps(
+        uri,
+        line,
+        column,
+        &get_artifacts,
+        &resolve_path,
+        max_depth,
+    );
     scope.symbols
 }
 

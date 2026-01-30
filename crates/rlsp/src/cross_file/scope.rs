@@ -5,13 +5,14 @@
 //
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Tree};
 
-use super::types::byte_offset_to_utf16_column;
+use super::source_detect::detect_source_calls;
+use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 /// Symbol kind
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,6 +53,12 @@ pub enum ScopeEvent {
         column: u32,
         symbol: ScopedSymbol,
     },
+    /// A source() call that introduces symbols from another file
+    Source {
+        line: u32,
+        column: u32,
+        source: ForwardSource,
+    },
 }
 
 /// Per-file scope artifacts
@@ -82,7 +89,8 @@ pub struct ScopeAtPosition {
     pub chain: Vec<Url>,
 }
 
-/// Compute scope artifacts for a file from its AST
+/// Compute scope artifacts for a file from its AST.
+/// This includes both definitions and source() calls in the timeline.
 pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifacts {
     let mut artifacts = ScopeArtifacts::default();
     let root = tree.root_node();
@@ -90,13 +98,32 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // Collect definitions from AST
     collect_definitions(root, content, uri, &mut artifacts);
 
+    // Collect source() calls and add them to timeline
+    let source_calls = detect_source_calls(tree, content);
+    for source in source_calls {
+        // Skip local=TRUE sources (symbols not inherited)
+        if !source.local {
+            artifacts.timeline.push(ScopeEvent::Source {
+                line: source.line,
+                column: source.column,
+                source,
+            });
+        }
+    }
+
+    // Sort timeline by position for correct ordering
+    artifacts.timeline.sort_by_key(|event| match event {
+        ScopeEvent::Def { line, column, .. } => (*line, *column),
+        ScopeEvent::Source { line, column, .. } => (*line, *column),
+    });
+
     // Compute interface hash
     artifacts.interface_hash = compute_interface_hash(&artifacts.exported_interface);
 
     artifacts
 }
 
-/// Compute scope at a specific position
+/// Compute scope at a specific position (single file, no traversal)
 pub fn scope_at_position(
     artifacts: &ScopeArtifacts,
     line: u32,
@@ -111,6 +138,90 @@ pub fn scope_at_position(
                 // Include if definition is before or at the position
                 if (*def_line, *def_col) <= (line, column) {
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                }
+            }
+            ScopeEvent::Source { .. } => {
+                // Source events are handled by scope_at_position_with_deps
+            }
+        }
+    }
+
+    scope
+}
+
+/// Compute scope at a position with cross-file traversal.
+/// This is the main entry point for cross-file scope resolution.
+pub fn scope_at_position_with_deps<F>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    max_depth: usize,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<ScopeArtifacts>,
+{
+    let mut visited = HashSet::new();
+    scope_at_position_recursive(uri, line, column, get_artifacts, resolve_path, max_depth, 0, &mut visited)
+}
+
+fn scope_at_position_recursive<F>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    max_depth: usize,
+    current_depth: usize,
+    visited: &mut HashSet<Url>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<ScopeArtifacts>,
+{
+    let mut scope = ScopeAtPosition::default();
+
+    if current_depth >= max_depth || visited.contains(uri) {
+        return scope;
+    }
+    visited.insert(uri.clone());
+    scope.chain.push(uri.clone());
+
+    let artifacts = match get_artifacts(uri) {
+        Some(a) => a,
+        None => return scope,
+    };
+
+    // Process timeline events up to the requested position
+    for event in &artifacts.timeline {
+        match event {
+            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+                if (*def_line, *def_col) <= (line, column) {
+                    // Local definitions take precedence (don't overwrite)
+                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| symbol.clone());
+                }
+            }
+            ScopeEvent::Source { line: src_line, column: src_col, source } => {
+                // Only include if source() call is before the position
+                if (*src_line, *src_col) < (line, column) {
+                    // Resolve the path and get symbols from sourced file
+                    if let Some(child_uri) = resolve_path(&source.path, uri) {
+                        let child_scope = scope_at_position_recursive(
+                            &child_uri,
+                            u32::MAX, // Include all symbols from sourced file
+                            u32::MAX,
+                            get_artifacts,
+                            resolve_path,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                        );
+                        // Merge child symbols (local definitions take precedence)
+                        for (name, symbol) in child_scope.symbols {
+                            scope.symbols.entry(name).or_insert(symbol);
+                        }
+                        scope.chain.extend(child_scope.chain);
+                    }
                 }
             }
         }
