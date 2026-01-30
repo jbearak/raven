@@ -542,9 +542,10 @@ pub fn on_configuration_changed(state: &mut WorldState, new_config: CrossFileCon
 
 ### Cache Structures (Versioned)
 
-Caches must be versioned/fingerprinted so concurrent edits cannot reuse stale cross-file state.
+Caches must be versioned/fingerprinted so concurrent edits cannot reuse stale cross-file state. Caches use interior mutability to allow population during read operations (see Issue 9 in Design Review Fixes).
 
 ```rust
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Url;
 
@@ -563,24 +564,69 @@ pub struct ScopeFingerprint {
     pub workspace_index_version: u64,
 }
 
+/// Metadata cache with interior mutability for read-path population
 pub struct MetadataCache {
-    cache: HashMap<Url, CrossFileMetadata>,
+    inner: RwLock<HashMap<Url, CrossFileMetadata>>,
 }
 
+impl MetadataCache {
+    pub fn get(&self, uri: &Url) -> Option<CrossFileMetadata> {
+        self.inner.read().get(uri).cloned()
+    }
+    
+    pub fn insert(&self, uri: Url, meta: CrossFileMetadata) {
+        self.inner.write().insert(uri, meta);
+    }
+    
+    pub fn remove(&self, uri: &Url) {
+        self.inner.write().remove(uri);
+    }
+}
+
+/// Artifacts cache with interior mutability for read-path population
 pub struct ArtifactsCache {
-    cache: HashMap<Url, (ScopeFingerprint, ScopeArtifacts)>,
+    inner: RwLock<HashMap<Url, (ScopeFingerprint, ScopeArtifacts)>>,
 }
 
 impl ArtifactsCache {
-    pub fn get_if_fresh(&self, uri: &Url, fp: &ScopeFingerprint) -> Option<ScopeArtifacts>;
-    pub fn insert(&mut self, uri: Url, fp: ScopeFingerprint, artifacts: ScopeArtifacts);
-    pub fn invalidate(&mut self, uri: &Url);
+    /// Get cached artifacts if fingerprint matches (read lock on inner)
+    pub fn get_if_fresh(&self, uri: &Url, fp: &ScopeFingerprint) -> Option<ScopeArtifacts> {
+        let guard = self.inner.read();
+        guard.get(uri).and_then(|(cached_fp, artifacts)| {
+            if cached_fp == fp {
+                Some(artifacts.clone())
+            } else {
+                None
+            }
+        })
+    }
+    
+    /// Get cached artifacts without fingerprint check
+    pub fn get(&self, uri: &Url) -> Option<ScopeArtifacts> {
+        self.inner.read().get(uri).map(|(_, a)| a.clone())
+    }
+    
+    /// Insert or update cache entry (write lock on inner, but callable from read-locked WorldState)
+    pub fn insert(&self, uri: Url, fp: ScopeFingerprint, artifacts: ScopeArtifacts) {
+        self.inner.write().insert(uri, (fp, artifacts));
+    }
+    
+    /// Invalidate a specific entry
+    pub fn invalidate(&self, uri: &Url) {
+        self.inner.write().remove(uri);
+    }
+    
+    /// Invalidate all entries
+    pub fn invalidate_all(&self) {
+        self.inner.write().clear();
+    }
 }
 ```
 
 Implementation notes:
 - The simplest correct approach is to compute `self_hash` from document text.
 - For performance, add Sight-like interface hashing: dependents only invalidate when `interface_hash` or edge set changes.
+- Interior mutability (`parking_lot::RwLock`) allows caches to be populated during read operations without requiring a write lock on `WorldState`.
 
 ### Closed File Staleness Model (Required)
 
@@ -678,6 +724,48 @@ pub struct WorldState {
 
     // Workspace index integration (required)
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+
+    // Parent selection cache for stability during graph convergence (Issue 11)
+    pub cross_file_parent_cache: ParentSelectionCache,
+}
+
+/// Cached parent selection to ensure stability during graph convergence
+#[derive(Debug, Clone, Default)]
+pub struct ParentSelectionCache {
+    /// Map from (child_uri, metadata_fingerprint) -> selected parent
+    cache: HashMap<(Url, u64), ParentResolution>,
+}
+
+impl ParentSelectionCache {
+    /// Get or compute parent selection, ensuring stability
+    pub fn get_or_compute(
+        &mut self,
+        child_uri: &Url,
+        metadata: &CrossFileMetadata,
+        graph: &DependencyGraph,
+        config: &CrossFileConfig,
+    ) -> ParentResolution {
+        let fingerprint = compute_metadata_fingerprint(metadata);
+        let key = (child_uri.clone(), fingerprint);
+        
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+        
+        let resolution = resolve_parent(metadata, graph, child_uri, config);
+        self.cache.insert(key, resolution.clone());
+        resolution
+    }
+    
+    /// Invalidate cache for a child (called when child's metadata changes)
+    pub fn invalidate(&mut self, child_uri: &Url) {
+        self.cache.retain(|(uri, _), _| uri != child_uri);
+    }
+    
+    /// Invalidate all entries
+    pub fn invalidate_all(&mut self) {
+        self.cache.clear();
+    }
 }
 
 /// Tracks client activity hints for revalidation prioritization (Requirement 15)
@@ -855,6 +943,10 @@ impl CrossFileRevalidationState {
 /// Revalidate a file and its dependents after a change.
 ///
 /// IMPORTANT: this runs under the server's write lock (mutating WorldState).
+///
+/// NOTE: interface_changed is computed from ScopeArtifacts.interface_hash (symbol surface),
+/// NOT from CrossFileMetadata hash. This ensures dependents invalidate when function
+/// definitions change, even if directives/source-calls remain identical.
 pub fn revalidate_after_change_locked(
     state: &mut WorldState,
     changed_uri: &Url,
@@ -864,17 +956,28 @@ pub fn revalidate_after_change_locked(
     let new_meta = extract_cross_file_metadata(state, changed_uri);
     state.cross_file_meta.insert(changed_uri.clone(), new_meta.clone());
 
-    // 2. Update dependency graph
+    // 2. Update dependency graph (always, based on metadata)
     state.cross_file_graph.update_file(changed_uri, &new_meta);
 
-// 3. Compute if interface or edges changed (semantics-bearing)
-    let old_hash = old_meta.as_ref().map(|m| compute_interface_hash(m));
-    let new_hash = compute_interface_hash(&new_meta);
-    let interface_changed = old_hash != Some(new_hash);
+    // 3. Get old artifacts (if cached) and compute new artifacts
+    let old_artifacts = state.cross_file_cache.get(changed_uri);
+    let new_artifacts = compute_scope_artifacts(state, changed_uri);
+    
+    // 4. Compute if SYMBOL INTERFACE changed (not metadata!)
+    // This is the key fix: use interface_hash from ScopeArtifacts
+    let old_interface_hash = old_artifacts.as_ref().map(|a| a.interface_hash);
+    let new_interface_hash = new_artifacts.interface_hash;
+    let interface_changed = old_interface_hash != Some(new_interface_hash);
 
+    // 5. Compute if edges changed (semantic edge set)
     let edges_changed = compute_edges_hash_from_meta(changed_uri, old_meta.as_ref())
         != compute_edges_hash_from_meta(changed_uri, Some(&new_meta));
-    // 4. Get affected files (transitive dependents)
+
+    // 6. Cache the new artifacts
+    let fingerprint = compute_scope_fingerprint(state, changed_uri, &new_meta);
+    state.cross_file_cache.insert(changed_uri.clone(), fingerprint, new_artifacts);
+
+    // 7. Get affected files (transitive dependents) - only if interface/edges changed
     let mut affected = vec![changed_uri.clone()];
     if interface_changed || edges_changed {
         let dependents = state.cross_file_graph.get_transitive_dependents(
@@ -888,7 +991,7 @@ pub fn revalidate_after_change_locked(
         affected.extend(dependents);
     }
 
-    // 5. Filter to only open documents (diagnostics are only pushed for open docs)
+    // 8. Filter to only open documents (diagnostics are only pushed for open docs)
     affected.retain(|uri| state.documents.contains_key(uri));
 
     affected
@@ -1583,6 +1686,18 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 **Validates: Requirements 6.1, 6.3**
 
+### Property 56: Duplicate Same-Version Publish Tolerance
+
+*For any* sequence of diagnostic publish attempts for the same document version, the server MAY publish diagnostics multiple times for the same version. This does not affect correctness as the client will simply overwrite with equivalent diagnostics. However, the server SHALL NEVER publish diagnostics for a version older than the most recently published version.
+
+**Validates: Requirements 0.7, 0.8**
+
+### Property 57: Parent Selection Stability
+
+*For any* file with backward directives, once a parent is selected for a given metadata fingerprint, the same parent SHALL be selected on subsequent queries until the file's `CrossFileMetadata` changes. Parent selection SHALL NOT change due to graph/index convergence or temporary unavailability of parent files.
+
+**Validates: Requirements 5.10**
+
 
 ## Error Handling
 
@@ -1598,11 +1713,15 @@ These invariants MUST be preserved across all refactoring. They are the core beh
 
 4. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files. This MUST be enforced at every read path: `CrossFileWorkspaceIndex` and `CrossFileFileCache` APIs MUST check "is it open?" before returning disk-derived data.
 
-5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent.
+5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent. Once a parent is selected for a given (child_uri, metadata_fingerprint), it remains until that child's metadata changes.
 
 6. **compute_artifacts() MUST NOT read other files' content** - it depends only on the file's own content/AST plus pre-existing dependency metadata (edges) and already-indexed interface hashes. This prevents recursion and lock contention.
 
-7. **handlers::diagnostics() MUST NOT mutate state** - it runs under a read lock and must be pure. All state mutations happen in separate write-lock passes.
+7. **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
+
+8. **Interface change detection uses symbol hash, not metadata hash** - `interface_changed` MUST be computed by comparing `ScopeArtifacts.interface_hash` (the actual exported symbol surface), not `CrossFileMetadata` hash. This ensures dependents invalidate when function definitions change, even if directives/source-calls remain identical.
+
+9. **Duplicate same-version diagnostic publishes are acceptable** - The monotonic gate prevents older-version publishes but allows same-version duplicates. This simplifies the implementation while maintaining correctness (client overwrites with equivalent diagnostics).
 
 ### Missing Files
 
@@ -2073,3 +2192,216 @@ This section documents key design decisions made based on review feedback to ens
 **Problem:** Rename events (delete+create) could fail to converge if URIs weren't properly canonicalized.
 
 **Fix:** Added explicit canonicalization requirements: normalize path casing per platform, resolve `..` before storage. Added Property 55.
+
+### Issue 8: Interface Change Detection Must Use Symbol Hash, Not Metadata Hash
+
+**Problem:** The `revalidate_after_change_locked()` function computed `interface_changed` by comparing `CrossFileMetadata` hashes. However, "exported interface" (what dependents care about) is fundamentally the **symbol surface**, not directives/source-call metadata. If a file changes function definitions but its `source()` calls and directives don't change, `CrossFileMetadata` may be identical while the exported symbol interface changed—dependents must invalidate and re-diagnose, but they wouldn't.
+
+**Fix:** Define three separate change detection concepts:
+- `metadata_changed`: Comparison of `CrossFileMetadata` hash (used for graph update, missing-file diagnostics)
+- `interface_changed`: Comparison of `ScopeArtifacts.interface_hash` (the actual exported symbol surface)
+- `edges_changed`: Comparison of the semantic edge set hash
+
+The invalidation trigger is now:
+- Graph update: always on metadata update
+- Dependent invalidation: only when `(interface_hash changed) OR (semantic edge set changed)`
+
+Updated `revalidate_after_change_locked()` pseudocode:
+
+```rust
+/// Revalidate a file and its dependents after a change.
+pub fn revalidate_after_change_locked(
+    state: &mut WorldState,
+    changed_uri: &Url,
+) -> Vec<Url> {
+    // 1. Update metadata for changed file
+    let old_meta = state.cross_file_meta.get(changed_uri).cloned();
+    let new_meta = extract_cross_file_metadata(state, changed_uri);
+    state.cross_file_meta.insert(changed_uri.clone(), new_meta.clone());
+
+    // 2. Update dependency graph (always, based on metadata)
+    state.cross_file_graph.update_file(changed_uri, &new_meta);
+
+    // 3. Compute old and new ScopeArtifacts to get interface_hash
+    // NOTE: This uses cached artifacts if available, or computes fresh ones
+    let old_artifacts = state.cross_file_cache.get(changed_uri);
+    let new_artifacts = compute_scope_artifacts(state, changed_uri);
+    state.cross_file_cache.insert(changed_uri.clone(), new_artifacts.clone());
+
+    // 4. Detect changes using SYMBOL INTERFACE hash, not metadata hash
+    let old_interface_hash = old_artifacts.map(|a| a.interface_hash);
+    let new_interface_hash = new_artifacts.interface_hash;
+    let interface_changed = old_interface_hash != Some(new_interface_hash);
+
+    let edges_changed = compute_edges_hash_from_meta(changed_uri, old_meta.as_ref())
+        != compute_edges_hash_from_meta(changed_uri, Some(&new_meta));
+
+    // 5. Get affected files (transitive dependents) - only if interface/edges changed
+    let mut affected = vec![changed_uri.clone()];
+    if interface_changed || edges_changed {
+        let dependents = state.cross_file_graph.get_transitive_dependents(
+            changed_uri,
+            state.cross_file_config.max_chain_depth,
+        );
+
+        for dep in &dependents {
+            state.cross_file_cache.invalidate(dep);
+        }
+        affected.extend(dependents);
+    }
+
+    // 6. Filter to only open documents
+    affected.retain(|uri| state.documents.contains_key(uri));
+
+    affected
+}
+```
+
+### Issue 9: Caching and Lock Strategy
+
+**Problem:** The design states "handlers::diagnostics() MUST NOT mutate state" (runs under read lock, must be pure), but the cache APIs (`ArtifactsCache`, `MetadataCache`) are plain `HashMap` requiring `&mut` to populate. If diagnostics computation needs to compute missing artifacts (very likely), this creates a contradiction.
+
+**Fix:** Adopt a two-tier caching strategy with interior mutability for read-path caches:
+
+**Option Selected: Interior Mutability for Caches**
+
+Caches that may be populated during read operations use interior mutability (`parking_lot::RwLock` or `DashMap`) so they can be updated while `WorldState` is read-locked. The invariant becomes: "handlers::diagnostics must not mutate *WorldState core fields* (documents, graph, config), but caches can evolve."
+
+```rust
+use parking_lot::RwLock;
+use std::collections::HashMap;
+
+/// Artifacts cache with interior mutability for read-path population
+pub struct ArtifactsCache {
+    /// Inner cache protected by its own lock
+    inner: RwLock<HashMap<Url, (ScopeFingerprint, ScopeArtifacts)>>,
+}
+
+impl ArtifactsCache {
+    /// Get cached artifacts if fingerprint matches (read lock)
+    pub fn get_if_fresh(&self, uri: &Url, fp: &ScopeFingerprint) -> Option<ScopeArtifacts> {
+        let guard = self.inner.read();
+        guard.get(uri).and_then(|(cached_fp, artifacts)| {
+            if cached_fp == fp {
+                Some(artifacts.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Insert or update cache entry (write lock on inner, but callable from read-locked WorldState)
+    pub fn insert(&self, uri: Url, fp: ScopeFingerprint, artifacts: ScopeArtifacts) {
+        let mut guard = self.inner.write();
+        guard.insert(uri, (fp, artifacts));
+    }
+
+    /// Invalidate a specific entry
+    pub fn invalidate(&self, uri: &Url) {
+        let mut guard = self.inner.write();
+        guard.remove(uri);
+    }
+
+    /// Invalidate all entries
+    pub fn invalidate_all(&self) {
+        let mut guard = self.inner.write();
+        guard.clear();
+    }
+}
+```
+
+**Updated Critical Design Invariant #7:**
+
+> **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
+
+### Issue 10: Diagnostic Publish Atomicity and Duplicate Publishes
+
+**Problem:** In `schedule_diagnostics_debounced()`, the sequence is:
+1. Read lock: check `can_publish()`
+2. Publish diagnostics (async)
+3. Write lock: `record_publish()`
+
+This allows a race where Task A checks `can_publish() == true`, Task B publishes first and updates `last_published_version`, then Task A publishes afterward (still same version). This results in duplicate same-version publishes.
+
+**Fix:** Document that duplicate same-version publishes are acceptable, but older-version publishes are forbidden. This keeps implementation simpler while maintaining correctness.
+
+**Explicit Policy:**
+- **Duplicate same-version publishes: ACCEPTABLE** - The client simply overwrites with identical diagnostics; no user-visible impact.
+- **Older-version publishes: FORBIDDEN** - This would cause stale diagnostics to overwrite fresh ones; the monotonic gate prevents this.
+
+This policy is already enforced by `CrossFileDiagnosticsGate.can_publish()` which allows `version >= last_published_version` when force republish is set, but never `version < last_published_version`.
+
+**Added Property 56: Duplicate Same-Version Publish Tolerance**
+
+*For any* sequence of diagnostic publish attempts for the same document version, the server MAY publish diagnostics multiple times for the same version. This does not affect correctness as the client will simply overwrite with equivalent diagnostics.
+
+**Validates: Requirements 0.7, 0.8**
+
+### Issue 11: Parent Selection Stability During Graph/Index Convergence
+
+**Problem:** Parent selection uses a mixture of backward directives (immediate), reverse edges (depends on indexing), and text inference (depends on disk reads). This can cause the selected parent to *flip* as more info arrives, even if inputs haven't changed, leading to flickering diagnostics during concurrent edits.
+
+**Fix:** Define a strict precedence order that does not change as new evidence appears, unless earlier evidence is invalidated. Add stability rule: once a parent is selected for a given (child URI, doc version, metadata fingerprint), it remains until that child's metadata changes.
+
+**Parent Selection Stability Rule:**
+
+1. **Precedence is strict and does not upgrade:** If a backward directive is present, we never "upgrade" to a reverse edge later. The precedence order is:
+   - Explicit `line=` directive (highest)
+   - Explicit `match=` directive
+   - Reverse-dependency edge with known call site
+   - Backward directive without call site (uses inference/default)
+   - Deterministic tiebreak: lexicographic by URI (lowest)
+
+2. **Selection is cached per (child_uri, metadata_fingerprint):** Once a parent is selected, it remains stable until the child's `CrossFileMetadata` changes (which changes the fingerprint).
+
+3. **Missing parents do not cause re-selection:** If a selected parent is temporarily missing (file deleted or not yet indexed), the selection remains stable. The scope resolver will emit a missing-file diagnostic but will not re-run parent selection to pick a different parent.
+
+```rust
+/// Cached parent selection to ensure stability during graph convergence
+pub struct ParentSelectionCache {
+    /// Map from (child_uri, metadata_fingerprint) -> selected parent
+    cache: HashMap<(Url, u64), ParentResolution>,
+}
+
+impl ParentSelectionCache {
+    /// Get or compute parent selection, ensuring stability
+    pub fn get_or_compute(
+        &mut self,
+        child_uri: &Url,
+        metadata: &CrossFileMetadata,
+        graph: &DependencyGraph,
+        config: &CrossFileConfig,
+    ) -> ParentResolution {
+        let fingerprint = compute_metadata_fingerprint(metadata);
+        let key = (child_uri.clone(), fingerprint);
+        
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+        
+        let resolution = resolve_parent(metadata, graph, child_uri, config);
+        self.cache.insert(key, resolution.clone());
+        resolution
+    }
+    
+    /// Invalidate cache for a child (called when child's metadata changes)
+    pub fn invalidate(&mut self, child_uri: &Url) {
+        self.cache.retain(|(uri, _), _| uri != child_uri);
+    }
+}
+```
+
+**Added Property 57: Parent Selection Stability**
+
+*For any* file with backward directives, once a parent is selected for a given metadata fingerprint, the same parent SHALL be selected on subsequent queries until the file's `CrossFileMetadata` changes. Parent selection SHALL NOT change due to graph/index convergence or temporary unavailability of parent files.
+
+**Validates: Requirements 5.10**
+
+### Issue 12: sys.source(envir=environment()) Limitation
+
+**Problem:** The pattern `sys.source("x.R", envir = environment())` inside a function or sourced file is not statically resolvable.
+
+**Fix:** Document this as an expected limitation. The LSP treats non-resolvable `envir` arguments conservatively as `local=TRUE` (no inheritance).
+
+**Documented Limitation:**
+> `sys.source()` calls with non-literal `envir` arguments (e.g., `envir = environment()`, `envir = my_env`) are treated conservatively as `local=TRUE`. Symbols from such sourced files will not be inherited by the caller. This is a known limitation of static analysis; runtime evaluation would be required to determine the actual target environment.
