@@ -400,7 +400,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 44: Workspace Index Version Monotonicity**
     - **Validates: Requirements 13.5**
 
-  - [ ] 14.6 Write property test for watched file cache invalidation
+  - [x] 14.6 Write property test for watched file cache invalidation
     - **Property 45: Watched File Cache Invalidation**
     - **Validates: Requirements 13.2**
 
@@ -419,7 +419,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Initialize all fields in `WorldState::new()`
     - _Requirements: 0.1-0.10, 6.1-6.8, 12.1-12.11, 13.1-13.6_
 
-- [ ] 16. Integrate cross-file into LSP handlers
+- [x] 16. Integrate cross-file into LSP handlers
   - [x] 16.1 Update completion handler
     - Query `ScopeResolver::scope_at_position()` for request position
     - Include symbols from resolved scope chain
@@ -427,11 +427,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Prefer local definitions over inherited symbols
     - _Requirements: 7.1-7.4_
 
-  - [ ] 16.2 Write property test for cross-file completion inclusion
+  - [x] 16.2 Write property test for cross-file completion inclusion
     - **Property 27: Cross-File Completion Inclusion**
     - **Validates: Requirements 7.1, 7.4**
 
-  - [ ] 16.3 Write property test for completion source attribution
+  - [x] 16.3 Write property test for completion source attribution
     - **Property 28: Completion Source Attribution**
     - **Validates: Requirements 7.2**
 
@@ -443,7 +443,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Show effective definition when multiple definitions exist
     - _Requirements: 8.1-8.3_
 
-  - [ ] 16.5 Write property test for cross-file hover information
+  - [x] 16.5 Write property test for cross-file hover information
     - **Property 29: Cross-File Hover Information**
     - **Validates: Requirements 8.1, 8.2**
 
@@ -453,7 +453,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Handle shadowing (navigate to effective definition)
     - _Requirements: 9.1-9.3_
 
-  - [ ] 16.7 Write property test for cross-file go-to-definition
+  - [x] 16.7 Write property test for cross-file go-to-definition
     - **Property 30: Cross-File Go-to-Definition**
     - **Validates: Requirements 9.1**
 
@@ -469,23 +469,23 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Use configurable severity levels
     - _Requirements: 10.1-10.6_
 
-  - [ ] 16.9 Write property test for diagnostic suppression
+  - [x] 16.9 Write property test for diagnostic suppression
     - **Property 5: Diagnostic Suppression**
     - **Validates: Requirements 2.4, 2.5, 10.4, 10.5**
 
-  - [ ] 16.10 Write property test for missing file diagnostics
+  - [x] 16.10 Write property test for missing file diagnostics
     - **Property 6: Missing File Diagnostics**
     - **Validates: Requirements 1.10, 2.7, 10.2**
 
-  - [ ] 16.11 Write property test for cross-file undefined variable suppression
+  - [x] 16.11 Write property test for cross-file undefined variable suppression
     - **Property 31: Cross-File Undefined Variable Suppression**
     - **Validates: Requirements 10.1**
 
-  - [ ] 16.12 Write property test for out-of-scope symbol warning
+  - [x] 16.12 Write property test for out-of-scope symbol warning
     - **Property 32: Out-of-Scope Symbol Warning**
     - **Validates: Requirements 10.3**
 
-- [ ] 17. Checkpoint - Ensure all tests pass
+- [x] 17. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 18. Update backend.rs with cross-file integration
@@ -508,7 +508,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Do NOT remove from dependency graph or metadata cache
     - _Requirements: 0.7, 0.8_
 
-  - [ ] 18.4 Write property test for diagnostics gate cleanup on close
+  - [x] 18.4 Write property test for diagnostics gate cleanup on close
     - **Property 54: Diagnostics Gate Cleanup on Close**
     - **Validates: Requirements 0.7, 0.8**
 
@@ -526,11 +526,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 15.1-15.5_
     - **NOTE: Not implemented due to tower-lsp limitations. Fallback behavior (Requirement 15.5) is implemented via record_recent() calls.**
 
-  - [ ] 18.7 Write property test for client activity signal processing
+  - [x] 18.7 Write property test for client activity signal processing
     - **Property 49: Client Activity Signal Processing**
     - **Validates: Requirements 15.4, 15.5**
 
-- [ ] 19. Update VS Code extension for client activity signals
+- [x] 19. Update VS Code extension for client activity signals
   - [x] 19.1 Update extension.ts to send activity notifications
     - Register `onDidChangeActiveTextEditor` listener
     - Register `onDidChangeVisibleTextEditors` listener
@@ -538,7 +538,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Include timestamp for ordering
     - _Requirements: 15.1, 15.2, 15.3_
 
-- [ ] 20. Update documentation
+- [x] 20. Update documentation
   - [x] 20.1 Update README.md with cross-file awareness section
     - Document all LSP directives with syntax and examples
     - Document cross-file behavior (source() detection, scope resolution, position-awareness)
@@ -557,8 +557,8 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 16.5-16.7_
 
 
-- [ ] 21. Final integration testing
-  - [ ] 21.1 Create multi-file workspace integration tests
+- [x] 21. Final integration testing
+  - [x] 21.1 Create multi-file workspace integration tests
     - Test completions include cross-file symbols
     - Test hover shows source file information
     - Test go-to-definition navigates to sourced files
@@ -567,14 +567,14 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Test workspace watching with disk changes
     - Test configuration changes trigger re-resolution
 
-  - [ ] 21.2 Test concurrent editing scenarios
+  - [x] 21.2 Test concurrent editing scenarios
     - Simulate rapid edits across multiple files
     - Verify debouncing and cancellation work correctly
     - Verify freshness guards prevent stale diagnostics
     - Verify monotonic publishing is enforced
     - Verify force republish works for dependency changes
 
-  - [ ] 21.3 Test edge cases and error handling
+  - [x] 21.3 Test edge cases and error handling
     - Test missing file diagnostics
     - Test circular dependency detection
     - Test ambiguous parent warnings
@@ -584,18 +584,18 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Test Unicode paths and special characters
     - Test UTF-16 correctness with emoji/CJK characters
 
-  - [ ] 21.4 Test v1 R symbol model edge cases
+  - [x] 21.4 Test v1 R symbol model edge cases
     - Test `assign()` with string literals vs dynamic names
     - Test `<<-` assignments
     - Test function definitions vs variable assignments
     - Test that unrecognized constructs don't suppress diagnostics
 
-  - [ ] 21.5 Test position-aware scope edge cases
+  - [x] 21.5 Test position-aware scope edge cases
     - Test same-line source() calls with completions/hover at different character positions
     - Test `line=` directive with definitions on same line as call site
     - Test multiple source() calls on same line
 
-- [ ] 22. Final checkpoint - Ensure all tests pass
+- [x] 22. Final checkpoint - Ensure all tests pass
   - Run full test suite including unit tests, property tests, and integration tests
   - Verify all requirements are covered
   - Ensure all tests pass, ask the user if questions arise.

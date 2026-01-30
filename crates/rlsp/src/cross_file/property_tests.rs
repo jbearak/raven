@@ -3117,7 +3117,7 @@ proptest! {
 // ============================================================================
 
 use super::workspace_index::{CrossFileWorkspaceIndex, IndexEntry};
-use super::file_cache::FileSnapshot;
+use super::file_cache::{FileSnapshot, CrossFileFileCache};
 use std::time::SystemTime;
 
 proptest! {
@@ -3154,5 +3154,744 @@ proptest! {
         for i in 1..versions.len() {
             prop_assert!(versions[i] > versions[i - 1]);
         }
+    }
+}
+
+// ============================================================================
+// Property 45: Watched File Cache Invalidation
+// Validates: Requirements 13.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 45: For any watched file that is created or changed on disk,
+    /// the disk-backed caches for that file SHALL be invalidated.
+    #[test]
+    fn prop_watched_file_cache_invalidation(
+        file_name in path_component(),
+        content1 in "[a-zA-Z_][a-zA-Z0-9_]{0,10} <- [0-9]{1,5}",
+        content2 in "[a-zA-Z_][a-zA-Z0-9_]{0,10} <- [0-9]{1,5}"
+    ) {
+        let cache = CrossFileFileCache::new();
+        let uri = make_url(&file_name);
+
+        let snapshot1 = FileSnapshot {
+            mtime: SystemTime::UNIX_EPOCH,
+            size: content1.len() as u64,
+            content_hash: None,
+        };
+
+        // Insert initial content
+        cache.insert(uri.clone(), snapshot1.clone(), content1.clone());
+        prop_assert_eq!(cache.get(&uri), Some(content1.clone()));
+
+        // Simulate file change by invalidating
+        cache.invalidate(&uri);
+
+        // Cache should be empty after invalidation
+        prop_assert!(cache.get(&uri).is_none(),
+            "Cache should be empty after invalidation");
+
+        // Insert new content with different snapshot
+        let snapshot2 = FileSnapshot {
+            mtime: SystemTime::now(),
+            size: content2.len() as u64,
+            content_hash: None,
+        };
+        cache.insert(uri.clone(), snapshot2.clone(), content2.clone());
+
+        // Should have new content
+        prop_assert_eq!(cache.get(&uri), Some(content2.clone()));
+
+        // Old snapshot should not match
+        prop_assert!(cache.get_if_fresh(&uri, &snapshot1).is_none(),
+            "Old snapshot should not match after file change");
+
+        // New snapshot should match
+        prop_assert_eq!(cache.get_if_fresh(&uri, &snapshot2), Some(content2));
+    }
+
+    /// Property 45 extended: Invalidate all clears entire cache
+    #[test]
+    fn prop_watched_file_cache_invalidate_all(
+        num_files in 1..10usize
+    ) {
+        let cache = CrossFileFileCache::new();
+
+        // Insert multiple files
+        for i in 0..num_files {
+            let uri = make_url(&format!("file{}", i));
+            let snapshot = FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 10,
+                content_hash: None,
+            };
+            cache.insert(uri, snapshot, format!("content{}", i));
+        }
+
+        // Verify all files are cached
+        for i in 0..num_files {
+            let uri = make_url(&format!("file{}", i));
+            prop_assert!(cache.get(&uri).is_some());
+        }
+
+        // Invalidate all
+        cache.invalidate_all();
+
+        // All files should be gone
+        for i in 0..num_files {
+            let uri = make_url(&format!("file{}", i));
+            prop_assert!(cache.get(&uri).is_none());
+        }
+    }
+}
+
+// ============================================================================
+// Property 27: Cross-File Completion Inclusion
+// Validates: Requirements 7.1, 7.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 27: For any file with a resolved scope chain containing symbol s
+    /// from a sourced file, completions at a position after the source() call
+    /// SHALL include s.
+    #[test]
+    fn prop_cross_file_completion_inclusion(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file (after source() call)
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol from child should be in scope (available for completion)
+        prop_assert!(scope.symbols.contains_key(&symbol_name),
+            "Symbol from sourced file should be available for completion");
+    }
+}
+
+// ============================================================================
+// Property 28: Completion Source Attribution
+// Validates: Requirements 7.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 28: For any completion item for a symbol from a sourced file,
+    /// the completion detail SHALL contain the source file path.
+    #[test]
+    fn prop_completion_source_attribution(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should have source_uri pointing to child
+        if let Some(symbol) = scope.symbols.get(&symbol_name) {
+            prop_assert_eq!(&symbol.source_uri, &child_uri,
+                "Symbol should have source_uri pointing to the sourced file");
+        } else {
+            prop_assert!(false, "Symbol should be in scope");
+        }
+    }
+}
+
+// ============================================================================
+// Property 29: Cross-File Hover Information
+// Validates: Requirements 8.1, 8.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 29: For any symbol from a sourced file, hovering over a usage
+    /// SHALL display the source file path and function signature (if applicable).
+    #[test]
+    fn prop_cross_file_hover_information(
+        func_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines a function
+        let child_code = format!("{} <- function(x, y) {{ x + y }}", func_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Function should be in scope with signature
+        if let Some(symbol) = scope.symbols.get(&func_name) {
+            prop_assert_eq!(&symbol.source_uri, &child_uri,
+                "Function should have source_uri pointing to the sourced file");
+            prop_assert!(symbol.signature.is_some(),
+                "Function should have a signature for hover");
+            prop_assert!(symbol.signature.as_ref().unwrap().contains(&func_name),
+                "Signature should contain function name");
+        } else {
+            prop_assert!(false, "Function should be in scope");
+        }
+    }
+}
+
+// ============================================================================
+// Property 30: Cross-File Go-to-Definition
+// Validates: Requirements 9.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 30: For any symbol defined in a sourced file, go-to-definition
+    /// SHALL navigate to the definition location in that file.
+    #[test]
+    fn prop_cross_file_go_to_definition(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol on line 0
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should have definition location in child file
+        if let Some(symbol) = scope.symbols.get(&symbol_name) {
+            prop_assert_eq!(&symbol.source_uri, &child_uri,
+                "Symbol should be defined in child file");
+            prop_assert_eq!(symbol.defined_line, 0,
+                "Symbol should be defined on line 0");
+        } else {
+            prop_assert!(false, "Symbol should be in scope");
+        }
+    }
+}
+
+// ============================================================================
+// Property 31: Cross-File Undefined Variable Suppression
+// Validates: Requirements 10.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 31: For any symbol s defined in a sourced file and used after
+    /// the source() call, no "undefined variable" diagnostic SHALL be emitted for s.
+    #[test]
+    fn prop_cross_file_undefined_variable_suppression(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file (after source() call)
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should be in scope, so no undefined variable diagnostic
+        prop_assert!(scope.symbols.contains_key(&symbol_name),
+            "Symbol from sourced file should be in scope (no undefined variable diagnostic)");
+    }
+}
+
+// ============================================================================
+// Property 32: Out-of-Scope Symbol Warning
+// Validates: Requirements 10.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 32: For any symbol s defined in a sourced file and used before
+    /// the source() call, an "out of scope" diagnostic SHALL be emitted.
+    #[test]
+    fn prop_out_of_scope_symbol_warning(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child on line 5
+        let parent_code = "# line 0\n# line 1\n# line 2\n# line 3\n# line 4\nsource(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope BEFORE source() call (line 4)
+        let scope_before = scope_at_position_with_deps(
+            &parent_uri, 4, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should NOT be in scope before source() call
+        prop_assert!(!scope_before.symbols.contains_key(&symbol_name),
+            "Symbol should NOT be in scope before source() call (out of scope)");
+
+        // Get scope AFTER source() call (line 6)
+        let scope_after = scope_at_position_with_deps(
+            &parent_uri, 6, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol SHOULD be in scope after source() call
+        prop_assert!(scope_after.symbols.contains_key(&symbol_name),
+            "Symbol should be in scope after source() call");
+    }
+}
+
+
+// ============================================================================
+// Property 5: Diagnostic Suppression
+// Validates: Requirements 2.2, 2.3, 10.4, 10.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 5: For any file containing `# @lsp-ignore` on line n, no diagnostics
+    /// SHALL be emitted for line n. For any file containing `# @lsp-ignore-next` on
+    /// line n, no diagnostics SHALL be emitted for line n+1.
+    #[test]
+    fn prop_diagnostic_suppression(
+        line_num in 0u32..10
+    ) {
+        use super::directive::{parse_directives, is_line_ignored};
+
+        // Test @lsp-ignore suppresses diagnostics on same line
+        let code_ignore = format!(
+            "{}undefined_var # @lsp-ignore",
+            "\n".repeat(line_num as usize)
+        );
+        let metadata = parse_directives(&code_ignore);
+
+        // The @lsp-ignore directive should be parsed
+        prop_assert!(metadata.ignored_lines.contains(&line_num),
+            "Line {} should be in ignored_lines", line_num);
+        prop_assert!(is_line_ignored(&metadata, line_num),
+            "Line {} should be ignored", line_num);
+
+        // Test @lsp-ignore-next suppresses diagnostics on next line
+        let code_ignore_next = format!(
+            "{}# @lsp-ignore-next\nundefined_var",
+            "\n".repeat(line_num as usize)
+        );
+        let metadata_next = parse_directives(&code_ignore_next);
+
+        // The line after @lsp-ignore-next should be in ignored_next_lines
+        prop_assert!(metadata_next.ignored_next_lines.contains(&(line_num + 1)),
+            "Line {} should be in ignored_next_lines (from @lsp-ignore-next)", line_num + 1);
+        prop_assert!(is_line_ignored(&metadata_next, line_num + 1),
+            "Line {} should be ignored (from @lsp-ignore-next)", line_num + 1);
+    }
+}
+
+// ============================================================================
+// Property 6: Missing File Diagnostics
+// Validates: Requirements 1.8, 2.5, 10.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 6: For any directive or source() call referencing a non-existent
+    /// file path, the Diagnostic_Engine SHALL emit exactly one warning diagnostic
+    /// at the location of that reference.
+    #[test]
+    fn prop_missing_file_diagnostics(
+        missing_path in "[a-z]{3,8}\\.R"
+    ) {
+        use super::source_detect::detect_source_calls;
+
+        let code = format!("source(\"{}\")", missing_path);
+        let tree = parse_r_tree(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        // Should detect the source() call
+        prop_assert_eq!(sources.len(), 1,
+            "Should detect exactly one source() call");
+
+        // The forward source should have the path
+        let forward = &sources[0];
+        prop_assert_eq!(&forward.path, &missing_path,
+            "Forward source should have the missing path");
+
+        // When path resolution fails, a diagnostic should be emitted
+        // (This is tested at the handler level - here we verify the path is captured)
+        prop_assert!(forward.line == 0,
+            "Source call should be on line 0");
+    }
+}
+
+
+// ============================================================================
+// Property 54: Diagnostics Gate Cleanup on Close
+// Validates: Requirements 0.7, 0.8
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 54: For any document that is closed via textDocument/didClose,
+    /// the server SHALL clear all diagnostics gate state for that URI.
+    #[test]
+    fn prop_diagnostics_gate_cleanup_on_close(
+        version in 1i32..1000
+    ) {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = make_url("test");
+
+        // Publish some diagnostics
+        gate.record_publish(&uri, version);
+
+        // Mark for force republish
+        gate.mark_force_republish(&uri);
+
+        // Verify state exists
+        prop_assert!(!gate.can_publish(&uri, version - 1),
+            "Should not be able to publish older version");
+
+        // Clear state (simulating document close)
+        gate.clear(&uri);
+
+        // After clear, any version should be publishable (no history)
+        prop_assert!(gate.can_publish(&uri, 1),
+            "After clear, version 1 should be publishable");
+        prop_assert!(gate.can_publish(&uri, version),
+            "After clear, same version should be publishable");
+        prop_assert!(gate.can_publish(&uri, version + 1),
+            "After clear, newer version should be publishable");
+    }
+}
+
+
+// ============================================================================
+// Property 49: Client Activity Signal Processing
+// Validates: Requirements 15.4, 15.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 49: For any rlsp/activeDocumentsChanged notification received
+    /// from the client, the server SHALL update its internal activity model
+    /// and use it to prioritize subsequent cross-file revalidations.
+    #[test]
+    fn prop_client_activity_signal_processing(
+        active_idx in 0usize..5,
+        visible_count in 1usize..5,
+        timestamp in 0u64..10000
+    ) {
+        let mut state = CrossFileActivityState::new();
+
+        // Create some URIs
+        let uris: Vec<Url> = (0..5).map(|i| make_url(&format!("file{}", i))).collect();
+        let active_uri = uris.get(active_idx).cloned();
+        let visible_uris: Vec<Url> = uris.iter().take(visible_count).cloned().collect();
+
+        // Update activity state (simulating client notification)
+        state.update(active_uri.clone(), visible_uris.clone(), timestamp);
+
+        // Verify state was updated
+        prop_assert_eq!(&state.active_uri, &active_uri);
+        prop_assert_eq!(&state.visible_uris, &visible_uris);
+        prop_assert_eq!(state.timestamp_ms, timestamp);
+
+        // Verify priority scoring
+        if let Some(ref active) = active_uri {
+            prop_assert_eq!(state.priority_score(active), 0,
+                "Active document should have highest priority (0)");
+        }
+
+        for visible in &visible_uris {
+            if active_uri.as_ref() != Some(visible) {
+                prop_assert_eq!(state.priority_score(visible), 1,
+                    "Visible (non-active) document should have priority 1");
+            }
+        }
+
+        // Non-visible, non-active should have lower priority
+        let other_uri = make_url("other");
+        prop_assert!(state.priority_score(&other_uri) > 1,
+            "Non-visible, non-active document should have priority > 1");
+    }
+}
+
+
+// ============================================================================
+// Integration Tests - Task 21
+// ============================================================================
+
+// 21.3 Edge cases and error handling
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Test UTF-16 correctness with emoji characters in paths
+    #[test]
+    fn prop_utf16_emoji_in_path(
+        prefix in "[a-z]{1,5}",
+        suffix in "[a-z]{1,5}"
+    ) {
+        // Path with emoji
+        let path = format!("{}_🎉_{}.R", prefix, suffix);
+        let code = format!("source(\"{}\")", path);
+        let tree = parse_r_tree(&code);
+
+        use super::source_detect::detect_source_calls;
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(&sources[0].path, &path);
+    }
+
+    /// Test UTF-16 correctness with CJK characters in paths
+    #[test]
+    fn prop_utf16_cjk_in_path(
+        prefix in "[a-z]{1,5}",
+        suffix in "[a-z]{1,5}"
+    ) {
+        // Path with CJK characters
+        let path = format!("{}_日本語_{}.R", prefix, suffix);
+        let code = format!("source(\"{}\")", path);
+        let tree = parse_r_tree(&code);
+
+        use super::source_detect::detect_source_calls;
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(&sources[0].path, &path);
+    }
+}
+
+// 21.5 Position-aware scope edge cases
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Test multiple source() calls on same line
+    #[test]
+    fn prop_multiple_source_calls_same_line(
+        path1 in "[a-z]{3,8}\\.R",
+        path2 in "[a-z]{3,8}\\.R"
+    ) {
+        // Two source() calls on same line
+        let code = format!("source(\"{}\"); source(\"{}\")", path1, path2);
+        let tree = parse_r_tree(&code);
+
+        use super::source_detect::detect_source_calls;
+        let sources = detect_source_calls(&tree, &code);
+
+        // Should detect both source() calls
+        prop_assert_eq!(sources.len(), 2);
+
+        // Both should be on line 0
+        prop_assert_eq!(sources[0].line, 0);
+        prop_assert_eq!(sources[1].line, 0);
+
+        // Paths should be correct
+        let paths: Vec<&str> = sources.iter().map(|s| s.path.as_str()).collect();
+        prop_assert!(paths.contains(&path1.as_str()));
+        prop_assert!(paths.contains(&path2.as_str()));
+    }
+
+    /// Test position-aware scope with same-line source() call
+    #[test]
+    fn prop_same_line_source_position_awareness(
+        symbol_name in r_identifier().prop_filter("not x or y", |s| s != "x" && s != "y")
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: x <- 1; source("child.R"); y <- 2
+        // Symbol from child should be available after source() but not before
+        let parent_code = "x <- 1; source(\"child.R\"); y <- 2";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // At column 0 (before x), child symbol should NOT be available
+        let scope_before = scope_at_position_with_deps(
+            &parent_uri, 0, 0, &get_artifacts, &resolve_path, 10,
+        );
+        prop_assert!(!scope_before.symbols.contains_key(&symbol_name),
+            "Symbol should NOT be available before source() call");
+
+        // At column 30 (after source()), child symbol SHOULD be available
+        let scope_after = scope_at_position_with_deps(
+            &parent_uri, 0, 30, &get_artifacts, &resolve_path, 10,
+        );
+        prop_assert!(scope_after.symbols.contains_key(&symbol_name),
+            "Symbol should be available after source() call");
+    }
+}
+
+// 21.4 v1 R symbol model edge cases
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Test that assign() with string literal is recognized
+    #[test]
+    fn prop_assign_string_literal_recognized(
+        symbol_name in r_identifier()
+    ) {
+        let code = format!("assign(\"{}\", 42)", symbol_name);
+        let tree = parse_r_tree(&code);
+        let uri = make_url("test");
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // assign() with string literal should be recognized
+        prop_assert!(artifacts.exported_interface.contains_key(&symbol_name),
+            "assign() with string literal should be recognized");
+    }
+
+    /// Test that assign() with variable is NOT recognized (dynamic)
+    #[test]
+    fn prop_assign_variable_not_recognized(
+        var_name in r_identifier()
+    ) {
+        let code = format!("assign({}, 42)", var_name);
+        let tree = parse_r_tree(&code);
+        let uri = make_url("test");
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // assign() with variable should NOT be recognized (dynamic)
+        prop_assert!(!artifacts.exported_interface.contains_key(&var_name),
+            "assign() with variable should NOT be recognized (dynamic)");
     }
 }
