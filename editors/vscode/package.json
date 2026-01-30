@@ -47,12 +47,6 @@
     "package": "npm run compile && node scripts/bundle.js && vsce package --allow-missing-repository",
     "package:target": "npm run compile && node scripts/bundle.js && vsce package --target"
   },
-  "files": [
-    "out/**",
-    "bin/**",
-    "node_modules/**",
-    "language-configuration.json"
-  ],
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
   },
