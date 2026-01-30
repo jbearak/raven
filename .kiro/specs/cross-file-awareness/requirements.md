@@ -1,10 +1,25 @@
 # Requirements: Cross-File Awareness
 
-## Introduction
+## Overview
 
 This document specifies requirements for adding cross-file awareness to Rlsp, a static R Language Server written in Rust. Cross-file awareness enables the LSP to understand relationships between R source files through `source()` calls and special comment directives, providing accurate symbol resolution, diagnostics, and navigation across file boundaries.
 
 The feature is inspired by the Sight LSP for Stata and adapted for R's specific patterns including `source()`, `sys.source()`, working directory conventions, and R project structures.
+
+## Goals
+
+- Enable the LSP to track dependencies between R files via `source()` calls and comment directives
+- Provide accurate symbol resolution across file boundaries for completions, hover, and go-to-definition
+- Suppress false-positive "undefined variable" diagnostics for symbols defined in sourced files
+- Support real-time updates when any file in a source chain is modified
+- Maintain performance through intelligent caching and lazy evaluation
+
+## Non-Goals
+
+- Runtime execution or evaluation of R code
+- Dynamic path resolution (variables, expressions, `paste0()` in source paths)
+- Package-level dependency management (handled separately by existing workspace indexing)
+- Support for non-standard sourcing mechanisms beyond `source()` and `sys.source()`
 
 ## Glossary
 
@@ -18,6 +33,11 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 - **Scope**: The set of symbols (functions, variables) available at a given point in a file
 - **Dependency_Graph**: A directed graph representing source relationships between files
 - **Symbol_Table**: A mapping of symbol names to their definitions and metadata
+
+## Actors
+
+- **R Developer**: The primary user who writes R code across multiple files and expects accurate LSP features
+- **LSP Client**: The editor (VS Code, etc.) that communicates with Rlsp via the Language Server Protocol
 
 ## Requirements
 

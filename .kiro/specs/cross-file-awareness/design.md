@@ -4,7 +4,7 @@
 
 This design document describes the architecture and implementation approach for adding cross-file awareness to Rlsp. The feature enables the LSP to understand relationships between R source files through `source()` calls and special comment directives, providing accurate symbol resolution, diagnostics, and navigation across file boundaries.
 
-The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `RwLock` for thread-safe state, and integration with the existing `WorldState` and `Document` structures.
+The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `RwLock` for thread-safe state, and integration with the existing `WorldState` and `Document` structures. Per project coding guidelines: use `log::trace!` instead of `log::debug!`, use explicit `return Err(anyhow!(...))` instead of `bail!`, and omit `return` in match expressions.
 
 ## Architecture
 
@@ -88,8 +88,9 @@ graph TB
 #### Line Numbering Conventions (Required)
 
 - LSP positions are 0-based for `line` and `character`.
-- Directive syntax `line=` is 1-based for user ergonomics.
+- Directive syntax `line=` is 1-based for user ergonomics (Requirement 1.4).
 - Internally, all stored line numbers in `CrossFileMetadata`, dependency edges, and scope artifacts MUST be 0-based.
+- The implementation MUST convert user-facing 1-based line numbers to internal 0-based representation.
 
 The implementation uses **one** structured representation for cross-file metadata (`CrossFileMetadata`) which is:
 - derived from document contents (directives + detected `source()` calls)
@@ -359,26 +360,40 @@ Implementation notes:
 
 ### Configuration
 
+Configuration options support all settings from Requirement 11.
+
 ```rust
 /// Cross-file awareness configuration
 #[derive(Debug, Clone)]
 pub struct CrossFileConfig {
+    /// Maximum depth for backward directive traversal (Requirement 11.1)
     pub max_backward_depth: usize,
+    /// Maximum depth for forward source() traversal (Requirement 11.2)
     pub max_forward_depth: usize,
+    /// Maximum total chain depth (Requirement 11.3)
     pub max_chain_depth: usize,
+    /// Default call site assumption when not specified (Requirement 11.4)
     pub assume_call_site: CallSiteDefault,
+    /// Whether to index workspace files (Requirement 11.5)
     pub index_workspace: bool,
 
-    /// Max number of open documents to schedule for diagnostics revalidation per trigger.
+    /// Max number of open documents to schedule for diagnostics revalidation per trigger (Requirement 11.6)
     pub max_revalidations_per_trigger: usize,
 
-    /// Debounce delay for cross-file diagnostics fanout.
+    /// Debounce delay for cross-file diagnostics fanout (Requirement 11.7)
     pub revalidation_debounce_ms: u64,
 
+    /// Whether undefined variable diagnostics are enabled (Requirement 11.9, 11.10)
     pub undefined_variables_enabled: bool,
+    
+    /// Severity for missing file diagnostics (Requirement 11.8)
     pub missing_file_severity: DiagnosticSeverity,
+    /// Severity for circular dependency diagnostics (Requirement 11.8)
     pub circular_dependency_severity: DiagnosticSeverity,
+    /// Severity for out-of-scope symbol diagnostics (Requirement 11.8)
     pub out_of_scope_severity: DiagnosticSeverity,
+    /// Severity for ambiguous parent diagnostics (Requirement 11.8)
+    pub ambiguous_parent_severity: DiagnosticSeverity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,17 +405,40 @@ pub enum CallSiteDefault {
 impl Default for CrossFileConfig {
     fn default() -> Self {
         Self {
-            max_backward_depth: 10,
-            max_forward_depth: 10,
-            max_chain_depth: 20,
-            assume_call_site: CallSiteDefault::End,
-            index_workspace: true,
-            max_revalidations_per_trigger: 10,
-            revalidation_debounce_ms: 200,
-            undefined_variables_enabled: true,
+            max_backward_depth: 10,      // Requirement 11.1
+            max_forward_depth: 10,       // Requirement 11.2
+            max_chain_depth: 20,         // Requirement 11.3
+            assume_call_site: CallSiteDefault::End, // Requirement 11.4
+            index_workspace: true,       // Requirement 11.5
+            max_revalidations_per_trigger: 10, // Requirement 11.6
+            revalidation_debounce_ms: 200,     // Requirement 11.7
+            undefined_variables_enabled: true, // Requirement 11.9
             missing_file_severity: DiagnosticSeverity::WARNING,
             circular_dependency_severity: DiagnosticSeverity::ERROR,
             out_of_scope_severity: DiagnosticSeverity::WARNING,
+            ambiguous_parent_severity: DiagnosticSeverity::WARNING,
+        }
+    }
+}
+
+/// Configuration change handling (Requirement 11.11)
+/// When configuration changes, the LSP must re-resolve scope chains for all open documents.
+pub fn on_configuration_changed(state: &mut WorldState, new_config: CrossFileConfig) {
+    let old_config = std::mem::replace(&mut state.cross_file_config, new_config);
+    
+    // If scope-affecting settings changed, invalidate all scope caches
+    if old_config.assume_call_site != state.cross_file_config.assume_call_site
+        || old_config.max_chain_depth != state.cross_file_config.max_chain_depth
+        || old_config.max_backward_depth != state.cross_file_config.max_backward_depth
+        || old_config.max_forward_depth != state.cross_file_config.max_forward_depth
+    {
+        // Invalidate all scope caches
+        state.cross_file_cache.invalidate_all();
+        
+        // Schedule diagnostics revalidation for all open documents
+        let open_docs: Vec<Url> = state.documents.keys().cloned().collect();
+        for uri in open_docs {
+            state.cross_file_revalidation.schedule(uri);
         }
     }
 }
@@ -862,6 +900,262 @@ pub struct ScopeAtLine {
 
 *For any* scope chain where a symbol `s` is defined in both a sourced file and the current file, the resolved scope SHALL contain the current file's definition of `s`, and completions, hover, and go-to-definition SHALL use the local definition.
 
+**Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3**
+
+### Property 5: Diagnostic Suppression
+
+*For any* file containing `# @lsp-ignore` on line `n`, no diagnostics SHALL be emitted for line `n`. *For any* file containing `# @lsp-ignore-next` on line `n`, no diagnostics SHALL be emitted for line `n+1`.
+
+**Validates: Requirements 2.2, 2.3, 10.4, 10.5**
+
+### Property 6: Missing File Diagnostics
+
+*For any* directive or source() call referencing a non-existent file path, the Diagnostic_Engine SHALL emit exactly one warning diagnostic at the location of that reference.
+
+Clarification: "exactly one" means a single diagnostic per (file, line, referenced path) tuple. If the same missing path is referenced multiple times at different lines, each reference may produce its own diagnostic.
+
+**Validates: Requirements 1.8, 2.5, 10.2**
+
+### Property 7: Circular Dependency Detection
+
+*For any* set of files where file A sources file B and file B sources file A (directly or transitively), the Scope_Resolver SHALL detect the cycle, break it, and emit an error diagnostic listing the cycle.
+
+**Validates: Requirements 5.7, 10.6**
+
+### Property 8: Directive Round-Trip Serialization
+
+*For any* valid `CrossFileMetadata` structure, serializing to JSON and then deserializing SHALL produce an equivalent structure. This implies parsing is deterministic.
+
+**Validates: Requirements 14.1, 14.2, 14.3, 14.4**
+
+### Property 9: Call Site Line Parameter Extraction
+
+*For any* backward directive with `line=N` parameter where N is a valid 1-based line number, the parsed `CallSiteSpec` SHALL be `Line(N-1)` (converted to 0-based) with the exact value.
+
+**Validates: Requirements 1.4**
+
+### Property 10: Call Site Match Parameter Extraction
+
+*For any* backward directive with `match="pattern"` parameter, the parsed `CallSiteSpec` SHALL be `Match(pattern)` with the exact pattern string.
+
+**Validates: Requirements 1.5**
+
+### Property 11: Relative Path Resolution
+
+*For any* file at path `/a/b/c.R` and relative directive path `../d/e.R`, the Path_Resolver SHALL resolve to `/a/d/e.R`.
+
+**Validates: Requirements 1.6, 1.7, 3.7**
+
+### Property 12: Forward Directive Order Preservation
+
+*For any* file containing multiple `@lsp-source` directives, the parsed `ForwardSource` list SHALL maintain the same order as they appear in the document.
+
+**Validates: Requirements 2.4**
+
+### Property 13: Working Directory Inheritance
+
+*For any* source chain A → B → C where only A has a working directory directive, files B and C SHALL inherit A's working directory for path resolution.
+
+**Validates: Requirements 3.5**
+
+### Property 14: Default Working Directory
+
+*For any* file at path `/a/b/c.R` with no working directory directive and no inherited working directory, the effective working directory SHALL be `/a/b/`.
+
+**Validates: Requirements 3.6**
+
+### Property 15: Named Argument Source Detection
+
+*For any* source() call using `source(file = "path.R")` syntax, the Source_Detector SHALL extract "path.R" as the path.
+
+**Validates: Requirements 4.3**
+
+### Property 16: sys.source Detection
+
+*For any* sys.source() call with a string literal path, the Source_Detector SHALL extract the path and mark `is_sys_source` as true.
+
+**Validates: Requirements 4.4**
+
+### Property 17: Dynamic Path Graceful Handling
+
+*For any* source() call where the path argument is a variable, expression, or paste0() call, the Source_Detector SHALL not extract a path and SHALL not emit an error.
+
+**Validates: Requirements 4.5, 4.6**
+
+### Property 18: Source Call Parameter Extraction
+
+*For any* source() call with `local = TRUE`, the extracted `SourceCall` SHALL have `local = true`. *For any* source() call with `chdir = TRUE`, the extracted `SourceCall` SHALL have `chdir = true`.
+
+**Validates: Requirements 4.7, 4.8**
+
+### Property 19: Backward-First Resolution Order
+
+*For any* file with both backward directives and forward source() calls, the Scope_Resolver SHALL process backward directives before forward sources, resulting in parent symbols being available before sourced file symbols.
+
+**Validates: Requirements 5.1, 5.2**
+
+### Property 20: Call Site Symbol Filtering
+
+*For any* backward directive with `line=N`, only symbols defined on lines 0 through N-1 (0-based) in the parent file SHALL be included in the scope.
+
+**Validates: Requirements 5.5**
+
+### Property 21: Default Call Site Behavior
+
+*For any* backward directive without a call site specification, when `assumeCallSite` is "end", all symbols from the parent SHALL be included; when "start", no symbols from the parent SHALL be included.
+
+**Validates: Requirements 5.6**
+
+### Property 22: Maximum Depth Enforcement
+
+*For any* source chain exceeding `maxChainDepth`, the Scope_Resolver SHALL stop traversal at the configured depth and emit a diagnostic.
+
+**Validates: Requirements 5.8**
+
+### Property 23: Dependency Graph Update on Change
+
+*For any* file change that modifies directives or source() calls, the Dependency_Graph edges for that file SHALL reflect the new state.
+
+**Validates: Requirements 0.1, 0.2, 6.1, 6.2**
+
+### Property 24: Scope Cache Invalidation on Interface Change
+
+*For any* file whose exported interface or dependency edges change, all files that depend on it (directly or transitively) SHALL have their scope caches invalidated.
+
+**Validates: Requirements 0.3, 12.4, 12.5**
+
+### Property 25: Dependency Graph Edge Removal
+
+*For any* file that is deleted, the Dependency_Graph SHALL contain no edges where that file is either source or target.
+
+**Validates: Requirements 6.3, 13.3**
+
+### Property 26: Transitive Dependency Query
+
+*For any* file A that sources B, and B sources C, querying dependencies of A SHALL include both B and C. Querying dependents of C SHALL include both B and A.
+
+**Validates: Requirements 6.4, 6.5**
+
+### Property 27: Cross-File Completion Inclusion
+
+*For any* file with a resolved scope chain containing symbol `s` from a sourced file, completions at a position after the source() call SHALL include `s`.
+
+**Validates: Requirements 7.1, 7.4**
+
+### Property 28: Completion Source Attribution
+
+*For any* completion item for a symbol from a sourced file, the completion detail SHALL contain the source file path.
+
+**Validates: Requirements 7.2**
+
+### Property 29: Cross-File Hover Information
+
+*For any* symbol from a sourced file, hovering over a usage SHALL display the source file path and function signature (if applicable).
+
+**Validates: Requirements 8.1, 8.2**
+
+### Property 30: Cross-File Go-to-Definition
+
+*For any* symbol defined in a sourced file, go-to-definition SHALL navigate to the definition location in that file.
+
+**Validates: Requirements 9.1**
+
+### Property 31: Cross-File Undefined Variable Suppression
+
+*For any* symbol `s` defined in a sourced file and used after the source() call, no "undefined variable" diagnostic SHALL be emitted for `s`.
+
+**Validates: Requirements 10.1**
+
+### Property 32: Out-of-Scope Symbol Warning
+
+*For any* symbol `s` defined in a sourced file and used before the source() call, an "out of scope" diagnostic SHALL be emitted.
+
+**Validates: Requirements 10.3**
+
+### Property 33: Undefined Variables Configuration
+
+*For any* configuration with `diagnostics.undefinedVariables = false`, no undefined variable diagnostics SHALL be emitted regardless of symbol resolution.
+
+**Validates: Requirements 11.9, 11.10**
+
+### Property 34: Configuration Change Re-resolution
+
+*For any* configuration change affecting scope resolution (e.g., `assumeCallSite`), all open documents SHALL have their scope chains re-resolved.
+
+**Validates: Requirements 11.11**
+
+### Property 35: Diagnostics Fanout to Open Files
+
+*For any* file change that invalidates dependent files, all affected open files SHALL receive updated diagnostics without requiring user edits to those files.
+
+**Validates: Requirements 0.4, 13.4**
+
+### Property 36: Debounce Cancellation
+
+*For any* sequence of rapid changes to a file, only the final change SHALL result in published diagnostics; intermediate pending revalidations SHALL be cancelled.
+
+**Validates: Requirements 0.5**
+
+### Property 37: Multiple Source Calls - Earliest Call Site
+
+*For any* file that is sourced multiple times at different call sites in the same parent, symbols from that file SHALL become available at the earliest call site.
+
+**Validates: Requirements 5.9**
+
+### Property 38: Ambiguous Parent Determinism
+
+*For any* file with multiple possible parents (via backward directives or reverse edges), the Scope_Resolver SHALL deterministically select the same parent given the same inputs, and SHALL emit an ambiguity diagnostic.
+
+**Validates: Requirements 5.10**
+
+### Property 39: Interface Hash Optimization
+
+*For any* file change where the exported interface hash remains identical and the edge set remains identical, dependent files SHALL NOT have their scope caches invalidated.
+
+**Validates: Requirements 12.8**
+
+### Property 40: Position-Aware Symbol Availability
+
+*For any* source() call at line N, symbols from the sourced file SHALL only be available for positions strictly after line N.
+
+**Validates: Requirements 5.3**
+
+### Property 41: Freshness Guard Prevents Stale Diagnostics
+
+*For any* debounced/background diagnostics task, if the document version changes between task scheduling and publishing, the task SHALL NOT publish diagnostics.
+
+**Validates: Requirements 0.6**
+
+### Property 42: Revalidation Prioritization
+
+*For any* invalidation affecting multiple open documents, the active document SHALL be revalidated before other open documents.
+
+**Validates: Requirements 0.7**
+
+### Property 43: Revalidation Cap Enforcement
+
+*For any* invalidation affecting more open documents than `maxRevalidationsPerTrigger`, only the first N documents (prioritized) SHALL be scheduled, and skipped documents SHALL be revalidated on-demand when they become active.
+
+**Validates: Requirements 0.7, 0.8**
+
+### Property 44: Workspace Index Version Monotonicity
+
+*For any* sequence of workspace index updates, the version counter SHALL be strictly increasing.
+
+**Validates: Requirements 13.5**
+
+### Property 45: Watched File Cache Invalidation
+
+*For any* watched file that is created or changed on disk, the disk-backed caches for that file SHALL be invalidated.
+
+**Validates: Requirements 13.2**
+
+### Property 46: Forward Directive as Explicit Source
+
+*For any* file containing `# @lsp-source <path>` at line N, the Directive_Parser SHALL treat it as an explicit source() declaration at line N.
+
+**Validates: Requirements 2.1**s, hover, and go-to-definition SHALL use the local definition.
+
 **Validates: Requirements 5.4, 7.3, 9.2, 9.3**
 
 ### Property 5: Diagnostic Suppression
@@ -1200,27 +1494,37 @@ Unit tests focus on specific examples and edge cases:
 1. **Directive Parser Tests**
    - Parse each directive type with various path formats
    - Handle edge cases: empty paths, paths with spaces, Unicode paths
-   - Verify line number extraction
+   - Verify line number extraction and 1-based to 0-based conversion
+   - Test all directive synonyms (sourced-by, run-by, included-by, etc.)
 
 2. **Source Detector Tests**
    - Detect source() with different argument styles
    - Handle nested calls, comments, strings containing "source"
    - Verify parameter extraction (local, chdir)
+   - Test sys.source() detection
 
 3. **Path Resolver Tests**
    - Resolve relative paths with various `..` combinations
    - Handle Windows vs Unix path separators
    - Test working directory inheritance
+   - Test relative working directory resolution
 
 4. **Dependency Graph Tests**
    - Add/remove edges correctly
    - Detect cycles of various lengths
-   - Query transitive dependencies
+   - Query transitive dependencies and dependents
+   - Test concurrent read access
 
 5. **Revalidation Tests**
    - Verify debouncing behavior
    - Test cancellation of pending work
    - Verify diagnostics fanout to open files
+   - Test prioritization (active document first)
+   - Test cap enforcement and on-demand revalidation
+
+6. **Configuration Tests**
+   - Verify all default values match requirements
+   - Test configuration change triggers re-resolution
 
 ### Property-Based Tests
 
@@ -1231,12 +1535,24 @@ Property-based tests verify universal properties across generated inputs. Each t
 - Valid file paths (relative and absolute)
 - Directive strings with random parameters
 - Source chains of varying depths
+- CrossFileMetadata structures for round-trip testing
 
 **Property Test Tags**: Each test is tagged with:
 ```
 // Feature: cross-file-awareness, Property N: <property_text>
 ```
 
+**Property Test Coverage**:
+- Properties 1-3: Directive parsing equivalence
+- Properties 4-5: Symbol precedence and diagnostic suppression
+- Properties 6-7: Error handling (missing files, circular deps)
+- Property 8: Round-trip serialization
+- Properties 9-18: Parameter extraction and detection
+- Properties 19-22: Scope resolution order and filtering
+- Properties 23-26: Dependency graph operations
+- Properties 27-32: LSP feature integration
+- Properties 33-34: Configuration effects
+- Properties 35-46: Real-time updates and workspace watching
 
 ### Integration Tests
 
@@ -1254,6 +1570,12 @@ Property-based tests verify universal properties across generated inputs. Each t
    - Simulate concurrent edits across multiple files
    - Verify diagnostics update in dependent files
    - Test debouncing under rapid changes
+   - Test freshness guard prevents stale diagnostics
+
+4. **Workspace watching tests**
+   - Test file watcher registration
+   - Verify cache invalidation on disk changes
+   - Test diagnostics update when closed files change
 
 ### Test File Structure
 
@@ -1268,6 +1590,8 @@ crates/rlsp/src/
 │   ├── scope.rs          # Scope resolution
 │   ├── config.rs         # Configuration
 │   ├── revalidation.rs   # Real-time update system
+│   ├── workspace_index.rs # Workspace indexing
+│   ├── file_cache.rs     # Disk file cache
 │   └── tests/
 │       ├── directive_tests.rs
 │       ├── source_detect_tests.rs
@@ -1275,5 +1599,6 @@ crates/rlsp/src/
 │       ├── dependency_tests.rs
 │       ├── scope_tests.rs
 │       ├── revalidation_tests.rs
+│       ├── workspace_tests.rs
 │       └── property_tests.rs  # All property-based tests
 ```
