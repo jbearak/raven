@@ -17,6 +17,23 @@ use super::types::{CallSiteSpec, CrossFileMetadata};
 // Generators for valid R file paths
 // ============================================================================
 
+/// R reserved words and special values that cannot be used as identifiers
+const R_RESERVED: &[&str] = &[
+    "if", "else", "for", "in", "while", "repeat", "next", "break", "function",
+    "NA", "NaN", "Inf", "NULL", "TRUE", "FALSE", "T", "F",
+    "na", "nan", "inf", "null", "true", "false",
+];
+
+/// Check if a name is a valid R identifier (not reserved)
+fn is_valid_r_identifier(name: &str) -> bool {
+    !R_RESERVED.contains(&name)
+}
+
+/// Generate a valid R identifier (lowercase to avoid reserved words)
+fn r_identifier() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9_]{0,5}".prop_filter("not reserved", |s| is_valid_r_identifier(s))
+}
+
 /// Generate a valid R file path component (no special chars that break parsing)
 fn path_component() -> impl Strategy<Value = String> {
     "[a-zA-Z][a-zA-Z0-9_]{0,10}"
@@ -617,7 +634,7 @@ proptest! {
     #[test]
     fn prop_dynamic_path_paste0_skipped(
         prefix in "[a-zA-Z]{1,5}",
-        varname in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        varname in r_identifier()
     ) {
         let code = format!("source(paste0(\"{}/\", {}))", prefix, varname);
         let tree = parse_r(&code);
@@ -1355,7 +1372,7 @@ proptest! {
     /// definition of s (local definitions shadow inherited ones).
     #[test]
     fn prop_local_symbol_precedence(
-        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        symbol_name in r_identifier()
     ) {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
@@ -1423,16 +1440,19 @@ proptest! {
     /// the sourced file SHALL only be available for positions strictly after (line, column).
     #[test]
     fn prop_position_aware_symbol_availability(
-        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
+        symbol_name in r_identifier(),
         source_line in 2..10u32
     ) {
+        // Ensure symbol_name doesn't conflict with generated variable names
+        prop_assume!(!symbol_name.starts_with('x') && !symbol_name.starts_with('y'));
+
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
 
         // Parent file: has source() call at specific line
         let mut parent_lines = vec!["# comment".to_string()];
         for i in 1..source_line {
-            parent_lines.push(format!("x{} <- {}", i, i));
+            parent_lines.push(format!("var{} <- {}", i, i));
         }
         parent_lines.push("source(\"child.R\")".to_string());
         parent_lines.push("# after source".to_string());
@@ -1501,7 +1521,7 @@ proptest! {
     /// SHALL stop traversal at the configured depth.
     #[test]
     fn prop_maximum_depth_enforcement(
-        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        symbol_name in r_identifier()
     ) {
         // Create a chain: a -> b -> c -> d
         let uri_a = make_url("a");
@@ -1625,7 +1645,7 @@ proptest! {
     /// the sourced file SHALL NOT be added to the caller's scope.
     #[test]
     fn prop_local_source_scope_isolation(
-        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        symbol_name in r_identifier()
     ) {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
@@ -1675,7 +1695,7 @@ proptest! {
     /// - If column > call_column, symbols from the sourced file SHALL be included
     #[test]
     fn prop_full_position_precision(
-        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
+        symbol_name in r_identifier(),
         prefix_len in 0..10usize
     ) {
         let parent_uri = make_url("parent");
@@ -1746,7 +1766,7 @@ proptest! {
     /// it as local = TRUE (no symbol inheritance).
     #[test]
     fn prop_sys_source_conservative_handling(
-        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        symbol_name in r_identifier()
     ) {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
@@ -1804,10 +1824,11 @@ proptest! {
     /// - assign(dynamic_name, <expr>) is NOT recognized
     #[test]
     fn prop_v1_symbol_model_recognized_constructs(
-        func_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
-        var_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
-        assign_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        func_name in r_identifier(),
+        var_name in r_identifier(),
+        assign_name in r_identifier()
     ) {
+        // Ensure names are distinct
         prop_assume!(func_name != var_name && var_name != assign_name && func_name != assign_name);
 
         let uri = make_url("test");
@@ -1837,7 +1858,7 @@ proptest! {
     /// V1 R Symbol Model: Dynamic assign() is NOT recognized
     #[test]
     fn prop_v1_symbol_model_dynamic_assign_not_recognized(
-        var_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        var_name in r_identifier()
     ) {
         let uri = make_url("test");
 
@@ -1853,7 +1874,7 @@ proptest! {
     /// V1 R Symbol Model: Super-assignment (<<-) is recognized
     #[test]
     fn prop_v1_symbol_model_super_assignment(
-        name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        name in r_identifier()
     ) {
         let uri = make_url("test");
 
@@ -1867,7 +1888,7 @@ proptest! {
     /// V1 R Symbol Model: Equals assignment (=) is recognized
     #[test]
     fn prop_v1_symbol_model_equals_assignment(
-        name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+        name in r_identifier()
     ) {
         let uri = make_url("test");
 
@@ -1997,5 +2018,180 @@ proptest! {
         prop_assert_eq!(&meta.sources[0].path, &path);
         prop_assert_eq!(meta.sources[0].line, prefix_lines);
         prop_assert!(meta.sources[0].is_directive);
+    }
+}
+
+
+// ============================================================================
+// Property 24: Scope Cache Invalidation on Interface Change
+// Validates: Requirements 0.3, 12.4, 12.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 24: For any file whose exported interface changes, all files that
+    /// depend on it SHALL have their scope caches invalidated.
+    #[test]
+    fn prop_scope_cache_invalidation_on_interface_change(
+        symbol1 in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
+        symbol2 in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+    ) {
+        prop_assume!(symbol1 != symbol2);
+
+        let uri = make_url("test");
+
+        // First version: defines symbol1
+        let code1 = format!("{} <- 42", symbol1);
+        let tree1 = parse_r_tree(&code1);
+        let artifacts1 = compute_artifacts(&uri, &tree1, &code1);
+
+        // Second version: defines symbol2 (different interface)
+        let code2 = format!("{} <- 42", symbol2);
+        let tree2 = parse_r_tree(&code2);
+        let artifacts2 = compute_artifacts(&uri, &tree2, &code2);
+
+        // Interface hashes should be different
+        prop_assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+}
+
+// ============================================================================
+// Property 39: Interface Hash Optimization
+// Validates: Requirements 12.11
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 39: For any file change where the exported interface hash remains
+    /// identical and the edge set remains identical, dependent files SHALL NOT
+    /// have their scope caches invalidated.
+    #[test]
+    fn prop_interface_hash_optimization(
+        symbol in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
+        value1 in 1..100i32,
+        value2 in 100..200i32
+    ) {
+        let uri = make_url("test");
+
+        // Two versions with same symbol name but different values
+        // Interface hash should be the same (same symbol name and kind)
+        let code1 = format!("{} <- {}", symbol, value1);
+        let code2 = format!("{} <- {}", symbol, value2);
+
+        let tree1 = parse_r_tree(&code1);
+        let tree2 = parse_r_tree(&code2);
+
+        let artifacts1 = compute_artifacts(&uri, &tree1, &code1);
+        let artifacts2 = compute_artifacts(&uri, &tree2, &code2);
+
+        // Interface hashes should be the same (same exported symbols)
+        prop_assert_eq!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+}
+
+// ============================================================================
+// Property 37: Multiple Source Calls - Earliest Call Site
+// Validates: Requirements 5.9
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 37: For any file that is sourced multiple times at different call
+    /// sites in the same parent, symbols from that file SHALL become available
+    /// at the earliest call site.
+    #[test]
+    fn prop_multiple_source_calls_earliest(
+        symbol_name in r_identifier(),
+        first_line in 1..5u32,
+        second_line in 6..10u32
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child twice at different lines
+        let mut parent_lines = vec!["# start".to_string()];
+        for i in 1..first_line {
+            parent_lines.push(format!("x{} <- {}", i, i));
+        }
+        parent_lines.push("source(\"child.R\")".to_string());
+        for i in first_line..second_line {
+            parent_lines.push(format!("y{} <- {}", i, i));
+        }
+        parent_lines.push("source(\"child.R\")".to_string());
+        parent_lines.push("# end".to_string());
+        let parent_code = parent_lines.join("\n");
+
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Symbol should be available after the FIRST source() call
+        let scope_after_first = scope_at_position_with_deps(
+            &parent_uri, first_line + 1, 0, &get_artifacts, &resolve_path, 10,
+        );
+        prop_assert!(scope_after_first.symbols.contains_key(&symbol_name));
+    }
+}
+
+// ============================================================================
+// Property 44: Workspace Index Version Monotonicity
+// Validates: Requirements 13.5
+// ============================================================================
+
+use super::workspace_index::{CrossFileWorkspaceIndex, IndexEntry};
+use super::file_cache::FileSnapshot;
+use std::time::SystemTime;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 44: For any sequence of workspace index updates, the version
+    /// counter SHALL be strictly increasing.
+    #[test]
+    fn prop_workspace_index_version_monotonicity(
+        num_updates in 1..10usize
+    ) {
+        let index = CrossFileWorkspaceIndex::new();
+        let mut versions = Vec::new();
+
+        versions.push(index.version());
+
+        for i in 0..num_updates {
+            let uri = make_url(&format!("file{}", i));
+            let entry = IndexEntry {
+                snapshot: FileSnapshot {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: 0,
+                    content_hash: None,
+                },
+                metadata: CrossFileMetadata::default(),
+                artifacts: ScopeArtifacts::default(),
+                indexed_at_version: index.version(),
+            };
+            index.insert(uri, entry);
+            versions.push(index.version());
+        }
+
+        // Each version should be greater than the previous
+        for i in 1..versions.len() {
+            prop_assert!(versions[i] > versions[i - 1]);
+        }
     }
 }
