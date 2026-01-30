@@ -2330,6 +2330,8 @@ proptest! {
         call_site_line in 2..5u32 // 1-based line number
     ) {
         prop_assume!(symbol_before != symbol_after);
+        // Ensure symbol_after doesn't conflict with intermediate variables (x1, x2, etc.)
+        prop_assume!(!symbol_after.starts_with('x') || symbol_after.len() < 2 || !symbol_after[1..].chars().all(|c| c.is_ascii_digit()));
 
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
@@ -2338,7 +2340,7 @@ proptest! {
         // (one line AFTER the call site)
         let mut parent_lines = vec![format!("{} <- 1", symbol_before)];
         for i in 1..=call_site_line {
-            parent_lines.push(format!("x{} <- {}", i, i));
+            parent_lines.push(format!("filler{} <- {}", i, i));
         }
         // symbol_after is defined AFTER the call site line
         parent_lines.push(format!("{} <- 2", symbol_after));
