@@ -29,6 +29,74 @@ struct ActiveDocumentsChangedParams {
     timestamp_ms: u64,
 }
 
+/// Parse cross-file configuration from LSP settings
+fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_file::CrossFileConfig> {
+    use crate::cross_file::{CallSiteDefault, CrossFileConfig};
+
+    let cross_file = settings.get("crossFile")?;
+    let diagnostics = settings.get("diagnostics");
+    
+    let mut config = CrossFileConfig::default();
+    
+    if let Some(v) = cross_file.get("maxBackwardDepth").and_then(|v| v.as_u64()) {
+        config.max_backward_depth = v as usize;
+    }
+    if let Some(v) = cross_file.get("maxForwardDepth").and_then(|v| v.as_u64()) {
+        config.max_forward_depth = v as usize;
+    }
+    if let Some(v) = cross_file.get("maxChainDepth").and_then(|v| v.as_u64()) {
+        config.max_chain_depth = v as usize;
+    }
+    if let Some(v) = cross_file.get("assumeCallSite").and_then(|v| v.as_str()) {
+        config.assume_call_site = match v {
+            "start" => CallSiteDefault::Start,
+            _ => CallSiteDefault::End,
+        };
+    }
+    if let Some(v) = cross_file.get("indexWorkspace").and_then(|v| v.as_bool()) {
+        config.index_workspace = v;
+    }
+    if let Some(v) = cross_file.get("maxRevalidationsPerTrigger").and_then(|v| v.as_u64()) {
+        config.max_revalidations_per_trigger = v as usize;
+    }
+    if let Some(v) = cross_file.get("revalidationDebounceMs").and_then(|v| v.as_u64()) {
+        config.revalidation_debounce_ms = v;
+    }
+    
+    // Parse diagnostic severities
+    if let Some(sev) = cross_file.get("missingFileSeverity").and_then(|v| v.as_str()) {
+        config.missing_file_severity = parse_severity(sev);
+    }
+    if let Some(sev) = cross_file.get("circularDependencySeverity").and_then(|v| v.as_str()) {
+        config.circular_dependency_severity = parse_severity(sev);
+    }
+    if let Some(sev) = cross_file.get("outOfScopeSeverity").and_then(|v| v.as_str()) {
+        config.out_of_scope_severity = parse_severity(sev);
+    }
+    if let Some(sev) = cross_file.get("ambiguousParentSeverity").and_then(|v| v.as_str()) {
+        config.ambiguous_parent_severity = parse_severity(sev);
+    }
+    
+    // Parse diagnostics.undefinedVariables
+    if let Some(diag) = diagnostics {
+        if let Some(v) = diag.get("undefinedVariables").and_then(|v| v.as_bool()) {
+            config.undefined_variables_enabled = v;
+        }
+    }
+    
+    Some(config)
+}
+
+fn parse_severity(s: &str) -> DiagnosticSeverity {
+    match s.to_lowercase().as_str() {
+        "error" => DiagnosticSeverity::ERROR,
+        "warning" => DiagnosticSeverity::WARNING,
+        "information" | "info" => DiagnosticSeverity::INFORMATION,
+        "hint" => DiagnosticSeverity::HINT,
+        _ => DiagnosticSeverity::WARNING,
+    }
+}
+
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<WorldState>>,
@@ -130,26 +198,144 @@ impl LanguageServer for Backend {
         let text = params.text_document.text;
         let version = params.text_document.version;
 
-        let mut state = self.state.write().await;
-        state.open_document(uri.clone(), &text, Some(version));
-        // Record as recently opened for activity prioritization
-        state.cross_file_activity.record_recent(uri.clone());
-        
-        // Update dependency graph with cross-file metadata
-        let meta = crate::cross_file::extract_metadata(&text);
-        let uri_clone = uri.clone();
-        state.cross_file_graph.update_file(&uri, &meta, |path| {
-            // Resolve path relative to the file using normalization (no blocking I/O)
-            let file_path = uri_clone.to_file_path().ok()?;
-            let parent_dir = file_path.parent()?;
-            let resolved = parent_dir.join(path);
-            let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-            Url::from_file_path(normalized).ok()
-        });
-        
-        drop(state);
+        // Compute affected files while holding write lock
+        let (work_items, debounce_ms) = {
+            let mut state = self.state.write().await;
+            state.open_document(uri.clone(), &text, Some(version));
+            // Record as recently opened for activity prioritization
+            state.cross_file_activity.record_recent(uri.clone());
+            
+            // Update dependency graph with cross-file metadata
+            let meta = crate::cross_file::extract_metadata(&text);
+            let uri_clone = uri.clone();
+            let result = state.cross_file_graph.update_file(&uri, &meta, |path| {
+                // Resolve path relative to the file using normalization (no blocking I/O)
+                let file_path = uri_clone.to_file_path().ok()?;
+                let parent_dir = file_path.parent()?;
+                let resolved = parent_dir.join(path);
+                let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                Url::from_file_path(normalized).ok()
+            });
+            
+            // Emit any directive-vs-AST conflict diagnostics
+            if !result.diagnostics.is_empty() {
+                log::trace!("Directive-vs-AST conflicts detected: {} diagnostics", result.diagnostics.len());
+            }
+            
+            // Compute affected files from dependency graph
+            let mut affected: Vec<Url> = vec![uri.clone()];
+            let dependents = state.cross_file_graph.get_transitive_dependents(
+                &uri,
+                state.cross_file_config.max_chain_depth,
+            );
+            // Filter to only open documents and mark for force republish
+            for dep in dependents {
+                if state.documents.contains_key(&dep) {
+                    state.diagnostics_gate.mark_force_republish(&dep);
+                    affected.push(dep);
+                }
+            }
+            
+            // Prioritize by activity
+            let activity = &state.cross_file_activity;
+            affected.sort_by_key(|u| {
+                if *u == uri { 0 }
+                else { activity.priority_score(u) + 1 }
+            });
+            
+            // Apply revalidation cap
+            let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
+            if affected.len() > max_revalidations {
+                log::trace!(
+                    "Cross-file revalidation cap exceeded: {} affected, scheduling {}",
+                    affected.len(),
+                    max_revalidations
+                );
+                affected.truncate(max_revalidations);
+            }
+            
+            // Build work items with trigger revision snapshot
+            let work_items: Vec<_> = affected
+                .into_iter()
+                .map(|affected_uri| {
+                    let trigger_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                    let trigger_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    (affected_uri, trigger_version, trigger_revision)
+                })
+                .collect();
+            
+            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
+            (work_items, debounce_ms)
+        };
 
-        self.publish_diagnostics(&uri).await;
+        // Schedule debounced diagnostics for all affected files via revalidation system
+        for (affected_uri, trigger_version, trigger_revision) in work_items {
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            
+            tokio::spawn(async move {
+                // Schedule with cancellation token
+                let token = {
+                    let state = state_arc.read().await;
+                    state.cross_file_revalidation.schedule(affected_uri.clone())
+                };
+                
+                // Debounce / cancellation
+                tokio::select! {
+                    _ = token.cancelled() => { return; }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
+                }
+                
+                // Freshness guard before computing
+                let diagnostics_opt = {
+                    let state = state_arc.read().await;
+                    
+                    let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    
+                    if current_version != trigger_version || current_revision != trigger_revision {
+                        log::trace!("Skipping stale diagnostics for {}: revision changed", affected_uri);
+                        return;
+                    }
+                    
+                    if let Some(ver) = current_version {
+                        if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
+                            log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
+                            return;
+                        }
+                    }
+                    
+                    Some(handlers::diagnostics(&state, &affected_uri))
+                };
+                
+                if let Some(diagnostics) = diagnostics_opt {
+                    // Second freshness check before publishing
+                    let can_publish = {
+                        let state = state_arc.read().await;
+                        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                        
+                        if current_version != trigger_version || current_revision != trigger_revision {
+                            false
+                        } else if let Some(ver) = current_version {
+                            state.diagnostics_gate.can_publish(&affected_uri, ver)
+                        } else {
+                            true
+                        }
+                    };
+                    
+                    if can_publish {
+                        client.publish_diagnostics(affected_uri.clone(), diagnostics, None).await;
+                        
+                        let state = state_arc.read().await;
+                        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
+                            state.diagnostics_gate.record_publish(&affected_uri, ver);
+                        }
+                        state.cross_file_revalidation.complete(&affected_uri);
+                    }
+                }
+            });
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -173,7 +359,7 @@ impl LanguageServer for Backend {
                 let text = doc.text();
                 let meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
-                state.cross_file_graph.update_file(&uri, &meta, |path| {
+                let _result = state.cross_file_graph.update_file(&uri, &meta, |path| {
                     let file_path = uri_clone.to_file_path().ok()?;
                     let parent_dir = file_path.parent()?;
                     let resolved = parent_dir.join(path);
@@ -326,19 +512,42 @@ impl LanguageServer for Backend {
         state.close_document(uri);
     }
 
-    async fn did_change_configuration(&self, _params: DidChangeConfigurationParams) {
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
-        log::trace!("Configuration changed, invalidating caches and scheduling revalidation");
+        log::trace!("Configuration changed, parsing new config and scheduling revalidation");
         
-        let open_uris: Vec<Url> = {
-            let state = self.state.write().await;
+        // Parse new configuration if provided
+        let new_config = parse_cross_file_config(&params.settings);
+        
+        let (open_uris, scope_changed) = {
+            let mut state = self.state.write().await;
+            
+            // Check if scope-affecting settings changed
+            let scope_changed = new_config.as_ref()
+                .map(|c| state.cross_file_config.scope_settings_changed(c))
+                .unwrap_or(false);
+            
+            // Apply new config if parsed
+            if let Some(config) = new_config {
+                state.cross_file_config = config;
+            }
             
             // Invalidate all scope caches since config affects resolution
             state.cross_file_cache.invalidate_all();
+            state.cross_file_parent_cache.invalidate_all();
             
-            // Get list of open documents
-            state.documents.keys().cloned().collect()
+            // Mark all open documents for force republish
+            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+            for uri in &open_uris {
+                state.diagnostics_gate.mark_force_republish(uri);
+            }
+            
+            (open_uris, scope_changed)
         };
+        
+        if scope_changed {
+            log::trace!("Scope-affecting settings changed, revalidating {} open documents", open_uris.len());
+        }
         
         // Schedule diagnostics for all open documents
         for uri in open_uris {

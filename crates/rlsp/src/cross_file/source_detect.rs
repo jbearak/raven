@@ -43,6 +43,13 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
     let local = find_bool_argument(&args_node, content, "local").unwrap_or(false);
     let chdir = find_bool_argument(&args_node, content, "chdir").unwrap_or(false);
 
+    // For sys.source, check if envir is globalenv()/.GlobalEnv
+    let sys_source_global_env = if is_sys_source {
+        find_envir_is_global(&args_node, content)
+    } else {
+        true // Not sys.source, so this field doesn't matter
+    };
+
     let start = node.start_position();
     let line_text = content.lines().nth(start.row).unwrap_or("");
     let column = byte_offset_to_utf16_column(line_text, start.column);
@@ -55,7 +62,30 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
         local,
         chdir,
         is_sys_source,
+        sys_source_global_env,
     })
+}
+
+/// Check if the envir argument is globalenv() or .GlobalEnv
+fn find_envir_is_global(args_node: &Node, content: &str) -> bool {
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() == "argument" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                let name = node_text(name_node, content);
+                if name == "envir" {
+                    if let Some(value_node) = child.child_by_field_name("value") {
+                        let value = node_text(value_node, content).trim();
+                        // Check for globalenv() or .GlobalEnv
+                        return value == "globalenv()" || value == ".GlobalEnv";
+                    }
+                }
+            }
+        }
+    }
+    // If envir is not specified, sys.source defaults to baseenv() which is NOT global
+    // So we return false (conservative: no symbol inheritance)
+    false
 }
 
 fn find_file_argument(args_node: &Node, content: &str) -> Option<String> {
@@ -240,5 +270,50 @@ source("b.R")"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_sys_source_with_globalenv() {
+        let code = r#"sys.source("utils.R", envir = globalenv())"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_sys_source);
+        assert!(sources[0].sys_source_global_env);
+        assert!(sources[0].inherits_symbols());
+    }
+
+    #[test]
+    fn test_sys_source_with_global_env_dot() {
+        let code = r#"sys.source("utils.R", envir = .GlobalEnv)"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_sys_source);
+        assert!(sources[0].sys_source_global_env);
+        assert!(sources[0].inherits_symbols());
+    }
+
+    #[test]
+    fn test_sys_source_with_new_env() {
+        let code = r#"sys.source("utils.R", envir = new.env())"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_sys_source);
+        assert!(!sources[0].sys_source_global_env);
+        assert!(!sources[0].inherits_symbols());
+    }
+
+    #[test]
+    fn test_sys_source_without_envir() {
+        // sys.source without envir defaults to baseenv(), not global
+        let code = r#"sys.source("utils.R")"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_sys_source);
+        assert!(!sources[0].sys_source_global_env);
+        assert!(!sources[0].inherits_symbols());
     }
 }

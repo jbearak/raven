@@ -101,8 +101,8 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // Collect source() calls and add them to timeline
     let source_calls = detect_source_calls(tree, content);
     for source in source_calls {
-        // Skip local=TRUE sources (symbols not inherited)
-        if !source.local {
+        // Skip sources that don't inherit symbols (local=TRUE or sys.source with non-global env)
+        if source.inherits_symbols() {
             artifacts.timeline.push(ScopeEvent::Source {
                 line: source.line,
                 column: source.column,
@@ -436,6 +436,145 @@ where
     )
 }
 
+/// Extended scope resolution that also uses dependency graph edges.
+/// This is the preferred entry point when a DependencyGraph is available.
+pub fn scope_at_position_with_graph<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    max_depth: usize,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
+{
+    let mut visited = HashSet::new();
+    scope_at_position_with_graph_recursive(
+        uri, line, column, get_artifacts, get_metadata, graph, resolve_path,
+        max_depth, 0, &mut visited,
+    )
+}
+
+fn scope_at_position_with_graph_recursive<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    max_depth: usize,
+    current_depth: usize,
+    visited: &mut HashSet<Url>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
+{
+    let mut scope = ScopeAtPosition::default();
+
+    if current_depth >= max_depth || visited.contains(uri) {
+        return scope;
+    }
+    visited.insert(uri.clone());
+    scope.chain.push(uri.clone());
+
+    let artifacts = match get_artifacts(uri) {
+        Some(a) => a,
+        None => return scope,
+    };
+
+    // STEP 1: Process parent context from dependency graph edges
+    // Get edges where this file is the child (callee)
+    for edge in graph.get_dependents(uri) {
+        // Skip local=TRUE edges (symbols not inherited)
+        if edge.local {
+            continue;
+        }
+        // Skip sys.source with non-global env
+        if edge.is_sys_source {
+            // For sys.source, we need to check if it's global env
+            // The edge doesn't store this directly, so we check metadata
+            if let Some(meta) = get_metadata(&edge.from) {
+                let is_global = meta.sources.iter().any(|s| {
+                    s.is_sys_source && s.sys_source_global_env && 
+                    s.line == edge.call_site_line.unwrap_or(u32::MAX)
+                });
+                if !is_global {
+                    continue;
+                }
+            }
+        }
+
+        // Get call site position for filtering
+        let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
+        let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
+
+        // Get parent's scope at the call site
+        let parent_scope = scope_at_position_with_graph_recursive(
+            &edge.from,
+            call_site_line,
+            call_site_col,
+            get_artifacts,
+            get_metadata,
+            graph,
+            resolve_path,
+            max_depth,
+            current_depth + 1,
+            visited,
+        );
+
+        // Merge parent symbols (they are available at the START of this file)
+        for (name, symbol) in parent_scope.symbols {
+            scope.symbols.entry(name).or_insert(symbol);
+        }
+        scope.chain.extend(parent_scope.chain);
+    }
+
+    // STEP 2: Process timeline events (local definitions and forward sources)
+    for event in &artifacts.timeline {
+        match event {
+            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+                if (*def_line, *def_col) <= (line, column) {
+                    // Local definitions take precedence over inherited symbols
+                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                }
+            }
+            ScopeEvent::Source { line: src_line, column: src_col, source } => {
+                // Only include if source() call is before the position
+                if (*src_line, *src_col) < (line, column) {
+                    // Resolve the path and get symbols from sourced file
+                    if let Some(child_uri) = resolve_path(&source.path, uri) {
+                        let child_scope = scope_at_position_with_graph_recursive(
+                            &child_uri,
+                            u32::MAX, // Include all symbols from sourced file
+                            u32::MAX,
+                            get_artifacts,
+                            get_metadata,
+                            graph,
+                            resolve_path,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                        );
+                        // Merge child symbols (local definitions take precedence)
+                        for (name, symbol) in child_scope.symbols {
+                            scope.symbols.entry(name).or_insert(symbol);
+                        }
+                        scope.chain.extend(child_scope.chain);
+                    }
+                }
+            }
+        }
+    }
+
+    scope
+}
+
 fn scope_at_position_with_backward_recursive<F, G>(
     uri: &Url,
     line: u32,
@@ -750,5 +889,127 @@ mod tests {
         assert!(!scope.symbols.contains_key("y"), "y should NOT be available");
         // z should be available (local definition in child)
         assert!(scope.symbols.contains_key("z"), "z should be available");
+    }
+
+    #[test]
+    fn test_scope_at_position_with_graph() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        // Parent code: defines 'a' then sources child
+        let parent_code = "a <- 1\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines 'b'
+        let child_code = "b <- 2";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, |path| {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        });
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // At end of parent file, both 'a' and 'b' should be available
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, &resolve_path, 10,
+        );
+
+        assert!(scope.symbols.contains_key("a"), "a should be available");
+        assert!(scope.symbols.contains_key("b"), "b should be available from sourced file");
+    }
+
+    #[test]
+    fn test_scope_with_graph_parent_context() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        // Parent code: defines 'parent_var' then sources child at line 1
+        let parent_code = "parent_var <- 1\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines 'child_var'
+        let child_code = "child_var <- 2";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, |path| {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        });
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // In child file, parent_var should be available via dependency graph edge
+        let scope = scope_at_position_with_graph(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, &resolve_path, 10,
+        );
+
+        assert!(scope.symbols.contains_key("parent_var"), "parent_var should be available from parent");
+        assert!(scope.symbols.contains_key("child_var"), "child_var should be available locally");
     }
 }

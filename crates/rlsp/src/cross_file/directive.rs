@@ -80,6 +80,7 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
+                sys_source_global_env: true,
             });
             continue;
         }

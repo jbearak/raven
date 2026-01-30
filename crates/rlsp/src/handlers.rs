@@ -48,51 +48,43 @@ fn get_cross_file_symbols(
         None
     };
 
-    // Closure to resolve paths relative to a file
+    // Closure to get metadata for a URI
+    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+        // Try open documents first
+        if let Some(doc) = state.documents.get(target_uri) {
+            let text = doc.text();
+            return Some(crate::cross_file::extract_metadata(&text));
+        }
+        // Try workspace index
+        if let Some(doc) = state.workspace_index.get(target_uri) {
+            let text = doc.text();
+            return Some(crate::cross_file::extract_metadata(&text));
+        }
+        None
+    };
+
+    // Closure to resolve paths relative to a file (no blocking I/O)
     let resolve_path = |path: &str, from_uri: &Url| -> Option<Url> {
         let from_path = from_uri.to_file_path().ok()?;
         let parent_dir = from_path.parent()?;
         let resolved = parent_dir.join(path);
-        let canonical = resolved.canonicalize().ok()?;
-        Url::from_file_path(canonical).ok()
+        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+        Url::from_file_path(normalized).ok()
     };
 
     let max_depth = state.cross_file_config.max_chain_depth;
-    let mut scope = scope::scope_at_position_with_deps(
+    
+    // Use the graph-aware scope resolution
+    let scope = scope::scope_at_position_with_graph(
         uri,
         line,
         column,
         &get_artifacts,
+        &get_metadata,
+        &state.cross_file_graph,
         &resolve_path,
         max_depth,
     );
-    
-    // Also include symbols from parent files via backward directives (Requirement 5.1)
-    // Get edges where this file is the child (callee)
-    let parent_edges = state.cross_file_graph.get_dependents(uri);
-    for edge in parent_edges {
-        // Skip local=TRUE edges (symbols not inherited)
-        if edge.local {
-            continue;
-        }
-        
-        // Get parent's artifacts
-        if let Some(parent_artifacts) = get_artifacts(&edge.from) {
-            // Determine call site position for filtering
-            let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
-            let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
-            
-            // Include parent symbols defined before the call site
-            for event in &parent_artifacts.timeline {
-                if let scope::ScopeEvent::Def { line: def_line, column: def_col, symbol } = event {
-                    if (*def_line, *def_col) <= (call_site_line, call_site_col) {
-                        // Parent symbols don't override local symbols
-                        scope.symbols.entry(symbol.name.clone()).or_insert_with(|| symbol.clone());
-                    }
-                }
-            }
-        }
-    }
     
     scope.symbols
 }
@@ -277,7 +269,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     let text = doc.text();
     let mut diagnostics = Vec::new();
 
-    // Parse directives to get ignored lines
+    // Parse directives to get ignored lines and cross-file metadata
     let directive_meta = crate::cross_file::directive::parse_directives(&text);
 
     // Collect syntax errors (not suppressed by @lsp-ignore)
@@ -293,11 +285,20 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
                 start: Position::new(line, col),
                 end: Position::new(line, col + 1),
             },
-            severity: Some(DiagnosticSeverity::ERROR),
+            severity: Some(state.cross_file_config.circular_dependency_severity),
             message: format!("Circular dependency detected: sourcing '{}' creates a cycle", target),
             ..Default::default()
         });
     }
+
+    // Check for missing files in source() calls and directives (Requirement 10.2)
+    collect_missing_file_diagnostics(state, uri, &directive_meta, &mut diagnostics);
+
+    // Check for ambiguous parents (Requirement 5.10 / 10.6)
+    collect_ambiguous_parent_diagnostics(state, uri, &directive_meta, &mut diagnostics);
+
+    // Check for out-of-scope symbol usage (Requirement 10.3)
+    collect_out_of_scope_diagnostics(state, uri, tree.root_node(), &text, &directive_meta, &mut diagnostics);
 
     // Collect undefined variable errors if enabled in config
     if state.cross_file_config.undefined_variables_enabled {
@@ -315,6 +316,278 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     }
 
     diagnostics
+}
+
+/// Collect diagnostics for missing files referenced in source() calls and directives
+fn collect_missing_file_diagnostics(
+    state: &WorldState,
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let resolve_path = |path: &str| -> Option<Url> {
+        let from_path = uri.to_file_path().ok()?;
+        let parent_dir = from_path.parent()?;
+        let resolved = parent_dir.join(path);
+        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+        Url::from_file_path(normalized).ok()
+    };
+
+    let file_exists = |target_uri: &Url| -> bool {
+        // Check open documents first
+        if state.documents.contains_key(target_uri) {
+            return true;
+        }
+        // Check workspace index
+        if state.workspace_index.contains_key(target_uri) {
+            return true;
+        }
+        // Check disk
+        target_uri.to_file_path().map(|p| p.exists()).unwrap_or(false)
+    };
+
+    // Check forward sources (source() calls and @lsp-source directives)
+    for source in &meta.sources {
+        if let Some(target_uri) = resolve_path(&source.path) {
+            if !file_exists(&target_uri) {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(source.line, source.column),
+                        end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                    },
+                    severity: Some(state.cross_file_config.missing_file_severity),
+                    message: format!("File not found: '{}'", source.path),
+                    ..Default::default()
+                });
+            }
+        } else {
+            // Path couldn't be resolved at all
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(source.line, source.column),
+                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                },
+                severity: Some(state.cross_file_config.missing_file_severity),
+                message: format!("Cannot resolve path: '{}'", source.path),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Check backward directives (@lsp-sourced-by)
+    for directive in &meta.sourced_by {
+        if let Some(target_uri) = resolve_path(&directive.path) {
+            if !file_exists(&target_uri) {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(directive.directive_line, 0),
+                        end: Position::new(directive.directive_line, u32::MAX),
+                    },
+                    severity: Some(state.cross_file_config.missing_file_severity),
+                    message: format!("Parent file not found: '{}'", directive.path),
+                    ..Default::default()
+                });
+            }
+        } else {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(directive.directive_line, 0),
+                    end: Position::new(directive.directive_line, u32::MAX),
+                },
+                severity: Some(state.cross_file_config.missing_file_severity),
+                message: format!("Cannot resolve parent path: '{}'", directive.path),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+/// Collect diagnostics for ambiguous parent relationships
+fn collect_ambiguous_parent_diagnostics(
+    state: &WorldState,
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use crate::cross_file::parent_resolve::resolve_parent;
+    use crate::cross_file::cache::ParentResolution;
+
+    let resolve_path = |path: &str| -> Option<Url> {
+        let from_path = uri.to_file_path().ok()?;
+        let parent_dir = from_path.parent()?;
+        let resolved = parent_dir.join(path);
+        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+        Url::from_file_path(normalized).ok()
+    };
+
+    let resolution = resolve_parent(meta, &state.cross_file_graph, uri, &state.cross_file_config, resolve_path);
+
+    if let ParentResolution::Ambiguous { selected_uri, alternatives, .. } = resolution {
+        // Find the first backward directive line to attach the diagnostic
+        let directive_line = meta.sourced_by.first().map(|d| d.directive_line).unwrap_or(0);
+
+        let alt_list: Vec<String> = alternatives.iter()
+            .filter_map(|u| u.path_segments().and_then(|s| s.last().map(|s| s.to_string())))
+            .collect();
+
+        let selected_name = selected_uri.path_segments()
+            .and_then(|s| s.last().map(|s| s.to_string()))
+            .unwrap_or_else(|| selected_uri.to_string());
+
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(directive_line, 0),
+                end: Position::new(directive_line, u32::MAX),
+            },
+            severity: Some(state.cross_file_config.ambiguous_parent_severity),
+            message: format!(
+                "Ambiguous parent: using '{}' but also found: {}. Consider adding line= or match= to disambiguate.",
+                selected_name,
+                alt_list.join(", ")
+            ),
+            ..Default::default()
+        });
+    }
+}
+
+/// Collect diagnostics for symbols used before their source() call (Requirement 10.3)
+fn collect_out_of_scope_diagnostics(
+    state: &WorldState,
+    uri: &Url,
+    node: Node,
+    text: &str,
+    directive_meta: &crate::cross_file::CrossFileMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Get all source() calls in this file
+    let source_calls: Vec<_> = directive_meta.sources.iter()
+        .filter(|s| !s.is_directive) // Only AST-detected source() calls
+        .collect();
+    
+    if source_calls.is_empty() {
+        return;
+    }
+
+    // Collect all identifier usages
+    let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
+    collect_identifier_usages(node, text, &mut usages);
+
+    // For each source() call, check if any symbols from that file are used before the call
+    for source in &source_calls {
+        let source_line = source.line;
+        let source_col = source.column;
+
+        // Resolve the source path
+        let resolve_path = |path: &str| -> Option<Url> {
+            let from_path = uri.to_file_path().ok()?;
+            let parent_dir = from_path.parent()?;
+            let resolved = parent_dir.join(path);
+            let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+            Url::from_file_path(normalized).ok()
+        };
+
+        let Some(source_uri) = resolve_path(&source.path) else {
+            continue;
+        };
+
+        // Get symbols from the sourced file
+        let source_symbols: std::collections::HashSet<String> = {
+            let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+                if let Some(doc) = state.documents.get(target_uri) {
+                    if let Some(tree) = &doc.tree {
+                        return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+                    }
+                }
+                if let Some(doc) = state.workspace_index.get(target_uri) {
+                    if let Some(tree) = &doc.tree {
+                        return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+                    }
+                }
+                None
+            };
+
+            get_artifacts(&source_uri)
+                .map(|a| a.exported_interface.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        // Check for usages of these symbols before the source() call
+        for (name, usage_line, usage_col, usage_node) in &usages {
+            if !source_symbols.contains(name) {
+                continue;
+            }
+
+            // Check if usage is before the source() call
+            if (*usage_line, *usage_col) < (source_line, source_col) {
+                // Skip if line is ignored
+                if crate::cross_file::directive::is_line_ignored(directive_meta, *usage_line) {
+                    continue;
+                }
+
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(
+                            usage_node.start_position().row as u32,
+                            usage_node.start_position().column as u32,
+                        ),
+                        end: Position::new(
+                            usage_node.end_position().row as u32,
+                            usage_node.end_position().column as u32,
+                        ),
+                    },
+                    severity: Some(state.cross_file_config.out_of_scope_severity),
+                    message: format!(
+                        "Symbol '{}' used before source() call at line {}",
+                        name,
+                        source_line + 1
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+}
+
+fn collect_identifier_usages<'a>(node: Node<'a>, text: &str, usages: &mut Vec<(String, u32, u32, Node<'a>)>) {
+    if node.kind() == "identifier" {
+        // Skip if this is the LHS of an assignment
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "binary_operator" {
+                let mut cursor = parent.walk();
+                let children: Vec<_> = parent.children(&mut cursor).collect();
+                if children.len() >= 2 && children[0].id() == node.id() {
+                    let op = children[1];
+                    let op_text = &text[op.byte_range()];
+                    if matches!(op_text, "<-" | "=" | "<<-") {
+                        // Skip LHS of assignment, but recurse into children
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            collect_identifier_usages(child, text, usages);
+                        }
+                        return;
+                    }
+                }
+            }
+            // Skip named arguments
+            if parent.kind() == "argument" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.id() == node.id() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let name = text[node.byte_range()].to_string();
+        let line = node.start_position().row as u32;
+        let col = node.start_position().column as u32;
+        usages.push((name, line, col, node));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifier_usages(child, text, usages);
+    }
 }
 
 fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {

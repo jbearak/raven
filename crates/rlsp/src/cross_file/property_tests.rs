@@ -961,6 +961,7 @@ fn make_meta_with_sources(sources: Vec<(&str, u32)>) -> CrossFileMetadata {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
+                sys_source_global_env: true,
             })
             .collect(),
         ..Default::default()
@@ -1212,6 +1213,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
@@ -1221,6 +1223,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
             ],
             ..Default::default()
@@ -1261,6 +1264,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
@@ -1270,6 +1274,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
             ],
             ..Default::default()
@@ -1321,6 +1326,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
@@ -1330,6 +1336,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
             ],
             ..Default::default()

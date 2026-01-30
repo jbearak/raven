@@ -252,4 +252,46 @@ mod tests {
             _ => panic!("Expected Single resolution"),
         }
     }
+
+    #[test]
+    fn test_resolve_parent_ambiguous() {
+        let meta = CrossFileMetadata {
+            sourced_by: vec![
+                BackwardDirective {
+                    path: "../main.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                },
+                BackwardDirective {
+                    path: "../other.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let graph = DependencyGraph::new();
+        let config = CrossFileConfig::default();
+        let child = url("child.R");
+        let main = url("main.R");
+        let other = url("other.R");
+
+        let result = resolve_parent(&meta, &graph, &child, &config, |p| {
+            match p {
+                "../main.R" => Some(main.clone()),
+                "../other.R" => Some(other.clone()),
+                _ => None,
+            }
+        });
+
+        match result {
+            ParentResolution::Ambiguous { selected_uri, alternatives, .. } => {
+                // Deterministic: main.R comes before other.R alphabetically
+                assert_eq!(selected_uri, main);
+                assert_eq!(alternatives.len(), 1);
+                assert_eq!(alternatives[0], other);
+            }
+            _ => panic!("Expected Ambiguous resolution"),
+        }
+    }
 }

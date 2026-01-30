@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::Url;
 
+use super::types::CrossFileMetadata;
+
 /// Context for path resolution
 #[derive(Debug, Clone)]
 pub struct PathContext {
@@ -31,6 +33,22 @@ impl PathContext {
             inherited_working_directory: None,
             workspace_root,
         })
+    }
+
+    /// Create a context from a file URI and its metadata
+    pub fn from_metadata(
+        file_uri: &Url,
+        metadata: &CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> Option<Self> {
+        let mut ctx = Self::new(file_uri, workspace_root)?;
+
+        // Apply working directory from metadata if present
+        if let Some(ref wd_path) = metadata.working_directory {
+            ctx.working_directory = resolve_working_directory(wd_path, &ctx);
+        }
+
+        Some(ctx)
     }
 
     /// Get the effective working directory for path resolution
@@ -68,6 +86,15 @@ impl PathContext {
             working_directory: None,
             inherited_working_directory: Some(self.effective_working_directory()),
             workspace_root: self.workspace_root.clone(),
+        }
+    }
+
+    /// Create a child context for a sourced file, respecting chdir flag
+    pub fn child_context_for_source(&self, child_path: &Path, chdir: bool) -> Self {
+        if chdir {
+            self.child_context_with_chdir(child_path)
+        } else {
+            self.child_context(child_path)
         }
     }
 }
@@ -236,5 +263,51 @@ mod tests {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let resolved = resolve_working_directory("/data/scripts", &ctx).unwrap();
         assert_eq!(resolved, PathBuf::from("/project/data/scripts"));
+    }
+
+    #[test]
+    fn test_from_metadata_with_working_directory() {
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/main.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()),
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/data"));
+    }
+
+    #[test]
+    fn test_from_metadata_relative_working_directory() {
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/main.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: Some("../data".to_string()),
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/data"));
+    }
+
+    #[test]
+    fn test_child_context_for_source_with_chdir() {
+        let ctx = make_context("/project/src/main.R", Some("/project"));
+        let child = ctx.child_context_for_source(Path::new("/project/data/utils.R"), true);
+        assert_eq!(child.effective_working_directory(), PathBuf::from("/project/data"));
+    }
+
+    #[test]
+    fn test_child_context_for_source_without_chdir() {
+        let ctx = make_context("/project/src/main.R", Some("/project"));
+        let child = ctx.child_context_for_source(Path::new("/project/data/utils.R"), false);
+        assert_eq!(child.effective_working_directory(), PathBuf::from("/project/src"));
     }
 }

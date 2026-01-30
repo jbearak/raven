@@ -5,9 +5,9 @@
 //
 
 use std::collections::{HashMap, HashSet};
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 
-use super::types::CrossFileMetadata;
+use super::types::{CallSiteSpec, CrossFileMetadata};
 
 /// A dependency edge from parent (caller) to child (callee)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -30,7 +30,14 @@ pub struct DependencyEdge {
     pub is_directive: bool,
 }
 
-/// Canonical key for edge deduplication
+/// Canonical key for edge deduplication (from, to pair only)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FromToPair {
+    from: Url,
+    to: Url,
+}
+
+/// Full edge key for deduplication including call site
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EdgeKey {
     from: Url,
@@ -54,6 +61,20 @@ impl DependencyEdge {
             is_sys_source: self.is_sys_source,
         }
     }
+
+    fn from_to_pair(&self) -> FromToPair {
+        FromToPair {
+            from: self.from.clone(),
+            to: self.to.clone(),
+        }
+    }
+}
+
+/// Result of updating a file in the dependency graph
+#[derive(Debug, Default)]
+pub struct UpdateResult {
+    /// Diagnostics to emit (e.g., directive-vs-AST conflict warnings)
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Dependency graph tracking source relationships between files
@@ -70,44 +91,183 @@ impl DependencyGraph {
         Self::default()
     }
 
-    /// Update edges for a file based on extracted metadata
+    /// Update edges for a file based on extracted metadata.
+    /// Processes both forward sources and backward directives.
+    /// Returns diagnostics for directive-vs-AST conflicts.
     pub fn update_file(
         &mut self,
         uri: &Url,
         meta: &CrossFileMetadata,
         resolve_path: impl Fn(&str) -> Option<Url>,
-    ) {
+    ) -> UpdateResult {
+        let mut result = UpdateResult::default();
+
         // Remove existing edges where this file is the parent
         self.remove_forward_edges(uri);
 
-        // Collect new edges with deduplication
-        let mut seen_keys = HashSet::new();
-        let mut new_edges = Vec::new();
+        // Also remove edges where this file is the child (from backward directives)
+        // These will be re-created from the current metadata
+        self.remove_backward_edges_for_child(uri);
 
-        // Process forward sources (this file sources others)
+        // Collect directive edges first (they are authoritative)
+        let mut directive_edges: Vec<DependencyEdge> = Vec::new();
+        let mut directive_from_to: HashSet<FromToPair> = HashSet::new();
+
+        // Process forward directive sources (@lsp-source)
         for source in &meta.sources {
-            if let Some(to_uri) = resolve_path(&source.path) {
-                let edge = DependencyEdge {
-                    from: uri.clone(),
-                    to: to_uri,
-                    call_site_line: Some(source.line),
-                    call_site_column: Some(source.column),
-                    local: source.local,
-                    chdir: source.chdir,
-                    is_sys_source: source.is_sys_source,
-                    is_directive: source.is_directive,
-                };
-                let key = edge.key();
-                if !seen_keys.contains(&key) {
-                    seen_keys.insert(key);
-                    new_edges.push(edge);
+            if source.is_directive {
+                if let Some(to_uri) = resolve_path(&source.path) {
+                    let edge = DependencyEdge {
+                        from: uri.clone(),
+                        to: to_uri.clone(),
+                        call_site_line: Some(source.line),
+                        call_site_column: Some(source.column),
+                        local: source.local,
+                        chdir: source.chdir,
+                        is_sys_source: source.is_sys_source,
+                        is_directive: true,
+                    };
+                    directive_from_to.insert(edge.from_to_pair());
+                    directive_edges.push(edge);
                 }
             }
         }
 
-        // Add new edges
-        for edge in new_edges {
-            self.add_edge(edge);
+        // Process backward directives (@lsp-sourced-by) - create forward edges from parent to this file
+        for directive in &meta.sourced_by {
+            if let Some(parent_uri) = resolve_path(&directive.path) {
+                let (call_site_line, call_site_column) = match &directive.call_site {
+                    CallSiteSpec::Line(n) => (Some(*n), Some(u32::MAX)), // end-of-line
+                    CallSiteSpec::Match(_) => (None, None), // TODO: implement match lookup
+                    CallSiteSpec::Default => (None, None),
+                };
+                let edge = DependencyEdge {
+                    from: parent_uri.clone(),
+                    to: uri.clone(),
+                    call_site_line,
+                    call_site_column,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    is_directive: true,
+                };
+                let pair = edge.from_to_pair();
+                if !directive_from_to.contains(&pair) {
+                    directive_from_to.insert(pair);
+                    directive_edges.push(edge);
+                }
+            }
+        }
+
+        // Process AST-detected sources, applying directive-vs-AST conflict resolution
+        let mut ast_edges: Vec<DependencyEdge> = Vec::new();
+        for source in &meta.sources {
+            if !source.is_directive {
+                if let Some(to_uri) = resolve_path(&source.path) {
+                    let edge = DependencyEdge {
+                        from: uri.clone(),
+                        to: to_uri.clone(),
+                        call_site_line: Some(source.line),
+                        call_site_column: Some(source.column),
+                        local: source.local,
+                        chdir: source.chdir,
+                        is_sys_source: source.is_sys_source,
+                        is_directive: false,
+                    };
+                    let pair = edge.from_to_pair();
+
+                    // Check for directive-vs-AST conflict (Requirement 6.8)
+                    if directive_from_to.contains(&pair) {
+                        // Find the directive edge for this (from, to) pair
+                        let directive_edge = directive_edges.iter().find(|e| e.from_to_pair() == pair);
+
+                        if let Some(dir_edge) = directive_edge {
+                            // Check if call sites match
+                            let call_sites_match = dir_edge.call_site_line == edge.call_site_line
+                                && dir_edge.call_site_column == edge.call_site_column;
+
+                            if !call_sites_match {
+                                // Emit warning: directive suppresses AST edge
+                                let diag_line = meta.sources.iter()
+                                    .find(|s| s.is_directive && resolve_path(&s.path) == Some(to_uri.clone()))
+                                    .map(|s| s.line)
+                                    .unwrap_or(0);
+
+                                result.diagnostics.push(Diagnostic {
+                                    range: Range {
+                                        start: Position { line: diag_line, character: 0 },
+                                        end: Position { line: diag_line, character: u32::MAX },
+                                    },
+                                    severity: Some(DiagnosticSeverity::WARNING),
+                                    message: format!(
+                                        "Directive overrides AST-detected source() call to '{}' at different call site",
+                                        to_uri.path()
+                                    ),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        // Skip AST edge - directive is authoritative for this (from, to) pair
+                        continue;
+                    }
+
+                    ast_edges.push(edge);
+                }
+            }
+        }
+
+        // Deduplicate and add all edges
+        let mut seen_keys = HashSet::new();
+        for edge in directive_edges.into_iter().chain(ast_edges.into_iter()) {
+            let key = edge.key();
+            if !seen_keys.contains(&key) {
+                seen_keys.insert(key);
+                self.add_edge(edge);
+            }
+        }
+
+        result
+    }
+
+    /// Simple update without conflict resolution (for backward compatibility)
+    pub fn update_file_simple(
+        &mut self,
+        uri: &Url,
+        meta: &CrossFileMetadata,
+        resolve_path: impl Fn(&str) -> Option<Url>,
+    ) {
+        let _ = self.update_file(uri, meta, resolve_path);
+    }
+
+    /// Remove edges where the given URI is the child that were created from backward directives
+    fn remove_backward_edges_for_child(&mut self, child_uri: &Url) {
+        // Get edges where this file is the child
+        let edges_to_remove: Vec<DependencyEdge> = self.backward
+            .get(child_uri)
+            .map(|edges| {
+                edges.iter()
+                    .filter(|e| e.is_directive && &e.to == child_uri)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Remove from both forward and backward indices
+        for edge in edges_to_remove {
+            // Remove from forward index
+            if let Some(forward_edges) = self.forward.get_mut(&edge.from) {
+                forward_edges.retain(|e| !(e.to == edge.to && e.is_directive && e.call_site_line == edge.call_site_line));
+                if forward_edges.is_empty() {
+                    self.forward.remove(&edge.from);
+                }
+            }
+            // Remove from backward index
+            if let Some(backward_edges) = self.backward.get_mut(child_uri) {
+                backward_edges.retain(|e| !(e.from == edge.from && e.is_directive && e.call_site_line == edge.call_site_line));
+                if backward_edges.is_empty() {
+                    self.backward.remove(child_uri);
+                }
+            }
         }
     }
 
@@ -251,6 +411,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
+                sys_source_global_env: true,
             }],
             ..Default::default()
         }
@@ -349,6 +510,7 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -358,6 +520,7 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
                 },
             ],
             ..Default::default()
@@ -444,5 +607,186 @@ mod tests {
 
         assert!(graph.detect_cycle(&a).is_none());
         assert!(graph.detect_cycle(&b).is_none());
+    }
+
+    #[test]
+    fn test_backward_directive_creates_edge() {
+        use super::super::types::{BackwardDirective, CallSiteSpec};
+
+        let mut graph = DependencyGraph::new();
+        let parent = url("parent.R");
+        let child = url("child.R");
+
+        // Child declares it's sourced by parent at line 10
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Line(10),
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        graph.update_file(&child, &meta, |p| {
+            if p == "../parent.R" { Some(parent.clone()) } else { None }
+        });
+
+        // Should create forward edge from parent to child
+        let deps = graph.get_dependencies(&parent);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].from, parent);
+        assert_eq!(deps[0].to, child);
+        assert_eq!(deps[0].call_site_line, Some(10));
+        assert!(deps[0].is_directive);
+
+        // Child should have parent as dependent
+        let dependents = graph.get_dependents(&child);
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].from, parent);
+    }
+
+    #[test]
+    fn test_directive_vs_ast_conflict_suppresses_ast() {
+        use super::super::types::ForwardSource;
+
+        let mut graph = DependencyGraph::new();
+        let main = url("main.R");
+        let utils = url("utils.R");
+
+        // Both directive and AST detect same target but different call sites
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 5,
+                    column: 0,
+                    is_directive: true, // Directive at line 5
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 10,
+                    column: 0,
+                    is_directive: false, // AST at line 10
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let result = graph.update_file(&main, &meta, |p| {
+            if p == "utils.R" { Some(utils.clone()) } else { None }
+        });
+
+        // Should only have one edge (directive wins)
+        let deps = graph.get_dependencies(&main);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].call_site_line, Some(5)); // Directive's line
+        assert!(deps[0].is_directive);
+
+        // Should emit warning diagnostic
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0].message.contains("overrides"));
+    }
+
+    #[test]
+    fn test_directive_and_ast_same_call_site_no_warning() {
+        use super::super::types::ForwardSource;
+
+        let mut graph = DependencyGraph::new();
+        let main = url("main.R");
+        let utils = url("utils.R");
+
+        // Both directive and AST at same call site
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 5,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 5,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let result = graph.update_file(&main, &meta, |p| {
+            if p == "utils.R" { Some(utils.clone()) } else { None }
+        });
+
+        // Should have one edge, no warning (same call site)
+        let deps = graph.get_dependencies(&main);
+        assert_eq!(deps.len(), 1);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_ast_edges_to_different_targets_preserved() {
+        use super::super::types::ForwardSource;
+
+        let mut graph = DependencyGraph::new();
+        let main = url("main.R");
+        let utils = url("utils.R");
+        let helpers = url("helpers.R");
+
+        // Directive to utils, AST to helpers (different targets)
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 5,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: "helpers.R".to_string(),
+                    line: 10,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let result = graph.update_file(&main, &meta, |p| {
+            match p {
+                "utils.R" => Some(utils.clone()),
+                "helpers.R" => Some(helpers.clone()),
+                _ => None,
+            }
+        });
+
+        // Should have both edges (different targets)
+        let deps = graph.get_dependencies(&main);
+        assert_eq!(deps.len(), 2);
+        assert!(result.diagnostics.is_empty());
     }
 }

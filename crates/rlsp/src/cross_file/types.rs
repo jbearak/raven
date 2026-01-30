@@ -48,6 +48,23 @@ pub struct ForwardSource {
     pub chdir: bool,
     /// true for sys.source(), false for source()
     pub is_sys_source: bool,
+    /// For sys.source: true if envir=globalenv()/.GlobalEnv, false otherwise
+    /// When false for sys.source, symbols are NOT inherited (treated as local)
+    pub sys_source_global_env: bool,
+}
+
+impl ForwardSource {
+    /// Check if symbols from this source should be inherited
+    /// Returns false for local=TRUE or sys.source with non-global env
+    pub fn inherits_symbols(&self) -> bool {
+        if self.local {
+            return false;
+        }
+        if self.is_sys_source && !self.sys_source_global_env {
+            return false;
+        }
+        true
+    }
 }
 
 /// Canonical key for edge deduplication
@@ -157,6 +174,7 @@ mod tests {
             local: true,
             chdir: false,
             is_sys_source: false,
+            sys_source_global_env: true,
         };
         let uri = Url::parse("file:///test.R").unwrap();
         let key = source.to_key(uri.clone());
@@ -185,6 +203,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
+                sys_source_global_env: true,
             }],
             working_directory: Some("/data".to_string()),
             ignored_lines: HashSet::from([10, 20]),
@@ -200,5 +219,65 @@ mod tests {
         assert_eq!(parsed.working_directory, Some("/data".to_string()));
         assert!(parsed.ignored_lines.contains(&10));
         assert!(parsed.ignored_next_lines.contains(&15));
+    }
+
+    #[test]
+    fn test_inherits_symbols_local_true() {
+        let source = ForwardSource {
+            path: "test.R".to_string(),
+            line: 0,
+            column: 0,
+            is_directive: false,
+            local: true,
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: true,
+        };
+        assert!(!source.inherits_symbols());
+    }
+
+    #[test]
+    fn test_inherits_symbols_sys_source_non_global() {
+        let source = ForwardSource {
+            path: "test.R".to_string(),
+            line: 0,
+            column: 0,
+            is_directive: false,
+            local: false,
+            chdir: false,
+            is_sys_source: true,
+            sys_source_global_env: false,
+        };
+        assert!(!source.inherits_symbols());
+    }
+
+    #[test]
+    fn test_inherits_symbols_sys_source_global() {
+        let source = ForwardSource {
+            path: "test.R".to_string(),
+            line: 0,
+            column: 0,
+            is_directive: false,
+            local: false,
+            chdir: false,
+            is_sys_source: true,
+            sys_source_global_env: true,
+        };
+        assert!(source.inherits_symbols());
+    }
+
+    #[test]
+    fn test_inherits_symbols_regular_source() {
+        let source = ForwardSource {
+            path: "test.R".to_string(),
+            line: 0,
+            column: 0,
+            is_directive: false,
+            local: false,
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: true,
+        };
+        assert!(source.inherits_symbols());
     }
 }
