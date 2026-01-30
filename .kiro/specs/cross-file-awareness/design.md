@@ -85,12 +85,24 @@ graph TB
 
 ### Unified Cross-File Metadata Model (Single Source of Truth)
 
-#### Line Numbering Conventions (Required)
+#### Position Conventions (Required)
 
-- LSP positions are 0-based for `line` and `character`.
+- LSP positions are 0-based for both `line` and `character`.
 - Directive syntax `line=` is 1-based for user ergonomics (Requirement 1.4).
-- Internally, all stored line numbers in `CrossFileMetadata`, dependency edges, and scope artifacts MUST be 0-based.
+- Internally, all stored positions in `CrossFileMetadata`, dependency edges, and scope artifacts MUST be 0-based.
 - The implementation MUST convert user-facing 1-based line numbers to internal 0-based representation.
+
+**Full Position Awareness (Required):**
+Position-awareness MUST use full `(line, character)` positions, not just line numbers. This is critical for edge cases like:
+- `x <- 1; source("a.R"); y <- foo()` on one line
+- Completion/hover requests at a character position on the same line as a `source()` call
+
+If only line-based gating is used, symbols may be incorrectly included/excluded for positions on the same line as the call. The implementation MUST:
+- Store call sites as full LSP `Position` (`line`, `character`) in events/edges
+- Gate symbol availability by `(line, char)` ordering: a symbol from a sourced file is available only at positions strictly after the call site position
+
+**Documented Limitation (Alternative):**
+If full `(line, character)` precision is not implemented, the spec MUST explicitly document this as a known limitation: "Symbols from sourced files become available at the start of the line following the source() call, not at the exact character position after the call."
 
 The implementation uses **one** structured representation for cross-file metadata (`CrossFileMetadata`) which is:
 - derived from document contents (directives + detected `source()` calls)
@@ -127,9 +139,23 @@ pub struct BackwardDirective {
 pub struct ForwardSource {
     pub path: String,
     pub line: u32,
+    pub column: u32,  // Character position for full (line, char) precision
     pub is_directive: bool, // true if @lsp-source, false if detected source()
     pub local: bool,
     pub chdir: bool,
+    pub is_sys_source: bool,
+}
+
+/// Canonical key for edge deduplication.
+/// Used to prevent duplicate edges when both directive and AST detection find the same relationship.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForwardSourceKey {
+    pub resolved_uri: Url,
+    pub call_site_line: u32,
+    pub call_site_column: u32,
+    pub local: bool,
+    pub chdir: bool,
+    pub is_sys_source: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,10 +167,18 @@ pub enum CallSiteSpec {
 
 pub trait CrossFileExtractor {
     /// Extract CrossFileMetadata from file content (directives + detected source() calls)
+    /// 
+    /// IMPORTANT: Forward sources MUST be deduplicated by canonical key before returning.
+    /// When both a directive and AST detection produce the same (resolved_uri, call_site, local, chdir, is_sys_source),
+    /// only one ForwardSource should be included. Prefer the directive (is_directive=true) for provenance tracking.
     fn extract(&self, content: &str, tree: Option<&tree_sitter::Tree>) -> CrossFileMetadata;
 
     /// Check if a line should have diagnostics suppressed
     fn is_line_ignored(&self, metadata: &CrossFileMetadata, line: u32) -> bool;
+    
+    /// Normalize forward sources to canonical set, deduplicating by key.
+    /// Returns deduplicated sources with provenance flags preserved.
+    fn normalize_forward_sources(&self, sources: Vec<ForwardSource>, base_uri: &Url) -> Vec<ForwardSource>;
 }
 ```
 
@@ -230,6 +264,9 @@ pub enum EdgeKind {
 /// - reverse-dep call-site inference can validate the relationship
 /// - scope resolution can apply correct inheritance rules
 /// - cache fingerprints are stable and complete
+///
+/// IMPORTANT: Edges are deduplicated by canonical key (to_uri, call_site_position, local, chdir, is_sys_source).
+/// Provenance flags (is_directive) are tracked separately but do not create separate semantic edges.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyEdge {
     pub from: Url,
@@ -238,6 +275,10 @@ pub struct DependencyEdge {
 
     /// 0-based line number in `from` where the call occurs (if known).
     pub call_site_line: Option<u32>,
+    
+    /// 0-based character position in `from` where the call occurs (if known).
+    /// Required for full (line, char) position-aware scope resolution.
+    pub call_site_column: Option<u32>,
 
     /// `source(..., local=TRUE)` semantics.
     pub local: bool,
@@ -249,6 +290,7 @@ pub struct DependencyEdge {
     pub is_sys_source: bool,
 
     /// True if declared via @lsp-source directive, false if detected from AST.
+    /// This is provenance metadata and does NOT affect edge identity for deduplication.
     pub is_directive: bool,
 }
 
@@ -324,45 +366,60 @@ pub struct ScopeArtifacts {
 /// A scope-introducing event within a file.
 #[derive(Debug, Clone)]
 pub enum ScopeEvent {
-    /// A symbol definition introduced at a specific line.
-    Def { line: u32, symbol: ScopedSymbol },
+    /// A symbol definition introduced at a specific position.
+    Def { line: u32, column: u32, symbol: ScopedSymbol },
 
-    /// A forward source edge introduced at a call site line.
-    /// The sourced file's interface becomes available strictly after `call_site_line`.
-    Source { call_site_line: u32, edge: DependencyEdge },
+    /// A forward source edge introduced at a call site position.
+    /// The sourced file's interface becomes available strictly after `(call_site_line, call_site_column)`.
+    Source { call_site_line: u32, call_site_column: u32, edge: DependencyEdge },
 
     /// A working directory change that affects subsequent path resolution.
     WorkingDirectory { line: u32, absolute_path: PathBuf },
 }
 
-/// A computed scope at a particular line.
+/// A computed scope at a particular position in a file.
 #[derive(Debug, Clone)]
-pub struct ScopeAtLine {
+pub struct ScopeAtPosition {
     pub symbols: HashMap<String, ScopedSymbol>,
     pub chain: Vec<Url>,
     pub errors: Vec<ScopeError>,
 }
 
+/// Legacy alias for line-only scope (deprecated, use ScopeAtPosition)
+pub type ScopeAtLine = ScopeAtPosition;
+
 pub trait ScopeResolver {
     /// Compute per-file artifacts used by dependents (hashable interface).
     fn compute_artifacts(&self, uri: &Url, state: &WorldState, config: &CrossFileConfig) -> ScopeArtifacts;
 
-    /// Resolve scope visible at a given line in `uri`.
-    fn scope_at_line(&self, uri: &Url, line: u32, state: &WorldState, config: &CrossFileConfig) -> ScopeAtLine;
+    /// Resolve scope visible at a given position in `uri`.
+    /// Position is (line, character), both 0-based.
+    fn scope_at_position(&self, uri: &Url, line: u32, character: u32, state: &WorldState, config: &CrossFileConfig) -> ScopeAtPosition;
+    
+    /// Legacy: Resolve scope visible at a given line in `uri` (character=0).
+    fn scope_at_line(&self, uri: &Url, line: u32, state: &WorldState, config: &CrossFileConfig) -> ScopeAtPosition {
+        self.scope_at_position(uri, line, 0, state, config)
+    }
 }
 ```
 
 Implementation notes:
-- `timeline` MUST be sufficient to compute `scope_at_line(uri, N)` without accidentally including symbols introduced after N via forward sourcing.
-- `scope_at_line` merges local defs + inherited interfaces gated by call-site ordering, using the parent's own position-aware scope at the call site.
+- `timeline` MUST be sufficient to compute `scope_at_position(uri, line, char)` without accidentally including symbols introduced after that position via forward sourcing.
+- `scope_at_position` merges local defs + inherited interfaces gated by call-site ordering, using the parent's own position-aware scope at the call site.
 - Both use call-site resolution ladder for backward directives (explicit → reverse deps → inference → default).
+- Position comparison: `(line1, char1) < (line2, char2)` iff `line1 < line2 || (line1 == line2 && char1 < char2)`.
 
 Required boundary:
-- `compute_artifacts(uri, ...)` MUST depend only on the file's own content/AST plus pre-existing dependency metadata (edges), and MUST NOT call `scope_at_line` for other files. This prevents recursion and avoids exponential recomputation.
-- `scope_at_line` MAY traverse to other files, but it MUST be bounded by `max_chain_depth` and MUST maintain a visited set to prevent cycles.
+- `compute_artifacts(uri, ...)` MUST depend only on the file's own content/AST plus pre-existing dependency metadata (edges), and MUST NOT call `scope_at_position` for other files. This prevents recursion and avoids exponential recomputation.
+- `scope_at_position` MAY traverse to other files, but it MUST be bounded by `max_chain_depth` and MUST maintain a visited set to prevent cycles.
 
 Caching requirement (performance + correctness):
-- Cache entries for `ScopeArtifacts` and `scope_at_line` MUST be fingerprinted so that concurrent edits and index updates cannot reuse stale results (see ScopeFingerprint).
+- Cache entries for `ScopeArtifacts` and `scope_at_position` MUST be fingerprinted so that concurrent edits and index updates cannot reuse stale results (see ScopeFingerprint).
+
+Upstream hashing boundary (Required):
+- `upstream_interfaces_hash` in `ScopeFingerprint` MUST be computed as a hash of the **directly referenced** children's `interface_hash` values (from cache/index), plus the **edge set hash** for this file, plus this file's own content hash.
+- This keeps artifact computation cheap and non-recursive.
+- Full transitive correctness is left to `scope_at_position` traversal (bounded + visited set).
 
 
 ### Configuration
@@ -493,6 +550,47 @@ impl ArtifactsCache {
 Implementation notes:
 - The simplest correct approach is to compute `self_hash` from document text.
 - For performance, add Sight-like interface hashing: dependents only invalidate when `interface_hash` or edge set changes.
+
+### Closed File Staleness Model (Required)
+
+For files that are not currently open, the system needs a clear policy for when cached data is valid.
+
+```rust
+/// Snapshot metadata for a closed file, used to determine cache validity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileSnapshot {
+    /// File modification time (from filesystem metadata)
+    pub mtime: SystemTime,
+    /// File size in bytes
+    pub size: u64,
+    /// Optional content hash (computed on first read, cached)
+    pub content_hash: Option<u64>,
+}
+
+impl FileSnapshot {
+    /// Create snapshot from filesystem metadata
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            size: metadata.len(),
+            content_hash: None,
+        }
+    }
+    
+    /// Check if this snapshot matches current disk state
+    pub fn matches_disk(&self, current: &FileSnapshot) -> bool {
+        self.mtime == current.mtime && self.size == current.size
+    }
+}
+```
+
+**Validity Policy:**
+1. Index entries are valid only if their `FileSnapshot` matches current disk metadata (or matches "last watched version" if maintained).
+2. On `workspace/didChangeWatchedFiles`, invalidate entries where snapshot no longer matches.
+3. On scope resolution for a closed file:
+   - Check if index entry exists and snapshot is fresh
+   - If fresh, use cached `ScopeArtifacts`
+   - If stale or missing, read from disk via `CrossFileFileCache`, update index entry
 
 
 ### Extended WorldState
@@ -757,13 +855,21 @@ pub fn revalidate_after_change_locked(
 
 /// Publish diagnostics for affected files with debouncing.
 ///
+/// IMPORTANT: This function MUST be async. Never use `futures::executor::block_on()` 
+/// inside a Tokio runtime - it can deadlock or stall under load.
+///
 /// IMPORTANT: background tasks must not capture `&mut WorldState`.
 /// Instead, they re-acquire state via `Arc<RwLock<WorldState>>` and must guard
 /// against publishing stale results.
 ///
 /// IMPORTANT: publishing MUST be monotonic per document: do not publish diagnostics for
 /// an older document version than what has already been published (Requirement 0.7).
-pub fn schedule_diagnostics_debounced(
+///
+/// Lock optimization: To avoid thrashing the lock with many files, this function:
+/// 1. Takes a single write lock to compute prioritized work list
+/// 2. Spawns tasks that mostly use read locks
+/// 3. Only takes brief write locks for bookkeeping updates
+pub async fn schedule_diagnostics_debounced(
     state_arc: Arc<tokio::sync::RwLock<WorldState>>,
     client: Client,
     trigger_uri: Url,
@@ -771,61 +877,63 @@ pub fn schedule_diagnostics_debounced(
     max_to_schedule: usize,
     is_dependency_triggered: bool, // true if triggered by dependency change, not direct edit
 ) {
-    // Prioritization + cap (Requirement 0.9):
-    // 1) Always schedule `trigger_uri` first.
-    // 2) If the client provides activity hints (Requirement 15),
-    //    prioritize active > visible > other open.
-    // 3) Otherwise, fall back to most-recently-changed/opened ordering.
-    
-    // Read activity state for prioritization
-    let activity_state = {
-        let st = futures::executor::block_on(state_arc.read());
-        st.cross_file_activity.clone()
-    };
-    
-    affected.sort_by_key(|u| {
-        if *u == trigger_uri {
-            return 0usize;
+    // Single write-lock pass to compute prioritized work list and mark force republish
+    let work_items: Vec<(Url, Option<i32>, bool)> = {
+        let mut st = state_arc.write().await;
+        
+        // Read activity state for prioritization (Requirement 15)
+        let activity_state = st.cross_file_activity.clone();
+        
+        affected.sort_by_key(|u| {
+            if *u == trigger_uri {
+                return 0usize;
+            }
+            activity_state.priority_score(u) + 1
+        });
+
+        // Log if cap exceeded (Requirement 0.10)
+        if affected.len() > max_to_schedule {
+            log::trace!(
+                "Cross-file revalidation cap exceeded: {} affected, scheduling {}. \
+                 Skipped documents will be revalidated on-demand.",
+                affected.len(),
+                max_to_schedule
+            );
         }
-        // Use activity state for prioritization (Requirement 15)
-        activity_state.priority_score(u) + 1
-    });
 
-    // Log if cap exceeded (Requirement 0.10)
-    if affected.len() > max_to_schedule {
-        log::trace!(
-            "Cross-file revalidation cap exceeded: {} affected, scheduling {}. \
-             Skipped documents will be revalidated on-demand.",
-            affected.len(),
-            max_to_schedule
-        );
-    }
-
-    for uri in affected.into_iter().take(max_to_schedule) {
-        // Determine the trigger version/hash now (freshness guard)
-        // If we can't read the current version/hash, skip scheduling.
-        let state_arc2 = state_arc.clone();
-        let client2 = client.clone();
-        let uri2 = uri.clone();
-        let is_dep_triggered = is_dependency_triggered && uri != trigger_uri;
-
-        tokio::spawn(async move {
-            // 1) Read trigger fingerprint/version and mark force republish if needed
-            let (debounce_ms, token, trigger_version) = {
-                let mut st = state_arc2.write().await;
-                let token = st.cross_file_revalidation.schedule(uri2.clone());
-                let debounce_ms = st.cross_file_revalidation.debounce_ms;
-                let trigger_version = st
-                    .documents
-                    .get(&uri2)
-                    .and_then(|d| d.version); // Document Versioning (Required)
+        // Build work items with trigger versions
+        affected.into_iter()
+            .take(max_to_schedule)
+            .map(|uri| {
+                let is_dep_triggered = is_dependency_triggered && uri != trigger_uri;
+                let trigger_version = st.documents.get(&uri).and_then(|d| d.version);
                 
                 // Mark for force republish if dependency-triggered (Requirement 0.8)
                 if is_dep_triggered {
-                    st.cross_file_diagnostics_gate.mark_force_republish(&uri2);
+                    st.cross_file_diagnostics_gate.mark_force_republish(&uri);
                 }
                 
-                (debounce_ms, token, trigger_version)
+                (uri, trigger_version, is_dep_triggered)
+            })
+            .collect()
+    };
+    
+    // Spawn tasks for each work item (mostly read locks from here)
+    let debounce_ms = {
+        let st = state_arc.read().await;
+        st.cross_file_revalidation.debounce_ms
+    };
+
+    for (uri, trigger_version, _is_dep_triggered) in work_items {
+        let state_arc2 = state_arc.clone();
+        let client2 = client.clone();
+        let uri2 = uri.clone();
+
+        tokio::spawn(async move {
+            // 1) Schedule with cancellation token (brief write lock)
+            let token = {
+                let mut st = state_arc2.write().await;
+                st.cross_file_revalidation.schedule(uri2.clone())
             };
 
             // 2) Debounce / cancellation (Requirement 0.5)
@@ -835,6 +943,7 @@ pub fn schedule_diagnostics_debounced(
             }
 
             // 3) Freshness guard + monotonic publish check (Requirements 0.6, 0.7)
+            // Use read lock for diagnostics computation
             let diagnostics_opt = {
                 let st = state_arc2.read().await;
                 let current_version = st.documents.get(&uri2).and_then(|d| d.version);
@@ -859,16 +968,13 @@ pub fn schedule_diagnostics_debounced(
             if let Some(diagnostics) = diagnostics_opt {
                 client2.publish_diagnostics(uri2.clone(), diagnostics, None).await;
                 
-                // Record successful publish (Requirement 0.7)
+                // Record successful publish (brief write lock)
                 let mut st = state_arc2.write().await;
                 if let Some(ver) = st.documents.get(&uri2).and_then(|d| d.version) {
                     st.cross_file_diagnostics_gate.record_publish(&uri2, ver);
                 }
+                st.cross_file_revalidation.complete(&uri2);
             }
-
-            // 4) Mark completion (best-effort)
-            let mut st = state_arc2.write().await;
-            st.cross_file_revalidation.complete(&uri2);
         });
     }
 }
@@ -1287,9 +1393,23 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 ### Property 40: Position-Aware Symbol Availability
 
-*For any* source() call at line N, symbols from the sourced file SHALL only be available for positions strictly after line N.
+*For any* source() call at position `(line, column)`, symbols from the sourced file SHALL only be available for positions strictly after `(line, column)` using lexicographic ordering: `(l1, c1) < (l2, c2)` iff `l1 < l2 || (l1 == l2 && c1 < c2)`.
 
 **Validates: Requirements 5.3**
+
+### Property 50: Edge Deduplication
+
+*For any* file where both a directive (`@lsp-source`) and AST detection (`source()` call) identify the same relationship (same target URI, same call site position, same `local`/`chdir`/`is_sys_source` flags), the Dependency_Graph SHALL contain exactly one edge for that relationship, not two.
+
+**Validates: Requirements 6.1, 6.2, 12.5**
+
+### Property 51: Full Position Precision
+
+*For any* completion, hover, or go-to-definition request at position `(line, column)` on the same line as a `source()` call at position `(line, call_column)`:
+- If `column <= call_column`, symbols from the sourced file SHALL NOT be included
+- If `column > call_column`, symbols from the sourced file SHALL be included
+
+**Validates: Requirements 5.3, 7.1, 7.4**
 
 ### Property 41: Freshness Guard Prevents Stale Diagnostics
 
@@ -1347,6 +1467,20 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 
 ## Error Handling
+
+### Critical Design Invariants
+
+These invariants MUST be preserved across all refactoring. They are the core behaviors that make cross-file awareness work correctly during concurrent editing.
+
+1. **Dependency-triggered revalidation MUST bypass "version didn't change" gating** while still respecting "don't publish older-than-last-published". This is the "force republish" behavior.
+
+2. **Never use `futures::executor::block_on()` inside Tokio runtime** - always use async/await patterns to avoid deadlocks.
+
+3. **Edge deduplication is semantic, not syntactic** - edges are deduplicated by `(to_uri, call_site_position, local, chdir, is_sys_source)`, not by provenance (directive vs AST).
+
+4. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files.
+
+5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent.
 
 ### Missing Files
 
@@ -1492,6 +1626,51 @@ Required watcher rule:
 ### Watch Registration
 
 Register watched file patterns for relevant R project files (at minimum `**/*.R` and `**/*.r`, and optionally `**/*.Rprofile`, `**/*.Renviron`).
+
+**LSP Registration Mechanics (Required):**
+
+The server MUST register file watchers via dynamic registration (`client/registerCapability`) during the `initialized` handler:
+
+```rust
+/// Register file watchers for R files (called from initialized handler)
+pub async fn register_file_watchers(client: &Client) -> Result<()> {
+    let watchers = vec![
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.R".to_string()),
+            kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.r".to_string()),
+            kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.Rprofile".to_string()),
+            kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+        },
+    ];
+    
+    let registration = Registration {
+        id: "rlsp-file-watcher".to_string(),
+        method: "workspace/didChangeWatchedFiles".to_string(),
+        register_options: Some(serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+            watchers,
+        })?),
+    };
+    
+    client.register_capability(vec![registration]).await?;
+    Ok(())
+}
+```
+
+**Timing:**
+- Registration MUST occur in the `initialized` handler (after `initialize` completes)
+- The server MUST check `capabilities.workspace.didChangeWatchedFiles.dynamicRegistration` before attempting dynamic registration
+
+**Fallback (if dynamic registration not supported):**
+- If the client does not support dynamic registration, the server SHOULD:
+  1. Rely on `textDocument/didOpen` and `textDocument/didClose` for open files
+  2. Optionally implement periodic workspace rescanning (configurable, default off)
+  3. Document this limitation in the extension README
 
 ### On File Changed/Created
 
