@@ -226,19 +226,15 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Collect syntax errors
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
 
-    // Get cross-file symbols for undefined variable suppression
-    // Use end of file position to get all symbols in scope
-    let line_count = text.lines().count() as u32;
-    let cross_file_symbols = get_cross_file_symbols(state, uri, line_count, 0);
-
-    // Collect undefined variable errors
-    collect_undefined_variables(
+    // Collect undefined variable errors with position-aware cross-file scope
+    collect_undefined_variables_position_aware(
+        state,
+        uri,
         tree.root_node(),
         &text,
         &doc.loaded_packages,
         &state.workspace_imports,
         &state.library,
-        &cross_file_symbols,
         &mut diagnostics,
     );
 
@@ -276,6 +272,66 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Position-aware undefined variable collection.
+/// Checks each usage against the cross-file scope at that specific position.
+fn collect_undefined_variables_position_aware(
+    state: &WorldState,
+    uri: &Url,
+    node: Node,
+    text: &str,
+    loaded_packages: &[String],
+    workspace_imports: &[String],
+    library: &crate::state::Library,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use std::collections::HashSet;
+
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut used: Vec<(String, Node)> = Vec::new();
+
+    // First pass: collect all definitions
+    collect_definitions(node, text, &mut defined);
+
+    // Second pass: collect all usages
+    collect_usages(node, text, &mut used);
+
+    // Report undefined variables with position-aware cross-file scope
+    for (name, usage_node) in used {
+        // Skip if locally defined or builtin
+        if defined.contains(&name)
+            || is_builtin(&name)
+            || is_package_export(&name, loaded_packages, library)
+            || workspace_imports.contains(&name)
+        {
+            continue;
+        }
+
+        // Get cross-file symbols at the usage position
+        let usage_line = usage_node.start_position().row as u32;
+        let usage_col = usage_node.start_position().column as u32;
+        let cross_file_symbols = get_cross_file_symbols(state, uri, usage_line, usage_col);
+
+        if !cross_file_symbols.contains_key(&name) {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(
+                        usage_node.start_position().row as u32,
+                        usage_node.start_position().column as u32,
+                    ),
+                    end: Position::new(
+                        usage_node.end_position().row as u32,
+                        usage_node.end_position().column as u32,
+                    ),
+                },
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: format!("Undefined variable: {}", name),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn collect_undefined_variables(
     node: Node,
     text: &str,
