@@ -216,6 +216,31 @@ pub trait SourceDetector {
 }
 ```
 
+#### R `local=TRUE` Semantics (Required)
+
+In R, `source(..., local=TRUE)` evaluates the sourced file in a new local environment. This has important implications for scope inheritance:
+
+**Default behavior (`local=FALSE` or omitted):**
+- Sourced file executes in the global environment
+- All assignments in the sourced file are visible to the caller
+- Functions and variables defined in the sourced file are available after the `source()` call
+
+**With `local=TRUE`:**
+- Sourced file executes in a new local environment
+- Assignments in the sourced file do NOT populate the caller's environment
+- Only the return value of the sourced file is available (typically `NULL` or the last expression)
+
+**LSP Behavior for `local=TRUE`:**
+- When `local=TRUE` is detected, symbols defined in the sourced file SHALL NOT be added to the caller's scope
+- Undefined variable diagnostics SHALL NOT be suppressed based on definitions in `local=TRUE` sourced files
+- Completions SHALL NOT include symbols from `local=TRUE` sourced files
+- A configuration option `crossFile.treatLocalAsGlobal` (default: `false`) MAY be provided for projects that use `local=TRUE` unconventionally
+
+**`sys.source()` behavior:**
+- `sys.source(file, envir=...)` evaluates in the specified environment
+- If `envir` is not statically resolvable (e.g., a variable), the LSP SHALL treat it conservatively as `local=TRUE` (no inheritance)
+- If `envir` is `.GlobalEnv` or `globalenv()`, treat as `local=FALSE`
+
 ### Path Resolver
 
 Resolves relative paths to absolute paths considering working directory context.
@@ -247,16 +272,11 @@ Key properties:
 - Supports multiple edges between the same (from,to) at different call sites.
 - Stores enough metadata to support backward call-site resolution via reverse deps.
 - Uses canonicalized URIs/paths to avoid duplicate nodes for the same file.
+- **Uses forward edges only as the canonical representation.** Backward directives are inputs used to infer/confirm forward edges, not separate edges in the graph. This prevents double-triggering invalidation and double-emitting diagnostics.
 
 ```rust
 use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::Url;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EdgeKind {
-    Forward,  // parent sources child
-    Backward, // child declares parent via directive
-}
 
 /// One call edge (a parent may source the same child multiple times).
 ///
@@ -267,11 +287,13 @@ pub enum EdgeKind {
 ///
 /// IMPORTANT: Edges are deduplicated by canonical key (to_uri, call_site_position, local, chdir, is_sys_source).
 /// Provenance flags (is_directive) are tracked separately but do not create separate semantic edges.
+///
+/// NOTE: EdgeKind is removed. All edges are forward edges (parent sources child).
+/// Backward directives are processed as inputs to create/confirm forward edges.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyEdge {
-    pub from: Url,
-    pub to: Url,
-    pub kind: EdgeKind,
+    pub from: Url,  // parent (caller)
+    pub to: Url,    // child (callee)
 
     /// 0-based line number in `from` where the call occurs (if known).
     pub call_site_line: Option<u32>,
@@ -281,6 +303,7 @@ pub struct DependencyEdge {
     pub call_site_column: Option<u32>,
 
     /// `source(..., local=TRUE)` semantics.
+    /// When true, symbols from the sourced file are NOT inherited by the caller.
     pub local: bool,
 
     /// `source(..., chdir=TRUE)` semantics.
@@ -295,7 +318,9 @@ pub struct DependencyEdge {
 }
 
 pub struct DependencyGraph {
+    /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,
+    /// Reverse lookup: child URI -> edges from parents (same edges, indexed by `to`)
     backward: HashMap<Url, Vec<DependencyEdge>>,
 }
 
@@ -303,12 +328,18 @@ impl DependencyGraph {
     pub fn new() -> Self;
 
     /// Update edges for a file based on extracted metadata.
+    /// 
+    /// This processes both:
+    /// - Forward sources (from `meta.sources`) - creates edges where this file is `from`
+    /// - Backward directives (from `meta.sourced_by`) - creates/confirms edges where this file is `to`
     pub fn update_file(&mut self, uri: &Url, meta: &CrossFileMetadata);
 
     pub fn remove_file(&mut self, uri: &Url);
 
+    /// Get edges where `uri` is the parent (caller)
     pub fn get_dependencies(&self, uri: &Url) -> Vec<&DependencyEdge>;
 
+    /// Get edges where `uri` is the child (callee)
     pub fn get_dependents(&self, uri: &Url) -> Vec<&DependencyEdge>;
 
     pub fn get_transitive_dependents(&self, uri: &Url, max_depth: usize) -> Vec<Url>;
@@ -705,14 +736,23 @@ pub struct CrossFileDiagnosticsGate {
 
 impl CrossFileDiagnosticsGate {
     /// Check if diagnostics can be published for this version
-    /// Returns true if version is newer than last published, or if force republish is set
+    /// 
+    /// CRITICAL: Force republish allows same-version republish but NEVER older versions.
+    /// - Normal: publish if `version > last_published_version`
+    /// - Forced: publish if `version >= last_published_version` (same version allowed)
+    /// - Never: publish if `version < last_published_version`
     pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
-        if self.force_republish.contains(uri) {
-            return true;
-        }
         match self.last_published_version.get(uri) {
-            Some(&last) => version > last,
-            None => true,
+            Some(&last) => {
+                if version < last {
+                    return false; // NEVER publish older versions, even when forced
+                }
+                if self.force_republish.contains(uri) {
+                    return version >= last; // Force allows same version
+                }
+                version > last // Normal requires strictly newer
+            }
+            None => true, // No previous publish, always allowed
         }
     }
 
@@ -734,6 +774,7 @@ impl CrossFileDiagnosticsGate {
     }
 
     /// Clear all state for a URI (e.g., when document is closed)
+    /// MUST be called in the didClose handler to prevent stale state on reopen.
     pub fn clear(&mut self, uri: &Url) {
         self.last_published_version.remove(uri);
         self.force_republish.remove(uri);
@@ -1031,13 +1072,55 @@ Precedence (highest to lowest):
 A warning diagnostic SHOULD be emitted when multiple viable parents exist.
 
 ```rust
+/// Unified call site position type used throughout the system.
+/// All call sites are stored as full (line, column) positions, both 0-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CallSitePosition {
+    pub line: u32,   // 0-based
+    pub column: u32, // 0-based
+}
+
+impl CallSitePosition {
+    /// Create from 0-based line and column
+    pub fn new(line: u32, column: u32) -> Self {
+        Self { line, column }
+    }
+    
+    /// Create from 1-based line (for directive `line=` parameter), column defaults to 0
+    pub fn from_user_line(one_based_line: u32) -> Self {
+        Self { line: one_based_line.saturating_sub(1), column: 0 }
+    }
+    
+    /// Create representing "end of line" for a given 0-based line
+    pub fn end_of_line(line: u32) -> Self {
+        Self { line, column: u32::MAX }
+    }
+    
+    /// Lexicographic comparison: (l1, c1) < (l2, c2) iff l1 < l2 || (l1 == l2 && c1 < c2)
+    pub fn is_before(&self, other: &CallSitePosition) -> bool {
+        self.line < other.line || (self.line == other.line && self.column < other.column)
+    }
+}
+
+impl Ord for CallSitePosition {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.line, self.column).cmp(&(other.line, other.column))
+    }
+}
+
+impl PartialOrd for CallSitePosition {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Result of parent resolution
 pub enum ParentResolution {
     /// Single unambiguous parent
-    Single(Url, Option<u32>), // (parent_uri, call_site_line)
+    Single(Url, Option<CallSitePosition>), // (parent_uri, call_site)
     /// Multiple possible parents - deterministic but ambiguous
     Ambiguous {
-        selected: (Url, Option<u32>),
+        selected: (Url, Option<CallSitePosition>),
         alternatives: Vec<Url>,
     },
     /// No parent found
@@ -1054,17 +1137,17 @@ pub fn resolve_parent(
     uri: &Url,
     config: &CrossFileConfig,
 ) -> ParentResolution {
-    // Collect all possible parents
-    let mut parents: Vec<(Url, Option<u32>)> = Vec::new();
+    // Collect all possible parents with full position info
+    let mut parents: Vec<(Url, Option<CallSitePosition>)> = Vec::new();
     
     // From backward directives
     for directive in &metadata.sourced_by {
         if let Some(parent_uri) = resolve_path(&directive.path, uri) {
             let call_site = match &directive.call_site {
-                CallSiteSpec::Line(n) => Some(*n),
+                CallSiteSpec::Line(n) => Some(CallSitePosition::from_user_line(*n)),
                 CallSiteSpec::Match(pattern) => {
-                    // Try to find matching line in parent
-                    find_matching_line(&parent_uri, pattern)
+                    // Try to find matching line in parent, returns full position
+                    find_matching_position(&parent_uri, pattern)
                 }
                 CallSiteSpec::Default => None,
             };
@@ -1073,12 +1156,16 @@ pub fn resolve_parent(
     }
     
     // From reverse dependency edges (forward resolution found us)
+    // All edges in the graph are forward edges; we look up edges where this file is `to`
     for edge in graph.get_dependents(uri) {
-        if edge.kind == EdgeKind::Forward {
-            let entry = (edge.from.clone(), edge.call_site_line);
-            if !parents.iter().any(|(u, _)| u == &edge.from) {
-                parents.push(entry);
-            }
+        let call_site = match (edge.call_site_line, edge.call_site_column) {
+            (Some(line), Some(col)) => Some(CallSitePosition::new(line, col)),
+            (Some(line), None) => Some(CallSitePosition::new(line, 0)),
+            _ => None,
+        };
+        let entry = (edge.from.clone(), call_site);
+        if !parents.iter().any(|(u, _)| u == &edge.from) {
+            parents.push(entry);
         }
     }
     
@@ -1271,6 +1358,18 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 *For any* source() call with `local = TRUE`, the extracted `SourceCall` SHALL have `local = true`. *For any* source() call with `chdir = TRUE`, the extracted `SourceCall` SHALL have `chdir = true`.
 
 **Validates: Requirements 4.7, 4.8**
+
+### Property 52: Local Source Scope Isolation
+
+*For any* source() call with `local = TRUE`, symbols defined in the sourced file SHALL NOT be added to the caller's scope. Completions, hover, and go-to-definition at positions after the call SHALL NOT include symbols from the sourced file. Undefined variable diagnostics SHALL NOT be suppressed based on definitions in the sourced file.
+
+**Validates: Requirements 4.7, 5.3, 7.1, 10.1**
+
+### Property 53: sys.source Conservative Handling
+
+*For any* sys.source() call where the `envir` argument is not statically resolvable to `.GlobalEnv` or `globalenv()`, the LSP SHALL treat it as `local = TRUE` (no symbol inheritance).
+
+**Validates: Requirements 4.4**
 
 ### Property 19: Backward-First Resolution Order
 
@@ -1472,6 +1571,18 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 **Validates: Requirements 15.4, 15.5**
 
+### Property 54: Diagnostics Gate Cleanup on Close
+
+*For any* document that is closed via `textDocument/didClose`, the server SHALL clear all diagnostics gate state for that URI. This prevents stale version tracking from affecting the document if it is reopened.
+
+**Validates: Requirements 0.7, 0.8**
+
+### Property 55: URI Canonicalization Stability
+
+*For any* file path, the canonicalized URI SHALL be stable across rename events (delete+create). Two paths that resolve to the same file SHALL produce the same canonical URI.
+
+**Validates: Requirements 6.1, 6.3**
+
 
 ## Error Handling
 
@@ -1479,15 +1590,19 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 These invariants MUST be preserved across all refactoring. They are the core behaviors that make cross-file awareness work correctly during concurrent editing.
 
-1. **Dependency-triggered revalidation MUST bypass "version didn't change" gating** while still respecting "don't publish older-than-last-published". This is the "force republish" behavior.
+1. **Dependency-triggered revalidation MUST bypass "version didn't change" gating** while still respecting "don't publish older-than-last-published". This is the "force republish" behavior. Specifically: force republish allows publishing when `version >= last_published_version` (same version allowed), but NEVER when `version < last_published_version`.
 
 2. **Never use `futures::executor::block_on()` inside Tokio runtime** - always use async/await patterns to avoid deadlocks.
 
-3. **Edge deduplication is semantic, not syntactic** - edges are deduplicated by `(to_uri, call_site_position, local, chdir, is_sys_source)`, not by provenance (directive vs AST).
+3. **Edge deduplication is semantic, not syntactic** - edges are deduplicated by `(to_uri, call_site_position, local, chdir, is_sys_source)`, not by provenance (directive vs AST). The dependency graph uses **forward edges only** as the canonical representation; backward directives are inputs used to infer/confirm forward edges, not separate edges.
 
-4. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files.
+4. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files. This MUST be enforced at every read path: `CrossFileWorkspaceIndex` and `CrossFileFileCache` APIs MUST check "is it open?" before returning disk-derived data.
 
 5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent.
+
+6. **compute_artifacts() MUST NOT read other files' content** - it depends only on the file's own content/AST plus pre-existing dependency metadata (edges) and already-indexed interface hashes. This prevents recursion and lock contention.
+
+7. **handlers::diagnostics() MUST NOT mutate state** - it runs under a read lock and must be pure. All state mutations happen in separate write-lock passes.
 
 ### Missing Files
 
@@ -1630,6 +1745,41 @@ To achieve this, the server MUST implement workspace watcher + indexing integrat
 Required watcher rule:
 - On `workspace/didChangeWatchedFiles`, if the changed path corresponds to an open document, the server MUST invalidate disk-backed caches/index entries for that path but MUST NOT replace in-memory metadata/artifacts with disk-derived results for that file.
 
+**Open-Docs-Authoritative Enforcement (Required):**
+
+To prevent "I have unsaved changes, but diagnostics keep reverting" bugs, the open-docs-authoritative rule MUST be enforced at every read path:
+
+```rust
+/// Trait for content providers that respect open-docs-authoritative rule
+pub trait CrossFileContentProvider {
+    /// Get content for a URI, preferring open documents over disk.
+    /// 
+    /// CRITICAL: If the URI is in `open_documents`, return the in-memory content.
+    /// Never return disk content for an open document.
+    fn get_content(&self, uri: &Url, open_documents: &HashMap<Url, Document>) -> Option<String>;
+    
+    /// Get metadata for a URI, preferring open documents over index.
+    fn get_metadata(&self, uri: &Url, open_documents: &HashMap<Url, Document>) -> Option<CrossFileMetadata>;
+    
+    /// Get scope artifacts for a URI, preferring open documents over cache.
+    fn get_artifacts(&self, uri: &Url, open_documents: &HashMap<Url, Document>) -> Option<ScopeArtifacts>;
+}
+
+impl CrossFileWorkspaceIndex {
+    /// Update index entry for a URI.
+    /// 
+    /// CRITICAL: If the URI is currently open, this is a no-op.
+    /// Open documents are authoritative; disk changes are ignored until close.
+    pub fn update_from_disk(&mut self, uri: &Url, open_documents: &HashSet<Url>) {
+        if open_documents.contains(uri) {
+            log::trace!("Skipping disk update for open document: {}", uri);
+            return;
+        }
+        // ... proceed with disk-based update
+    }
+}
+```
+
 ### Watch Registration
 
 Register watched file patterns for relevant R project files (at minimum `**/*.R` and `**/*.r`, and optionally `**/*.Rprofile`, `**/*.Renviron`).
@@ -1678,6 +1828,35 @@ pub async fn register_file_watchers(client: &Client) -> Result<()> {
   1. Rely on `textDocument/didOpen` and `textDocument/didClose` for open files
   2. Optionally implement periodic workspace rescanning (configurable, default off)
   3. Document this limitation in the extension README
+  4. The VS Code extension SHOULD configure file watching on its side (VS Code supports watchers) and forward events to the server
+
+### Document Close Handler (Required)
+
+The `textDocument/didClose` handler MUST clean up all cross-file state for the closed document:
+
+```rust
+/// Handle textDocument/didClose - clean up cross-file state
+pub fn on_did_close(state: &mut WorldState, uri: &Url) {
+    // Clear diagnostics gate state to prevent stale state on reopen
+    state.cross_file_diagnostics_gate.clear(uri);
+    
+    // Cancel any pending revalidation for this document
+    if let Some(token) = state.cross_file_revalidation.pending.remove(uri) {
+        token.cancel();
+    }
+    
+    // Remove from activity tracking
+    state.cross_file_activity.recent_uris.retain(|u| u != uri);
+    if state.cross_file_activity.active_uri.as_ref() == Some(uri) {
+        state.cross_file_activity.active_uri = None;
+    }
+    state.cross_file_activity.visible_uris.retain(|u| u != uri);
+    
+    // Note: Do NOT remove from dependency graph or metadata cache.
+    // The file still exists on disk and may be referenced by other files.
+    // The workspace index will maintain its metadata.
+}
+```
 
 ### On File Changed/Created
 
@@ -1688,6 +1867,7 @@ pub async fn register_file_watchers(client: &Client) -> Result<()> {
 Notes:
 - Rename/move events may arrive as delete+create. The handler SHOULD treat these as independent events and allow the graph/index to converge after debounce.
 - Canonicalization failures (e.g., path does not exist yet) MUST be handled gracefully: keep best-effort node identity but avoid panics.
+- **URI Canonicalization (Required):** All URIs in the dependency graph MUST be canonical file URIs. Path casing MUST be normalized (case-insensitive on macOS/Windows, case-sensitive on Linux). Paths with `..` MUST be resolved before storage. This ensures rename events (delete+create) converge correctly.
 
 ### On File Deleted
 
@@ -1846,3 +2026,50 @@ crates/rlsp/src/
 │       ├── workspace_tests.rs
 │       └── property_tests.rs  # All property-based tests
 ```
+
+
+## Design Review Fixes
+
+This section documents key design decisions made based on review feedback to ensure correctness during concurrent multi-file editing.
+
+### Issue 1: Force-Republish Monotonicity
+
+**Problem:** Original `can_publish()` returned `true` unconditionally when `force_republish` was set, which could allow publishing diagnostics for older versions than previously published.
+
+**Fix:** Force republish now allows same-version republish (`version >= last_published_version`) but NEVER older versions (`version < last_published_version`). This matches Sight's `clear_published_version()` pattern while maintaining monotonicity.
+
+### Issue 2: Full Position Awareness for Backward Resolution
+
+**Problem:** `ParentResolution` and `resolve_parent()` used line-only call sites (`Option<u32>`), but the spec requires full `(line, column)` precision for same-line edge cases.
+
+**Fix:** Introduced `CallSitePosition` struct with full `(line, column)` support. All parent resolution now uses `Option<CallSitePosition>`. The `CallSiteSpec::Line` variant converts 1-based user input to 0-based internal representation with `column=0`.
+
+### Issue 3: Edge Deduplication and Graph Representation
+
+**Problem:** Having both `Forward` and `Backward` edge kinds could lead to duplicate edges representing the same relationship, causing double-triggering of invalidation and diagnostics.
+
+**Fix:** Removed `EdgeKind` enum. The dependency graph now uses **forward edges only** as the canonical representation. Backward directives are processed as inputs to create/confirm forward edges, not as separate edges.
+
+### Issue 4: R `local=TRUE` Semantics
+
+**Problem:** The spec recorded `local=TRUE` but didn't specify the actual scope inheritance rules, which could lead to incorrect suppression of undefined-variable diagnostics.
+
+**Fix:** Added explicit rules: when `local=TRUE`, symbols from the sourced file are NOT inherited. Added Properties 52 and 53 to validate this behavior. Added configuration option `crossFile.treatLocalAsGlobal` for unconventional projects.
+
+### Issue 5: Open-Docs-Authoritative Enforcement
+
+**Problem:** The rule was stated but not enforced at every read path, which could cause "unsaved changes but diagnostics revert" bugs.
+
+**Fix:** Added `CrossFileContentProvider` trait and explicit enforcement in `CrossFileWorkspaceIndex::update_from_disk()`. Added to Critical Design Invariants.
+
+### Issue 6: Diagnostics Gate Cleanup on Close
+
+**Problem:** Not explicitly requiring cleanup on `didClose` could leave stale version tracking that affects reopened documents.
+
+**Fix:** Added explicit `on_did_close()` handler requirements and Property 54 to validate cleanup.
+
+### Issue 7: URI Canonicalization
+
+**Problem:** Rename events (delete+create) could fail to converge if URIs weren't properly canonicalized.
+
+**Fix:** Added explicit canonicalization requirements: normalize path casing per platform, resolve `..` before storage. Added Property 55.
