@@ -16,7 +16,7 @@
   "activationEvents": [
     "onLanguage:r"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "languages": [
       {
@@ -39,13 +39,17 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "vscode:prepublish": "bun run bundle && bun run copy-binary",
+    "bundle": "bunx esbuild src/extension.ts --bundle --platform=node --outfile=dist/extension.js --external:vscode --minify",
+    "copy-binary": "bun scripts/bundle.js",
+    "compile": "bun run bundle",
+    "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile",
+    "pretest": "bun run compile:test",
     "test": "vscode-test",
-    "package": "npm run compile && node scripts/bundle.js && vsce package --allow-missing-repository",
-    "package:target": "npm run compile && node scripts/bundle.js && vsce package --target"
+    "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
+    "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -57,6 +61,7 @@
     "@vscode/test-cli": "^0.0.8",
     "@vscode/test-electron": "^2.3.9",
     "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.27.2",
     "mocha": "^10.2.0",
     "typescript": "^5.0.0"
   }

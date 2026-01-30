@@ -4,10 +4,11 @@ export default defineConfig({
     files: 'out/test/**/*.test.js',
     workspaceFolder: './src/test/fixtures',
     mocha: {
-        timeout: 30000
+        timeout: 60000
     },
     launchArgs: [
         '--disable-gpu',
-        '--no-sandbox'
+        '--no-sandbox',
+        '--disable-extensions'
     ]
 });

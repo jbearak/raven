@@ -1,6 +1,8 @@
 .vscode/**
 .vscode-test/**
 src/**
+out/**
+node_modules/**
 .gitignore
 .yarnrc
 vsc-extension-quickstart.md
@@ -11,3 +13,4 @@ vsc-extension-quickstart.md
 scripts/**
 .vscode-test.mjs
 package-lock.json
+bun.lock
