@@ -485,3 +485,436 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// Property 3: Quote Style Equivalence for Source Detection
+// Validates: Requirements 4.1, 4.2
+// ============================================================================
+
+use super::source_detect::detect_source_calls;
+use tree_sitter::Parser;
+
+fn parse_r(code: &str) -> tree_sitter::Tree {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    parser.parse(code, None).unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 3: For any valid path string p, detecting source("p") and source('p')
+    /// SHALL produce equivalent SourceCall structures with the same path.
+    #[test]
+    fn prop_quote_style_equivalence(path in relative_path()) {
+        let double_quoted = format!("source(\"{}\")", path);
+        let single_quoted = format!("source('{}')", path);
+
+        let tree1 = parse_r(&double_quoted);
+        let tree2 = parse_r(&single_quoted);
+
+        let sources1 = detect_source_calls(&tree1, &double_quoted);
+        let sources2 = detect_source_calls(&tree2, &single_quoted);
+
+        prop_assert_eq!(sources1.len(), 1);
+        prop_assert_eq!(sources2.len(), 1);
+        prop_assert_eq!(&sources1[0].path, &path);
+        prop_assert_eq!(&sources2[0].path, &path);
+        prop_assert_eq!(sources1[0].is_sys_source, sources2[0].is_sys_source);
+        prop_assert_eq!(sources1[0].local, sources2[0].local);
+        prop_assert_eq!(sources1[0].chdir, sources2[0].chdir);
+    }
+}
+
+// ============================================================================
+// Property 15: Named Argument Source Detection
+// Validates: Requirements 4.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 15: For any source() call using source(file = "path.R") syntax,
+    /// the Source_Detector SHALL extract "path.R" as the path.
+    #[test]
+    fn prop_named_argument_source_detection(path in relative_path()) {
+        let code = format!("source(file = \"{}\")", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(&sources[0].path, &path);
+    }
+
+    /// Property 15 extended: Named argument with other arguments
+    #[test]
+    fn prop_named_argument_with_other_args(path in relative_path()) {
+        let code = format!("source(file = \"{}\", local = TRUE)", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(&sources[0].path, &path);
+        prop_assert!(sources[0].local);
+    }
+}
+
+// ============================================================================
+// Property 16: sys.source Detection
+// Validates: Requirements 4.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 16: For any sys.source() call with a string literal path,
+    /// the Source_Detector SHALL extract the path and mark is_sys_source as true.
+    #[test]
+    fn prop_sys_source_detection(path in relative_path()) {
+        let code = format!("sys.source(\"{}\", envir = globalenv())", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(&sources[0].path, &path);
+        prop_assert!(sources[0].is_sys_source);
+    }
+
+    /// Property 16 extended: sys.source with single quotes
+    #[test]
+    fn prop_sys_source_single_quotes(path in relative_path()) {
+        let code = format!("sys.source('{}', envir = globalenv())", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(&sources[0].path, &path);
+        prop_assert!(sources[0].is_sys_source);
+    }
+}
+
+// ============================================================================
+// Property 17: Dynamic Path Graceful Handling
+// Validates: Requirements 4.5, 4.6
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 17: For any source() call where the path argument is a variable,
+    /// the Source_Detector SHALL not extract a path and SHALL not emit an error.
+    #[test]
+    fn prop_dynamic_path_variable_skipped(varname in "[a-zA-Z][a-zA-Z0-9_]{0,10}") {
+        let code = format!("source({})", varname);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        // Should skip, not error
+        prop_assert_eq!(sources.len(), 0);
+    }
+
+    /// Property 17 extended: paste0() calls should be skipped
+    #[test]
+    fn prop_dynamic_path_paste0_skipped(
+        prefix in "[a-zA-Z]{1,5}",
+        varname in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+    ) {
+        let code = format!("source(paste0(\"{}/\", {}))", prefix, varname);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 0);
+    }
+
+    /// Property 17 extended: Expression paths should be skipped
+    #[test]
+    fn prop_dynamic_path_expression_skipped(
+        base in "[a-zA-Z]{1,5}",
+        suffix in "[a-zA-Z]{1,5}"
+    ) {
+        let code = format!("source(paste({}, \"{}\"))", base, suffix);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 0);
+    }
+}
+
+// ============================================================================
+// Property 18: Source Call Parameter Extraction
+// Validates: Requirements 4.7, 4.8
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 18: For any source() call with local = TRUE, the extracted
+    /// SourceCall SHALL have local = true.
+    #[test]
+    fn prop_source_local_true_extraction(path in relative_path()) {
+        let code = format!("source(\"{}\", local = TRUE)", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert!(sources[0].local);
+    }
+
+    /// Property 18 extended: local = FALSE should have local = false
+    #[test]
+    fn prop_source_local_false_extraction(path in relative_path()) {
+        let code = format!("source(\"{}\", local = FALSE)", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert!(!sources[0].local);
+    }
+
+    /// Property 18: For any source() call with chdir = TRUE, the extracted
+    /// SourceCall SHALL have chdir = true.
+    #[test]
+    fn prop_source_chdir_true_extraction(path in relative_path()) {
+        let code = format!("source(\"{}\", chdir = TRUE)", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert!(sources[0].chdir);
+    }
+
+    /// Property 18 extended: chdir = FALSE should have chdir = false
+    #[test]
+    fn prop_source_chdir_false_extraction(path in relative_path()) {
+        let code = format!("source(\"{}\", chdir = FALSE)", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert!(!sources[0].chdir);
+    }
+
+    /// Property 18 extended: Both local and chdir together
+    #[test]
+    fn prop_source_local_and_chdir_extraction(path in relative_path()) {
+        let code = format!("source(\"{}\", local = TRUE, chdir = TRUE)", path);
+        let tree = parse_r(&code);
+        let sources = detect_source_calls(&tree, &code);
+
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert!(sources[0].local);
+        prop_assert!(sources[0].chdir);
+    }
+}
+
+// ============================================================================
+// Property 11: Relative Path Resolution
+// Validates: Requirements 1.8, 1.9, 3.9
+// ============================================================================
+
+use super::path_resolve::resolve_path;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 11: For any file at path /a/b/c.R and relative directive path ../d/e.R,
+    /// the Path_Resolver SHALL resolve to /a/d/e.R.
+    #[test]
+    fn prop_relative_path_resolution(
+        dir_a in path_component(),
+        dir_b in path_component(),
+        dir_c in path_component(),
+        dir_d in path_component(),
+        file_e in path_component()
+    ) {
+        let file_path = PathBuf::from(format!("/{}/{}/{}/main.R", dir_a, dir_b, dir_c));
+        let workspace_root = PathBuf::from(format!("/{}", dir_a));
+
+        let ctx = PathContext {
+            file_path,
+            working_directory: None,
+            inherited_working_directory: None,
+            workspace_root: Some(workspace_root),
+        };
+
+        let relative_path = format!("../{}/{}.R", dir_d, file_e);
+        let resolved = resolve_path(&relative_path, &ctx);
+
+        prop_assert!(resolved.is_some());
+        let resolved = resolved.unwrap();
+
+        // Should resolve to /dir_a/dir_b/dir_d/file_e.R
+        let expected = PathBuf::from(format!("/{}/{}/{}/{}.R", dir_a, dir_b, dir_d, file_e));
+        prop_assert_eq!(resolved, expected);
+    }
+
+    /// Property 11 extended: Multiple parent directory navigation
+    #[test]
+    fn prop_multiple_parent_navigation(
+        dir_a in path_component(),
+        dir_b in path_component(),
+        dir_c in path_component(),
+        file in path_component()
+    ) {
+        let file_path = PathBuf::from(format!("/{}/{}/{}/main.R", dir_a, dir_b, dir_c));
+        let workspace_root = PathBuf::from(format!("/{}", dir_a));
+
+        let ctx = PathContext {
+            file_path,
+            working_directory: None,
+            inherited_working_directory: None,
+            workspace_root: Some(workspace_root),
+        };
+
+        // Go up two levels
+        let relative_path = format!("../../{}.R", file);
+        let resolved = resolve_path(&relative_path, &ctx);
+
+        prop_assert!(resolved.is_some());
+        let resolved = resolved.unwrap();
+
+        // Should resolve to /dir_a/file.R
+        let expected = PathBuf::from(format!("/{}/{}.R", dir_a, file));
+        prop_assert_eq!(resolved, expected);
+    }
+}
+
+// ============================================================================
+// Property 13: Working Directory Inheritance
+// Validates: Requirements 3.11
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 13: For any source chain A → B → C where only A has a working directory
+    /// directive, files B and C SHALL inherit A's working directory for path resolution.
+    #[test]
+    fn prop_working_directory_inheritance(
+        workspace in path_component(),
+        wd_dir in path_component(),
+        file_b in path_component(),
+        file_c in path_component()
+    ) {
+        let workspace_root = PathBuf::from(format!("/{}", workspace));
+        let working_dir = PathBuf::from(format!("/{}/{}", workspace, wd_dir));
+
+        // File A has explicit working directory
+        let ctx_a = PathContext {
+            file_path: PathBuf::from(format!("/{}/src/a.R", workspace)),
+            working_directory: Some(working_dir.clone()),
+            inherited_working_directory: None,
+            workspace_root: Some(workspace_root.clone()),
+        };
+
+        // File B inherits from A (via child_context)
+        let ctx_b = ctx_a.child_context(&PathBuf::from(format!("/{}/src/{}.R", workspace, file_b)));
+
+        // File C inherits from B (which inherited from A)
+        let ctx_c = ctx_b.child_context(&PathBuf::from(format!("/{}/src/{}.R", workspace, file_c)));
+
+        // All should have the same effective working directory
+        prop_assert_eq!(ctx_a.effective_working_directory(), working_dir.clone());
+        prop_assert_eq!(ctx_b.effective_working_directory(), working_dir.clone());
+        prop_assert_eq!(ctx_c.effective_working_directory(), working_dir);
+    }
+
+    /// Property 13 extended: chdir=TRUE breaks inheritance
+    #[test]
+    fn prop_chdir_breaks_inheritance(
+        workspace in path_component(),
+        wd_dir in path_component(),
+        child_dir in path_component()
+    ) {
+        let workspace_root = PathBuf::from(format!("/{}", workspace));
+        let working_dir = PathBuf::from(format!("/{}/{}", workspace, wd_dir));
+        let child_path = PathBuf::from(format!("/{}/{}/child.R", workspace, child_dir));
+
+        // Parent has explicit working directory
+        let ctx_parent = PathContext {
+            file_path: PathBuf::from(format!("/{}/src/parent.R", workspace)),
+            working_directory: Some(working_dir.clone()),
+            inherited_working_directory: None,
+            workspace_root: Some(workspace_root.clone()),
+        };
+
+        // Child with chdir=TRUE gets its own directory as working directory
+        let ctx_child = ctx_parent.child_context_with_chdir(&child_path);
+
+        // Child's effective working directory should be its own directory, not parent's
+        let expected_child_wd = PathBuf::from(format!("/{}/{}", workspace, child_dir));
+        prop_assert_eq!(ctx_child.effective_working_directory(), expected_child_wd);
+    }
+}
+
+// ============================================================================
+// Property 14: Default Working Directory
+// Validates: Requirements 3.12
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 14: For any file at path /a/b/c.R with no working directory directive
+    /// and no inherited working directory, the effective working directory SHALL be /a/b/.
+    #[test]
+    fn prop_default_working_directory(
+        dir_a in path_component(),
+        dir_b in path_component(),
+        file in path_component()
+    ) {
+        let file_path = PathBuf::from(format!("/{}/{}/{}.R", dir_a, dir_b, file));
+
+        let ctx = PathContext {
+            file_path,
+            working_directory: None,
+            inherited_working_directory: None,
+            workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
+        };
+
+        let expected = PathBuf::from(format!("/{}/{}", dir_a, dir_b));
+        prop_assert_eq!(ctx.effective_working_directory(), expected);
+    }
+
+    /// Property 14 extended: Explicit working directory takes precedence
+    #[test]
+    fn prop_explicit_wd_takes_precedence(
+        dir_a in path_component(),
+        dir_b in path_component(),
+        explicit_wd in path_component()
+    ) {
+        let file_path = PathBuf::from(format!("/{}/{}/main.R", dir_a, dir_b));
+        let explicit_working_dir = PathBuf::from(format!("/{}/{}", dir_a, explicit_wd));
+
+        let ctx = PathContext {
+            file_path,
+            working_directory: Some(explicit_working_dir.clone()),
+            inherited_working_directory: Some(PathBuf::from(format!("/{}/inherited", dir_a))),
+            workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
+        };
+
+        // Explicit should take precedence over inherited
+        prop_assert_eq!(ctx.effective_working_directory(), explicit_working_dir);
+    }
+
+    /// Property 14 extended: Inherited takes precedence over default
+    #[test]
+    fn prop_inherited_wd_takes_precedence(
+        dir_a in path_component(),
+        dir_b in path_component(),
+        inherited_wd in path_component()
+    ) {
+        let file_path = PathBuf::from(format!("/{}/{}/main.R", dir_a, dir_b));
+        let inherited_working_dir = PathBuf::from(format!("/{}/{}", dir_a, inherited_wd));
+
+        let ctx = PathContext {
+            file_path,
+            working_directory: None,
+            inherited_working_directory: Some(inherited_working_dir.clone()),
+            workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
+        };
+
+        // Inherited should take precedence over default (file's directory)
+        prop_assert_eq!(ctx.effective_working_directory(), inherited_working_dir);
+    }
+}

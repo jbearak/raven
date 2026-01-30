@@ -84,23 +84,23 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Mark `is_sys_source` flag appropriately
     - _Requirements: 4.1-4.8_
 
-  - [ ] 3.2 Write property test for quote style equivalence
+  - [x] 3.2 Write property test for quote style equivalence
     - **Property 3: Quote Style Equivalence for Source Detection**
     - **Validates: Requirements 4.1, 4.2**
 
-  - [ ] 3.3 Write property test for named argument source detection
+  - [x] 3.3 Write property test for named argument source detection
     - **Property 15: Named Argument Source Detection**
     - **Validates: Requirements 4.3**
 
-  - [ ] 3.4 Write property test for sys.source detection
+  - [x] 3.4 Write property test for sys.source detection
     - **Property 16: sys.source Detection**
     - **Validates: Requirements 4.4**
 
-  - [ ] 3.5 Write property test for dynamic path graceful handling
+  - [x] 3.5 Write property test for dynamic path graceful handling
     - **Property 17: Dynamic Path Graceful Handling**
     - **Validates: Requirements 4.5, 4.6**
 
-  - [ ] 3.6 Write property test for source call parameter extraction
+  - [x] 3.6 Write property test for source call parameter extraction
     - **Property 18: Source Call Parameter Extraction**
     - **Validates: Requirements 4.7, 4.8**
 
@@ -114,15 +114,15 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Implement `chdir=TRUE` working-directory override during child traversal (restore parent context after returning)
     - _Requirements: 1.8, 1.9, 3.9-3.12, 4.8_
 
-  - [ ] 4.2 Write property test for relative path resolution
+  - [x] 4.2 Write property test for relative path resolution
     - **Property 11: Relative Path Resolution**
     - **Validates: Requirements 1.8, 1.9, 3.9**
 
-  - [ ] 4.3 Write property test for working directory inheritance
+  - [x] 4.3 Write property test for working directory inheritance
     - **Property 13: Working Directory Inheritance**
     - **Validates: Requirements 3.11**
 
-  - [ ] 4.4 Write property test for default working directory
+  - [x] 4.4 Write property test for default working directory
     - **Property 14: Default Working Directory**
     - **Validates: Requirements 3.12**
 
