@@ -1,0 +1,10 @@
+    async fn initialized(&self, _: InitializedParams) {
+        log::info!("ark-lsp initialized");
+        
+        let mut state = self.state.write().await;
+        eprintln!("Before indexing:");
+        state.debug_state();
+        state.index_workspace();
+        eprintln!("After indexing:");
+        state.debug_state();
+    }

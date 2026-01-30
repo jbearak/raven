@@ -1,0 +1,8 @@
+target/
+node_modules/
+dist/
+out/
+*.vsix
+.vscode-test/
+bin/rlsp
+bin/rlsp.exe

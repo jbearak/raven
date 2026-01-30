@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-lsp:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            use-zigbuild: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            use-zigbuild: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+            use-zigbuild: false
+          - os: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            platform: windows-x64
+            use-zigbuild: false
+          - os: ubuntu-latest
+            target: aarch64-pc-windows-gnullvm
+            platform: windows-arm64
+            use-zigbuild: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        if: matrix.use-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Install cross
+        if: contains(matrix.target, 'windows')
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build LSP
+        run: |
+          if [ "${{ matrix.use-zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }} --bin rlsp
+          elif [ "${{ contains(matrix.target, 'windows') }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --bin rlsp
+          else
+            cargo build --release --target ${{ matrix.target }} --bin rlsp
+          fi
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
+            cp target/${{ matrix.target }}/release/rlsp.exe dist/
+            cp LICENSE dist/
+            cd dist && zip -r ../rlsp-${{ matrix.platform }}.zip .
+          else
+            cp target/${{ matrix.target }}/release/rlsp dist/
+            cp LICENSE dist/
+            cd dist && zip -r ../rlsp-${{ matrix.platform }}.zip .
+          fi
+
+      - name: Upload LSP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsp-${{ matrix.platform }}
+          path: rlsp-${{ matrix.platform }}.zip
+
+  build-vscode:
+    needs: build-lsp
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [darwin-arm64, linux-x64, linux-arm64, win32-x64, win32-arm64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Download LSP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lsp-*
+          path: lsp-binaries
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update package.json version
+        run: |
+          cd vscode-extension
+          npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+
+      - name: Install dependencies
+        run: |
+          cd vscode-extension
+          npm install
+
+      - name: Compile extension
+        run: |
+          cd vscode-extension
+          npm run compile
+
+      - name: Copy LSP binary
+        run: |
+          cd vscode-extension
+          mkdir -p bin
+          case "${{ matrix.target }}" in
+            darwin-arm64) cp ../lsp-binaries/lsp-macos-arm64/rlsp-macos-arm64.zip bin/ && cd bin && unzip rlsp-macos-arm64.zip && mv rlsp rlsp-server ;;
+            linux-x64) cp ../lsp-binaries/lsp-linux-x64/rlsp-linux-x64.zip bin/ && cd bin && unzip rlsp-linux-x64.zip && mv rlsp rlsp-server ;;
+            linux-arm64) cp ../lsp-binaries/lsp-linux-arm64/rlsp-linux-arm64.zip bin/ && cd bin && unzip rlsp-linux-arm64.zip && mv rlsp rlsp-server ;;
+            win32-x64) cp ../lsp-binaries/lsp-windows-x64/rlsp-windows-x64.zip bin/ && cd bin && unzip rlsp-windows-x64.zip && mv rlsp.exe rlsp-server.exe ;;
+            win32-arm64) cp ../lsp-binaries/lsp-windows-arm64/rlsp-windows-arm64.zip bin/ && cd bin && unzip rlsp-windows-arm64.zip && mv rlsp.exe rlsp-server.exe ;;
+          esac
+
+      - name: Package extension
+        run: |
+          cd vscode-extension
+          vsce package --target ${{ matrix.target }}
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-${{ matrix.target }}
+          path: vscode-extension/*.vsix
+
+  release:
+    needs: [build-lsp, build-vscode]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release v${{ steps.version.outputs.version }}
+          files: |
+            artifacts/lsp-*/rlsp-*.zip
+            artifacts/vscode-*/*.vsix
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/rlsp"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Jonathan Marc Bearak <jbearak@gmail.com>"]
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+tower-lsp = "0.20"

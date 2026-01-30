@@ -1,0 +1,69 @@
+{
+  "name": "rlsp",
+  "displayName": "Rlsp - Static R Language Server",
+  "description": "Static R language support with workspace symbol indexing",
+  "version": "0.1.0",
+  "publisher": "jbearak",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jbearak/Rlsp"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": [
+    "onLanguage:r"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "r",
+        "aliases": ["R", "r"],
+        "extensions": [".r", ".R", ".rmd", ".Rmd", ".qmd"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Rlsp",
+      "properties": {
+        "rlsp.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to rlsp binary. If empty, uses bundled binary."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "vscode-test",
+    "package": "npm run compile && node scripts/bundle.js && vsce package",
+    "package:target": "npm run compile && node scripts/bundle.js && vsce package --target"
+  },
+  "files": [
+    "out/**",
+    "bin/**",
+    "node_modules/**",
+    "language-configuration.json"
+  ],
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.1",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.75.0",
+    "@vscode/test-cli": "^0.0.8",
+    "@vscode/test-electron": "^2.3.9",
+    "@vscode/vsce": "^2.22.0",
+    "mocha": "^10.2.0",
+    "typescript": "^5.0.0"
+  }
+}
