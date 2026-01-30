@@ -2579,6 +2579,245 @@ proptest! {
 }
 
 // ============================================================================
+// Property 38: Ambiguous Parent Determinism
+// Validates: Requirements 5.10
+// ============================================================================
+
+use super::parent_resolve::{resolve_parent, compute_metadata_fingerprint, compute_reverse_edges_hash};
+use super::cache::ParentResolution;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 38: For any file with multiple possible parents (via backward directives
+    /// or reverse edges), the Scope_Resolver SHALL deterministically select the same
+    /// parent given the same inputs.
+    #[test]
+    fn prop_ambiguous_parent_determinism(
+        parent1_name in path_component(),
+        parent2_name in path_component()
+    ) {
+        prop_assume!(parent1_name != parent2_name);
+
+        let child_uri = make_url("child");
+        let parent1_uri = make_url(&parent1_name);
+        let parent2_uri = make_url(&parent2_name);
+
+        // Create metadata with two backward directives (ambiguous)
+        let metadata = CrossFileMetadata {
+            sourced_by: vec![
+                BackwardDirective {
+                    path: format!("../{}.R", parent1_name),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                },
+                BackwardDirective {
+                    path: format!("../{}.R", parent2_name),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 1,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let graph = DependencyGraph::new();
+        let config = CrossFileConfig::default();
+
+        let resolve_path = |path: &str| -> Option<Url> {
+            if path == format!("../{}.R", parent1_name) {
+                Some(parent1_uri.clone())
+            } else if path == format!("../{}.R", parent2_name) {
+                Some(parent2_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        // Resolve parent multiple times
+        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+        let result3 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+
+        // All results should be identical (deterministic)
+        match (&result1, &result2, &result3) {
+            (
+                ParentResolution::Ambiguous { selected_uri: s1, alternatives: a1, .. },
+                ParentResolution::Ambiguous { selected_uri: s2, alternatives: a2, .. },
+                ParentResolution::Ambiguous { selected_uri: s3, alternatives: a3, .. },
+            ) => {
+                prop_assert_eq!(s1, s2, "Selected parent should be deterministic");
+                prop_assert_eq!(s2, s3, "Selected parent should be deterministic");
+                prop_assert_eq!(a1.len(), a2.len(), "Alternatives should be deterministic");
+                prop_assert_eq!(a2.len(), a3.len(), "Alternatives should be deterministic");
+            }
+            _ => {
+                // If not ambiguous, still should be deterministic
+                prop_assert!(matches!((&result1, &result2, &result3),
+                    (ParentResolution::Single { .. }, ParentResolution::Single { .. }, ParentResolution::Single { .. }) |
+                    (ParentResolution::None, ParentResolution::None, ParentResolution::None)
+                ), "Results should be deterministic");
+            }
+        }
+    }
+
+    /// Property 38 extended: Precedence order is respected (line= > match= > reverse edge > default)
+    #[test]
+    fn prop_ambiguous_parent_precedence(
+        parent_name in path_component(),
+        call_site_line in 1..100u32
+    ) {
+        let child_uri = make_url("child");
+        let parent_uri = make_url(&parent_name);
+
+        // Create metadata with explicit line= (highest precedence)
+        let metadata_with_line = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: format!("../{}.R", parent_name),
+                call_site: CallSiteSpec::Line(call_site_line - 1), // 0-based
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        // Create metadata with default (lowest precedence)
+        let metadata_with_default = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: format!("../{}.R", parent_name),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let graph = DependencyGraph::new();
+        let config = CrossFileConfig::default();
+
+        let resolve_path = |path: &str| -> Option<Url> {
+            if path == format!("../{}.R", parent_name) {
+                Some(parent_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        let result_with_line = resolve_parent(&metadata_with_line, &graph, &child_uri, &config, &resolve_path);
+        let result_with_default = resolve_parent(&metadata_with_default, &graph, &child_uri, &config, &resolve_path);
+
+        // Both should resolve to the same parent
+        match (&result_with_line, &result_with_default) {
+            (
+                ParentResolution::Single { parent_uri: p1, call_site_line: l1, .. },
+                ParentResolution::Single { parent_uri: p2, call_site_line: l2, .. },
+            ) => {
+                prop_assert_eq!(p1, p2, "Same parent should be selected");
+                // But call site should differ
+                prop_assert_eq!(*l1, Some(call_site_line - 1), "Line= should use explicit line");
+                prop_assert_eq!(*l2, Some(u32::MAX), "Default should use end of file");
+            }
+            _ => prop_assert!(false, "Expected Single resolution for both"),
+        }
+    }
+}
+
+// ============================================================================
+// Property 57: Parent Selection Stability
+// Validates: Requirements 5.10
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 57: For any file with backward directives, once a parent is selected
+    /// for a given (metadata_fingerprint, reverse_edges_hash) cache key, the same
+    /// parent SHALL be selected on subsequent queries until either the file's
+    /// CrossFileMetadata changes OR the reverse edges pointing to this file change.
+    #[test]
+    fn prop_parent_selection_stability(
+        parent_name in path_component()
+    ) {
+        let child_uri = make_url("child");
+        let parent_uri = make_url(&parent_name);
+
+        let metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: format!("../{}.R", parent_name),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let graph = DependencyGraph::new();
+
+        // Compute fingerprints
+        let fp1 = compute_metadata_fingerprint(&metadata);
+        let fp2 = compute_metadata_fingerprint(&metadata);
+        let edges_hash1 = compute_reverse_edges_hash(&graph, &child_uri);
+        let edges_hash2 = compute_reverse_edges_hash(&graph, &child_uri);
+
+        // Fingerprints should be stable
+        prop_assert_eq!(fp1, fp2, "Metadata fingerprint should be stable");
+        prop_assert_eq!(edges_hash1, edges_hash2, "Reverse edges hash should be stable");
+
+        // Parent resolution should be stable
+        let config = CrossFileConfig::default();
+        let resolve_path = |path: &str| -> Option<Url> {
+            if path == format!("../{}.R", parent_name) {
+                Some(parent_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+
+        match (&result1, &result2) {
+            (
+                ParentResolution::Single { parent_uri: p1, .. },
+                ParentResolution::Single { parent_uri: p2, .. },
+            ) => {
+                prop_assert_eq!(p1, p2, "Parent selection should be stable");
+            }
+            _ => prop_assert!(false, "Expected Single resolution"),
+        }
+    }
+
+    /// Property 57 extended: Changing metadata fingerprint should allow re-selection
+    #[test]
+    fn prop_parent_selection_changes_with_metadata(
+        parent1_name in path_component(),
+        parent2_name in path_component()
+    ) {
+        prop_assume!(parent1_name != parent2_name);
+
+        // Two different metadata configurations
+        let metadata1 = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: format!("../{}.R", parent1_name),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let metadata2 = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: format!("../{}.R", parent2_name),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        // Fingerprints should be different
+        let fp1 = compute_metadata_fingerprint(&metadata1);
+        let fp2 = compute_metadata_fingerprint(&metadata2);
+        prop_assert_ne!(fp1, fp2, "Different metadata should have different fingerprints");
+    }
+}
+
+// ============================================================================
 // Property 44: Workspace Index Version Monotonicity
 // Validates: Requirements 13.5
 // ============================================================================

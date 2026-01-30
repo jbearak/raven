@@ -300,11 +300,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 37: Multiple Source Calls - Earliest Call Site**
     - **Validates: Requirements 5.9**
 
-  - [ ] 11.3 Write property test for ambiguous parent determinism
+  - [x] 11.3 Write property test for ambiguous parent determinism
     - **Property 38: Ambiguous Parent Determinism**
     - **Validates: Requirements 5.10**
 
-  - [ ] 11.4 Write property test for parent selection stability
+  - [x] 11.4 Write property test for parent selection stability
     - **Property 57: Parent Selection Stability**
     - **Validates: Requirements 5.10**
 
