@@ -24,9 +24,12 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Support all working directory directive synonyms
     - Support forward directives (`@lsp-source`)
     - Support ignore directives (`@lsp-ignore`, `@lsp-ignore-next`)
+    - Support global directive syntax rules:
+      - optional colon after directive name for all directives
+      - optional quoting around paths for path-taking directives
     - Extract `line=` and `match=` parameters from backward directives
     - Convert 1-based `line=` to 0-based internal representation
-    - _Requirements: 1.1-1.8, 2.1-2.5, 3.1-3.10_
+    - _Requirements: 0a, 1.1-1.8, 2.1-2.5, 3.1-3.10_
 
   - [ ] 2.2 Write property test for directive parsing
     - **Property 1: Backward Directive Synonym Equivalence**

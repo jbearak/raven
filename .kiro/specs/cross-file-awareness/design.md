@@ -215,7 +215,23 @@ pub trait CrossFileExtractor {
 }
 ```
 
-#### Directive Synonym Forms
+#### Directive Syntax and Synonym Forms
+
+The directive parser MUST be ergonomic and accept multiple equivalent forms.
+
+**Colon is optional for all directives** (even those without a path argument):
+- `# @lsp-ignore` and `# @lsp-ignore:`
+- `# @lsp-ignore-next` and `# @lsp-ignore-next:`
+- `# @lsp-source path.R` and `# @lsp-source: path.R`
+
+**Quotes around paths are optional** (for directives that take a path; both single and double quotes are allowed):
+- `# @lsp-source path.R`
+- `# @lsp-source "path.R"`
+- `# @lsp-source 'path.R'`
+- `# @lsp-working-directory: "/data/scripts"`
+
+**Whitespace is flexible**:
+- The parser SHOULD tolerate extra spaces around `:` and between tokens.
 
 The directive parser MUST recognize multiple synonym forms for each directive type to improve ergonomics:
 
@@ -244,18 +260,24 @@ The directive parser MUST recognize multiple synonym forms for each directive ty
 **Workspace-Root-Relative Paths:**
 Paths starting with `/` are treated as workspace-root-relative, NOT filesystem-absolute. This convention allows portable references to workspace-level directories.
 
-Example:
+Example (all equivalent):
 ```r
+# @lsp-working-directory /data/scripts
 # @lsp-working-directory: /data/scripts
+# @lsp-working-directory "/data/scripts"
+# @lsp-working-directory: "/data/scripts"
 ```
 Resolves to `<workspaceRoot>/data/scripts`, not the filesystem root `/data/scripts`.
 
 **File-Relative Paths:**
 Paths not starting with `/` are resolved relative to the file's containing directory.
 
-Example:
+Example (all equivalent):
 ```r
+# @lsp-working-directory ../shared
 # @lsp-working-directory: ../shared
+# @lsp-working-directory "../shared"
+# @lsp-working-directory: "../shared"
 ```
 Resolves to the `shared` directory one level up from the current file's directory.
 
@@ -791,7 +813,10 @@ Key rule: **Never spawn background work that holds a borrowed `&mut WorldState`*
 
 To support concurrent editing and to prevent publishing stale diagnostics:
 - Each open `Document` MUST store the LSP `TextDocumentItem.version` (monotonic per document while open).
-- Any debounced/background diagnostics task MUST capture a trigger version (or content hash) and MUST re-check it before publishing.
+- Each open `Document` MUST expose a stable content revision identifier (e.g., `contents_hash()` or a monotonically increasing in-memory revision counter).
+  - This revision identifier MUST change whenever the document contents change.
+  - It MUST be available even when `version` is absent.
+- Any debounced/background diagnostics task MUST capture a trigger revision snapshot (version + content revision) and MUST re-check it before computing and before publishing.
 - If the document is no longer open, tasks MUST no-op.
 
 **Implementation Note (rlsp-specific):**
@@ -803,13 +828,25 @@ pub struct Document {
     pub tree: Option<Tree>,
     pub loaded_packages: Vec<String>,
     pub version: Option<i32>,  // NEW: LSP document version for freshness/monotonicity
+    revision: u64,              // NEW: Monotonic content revision counter (increments on every change)
+}
+
+impl Document {
+    /// Returns a stable hash/revision of the document's current contents.
+    /// This is used for freshness guards in debounced diagnostics tasks.
+    /// 
+    /// IMPORTANT: The revision MUST change whenever contents change, even if version is absent.
+    /// For simplicity, this can be implemented as a monotonic counter incremented on every change.
+    pub fn contents_hash(&self) -> u64 {
+        self.revision
+    }
 }
 ```
 
 Update points:
-- `Document::new()`: accept version parameter, store it
+- `Document::new()`: accept version parameter, store it; initialize `revision` to 0
 - `did_open`: pass `params.text_document.version` to `open_document()`
-- `did_change`: update `doc.version` from `params.text_document.version`
+- `did_change`: update `doc.version` from `params.text_document.version`; increment `doc.revision`
 - `did_close`: clear diagnostics gate state (already specified in `on_did_close()`)
 
 #### Diagnostics Publish Gating (Required)
@@ -1243,7 +1280,9 @@ pub async fn schedule_diagnostics_debounced(
     is_dependency_triggered: bool, // true if triggered by dependency change, not direct edit
 ) {
     // Single write-lock pass to compute prioritized work list and mark force republish
-    let work_items: Vec<(Url, Option<i32>, bool)> = {
+    //
+    // work_items include a revision snapshot (version + content hash) for freshness guarding.
+    let work_items: Vec<(Url, Option<i32>, Option<u64>, bool)> = {
         let mut st = state_arc.write().await;
         
         // Read activity state for prioritization (Requirement 15)
@@ -1266,19 +1305,23 @@ pub async fn schedule_diagnostics_debounced(
             );
         }
 
-        // Build work items with trigger versions
+// Build work items with trigger revision snapshot.
+        //
+        // NOTE: For open documents, we expect a document version in normal LSP flows,
+        // but the freshness guard MUST also include a content hash.
         affected.into_iter()
             .take(max_to_schedule)
             .map(|uri| {
                 let is_dep_triggered = is_dependency_triggered && uri != trigger_uri;
                 let trigger_version = st.documents.get(&uri).and_then(|d| d.version);
-                
+                let trigger_hash = st.documents.get(&uri).map(|d| d.contents_hash());
+
                 // Mark for force republish if dependency-triggered (Requirement 0.8)
                 if is_dep_triggered {
                     st.cross_file_diagnostics_gate.mark_force_republish(&uri);
                 }
-                
-                (uri, trigger_version, is_dep_triggered)
+
+                (uri, trigger_version, trigger_hash, is_dep_triggered)
             })
             .collect()
     };
@@ -1289,7 +1332,7 @@ pub async fn schedule_diagnostics_debounced(
         st.cross_file_revalidation.debounce_ms
     };
 
-    for (uri, trigger_version, _is_dep_triggered) in work_items {
+for (uri, trigger_version, trigger_hash, _is_dep_triggered) in work_items {
         let state_arc2 = state_arc.clone();
         let client2 = client.clone();
         let uri2 = uri.clone();
@@ -1307,18 +1350,25 @@ pub async fn schedule_diagnostics_debounced(
                 _ = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {}
             }
 
-            // 3) Freshness guard + monotonic publish check (Requirements 0.6, 0.7)
+// 3) Freshness guard + monotonic publish check (Requirements 0.6, 0.7)
             // Use read lock for diagnostics computation
+            //
+            // IMPORTANT: Freshness MUST be guarded by (version, content_hash).
+            // Version alone is insufficient (dependency-triggered republish may be same-version;
+            // and some clients may omit versions).
             let diagnostics_opt = {
                 let st = state_arc2.read().await;
+
                 let current_version = st.documents.get(&uri2).and_then(|d| d.version);
-                
-                // Check freshness: version must match trigger version
-                if current_version != trigger_version {
-                    log::trace!("Skipping stale diagnostics for {}: version changed", uri2);
-                    return; // stale
+                let current_hash = st.documents.get(&uri2).map(|d| d.contents_hash());
+
+                // Check freshness: both version (when present) AND content hash must match.
+                // If version is None, only content hash is used.
+                if current_version != trigger_version || current_hash != trigger_hash {
+                    log::trace!("Skipping stale diagnostics for {}: revision changed", uri2);
+                    return;
                 }
-                
+
                 // Check monotonic publishing gate (Requirement 0.7)
                 if let Some(ver) = current_version {
                     if !st.cross_file_diagnostics_gate.can_publish(&uri2, ver) {
@@ -1326,11 +1376,28 @@ pub async fn schedule_diagnostics_debounced(
                         return;
                     }
                 }
-                
+
                 Some(handlers::diagnostics(&st, &uri2))
             };
 
             if let Some(diagnostics) = diagnostics_opt {
+                // SECOND freshness check: guard against revision changes during diagnostics computation.
+                {
+                    let st = state_arc2.read().await;
+                    let current_version = st.documents.get(&uri2).and_then(|d| d.version);
+                    let current_hash = st.documents.get(&uri2).map(|d| d.contents_hash());
+                    if current_version != trigger_version || current_hash != trigger_hash {
+                        log::trace!("Skipping stale diagnostics publish for {}: revision changed during computation", uri2);
+                        return;
+                    }
+                    if let Some(ver) = current_version {
+                        if !st.cross_file_diagnostics_gate.can_publish(&uri2, ver) {
+                            log::trace!("Skipping diagnostics for {}: monotonic gate (pre-publish)", uri2);
+                            return;
+                        }
+                    }
+                }
+
                 client2.publish_diagnostics(uri2.clone(), diagnostics, None).await;
                 
                 // Record successful publish (brief write lock)
@@ -1461,58 +1528,91 @@ pub enum ParentResolution {
 
 
 ```rust
-/// Resolve parent for a file with backward directives
+/// Resolve parent for a file with backward directives.
+///
+/// IMPORTANT: This implementation MUST respect the documented precedence order:
+/// 1) backward directive with explicit line=
+/// 2) backward directive with explicit match=
+/// 3) reverse-dependency edge with known full call site
+/// 4) other candidates (no call site)
+/// 5) deterministic tiebreak: lexicographic by URI
 pub fn resolve_parent(
     metadata: &CrossFileMetadata,
     graph: &DependencyGraph,
     uri: &Url,
     config: &CrossFileConfig,
 ) -> ParentResolution {
-    // Collect all possible parents with full position info
-    let mut parents: Vec<(Url, Option<CallSitePosition>)> = Vec::new();
-    
+    #[derive(Debug, Clone)]
+    struct Candidate {
+        parent: Url,
+        call_site: Option<CallSitePosition>,
+        precedence: u8,
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+
     // From backward directives
     for directive in &metadata.sourced_by {
         if let Some(parent_uri) = resolve_path(&directive.path, uri) {
-            let call_site = match &directive.call_site {
-                CallSiteSpec::Line(n) => Some(CallSitePosition::from_user_line(*n)),
-                CallSiteSpec::Match(pattern) => {
-                    // Try to find matching line in parent, returns full position
-                    find_matching_position(&parent_uri, pattern)
-                }
-                CallSiteSpec::Default => None,
+            let (call_site, precedence) = match &directive.call_site {
+                CallSiteSpec::Line(n) => (Some(CallSitePosition::from_user_line(*n)), 0),
+                CallSiteSpec::Match(pattern) => (find_matching_position(&parent_uri, pattern), 1),
+                CallSiteSpec::Default => (None, 3),
             };
-            parents.push((parent_uri, call_site));
+            candidates.push(Candidate {
+                parent: parent_uri,
+                call_site,
+                precedence,
+            });
         }
     }
-    
+
     // From reverse dependency edges (forward resolution found us)
     // All edges in the graph are forward edges; we look up edges where this file is `to`
     for edge in graph.get_dependents(uri) {
         let call_site = match (edge.call_site_line, edge.call_site_column) {
             (Some(line), Some(col)) => Some(CallSitePosition::new(line, col)),
-            (Some(line), None) => Some(CallSitePosition::new(line, 0)),
             _ => None,
         };
-        let entry = (edge.from.clone(), call_site);
-        if !parents.iter().any(|(u, _)| u == &edge.from) {
-            parents.push(entry);
+
+        // Only treat as the "known call site" precedence if we have both line+col.
+        // Line-only is not sufficient for same-line correctness.
+        let precedence = if call_site.is_some() { 2 } else { 3 };
+
+        // Avoid duplicates by parent URI (best-effort); keep the best (lowest precedence)
+        // if the same parent appears multiple times.
+        let parent_uri = edge.from.clone();
+        if let Some(existing) = candidates.iter_mut().find(|c| c.parent == parent_uri) {
+            if precedence < existing.precedence {
+                existing.precedence = precedence;
+                existing.call_site = call_site;
+            }
+        } else {
+            candidates.push(Candidate {
+                parent: parent_uri,
+                call_site,
+                precedence,
+            });
         }
     }
-    
-    match parents.len() {
-        0 => ParentResolution::None,
-        1 => ParentResolution::Single(parents[0].0.clone(), parents[0].1),
-        _ => {
-            // Deterministic selection: sort by URI string, take first
-            parents.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-            let selected = parents.remove(0);
-            let alternatives: Vec<Url> = parents.into_iter().map(|(u, _)| u).collect();
-            ParentResolution::Ambiguous {
-                selected: (selected.0, selected.1),
-                alternatives,
-            }
-        }
+
+    if candidates.is_empty() {
+        return ParentResolution::None;
+    }
+
+    // Deterministic selection with precedence, then URI tiebreak.
+    candidates.sort_by(|a, b| {
+        (a.precedence, a.parent.as_str()).cmp(&(b.precedence, b.parent.as_str()))
+    });
+
+    let selected = candidates.remove(0);
+    if candidates.is_empty() {
+        return ParentResolution::Single(selected.parent, selected.call_site);
+    }
+
+    ParentResolution::Ambiguous {
+        selected: (selected.parent, selected.call_site),
+        alternatives: candidates.into_iter().map(|c| c.parent).collect(),
     }
 }
 ```
@@ -2326,7 +2426,10 @@ pub fn on_did_close(state: &mut WorldState, uri: &Url) {
 Notes:
 - Rename/move events may arrive as delete+create. The handler SHOULD treat these as independent events and allow the graph/index to converge after debounce.
 - Canonicalization failures (e.g., path does not exist yet) MUST be handled gracefully: keep best-effort node identity but avoid panics.
-- **URI Canonicalization (Required):** All URIs in the dependency graph MUST be canonical file URIs. Path casing MUST be normalized (case-insensitive on macOS/Windows, case-sensitive on Linux). Paths with `..` MUST be resolved before storage. This ensures rename events (delete+create) converge correctly.
+- **URI Canonicalization (Required):** All URIs in the dependency graph MUST be canonical file URIs. Paths with `..` MUST be resolved before storage.
+  - The implementation SHOULD canonicalize paths via filesystem resolution (e.g., `std::fs::canonicalize` / async equivalent) when the path exists.
+  - The implementation MUST NOT assume case-insensitivity based solely on OS (macOS filesystems may be case-sensitive). Prefer canonicalization via the filesystem rather than ad-hoc case folding.
+  - When canonicalization is not possible (e.g., path does not exist yet during create/rename convergence), the implementation MUST fall back to stable normalization (best-effort) and allow the graph/index to converge once the path exists.
 
 ### On File Deleted
 
@@ -2501,7 +2604,9 @@ This section documents key design decisions made based on review feedback to ens
 
 **Problem:** `ParentResolution` and `resolve_parent()` used line-only call sites (`Option<u32>`), but the spec requires full `(line, column)` precision for same-line edge cases.
 
-**Fix:** Introduced `CallSitePosition` struct with full `(line, column)` support. All parent resolution now uses `Option<CallSitePosition>`. The `CallSiteSpec::Line` variant converts 1-based user input to 0-based internal representation with `column=0`.
+**Fix:** Introduced `CallSitePosition` struct with full `(line, column)` support. All parent resolution now uses `Option<CallSitePosition>`.
+
+Clarification (required): `line=` is line-level precision only, so `CallSiteSpec::Line` MUST be interpreted as end-of-line for that line (`column = u32::MAX`) to avoid false negatives for same-line definitions (see `CallSitePosition::from_user_line`).
 
 ### Issue 3: Edge Deduplication and Graph Representation
 

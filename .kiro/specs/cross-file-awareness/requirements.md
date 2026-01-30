@@ -41,6 +41,25 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 
 ## Requirements
 
+### Requirement 0a: Directive Syntax (Applies to All Directives)
+
+**User Story:** As an R developer, I want directive syntax to be flexible and consistent across directive types, so that I can use directives without worrying about minor formatting differences.
+
+#### Acceptance Criteria
+
+1. The Directive_Parser SHALL accept an optional colon `:` after the directive name for all directives.
+   - Examples (equivalent): `# @lsp-ignore` and `# @lsp-ignore:`
+2. For directives that take a path parameter, the Directive_Parser SHALL accept the path both quoted and unquoted.
+   - Examples (equivalent):
+     - `# @lsp-source path.R`
+     - `# @lsp-source "path.R"`
+     - `# @lsp-source 'path.R'`
+3. For directives that take a path parameter, the Directive_Parser SHALL accept the optional colon in combination with quoting.
+   - Examples (equivalent):
+     - `# @lsp-working-directory: /data`
+     - `# @lsp-working-directory: "/data"`
+4. The Directive_Parser SHOULD tolerate additional whitespace around `:` and between tokens.
+
 ### Requirement 0: Real-Time Cross-File Updates (Core)
 
 **User Story:** As an R developer, I want diagnostics, completions, hover, and definition results to update in all affected open files when I edit any file in the chain, so that cross-file analysis stays correct while I edit multiple files concurrently.
@@ -72,14 +91,19 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 1. WHEN a file contains `# @lsp-sourced-by <path>`, THE Directive_Parser SHALL extract the path and associate it with the current file
 2. WHEN a file contains `# @lsp-run-by <path>`, THE Directive_Parser SHALL treat it equivalently to `@lsp-sourced-by`
 3. WHEN a file contains `# @lsp-included-by <path>`, THE Directive_Parser SHALL treat it equivalently to `@lsp-sourced-by`
-4. WHEN a backward directive includes `line=<number>`, THE Directive_Parser SHALL record the call site line number.
+4. The Directive_Parser SHALL accept both `# @lsp-sourced-by <path>` and `# @lsp-sourced-by: <path>` (colon optional).
+5. The Directive_Parser SHALL accept paths both with and without quotes:
+   - `# @lsp-sourced-by ../main.R`
+   - `# @lsp-sourced-by "../main.R"`
+   - `# @lsp-sourced-by '../main.R'`
+6. WHEN a backward directive includes `line=<number>`, THE Directive_Parser SHALL record the call site line number.
    - The directive syntax SHALL interpret `line=` as a 1-based line number for user ergonomics.
    - Internally, the LSP SHALL convert to 0-based lines to match LSP positions.
    - The Scope_Resolver SHALL interpret `line=` as a coarse call-site hint and SHALL treat it as occurring at end-of-line for call-site filtering (conservative; avoids false negatives for same-line definitions).
-5. WHEN a backward directive includes `match="<pattern>"`, THE Directive_Parser SHALL record the pattern for call site identification
-6. WHEN a directive path is relative, THE Path_Resolver SHALL resolve it relative to the current file's directory
-7. WHEN a directive path uses `..`, THE Path_Resolver SHALL correctly navigate parent directories
-8. IF a backward directive references a non-existent file, THEN THE Diagnostic_Engine SHALL emit a warning diagnostic
+7. WHEN a backward directive includes `match="<pattern>"`, THE Directive_Parser SHALL record the pattern for call site identification
+8. WHEN a directive path is relative, THE Path_Resolver SHALL resolve it relative to the current file's directory
+9. WHEN a directive path uses `..`, THE Path_Resolver SHALL correctly navigate parent directories
+10. IF a backward directive references a non-existent file, THEN THE Diagnostic_Engine SHALL emit a warning diagnostic
 
 ### Requirement 2: Forward Directive Parsing
 
@@ -88,10 +112,12 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 #### Acceptance Criteria
 
 1. WHEN a file contains `# @lsp-source <path>`, THE Directive_Parser SHALL treat it as an explicit source() declaration at that line
-2. WHEN a file contains `# @lsp-ignore`, THE Diagnostic_Engine SHALL suppress diagnostics for that line
-3. WHEN a file contains `# @lsp-ignore-next`, THE Diagnostic_Engine SHALL suppress diagnostics for the following line
-4. WHEN multiple `@lsp-source` directives exist, THE Directive_Parser SHALL process them in document order
-5. IF a forward directive references a non-existent file, THEN THE Diagnostic_Engine SHALL emit a warning diagnostic
+2. The Directive_Parser SHALL accept both `# @lsp-source <path>` and `# @lsp-source: <path>` (colon optional).
+3. The Directive_Parser SHALL accept paths both with and without quotes for `@lsp-source`.
+4. WHEN a file contains `# @lsp-ignore`, THE Diagnostic_Engine SHALL suppress diagnostics for that line
+5. WHEN a file contains `# @lsp-ignore-next`, THE Diagnostic_Engine SHALL suppress diagnostics for the following line
+6. WHEN multiple `@lsp-source` directives exist, THE Directive_Parser SHALL process them in document order
+7. IF a forward directive references a non-existent file, THEN THE Diagnostic_Engine SHALL emit a warning diagnostic
 
 ### Requirement 3: Working Directory Directives
 
@@ -100,15 +126,17 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 #### Acceptance Criteria
 
 1. WHEN a file contains `# @lsp-working-directory <path>`, THE Path_Resolver SHALL use that path as the base for relative path resolution
-2. WHEN a file contains `# @lsp-wd <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
-3. WHEN a file contains `# @lsp-cd <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
-4. WHEN a file contains `# @lsp-current-directory <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
-5. WHEN a file contains `# @lsp-current-dir <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
-6. WHEN a file contains `# @lsp-working-dir <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
-7. WHEN a working directory path starts with `/`, THE Path_Resolver SHALL resolve it relative to the workspace root (not as a filesystem-absolute path)
-8. WHEN a working directory path does not start with `/`, THE Path_Resolver SHALL resolve it relative to the file's directory
-9. WHEN no working directory directive exists, THE Path_Resolver SHALL inherit the working directory from the parent file in the source chain
-10. WHEN no working directory is inherited and no directive exists, THE Path_Resolver SHALL use the file's own directory as the working directory
+2. The Directive_Parser SHALL accept `:` after the directive name (colon optional) for all working directory directive synonyms.
+3. The Directive_Parser SHALL accept paths both with and without quotes for working directory directives.
+4. WHEN a file contains `# @lsp-wd <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+5. WHEN a file contains `# @lsp-cd <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+6. WHEN a file contains `# @lsp-current-directory <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+7. WHEN a file contains `# @lsp-current-dir <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+8. WHEN a file contains `# @lsp-working-dir <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+9. WHEN a working directory path starts with `/`, THE Path_Resolver SHALL resolve it relative to the workspace root (not as a filesystem-absolute path)
+10. WHEN a working directory path does not start with `/`, THE Path_Resolver SHALL resolve it relative to the file's directory
+11. WHEN no working directory directive exists, THE Path_Resolver SHALL inherit the working directory from the parent file in the source chain
+12. WHEN no working directory is inherited and no directive exists, THE Path_Resolver SHALL use the file's own directory as the working directory
 
 ### Requirement 4: Automatic source() Detection
 
