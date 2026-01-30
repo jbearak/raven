@@ -2754,3 +2754,307 @@ tokio::spawn(async move {
 ```
 
 This optimization is especially important for large files or deep source chains where cross-file resolution can be expensive.
+
+## Documentation Updates
+
+### Overview
+
+Comprehensive documentation is essential for users and contributors to effectively use and extend Rlsp's cross-file awareness features. This section addresses Requirement 16 by specifying what documentation must be created or updated.
+
+### README.md Updates (Required)
+
+The README.md file MUST be updated to include a dedicated "Cross-File Awareness" section that documents:
+
+#### LSP Directives
+
+All directive types with syntax, semantics, and examples:
+
+**Backward Directives** (declare that this file is sourced by another):
+- `# @lsp-sourced-by <path>` - Standard form
+- `# @lsp-run-by <path>` - Synonym
+- `# @lsp-included-by <path>` - Synonym
+- Optional parameters:
+  - `line=N` - Specify 1-based line number in parent where source() call occurs
+  - `match="pattern"` - Specify text pattern to find source() call in parent
+
+Example:
+```r
+# @lsp-sourced-by ../main.R line=15
+# This file is sourced by main.R at line 15
+
+my_function <- function(x) {
+  x + 1
+}
+```
+
+**Forward Directives** (explicitly declare source() calls):
+- `# @lsp-source <path>` - Treat as explicit source() call at this line
+
+Example:
+```r
+# @lsp-source utils/helpers.R
+# Explicit declaration for dynamic paths that can't be detected
+```
+
+**Working Directory Directives** (set working directory context):
+- `# @lsp-working-directory <path>` - Standard form
+- `# @lsp-working-dir <path>` - Synonym
+- `# @lsp-current-directory <path>` - Synonym
+- `# @lsp-current-dir <path>` - Synonym
+- `# @lsp-cd <path>` - Synonym
+- `# @lsp-wd <path>` - Synonym
+
+Path resolution rules:
+- Paths starting with `/` are workspace-root-relative (e.g., `/data` → `<workspace>/data`)
+- Paths not starting with `/` are file-relative (e.g., `../shared` → parent directory's `shared`)
+
+Example:
+```r
+# @lsp-working-directory /data/scripts
+# All relative paths in source() calls resolve from <workspace>/data/scripts
+```
+
+**Diagnostic Suppression Directives**:
+- `# @lsp-ignore` - Suppress diagnostics on current line
+- `# @lsp-ignore-next` - Suppress diagnostics on next line
+
+Example:
+```r
+# @lsp-ignore-next
+x <- some_dynamic_function()  # No "undefined variable" warning
+```
+
+#### Cross-File Behavior
+
+**Automatic source() Detection**:
+- The LSP automatically detects `source("path.R")` and `sys.source("path.R")` calls
+- Supports both single and double quotes
+- Handles named arguments: `source(file = "path.R")`
+- Detects `local = TRUE` and `chdir = TRUE` parameters
+- Skips dynamic paths (variables, expressions, `paste0()`) gracefully
+
+**Position-Aware Symbol Availability**:
+- Symbols from sourced files are only available AFTER the source() call site
+- Uses full (line, character) position precision
+- Example: `x <- 1; source("a.R"); y <- foo()` - `foo()` is available after the semicolon
+
+**Scope Resolution Across Files**:
+- Backward directives establish parent context (symbols available before this file runs)
+- Forward source() calls add symbols in document order
+- Local definitions shadow inherited symbols
+- Call-site filtering: only symbols defined before the call site in parent are inherited
+
+**Working Directory Resolution**:
+- Files inherit working directory from parent in source chain
+- Default: file's own directory if no directive or inheritance
+- Affects relative path resolution in source() calls
+
+**Call Site Identification**:
+Resolution priority for backward directives:
+1. Explicit `line=N` parameter (highest priority)
+2. Explicit `match="pattern"` parameter
+3. Reverse dependency edges (from forward resolution)
+4. Text inference in parent file (static string-literal source() only)
+5. Configuration default (`assumeCallSite`: "end" or "start")
+
+**Circular Dependency Handling**:
+- Detected automatically
+- Cycle is broken with a diagnostic
+- Partial scope is provided
+
+#### Configuration Options
+
+All configuration options with descriptions and defaults:
+
+```json
+{
+  "rlsp.crossFile.maxBackwardDepth": 10,
+  "rlsp.crossFile.maxForwardDepth": 10,
+  "rlsp.crossFile.maxChainDepth": 20,
+  "rlsp.crossFile.assumeCallSite": "end",
+  "rlsp.crossFile.indexWorkspace": true,
+  "rlsp.crossFile.maxRevalidationsPerTrigger": 10,
+  "rlsp.crossFile.revalidationDebounceMs": 200,
+  "rlsp.diagnostics.undefinedVariables": true
+}
+```
+
+**Configuration Descriptions**:
+- `maxBackwardDepth`: Maximum depth for backward directive traversal (default: 10)
+- `maxForwardDepth`: Maximum depth for forward source() traversal (default: 10)
+- `maxChainDepth`: Maximum total chain depth (default: 20)
+- `assumeCallSite`: Default call site when not specified - "end" (symbols available) or "start" (symbols not available) (default: "end")
+- `indexWorkspace`: Enable workspace file indexing for closed files (default: true)
+- `maxRevalidationsPerTrigger`: Max open documents to revalidate per change (default: 10)
+- `revalidationDebounceMs`: Debounce delay for cross-file diagnostics (default: 200ms)
+- `undefinedVariables`: Enable undefined variable diagnostics (default: true)
+
+Diagnostic severity settings are also configurable for:
+- Missing file warnings
+- Circular dependency errors
+- Out-of-scope symbol warnings
+- Ambiguous parent warnings
+
+#### Practical Usage Examples
+
+**Example 1: Basic Multi-File Project**
+```r
+# File: utils/helpers.R
+add_one <- function(x) { x + 1 }
+
+# File: main.R
+source("utils/helpers.R")
+result <- add_one(5)  # Completion and hover work for add_one
+```
+
+**Example 2: Using Backward Directives**
+```r
+# File: config.R
+# @lsp-sourced-by main.R line=10
+DB_HOST <- "localhost"
+
+# File: main.R (line 10)
+source("config.R")
+connect(DB_HOST)  # No "undefined variable" warning
+```
+
+**Example 3: Forward Directives for Dynamic Paths**
+```r
+# File: main.R
+config_file <- "config.R"
+# @lsp-source config.R
+source(config_file)  # Dynamic path, but directive provides hint
+```
+
+**Example 4: Working Directory Configuration**
+```r
+# File: scripts/analysis.R
+# @lsp-working-directory /data
+source("raw/input.R")  # Resolves to <workspace>/data/raw/input.R
+```
+
+**Example 5: Handling Circular Dependencies**
+```r
+# File: a.R
+source("b.R")
+func_a <- function() { func_b() }
+
+# File: b.R
+source("a.R")  # Circular dependency detected, diagnostic emitted
+func_b <- function() { func_a() }
+```
+
+### AGENTS.md Updates (Required)
+
+The AGENTS.md file MUST be updated with cross-file architecture and implementation details:
+
+#### Cross-File Architecture
+
+**Dependency Graph Structure**:
+- Forward edges only (parent sources child)
+- Backward directives are inputs to create/confirm forward edges
+- Edges store call site position (line, column), local/chdir flags
+- Supports multiple edges between same (from, to) at different call sites
+- Thread-safe with RwLock protection
+
+**Scope Resolution Algorithm**:
+- Position-aware: scope depends on (line, character) position in file
+- Two-phase: compute per-file artifacts (non-recursive), then traverse for scope-at-position
+- Artifacts include: exported interface, timeline of scope events, interface hash
+- Timeline contains: symbol definitions, source() calls, working directory changes
+- Traversal bounded by max_chain_depth and visited set (cycle prevention)
+
+**Caching and Invalidation Strategy**:
+- Three caches with interior mutability: MetadataCache, ArtifactsCache, ParentSelectionCache
+- Fingerprinted entries: self_hash, edges_hash, upstream_interfaces_hash, workspace_index_version
+- Invalidation triggers: interface hash change OR edge set change
+- Interface hash optimization: skip dependent invalidation if interface unchanged
+
+**Real-Time Update Mechanism**:
+- Metadata extraction on document change (directives + detected source() calls)
+- Dependency graph update
+- Selective invalidation based on interface/edge changes
+- Debounced diagnostics fanout to affected open files
+- Cancellation of outdated pending revalidations
+- Freshness guards prevent stale diagnostic publishes
+- Monotonic publishing: never publish older version than last published
+
+**Thread-Safety Considerations**:
+- WorldState protected by Arc<tokio::sync::RwLock> at server boundary
+- Concurrent reads from request handlers (completion, hover, definition)
+- Serialized writes for state mutations
+- Interior-mutable caches allow population during read operations
+- Background tasks reacquire locks, never hold borrowed &mut WorldState
+- Minimal lock hold-time for cache operations
+
+#### Implementation Patterns
+
+**Adding New Directive Types**:
+1. Add variant to directive enum in `cross_file/directive.rs`
+2. Update regex patterns in directive parser
+3. Add extraction logic in `CrossFileExtractor::extract()`
+4. Update `CrossFileMetadata` struct if needed
+5. Add unit tests for parsing
+6. Add property test for round-trip serialization
+7. Update README.md documentation
+
+**Extending Scope Resolution Logic**:
+1. Modify `ScopeResolver::compute_artifacts()` for per-file changes
+2. Modify `ScopeResolver::scope_at_position()` for traversal changes
+3. Update `ScopeEvent` enum if adding new scope-introducing events
+4. Ensure non-recursive artifact computation (Critical Invariant #6)
+5. Update fingerprinting to include new semantics-bearing fields
+6. Add property tests for new resolution behavior
+
+**Adding Cross-File Diagnostics**:
+1. Implement diagnostic logic in `handlers/diagnostics.rs`
+2. Use `ScopeResolver::scope_at_position()` for symbol resolution
+3. Check `CrossFileMetadata::ignored_lines` for suppression
+4. Respect `config.undefined_variables_enabled` flag
+5. Use configurable severity from `CrossFileConfig`
+6. Ensure diagnostics are position-aware (check call site ordering)
+7. Add unit tests for specific diagnostic cases
+8. Add property tests for diagnostic suppression
+
+**Testing Strategies for Cross-File Features**:
+
+**Unit Tests**:
+- Test each component in isolation (parser, detector, resolver)
+- Use temporary files for path resolution tests
+- Mock dependency graph for scope resolution tests
+- Test edge cases: empty files, Unicode paths, nested calls
+
+**Property-Based Tests** (minimum 100 iterations):
+- Use `proptest` crate with custom generators
+- Generate valid R identifiers, file paths, directive strings
+- Test round-trip serialization (parse → serialize → parse)
+- Test equivalence properties (synonym directives produce same result)
+- Test invariants (local symbol precedence, call-site filtering)
+
+**Integration Tests**:
+- Create temporary workspace with multiple R files
+- Test LSP protocol: send requests, verify responses
+- Test real-time updates: edit file, verify dependent diagnostics update
+- Test workspace watching: modify closed file, verify open dependents update
+- Test concurrent editing: rapid changes across multiple files
+
+**Regression Tests**:
+- Test each Critical Design Invariant (see Design Review Fixes section)
+- Test edge cases from Issue 1-14 in Design Review Fixes
+- Test rename/delete+create convergence
+- Test force republish mechanism
+- Test parent selection stability
+
+### Documentation Testing (Required)
+
+When documentation is updated, examples MUST be tested to ensure accuracy:
+
+1. Create test workspace with example files from README.md
+2. Verify directives are parsed correctly
+3. Verify completions include cross-file symbols
+4. Verify diagnostics behave as documented
+5. Verify configuration options have documented effects
+
+### Documentation Validation (Requirement 16.7)
+
+**Validates: Requirements 16.1, 16.2, 16.3, 16.4, 16.5, 16.6, 16.7, 16.8**
