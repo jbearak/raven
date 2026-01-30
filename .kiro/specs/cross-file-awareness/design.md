@@ -215,6 +215,50 @@ pub trait CrossFileExtractor {
 }
 ```
 
+#### Directive Synonym Forms
+
+The directive parser MUST recognize multiple synonym forms for each directive type to improve ergonomics:
+
+**Backward Directives (all equivalent):**
+- `@lsp-sourced-by <path>`
+- `@lsp-run-by <path>`
+- `@lsp-included-by <path>`
+
+**Working Directory Directives (all equivalent):**
+- `@lsp-working-directory <path>`
+- `@lsp-working-dir <path>`
+- `@lsp-current-directory <path>`
+- `@lsp-current-dir <path>`
+- `@lsp-cd <path>`
+- `@lsp-wd <path>`
+
+**Forward Directives:**
+- `@lsp-source <path>`
+
+**Ignore Directives:**
+- `@lsp-ignore` (suppress diagnostics on current line)
+- `@lsp-ignore-next` (suppress diagnostics on next line)
+
+#### Path Resolution Rules
+
+**Workspace-Root-Relative Paths:**
+Paths starting with `/` are treated as workspace-root-relative, NOT filesystem-absolute. This convention allows portable references to workspace-level directories.
+
+Example:
+```r
+# @lsp-working-directory: /data/scripts
+```
+Resolves to `<workspaceRoot>/data/scripts`, not the filesystem root `/data/scripts`.
+
+**File-Relative Paths:**
+Paths not starting with `/` are resolved relative to the file's containing directory.
+
+Example:
+```r
+# @lsp-working-directory: ../shared
+```
+Resolves to the `shared` directory one level up from the current file's directory.
+
 
 ### Call-Site Resolution (Backward Directives)
 
@@ -1518,9 +1562,21 @@ pub struct ScopeAtLine {
 
 ### Property 2: Working Directory Synonym Equivalence
 
-*For any* valid path string, parsing `# @lsp-working-directory <path>`, `# @lsp-wd <path>`, `# @lsp-cd <path>`, and `# @lsp-current-directory <path>` SHALL produce equivalent working directory configurations.
+*For any* valid path string, parsing `# @lsp-working-directory <path>`, `# @lsp-wd <path>`, `# @lsp-cd <path>`, `# @lsp-current-directory <path>`, `# @lsp-current-dir <path>`, and `# @lsp-working-dir <path>` SHALL produce equivalent working directory configurations.
 
-**Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+**Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6**
+
+### Property 2a: Working Directory Path Resolution (Workspace-Root-Relative)
+
+*For any* working directory path starting with `/`, the Path_Resolver SHALL resolve it relative to the workspace root, not as a filesystem-absolute path. For example, `# @lsp-working-directory /data` SHALL resolve to `<workspaceRoot>/data`, not the filesystem root `/data`.
+
+**Validates: Requirements 3.7**
+
+### Property 2b: Working Directory Path Resolution (File-Relative)
+
+*For any* working directory path not starting with `/`, the Path_Resolver SHALL resolve it relative to the file's containing directory.
+
+**Validates: Requirements 3.8**
 
 ### Property 3: Quote Style Equivalence for Source Detection
 

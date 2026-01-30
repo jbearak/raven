@@ -100,9 +100,12 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 2. WHEN a file contains `# @lsp-wd <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
 3. WHEN a file contains `# @lsp-cd <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
 4. WHEN a file contains `# @lsp-current-directory <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
-5. WHEN no working directory directive exists, THE Path_Resolver SHALL inherit the working directory from the parent file in the source chain
-6. WHEN no working directory is inherited and no directive exists, THE Path_Resolver SHALL use the file's own directory as the working directory
-7. WHEN a working directory path is relative, THE Path_Resolver SHALL resolve it relative to the file's directory
+5. WHEN a file contains `# @lsp-current-dir <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+6. WHEN a file contains `# @lsp-working-dir <path>`, THE Path_Resolver SHALL treat it equivalently to `@lsp-working-directory`
+7. WHEN a working directory path starts with `/`, THE Path_Resolver SHALL resolve it relative to the workspace root (not as a filesystem-absolute path)
+8. WHEN a working directory path does not start with `/`, THE Path_Resolver SHALL resolve it relative to the file's directory
+9. WHEN no working directory directive exists, THE Path_Resolver SHALL inherit the working directory from the parent file in the source chain
+10. WHEN no working directory is inherited and no directive exists, THE Path_Resolver SHALL use the file's own directory as the working directory
 
 ### Requirement 4: Automatic source() Detection
 
