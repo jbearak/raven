@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 
 use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
+use super::path_resolve::{path_to_uri, resolve_path, PathContext};
 use super::types::{CallSiteSpec, CrossFileMetadata};
 
 /// A dependency edge from parent (caller) to child (callee)
@@ -96,19 +97,32 @@ impl DependencyGraph {
     /// Processes both forward sources and backward directives.
     /// Returns diagnostics for directive-vs-AST conflicts.
     ///
+    /// Uses PathContext for proper working directory and workspace-root-relative path resolution.
     /// The `get_content` closure provides parent file content for match=/inference resolution.
     /// It should return None for files that aren't available (not open, not cached).
     pub fn update_file<F>(
         &mut self,
         uri: &Url,
         meta: &CrossFileMetadata,
-        resolve_path: impl Fn(&str) -> Option<Url>,
+        workspace_root: Option<&Url>,
         get_content: F,
     ) -> UpdateResult
     where
         F: Fn(&Url) -> Option<String>,
     {
         let mut result = UpdateResult::default();
+
+        // Build PathContext for this file
+        let path_ctx = match PathContext::from_metadata(uri, meta, workspace_root) {
+            Some(ctx) => ctx,
+            None => return result,
+        };
+
+        // Helper to resolve paths using PathContext
+        let do_resolve = |path: &str| -> Option<Url> {
+            let resolved = resolve_path(path, &path_ctx)?;
+            path_to_uri(&resolved)
+        };
 
         // Remove existing edges where this file is the parent
         self.remove_forward_edges(uri);
@@ -124,7 +138,7 @@ impl DependencyGraph {
         // Process forward directive sources (@lsp-source)
         for source in &meta.sources {
             if source.is_directive {
-                if let Some(to_uri) = resolve_path(&source.path) {
+                if let Some(to_uri) = do_resolve(&source.path) {
                     let edge = DependencyEdge {
                         from: uri.clone(),
                         to: to_uri.clone(),
@@ -143,7 +157,7 @@ impl DependencyGraph {
 
         // Process backward directives (@lsp-sourced-by) - create forward edges from parent to this file
         for directive in &meta.sourced_by {
-            if let Some(parent_uri) = resolve_path(&directive.path) {
+            if let Some(parent_uri) = do_resolve(&directive.path) {
                 // Extract child filename for inference
                 let child_filename = uri.path_segments()
                     .and_then(|s| s.last())
@@ -198,7 +212,7 @@ impl DependencyGraph {
         let mut ast_edges: Vec<DependencyEdge> = Vec::new();
         for source in &meta.sources {
             if !source.is_directive {
-                if let Some(to_uri) = resolve_path(&source.path) {
+                if let Some(to_uri) = do_resolve(&source.path) {
                     let edge = DependencyEdge {
                         from: uri.clone(),
                         to: to_uri.clone(),
@@ -238,10 +252,10 @@ impl DependencyGraph {
                                 // Directive has no call site: suppress all AST edges to this target
                                 // Emit warning about suppression
                                 let diag_line = meta.sourced_by.iter()
-                                    .find(|d| resolve_path(&d.path) == Some(dir_edge.from.clone()))
+                                    .find(|d| do_resolve(&d.path) == Some(dir_edge.from.clone()))
                                     .map(|d| d.directive_line)
                                     .or_else(|| meta.sources.iter()
-                                        .find(|s| s.is_directive && resolve_path(&s.path) == Some(to_uri.clone()))
+                                        .find(|s| s.is_directive && do_resolve(&s.path) == Some(to_uri.clone()))
                                         .map(|s| s.line))
                                     .unwrap_or(0);
 
@@ -284,13 +298,13 @@ impl DependencyGraph {
     }
 
     /// Simple update without content provider (for backward compatibility in tests)
+    /// Uses file-relative path resolution only (no workspace root)
     pub fn update_file_simple(
         &mut self,
         uri: &Url,
         meta: &CrossFileMetadata,
-        resolve_path: impl Fn(&str) -> Option<Url>,
     ) {
-        let _ = self.update_file(uri, meta, resolve_path, |_| None);
+        let _ = self.update_file(uri, meta, None, |_| None);
     }
 
     /// Remove edges where the given URI is the child that were created from backward directives
@@ -451,7 +465,11 @@ mod tests {
     use super::*;
 
     fn url(s: &str) -> Url {
-        Url::parse(&format!("file:///{}", s)).unwrap()
+        Url::parse(&format!("file:///project/{}", s)).unwrap()
+    }
+
+    fn workspace_root() -> Url {
+        Url::parse("file:///project").unwrap()
     }
 
     fn make_meta_with_source(path: &str, line: u32) -> CrossFileMetadata {
@@ -478,9 +496,7 @@ mod tests {
         let utils = url("utils.R");
 
         let meta = make_meta_with_source("utils.R", 5);
-        graph.update_file(&main, &meta, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 1);
@@ -495,9 +511,7 @@ mod tests {
         let utils = url("utils.R");
 
         let meta = make_meta_with_source("utils.R", 5);
-        graph.update_file(&main, &meta, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         let dependents = graph.get_dependents(&utils);
         assert_eq!(dependents.len(), 1);
@@ -511,9 +525,7 @@ mod tests {
         let utils = url("utils.R");
 
         let meta = make_meta_with_source("utils.R", 5);
-        graph.update_file(&main, &meta, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         graph.remove_file(&main);
 
@@ -530,14 +542,10 @@ mod tests {
 
         // a sources b, b sources c
         let meta_a = make_meta_with_source("b.R", 1);
-        graph.update_file(&a, &meta_a, |p| {
-            if p == "b.R" { Some(b.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
 
         let meta_b = make_meta_with_source("c.R", 1);
-        graph.update_file(&b, &meta_b, |p| {
-            if p == "c.R" { Some(c.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
 
         // Dependents of c should include b and a
         let dependents = graph.get_transitive_dependents(&c, 10);
@@ -580,9 +588,7 @@ mod tests {
             ..Default::default()
         };
 
-        graph.update_file(&main, &meta, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         // Should only have one edge (deduplicated)
         let deps = graph.get_dependencies(&main);
@@ -598,15 +604,11 @@ mod tests {
 
         // First update: main sources utils
         let meta1 = make_meta_with_source("utils.R", 5);
-        graph.update_file(&main, &meta1, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&main, &meta1, Some(&workspace_root()), |_| None);
 
         // Second update: main sources helpers instead
         let meta2 = make_meta_with_source("helpers.R", 10);
-        graph.update_file(&main, &meta2, |p| {
-            if p == "helpers.R" { Some(helpers.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&main, &meta2, Some(&workspace_root()), |_| None);
 
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 1);
@@ -624,15 +626,11 @@ mod tests {
 
         // a sources b at line 1
         let meta_a = make_meta_with_source("b.R", 1);
-        graph.update_file(&a, &meta_a, |p| {
-            if p == "b.R" { Some(b.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
 
         // b sources a at line 2 (creates cycle)
         let meta_b = make_meta_with_source("a.R", 2);
-        graph.update_file(&b, &meta_b, |p| {
-            if p == "a.R" { Some(a.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
 
         // Cycle should be detected from a
         let cycle = graph.detect_cycle(&a);
@@ -655,9 +653,7 @@ mod tests {
 
         // a sources b (no cycle)
         let meta_a = make_meta_with_source("b.R", 1);
-        graph.update_file(&a, &meta_a, |p| {
-            if p == "b.R" { Some(b.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
 
         assert!(graph.detect_cycle(&a).is_none());
         assert!(graph.detect_cycle(&b).is_none());
@@ -668,8 +664,9 @@ mod tests {
         use super::super::types::{BackwardDirective, CallSiteSpec};
 
         let mut graph = DependencyGraph::new();
-        let parent = url("parent.R");
-        let child = url("child.R");
+        // Use subdirectory structure for backward directive test
+        let parent = Url::parse("file:///project/parent.R").unwrap();
+        let child = Url::parse("file:///project/sub/child.R").unwrap();
 
         // Child declares it's sourced by parent at line 10
         let meta = CrossFileMetadata {
@@ -681,9 +678,7 @@ mod tests {
             ..Default::default()
         };
 
-        graph.update_file(&child, &meta, |p| {
-            if p == "../parent.R" { Some(parent.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&child, &meta, Some(&workspace_root()), |_| None);
 
         // Should create forward edge from parent to child
         let deps = graph.get_dependencies(&parent);
@@ -735,9 +730,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = graph.update_file(&main, &meta, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        let result = graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         // Should have TWO edges (directive at line 5, AST at line 10)
         // because directive has known call site and doesn't suppress AST at different site
@@ -778,13 +771,7 @@ mod tests {
         };
 
         // Update from utils.R perspective (it has the backward directive)
-        let result = graph.update_file(&utils, &meta, |p| {
-            match p {
-                "main.R" => Some(main.clone()),
-                "utils.R" => Some(utils.clone()),
-                _ => None,
-            }
-        }, |_| None);
+        let _result = graph.update_file(&utils, &meta, Some(&workspace_root()), |_| None);
 
         // The backward directive creates edge from main->utils with no call site
         // The AST edge is from utils->utils (same file) which is different target
@@ -828,9 +815,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = graph.update_file(&main, &meta, |p| {
-            if p == "utils.R" { Some(utils.clone()) } else { None }
-        }, |_| None);
+        let result = graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         // Should have one edge, no warning (same call site)
         let deps = graph.get_dependencies(&main);
@@ -874,13 +859,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = graph.update_file(&main, &meta, |p| {
-            match p {
-                "utils.R" => Some(utils.clone()),
-                "helpers.R" => Some(helpers.clone()),
-                _ => None,
-            }
-        }, |_| None);
+        let result = graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
 
         // Should have both edges (different targets)
         let deps = graph.get_dependencies(&main);
@@ -893,8 +872,9 @@ mod tests {
         use super::super::types::{BackwardDirective, CallSiteSpec};
 
         let mut graph = DependencyGraph::new();
-        let parent = url("parent.R");
-        let child = url("child.R");
+        // Use subdirectory structure for backward directive test
+        let parent = Url::parse("file:///project/parent.R").unwrap();
+        let child = Url::parse("file:///project/sub/child.R").unwrap();
 
         // Child declares it's sourced by parent with match="source("
         let meta = CrossFileMetadata {
@@ -915,9 +895,7 @@ source("child.R")  # Line 4 (0-based)
 z <- 3
 "#;
 
-        graph.update_file(&child, &meta, |p| {
-            if p == "../parent.R" { Some(parent.clone()) } else { None }
-        }, |uri| {
+        graph.update_file(&child, &meta, Some(&workspace_root()), |uri| {
             if uri == &parent { Some(parent_content.to_string()) } else { None }
         });
 
@@ -937,6 +915,10 @@ z <- 3
         let child = url("child.R");
 
         // Child declares it's sourced by parent with Default (triggers inference)
+        // Use subdirectory structure for backward directive test
+        let parent = Url::parse("file:///project/parent.R").unwrap();
+        let child = Url::parse("file:///project/sub/child.R").unwrap();
+
         let meta = CrossFileMetadata {
             sourced_by: vec![BackwardDirective {
                 path: "../parent.R".to_string(),
@@ -953,9 +935,7 @@ source("child.R")
 z <- 3
 "#;
 
-        graph.update_file(&child, &meta, |p| {
-            if p == "../parent.R" { Some(parent.clone()) } else { None }
-        }, |uri| {
+        graph.update_file(&child, &meta, Some(&workspace_root()), |uri| {
             if uri == &parent { Some(parent_content.to_string()) } else { None }
         });
 

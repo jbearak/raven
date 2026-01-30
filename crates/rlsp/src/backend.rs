@@ -211,16 +211,19 @@ impl LanguageServer for Backend {
             // Update dependency graph with cross-file metadata
             let meta = crate::cross_file::extract_metadata(&text);
             let uri_clone = uri.clone();
+            let workspace_root = state.workspace_folders.first().cloned();
             
             // Pre-collect content for potential parent files to avoid borrow conflicts
             // The content provider needs to access documents/cache while graph is mutably borrowed
+            // Use PathContext for proper path resolution
+            let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                &uri_clone, &meta, workspace_root.as_ref()
+            );
             let parent_content: std::collections::HashMap<Url, String> = meta.sourced_by.iter()
                 .filter_map(|d| {
-                    let file_path = uri_clone.to_file_path().ok()?;
-                    let parent_dir = file_path.parent()?;
-                    let resolved = parent_dir.join(&d.path);
-                    let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                    let parent_uri = Url::from_file_path(normalized).ok()?;
+                    let ctx = path_ctx.as_ref()?;
+                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                    let parent_uri = Url::from_file_path(resolved).ok()?;
                     let content = state.documents.get(&parent_uri)
                         .map(|doc| doc.text())
                         .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
@@ -231,14 +234,7 @@ impl LanguageServer for Backend {
             let result = state.cross_file_graph.update_file(
                 &uri,
                 &meta,
-                |path| {
-                    // Resolve path relative to the file using normalization (no blocking I/O)
-                    let file_path = uri_clone.to_file_path().ok()?;
-                    let parent_dir = file_path.parent()?;
-                    let resolved = parent_dir.join(path);
-                    let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                    Url::from_file_path(normalized).ok()
-                },
+                workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
             
@@ -384,15 +380,18 @@ impl LanguageServer for Backend {
                 let text = doc.text();
                 let meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
+                let workspace_root = state.workspace_folders.first().cloned();
                 
                 // Pre-collect content for potential parent files to avoid borrow conflicts
+                // Use PathContext for proper path resolution
+                let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                    &uri_clone, &meta, workspace_root.as_ref()
+                );
                 let parent_content: std::collections::HashMap<Url, String> = meta.sourced_by.iter()
                     .filter_map(|d| {
-                        let file_path = uri_clone.to_file_path().ok()?;
-                        let parent_dir = file_path.parent()?;
-                        let resolved = parent_dir.join(&d.path);
-                        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                        let parent_uri = Url::from_file_path(normalized).ok()?;
+                        let ctx = path_ctx.as_ref()?;
+                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                        let parent_uri = Url::from_file_path(resolved).ok()?;
                         let content = state.documents.get(&parent_uri)
                             .map(|doc| doc.text())
                             .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
@@ -403,13 +402,7 @@ impl LanguageServer for Backend {
                 let _result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
-                    |path| {
-                        let file_path = uri_clone.to_file_path().ok()?;
-                        let parent_dir = file_path.parent()?;
-                        let resolved = parent_dir.join(path);
-                        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                        Url::from_file_path(normalized).ok()
-                    },
+                    workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
             }
@@ -736,15 +729,18 @@ impl LanguageServer for Backend {
                     {
                         let mut state = state_arc.write().await;
                         let uri_clone = uri.clone();
+                        let workspace_root = state.workspace_folders.first().cloned();
                         
                         // Pre-collect content for potential parent files to avoid borrow conflicts
+                        // Use PathContext for proper path resolution
+                        let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                            &uri_clone, &cross_file_meta, workspace_root.as_ref()
+                        );
                         let parent_content: std::collections::HashMap<Url, String> = cross_file_meta.sourced_by.iter()
                             .filter_map(|d| {
-                                let file_path = uri_clone.to_file_path().ok()?;
-                                let parent_dir = file_path.parent()?;
-                                let resolved = parent_dir.join(&d.path);
-                                let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                                let parent_uri = Url::from_file_path(normalized).ok()?;
+                                let ctx = path_ctx.as_ref()?;
+                                let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                                let parent_uri = Url::from_file_path(resolved).ok()?;
                                 let content = state.documents.get(&parent_uri)
                                     .map(|doc| doc.text())
                                     .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
@@ -755,13 +751,7 @@ impl LanguageServer for Backend {
                         state.cross_file_graph.update_file(
                             &uri,
                             &cross_file_meta,
-                            |path| {
-                                let file_path = uri_clone.to_file_path().ok()?;
-                                let parent_dir = file_path.parent()?;
-                                let resolved = parent_dir.join(path);
-                                let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                                Url::from_file_path(normalized).ok()
-                            },
+                            workspace_root.as_ref(),
                             |parent_uri| parent_content.get(parent_uri).cloned(),
                         );
                     }

@@ -454,7 +454,7 @@ pub fn scope_at_position_with_graph<F, G>(
     get_artifacts: &F,
     get_metadata: &G,
     graph: &super::dependency::DependencyGraph,
-    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    workspace_root: Option<&Url>,
     max_depth: usize,
 ) -> ScopeAtPosition
 where
@@ -462,9 +462,16 @@ where
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
     let mut visited = HashSet::new();
+    
+    // Build initial PathContext for the root file
+    let meta = get_metadata(uri);
+    let path_ctx = meta.as_ref()
+        .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
+        .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
+    
     scope_at_position_with_graph_recursive(
-        uri, line, column, get_artifacts, get_metadata, graph, resolve_path,
-        max_depth, 0, &mut visited,
+        uri, line, column, get_artifacts, get_metadata, graph, workspace_root,
+        path_ctx, max_depth, 0, &mut visited,
     )
 }
 
@@ -475,7 +482,8 @@ fn scope_at_position_with_graph_recursive<F, G>(
     get_artifacts: &F,
     get_metadata: &G,
     graph: &super::dependency::DependencyGraph,
-    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    workspace_root: Option<&Url>,
+    path_ctx: Option<super::path_resolve::PathContext>,
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<Url>,
@@ -529,6 +537,12 @@ where
             continue;
         }
 
+        // Build PathContext for parent
+        let parent_meta = get_metadata(&edge.from);
+        let parent_ctx = parent_meta.as_ref()
+            .and_then(|m| super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root))
+            .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
+
         // Get parent's scope at the call site
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
@@ -537,7 +551,8 @@ where
             get_artifacts,
             get_metadata,
             graph,
-            resolve_path,
+            workspace_root,
+            parent_ctx,
             max_depth,
             current_depth + 1,
             visited,
@@ -563,13 +578,42 @@ where
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
-                    // Resolve the path and get symbols from sourced file
-                    if let Some(child_uri) = resolve_path(&source.path, uri) {
+                    // Resolve the path using PathContext
+                    let child_uri = path_ctx.as_ref().and_then(|ctx| {
+                        let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
+                        super::path_resolve::path_to_uri(&resolved)
+                    });
+                    
+                    if let Some(child_uri) = child_uri {
                         // Check if we would exceed max depth
                         if current_depth + 1 >= max_depth {
                             scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
                             continue;
                         }
+
+                        // Build child PathContext, respecting chdir flag
+                        let child_path = child_uri.to_file_path().ok();
+                        let child_ctx = child_path.as_ref().and_then(|cp| {
+                            let ctx = path_ctx.as_ref()?;
+                            // Get child's metadata for its own working directory directive
+                            let child_meta = get_metadata(&child_uri);
+                            if let Some(cm) = child_meta {
+                                // Child has its own metadata - use it, but inherit working dir if no explicit one
+                                let mut child_ctx = super::path_resolve::PathContext::from_metadata(&child_uri, &cm, workspace_root)?;
+                                if child_ctx.working_directory.is_none() {
+                                    // Inherit from parent based on chdir flag
+                                    child_ctx.inherited_working_directory = if source.chdir {
+                                        Some(cp.parent()?.to_path_buf())
+                                    } else {
+                                        Some(ctx.effective_working_directory())
+                                    };
+                                }
+                                Some(child_ctx)
+                            } else {
+                                // No metadata for child - create context based on chdir
+                                Some(ctx.child_context_for_source(cp, source.chdir))
+                            }
+                        });
 
                         let child_scope = scope_at_position_with_graph_recursive(
                             &child_uri,
@@ -578,7 +622,8 @@ where
                             get_artifacts,
                             get_metadata,
                             graph,
-                            resolve_path,
+                            workspace_root,
+                            child_ctx,
                             max_depth,
                             current_depth + 1,
                             visited,
@@ -937,8 +982,9 @@ mod tests {
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
-        let parent_uri = Url::parse("file:///parent.R").unwrap();
-        let child_uri = Url::parse("file:///child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent code: defines 'a' then sources child
         let parent_code = "a <- 1\nsource(\"child.R\")";
@@ -965,9 +1011,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        graph.update_file(&parent_uri, &parent_meta, |path| {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
@@ -980,13 +1024,9 @@ mod tests {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
         // At end of parent file, both 'a' and 'b' should be available
         let scope = scope_at_position_with_graph(
-            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, &resolve_path, 10,
+            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -998,8 +1038,9 @@ mod tests {
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
-        let parent_uri = Url::parse("file:///parent.R").unwrap();
-        let child_uri = Url::parse("file:///child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent code: defines 'parent_var' then sources child at line 1
         let parent_code = "parent_var <- 1\nsource(\"child.R\")";
@@ -1026,9 +1067,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        graph.update_file(&parent_uri, &parent_meta, |path| {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
@@ -1041,13 +1080,9 @@ mod tests {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
         // In child file, parent_var should be available via dependency graph edge
         let scope = scope_at_position_with_graph(
-            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, &resolve_path, 10,
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
         assert!(scope.symbols.contains_key("parent_var"), "parent_var should be available from parent");
@@ -1057,9 +1092,9 @@ mod tests {
     #[test]
     fn test_max_depth_exceeded_forward() {
         // Test that depth_exceeded is populated when max depth is hit on forward sources
-        let uri_a = Url::parse("file:///a.R").unwrap();
-        let uri_b = Url::parse("file:///b.R").unwrap();
-        let uri_c = Url::parse("file:///c.R").unwrap();
+        let uri_a = Url::parse("file:///project/a.R").unwrap();
+        let uri_b = Url::parse("file:///project/b.R").unwrap();
+        let uri_c = Url::parse("file:///project/c.R").unwrap();
 
         // a.R sources b.R, b.R sources c.R
         let code_a = "source(\"b.R\")";
@@ -1102,9 +1137,10 @@ mod tests {
         use super::super::dependency::DependencyGraph;
         use super::super::types::{CrossFileMetadata, ForwardSource};
 
-        let uri_a = Url::parse("file:///a.R").unwrap();
-        let uri_b = Url::parse("file:///b.R").unwrap();
-        let uri_c = Url::parse("file:///c.R").unwrap();
+        let uri_a = Url::parse("file:///project/a.R").unwrap();
+        let uri_b = Url::parse("file:///project/b.R").unwrap();
+        let uri_c = Url::parse("file:///project/c.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
         // c.R is sourced by b.R, b.R is sourced by a.R
         let code_a = "a_var <- 1\nsource(\"b.R\")";
@@ -1148,12 +1184,8 @@ mod tests {
             ..Default::default()
         };
 
-        graph.update_file(&uri_a, &meta_a, |path| {
-            if path == "b.R" { Some(uri_b.clone()) } else { None }
-        }, |_| None);
-        graph.update_file(&uri_b, &meta_b, |path| {
-            if path == "c.R" { Some(uri_c.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&uri_a, &meta_a, Some(&workspace_root), |_| None);
+        graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &uri_a { Some(artifacts_a.clone()) }
@@ -1168,15 +1200,9 @@ mod tests {
             else { None }
         };
 
-        let resolve_path = |path: &str, from: &Url| -> Option<Url> {
-            if from == &uri_a && path == "b.R" { Some(uri_b.clone()) }
-            else if from == &uri_b && path == "c.R" { Some(uri_c.clone()) }
-            else { None }
-        };
-
         // With max_depth=2, traversing c->b->a should exceed
         let scope = scope_at_position_with_graph(
-            &uri_c, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, &resolve_path, 2,
+            &uri_c, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 2,
         );
 
         // Should have depth_exceeded entry
@@ -1188,8 +1214,9 @@ mod tests {
         // Test that @lsp-source directives are treated as source call sites for scope resolution
         use super::super::types::ForwardSource;
 
-        let parent_uri = Url::parse("file:///parent.R").unwrap();
-        let child_uri = Url::parse("file:///child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent file: has @lsp-source directive on line 2 (0-based: line 1)
         // The directive is parsed into sources with is_directive=true
@@ -1241,5 +1268,156 @@ mod tests {
         let scope_after = scope_at_position_with_deps(&parent_uri, 2, 0, &get_artifacts, &resolve_path, 10);
         assert!(scope_after.symbols.contains_key("child_var"), 
             "child_var SHOULD be in scope after @lsp-source directive");
+    }
+
+    #[test]
+    fn test_chdir_affects_nested_path_resolution() {
+        // Test that chdir=TRUE causes child's relative paths to resolve from child's directory
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        // Directory structure:
+        // /project/main.R - sources data/loader.R with chdir=TRUE
+        // /project/data/loader.R - sources helpers.R (relative to data/)
+        // /project/data/helpers.R - defines helper_func
+        let main_uri = Url::parse("file:///project/main.R").unwrap();
+        let loader_uri = Url::parse("file:///project/data/loader.R").unwrap();
+        let helpers_uri = Url::parse("file:///project/data/helpers.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // main.R: sources data/loader.R with chdir=TRUE
+        let main_code = "x <- 1\nsource(\"data/loader.R\", chdir = TRUE)";
+        let main_tree = parse_r(main_code);
+        let main_artifacts = compute_artifacts(&main_uri, &main_tree, main_code);
+
+        // loader.R: sources helpers.R (relative path)
+        let loader_code = "source(\"helpers.R\")\nloader_var <- 1";
+        let loader_tree = parse_r(loader_code);
+        let loader_artifacts = compute_artifacts(&loader_uri, &loader_tree, loader_code);
+
+        // helpers.R: defines helper_func
+        let helpers_code = "helper_func <- function() {}";
+        let helpers_tree = parse_r(helpers_code);
+        let helpers_artifacts = compute_artifacts(&helpers_uri, &helpers_tree, helpers_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let main_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "data/loader.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: true, // chdir=TRUE
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        let loader_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "helpers.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&loader_uri, &loader_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &main_uri { Some(main_artifacts.clone()) }
+            else if uri == &loader_uri { Some(loader_artifacts.clone()) }
+            else if uri == &helpers_uri { Some(helpers_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &main_uri { Some(main_meta.clone()) }
+            else if uri == &loader_uri { Some(loader_meta.clone()) }
+            else { None }
+        };
+
+        // At end of main.R, helper_func should be available because:
+        // 1. main.R sources data/loader.R with chdir=TRUE
+        // 2. loader.R's working directory becomes /project/data/
+        // 3. loader.R sources "helpers.R" which resolves to /project/data/helpers.R
+        let scope = scope_at_position_with_graph(
+            &main_uri, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        assert!(scope.symbols.contains_key("x"), "x should be available");
+        assert!(scope.symbols.contains_key("loader_var"), "loader_var should be available from loader.R");
+        assert!(scope.symbols.contains_key("helper_func"), "helper_func should be available from helpers.R via chdir");
+    }
+
+    #[test]
+    fn test_working_directory_directive_affects_path_resolution() {
+        // Test that @lsp-working-directory affects path resolution
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        // Directory structure:
+        // /project/scripts/main.R - has @lsp-working-directory /data, sources helpers.R
+        // /project/data/helpers.R - defines helper_func
+        let main_uri = Url::parse("file:///project/scripts/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///project/data/helpers.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // main.R: has working directory directive, sources helpers.R
+        let main_code = "# @lsp-working-directory /data\nsource(\"helpers.R\")";
+        let main_tree = parse_r(main_code);
+        let main_artifacts = compute_artifacts(&main_uri, &main_tree, main_code);
+
+        // helpers.R: defines helper_func
+        let helpers_code = "helper_func <- function() {}";
+        let helpers_tree = parse_r(helpers_code);
+        let helpers_artifacts = compute_artifacts(&helpers_uri, &helpers_tree, helpers_code);
+
+        // Build dependency graph with working directory
+        let mut graph = DependencyGraph::new();
+        let main_meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()), // workspace-root-relative
+            sources: vec![ForwardSource {
+                path: "helpers.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &main_uri { Some(main_artifacts.clone()) }
+            else if uri == &helpers_uri { Some(helpers_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &main_uri { Some(main_meta.clone()) }
+            else { None }
+        };
+
+        // At end of main.R, helper_func should be available because:
+        // 1. main.R has @lsp-working-directory /data
+        // 2. source("helpers.R") resolves to /project/data/helpers.R
+        let scope = scope_at_position_with_graph(
+            &main_uri, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        assert!(scope.symbols.contains_key("helper_func"), "helper_func should be available via working directory directive");
     }
 }

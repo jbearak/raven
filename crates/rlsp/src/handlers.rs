@@ -71,18 +71,9 @@ fn get_cross_file_symbols(
         None
     };
 
-    // Closure to resolve paths relative to a file (no blocking I/O)
-    let resolve_path = |path: &str, from_uri: &Url| -> Option<Url> {
-        let from_path = from_uri.to_file_path().ok()?;
-        let parent_dir = from_path.parent()?;
-        let resolved = parent_dir.join(path);
-        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-        Url::from_file_path(normalized).ok()
-    };
-
     let max_depth = state.cross_file_config.max_chain_depth;
     
-    // Use the graph-aware scope resolution
+    // Use the graph-aware scope resolution with PathContext
     let scope = scope::scope_at_position_with_graph(
         uri,
         line,
@@ -90,7 +81,7 @@ fn get_cross_file_symbols(
         &get_artifacts,
         &get_metadata,
         &state.cross_file_graph,
-        &resolve_path,
+        state.workspace_folders.first(),
         max_depth,
     );
     
@@ -336,12 +327,15 @@ fn collect_missing_file_diagnostics(
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Build PathContext for proper path resolution
+    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri, meta, state.workspace_folders.first()
+    );
+    
     let resolve_path = |path: &str| -> Option<Url> {
-        let from_path = uri.to_file_path().ok()?;
-        let parent_dir = from_path.parent()?;
-        let resolved = parent_dir.join(path);
-        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-        Url::from_file_path(normalized).ok()
+        let ctx = path_ctx.as_ref()?;
+        let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
+        crate::cross_file::path_resolve::path_to_uri(&resolved)
     };
 
     // Check if file exists using cached/indexed data only (no blocking I/O)
@@ -455,17 +449,9 @@ fn collect_max_depth_diagnostics(
         state.cross_file_workspace_index.get_metadata(target_uri)
     };
 
-    let resolve_path = |path: &str, from_uri: &Url| -> Option<Url> {
-        let from_path = from_uri.to_file_path().ok()?;
-        let parent_dir = from_path.parent()?;
-        let resolved = parent_dir.join(path);
-        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-        Url::from_file_path(normalized).ok()
-    };
-
     let max_depth = state.cross_file_config.max_chain_depth;
 
-    // Use scope resolution to detect depth exceeded
+    // Use scope resolution to detect depth exceeded (now uses PathContext internally)
     let scope = scope::scope_at_position_with_graph(
         uri,
         u32::MAX,
@@ -473,7 +459,7 @@ fn collect_max_depth_diagnostics(
         &get_artifacts,
         &get_metadata,
         &state.cross_file_graph,
-        &resolve_path,
+        state.workspace_folders.first(),
         max_depth,
     );
 
@@ -506,12 +492,15 @@ fn collect_ambiguous_parent_diagnostics(
     use crate::cross_file::parent_resolve::resolve_parent_with_content;
     use crate::cross_file::cache::ParentResolution;
 
+    // Build PathContext for proper path resolution
+    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri, meta, state.workspace_folders.first()
+    );
+    
     let resolve_path = |path: &str| -> Option<Url> {
-        let from_path = uri.to_file_path().ok()?;
-        let parent_dir = from_path.parent()?;
-        let resolved = parent_dir.join(path);
-        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-        Url::from_file_path(normalized).ok()
+        let ctx = path_ctx.as_ref()?;
+        let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
+        crate::cross_file::path_resolve::path_to_uri(&resolved)
     };
 
     let get_content = |parent_uri: &Url| -> Option<String> {

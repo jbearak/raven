@@ -984,13 +984,7 @@ proptest! {
         let child_uri = make_url(&child);
 
         let meta = make_meta_with_sources(vec![(&format!("{}.R", child), line)]);
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child) {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 1);
@@ -1017,15 +1011,7 @@ proptest! {
             (&format!("{}.R", child2), 10),
         ]);
 
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child1) {
-                Some(child1_uri.clone())
-            } else if p == format!("{}.R", child2) {
-                Some(child2_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 2);
@@ -1053,13 +1039,7 @@ proptest! {
 
         // Add edge
         let meta = make_meta_with_sources(vec![(&format!("{}.R", child), 5)]);
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child) {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         // Verify edge exists
         prop_assert_eq!(graph.get_dependencies(&parent_uri).len(), 1);
@@ -1085,13 +1065,7 @@ proptest! {
 
         // Add edge
         let meta = make_meta_with_sources(vec![(&format!("{}.R", child), 5)]);
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child) {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         // Remove child file
         graph.remove_file(&child_uri);
@@ -1126,23 +1100,11 @@ proptest! {
 
         // A sources B
         let meta_a = make_meta_with_sources(vec![(&format!("{}.R", file_b), 1)]);
-        graph.update_file(&uri_a, &meta_a, |p| {
-            if p == format!("{}.R", file_b) {
-                Some(uri_b.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&uri_a, &meta_a, None, |_| None);
 
         // B sources C
         let meta_b = make_meta_with_sources(vec![(&format!("{}.R", file_c), 1)]);
-        graph.update_file(&uri_b, &meta_b, |p| {
-            if p == format!("{}.R", file_c) {
-                Some(uri_c.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&uri_b, &meta_b, None, |_| None);
 
         // Transitive dependents of C should include both B and A
         let dependents = graph.get_transitive_dependents(&uri_c, 10);
@@ -1166,14 +1128,10 @@ proptest! {
 
         // A sources B sources C
         let meta_a = make_meta_with_sources(vec![(&format!("{}.R", file_b), 1)]);
-        graph.update_file(&uri_a, &meta_a, |p| {
-            if p == format!("{}.R", file_b) { Some(uri_b.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&uri_a, &meta_a, None, |_| None);
 
         let meta_b = make_meta_with_sources(vec![(&format!("{}.R", file_c), 1)]);
-        graph.update_file(&uri_b, &meta_b, |p| {
-            if p == format!("{}.R", file_c) { Some(uri_c.clone()) } else { None }
-        }, |_| None);
+        graph.update_file(&uri_b, &meta_b, None, |_| None);
 
         // With depth 1, only B should be returned (not A)
         let dependents = graph.get_transitive_dependents(&uri_c, 1);
@@ -1229,13 +1187,7 @@ proptest! {
             ..Default::default()
         };
 
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child) {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         // Should have exactly one edge (deduplicated)
         let deps = graph.get_dependencies(&parent_uri);
@@ -1280,13 +1232,7 @@ proptest! {
             ..Default::default()
         };
 
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child) {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         // Should have two edges (different call sites)
         let deps = graph.get_dependencies(&parent_uri);
@@ -1342,13 +1288,7 @@ proptest! {
             ..Default::default()
         };
 
-        graph.update_file(&parent_uri, &meta, |p| {
-            if p == format!("{}.R", child) {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        }, |_| None);
+        graph.update_file(&parent_uri, &meta, None, |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 1);
