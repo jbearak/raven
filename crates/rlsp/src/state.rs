@@ -475,7 +475,7 @@ impl WorldState {
             } else if path.extension().and_then(|s| s.to_str()) == Some("R") {
                     if let Ok(text) = fs::read_to_string(&path) {
                         if let Ok(uri) = Url::from_file_path(&path) {
-                            log::debug!("Indexing file: {}", uri);
+                            log::trace!("Indexing file: {}", uri);
                             self.workspace_index.insert(uri, Document::new(&text, None));
                         }
                     }
