@@ -229,18 +229,20 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Collect syntax errors (not suppressed by @lsp-ignore)
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
 
-    // Collect undefined variable errors with position-aware cross-file scope
-    collect_undefined_variables_position_aware(
-        state,
-        uri,
-        tree.root_node(),
-        &text,
-        &doc.loaded_packages,
-        &state.workspace_imports,
-        &state.library,
-        &directive_meta,
-        &mut diagnostics,
-    );
+    // Collect undefined variable errors if enabled in config
+    if state.cross_file_config.undefined_variables_enabled {
+        collect_undefined_variables_position_aware(
+            state,
+            uri,
+            tree.root_node(),
+            &text,
+            &doc.loaded_packages,
+            &state.workspace_imports,
+            &state.library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+    }
 
     diagnostics
 }
