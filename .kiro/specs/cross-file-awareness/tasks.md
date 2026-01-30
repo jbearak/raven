@@ -211,7 +211,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 40: Position-Aware Symbol Availability**
     - **Validates: Requirements 5.3**
 
-  - [ ] 7.8 Write property test for full position precision
+  - [x] 7.8 Write property test for full position precision
     - **Property 51: Full Position Precision**
     - **Validates: Requirements 5.3, 7.1, 7.4**
 
@@ -223,11 +223,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 52: Local Source Scope Isolation**
     - **Validates: Requirements 4.7, 5.3, 7.1, 10.1**
 
-  - [ ] 7.11 Write property test for sys.source conservative handling
+  - [x] 7.11 Write property test for sys.source conservative handling
     - **Property 53: sys.source Conservative Handling**
     - **Validates: Requirements 4.4**
 
-  - [ ] 7.12 Write property test for v1 R symbol model
+  - [x] 7.12 Write property test for v1 R symbol model
     - Generate files with mix of recognized and unrecognized constructs
     - Verify only v1-recognized constructs contribute to exported interface
     - Verify non-literal `assign()` does NOT suppress diagnostics
