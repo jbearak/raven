@@ -126,7 +126,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 14: Default Working Directory**
     - **Validates: Requirements 3.12**
 
-- [ ] 5. Checkpoint - Ensure all tests pass
+- [x] 5. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 
@@ -145,23 +145,23 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Use `HashMap` with forward and backward indexes for efficient queries
     - _Requirements: 6.1-6.8_
 
-  - [ ] 6.2 Write property test for dependency graph operations
+  - [x] 6.2 Write property test for dependency graph operations
     - **Property 23: Dependency Graph Update on Change**
     - **Validates: Requirements 0.1, 0.2, 6.1, 6.2**
 
-  - [ ] 6.3 Write property test for dependency graph edge removal
+  - [x] 6.3 Write property test for dependency graph edge removal
     - **Property 25: Dependency Graph Edge Removal**
     - **Validates: Requirements 6.3, 13.3**
 
-  - [ ] 6.4 Write property test for transitive dependency query
+  - [x] 6.4 Write property test for transitive dependency query
     - **Property 26: Transitive Dependency Query**
     - **Validates: Requirements 6.4, 6.5**
 
-  - [ ] 6.5 Write property test for edge deduplication
+  - [x] 6.5 Write property test for edge deduplication
     - **Property 50: Edge Deduplication**
     - **Validates: Requirements 6.1, 6.2, 12.5**
 
-  - [ ] 6.6 Write property test for directive-vs-AST conflict resolution
+  - [x] 6.6 Write property test for directive-vs-AST conflict resolution
     - **Property 58: Directive Overrides AST For Same (from,to)**
     - **Validates: Requirements 6.8**
 

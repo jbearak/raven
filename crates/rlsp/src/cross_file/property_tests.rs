@@ -918,3 +918,417 @@ proptest! {
         prop_assert_eq!(ctx.effective_working_directory(), inherited_working_dir);
     }
 }
+
+// ============================================================================
+// Property 23: Dependency Graph Update on Change
+// Validates: Requirements 0.1, 0.2, 6.1, 6.2
+// ============================================================================
+
+use super::dependency::DependencyGraph;
+use super::types::ForwardSource;
+use tower_lsp::lsp_types::Url;
+
+fn make_url(name: &str) -> Url {
+    Url::parse(&format!("file:///{}.R", name)).unwrap()
+}
+
+fn make_meta_with_sources(sources: Vec<(&str, u32)>) -> CrossFileMetadata {
+    CrossFileMetadata {
+        sources: sources
+            .into_iter()
+            .map(|(path, line)| ForwardSource {
+                path: path.to_string(),
+                line,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 23: When a file is opened or changed, the Dependency_Graph SHALL
+    /// update edges for that file.
+    #[test]
+    fn prop_dependency_graph_update_on_change(
+        parent in path_component(),
+        child in path_component(),
+        line in 0..100u32
+    ) {
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child_uri = make_url(&child);
+
+        let meta = make_meta_with_sources(vec![(&format!("{}.R", child), line)]);
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child) {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        let deps = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps.len(), 1);
+        prop_assert_eq!(&deps[0].to, &child_uri);
+        prop_assert_eq!(deps[0].call_site_line, Some(line));
+    }
+
+    /// Property 23 extended: Multiple sources create multiple edges
+    #[test]
+    fn prop_multiple_sources_create_edges(
+        parent in path_component(),
+        child1 in path_component(),
+        child2 in path_component()
+    ) {
+        prop_assume!(child1 != child2);
+
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child1_uri = make_url(&child1);
+        let child2_uri = make_url(&child2);
+
+        let meta = make_meta_with_sources(vec![
+            (&format!("{}.R", child1), 5),
+            (&format!("{}.R", child2), 10),
+        ]);
+
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child1) {
+                Some(child1_uri.clone())
+            } else if p == format!("{}.R", child2) {
+                Some(child2_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        let deps = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps.len(), 2);
+    }
+}
+
+// ============================================================================
+// Property 25: Dependency Graph Edge Removal
+// Validates: Requirements 6.3, 13.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 25: For any file that is deleted, the Dependency_Graph SHALL contain
+    /// no edges where that file is either source or target.
+    #[test]
+    fn prop_dependency_graph_edge_removal(
+        parent in path_component(),
+        child in path_component()
+    ) {
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child_uri = make_url(&child);
+
+        // Add edge
+        let meta = make_meta_with_sources(vec![(&format!("{}.R", child), 5)]);
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child) {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        // Verify edge exists
+        prop_assert_eq!(graph.get_dependencies(&parent_uri).len(), 1);
+        prop_assert_eq!(graph.get_dependents(&child_uri).len(), 1);
+
+        // Remove parent file
+        graph.remove_file(&parent_uri);
+
+        // No edges should remain
+        prop_assert!(graph.get_dependencies(&parent_uri).is_empty());
+        prop_assert!(graph.get_dependents(&child_uri).is_empty());
+    }
+
+    /// Property 25 extended: Removing child file removes backward edges
+    #[test]
+    fn prop_remove_child_removes_backward_edges(
+        parent in path_component(),
+        child in path_component()
+    ) {
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child_uri = make_url(&child);
+
+        // Add edge
+        let meta = make_meta_with_sources(vec![(&format!("{}.R", child), 5)]);
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child) {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        // Remove child file
+        graph.remove_file(&child_uri);
+
+        // Forward edge from parent should be removed
+        prop_assert!(graph.get_dependencies(&parent_uri).is_empty());
+    }
+}
+
+// ============================================================================
+// Property 26: Transitive Dependency Query
+// Validates: Requirements 6.4, 6.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 26: For any file A that sources B, and B sources C, querying
+    /// dependents of C SHALL include both B and A.
+    #[test]
+    fn prop_transitive_dependency_query(
+        file_a in path_component(),
+        file_b in path_component(),
+        file_c in path_component()
+    ) {
+        prop_assume!(file_a != file_b && file_b != file_c && file_a != file_c);
+
+        let mut graph = DependencyGraph::new();
+        let uri_a = make_url(&file_a);
+        let uri_b = make_url(&file_b);
+        let uri_c = make_url(&file_c);
+
+        // A sources B
+        let meta_a = make_meta_with_sources(vec![(&format!("{}.R", file_b), 1)]);
+        graph.update_file(&uri_a, &meta_a, |p| {
+            if p == format!("{}.R", file_b) {
+                Some(uri_b.clone())
+            } else {
+                None
+            }
+        });
+
+        // B sources C
+        let meta_b = make_meta_with_sources(vec![(&format!("{}.R", file_c), 1)]);
+        graph.update_file(&uri_b, &meta_b, |p| {
+            if p == format!("{}.R", file_c) {
+                Some(uri_c.clone())
+            } else {
+                None
+            }
+        });
+
+        // Transitive dependents of C should include both B and A
+        let dependents = graph.get_transitive_dependents(&uri_c, 10);
+        prop_assert!(dependents.contains(&uri_b));
+        prop_assert!(dependents.contains(&uri_a));
+    }
+
+    /// Property 26 extended: Depth limit is respected
+    #[test]
+    fn prop_transitive_depth_limit(
+        file_a in path_component(),
+        file_b in path_component(),
+        file_c in path_component()
+    ) {
+        prop_assume!(file_a != file_b && file_b != file_c && file_a != file_c);
+
+        let mut graph = DependencyGraph::new();
+        let uri_a = make_url(&file_a);
+        let uri_b = make_url(&file_b);
+        let uri_c = make_url(&file_c);
+
+        // A sources B sources C
+        let meta_a = make_meta_with_sources(vec![(&format!("{}.R", file_b), 1)]);
+        graph.update_file(&uri_a, &meta_a, |p| {
+            if p == format!("{}.R", file_b) { Some(uri_b.clone()) } else { None }
+        });
+
+        let meta_b = make_meta_with_sources(vec![(&format!("{}.R", file_c), 1)]);
+        graph.update_file(&uri_b, &meta_b, |p| {
+            if p == format!("{}.R", file_c) { Some(uri_c.clone()) } else { None }
+        });
+
+        // With depth 1, only B should be returned (not A)
+        let dependents = graph.get_transitive_dependents(&uri_c, 1);
+        prop_assert!(dependents.contains(&uri_b));
+        prop_assert!(!dependents.contains(&uri_a));
+    }
+}
+
+// ============================================================================
+// Property 50: Edge Deduplication
+// Validates: Requirements 6.1, 6.2, 12.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 50: For any file where both a directive and AST detection identify
+    /// the same relationship, the Dependency_Graph SHALL contain exactly one edge.
+    #[test]
+    fn prop_edge_deduplication(
+        parent in path_component(),
+        child in path_component(),
+        line in 0..100u32
+    ) {
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child_uri = make_url(&child);
+
+        // Create metadata with duplicate sources (directive and AST)
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: format!("{}.R", child),
+                    line,
+                    column: 0,
+                    is_directive: false, // AST detected
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                },
+                ForwardSource {
+                    path: format!("{}.R", child),
+                    line,
+                    column: 0,
+                    is_directive: true, // Directive
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child) {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        // Should have exactly one edge (deduplicated)
+        let deps = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps.len(), 1);
+    }
+
+    /// Property 50 extended: Different call sites create separate edges
+    #[test]
+    fn prop_different_call_sites_separate_edges(
+        parent in path_component(),
+        child in path_component(),
+        line1 in 0..50u32,
+        line2 in 50..100u32
+    ) {
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child_uri = make_url(&child);
+
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: format!("{}.R", child),
+                    line: line1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                },
+                ForwardSource {
+                    path: format!("{}.R", child),
+                    line: line2,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child) {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        // Should have two edges (different call sites)
+        let deps = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps.len(), 2);
+    }
+}
+
+// ============================================================================
+// Property 58: Directive Overrides AST For Same (from,to)
+// Validates: Requirements 6.8
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 58: For any file where both @lsp-source directive and AST detection
+    /// identify a relationship to the same target URI, the directive SHALL be
+    /// authoritative (first one wins in deduplication).
+    #[test]
+    fn prop_directive_overrides_ast(
+        parent in path_component(),
+        child in path_component(),
+        line in 0..100u32
+    ) {
+        let mut graph = DependencyGraph::new();
+        let parent_uri = make_url(&parent);
+        let child_uri = make_url(&child);
+
+        // Directive comes first in the list
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: format!("{}.R", child),
+                    line,
+                    column: 0,
+                    is_directive: true, // Directive first
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                },
+                ForwardSource {
+                    path: format!("{}.R", child),
+                    line,
+                    column: 0,
+                    is_directive: false, // AST second
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        graph.update_file(&parent_uri, &meta, |p| {
+            if p == format!("{}.R", child) {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        });
+
+        let deps = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps.len(), 1);
+        // First one (directive) wins
+        prop_assert!(deps[0].is_directive);
+    }
+}
