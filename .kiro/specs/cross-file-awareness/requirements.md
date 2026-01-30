@@ -62,6 +62,24 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 
 ### Requirement 0: Real-Time Cross-File Updates (Core)
 
+### Requirement 0b: UTF-16 Correct Incremental Edit Application (Required)
+
+**User Story:** As an editor user working with Unicode text, I need the server to apply incremental edits correctly so that parse trees, diagnostics, and cross-file call-site positions remain correct.
+
+#### Acceptance Criteria
+1. WHEN applying `textDocument/didChange` incremental edits that include an LSP `Range`, THE server SHALL interpret `Position.character` as UTF-16 code units.
+2. THE server SHALL convert UTF-16 columns to the document storage indexing scheme before mutating the in-memory document.
+3. The implementation SHALL include tests for non-ASCII lines (e.g., emoji/CJK) verifying that edits are applied at the correct offsets.
+
+### Requirement 0c: Document Freshness Identifiers (Required)
+
+**User Story:** As an editor user, I need diagnostics updates (including dependency-triggered updates) to never publish stale results.
+
+#### Acceptance Criteria
+1. Each open `Document` SHALL store the last known LSP document version when provided by the client.
+2. Each open `Document` SHALL maintain a monotonic content revision identifier (or content hash) that changes on every edit.
+3. Any debounced/background diagnostics task SHALL guard publishing using both the document version (when present) and the content revision identifier.
+
 **User Story:** As an R developer, I want diagnostics, completions, hover, and definition results to update in all affected open files when I edit any file in the chain, so that cross-file analysis stays correct while I edit multiple files concurrently.
 
 #### Acceptance Criteria
@@ -285,6 +303,15 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 11. The LSP SHOULD use an interface-hash optimization: IF a file changes but its exported interface hash remains identical and its edge set remains identical, THEN dependent invalidation SHOULD be skipped.
 
 ### Requirement 13: Workspace Watching + Indexing (Required)
+
+### Requirement 13a: Non-Blocking Indexing Under Tokio Lock (Required)
+
+**User Story:** As an editor user, I need the server to stay responsive while indexing large workspaces and updating cross-file state.
+
+#### Acceptance Criteria
+1. The server SHALL NOT perform blocking filesystem I/O while holding the Tokio `WorldState` lock (read or write).
+2. Workspace indexing work SHALL run outside the Tokio `WorldState` lock (e.g., via async tasks), and results SHALL be applied under brief locks.
+3. When index results are applied, the server SHALL re-check freshness for any affected open documents before publishing diagnostics.
 
 **User Story:** As an R developer, I want cross-file scope and diagnostics to remain correct even when related files change on disk (including when those files are not open), so that the LSP does not depend on me opening every file to keep analysis fresh.
 

@@ -8,6 +8,13 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 
 ## Tasks
 
+- [ ] 0. Prerequisites (blocking)
+  - Add UTF-16 correct incremental edit application for in-memory documents
+  - Add `Document.version` storage and a monotonic content revision identifier
+  - Replace single-file diagnostics publishing with debounced fanout + monotonic gating + force republish
+  - Move workspace indexing off the Tokio `WorldState` lock (no blocking fs I/O under lock)
+  - Implement watched file handling (`workspace/didChangeWatchedFiles`) and register watchers
+
 - [ ] 1. Set up cross-file module structure and core types
   - Create `crates/rlsp/src/cross_file/` directory
   - Create `mod.rs` with module declarations
@@ -230,6 +237,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 5.10**
 
 - [ ] 12. Implement real-time update system
+  - NOTE: This task depends on completing the prerequisites in Task 0 (Document freshness IDs, monotonic publish gating, and non-blocking indexing).
   - [ ] 12.1 Create `revalidation.rs` with revalidation logic
     - Implement `CrossFileRevalidationState` with pending task tracking
     - Implement `CrossFileDiagnosticsGate` for monotonic publishing

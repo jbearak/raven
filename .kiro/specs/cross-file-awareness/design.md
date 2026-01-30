@@ -83,6 +83,44 @@ graph TB
 
 ## Components and Interfaces
 
+## Prerequisites / Required Integration Changes (Blocking)
+
+Cross-file awareness depends on core LSP infrastructure behaving correctly under concurrent editing and dependency-triggered revalidation. The following prerequisites MUST be addressed as part of this work; otherwise the core goals (real-time updates, position-aware scope, and non-stale diagnostics) cannot be met.
+
+### 1) UTF-16 Correctness for Incremental Edits (Required)
+
+All LSP `Position.character` values are UTF-16 code units. The server MUST apply incremental edits (`textDocument/didChange`) correctly when documents contain non-ASCII characters.
+
+- When applying an LSP `Range` to the in-memory document, the implementation MUST convert UTF-16 columns to the document's internal indexing scheme.
+- If the document storage uses Unicode scalar indexing (e.g., `ropey`), the conversion MUST be explicit and tested.
+
+Without this, the server may apply edits at incorrect offsets, corrupting parse trees and causing incorrect diagnostics/completions that appear nondeterministic.
+
+### 2) Document Version + Content Revision (Required)
+
+To support freshness guards and monotonic diagnostic publishing:
+- Each open `Document` MUST store the LSP `TextDocumentItem.version` when provided.
+- Each open `Document` MUST expose a monotonic content revision identifier (or content hash) that changes on every edit, even if `version` is absent.
+
+This is required for safe debounced/background diagnostics and for dependency-triggered diagnostics republish when the target document’s version has not changed.
+
+### 3) Diagnostics Publishing Architecture (Required)
+
+The server MUST not publish diagnostics only for the changed file. Instead, it MUST:
+- Compute the set of affected open documents when a file’s exported interface or dependency edges change.
+- Debounce and cancel revalidation per-URI.
+- Enforce monotonic publishing per URI.
+- Support same-version republish for dependency-triggered updates via a "force republish" mechanism.
+
+### 4) Workspace Indexing + File Watching Must Be Non-Blocking (Required)
+
+Cross-file awareness relies on closed-file snapshots (workspace index) and on-disk change observation.
+
+- Workspace indexing and any filesystem reads MUST NOT run while holding the Tokio `WorldState` lock.
+- The server MUST implement `workspace/didChangeWatchedFiles` and register watchers so that on-disk edits to closed files invalidate cross-file state and trigger revalidation of affected open documents.
+
+These prerequisites are part of this spec because they are necessary for correctness and real-time behavior, not just performance.
+
 ### Unified Cross-File Metadata Model (Single Source of Truth)
 
 #### Position Conventions (Required)
