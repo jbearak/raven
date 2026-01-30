@@ -327,34 +327,69 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         log::trace!("Received watched files change: {} changes", params.changes.len());
         
-        let mut state = self.state.write().await;
-        for change in params.changes {
-            let uri = &change.uri;
+        // Collect affected URIs and open documents that need revalidation
+        let affected_open_docs: Vec<Url> = {
+            let mut state = self.state.write().await;
+            let mut affected = Vec::new();
             
-            // Skip if document is open (open docs are authoritative)
-            if state.documents.contains_key(uri) {
-                log::trace!("Skipping watched file change for open document: {}", uri);
-                continue;
-            }
-            
-            match change.typ {
-                FileChangeType::CREATED | FileChangeType::CHANGED => {
-                    // Invalidate disk-backed caches
-                    state.cross_file_file_cache.invalidate(uri);
-                    state.cross_file_workspace_index.invalidate(uri);
-                    log::trace!("Invalidated caches for changed file: {}", uri);
+            for change in params.changes {
+                let uri = &change.uri;
+                
+                // Skip if document is open (open docs are authoritative)
+                if state.documents.contains_key(uri) {
+                    log::trace!("Skipping watched file change for open document: {}", uri);
+                    continue;
                 }
-                FileChangeType::DELETED => {
-                    // Remove from dependency graph and caches
-                    state.cross_file_graph.remove_file(uri);
-                    state.cross_file_file_cache.invalidate(uri);
-                    state.cross_file_workspace_index.invalidate(uri);
-                    state.cross_file_cache.invalidate(uri);
-                    state.cross_file_meta.remove(uri);
-                    log::trace!("Removed deleted file from cross-file state: {}", uri);
+                
+                match change.typ {
+                    FileChangeType::CREATED | FileChangeType::CHANGED => {
+                        // Invalidate disk-backed caches
+                        state.cross_file_file_cache.invalidate(uri);
+                        state.cross_file_workspace_index.invalidate(uri);
+                        
+                        // Find open documents that depend on this file (Requirement 13.4)
+                        let dependents = state.cross_file_graph.get_transitive_dependents(
+                            uri,
+                            state.cross_file_config.max_chain_depth,
+                        );
+                        for dep in dependents {
+                            if state.documents.contains_key(&dep) && !affected.contains(&dep) {
+                                state.diagnostics_gate.mark_force_republish(&dep);
+                                affected.push(dep);
+                            }
+                        }
+                        log::trace!("Invalidated caches for changed file: {}", uri);
+                    }
+                    FileChangeType::DELETED => {
+                        // Find dependents before removing from graph
+                        let dependents = state.cross_file_graph.get_transitive_dependents(
+                            uri,
+                            state.cross_file_config.max_chain_depth,
+                        );
+                        for dep in dependents {
+                            if state.documents.contains_key(&dep) && !affected.contains(&dep) {
+                                state.diagnostics_gate.mark_force_republish(&dep);
+                                affected.push(dep);
+                            }
+                        }
+                        
+                        // Remove from dependency graph and caches
+                        state.cross_file_graph.remove_file(uri);
+                        state.cross_file_file_cache.invalidate(uri);
+                        state.cross_file_workspace_index.invalidate(uri);
+                        state.cross_file_cache.invalidate(uri);
+                        state.cross_file_meta.remove(uri);
+                        log::trace!("Removed deleted file from cross-file state: {}", uri);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            affected
+        };
+        
+        // Schedule diagnostics for affected open documents (Requirement 13.4)
+        for uri in affected_open_docs {
+            self.publish_diagnostics(&uri).await;
         }
     }
 
