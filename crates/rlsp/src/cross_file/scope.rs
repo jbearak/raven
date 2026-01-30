@@ -248,11 +248,88 @@ fn collect_definitions(
             artifacts.exported_interface.insert(symbol.name.clone(), symbol);
         }
     }
+    
+    // Check for assign() calls (Requirement 17.4)
+    if node.kind() == "call" {
+        if let Some(symbol) = try_extract_assign_call(node, content, uri) {
+            let event = ScopeEvent::Def {
+                line: symbol.defined_line,
+                column: symbol.defined_column,
+                symbol: symbol.clone(),
+            };
+            artifacts.timeline.push(event);
+            artifacts.exported_interface.insert(symbol.name.clone(), symbol);
+        }
+    }
 
     // Recurse into children
     for child in node.children(&mut node.walk()) {
         collect_definitions(child, content, uri, artifacts);
     }
+}
+
+/// Extract definition from assign("name", value) calls.
+/// Only handles string literal names per Requirement 17.4.
+fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+    // Get function name
+    let func_node = node.child_by_field_name("function")?;
+    let func_name = node_text(func_node, content);
+    
+    if func_name != "assign" {
+        return None;
+    }
+    
+    // Get arguments
+    let args_node = node.child_by_field_name("arguments")?;
+    
+    // Find the first argument (the name)
+    let mut name_arg = None;
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() == "argument" {
+            // Check if it's a named argument
+            if let Some(name_node) = child.child_by_field_name("name") {
+                let arg_name = node_text(name_node, content);
+                if arg_name == "x" {
+                    // This is the name argument
+                    name_arg = child.child_by_field_name("value");
+                    break;
+                }
+            } else {
+                // Positional argument - first one is the name
+                name_arg = child.child_by_field_name("value");
+                break;
+            }
+        }
+    }
+    
+    let name_node = name_arg?;
+    
+    // Only handle string literals
+    if name_node.kind() != "string" {
+        return None;
+    }
+    
+    // Extract the string content (remove quotes)
+    let name_text = node_text(name_node, content);
+    let name = name_text.trim_matches(|c| c == '"' || c == '\'').to_string();
+    
+    if name.is_empty() {
+        return None;
+    }
+    
+    // Get position with UTF-16 column
+    let start = node.start_position();
+    let line_text = content.lines().nth(start.row).unwrap_or("");
+    let column = byte_offset_to_utf16_column(line_text, start.column);
+    
+    Some(ScopedSymbol {
+        name,
+        kind: SymbolKind::Variable,
+        source_uri: uri.clone(),
+        defined_line: start.row as u32,
+        defined_column: column,
+        signature: None,
+    })
 }
 
 fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
@@ -445,5 +522,26 @@ mod tests {
         let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
 
         assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+
+    #[test]
+    fn test_assign_call_string_literal() {
+        let code = r#"assign("my_var", 42)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        let symbol = artifacts.exported_interface.get("my_var").unwrap();
+        assert_eq!(symbol.kind, SymbolKind::Variable);
+    }
+
+    #[test]
+    fn test_assign_call_dynamic_name_ignored() {
+        let code = r#"assign(name_var, 42)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Dynamic name should not be treated as a definition
+        assert_eq!(artifacts.exported_interface.len(), 0);
     }
 }
