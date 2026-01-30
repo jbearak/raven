@@ -859,15 +859,30 @@ impl ParentSelectionCache {
 
 /// Compute hash of reverse edges pointing to a child URI.
 /// Used for cache key to detect graph structure changes (rename/delete+create).
+///
+/// IMPORTANT: Include all semantics-bearing fields that could affect parent selection stability
+/// or call-site resolution behavior, not just the parent URI.
 fn compute_reverse_edges_hash(graph: &DependencyGraph, child_uri: &Url) -> u64 {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
-    
+    use std::hash::{Hash, Hasher};
+
     let mut hasher = DefaultHasher::new();
-    let mut edges: Vec<_> = graph.get_dependents(child_uri)
+
+    let mut edges: Vec<_> = graph
+        .get_dependents(child_uri)
         .iter()
-        .map(|e| (e.from.as_str(), e.call_site_line, e.call_site_column))
+        .map(|e| {
+            (
+                e.from.as_str(),
+                e.call_site_line,
+                e.call_site_column,
+                e.local,
+                e.chdir,
+                e.is_sys_source,
+            )
+        })
         .collect();
+
     edges.sort(); // Deterministic ordering
     edges.hash(&mut hasher);
     hasher.finish()
@@ -1858,7 +1873,7 @@ These invariants MUST be preserved across all refactoring. They are the core beh
 
 4. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files. This MUST be enforced at every read path: `CrossFileWorkspaceIndex` and `CrossFileFileCache` APIs MUST check "is it open?" before returning disk-derived data.
 
-5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent. Once a parent is selected for a given (child_uri, metadata_fingerprint), it remains until that child's metadata changes.
+5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent. Once a parent is selected for a given (child_uri, metadata_fingerprint, reverse_edges_hash) cache key, it remains until either that child's metadata changes OR the reverse edges pointing to the child change (e.g., rename/delete+create convergence).
 
 6. **compute_artifacts() MUST NOT read other files' content** - it depends only on the file's own content/AST plus pre-existing dependency metadata (edges) and already-indexed interface hashes. This prevents recursion and lock contention.
 
@@ -2525,7 +2540,7 @@ This policy is already enforced by `CrossFileDiagnosticsGate.can_publish()` whic
 
 **Problem:** Parent selection uses a mixture of backward directives (immediate), reverse edges (depends on indexing), and text inference (depends on disk reads). This can cause the selected parent to *flip* as more info arrives, even if inputs haven't changed, leading to flickering diagnostics during concurrent edits.
 
-**Fix:** Define a strict precedence order that does not change as new evidence appears, unless earlier evidence is invalidated. Add stability rule: once a parent is selected for a given (child URI, doc version, metadata fingerprint), it remains until that child's metadata changes.
+**Fix:** Define a strict precedence order that does not change as new evidence appears, unless earlier evidence is invalidated. Add stability rule: once a parent is selected for a given (child URI, metadata fingerprint, reverse_edges_hash) cache key, it remains stable until either the child's metadata changes OR the reverse edges pointing to the child change.
 
 **Parent Selection Stability Rule:**
 
@@ -2536,7 +2551,7 @@ This policy is already enforced by `CrossFileDiagnosticsGate.can_publish()` whic
    - Backward directive without call site (uses inference/default)
    - Deterministic tiebreak: lexicographic by URI (lowest)
 
-2. **Selection is cached per (child_uri, metadata_fingerprint):** Once a parent is selected, it remains stable until the child's `CrossFileMetadata` changes (which changes the fingerprint).
+2. **Selection is cached per (child_uri, metadata_fingerprint, reverse_edges_hash):** Once a parent is selected, it remains stable until either the child's `CrossFileMetadata` changes (which changes the fingerprint) OR the reverse edges pointing to the child change (which changes `reverse_edges_hash`).
 
 3. **Missing parents do not cause re-selection:** If a selected parent is temporarily missing (file deleted or not yet indexed), the selection remains stable. The scope resolver will emit a missing-file diagnostic but will not re-run parent selection to pick a different parent.
 
