@@ -76,6 +76,9 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
     if let Some(sev) = cross_file.get("ambiguousParentSeverity").and_then(|v| v.as_str()) {
         config.ambiguous_parent_severity = parse_severity(sev);
     }
+    if let Some(sev) = cross_file.get("maxChainDepthSeverity").and_then(|v| v.as_str()) {
+        config.max_chain_depth_severity = parse_severity(sev);
+    }
     
     // Parse diagnostics.undefinedVariables
     if let Some(diag) = diagnostics {
@@ -208,14 +211,36 @@ impl LanguageServer for Backend {
             // Update dependency graph with cross-file metadata
             let meta = crate::cross_file::extract_metadata(&text);
             let uri_clone = uri.clone();
-            let result = state.cross_file_graph.update_file(&uri, &meta, |path| {
-                // Resolve path relative to the file using normalization (no blocking I/O)
-                let file_path = uri_clone.to_file_path().ok()?;
-                let parent_dir = file_path.parent()?;
-                let resolved = parent_dir.join(path);
-                let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                Url::from_file_path(normalized).ok()
-            });
+            
+            // Pre-collect content for potential parent files to avoid borrow conflicts
+            // The content provider needs to access documents/cache while graph is mutably borrowed
+            let parent_content: std::collections::HashMap<Url, String> = meta.sourced_by.iter()
+                .filter_map(|d| {
+                    let file_path = uri_clone.to_file_path().ok()?;
+                    let parent_dir = file_path.parent()?;
+                    let resolved = parent_dir.join(&d.path);
+                    let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                    let parent_uri = Url::from_file_path(normalized).ok()?;
+                    let content = state.documents.get(&parent_uri)
+                        .map(|doc| doc.text())
+                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    Some((parent_uri, content))
+                })
+                .collect();
+            
+            let result = state.cross_file_graph.update_file(
+                &uri,
+                &meta,
+                |path| {
+                    // Resolve path relative to the file using normalization (no blocking I/O)
+                    let file_path = uri_clone.to_file_path().ok()?;
+                    let parent_dir = file_path.parent()?;
+                    let resolved = parent_dir.join(path);
+                    let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                    Url::from_file_path(normalized).ok()
+                },
+                |parent_uri| parent_content.get(parent_uri).cloned(),
+            );
             
             // Emit any directive-vs-AST conflict diagnostics
             if !result.diagnostics.is_empty() {
@@ -359,13 +384,34 @@ impl LanguageServer for Backend {
                 let text = doc.text();
                 let meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
-                let _result = state.cross_file_graph.update_file(&uri, &meta, |path| {
-                    let file_path = uri_clone.to_file_path().ok()?;
-                    let parent_dir = file_path.parent()?;
-                    let resolved = parent_dir.join(path);
-                    let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-                    Url::from_file_path(normalized).ok()
-                });
+                
+                // Pre-collect content for potential parent files to avoid borrow conflicts
+                let parent_content: std::collections::HashMap<Url, String> = meta.sourced_by.iter()
+                    .filter_map(|d| {
+                        let file_path = uri_clone.to_file_path().ok()?;
+                        let parent_dir = file_path.parent()?;
+                        let resolved = parent_dir.join(&d.path);
+                        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                        let parent_uri = Url::from_file_path(normalized).ok()?;
+                        let content = state.documents.get(&parent_uri)
+                            .map(|doc| doc.text())
+                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                        Some((parent_uri, content))
+                    })
+                    .collect();
+                
+                let _result = state.cross_file_graph.update_file(
+                    &uri,
+                    &meta,
+                    |path| {
+                        let file_path = uri_clone.to_file_path().ok()?;
+                        let parent_dir = file_path.parent()?;
+                        let resolved = parent_dir.join(path);
+                        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                        Url::from_file_path(normalized).ok()
+                    },
+                    |parent_uri| parent_content.get(parent_uri).cloned(),
+                );
             }
             
             // Compute affected files from dependency graph
@@ -558,12 +604,13 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         log::trace!("Received watched files change: {} changes", params.changes.len());
         
-        // Collect affected URIs and open documents that need revalidation
-        let affected_open_docs: Vec<Url> = {
+        // Collect URIs to update and affected open documents
+        let (uris_to_update, affected_open_docs): (Vec<Url>, Vec<Url>) = {
             let mut state = self.state.write().await;
+            let mut to_update = Vec::new();
             let mut affected = Vec::new();
             
-            for change in params.changes {
+            for change in &params.changes {
                 let uri = &change.uri;
                 
                 // Skip if document is open (open docs are authoritative)
@@ -578,7 +625,10 @@ impl LanguageServer for Backend {
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
                         
-                        // Find open documents that depend on this file (Requirement 13.4)
+                        // Schedule for async update
+                        to_update.push(uri.clone());
+                        
+                        // Find open documents that depend on this file
                         let dependents = state.cross_file_graph.get_transitive_dependents(
                             uri,
                             state.cross_file_config.max_chain_depth,
@@ -615,8 +665,111 @@ impl LanguageServer for Backend {
                     _ => {}
                 }
             }
-            affected
+            (to_update, affected)
         };
+        
+        // Schedule async disk reads to update workspace index for changed files
+        if !uris_to_update.is_empty() {
+            let state_arc = self.state.clone();
+            tokio::spawn(async move {
+                for uri in uris_to_update {
+                    // Read file content asynchronously
+                    let path = match uri.to_file_path() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    
+                    let content = match tokio::fs::read_to_string(&path).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::trace!("Failed to read file {}: {}", uri, e);
+                            continue;
+                        }
+                    };
+                    
+                    let metadata = match tokio::fs::metadata(&path).await {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    
+                    // Compute metadata and artifacts
+                    let cross_file_meta = crate::cross_file::extract_metadata(&content);
+                    let artifacts = {
+                        let mut parser = tree_sitter::Parser::new();
+                        if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
+                            if let Some(tree) = parser.parse(&content, None) {
+                                crate::cross_file::scope::compute_artifacts(&uri, &tree, &content)
+                            } else {
+                                crate::cross_file::scope::ScopeArtifacts::default()
+                            }
+                        } else {
+                            crate::cross_file::scope::ScopeArtifacts::default()
+                        }
+                    };
+                    
+                    let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                        &metadata,
+                        &content,
+                    );
+                    
+                    // Cache content for future match/inference resolution
+                    state_arc.read().await.cross_file_file_cache.insert(
+                        uri.clone(),
+                        snapshot.clone(),
+                        content.clone(),
+                    );
+                    
+                    // Update workspace index under brief lock
+                    {
+                        let state = state_arc.read().await;
+                        let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
+                        state.cross_file_workspace_index.update_from_disk(
+                            &uri,
+                            &open_docs,
+                            snapshot,
+                            cross_file_meta.clone(),
+                            artifacts,
+                        );
+                    }
+                    
+                    // Update dependency graph
+                    {
+                        let mut state = state_arc.write().await;
+                        let uri_clone = uri.clone();
+                        
+                        // Pre-collect content for potential parent files to avoid borrow conflicts
+                        let parent_content: std::collections::HashMap<Url, String> = cross_file_meta.sourced_by.iter()
+                            .filter_map(|d| {
+                                let file_path = uri_clone.to_file_path().ok()?;
+                                let parent_dir = file_path.parent()?;
+                                let resolved = parent_dir.join(&d.path);
+                                let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                                let parent_uri = Url::from_file_path(normalized).ok()?;
+                                let content = state.documents.get(&parent_uri)
+                                    .map(|doc| doc.text())
+                                    .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                                Some((parent_uri, content))
+                            })
+                            .collect();
+                        
+                        state.cross_file_graph.update_file(
+                            &uri,
+                            &cross_file_meta,
+                            |path| {
+                                let file_path = uri_clone.to_file_path().ok()?;
+                                let parent_dir = file_path.parent()?;
+                                let resolved = parent_dir.join(path);
+                                let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                                Url::from_file_path(normalized).ok()
+                            },
+                            |parent_uri| parent_content.get(parent_uri).cloned(),
+                        );
+                    }
+                    
+                    log::trace!("Updated workspace index for: {}", uri);
+                }
+            });
+        }
         
         // Schedule diagnostics for affected open documents (Requirement 13.4)
         for uri in affected_open_docs {

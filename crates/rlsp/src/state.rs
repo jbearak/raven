@@ -560,3 +560,125 @@ fn parse_namespace_imports_from_text(text: &str) -> Vec<String> {
 
     imports
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    #[test]
+    fn test_document_apply_change_ascii() {
+        let mut doc = Document::new("hello world", None);
+        
+        // Replace "world" with "rust"
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position { line: 0, character: 6 },
+                end: Position { line: 0, character: 11 },
+            }),
+            range_length: None,
+            text: "rust".to_string(),
+        });
+        
+        assert_eq!(doc.text(), "hello rust");
+    }
+
+    #[test]
+    fn test_document_apply_change_utf16_emoji() {
+        // 🎉 is 4 bytes in UTF-8, 2 UTF-16 code units
+        let mut doc = Document::new("a🎉b", None);
+        
+        // Insert "x" after the emoji (UTF-16 position 3 = after 'a' + 2 for emoji)
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position { line: 0, character: 3 },
+                end: Position { line: 0, character: 3 },
+            }),
+            range_length: None,
+            text: "x".to_string(),
+        });
+        
+        assert_eq!(doc.text(), "a🎉xb");
+    }
+
+    #[test]
+    fn test_document_apply_change_utf16_cjk() {
+        // CJK characters are 3 bytes in UTF-8, 1 UTF-16 code unit each
+        let mut doc = Document::new("a中b", None);
+        
+        // Insert "x" after '中' (UTF-16 position 2)
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position { line: 0, character: 2 },
+                end: Position { line: 0, character: 2 },
+            }),
+            range_length: None,
+            text: "x".to_string(),
+        });
+        
+        assert_eq!(doc.text(), "a中xb");
+    }
+
+    #[test]
+    fn test_document_apply_change_utf16_delete_emoji() {
+        let mut doc = Document::new("a🎉b", None);
+        
+        // Delete the emoji (UTF-16 positions 1-3)
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position { line: 0, character: 1 },
+                end: Position { line: 0, character: 3 },
+            }),
+            range_length: None,
+            text: "".to_string(),
+        });
+        
+        assert_eq!(doc.text(), "ab");
+    }
+
+    #[test]
+    fn test_document_apply_change_multiline_utf16() {
+        let mut doc = Document::new("line1\n🎉line2", None);
+        
+        // Replace "line2" on second line (after emoji)
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position { line: 1, character: 2 }, // After emoji (2 UTF-16 units)
+                end: Position { line: 1, character: 7 },   // End of "line2"
+            }),
+            range_length: None,
+            text: "test".to_string(),
+        });
+        
+        assert_eq!(doc.text(), "line1\n🎉test");
+    }
+
+    #[test]
+    fn test_utf16_offset_to_char_offset_ascii() {
+        let line = "hello";
+        assert_eq!(utf16_offset_to_char_offset(line, 0), 0);
+        assert_eq!(utf16_offset_to_char_offset(line, 3), 3);
+        assert_eq!(utf16_offset_to_char_offset(line, 5), 5);
+    }
+
+    #[test]
+    fn test_utf16_offset_to_char_offset_emoji() {
+        // 🎉 is 2 UTF-16 code units, 1 char
+        let line = "a🎉b";
+        assert_eq!(utf16_offset_to_char_offset(line, 0), 0); // before 'a'
+        assert_eq!(utf16_offset_to_char_offset(line, 1), 1); // after 'a', before emoji
+        assert_eq!(utf16_offset_to_char_offset(line, 3), 2); // after emoji (1 + 2 UTF-16 units)
+        assert_eq!(utf16_offset_to_char_offset(line, 4), 3); // after 'b'
+    }
+
+    #[test]
+    fn test_utf16_offset_to_char_offset_cjk() {
+        // CJK characters are 1 UTF-16 code unit each
+        let line = "a中b";
+        assert_eq!(utf16_offset_to_char_offset(line, 0), 0); // before 'a'
+        assert_eq!(utf16_offset_to_char_offset(line, 1), 1); // after 'a'
+        assert_eq!(utf16_offset_to_char_offset(line, 2), 2); // after '中'
+        assert_eq!(utf16_offset_to_char_offset(line, 3), 3); // after 'b'
+    }
+}

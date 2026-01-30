@@ -990,7 +990,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 1);
@@ -1025,7 +1025,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 2);
@@ -1059,7 +1059,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         // Verify edge exists
         prop_assert_eq!(graph.get_dependencies(&parent_uri).len(), 1);
@@ -1091,7 +1091,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         // Remove child file
         graph.remove_file(&child_uri);
@@ -1132,7 +1132,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         // B sources C
         let meta_b = make_meta_with_sources(vec![(&format!("{}.R", file_c), 1)]);
@@ -1142,7 +1142,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         // Transitive dependents of C should include both B and A
         let dependents = graph.get_transitive_dependents(&uri_c, 10);
@@ -1168,12 +1168,12 @@ proptest! {
         let meta_a = make_meta_with_sources(vec![(&format!("{}.R", file_b), 1)]);
         graph.update_file(&uri_a, &meta_a, |p| {
             if p == format!("{}.R", file_b) { Some(uri_b.clone()) } else { None }
-        });
+        }, |_| None);
 
         let meta_b = make_meta_with_sources(vec![(&format!("{}.R", file_c), 1)]);
         graph.update_file(&uri_b, &meta_b, |p| {
             if p == format!("{}.R", file_c) { Some(uri_c.clone()) } else { None }
-        });
+        }, |_| None);
 
         // With depth 1, only B should be returned (not A)
         let dependents = graph.get_transitive_dependents(&uri_c, 1);
@@ -1235,7 +1235,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         // Should have exactly one edge (deduplicated)
         let deps = graph.get_dependencies(&parent_uri);
@@ -1286,7 +1286,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         // Should have two edges (different call sites)
         let deps = graph.get_dependencies(&parent_uri);
@@ -1348,7 +1348,7 @@ proptest! {
             } else {
                 None
             }
-        });
+        }, |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 1);

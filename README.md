@@ -34,6 +34,8 @@ The LSP automatically detects `source()` and `sys.source()` calls:
 
 ### LSP Directives
 
+All directives support optional colon and quotes: `# @lsp-sourced-by: "../main.R"` is equivalent to `# @lsp-sourced-by ../main.R`.
+
 #### Backward Directives
 Declare that this file is sourced by another file:
 ```r
@@ -44,13 +46,22 @@ Declare that this file is sourced by another file:
 
 Optional parameters:
 - `line=N` - Specify 1-based line number in parent where source() call occurs
-- `match="pattern"` - Specify text pattern to find source() call in parent (not yet implemented, falls back to default)
+- `match="pattern"` - Specify text pattern to find source() call in parent
 
-Example:
+Example with line number:
 ```r
 # @lsp-sourced-by ../main.R line=15
 my_function <- function(x) { x + 1 }
 ```
+
+Example with match pattern:
+```r
+# @lsp-sourced-by ../main.R match="source("
+# The LSP will search for "source(" in main.R and use the first match
+# on a line containing a source() call to this file
+```
+
+**Call-site inference:** When neither `line=` nor `match=` is specified, the LSP will scan the parent file for `source()` or `sys.source()` calls that reference this file and use the first match as the call site. If no match is found, the configured default (`assumeCallSite`) is used.
 
 #### Forward Directives
 Explicitly declare source() calls (useful for dynamic paths):
@@ -62,8 +73,11 @@ Explicitly declare source() calls (useful for dynamic paths):
 Set working directory context for path resolution:
 ```r
 # @lsp-working-directory /data/scripts
-# @lsp-wd /data/scripts          # synonym
-# @lsp-cd /data/scripts          # synonym
+# @lsp-working-dir /data/scripts     # synonym
+# @lsp-current-directory /data/scripts  # synonym
+# @lsp-current-dir /data/scripts     # synonym
+# @lsp-wd /data/scripts              # synonym
+# @lsp-cd /data/scripts              # synonym
 ```
 
 Path resolution:
@@ -117,10 +131,68 @@ Configure via VS Code settings or LSP initialization:
 |---------|---------|-------------|
 | `rlsp.crossFile.maxBackwardDepth` | 10 | Maximum depth for backward directive traversal |
 | `rlsp.crossFile.maxForwardDepth` | 10 | Maximum depth for forward source() traversal |
-| `rlsp.crossFile.maxChainDepth` | 20 | Maximum total chain depth |
+| `rlsp.crossFile.maxChainDepth` | 20 | Maximum total chain depth (emits diagnostic when exceeded) |
 | `rlsp.crossFile.assumeCallSite` | "end" | Default call site when not specified ("end" or "start") |
 | `rlsp.crossFile.indexWorkspace` | true | Enable workspace file indexing |
+| `rlsp.crossFile.maxRevalidationsPerTrigger` | 10 | Max open documents to revalidate per change |
+| `rlsp.crossFile.revalidationDebounceMs` | 200 | Debounce delay for cross-file diagnostics (ms) |
+| `rlsp.crossFile.missingFileSeverity` | "warning" | Severity for missing file diagnostics |
+| `rlsp.crossFile.circularDependencySeverity` | "error" | Severity for circular dependency diagnostics |
+| `rlsp.crossFile.maxChainDepthSeverity` | "warning" | Severity for max chain depth exceeded diagnostics |
+| `rlsp.crossFile.outOfScopeSeverity` | "warning" | Severity for out-of-scope symbol diagnostics |
+| `rlsp.crossFile.ambiguousParentSeverity` | "warning" | Severity for ambiguous parent diagnostics |
 | `rlsp.diagnostics.undefinedVariables` | true | Enable undefined variable diagnostics |
+
+### Usage Examples
+
+#### Basic Cross-File Setup
+```r
+# main.R
+source("utils.R")
+result <- helper_function(42)  # helper_function from utils.R
+```
+
+```r
+# utils.R
+helper_function <- function(x) { x * 2 }
+```
+
+#### Backward Directive with Call-Site
+```r
+# child.R
+# @lsp-sourced-by ../main.R line=10
+# Symbols from main.R (lines 1-9) are available here
+my_var <- parent_var + 1
+```
+
+#### Working Directory Override
+```r
+# scripts/analysis.R
+# @lsp-working-directory /data
+source("helpers.R")  # Resolves to <workspace>/data/helpers.R
+```
+
+#### Forward Directive for Dynamic Paths
+```r
+# main.R
+# When source() path is computed dynamically, use @lsp-source to tell the LSP
+config_file <- paste0(env, "_config.R")
+source(config_file)  # LSP can't resolve this dynamically
+
+# @lsp-source configs/dev_config.R
+# Now the LSP knows about symbols from dev_config.R
+```
+
+#### Circular Dependency Detection
+```r
+# a.R
+source("b.R")  # ERROR: Circular dependency if b.R sources a.R
+```
+
+```r
+# b.R
+source("a.R")  # Creates cycle back to a.R
+```
 
 ## Differences from Other R Language Servers
 

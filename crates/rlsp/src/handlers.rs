@@ -31,14 +31,18 @@ fn get_cross_file_symbols(
 ) -> HashMap<String, ScopedSymbol> {
     // Closure to get artifacts for a URI
     let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
-        // Try open documents first
+        // Try open documents first (authoritative)
         if let Some(doc) = state.documents.get(target_uri) {
             if let Some(tree) = &doc.tree {
                 let text = doc.text();
                 return Some(scope::compute_artifacts(target_uri, tree, &text));
             }
         }
-        // Try workspace index
+        // Try cross-file workspace index (preferred for closed files)
+        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
+            return Some(artifacts);
+        }
+        // Fallback to legacy workspace index
         if let Some(doc) = state.workspace_index.get(target_uri) {
             if let Some(tree) = &doc.tree {
                 let text = doc.text();
@@ -50,12 +54,16 @@ fn get_cross_file_symbols(
 
     // Closure to get metadata for a URI
     let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-        // Try open documents first
+        // Try open documents first (authoritative)
         if let Some(doc) = state.documents.get(target_uri) {
             let text = doc.text();
             return Some(crate::cross_file::extract_metadata(&text));
         }
-        // Try workspace index
+        // Try cross-file workspace index (preferred for closed files)
+        if let Some(metadata) = state.cross_file_workspace_index.get_metadata(target_uri) {
+            return Some(metadata);
+        }
+        // Fallback to legacy workspace index
         if let Some(doc) = state.workspace_index.get(target_uri) {
             let text = doc.text();
             return Some(crate::cross_file::extract_metadata(&text));
@@ -291,6 +299,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
         });
     }
 
+    // Check for max chain depth exceeded (Requirement 5.8)
+    collect_max_depth_diagnostics(state, uri, &mut diagnostics);
+
     // Check for missing files in source() calls and directives (Requirement 10.2)
     collect_missing_file_diagnostics(state, uri, &directive_meta, &mut diagnostics);
 
@@ -333,17 +344,27 @@ fn collect_missing_file_diagnostics(
         Url::from_file_path(normalized).ok()
     };
 
+    // Check if file exists using cached/indexed data only (no blocking I/O)
     let file_exists = |target_uri: &Url| -> bool {
-        // Check open documents first
+        // Check open documents first (authoritative)
         if state.documents.contains_key(target_uri) {
             return true;
         }
-        // Check workspace index
+        // Check workspace index (legacy)
         if state.workspace_index.contains_key(target_uri) {
             return true;
         }
-        // Check disk
-        target_uri.to_file_path().map(|p| p.exists()).unwrap_or(false)
+        // Check cross-file workspace index (preferred for closed files)
+        if state.cross_file_workspace_index.contains(target_uri) {
+            return true;
+        }
+        // Check file cache (may have been read previously)
+        if state.cross_file_file_cache.get(target_uri).is_some() {
+            return true;
+        }
+        // Don't do blocking I/O here - if not in any cache, assume missing
+        // The file will be indexed on next didChangeWatchedFiles if it exists
+        false
     };
 
     // Check forward sources (source() calls and @lsp-source directives)
@@ -402,6 +423,79 @@ fn collect_missing_file_diagnostics(
     }
 }
 
+/// Collect diagnostics for max chain depth exceeded (Requirement 5.8)
+fn collect_max_depth_diagnostics(
+    state: &WorldState,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use crate::cross_file::scope;
+
+    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+        if let Some(doc) = state.documents.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+            }
+        }
+        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
+            return Some(artifacts);
+        }
+        if let Some(doc) = state.workspace_index.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+            }
+        }
+        None
+    };
+
+    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+        if let Some(doc) = state.documents.get(target_uri) {
+            return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+        }
+        state.cross_file_workspace_index.get_metadata(target_uri)
+    };
+
+    let resolve_path = |path: &str, from_uri: &Url| -> Option<Url> {
+        let from_path = from_uri.to_file_path().ok()?;
+        let parent_dir = from_path.parent()?;
+        let resolved = parent_dir.join(path);
+        let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+        Url::from_file_path(normalized).ok()
+    };
+
+    let max_depth = state.cross_file_config.max_chain_depth;
+
+    // Use scope resolution to detect depth exceeded
+    let scope = scope::scope_at_position_with_graph(
+        uri,
+        u32::MAX,
+        u32::MAX,
+        &get_artifacts,
+        &get_metadata,
+        &state.cross_file_graph,
+        &resolve_path,
+        max_depth,
+    );
+
+    // Emit diagnostics for depth exceeded, filtering to only those in this file
+    for (exceeded_uri, line, col) in &scope.depth_exceeded {
+        if exceeded_uri == uri {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(*line, *col),
+                    end: Position::new(*line, col.saturating_add(1)),
+                },
+                severity: Some(state.cross_file_config.max_chain_depth_severity),
+                message: format!(
+                    "Maximum chain depth ({}) exceeded; some symbols may not be resolved",
+                    max_depth
+                ),
+                ..Default::default()
+            });
+        }
+    }
+}
+
 /// Collect diagnostics for ambiguous parent relationships
 fn collect_ambiguous_parent_diagnostics(
     state: &WorldState,
@@ -409,7 +503,7 @@ fn collect_ambiguous_parent_diagnostics(
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    use crate::cross_file::parent_resolve::resolve_parent;
+    use crate::cross_file::parent_resolve::resolve_parent_with_content;
     use crate::cross_file::cache::ParentResolution;
 
     let resolve_path = |path: &str| -> Option<Url> {
@@ -420,7 +514,22 @@ fn collect_ambiguous_parent_diagnostics(
         Url::from_file_path(normalized).ok()
     };
 
-    let resolution = resolve_parent(meta, &state.cross_file_graph, uri, &state.cross_file_config, resolve_path);
+    let get_content = |parent_uri: &Url| -> Option<String> {
+        // Open docs first, then file cache
+        if let Some(doc) = state.documents.get(parent_uri) {
+            return Some(doc.text());
+        }
+        state.cross_file_file_cache.get(parent_uri)
+    };
+
+    let resolution = resolve_parent_with_content(
+        meta,
+        &state.cross_file_graph,
+        uri,
+        &state.cross_file_config,
+        resolve_path,
+        get_content,
+    );
 
     if let ParentResolution::Ambiguous { selected_uri, alternatives, .. } = resolution {
         // Find the first backward directive line to attach the diagnostic
@@ -459,23 +568,23 @@ fn collect_out_of_scope_diagnostics(
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // Get all source() calls in this file
-    let source_calls: Vec<_> = directive_meta.sources.iter()
-        .filter(|s| !s.is_directive) // Only AST-detected source() calls
-        .collect();
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    // Get all source() calls and @lsp-source directives in this file
+    let source_calls: Vec<_> = directive_meta.sources.iter().collect();
     
     if source_calls.is_empty() {
         return;
     }
 
-    // Collect all identifier usages
+    // Collect all identifier usages with UTF-16 columns
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
-    collect_identifier_usages(node, text, &mut usages);
+    collect_identifier_usages_utf16(node, text, &mut usages);
 
     // For each source() call, check if any symbols from that file are used before the call
     for source in &source_calls {
         let source_line = source.line;
-        let source_col = source.column;
+        let source_col = source.column; // Already UTF-16
 
         // Resolve the source path
         let resolve_path = |path: &str| -> Option<Url> {
@@ -493,11 +602,17 @@ fn collect_out_of_scope_diagnostics(
         // Get symbols from the sourced file
         let source_symbols: std::collections::HashSet<String> = {
             let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+                // Try open documents first (authoritative)
                 if let Some(doc) = state.documents.get(target_uri) {
                     if let Some(tree) = &doc.tree {
                         return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
                     }
                 }
+                // Try cross-file workspace index (preferred for closed files)
+                if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
+                    return Some(artifacts);
+                }
+                // Fallback to legacy workspace index
                 if let Some(doc) = state.workspace_index.get(target_uri) {
                     if let Some(tree) = &doc.tree {
                         return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
@@ -517,23 +632,23 @@ fn collect_out_of_scope_diagnostics(
                 continue;
             }
 
-            // Check if usage is before the source() call
+            // Check if usage is before the source() call (both columns are UTF-16)
             if (*usage_line, *usage_col) < (source_line, source_col) {
                 // Skip if line is ignored
                 if crate::cross_file::directive::is_line_ignored(directive_meta, *usage_line) {
                     continue;
                 }
 
+                // Convert byte columns to UTF-16 for diagnostic range
+                let start_line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
+                let end_line_text = text.lines().nth(usage_node.end_position().row).unwrap_or("");
+                let start_col = byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
+                let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+
                 diagnostics.push(Diagnostic {
                     range: Range {
-                        start: Position::new(
-                            usage_node.start_position().row as u32,
-                            usage_node.start_position().column as u32,
-                        ),
-                        end: Position::new(
-                            usage_node.end_position().row as u32,
-                            usage_node.end_position().column as u32,
-                        ),
+                        start: Position::new(usage_node.start_position().row as u32, start_col),
+                        end: Position::new(usage_node.end_position().row as u32, end_col),
                     },
                     severity: Some(state.cross_file_config.out_of_scope_severity),
                     message: format!(
@@ -545,6 +660,53 @@ fn collect_out_of_scope_diagnostics(
                 });
             }
         }
+    }
+}
+
+/// Collect identifier usages with UTF-16 column positions
+fn collect_identifier_usages_utf16<'a>(node: Node<'a>, text: &str, usages: &mut Vec<(String, u32, u32, Node<'a>)>) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    if node.kind() == "identifier" {
+        // Skip if this is the LHS of an assignment
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "binary_operator" {
+                let mut cursor = parent.walk();
+                let children: Vec<_> = parent.children(&mut cursor).collect();
+                if children.len() >= 2 && children[0].id() == node.id() {
+                    let op = children[1];
+                    let op_text = &text[op.byte_range()];
+                    if matches!(op_text, "<-" | "=" | "<<-") {
+                        // Skip LHS of assignment, but recurse into children
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            collect_identifier_usages_utf16(child, text, usages);
+                        }
+                        return;
+                    }
+                }
+            }
+            // Skip named arguments
+            if parent.kind() == "argument" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.id() == node.id() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let name = text[node.byte_range()].to_string();
+        let line = node.start_position().row as u32;
+        // Convert byte column to UTF-16
+        let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
+        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+        usages.push((name, line, col, node));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifier_usages_utf16(child, text, usages);
     }
 }
 
@@ -636,6 +798,7 @@ fn collect_undefined_variables_position_aware(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     use std::collections::HashSet;
+    use crate::cross_file::types::byte_offset_to_utf16_column;
 
     let mut defined: HashSet<String> = HashSet::new();
     let mut used: Vec<(String, Node)> = Vec::new();
@@ -664,21 +827,22 @@ fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Get cross-file symbols at the usage position
-        let usage_col = usage_node.start_position().column as u32;
+        // Convert byte column to UTF-16 for cross-file scope lookup
+        let line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
+        let usage_col = byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
         let cross_file_symbols = get_cross_file_symbols(state, uri, usage_line, usage_col);
 
         if !cross_file_symbols.contains_key(&name) {
+            // Convert byte columns to UTF-16 for diagnostic range
+            let start_line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
+            let end_line_text = text.lines().nth(usage_node.end_position().row).unwrap_or("");
+            let start_col = byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
+            let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+
             diagnostics.push(Diagnostic {
                 range: Range {
-                    start: Position::new(
-                        usage_node.start_position().row as u32,
-                        usage_node.start_position().column as u32,
-                    ),
-                    end: Position::new(
-                        usage_node.end_position().row as u32,
-                        usage_node.end_position().column as u32,
-                    ),
+                    start: Position::new(usage_node.start_position().row as u32, start_col),
+                    end: Position::new(usage_node.end_position().row as u32, end_col),
                 },
                 severity: Some(DiagnosticSeverity::WARNING),
                 message: format!("Undefined variable: {}", name),

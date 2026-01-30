@@ -43,6 +43,8 @@ pub struct CrossFileConfig {
     pub out_of_scope_severity: DiagnosticSeverity,
     /// Severity for ambiguous parent diagnostics
     pub ambiguous_parent_severity: DiagnosticSeverity,
+    /// Severity for max chain depth exceeded diagnostics
+    pub max_chain_depth_severity: DiagnosticSeverity,
 }
 
 impl Default for CrossFileConfig {
@@ -60,6 +62,7 @@ impl Default for CrossFileConfig {
             circular_dependency_severity: DiagnosticSeverity::ERROR,
             out_of_scope_severity: DiagnosticSeverity::WARNING,
             ambiguous_parent_severity: DiagnosticSeverity::WARNING,
+            max_chain_depth_severity: DiagnosticSeverity::WARNING,
         }
     }
 }

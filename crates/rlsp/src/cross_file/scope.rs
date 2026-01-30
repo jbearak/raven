@@ -87,6 +87,8 @@ impl Default for ScopeArtifacts {
 pub struct ScopeAtPosition {
     pub symbols: HashMap<String, ScopedSymbol>,
     pub chain: Vec<Url>,
+    /// URIs where max depth was exceeded, with the source call position (line, col)
+    pub depth_exceeded: Vec<(Url, u32, u32)>,
 }
 
 /// Compute scope artifacts for a file from its AST.
@@ -206,6 +208,12 @@ where
                 if (*src_line, *src_col) < (line, column) {
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
+                        // Check if we would exceed max depth
+                        if current_depth + 1 >= max_depth {
+                            scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
+                            continue;
+                        }
+
                         let child_scope = scope_at_position_recursive(
                             &child_uri,
                             u32::MAX, // Include all symbols from sourced file
@@ -221,6 +229,7 @@ where
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
+                        scope.depth_exceeded.extend(child_scope.depth_exceeded);
                     }
                 }
             }
@@ -514,6 +523,12 @@ where
         let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
         let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
 
+        // Check if we would exceed max depth
+        if current_depth + 1 >= max_depth {
+            scope.depth_exceeded.push((uri.clone(), call_site_line, call_site_col));
+            continue;
+        }
+
         // Get parent's scope at the call site
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
@@ -533,6 +548,7 @@ where
             scope.symbols.entry(name).or_insert(symbol);
         }
         scope.chain.extend(parent_scope.chain);
+        scope.depth_exceeded.extend(parent_scope.depth_exceeded);
     }
 
     // STEP 2: Process timeline events (local definitions and forward sources)
@@ -549,6 +565,12 @@ where
                 if (*src_line, *src_col) < (line, column) {
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
+                        // Check if we would exceed max depth
+                        if current_depth + 1 >= max_depth {
+                            scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
+                            continue;
+                        }
+
                         let child_scope = scope_at_position_with_graph_recursive(
                             &child_uri,
                             u32::MAX, // Include all symbols from sourced file
@@ -566,6 +588,7 @@ where
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
+                        scope.depth_exceeded.extend(child_scope.depth_exceeded);
                     }
                 }
             }
@@ -612,11 +635,21 @@ where
                 // Get the call site in the parent
                 let call_site = match &directive.call_site {
                     super::types::CallSiteSpec::Line(n) => Some((*n, u32::MAX)), // end of line
-                    super::types::CallSiteSpec::Match(_) => None, // TODO: implement match
+                    super::types::CallSiteSpec::Match(_) => {
+                        // Match resolution requires content provider - not available in this path
+                        // Fall back to end of file (conservative)
+                        Some((u32::MAX, u32::MAX))
+                    }
                     super::types::CallSiteSpec::Default => Some((u32::MAX, u32::MAX)), // end of file
                 };
 
                 if let Some((call_line, call_col)) = call_site {
+                    // Check if we would exceed max depth
+                    if current_depth + 1 >= max_depth {
+                        scope.depth_exceeded.push((uri.clone(), directive.directive_line, 0));
+                        continue;
+                    }
+
                     // Get parent's scope at the call site
                     let parent_scope = scope_at_position_with_backward_recursive(
                         &parent_uri,
@@ -637,6 +670,7 @@ where
                         scope.symbols.entry(name).or_insert(symbol);
                     }
                     scope.chain.extend(parent_scope.chain);
+                    scope.depth_exceeded.extend(parent_scope.depth_exceeded);
                 }
             }
         }
@@ -656,6 +690,12 @@ where
                 if (*src_line, *src_col) < (line, column) {
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
+                        // Check if we would exceed max depth
+                        if current_depth + 1 >= max_depth {
+                            scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
+                            continue;
+                        }
+
                         let child_scope = scope_at_position_with_backward_recursive(
                             &child_uri,
                             u32::MAX, // Include all symbols from sourced file
@@ -673,6 +713,7 @@ where
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
+                        scope.depth_exceeded.extend(child_scope.depth_exceeded);
                     }
                 }
             }
@@ -926,7 +967,7 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, |path| {
             if path == "child.R" { Some(child_uri.clone()) } else { None }
-        });
+        }, |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
@@ -987,7 +1028,7 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, |path| {
             if path == "child.R" { Some(child_uri.clone()) } else { None }
-        });
+        }, |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
@@ -1011,5 +1052,194 @@ mod tests {
 
         assert!(scope.symbols.contains_key("parent_var"), "parent_var should be available from parent");
         assert!(scope.symbols.contains_key("child_var"), "child_var should be available locally");
+    }
+
+    #[test]
+    fn test_max_depth_exceeded_forward() {
+        // Test that depth_exceeded is populated when max depth is hit on forward sources
+        let uri_a = Url::parse("file:///a.R").unwrap();
+        let uri_b = Url::parse("file:///b.R").unwrap();
+        let uri_c = Url::parse("file:///c.R").unwrap();
+
+        // a.R sources b.R, b.R sources c.R
+        let code_a = "source(\"b.R\")";
+        let code_b = "source(\"c.R\")";
+        let code_c = "x <- 1";
+
+        let tree_a = parse_r(code_a);
+        let tree_b = parse_r(code_b);
+        let tree_c = parse_r(code_c);
+
+        let artifacts_a = compute_artifacts(&uri_a, &tree_a, code_a);
+        let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
+        let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &uri_a { Some(artifacts_a.clone()) }
+            else if uri == &uri_b { Some(artifacts_b.clone()) }
+            else if uri == &uri_c { Some(artifacts_c.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, from: &Url| -> Option<Url> {
+            if from == &uri_a && path == "b.R" { Some(uri_b.clone()) }
+            else if from == &uri_b && path == "c.R" { Some(uri_c.clone()) }
+            else { None }
+        };
+
+        // With max_depth=2, traversing a->b->c should exceed at b->c
+        let scope = scope_at_position_with_deps(&uri_a, u32::MAX, u32::MAX, &get_artifacts, &resolve_path, 2);
+
+        // Should have depth_exceeded entry for b.R at the source("c.R") call
+        assert!(!scope.depth_exceeded.is_empty(), "depth_exceeded should not be empty");
+        assert!(scope.depth_exceeded.iter().any(|(uri, _, _)| uri == &uri_b), 
+            "depth_exceeded should contain b.R");
+    }
+
+    #[test]
+    fn test_max_depth_exceeded_backward() {
+        // Test that depth_exceeded is populated when max depth is hit on backward directives
+        use super::super::dependency::DependencyGraph;
+        use super::super::types::{CrossFileMetadata, ForwardSource};
+
+        let uri_a = Url::parse("file:///a.R").unwrap();
+        let uri_b = Url::parse("file:///b.R").unwrap();
+        let uri_c = Url::parse("file:///c.R").unwrap();
+
+        // c.R is sourced by b.R, b.R is sourced by a.R
+        let code_a = "a_var <- 1\nsource(\"b.R\")";
+        let code_b = "b_var <- 2\nsource(\"c.R\")";
+        let code_c = "c_var <- 3";
+
+        let tree_a = parse_r(code_a);
+        let tree_b = parse_r(code_b);
+        let tree_c = parse_r(code_c);
+
+        let artifacts_a = compute_artifacts(&uri_a, &tree_a, code_a);
+        let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
+        let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let meta_a = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "b.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        let meta_b = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "c.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        graph.update_file(&uri_a, &meta_a, |path| {
+            if path == "b.R" { Some(uri_b.clone()) } else { None }
+        }, |_| None);
+        graph.update_file(&uri_b, &meta_b, |path| {
+            if path == "c.R" { Some(uri_c.clone()) } else { None }
+        }, |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &uri_a { Some(artifacts_a.clone()) }
+            else if uri == &uri_b { Some(artifacts_b.clone()) }
+            else if uri == &uri_c { Some(artifacts_c.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &uri_a { Some(meta_a.clone()) }
+            else if uri == &uri_b { Some(meta_b.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, from: &Url| -> Option<Url> {
+            if from == &uri_a && path == "b.R" { Some(uri_b.clone()) }
+            else if from == &uri_b && path == "c.R" { Some(uri_c.clone()) }
+            else { None }
+        };
+
+        // With max_depth=2, traversing c->b->a should exceed
+        let scope = scope_at_position_with_graph(
+            &uri_c, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, &resolve_path, 2,
+        );
+
+        // Should have depth_exceeded entry
+        assert!(!scope.depth_exceeded.is_empty(), "depth_exceeded should not be empty with max_depth=2");
+    }
+
+    #[test]
+    fn test_lsp_source_directive_in_scope() {
+        // Test that @lsp-source directives are treated as source call sites for scope resolution
+        use super::super::types::ForwardSource;
+
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        // Parent file: has @lsp-source directive on line 2 (0-based: line 1)
+        // The directive is parsed into sources with is_directive=true
+        let parent_code = "x <- 1\n# @lsp-source child.R\ny <- 2";
+        let parent_tree = parse_r(parent_code);
+        let mut parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Manually add the directive source (normally done by directive parsing)
+        parent_artifacts.timeline.push(ScopeEvent::Source {
+            line: 1,
+            column: 0,
+            source: ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: true,  // This is the key - it's a directive
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            },
+        });
+        parent_artifacts.timeline.sort_by_key(|e| match e {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+        });
+
+        // Child file: defines 'child_var'
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Before the @lsp-source directive (line 0), child_var should NOT be in scope
+        let scope_before = scope_at_position_with_deps(&parent_uri, 0, 10, &get_artifacts, &resolve_path, 10);
+        assert!(!scope_before.symbols.contains_key("child_var"), 
+            "child_var should NOT be in scope before @lsp-source directive");
+
+        // After the @lsp-source directive (line 2), child_var SHOULD be in scope
+        let scope_after = scope_at_position_with_deps(&parent_uri, 2, 0, &get_artifacts, &resolve_path, 10);
+        assert!(scope_after.symbols.contains_key("child_var"), 
+            "child_var SHOULD be in scope after @lsp-source directive");
     }
 }
