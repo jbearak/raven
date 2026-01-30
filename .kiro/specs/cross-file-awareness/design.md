@@ -985,26 +985,33 @@ pub async fn schedule_diagnostics_debounced(
 
 #### Multiple Source Calls at Different Call Sites (Requirement 5.9)
 
-When a file is sourced multiple times at different call sites in the same parent:
+When a file is sourced multiple times at different call sites in the same parent, symbol availability MUST use full `(line, column)` ordering.
 
 ```rust
-/// Resolve the effective call site when a file is sourced multiple times
+/// Resolve the effective call site when a file is sourced multiple times.
+///
+/// Returns the earliest call site position using lexicographic ordering:
+/// `(l1, c1) < (l2, c2)` iff `l1 < l2 || (l1 == l2 && c1 < c2)`.
 pub fn resolve_multiple_source_calls(
     sources: &[ForwardSource],
     target_path: &str,
-) -> Option<u32> {
+) -> Option<(u32, u32)> {
     // Find all source calls to the same target
-    let calls: Vec<_> = sources.iter()
+    let calls: Vec<_> = sources
+        .iter()
         .filter(|s| s.path == target_path)
         .collect();
-    
+
     match calls.len() {
         0 => None,
-        1 => Some(calls[0].line),
+        1 => Some((calls[0].line, calls[0].column)),
         _ => {
-            // Multiple calls: use the earliest call site
-            // Symbols become available at the first source() call
-            calls.iter().map(|s| s.line).min()
+            // Multiple calls: use the earliest call site.
+            // Symbols become available strictly after the first source() call.
+            calls
+                .iter()
+                .map(|s| (s.line, s.column))
+                .min()
         }
     }
 }
