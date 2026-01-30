@@ -1588,8 +1588,8 @@ proptest! {
     /// sources file A, the Scope_Resolver SHALL detect the cycle and break it.
     #[test]
     fn prop_circular_dependency_detection(
-        symbol_a in "[a-zA-Z][a-zA-Z0-9_]{0,3}",
-        symbol_b in "[a-zA-Z][a-zA-Z0-9_]{0,3}"
+        symbol_a in r_identifier(),
+        symbol_b in r_identifier()
     ) {
         prop_assume!(symbol_a != symbol_b);
 

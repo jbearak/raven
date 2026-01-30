@@ -448,6 +448,13 @@ impl WorldState {
         // Load workspace NAMESPACE imports
         self.load_workspace_namespace();
     }
+
+    /// Apply pre-scanned workspace index results (for non-blocking initialization)
+    pub fn apply_workspace_index(&mut self, index: HashMap<Url, Document>, imports: Vec<String>) {
+        self.workspace_index = index;
+        self.workspace_imports = imports;
+        log::info!("Applied {} workspace files, {} imports", self.workspace_index.len(), self.workspace_imports.len());
+    }
     
     fn load_workspace_namespace(&mut self) {
         for folder_url in &self.workspace_folders {
@@ -482,4 +489,74 @@ impl WorldState {
             }
         }
     }
+}
+
+/// Scan workspace folders for R files without holding any locks (Requirement 13a)
+pub fn scan_workspace(folders: &[Url]) -> (HashMap<Url, Document>, Vec<String>) {
+    let mut index = HashMap::new();
+    let mut imports = Vec::new();
+
+    for folder in folders {
+        log::info!("Scanning folder: {}", folder);
+        if let Ok(path) = folder.to_file_path() {
+            scan_directory(&path, &mut index);
+            
+            // Check for NAMESPACE file
+            let namespace_path = path.join("NAMESPACE");
+            if namespace_path.exists() && imports.is_empty() {
+                if let Ok(text) = fs::read_to_string(&namespace_path) {
+                    imports = parse_namespace_imports_from_text(&text);
+                    log::info!("Found {} imports from NAMESPACE", imports.len());
+                }
+            }
+        }
+    }
+
+    log::info!("Scanned {} workspace files", index.len());
+    (index, imports)
+}
+
+fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        
+        if path.is_dir() {
+            scan_directory(&path, index);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("R") {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(uri) = Url::from_file_path(&path) {
+                    log::trace!("Scanning file: {}", uri);
+                    index.insert(uri, Document::new(&text, None));
+                }
+            }
+        }
+    }
+}
+
+/// Parse NAMESPACE imports without needing Library reference
+fn parse_namespace_imports_from_text(text: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        
+        // importFrom(pkg, sym1, sym2, ...)
+        if line.starts_with("importFrom(") {
+            if let Some(args) = line.strip_prefix("importFrom(").and_then(|s| s.strip_suffix(')')) {
+                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
+                if parts.len() >= 2 {
+                    for sym in &parts[1..] {
+                        let sym = sym.trim_matches('"');
+                        imports.push(sym.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    imports
 }

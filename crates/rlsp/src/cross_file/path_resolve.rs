@@ -138,6 +138,11 @@ fn normalize_path(path: &Path) -> Option<PathBuf> {
     Some(result)
 }
 
+/// Public version of normalize_path for use outside this module
+pub fn normalize_path_public(path: &Path) -> Option<PathBuf> {
+    normalize_path(path)
+}
+
 /// Convert a resolved path to a file URI
 pub fn path_to_uri(path: &Path) -> Option<Url> {
     Url::from_file_path(path).ok()

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -17,7 +18,16 @@ use tower_lsp::Server;
 
 use crate::handlers;
 use crate::r_env;
-use crate::state::WorldState;
+use crate::state::{scan_workspace, WorldState};
+
+/// Parameters for the rlsp/activeDocumentsChanged notification
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveDocumentsChangedParams {
+    active_uri: Option<String>,
+    visible_uris: Vec<String>,
+    timestamp_ms: u64,
+}
 
 pub struct Backend {
     client: Client,
@@ -94,8 +104,20 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         
+        // Get workspace folders under brief lock
+        let folders: Vec<Url> = {
+            let state = self.state.read().await;
+            state.workspace_folders.clone()
+        };
+        
+        // Scan workspace without holding lock (Requirement 13a)
+        let (index, imports) = tokio::task::spawn_blocking(move || {
+            scan_workspace(&folders)
+        }).await.unwrap_or_default();
+        
+        // Apply results under brief write lock
         let mut state = self.state.write().await;
-        state.index_workspace();
+        state.apply_workspace_index(index, imports);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -114,15 +136,15 @@ impl LanguageServer for Backend {
         state.cross_file_activity.record_recent(uri.clone());
         
         // Update dependency graph with cross-file metadata
-        let meta = crate::cross_file::directive::parse_directives(&text);
+        let meta = crate::cross_file::extract_metadata(&text);
         let uri_clone = uri.clone();
         state.cross_file_graph.update_file(&uri, &meta, |path| {
-            // Resolve path relative to the file
+            // Resolve path relative to the file using normalization (no blocking I/O)
             let file_path = uri_clone.to_file_path().ok()?;
             let parent_dir = file_path.parent()?;
             let resolved = parent_dir.join(path);
-            let canonical = resolved.canonicalize().ok()?;
-            Url::from_file_path(canonical).ok()
+            let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+            Url::from_file_path(normalized).ok()
         });
         
         drop(state);
@@ -149,14 +171,14 @@ impl LanguageServer for Backend {
             // Update dependency graph with new cross-file metadata
             if let Some(doc) = state.documents.get(&uri) {
                 let text = doc.text();
-                let meta = crate::cross_file::directive::parse_directives(&text);
+                let meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
                 state.cross_file_graph.update_file(&uri, &meta, |path| {
                     let file_path = uri_clone.to_file_path().ok()?;
                     let parent_dir = file_path.parent()?;
                     let resolved = parent_dir.join(path);
-                    let canonical = resolved.canonicalize().ok()?;
-                    Url::from_file_path(canonical).ok()
+                    let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
+                    Url::from_file_path(normalized).ok()
                 });
             }
             
@@ -507,13 +529,35 @@ impl Backend {
         
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
     }
+
+    /// Handle the rlsp/activeDocumentsChanged notification (Requirement 15)
+    async fn handle_active_documents_changed(&self, params: ActiveDocumentsChangedParams) {
+        log::trace!(
+            "Received activeDocumentsChanged: active={:?}, visible={}, timestamp={}",
+            params.active_uri,
+            params.visible_uris.len(),
+            params.timestamp_ms
+        );
+
+        let active_uri = params.active_uri.and_then(|s| Url::parse(&s).ok());
+        let visible_uris: Vec<Url> = params
+            .visible_uris
+            .iter()
+            .filter_map(|s| Url::parse(s).ok())
+            .collect();
+
+        let mut state = self.state.write().await;
+        state.cross_file_activity.update(active_uri, visible_uris, params.timestamp_ms);
+    }
 }
 
 pub async fn start_lsp() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = LspService::build(Backend::new)
+        .custom_method("rlsp/activeDocumentsChanged", Backend::handle_active_documents_changed)
+        .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())

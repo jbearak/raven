@@ -42,3 +42,37 @@ pub use scope::*;
 pub use source_detect::*;
 pub use types::*;
 pub use workspace_index::*;
+
+use tree_sitter::Parser;
+
+/// Extract cross-file metadata from R source code (Requirement 0.1)
+/// Combines directive parsing with AST-detected source() calls
+pub fn extract_metadata(content: &str) -> CrossFileMetadata {
+    // Parse directives first
+    let mut meta = directive::parse_directives(content);
+    
+    // Parse AST for source() calls
+    let mut parser = Parser::new();
+    if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
+        if let Some(tree) = parser.parse(content, None) {
+            let detected = source_detect::detect_source_calls(&tree, content);
+            
+            // Merge detected source() calls with directive sources
+            // Directive sources take precedence (Requirement 6.8)
+            for source in detected {
+                // Check if there's already a directive at the same line
+                let has_directive = meta.sources.iter().any(|s| {
+                    s.is_directive && s.line == source.line
+                });
+                if !has_directive {
+                    meta.sources.push(source);
+                }
+            }
+            
+            // Sort by line number for consistent ordering
+            meta.sources.sort_by_key(|s| (s.line, s.column));
+        }
+    }
+    
+    meta
+}
