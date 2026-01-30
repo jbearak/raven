@@ -678,4 +678,77 @@ mod tests {
         // Dynamic name should not be treated as a definition
         assert_eq!(artifacts.exported_interface.len(), 0);
     }
+
+    #[test]
+    fn test_backward_directive_call_site_filtering() {
+        use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata};
+
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        // Parent code: a on line 0, x1 on line 1, x2 on line 2, y on line 3
+        let parent_code = "a <- 1\nx1 <- 1\nx2 <- 2\ny <- 2";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Verify parent artifacts
+        println!("Parent timeline:");
+        for event in &parent_artifacts.timeline {
+            match event {
+                ScopeEvent::Def { line, column, symbol } => {
+                    println!("  Def: {} at ({}, {})", symbol.name, line, column);
+                }
+                _ => {}
+            }
+        }
+
+        // Child with backward directive line=2 (1-based, so 0-based line 1)
+        let child_code = "z <- 3";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Line(1), // 0-based line 1
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        let scope = scope_at_position_with_backward(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+
+        println!("Scope symbols:");
+        for (name, symbol) in &scope.symbols {
+            println!("  {} (line {})", name, symbol.defined_line);
+        }
+
+        // a should be available (line 0, before call site line 1)
+        assert!(scope.symbols.contains_key("a"), "a should be available");
+        // x1 should be available (line 1, on call site line with end-of-line column)
+        assert!(scope.symbols.contains_key("x1"), "x1 should be available");
+        // x2 should NOT be available (line 2, after call site line 1)
+        assert!(!scope.symbols.contains_key("x2"), "x2 should NOT be available");
+        // y should NOT be available (line 3, after call site line 1)
+        assert!(!scope.symbols.contains_key("y"), "y should NOT be available");
+        // z should be available (local definition in child)
+        assert!(scope.symbols.contains_key("z"), "z should be available");
+    }
 }

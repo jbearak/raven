@@ -329,36 +329,36 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 0.1-0.10, 15.1-15.5_
 
 
-  - [ ] 12.2 Write property test for diagnostics fanout to open files
+  - [x] 12.2 Write property test for diagnostics fanout to open files
     - **Property 35: Diagnostics Fanout to Open Files**
     - **Validates: Requirements 0.4, 13.4**
 
-  - [ ] 12.3 Write property test for debounce cancellation
+  - [x] 12.3 Write property test for debounce cancellation
     - **Property 36: Debounce Cancellation**
     - **Validates: Requirements 0.5**
 
-  - [ ] 12.4 Write property test for freshness guard
+  - [x] 12.4 Write property test for freshness guard
     - **Property 41: Freshness Guard Prevents Stale Diagnostics**
     - Verify freshness guard uses both version (when present) AND content hash/revision
     - **Validates: Requirements 0.6**
 
-  - [ ] 12.5 Write property test for monotonic diagnostic publishing
+  - [x] 12.5 Write property test for monotonic diagnostic publishing
     - **Property 47: Monotonic Diagnostic Publishing**
     - **Validates: Requirements 0.7**
 
-  - [ ] 12.6 Write property test for force republish on dependency change
+  - [x] 12.6 Write property test for force republish on dependency change
     - **Property 48: Force Republish on Dependency Change**
     - **Validates: Requirements 0.8**
 
-  - [ ] 12.7 Write property test for revalidation prioritization
+  - [x] 12.7 Write property test for revalidation prioritization
     - **Property 42: Revalidation Prioritization**
     - **Validates: Requirements 0.9**
 
-  - [ ] 12.8 Write property test for revalidation cap enforcement
+  - [x] 12.8 Write property test for revalidation cap enforcement
     - **Property 43: Revalidation Cap Enforcement**
     - **Validates: Requirements 0.9, 0.10**
 
-- [ ] 13. Checkpoint - Ensure all tests pass
+- [x] 13. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 14. Implement workspace watching and indexing

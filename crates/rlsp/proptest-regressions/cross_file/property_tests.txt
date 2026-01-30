@@ -7,3 +7,4 @@
 cc 31ed90d1f7c0270051a8a27452837ab8f22ddf2224059a93894e244374d20b78 # shrinks to symbol_name = "A", local_value = 1, sourced_value = 100
 cc 0dbb93c682f146e747e877769953329dcc48e709073c47f47b4f43de9613c7f5 # shrinks to symbol_name = "x1", source_line = 2
 cc fdcf3715654de9f8771d4361fc184dee0bbe1e081f65cd67db6f2116e2fb5d49 # shrinks to func_name = "NA", var_name = "A", assign_name = "a"
+cc cead6597beeef48cc450e419ace396b6547bb66be9e65b66457770244641374a # shrinks to symbol_before = "a", symbol_after = "y", call_site_line = 2

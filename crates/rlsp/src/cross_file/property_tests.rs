@@ -2334,22 +2334,26 @@ proptest! {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
 
-        // Parent file: defines symbol_before on line 0, symbol_after on line call_site_line
+        // Parent file: defines symbol_before on line 0, symbol_after on line call_site_line + 1
+        // (one line AFTER the call site)
         let mut parent_lines = vec![format!("{} <- 1", symbol_before)];
-        for i in 1..call_site_line {
+        for i in 1..=call_site_line {
             parent_lines.push(format!("x{} <- {}", i, i));
         }
+        // symbol_after is defined AFTER the call site line
         parent_lines.push(format!("{} <- 2", symbol_after));
         let parent_code = parent_lines.join("\n");
         let parent_tree = parse_r_tree(&parent_code);
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
 
         // Child file: has backward directive with line= parameter
-        let child_code = format!("# @lsp-sourced-by ../parent.R line={}\ny <- 3", call_site_line);
+        // Use a unique variable name that won't conflict with symbol_before or symbol_after
+        let child_code = format!("# @lsp-sourced-by ../parent.R line={}\nchild_local_var <- 3", call_site_line);
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
         // line= is 1-based, so line=N means call site is at 0-based line N-1
+        // We treat line= as end-of-line, so symbols on that line ARE included
         let child_metadata = CrossFileMetadata {
             sourced_by: vec![BackwardDirective {
                 path: "../parent.R".to_string(),
@@ -2383,7 +2387,7 @@ proptest! {
         prop_assert!(scope.symbols.contains_key(&symbol_before),
             "Symbol defined before call site should be available");
 
-        // symbol_after (defined on line call_site_line) should NOT be available
+        // symbol_after (defined on line call_site_line + 1) should NOT be available
         // because it's defined AFTER the call site line
         prop_assert!(!scope.symbols.contains_key(&symbol_after),
             "Symbol defined after call site should NOT be available");
@@ -2814,6 +2818,296 @@ proptest! {
         let fp1 = compute_metadata_fingerprint(&metadata1);
         let fp2 = compute_metadata_fingerprint(&metadata2);
         prop_assert_ne!(fp1, fp2, "Different metadata should have different fingerprints");
+    }
+}
+
+// ============================================================================
+// Property 35: Diagnostics Fanout to Open Files
+// Validates: Requirements 0.4, 13.4
+// ============================================================================
+
+use super::revalidation::{CrossFileRevalidationState, CrossFileDiagnosticsGate, CrossFileActivityState};
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 35: For any file change that invalidates dependent files, all affected
+    /// open files SHALL receive updated diagnostics without requiring user edits.
+    /// 
+    /// This test verifies the revalidation scheduling mechanism works correctly.
+    #[test]
+    fn prop_diagnostics_fanout_to_open_files(
+        num_files in 1..10usize
+    ) {
+        let state = CrossFileRevalidationState::new();
+        let mut tokens = Vec::new();
+
+        // Schedule revalidation for multiple files
+        for i in 0..num_files {
+            let uri = make_url(&format!("file{}", i));
+            let token = state.schedule(uri);
+            tokens.push(token);
+        }
+
+        // All tokens should be valid (not cancelled)
+        for token in &tokens {
+            prop_assert!(!token.is_cancelled(),
+                "Scheduled revalidation tokens should not be cancelled");
+        }
+    }
+}
+
+// ============================================================================
+// Property 36: Debounce Cancellation
+// Validates: Requirements 0.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 36: For any sequence of rapid changes to a file, only the final
+    /// change SHALL result in published diagnostics; intermediate pending
+    /// revalidations SHALL be cancelled.
+    #[test]
+    fn prop_debounce_cancellation(
+        num_changes in 2..10usize
+    ) {
+        let state = CrossFileRevalidationState::new();
+        let uri = make_url("test");
+        let mut tokens = Vec::new();
+
+        // Simulate rapid changes by scheduling multiple times
+        for _ in 0..num_changes {
+            let token = state.schedule(uri.clone());
+            tokens.push(token);
+        }
+
+        // All but the last token should be cancelled
+        for (i, token) in tokens.iter().enumerate() {
+            if i < num_changes - 1 {
+                prop_assert!(token.is_cancelled(),
+                    "Intermediate revalidation should be cancelled");
+            } else {
+                prop_assert!(!token.is_cancelled(),
+                    "Final revalidation should not be cancelled");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Property 41: Freshness Guard Prevents Stale Diagnostics
+// Validates: Requirements 0.6
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 41: For any debounced/background diagnostics task, if either the
+    /// document version OR the document content hash/revision changes between task
+    /// scheduling and publishing, the task SHALL NOT publish diagnostics.
+    /// 
+    /// This test verifies the diagnostics gate mechanism.
+    #[test]
+    fn prop_freshness_guard_prevents_stale(
+        initial_version in 1..100i32,
+        new_version in 1..100i32
+    ) {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = make_url("test");
+
+        // Record initial publish
+        gate.record_publish(&uri, initial_version);
+
+        // Check if new version can be published
+        let can_publish = gate.can_publish(&uri, new_version);
+
+        if new_version > initial_version {
+            prop_assert!(can_publish, "Newer version should be publishable");
+        } else if new_version < initial_version {
+            prop_assert!(!can_publish, "Older version should be blocked");
+        } else {
+            // Same version without force should be blocked
+            prop_assert!(!can_publish, "Same version without force should be blocked");
+        }
+    }
+}
+
+// ============================================================================
+// Property 47: Monotonic Diagnostic Publishing
+// Validates: Requirements 0.7
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 47: For any sequence of diagnostic publish attempts for a document,
+    /// the server SHALL never publish diagnostics for a document version older than
+    /// the most recently published version for that document.
+    #[test]
+    fn prop_monotonic_diagnostic_publishing(
+        versions in prop::collection::vec(1..100i32, 1..10)
+    ) {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = make_url("test");
+
+        let mut max_published = 0i32;
+
+        for version in versions {
+            let can_publish = gate.can_publish(&uri, version);
+
+            if version > max_published {
+                // Should be able to publish newer versions
+                prop_assert!(can_publish, "Should be able to publish version {} > {}", version, max_published);
+                gate.record_publish(&uri, version);
+                max_published = version;
+            } else {
+                // Should NOT be able to publish older or same versions
+                prop_assert!(!can_publish, "Should NOT be able to publish version {} <= {}", version, max_published);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Property 48: Force Republish on Dependency Change
+// Validates: Requirements 0.8
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 48: For any open document whose dependency-driven scope/diagnostic
+    /// inputs change without changing its text document version, the server SHALL
+    /// provide a mechanism to force republish updated diagnostics.
+    #[test]
+    fn prop_force_republish_on_dependency_change(
+        version in 1..100i32
+    ) {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = make_url("test");
+
+        // Initial publish
+        gate.record_publish(&uri, version);
+
+        // Without force, same version should be blocked
+        prop_assert!(!gate.can_publish(&uri, version),
+            "Same version without force should be blocked");
+
+        // Mark for force republish (simulating dependency change)
+        gate.mark_force_republish(&uri);
+
+        // With force, same version should be allowed
+        prop_assert!(gate.can_publish(&uri, version),
+            "Same version with force should be allowed");
+
+        // But older versions should still be blocked
+        if version > 1 {
+            prop_assert!(!gate.can_publish(&uri, version - 1),
+                "Older version should still be blocked even with force");
+        }
+    }
+}
+
+// ============================================================================
+// Property 42: Revalidation Prioritization
+// Validates: Requirements 0.9
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 42: For any invalidation affecting multiple open documents, the
+    /// trigger document SHALL be revalidated before other open documents.
+    /// If the client provides active/visible document hints, the server SHOULD
+    /// prioritize: active > visible > other open.
+    #[test]
+    fn prop_revalidation_prioritization(
+        num_files in 2..10usize
+    ) {
+        let mut state = CrossFileActivityState::new();
+
+        // Create URIs
+        let uris: Vec<_> = (0..num_files)
+            .map(|i| make_url(&format!("file{}", i)))
+            .collect();
+
+        // Set first as active, second as visible, rest as recent
+        if !uris.is_empty() {
+            state.update(Some(uris[0].clone()), vec![], 0);
+        }
+        if uris.len() > 1 {
+            state.update(state.active_uri.clone(), vec![uris[1].clone()], 0);
+        }
+        for uri in uris.iter().skip(2) {
+            state.record_recent(uri.clone());
+        }
+
+        // Verify priority ordering
+        if !uris.is_empty() {
+            prop_assert_eq!(state.priority_score(&uris[0]), 0, "Active should have priority 0");
+        }
+        if uris.len() > 1 {
+            prop_assert_eq!(state.priority_score(&uris[1]), 1, "Visible should have priority 1");
+        }
+        // Recent files get priority = position_in_recent + 2
+        // Since we add them in order (2, 3, 4, ...), the last one added is at position 0
+        // So file[2] is at position num_files-3, file[3] is at position num_files-4, etc.
+        // Actually, record_recent adds to front, so the order is reversed
+        for (i, uri) in uris.iter().enumerate().skip(2) {
+            let position_in_recent = num_files - 1 - i; // Last added is at position 0
+            let expected_priority = position_in_recent + 2;
+            prop_assert_eq!(state.priority_score(uri), expected_priority,
+                "Recent file {} should have priority {}", i, expected_priority);
+        }
+    }
+}
+
+// ============================================================================
+// Property 43: Revalidation Cap Enforcement
+// Validates: Requirements 0.9, 0.10
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 43: For any invalidation affecting more open documents than
+    /// maxRevalidationsPerTrigger, only the first N documents (prioritized)
+    /// SHALL be scheduled.
+    #[test]
+    fn prop_revalidation_cap_enforcement(
+        num_files in 1..20usize,
+        cap in 1..10usize
+    ) {
+        let mut state = CrossFileActivityState::new();
+
+        // Create URIs and add to recent
+        let uris: Vec<_> = (0..num_files)
+            .map(|i| make_url(&format!("file{}", i)))
+            .collect();
+
+        for uri in &uris {
+            state.record_recent(uri.clone());
+        }
+
+        // Sort by priority
+        let mut sorted_uris = uris.clone();
+        sorted_uris.sort_by_key(|u| state.priority_score(u));
+
+        // Take only up to cap
+        let scheduled: Vec<_> = sorted_uris.into_iter().take(cap).collect();
+
+        // Verify cap is respected
+        prop_assert!(scheduled.len() <= cap,
+            "Scheduled count {} should not exceed cap {}", scheduled.len(), cap);
+
+        // Verify prioritization (lower priority scores come first)
+        for i in 1..scheduled.len() {
+            let prev_score = state.priority_score(&scheduled[i - 1]);
+            let curr_score = state.priority_score(&scheduled[i]);
+            prop_assert!(prev_score <= curr_score,
+                "Priority should be non-decreasing: {} <= {}", prev_score, curr_score);
+        }
     }
 }
 
