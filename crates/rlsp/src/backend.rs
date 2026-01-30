@@ -121,8 +121,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        // Compute affected files while holding write lock
-        let affected_uris = {
+        // Compute affected files and debounce config while holding write lock
+        let (work_items, debounce_ms) = {
             let mut state = self.state.write().await;
             if let Some(doc) = state.documents.get_mut(&uri) {
                 doc.version = Some(version);
@@ -167,12 +167,96 @@ impl LanguageServer for Backend {
                 affected.truncate(max_revalidations);
             }
             
-            affected
+            // Build work items with trigger revision snapshot for freshness guard
+            let work_items: Vec<_> = affected
+                .into_iter()
+                .map(|affected_uri| {
+                    let trigger_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                    let trigger_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    (affected_uri, trigger_version, trigger_revision)
+                })
+                .collect();
+            
+            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
+            (work_items, debounce_ms)
         };
 
-        // Publish diagnostics for all affected files
-        for affected_uri in affected_uris {
-            self.publish_diagnostics(&affected_uri).await;
+        // Schedule debounced diagnostics for all affected files (Requirement 0.5)
+        for (affected_uri, trigger_version, trigger_revision) in work_items {
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            
+            tokio::spawn(async move {
+                // 1) Schedule with cancellation token
+                let token = {
+                    let state = state_arc.read().await;
+                    state.cross_file_revalidation.schedule(affected_uri.clone())
+                };
+                
+                // 2) Debounce / cancellation (Requirement 0.5)
+                tokio::select! {
+                    _ = token.cancelled() => { return; }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
+                }
+                
+                // 3) Freshness guard before computing (Requirement 0.6)
+                let diagnostics_opt = {
+                    let state = state_arc.read().await;
+                    
+                    let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    
+                    // Check freshness: both version and revision must match
+                    if current_version != trigger_version || current_revision != trigger_revision {
+                        log::trace!("Skipping stale diagnostics for {}: revision changed", affected_uri);
+                        return;
+                    }
+                    
+                    // Check monotonic publishing gate (Requirement 0.7)
+                    if let Some(ver) = current_version {
+                        if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
+                            log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
+                            return;
+                        }
+                    }
+                    
+                    Some(handlers::diagnostics(&state, &affected_uri))
+                };
+                
+                if let Some(diagnostics) = diagnostics_opt {
+                    // 4) Second freshness check before publishing
+                    let can_publish = {
+                        let state = state_arc.read().await;
+                        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                        
+                        if current_version != trigger_version || current_revision != trigger_revision {
+                            log::trace!("Skipping stale diagnostics publish for {}: revision changed during computation", affected_uri);
+                            false
+                        } else if let Some(ver) = current_version {
+                            if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
+                                log::trace!("Skipping diagnostics for {}: monotonic gate (pre-publish)", affected_uri);
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    };
+                    
+                    if can_publish {
+                        client.publish_diagnostics(affected_uri.clone(), diagnostics, None).await;
+                        
+                        // Record successful publish
+                        let state = state_arc.read().await;
+                        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
+                            state.diagnostics_gate.record_publish(&affected_uri, ver);
+                        }
+                        state.cross_file_revalidation.complete(&affected_uri);
+                    }
+                }
+            });
         }
     }
 
