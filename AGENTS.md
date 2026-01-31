@@ -220,6 +220,10 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Watch for O(n²) scope detection or duplicate-detection paths in large files; prefer indexed lookups when possible.
 - Avoid duplicating local-scoping condition logic across functions; centralize to reduce drift.
 - Be careful with hover/definition range calculations at line boundaries to avoid off-by-one bugs or invalid points.
+- For removal events, use strict position comparisons (before, not at) to avoid removing symbols at their definition position.
+- In hot scope-resolution paths, avoid repeated scans over large lists (e.g., function scopes per event); precompute mappings or cache lookups to prevent O(R·F) regressions.
+- Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
+- Normalize markdown table spacing to match project lint expectations when adding spec tables.
 
 ### Thread-Safety
 
