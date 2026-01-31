@@ -1492,36 +1492,26 @@ where
     }
 
     // STEP 2: Process timeline events (local definitions and forward sources)
-    // First pass: collect all function scopes that contain the query position
-    let mut active_function_scopes = Vec::new();
-    let is_eof_position = line == u32::MAX || column == u32::MAX;
-    for event in &artifacts.timeline {
-        if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
-            if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
-                active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
-            }
-        }
-    }
+    // Use interval tree for function scope queries (skip EOF sentinel)
+    let query_pos = Position::new(line, column);
+    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if query_pos.is_eof() {
+        Vec::new()
+    } else {
+        artifacts.function_scope_tree.query_point(query_pos)
+            .into_iter()
+            .map(|interval| interval.to_tuple())
+            .collect()
+    };
     
     // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
-                    // Check if this definition is inside any function scope
-                    let def_function_scope = artifacts.timeline.iter()
-                        .filter_map(|e| {
-                            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
-                                if (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column) {
-                                    Some((*start_line, *start_column, *end_line, *end_column))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .next();
+                    // Check if this definition is inside any function scope using interval tree
+                    let def_function_scope = artifacts.function_scope_tree
+                        .query_innermost(Position::new(*def_line, *def_col))
+                        .map(|interval| interval.to_tuple());
                     
                     match def_function_scope {
                         None => {
