@@ -4240,3 +4240,312 @@ proptest! {
             "Parameter with default value should be available within function body");
     }
 }
+
+// ============================================================================
+// Task 15 Property Tests: Source() Scoping
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 25: Source local=FALSE global scope
+    /// For any file sourced with local=FALSE, all symbols defined in that file 
+    /// should be available in the global scope.
+    #[test]
+    fn prop_source_local_false_global_scope(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child with local=FALSE (default)
+        let parent_code = "source(\"child.R\", local = FALSE)";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file (after source() call)
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol from child should be available in global scope (local=FALSE)
+        prop_assert!(scope.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced with local=FALSE should be available in global scope");
+    }
+
+    /// Property 26: Source local=TRUE function scope
+    /// For any file sourced with local=TRUE inside a function, all symbols 
+    /// defined in that file should be available only within that function scope.
+    #[test]
+    fn prop_source_local_true_function_scope(
+        symbol_name in r_identifier(),
+        func_name in r_identifier()
+    ) {
+        prop_assume!(symbol_name != func_name);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: function that sources child with local=TRUE
+        let parent_code = format!(
+            "{} <- function() {{ source(\"child.R\", local = TRUE); {} }}",
+            func_name, symbol_name
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope within function body (after source() call)
+        let scope_in_function = scope_at_position_with_deps(
+            &parent_uri, 0, 60, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should be available within function scope (local=TRUE)
+        prop_assert!(scope_in_function.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced with local=TRUE should be available within function scope");
+
+        // Get scope outside function (global scope)
+        let scope_global = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should NOT be available in global scope (local=TRUE isolates it)
+        prop_assert!(!scope_global.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced with local=TRUE should NOT be available in global scope");
+
+        // Function name should be available in global scope
+        prop_assert!(scope_global.symbols.contains_key(&func_name),
+            "Function name should be available in global scope");
+    }
+
+    /// Property 27: Source local parameter default
+    /// For any source() call without an explicit local parameter, the system 
+    /// should treat it as local=FALSE.
+    #[test]
+    fn prop_source_local_parameter_default(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child without explicit local parameter (defaults to FALSE)
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should be available (default local=FALSE means global scope)
+        prop_assert!(scope.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced without explicit local parameter should be available (default local=FALSE)");
+
+        // Verify the source() call was detected with local=false by default
+        let has_source_call = parent_artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Source { source, .. } 
+                if source.path == "child.R" && !source.local)
+        });
+        prop_assert!(has_source_call,
+            "Source call should be detected with local=false by default");
+    }
+}
+
+// ============================================================================
+// Task 11 Property Tests: Scope Resolution Invariants
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: enhanced-variable-detection-hover, Property 2: Loop iterator persistence after loop
+    #[test]
+    fn prop_loop_iterator_persistence_after_loop(
+        iterator_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // For loop with iterator variable
+        let code = format!("for ({} in 1:10) {{ print({}) }}\nafter_loop <- {}", 
+                          iterator_name, iterator_name, iterator_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope at position after loop body completes
+        let scope_after_loop = scope_at_position(&artifacts, 10, 0);
+
+        // Iterator variable should still be included in available symbols
+        prop_assert!(scope_after_loop.symbols.contains_key(&iterator_name),
+            "Loop iterator should persist in scope after loop completes");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 3: Nested loop iterator tracking
+    #[test]
+    fn prop_nested_loop_iterator_tracking(
+        outer_iterator in r_identifier(),
+        inner_iterator in r_identifier()
+    ) {
+        prop_assume!(outer_iterator != inner_iterator);
+
+        let uri = make_url("test");
+
+        // Nested for loops
+        let code = format!(
+            "for ({} in 1:3) {{ for ({} in 1:2) {{ print({}, {}) }} }}",
+            outer_iterator, inner_iterator, outer_iterator, inner_iterator
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope at position after both loops complete
+        let scope_after_loops = scope_at_position(&artifacts, 10, 0);
+
+        // Both outer and inner iterator variables should be available in scope
+        prop_assert!(scope_after_loops.symbols.contains_key(&outer_iterator),
+            "Outer loop iterator should be available after nested loops complete");
+        prop_assert!(scope_after_loops.symbols.contains_key(&inner_iterator),
+            "Inner loop iterator should be available after nested loops complete");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 4: Loop iterator shadowing
+    #[test]
+    fn prop_loop_iterator_shadowing(
+        var_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Variable defined, then for loop uses same name as iterator
+        let code = format!(
+            "{} <- 42\nfor ({} in 1:5) {{ print({}) }}",
+            var_name, var_name, var_name
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope after the for statement
+        let scope_after_for = scope_at_position(&artifacts, 10, 0);
+
+        // Iterator definition should take precedence over original variable
+        prop_assert!(scope_after_for.symbols.contains_key(&var_name),
+            "Variable should be in scope after for loop");
+
+        // The symbol should be the iterator (most recent definition)
+        let symbol = scope_after_for.symbols.get(&var_name).unwrap();
+        prop_assert_eq!(symbol.kind, super::scope::SymbolKind::Variable,
+            "Symbol should be Variable kind (iterator)");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 7: Function-local undefined variable diagnostics
+    #[test]
+    fn prop_function_local_undefined_variable_diagnostics(
+        func_name in r_identifier(),
+        local_var in r_identifier(),
+        usage_var in r_identifier()
+    ) {
+        prop_assume!(func_name != local_var && local_var != usage_var && func_name != usage_var);
+
+        let uri = make_url("test");
+
+        // Function with local variable, then usage outside function
+        let code = format!(
+            "{} <- function() {{ {} <- 42 }}\nresult <- {}",
+            func_name, local_var, local_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope outside function body (where local_var is referenced)
+        let scope_outside = scope_at_position(&artifacts, 1, 15);
+
+        // Function-local variable should NOT be available outside function
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function body");
+
+        // Function name should be available
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 9: Function parameter with default value recognition
+    #[test]
+    fn prop_function_parameter_default_value_recognition(
+        func_name in r_identifier(),
+        param_with_default in r_identifier(),
+        param_without_default in r_identifier()
+    ) {
+        prop_assume!(func_name != param_with_default && param_with_default != param_without_default && func_name != param_without_default);
+
+        let uri = make_url("test");
+
+        // Function with parameter with default value and parameter without
+        let code = format!(
+            "{} <- function({}, {} = 42) {{ {} + {} }}",
+            func_name, param_without_default, param_with_default, param_without_default, param_with_default
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 60);
+
+        // Both parameters should be recognized and included in function body scope
+        prop_assert!(scope_in_body.symbols.contains_key(&param_with_default),
+            "Parameter with default value should be recognized in function body scope");
+        prop_assert!(scope_in_body.symbols.contains_key(&param_without_default),
+            "Parameter without default value should be recognized in function body scope");
+
+        // Both should have Parameter kind
+        let param_with_default_symbol = scope_in_body.symbols.get(&param_with_default).unwrap();
+        let param_without_default_symbol = scope_in_body.symbols.get(&param_without_default).unwrap();
+        
+        prop_assert_eq!(param_with_default_symbol.kind, super::scope::SymbolKind::Parameter,
+            "Parameter with default should have Parameter kind");
+        prop_assert_eq!(param_without_default_symbol.kind, super::scope::SymbolKind::Parameter,
+            "Parameter without default should have Parameter kind");
+    }
+}

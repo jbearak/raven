@@ -1299,25 +1299,104 @@ mod tests {
             if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
         };
 
+        // Test scope at end of child file (line 0, after z definition)
         let scope = scope_at_position_with_backward(
-            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+            &child_uri, 0, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None
         );
 
-        println!("Scope symbols:");
-        for (name, symbol) in &scope.symbols {
-            println!("  {} (line {})", name, symbol.defined_line);
-        }
+        // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
+        // Should NOT have: x2 (parent line 2), y (parent line 3) - after call site
+        assert!(scope.symbols.contains_key("a"), "Should have 'a' from parent");
+        assert!(scope.symbols.contains_key("x1"), "Should have 'x1' from parent");
+        assert!(scope.symbols.contains_key("z"), "Should have 'z' from local");
+        assert!(!scope.symbols.contains_key("x2"), "Should NOT have 'x2' - after call site");
+        assert!(!scope.symbols.contains_key("y"), "Should NOT have 'y' - after call site");
+    }
 
-        // a should be available (line 0, before call site line 1)
-        assert!(scope.symbols.contains_key("a"), "a should be available");
-        // x1 should be available (line 1, on call site line with end-of-line column)
-        assert!(scope.symbols.contains_key("x1"), "x1 should be available");
-        // x2 should NOT be available (line 2, after call site line 1)
-        assert!(!scope.symbols.contains_key("x2"), "x2 should NOT be available");
-        // y should NOT be available (line 3, after call site line 1)
-        assert!(!scope.symbols.contains_key("y"), "y should NOT be available");
-        // z should be available (local definition in child)
-        assert!(scope.symbols.contains_key("z"), "z should be available");
+    #[test]
+    fn test_source_local_false_global_scope() {
+        // Test that source() with local=FALSE makes symbols available (inherits_symbols() returns true)
+        let source = ForwardSource {
+            path: "child.R".to_string(),
+            line: 0,
+            column: 0,
+            is_directive: false,
+            local: false,  // local=FALSE
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: false,
+        };
+
+        assert!(source.inherits_symbols(), "source() with local=FALSE should inherit symbols");
+
+        // Test that such sources are included in timeline
+        let code = "x <- 1\nsource(\"child.R\", local = FALSE)\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have source event in timeline
+        let source_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Source { source, .. } => Some(source),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(source_events.len(), 1, "Should have one source event");
+        assert!(!source_events[0].local, "Source should have local=FALSE");
+        assert!(source_events[0].inherits_symbols(), "Source should inherit symbols");
+    }
+
+    #[test]
+    fn test_source_local_true_not_inherited() {
+        // Test that source() with local=TRUE does NOT make symbols available (inherits_symbols() returns false)
+        let source = ForwardSource {
+            path: "child.R".to_string(),
+            line: 0,
+            column: 0,
+            is_directive: false,
+            local: true,   // local=TRUE
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: false,
+        };
+
+        assert!(!source.inherits_symbols(), "source() with local=TRUE should NOT inherit symbols");
+
+        // Test that such sources are NOT included in timeline
+        let code = "x <- 1\nsource(\"child.R\", local = TRUE)\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should NOT have source event in timeline (filtered out by compute_artifacts)
+        let source_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Source { .. } => Some(e),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(source_events.len(), 0, "Should have no source events (local=TRUE filtered out)");
+    }
+
+    #[test]
+    fn test_source_default_local_false() {
+        // Test that source() without local parameter defaults to local=FALSE behavior
+        let code = "x <- 1\nsource(\"child.R\")\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have source event in timeline (defaults to local=FALSE)
+        let source_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Source { source, .. } => Some(source),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(source_events.len(), 1, "Should have one source event");
+        assert!(!source_events[0].local, "Source should default to local=FALSE");
+        assert!(source_events[0].inherits_symbols(), "Source should inherit symbols by default");
     }
 
     #[test]
