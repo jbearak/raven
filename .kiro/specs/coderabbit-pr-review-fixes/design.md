@@ -13,7 +13,7 @@ The fixes are organized into three categories:
 
 ### Affected Components
 
-```
+```text
 crates/rlsp/src/
 ├── backend.rs          # Requirement 1: On-demand indexing flag check
 ├── handlers.rs         # Requirements 5, 6, 8: Diagnostics and dead code
@@ -211,25 +211,25 @@ No new data models are introduced. Existing models are unchanged.
 
 *For any* document open event with `on_demand_indexing_enabled` set to false, no Priority 1, 2, or 3 indexing operations should be performed.
 
-**Validates: Requirements 1.1, 1.2, 1.3, 1.4**
+Validates: Requirements 1.1, 1.2, 1.3, 1.4
 
 ### Property 2: Quoted Path Extraction Preserves Spaces
 
 *For any* directive containing a quoted path with spaces, parsing then extracting the path should preserve all characters including spaces.
 
-**Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+Validates: Requirements 2.1, 2.2, 2.3, 2.4
 
 ### Property 3: Path Normalization Preserves Root
 
 *For any* absolute path starting with root or prefix, normalizing with leading ParentDir components should preserve the root/prefix.
 
-**Validates: Requirements 4.1, 4.2, 4.3**
+Validates: Requirements 4.1, 4.2, 4.3
 
 ### Property 4: Diagnostic Range Matches Path Length
 
 *For any* source path diagnostic, the range end column should equal start column plus path length.
 
-**Validates: Requirements 5.1, 5.2**
+Validates: Requirements 5.1, 5.2
 
 ## Error Handling
 

@@ -48,19 +48,19 @@ fn patterns() -> &'static DirectivePatterns {
         // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
         DirectivePatterns {
             backward: Regex::new(
-                r#"#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
+                r#"#\s*@?lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
             ).unwrap(),
             forward: Regex::new(
-                r#"#\s*@lsp-source\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"#\s*@?lsp-source\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             working_dir: Regex::new(
-                r#"#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"#\s*@?lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             ignore: Regex::new(
-                r"#\s*@lsp-ignore\s*:?\s*$"
+                r"#\s*@?lsp-ignore\s*:?\s*$"
             ).unwrap(),
             ignore_next: Regex::new(
-                r"#\s*@lsp-ignore-next\s*:?\s*$"
+                r"#\s*@?lsp-ignore-next\s*:?\s*$"
             ).unwrap(),
         }
     })
@@ -360,75 +360,68 @@ x <- undefined"#;
         let meta = parse_directives(content);
         assert_eq!(meta.working_directory, Some("/data/my project".to_string()));
     }
-}
 
-#[cfg(test)]
-mod property_tests {
-    use super::*;
-    use proptest::prelude::*;
-
-    /// Strategy for generating valid path characters (no quotes)
-    fn path_char_strategy() -> impl Strategy<Value = char> {
-        prop_oneof![
-            Just('a'),
-            Just('z'),
-            Just('A'),
-            Just('Z'),
-            Just('0'),
-            Just('9'),
-            Just('_'),
-            Just('-'),
-            Just('.'),
-            Just('/'),
-            Just(' '),
-        ]
+    // Tests for directives without '@' prefix
+    #[test]
+    fn test_backward_directive_no_at_prefix() {
+        let content = "# lsp-sourced-by ../main.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].path, "../main.R");
     }
 
-    /// Strategy for generating paths with spaces
-    fn path_with_spaces_strategy() -> impl Strategy<Value = String> {
-        prop::collection::vec(path_char_strategy(), 1..30)
-            .prop_map(|chars| chars.into_iter().collect::<String>())
-            .prop_filter("must contain space", |s| s.contains(' '))
-            .prop_filter("must not be only spaces", |s| s.trim().len() > 0)
+    #[test]
+    fn test_backward_directive_no_at_prefix_with_colon() {
+        let content = "# lsp-sourced-by: ../main.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].path, "../main.R");
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+    #[test]
+    fn test_backward_directive_no_at_prefix_synonyms() {
+        let content = "# lsp-run-by ../main.R\n# lsp-included-by ../other.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 2);
+        assert_eq!(meta.sourced_by[0].path, "../main.R");
+        assert_eq!(meta.sourced_by[1].path, "../other.R");
+    }
 
-        /// Property 2: Quoted path extraction preserves spaces
-        /// For any path with spaces, parsing a double-quoted directive should preserve the path.
-        #[test]
-        fn prop_double_quoted_path_preserves_spaces(path in path_with_spaces_strategy()) {
-            let content = format!(r#"# @lsp-sourced-by "{}""#, path);
-            let meta = parse_directives(&content);
-            prop_assert_eq!(meta.sourced_by.len(), 1);
-            prop_assert_eq!(&meta.sourced_by[0].path, &path);
-        }
+    #[test]
+    fn test_forward_directive_no_at_prefix() {
+        let content = "# lsp-source utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+    }
 
-        /// Property 2: Single-quoted path extraction preserves spaces
-        #[test]
-        fn prop_single_quoted_path_preserves_spaces(path in path_with_spaces_strategy()) {
-            let content = format!("# @lsp-sourced-by '{}'", path);
-            let meta = parse_directives(&content);
-            prop_assert_eq!(meta.sourced_by.len(), 1);
-            prop_assert_eq!(&meta.sourced_by[0].path, &path);
-        }
+    #[test]
+    fn test_working_dir_no_at_prefix() {
+        let content = "# lsp-wd /data/scripts";
+        let meta = parse_directives(content);
+        assert_eq!(meta.working_directory, Some("/data/scripts".to_string()));
+    }
 
-        /// Property 2: Forward directive quoted path preserves spaces
-        #[test]
-        fn prop_forward_quoted_path_preserves_spaces(path in path_with_spaces_strategy()) {
-            let content = format!(r#"# @lsp-source "{}""#, path);
+    #[test]
+    fn test_working_dir_no_at_prefix_synonyms() {
+        for directive in ["lsp-cd", "lsp-working-directory", "lsp-working-dir", "lsp-current-directory", "lsp-current-dir"] {
+            let content = format!("# {} /data", directive);
             let meta = parse_directives(&content);
-            prop_assert_eq!(meta.sources.len(), 1);
-            prop_assert_eq!(&meta.sources[0].path, &path);
+            assert_eq!(meta.working_directory, Some("/data".to_string()), "Failed for {}", directive);
         }
+    }
 
-        /// Property 2: Working directory quoted path preserves spaces
-        #[test]
-        fn prop_working_dir_quoted_path_preserves_spaces(path in path_with_spaces_strategy()) {
-            let content = format!(r#"# @lsp-cd "{}""#, path);
-            let meta = parse_directives(&content);
-            prop_assert_eq!(meta.working_directory, Some(path));
-        }
+    #[test]
+    fn test_ignore_directive_no_at_prefix() {
+        let content = "x <- 1\n# lsp-ignore\ny <- undefined";
+        let meta = parse_directives(content);
+        assert!(meta.ignored_lines.contains(&1));
+    }
+
+    #[test]
+    fn test_ignore_next_directive_no_at_prefix() {
+        let content = "# lsp-ignore-next\ny <- undefined";
+        let meta = parse_directives(content);
+        assert!(meta.ignored_next_lines.contains(&1));
     }
 }

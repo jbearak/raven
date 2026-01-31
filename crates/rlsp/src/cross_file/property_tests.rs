@@ -4034,3 +4034,77 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// Property Tests for Directive Parsing (Quoted Paths with Spaces)
+// Feature: coderabbit-pr-review-fixes
+// ============================================================================
+
+/// Strategy for generating valid path characters (no quotes)
+fn directive_path_char_strategy() -> impl Strategy<Value = char> {
+    prop_oneof![
+        Just('a'),
+        Just('z'),
+        Just('A'),
+        Just('Z'),
+        Just('0'),
+        Just('9'),
+        Just('_'),
+        Just('-'),
+        Just('.'),
+        Just('/'),
+        Just(' '),
+    ]
+}
+
+/// Strategy for generating paths with spaces
+fn directive_path_with_spaces_strategy() -> impl Strategy<Value = String> {
+    prop::collection::vec(directive_path_char_strategy(), 1..30)
+        .prop_map(|chars| chars.into_iter().collect::<String>())
+        .prop_filter("must contain space", |s| s.contains(' '))
+        .prop_filter("must not be only spaces", |s| !s.trim().is_empty())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 2: Quoted path extraction preserves spaces
+    /// For any path with spaces, parsing a double-quoted directive should preserve the path.
+    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    #[test]
+    fn prop_directive_double_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
+        let content = format!(r#"# @lsp-sourced-by "{}""#, path);
+        let meta = parse_directives(&content);
+        prop_assert_eq!(meta.sourced_by.len(), 1);
+        prop_assert_eq!(&meta.sourced_by[0].path, &path);
+    }
+
+    /// Property 2: Single-quoted path extraction preserves spaces
+    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    #[test]
+    fn prop_directive_single_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
+        let content = format!("# @lsp-sourced-by '{}'", path);
+        let meta = parse_directives(&content);
+        prop_assert_eq!(meta.sourced_by.len(), 1);
+        prop_assert_eq!(&meta.sourced_by[0].path, &path);
+    }
+
+    /// Property 2: Forward directive quoted path preserves spaces
+    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    #[test]
+    fn prop_directive_forward_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
+        let content = format!(r#"# @lsp-source "{}""#, path);
+        let meta = parse_directives(&content);
+        prop_assert_eq!(meta.sources.len(), 1);
+        prop_assert_eq!(&meta.sources[0].path, &path);
+    }
+
+    /// Property 2: Working directory quoted path preserves spaces
+    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    #[test]
+    fn prop_directive_working_dir_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
+        let content = format!(r#"# @lsp-cd "{}""#, path);
+        let meta = parse_directives(&content);
+        prop_assert_eq!(meta.working_directory, Some(path));
+    }
+}

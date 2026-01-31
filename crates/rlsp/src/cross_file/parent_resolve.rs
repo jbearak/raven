@@ -96,6 +96,15 @@ pub fn infer_call_site_from_parent(
         .and_then(|s| s.to_str())
         .unwrap_or(child_path);
 
+    // Helper to check if a path in source() matches our child path
+    // Accepts exact matches or paths that end with our filename/path
+    let path_matches = |quoted_path: &str| -> bool {
+        quoted_path == child_path
+            || quoted_path == child_filename
+            || quoted_path.ends_with(&format!("/{}", child_filename))
+            || quoted_path.ends_with(&format!("/{}", child_path))
+    };
+
     for (line_num, line) in parent_content.lines().enumerate() {
         // Look for sys.source() first (more specific), then source()
         let call_start = if let Some(pos) = line.find("sys.source(") {
@@ -107,16 +116,30 @@ pub fn infer_call_site_from_parent(
         if let Some(start) = call_start {
             // Check if this call references the child path (string literal)
             let after_call = &line[start..];
-            // Look for quoted path containing child filename
-            if after_call.contains(&format!("\"{}\"", child_path))
-                || after_call.contains(&format!("'{}'", child_path))
-                || after_call.contains(&format!("\"{}\"", child_filename))
-                || after_call.contains(&format!("'{}'", child_filename))
-                || after_call.contains(&format!("file = \"{}\"", child_path))
-                || after_call.contains(&format!("file = '{}'", child_path))
-                || after_call.contains(&format!("file = \"{}\"", child_filename))
-                || after_call.contains(&format!("file = '{}'", child_filename))
-            {
+
+            // Extract paths from quoted strings and check for matches
+            let mut matched = false;
+
+            // Check double-quoted paths
+            for part in after_call.split('"') {
+                // Every other part (1st, 3rd, etc.) is the content between quotes
+                if path_matches(part) {
+                    matched = true;
+                    break;
+                }
+            }
+
+            // Check single-quoted paths if not yet matched
+            if !matched {
+                for part in after_call.split('\'') {
+                    if path_matches(part) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            if matched {
                 let utf16_col = byte_offset_to_utf16_column(line, start);
                 return Some((line_num as u32, utf16_col));
             }
@@ -170,11 +193,24 @@ where
     let mut candidates: Vec<Candidate> = Vec::new();
 
     // Derive child_path from child_uri for match pattern and call-site inference
-    let child_path = child_uri
-        .to_file_path()
-        .ok()
-        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_default();
+    // Try to produce a relative path when possible (e.g., "subdir/child.R"), falling back to just filename
+    let child_path = child_uri.to_file_path().ok().map(|full_path| {
+        // Try to extract a meaningful relative path by finding the filename and potentially one parent dir
+        // This helps match source("subdir/child.R") calls
+        let filename = full_path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Try to get parent directory name for relative path matching
+        if let Some(parent) = full_path.parent() {
+            if let Some(parent_name) = parent.file_name() {
+                let parent_str = parent_name.to_string_lossy();
+                // Return "parent/filename" format for better matching
+                return format!("{}/{}", parent_str, filename);
+            }
+        }
+        filename
+    }).unwrap_or_default();
 
     // From backward directives
     for directive in &metadata.sourced_by {
@@ -538,6 +574,31 @@ y <- 2"#;
         // Should match by filename even if directive has relative path
         let parent_content = "source(\"child.R\")";
         let result = infer_call_site_from_parent(parent_content, "../subdir/child.R");
+        assert_eq!(result, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_infer_call_site_subdir_path() {
+        // Should match source("subdir/child.R") when child_path is "subdir/child.R"
+        let parent_content = "x <- 1\nsource(\"subdir/child.R\")\ny <- 2";
+        let result = infer_call_site_from_parent(parent_content, "subdir/child.R");
+        assert_eq!(result, Some((1, 0)));
+    }
+
+    #[test]
+    fn test_infer_call_site_nested_subdir_path() {
+        // Should match when source path ends with our child path
+        let parent_content = "source(\"R/subdir/child.R\")";
+        let result = infer_call_site_from_parent(parent_content, "subdir/child.R");
+        assert_eq!(result, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_infer_call_site_relative_path_match() {
+        // Should match relative path in source call
+        let parent_content = "source(\"./subdir/child.R\")";
+        // This should match because the path ends with "subdir/child.R" after removing "./"
+        let result = infer_call_site_from_parent(parent_content, "subdir/child.R");
         assert_eq!(result, Some((0, 0)));
     }
 

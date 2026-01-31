@@ -377,7 +377,7 @@ fn collect_missing_file_diagnostics(
     // Check if file exists using cached/indexed data, with filesystem fallback
     let file_exists = |target_uri: &Url| -> bool {
         log::trace!("file_exists: checking if URI exists: {}", target_uri);
-        
+
         // Check open documents first (authoritative)
         if state.documents.contains_key(target_uri) {
             log::trace!("file_exists: found in open documents");
@@ -398,10 +398,16 @@ fn collect_missing_file_diagnostics(
             log::trace!("file_exists: found in file cache");
             return true;
         }
-        // Don't block on filesystem I/O - assume file exists if not in cache
-        // On-demand indexing will populate the cache when the file is needed
-        log::trace!("file_exists: {} not in cache, assuming exists to avoid false positives", target_uri);
-        true
+        // Perform filesystem existence check for files not in cache
+        // This is synchronous but necessary to provide accurate missing-file diagnostics
+        if let Ok(path) = target_uri.to_file_path() {
+            let exists = std::fs::metadata(&path).is_ok();
+            log::trace!("file_exists: {} filesystem check = {}", target_uri, exists);
+            return exists;
+        }
+        // If we can't convert URI to file path, assume it doesn't exist
+        log::trace!("file_exists: {} could not be converted to file path", target_uri);
+        false
     };
 
     // Check forward sources (source() calls and @lsp-source directives)
