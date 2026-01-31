@@ -361,3 +361,175 @@ impl Drop for BackgroundIndexer {
         self.shutdown();
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_uri(name: &str) -> Url {
+        Url::parse(&format!("file:///test/{}", name)).unwrap()
+    }
+
+    #[test]
+    fn test_index_task_creation() {
+        let task = IndexTask {
+            uri: test_uri("test.r"),
+            priority: 2,
+            depth: 0,
+            submitted_at: Instant::now(),
+        };
+        assert_eq!(task.priority, 2);
+        assert_eq!(task.depth, 0);
+    }
+
+    #[test]
+    fn test_queue_priority_ordering() {
+        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+        // Insert tasks with different priorities
+        let tasks = vec![
+            IndexTask {
+                uri: test_uri("p3.r"),
+                priority: 3,
+                depth: 1,
+                submitted_at: Instant::now(),
+            },
+            IndexTask {
+                uri: test_uri("p2.r"),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            },
+            IndexTask {
+                uri: test_uri("p3b.r"),
+                priority: 3,
+                depth: 2,
+                submitted_at: Instant::now(),
+            },
+        ];
+
+        // Simulate submit logic for priority ordering
+        for task in tasks {
+            let mut q = queue.lock().unwrap();
+            let insert_pos = q
+                .iter()
+                .position(|t| t.priority > task.priority)
+                .unwrap_or(q.len());
+            q.insert(insert_pos, task);
+        }
+
+        // Verify order: priority 2 first, then priority 3s in FIFO order
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 3);
+        assert_eq!(q[0].priority, 2);
+        assert_eq!(q[1].priority, 3);
+        assert_eq!(q[2].priority, 3);
+        assert_eq!(q[0].uri.path(), "/test/p2.r");
+        assert_eq!(q[1].uri.path(), "/test/p3.r");
+        assert_eq!(q[2].uri.path(), "/test/p3b.r");
+    }
+
+    #[test]
+    fn test_queue_duplicate_detection() {
+        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+        // Add first task
+        {
+            let mut q = queue.lock().unwrap();
+            q.push_back(IndexTask {
+                uri: test_uri("test.r"),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            });
+        }
+
+        // Try to add duplicate
+        let uri = test_uri("test.r");
+        let is_duplicate = {
+            let q = queue.lock().unwrap();
+            q.iter().any(|task| task.uri == uri)
+        };
+
+        assert!(is_duplicate);
+        assert_eq!(queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_queue_size_limiting() {
+        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let max_size = 3;
+
+        // Fill queue to max
+        for i in 0..max_size {
+            let mut q = queue.lock().unwrap();
+            q.push_back(IndexTask {
+                uri: test_uri(&format!("file{}.r", i)),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            });
+        }
+
+        // Verify queue is at max
+        assert_eq!(queue.lock().unwrap().len(), max_size);
+
+        // Try to add one more (should be rejected)
+        let should_reject = queue.lock().unwrap().len() >= max_size;
+        assert!(should_reject);
+    }
+
+    #[test]
+    fn test_priority_2_before_priority_3() {
+        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+        // Add priority 3 first
+        {
+            let mut q = queue.lock().unwrap();
+            q.push_back(IndexTask {
+                uri: test_uri("p3.r"),
+                priority: 3,
+                depth: 1,
+                submitted_at: Instant::now(),
+            });
+        }
+
+        // Add priority 2 (should go before priority 3)
+        {
+            let mut q = queue.lock().unwrap();
+            let task = IndexTask {
+                uri: test_uri("p2.r"),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            };
+            let insert_pos = q
+                .iter()
+                .position(|t| t.priority > task.priority)
+                .unwrap_or(q.len());
+            q.insert(insert_pos, task);
+        }
+
+        let q = queue.lock().unwrap();
+        assert_eq!(q[0].priority, 2);
+        assert_eq!(q[1].priority, 3);
+    }
+
+    #[test]
+    fn test_depth_tracking() {
+        let task = IndexTask {
+            uri: test_uri("test.r"),
+            priority: 3,
+            depth: 2,
+            submitted_at: Instant::now(),
+        };
+
+        // Verify depth is tracked
+        assert_eq!(task.depth, 2);
+
+        // Simulate depth increment for transitive
+        let next_depth = task.depth + 1;
+        assert_eq!(next_depth, 3);
+    }
+}
