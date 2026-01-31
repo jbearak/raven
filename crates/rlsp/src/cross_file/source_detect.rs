@@ -184,7 +184,7 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 
 /// Detect rm() and remove() calls in R code.
 /// Returns calls that should affect scope (excludes those with non-default envir=).
-/// For now, only extracts bare symbol arguments from positional args.
+/// Extracts bare symbols from positional args and string-literal symbols from list=.
 pub fn detect_rm_calls(tree: &Tree, content: &str) -> Vec<RmCall> {
     log::trace!("Starting tree-sitter parsing for rm() call detection");
     let mut rm_calls = Vec::new();
@@ -206,6 +206,9 @@ pub fn detect_rm_calls(tree: &Tree, content: &str) -> Vec<RmCall> {
 }
 
 fn visit_node_for_rm(node: Node, content: &str, rm_calls: &mut Vec<RmCall>) {
+    if node.kind() == "identifier" {
+        return;
+    }
     if node.kind() == "call" {
         if let Some(rm_call) = try_parse_rm_call(node, content) {
             // Only add if there are symbols to remove

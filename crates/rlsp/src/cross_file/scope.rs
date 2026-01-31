@@ -114,6 +114,38 @@ pub struct ScopeAtPosition {
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
 }
+fn apply_removal(
+    scope: &mut ScopeAtPosition,
+    artifacts: &ScopeArtifacts,
+    active_function_scopes: &[(u32, u32, u32, u32)],
+    rm_line: u32,
+    rm_col: u32,
+    symbols: &[String],
+) {
+    let rm_function_scope = artifacts
+        .function_scopes
+        .iter()
+        .filter(|(start_line, start_column, end_line, end_column)| {
+            (*start_line, *start_column) <= (rm_line, rm_col)
+                && (rm_line, rm_col) <= (*end_line, *end_column)
+        })
+        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+        .copied();
+
+    match rm_function_scope {
+        None => {
+            for sym in symbols {
+                scope.symbols.remove(sym);
+            }
+        }
+        Some(rm_scope) if active_function_scopes.contains(&rm_scope) => {
+            for sym in symbols {
+                scope.symbols.remove(sym);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Compute scope artifacts for a file from its AST.
 /// This includes both definitions and source() calls in the timeline.
@@ -235,33 +267,9 @@ pub fn scope_at_position(
                 }
             }
             ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
-                // Only process if removal is before the query position
-                if (*rm_line, *rm_col) <= (line, column) {
-                    // Check function scope - removals inside functions only affect that function
-                    let rm_function_scope = artifacts.function_scopes.iter()
-                        .filter(|(start_line, start_column, end_line, end_column)| {
-                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
-                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
-                        })
-                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
-                        .copied();
-                    
-                    match rm_function_scope {
-                        None => {
-                            // Global removal - remove from scope
-                            for sym in symbols {
-                                scope.symbols.remove(sym);
-                            }
-                        }
-                        Some(rm_scope) => {
-                            // Function-local removal - only remove if we're in the same function
-                            if active_function_scopes.contains(&rm_scope) {
-                                for sym in symbols {
-                                    scope.symbols.remove(sym);
-                                }
-                            }
-                        }
-                    }
+                // Only process if removal is strictly before the query position
+                if (*rm_line, *rm_col) < (line, column) {
+                    apply_removal(&mut scope, artifacts, &active_function_scopes, *rm_line, *rm_col, symbols);
                 }
             }
         }

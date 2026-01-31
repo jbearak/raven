@@ -150,7 +150,7 @@ The LSP tracks when variables are removed from scope via `rm()` or `remove()` ca
 **Behavior:**
 - `rm()` and `remove()` are treated identically (they are aliases in R)
 - Removals inside functions only affect that function's local scope
-- Removals at the top level affect global scope
+- Removals at the top-level affect global scope
 - Symbols can be re-defined after removal and will be back in scope
 - The `envir=` argument is checked: calls with `envir = globalenv()` or `envir = .GlobalEnv` are processed normally, but any other `envir=` value causes the call to be ignored for scope tracking
 

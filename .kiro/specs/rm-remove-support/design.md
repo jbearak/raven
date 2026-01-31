@@ -285,23 +285,23 @@ call
 
 ### Supported Patterns
 
-| Pattern | Extracted Symbols |
-|---------|-------------------|
-| `rm(x)` | `["x"]` |
-| `rm(x, y, z)` | `["x", "y", "z"]` |
-| `rm(list = "x")` | `["x"]` |
-| `rm(list = c("x", "y"))` | `["x", "y"]` |
-| `remove(x)` | `["x"]` |
-| `rm(x, list = c("y", "z"))` | `["x", "y", "z"]` |
+| Pattern                      | Extracted Symbols     |
+|-----------------------------|-----------------------|
+| `rm(x)`                     | `["x"]`               |
+| `rm(x, y, z)`               | `["x", "y", "z"]`      |
+| `rm(list = "x")`            | `["x"]`               |
+| `rm(list = c("x", "y"))`    | `["x", "y"]`           |
+| `remove(x)`                 | `["x"]`               |
+| `rm(x, list = c("y", "z"))` | `["x", "y", "z"]`      |
 
 ### Unsupported Patterns (No Symbols Extracted)
 
-| Pattern | Reason |
-|---------|--------|
-| `rm(list = var)` | Dynamic variable |
-| `rm(list = ls())` | Dynamic expression |
-| `rm(list = ls(pattern = "..."))` | Pattern-based |
-| `rm(x, envir = my_env)` | Non-default environment |
+| Pattern                         | Reason                  |
+|---------------------------------|-------------------------|
+| `rm(list = var)`                | Dynamic variable        |
+| `rm(list = ls())`               | Dynamic expression      |
+| `rm(list = ls(pattern = "..."))` | Pattern-based           |
+| `rm(x, envir = my_env)`         | Non-default environment |
 
 
 
