@@ -1158,14 +1158,27 @@ pub fn extract_definition_statement(
     extract_statement_from_tree(tree, symbol, &content)
 }
 
+fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
+    let mut utf16_count = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_count == utf16_col as usize {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    line.len()
+}
+
 fn extract_statement_from_tree(
     tree: &tree_sitter::Tree,
     symbol: &ScopedSymbol,
     content: &str,
 ) -> Option<DefinitionInfo> {
+    let line_text = content.lines().nth(symbol.defined_line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, symbol.defined_column);
     let point = tree_sitter::Point::new(
         symbol.defined_line as usize,
-        symbol.defined_column as usize,
+        byte_col,
     );
     
     let node = tree.root_node().descendant_for_point_range(point, point)?;
@@ -1207,11 +1220,11 @@ fn find_assignment_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str)
                     }
                 }
             }
-            "for_statement" => return Some(StatementMatch { node, header_only: true }),
+            "for_statement" => return Some(StatementMatch { node, header_only: false }),
             "parameter" => {
                 // For parameters, find enclosing function_definition
                 if let Some(func) = find_enclosing_function(node) {
-                    return Some(StatementMatch { node: func, header_only: true });
+                    return Some(StatementMatch { node: func, header_only: false });
                 }
             }
             _ => {}

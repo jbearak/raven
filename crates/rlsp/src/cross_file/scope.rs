@@ -174,10 +174,12 @@ pub fn scope_at_position(
                 // Include if definition is before or at the position
                 if (*def_line, *def_col) <= (line, column) {
                     // Check if this definition is inside any function scope using cached lookup
+                    // Use max_by_key to get the innermost (most recent start) containing scope
                     let def_function_scope = artifacts.function_scopes.iter()
-                        .find(|(start_line, start_column, end_line, end_column)| {
+                        .filter(|(start_line, start_column, end_line, end_column)| {
                             (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column)
                         })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
                         .copied();
                     
                     match def_function_scope {
@@ -844,10 +846,12 @@ where
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Check if this definition is inside any function scope using cached lookup
+                    // Use max_by_key to get the innermost (most recent start) containing scope
                     let def_function_scope = artifacts.function_scopes.iter()
-                        .find(|(start_line, start_column, end_line, end_column)| {
+                        .filter(|(start_line, start_column, end_line, end_column)| {
                             (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column)
                         })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
                         .copied();
                     
                     match def_function_scope {
