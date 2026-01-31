@@ -427,7 +427,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
         "parameter" => {
             // Look for identifier child
             for child in param_node.children(&mut param_node.walk()) {
-                if child.kind() == "identifier" || child.kind() == "dots" {
+                if child.kind() == "identifier" {
                     let name = node_text(child, content).to_string();
                     let start = child.start_position();
                     let line_text = content.lines().nth(start.row).unwrap_or("");
