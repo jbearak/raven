@@ -1634,7 +1634,7 @@ where
 
     // STEP 2: Process timeline events (local definitions and forward sources)
     // Use interval tree for O(log n) query instead of linear scan
-    let is_eof_position = line == u32::MAX || column == u32::MAX;
+    let is_eof_position = line == u32::MAX && column == u32::MAX;
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
         Vec::new()
     } else {
@@ -1752,7 +1752,7 @@ where
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                let is_eof_position = line == u32::MAX && column == u32::MAX;
                 if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
