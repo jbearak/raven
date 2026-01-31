@@ -1934,13 +1934,15 @@ proptest! {
 
         // Inside outer function but outside inner function
         // Choose a position inside the outer body *after* the inner function definition begins.
-        // Use a more specific needle than `inner_func` alone, since very short names (e.g. "i")
-        // could match earlier substrings like "function".
-        let inner_def_needle = format!("{} <- function", inner_func);
+        // Be careful: `"{inner_func} <- function"` can match inside other identifiers (e.g. outer_func="ab", inner_func="b").
+        // Prefer a delimiter-aware search and use rfind to bias towards the inner definition.
+        let inner_def_needle = format!("; {} <- function", inner_func);
+        let inner_def_needle2 = format!(" {} <- function", inner_func);
         let col_in_outer_after_inner_def = code
-            .find(&inner_def_needle)
-            .or_else(|| code.find(&inner_func))
-            .map(|i| (i + 1) as u32)
+            .rfind(&inner_def_needle)
+            .map(|i| (i + 3) as u32) // skip "; " then move inside identifier
+            .or_else(|| code.rfind(&inner_def_needle2).map(|i| (i + 2) as u32))
+            .or_else(|| code.rfind(&inner_func).map(|i| (i + 1) as u32))
             .unwrap_or(0);
         let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def);
         prop_assert!(scope_outer.symbols.contains_key(&outer_func),

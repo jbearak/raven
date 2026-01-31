@@ -188,7 +188,7 @@ pub fn scope_at_position(
                         })
                         .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
                         .copied();
-                    
+
                     match def_function_scope {
                         None => {
                             // Global definition - always include
@@ -1318,6 +1318,7 @@ mod tests {
         let scope = scope_at_position(&artifacts, 2, 10);
         assert_eq!(scope.symbols.len(), 3);
     }
+
 
     #[test]
     fn test_interface_hash_deterministic() {
