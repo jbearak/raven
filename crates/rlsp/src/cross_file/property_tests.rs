@@ -8005,7 +8005,7 @@ proptest! {
     }
 
     /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering (Consistency)
-    /// **Validates: Requirements 4.1**
+}
     ///
     /// The Ord implementation should be consistent with PartialOrd and Eq.
     /// Specifically: (a == b) implies (a.cmp(&b) == Ordering::Equal)

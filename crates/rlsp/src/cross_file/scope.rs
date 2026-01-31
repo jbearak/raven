@@ -4740,7 +4740,7 @@ mod tests {
         assert_eq!(inside.len(), 1, "Should find 1 interval for position inside");
         assert_eq!(inside[0].start, Position::new(5, 0));
         assert_eq!(inside[0].end, Position::new(10, 20));
-        
+}
         // Position before the interval (line 3)
         let before = tree.query_point(Position::new(3, 10));
         assert!(before.is_empty(), "Should find no intervals for position before");
