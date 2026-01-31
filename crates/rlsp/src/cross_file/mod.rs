@@ -58,31 +58,26 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     // Parse directives first
     let mut meta = directive::parse_directives(content);
     
-    // Parse AST for source() calls
-    let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
-        if let Some(tree) = parser.parse(content, None) {
-            let detected = source_detect::detect_source_calls(&tree, content);
-            
-            // Merge detected source() calls with directive sources
-            // Directive sources take precedence (Requirement 6.8)
-            for source in detected {
-                // Check if there's already a directive at the same line
-                let has_directive = meta.sources.iter().any(|s| {
-                    s.is_directive && s.line == source.line
-                });
-                if !has_directive {
-                    meta.sources.push(source);
-                }
+    // Parse AST for source() calls using thread-local parser for efficiency
+    if let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(content, None)) {
+        let detected = source_detect::detect_source_calls(&tree, content);
+        
+        // Merge detected source() calls with directive sources
+        // Directive sources take precedence (Requirement 6.8)
+        for source in detected {
+            // Check if there's already a directive at the same line
+            let has_directive = meta.sources.iter().any(|s| {
+                s.is_directive && s.line == source.line
+            });
+            if !has_directive {
+                meta.sources.push(source);
             }
-            
-            // Sort by line number for consistent ordering
-            meta.sources.sort_by_key(|s| (s.line, s.column));
-        } else {
-            log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
         }
+        
+        // Sort by line number for consistent ordering
+        meta.sources.sort_by_key(|s| (s.line, s.column));
     } else {
-        log::error!("Failed to set tree-sitter language to R during metadata extraction");
+        log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
     }
     
     log::trace!(
