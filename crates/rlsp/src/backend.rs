@@ -119,6 +119,7 @@ fn parse_severity(s: &str) -> DiagnosticSeverity {
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<WorldState>>,
+    background_indexer: Arc<crate::cross_file::BackgroundIndexer>,
 }
 
 impl Backend {
@@ -126,9 +127,13 @@ impl Backend {
         let library_paths = r_env::find_library_paths();
         log::info!("Discovered R library paths: {:?}", library_paths);
 
+        let state = Arc::new(RwLock::new(WorldState::new(library_paths)));
+        let background_indexer = Arc::new(crate::cross_file::BackgroundIndexer::new(state.clone()));
+
         Self {
             client,
-            state: Arc::new(RwLock::new(WorldState::new(library_paths))),
+            state,
+            background_indexer,
         }
     }
 }
@@ -365,9 +370,25 @@ impl LanguageServer for Backend {
             }
         }
         
-        // Priority 2+ files (backward directives, transitive) can be indexed in background
-        // For now, we skip these to keep the implementation simple
-        // They will be indexed by the background workspace scan or on next access
+        // Priority 2 files (backward directive targets) are indexed in background
+        let priority_2_enabled = {
+            let state = self.state.read().await;
+            state.cross_file_config.on_demand_indexing_priority_2_enabled
+        };
+        
+        if priority_2_enabled {
+            let priority_2_files: Vec<Url> = files_to_index.iter()
+                .filter(|(_, priority)| *priority == 2)
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            
+            if !priority_2_files.is_empty() {
+                log::info!("Submitting {} backward directive targets for background indexing", priority_2_files.len());
+                for file_uri in priority_2_files {
+                    self.background_indexer.submit(file_uri, 2, 0);
+                }
+            }
+        }
 
         // Schedule debounced diagnostics for all affected files via revalidation system
         for (affected_uri, trigger_version, trigger_revision) in work_items {
