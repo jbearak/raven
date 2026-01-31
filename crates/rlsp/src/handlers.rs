@@ -3632,6 +3632,171 @@ mod proptests {
                 prop_assert_eq!(symbol.defined_line, 2, "Should select the definition that's in scope at reference position");
             }
         }
+
+        // ========================================================================
+        // Feature: skip-nse-undefined-checks
+        // Property-based tests for NSE context skipping in undefined variable checks
+        // ========================================================================
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 1: Extract Operator RHS Skipped
+        /// For any R code containing an extract operator ($ or @), the identifier on the
+        /// right-hand side SHALL NOT be collected as a usage.
+        fn prop_skip_nse_extract_operator_rhs_skipped(
+            lhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            rhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["$", "@"])
+        ) {
+            let code = format!("{}{}{}", lhs, op, rhs);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let rhs_used = used.iter().any(|(name, _)| name == &rhs);
+            prop_assert!(!rhs_used, "RHS '{}' of extract operator should NOT be collected", rhs);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 2: Extract Operator LHS Checked
+        /// For any R code containing an extract operator ($ or @), the identifier on the
+        /// left-hand side SHALL be collected as a usage.
+        fn prop_skip_nse_extract_operator_lhs_checked(
+            lhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            rhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["$", "@"])
+        ) {
+            let code = format!("{}{}{}", lhs, op, rhs);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let lhs_used = used.iter().any(|(name, _)| name == &lhs);
+            prop_assert!(lhs_used, "LHS '{}' of extract operator should be collected", lhs);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 3: Call-Like Arguments Skipped
+        /// For any R code containing a call-like node (call, subset, subset2), identifiers
+        /// inside the arguments field SHALL NOT be collected as usages.
+        fn prop_skip_nse_call_like_arguments_skipped(
+            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            arg in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            call_type in prop::sample::select(vec!["call", "subset", "subset2"])
+        ) {
+            let code = match call_type {
+                "call" => format!("{}({})", func, arg),
+                "subset" => format!("{}[{}]", func, arg),
+                "subset2" => format!("{}[[{}]]", func, arg),
+                _ => unreachable!(),
+            };
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let arg_used = used.iter().any(|(name, _)| name == &arg);
+            prop_assert!(!arg_used, "Argument '{}' inside {} should NOT be collected", arg, call_type);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 4: Function Names Checked
+        /// For any R code containing a function call, the function name SHALL be collected
+        /// as a usage.
+        fn prop_skip_nse_function_names_checked(
+            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            arg in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!("{}({})", func, arg);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let func_used = used.iter().any(|(name, _)| name == &func);
+            prop_assert!(func_used, "Function name '{}' should be collected", func);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 5: Formula Expressions Skipped
+        /// For any R code containing a formula expression (unary ~ or binary ~), identifiers
+        /// inside the formula SHALL NOT be collected as usages.
+        fn prop_skip_nse_formula_expressions_skipped(
+            var in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            formula_type in prop::sample::select(vec!["unary", "binary"])
+        ) {
+            let code = match formula_type {
+                "unary" => format!("~ {}", var),
+                "binary" => format!("y ~ {}", var),
+                _ => unreachable!(),
+            };
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let var_used = used.iter().any(|(name, _)| name == &var);
+            prop_assert!(!var_used, "Variable '{}' inside {} formula should NOT be collected", var, formula_type);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 6: Nested Skip Contexts
+        /// For any R code where a formula appears inside call arguments, identifiers in the
+        /// formula SHALL NOT be collected (both skip contexts apply).
+        fn prop_skip_nse_nested_formula_in_call(
+            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            lhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            rhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!("{}({} ~ {})", func, lhs, rhs);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let lhs_used = used.iter().any(|(name, _)| name == &lhs);
+            let rhs_used = used.iter().any(|(name, _)| name == &rhs);
+            prop_assert!(!lhs_used, "Formula LHS '{}' inside call should NOT be collected", lhs);
+            prop_assert!(!rhs_used, "Formula RHS '{}' inside call should NOT be collected", rhs);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 7: Existing Skip Rules Preserved
+        /// For any R code containing assignments or named arguments, the existing skip rules
+        /// SHALL continue to work (assignment LHS and named argument names are skipped).
+        fn prop_skip_nse_existing_rules_preserved(
+            var in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["<-", "=", "<<-"]),
+            arg_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Test assignment LHS
+            let assign_code = format!("{} {} 42", var, op);
+            let tree = parse_r_code(&assign_code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &assign_code, &UsageContext::default(), &mut used);
+            let var_used = used.iter().any(|(name, _)| name == &var);
+            prop_assert!(!var_used, "Assignment LHS '{}' with '{}' should NOT be collected", var, op);
+
+            // Test named argument
+            let named_arg_code = format!("func({} = 1)", arg_name);
+            let tree2 = parse_r_code(&named_arg_code);
+            let mut used2 = Vec::new();
+            collect_usages_with_context(tree2.root_node(), &named_arg_code, &UsageContext::default(), &mut used2);
+            let arg_used = used2.iter().any(|(name, _)| name == &arg_name);
+            prop_assert!(!arg_used, "Named argument '{}' should NOT be collected", arg_name);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 8: Non-Skipped Contexts Checked
+        /// For any R code containing an identifier NOT in a skip context, the identifier
+        /// SHALL be collected as a usage.
+        fn prop_skip_nse_non_skipped_contexts_checked(
+            var in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Standalone identifier (not in any skip context)
+            let code = var.clone();
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let var_used = used.iter().any(|(name, _)| name == &var);
+            prop_assert!(var_used, "Standalone identifier '{}' should be collected", var);
+        }
     }
 }
 
