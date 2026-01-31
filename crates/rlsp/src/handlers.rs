@@ -407,7 +407,12 @@ async fn collect_missing_file_diagnostics_standalone(
                     diagnostics.push(Diagnostic {
                         range: Range {
                             start: Position::new(source.line, source.column),
-                            end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                            end: Position::new(
+                                source.line,
+                                source.column
+                                    .saturating_add(source.path.len() as u32)
+                                    .saturating_add(10),
+                            ),
                         },
                         severity: Some(missing_file_severity),
                         message: format!("Path is outside workspace: '{}'", source.path),
@@ -421,7 +426,12 @@ async fn collect_missing_file_diagnostics_standalone(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(source.line, source.column),
-                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                    end: Position::new(
+                        source.line,
+                        source.column
+                            .saturating_add(source.path.len() as u32)
+                            .saturating_add(10),
+                    ),
                 },
                 severity: Some(missing_file_severity),
                 message: format!("Cannot resolve path: '{}'", source.path),
@@ -496,7 +506,10 @@ async fn collect_missing_file_diagnostics_standalone(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(line, col),
-                        end: Position::new(line, col + path_str.len() as u32 + 10),
+                        end: Position::new(
+                            line,
+                            col.saturating_add(path_str.len() as u32).saturating_add(10),
+                        ),
                     },
                     severity: Some(missing_file_severity),
                     message: format!("File not found: '{}'", path_str),
@@ -550,7 +563,12 @@ fn collect_missing_file_diagnostics(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(source.line, source.column),
-                        end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                        end: Position::new(
+                            source.line,
+                            source.column
+                                .saturating_add(source.path.len() as u32)
+                                .saturating_add(10),
+                        ),
                     },
                     severity: Some(state.cross_file_config.missing_file_severity),
                     message: format!("File not found: '{}'", source.path),
@@ -561,7 +579,12 @@ fn collect_missing_file_diagnostics(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(source.line, source.column),
-                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                    end: Position::new(
+                        source.line,
+                        source.column
+                            .saturating_add(source.path.len() as u32)
+                            .saturating_add(10),
+                    ),
                 },
                 severity: Some(state.cross_file_config.missing_file_severity),
                 message: format!("Cannot resolve path: '{}'", source.path),
@@ -646,7 +669,12 @@ pub async fn collect_missing_file_diagnostics_async(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(source.line, source.column),
-                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                    end: Position::new(
+                        source.line,
+                        source.column
+                            .saturating_add(source.path.len() as u32)
+                            .saturating_add(10),
+                    ),
                 },
                 severity: Some(missing_file_severity),
                 message: format!("Cannot resolve path: '{}'", source.path),
@@ -700,7 +728,10 @@ pub async fn collect_missing_file_diagnostics_async(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(line, col),
-                        end: Position::new(line, col + path.len() as u32 + 10),
+                        end: Position::new(
+                            line,
+                            col.saturating_add(path.len() as u32).saturating_add(10),
+                        ),
                     },
                     severity: Some(missing_file_severity),
                     message: format!("File not found: '{}'", path),

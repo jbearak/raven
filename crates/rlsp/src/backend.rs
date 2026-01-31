@@ -1394,6 +1394,22 @@ impl Backend {
             workspace_folder.as_ref(),
             missing_file_severity,
         ).await;
+
+        // Re-check freshness after async work to avoid publishing stale diagnostics
+        {
+            let state = self.state.read().await;
+            if let Some(ver) = version {
+                let current_version = state.documents.get(uri).and_then(|d| d.version);
+                if current_version != Some(ver) {
+                    log::trace!("Skipping diagnostics for {}: version changed (was {:?}, now {:?})", uri, version, current_version);
+                    return;
+                }
+                if !state.diagnostics_gate.can_publish(uri, ver) {
+                    log::trace!("Skipping diagnostics for {}: monotonic gate after async (version={})", uri, ver);
+                    return;
+                }
+            }
+        }
         
         // Record the publish (uses interior mutability, no write lock needed)
         {

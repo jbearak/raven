@@ -359,6 +359,18 @@ impl WorkspaceIndex {
             );
             return false;
         }
+        // Check max_file_size_bytes limit for all entries
+        if self.config.max_file_size_bytes > 0
+            && entry.snapshot.size > self.config.max_file_size_bytes as u64
+        {
+            log::info!(
+                "WorkspaceIndex rejecting oversized file {} ({} bytes > {} limit)",
+                uri,
+                entry.snapshot.size,
+                self.config.max_file_size_bytes
+            );
+            return false;
+        }
 
         guard.insert(uri, entry);
         drop(guard);
@@ -523,18 +535,27 @@ impl WorkspaceIndex {
     /// This method removes URIs from the pending queue and returns them.
     /// The caller is responsible for actually re-indexing the files.
     pub async fn process_update_queue(&self, open_uris: &HashSet<Url>) -> Vec<Url> {
-        // Get URIs ready for processing
-        let ready_uris = self.get_ready_updates(open_uris);
+        let now = Instant::now();
+        let debounce_duration = std::time::Duration::from_millis(self.config.debounce_ms);
+        let mut ready_uris = Vec::new();
+
+        // Determine readiness and remove ready URIs atomically under write lock.
+        let Ok(mut pending) = self.pending_updates.write() else {
+            return Vec::new();
+        };
+        pending.retain(|uri, scheduled_at| {
+            if open_uris.contains(uri) {
+                return true;
+            }
+            if now.duration_since(*scheduled_at) >= debounce_duration {
+                ready_uris.push(uri.clone());
+                return false;
+            }
+            true
+        });
 
         if ready_uris.is_empty() {
             return Vec::new();
-        }
-
-        // Remove processed URIs from pending_updates
-        if let Ok(mut pending) = self.pending_updates.write() {
-            for uri in &ready_uris {
-                pending.remove(uri);
-            }
         }
 
         // Remove processed URIs from update_queue

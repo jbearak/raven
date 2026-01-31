@@ -120,8 +120,8 @@ pub struct DocumentStore {
     documents: HashMap<Url, DocumentState>,
     /// LRU tracking via insertion order
     access_order: IndexSet<Url>,
-    /// Active async updates
-    active_updates: HashMap<Url, tokio::sync::oneshot::Sender<()>>,
+    /// Active async update trackers (watch-based)
+    update_trackers: HashMap<Url, UpdateTracker>,
     /// Configuration
     config: DocumentStoreConfig,
     /// Metrics
@@ -435,7 +435,7 @@ impl WorldState {
 ### DocumentState Fields
 
 | Field | Type | Purpose |
-|-------|------|---------|
+| --- | --- | --- |
 | `uri` | `Url` | Document URI |
 | `version` | `i32` | LSP document version |
 | `contents` | `Rope` | File content |
@@ -448,7 +448,7 @@ impl WorldState {
 ### IndexEntry Fields
 
 | Field | Type | Purpose |
-|-------|------|---------|
+| --- | --- | --- |
 | `contents` | `Rope` | File content |
 | `tree` | `Option<Tree>` | Parsed AST |
 | `loaded_packages` | `Vec<String>` | library() calls |
@@ -517,77 +517,77 @@ async fn collect_missing_file_diagnostics(
 
 ## Correctness Properties
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system—essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+A property is a characteristic or behavior that should hold true across all valid executions of a system—essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.
 
 ### Property 1: Open Documents Are Authoritative
 
-*For any* URI that exists in both `DocumentStore` and `WorkspaceIndex`, the `ContentProvider` SHALL always return data from `DocumentStore`.
+Property statement: *For any* URI that exists in both `DocumentStore` and `WorkspaceIndex`, the `ContentProvider` SHALL always return data from `DocumentStore`.
 
 **Validates: Requirements 3.1, 3.2, 3.4**
 
 ### Property 2: LRU Eviction Correctness
 
-*For any* sequence of document opens exceeding `max_documents`, the `DocumentStore` SHALL evict the least-recently-accessed documents first, maintaining at most `max_documents` entries.
+Property statement: *For any* sequence of document opens exceeding `max_documents`, the `DocumentStore` SHALL evict the least-recently-accessed documents first, maintaining at most `max_documents` entries.
 
 **Validates: Requirements 2.1 (new), 2.2 (new)**
 
 ### Property 3: Memory Limit Enforcement
 
-*For any* sequence of document opens, the `DocumentStore` SHALL evict documents to keep total memory usage below `max_memory_bytes`.
+Property statement: *For any* sequence of document opens, the `DocumentStore` SHALL evict documents to keep total memory usage below `max_memory_bytes`.
 
 **Validates: Requirements 2.1 (new), 2.2 (new)**
 
 ### Property 4: Version Monotonicity
 
-*For any* sequence of modification operations on `WorkspaceIndex`, the version counter SHALL strictly increase after each operation.
+Property statement: *For any* sequence of modification operations on `WorkspaceIndex`, the version counter SHALL strictly increase after each operation.
 
 **Validates: Requirements 2.4, 8.3, 12.4**
 
 ### Property 5: Debounce Batching
 
-*For any* sequence of rapid `schedule_update` calls for the same URI within `debounce_ms`, only one actual update SHALL be performed.
+Property statement: *For any* sequence of rapid `schedule_update` calls for the same URI within `debounce_ms`, only one actual update SHALL be performed.
 
 **Validates: Requirements (new debouncing)**
 
 ### Property 6: Update Queue Processing
 
-*For any* URI in the update queue, `process_update_queue` SHALL skip URIs that are currently open in `DocumentStore`.
+Property statement: *For any* URI in the update queue, `process_update_queue` SHALL skip URIs that are currently open in `DocumentStore`.
 
 **Validates: Requirements 3.2**
 
 ### Property 7: Freshness Checking
 
-*For any* `IndexEntry` with a stored snapshot, `get_if_fresh` SHALL return the entry if and only if the provided snapshot matches the stored snapshot.
+Property statement: *For any* `IndexEntry` with a stored snapshot, `get_if_fresh` SHALL return the entry if and only if the provided snapshot matches the stored snapshot.
 
 **Validates: Requirements 5.1, 5.2, 5.3**
 
 ### Property 8: Content Provider Consistency
 
-*For any* URI, the `ContentProvider` SHALL return consistent data across `get_content`, `get_metadata`, and `get_artifacts` calls (all from same source).
+Property statement: *For any* URI, the `ContentProvider` SHALL return consistent data across `get_content`, `get_metadata`, and `get_artifacts` calls (all from same source).
 
 **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
 
 ### Property 9: Async Update Coordination
 
-*For any* URI with an active update, `wait_for_update` SHALL block until the update completes, and subsequent `get` calls SHALL return the updated data.
+Property statement: *For any* URI with an active update, `wait_for_update` SHALL block until the update completes, and subsequent `get` calls SHALL return the updated data.
 
 **Validates: Requirements (new async coordination)**
 
 ### Property 10: Invalidation Correctness
 
-*For any* URI, calling `invalidate` SHALL remove the entry, and subsequent `get` calls SHALL return `None`.
+Property statement: *For any* URI, calling `invalidate` SHALL remove the entry, and subsequent `get` calls SHALL return `None`.
 
 **Validates: Requirements 8.1, 8.2**
 
 ### Property 11: Iteration Completeness
 
-*For any* set of entries in `WorkspaceIndex`, `iter()` SHALL return all entries with their full data.
+Property statement: *For any* set of entries in `WorkspaceIndex`, `iter()` SHALL return all entries with their full data.
 
 **Validates: Requirements 9.1, 9.2, 9.3, 9.4**
 
 ### Property 12: Entry Completeness
 
-*For any* valid R file content, creating an `IndexEntry` SHALL produce an entry where all fields are accessible and correctly computed.
+Property statement: *For any* valid R file content, creating an `IndexEntry` SHALL produce an entry where all fields are accessible and correctly computed.
 
 **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 11.1, 11.2, 11.3**
 
@@ -596,7 +596,7 @@ async fn collect_missing_file_diagnostics(
 ### DocumentStore Errors
 
 | Error Condition | Handling Strategy |
-|-----------------|-------------------|
+| --- | --- |
 | Parse timeout | Store partial state with error diagnostic |
 | Memory limit exceeded | Evict LRU documents until under limit |
 | Invalid UTF-8 content | Return error; don't store document |
@@ -605,7 +605,7 @@ async fn collect_missing_file_diagnostics(
 ### WorkspaceIndex Errors
 
 | Error Condition | Handling Strategy |
-|-----------------|-------------------|
+| --- | --- |
 | RwLock poisoned | Return `None`; log error |
 | File read failure | Log warning; skip file |
 | Parse failure | Store entry with `tree: None` |
@@ -614,10 +614,10 @@ async fn collect_missing_file_diagnostics(
 ### ContentProvider Errors
 
 | Error Condition | Handling Strategy |
-|-----------------|-------------------|
+| --- | --- |
 | URI not found anywhere | Return `None` |
 | Stale data detected | Return stale data; trigger background refresh |
-| File cache miss | Read from disk; cache result |
+| File cache miss | Return `None`; disk checks handled via async existence path |
 
 ## Testing Strategy
 
