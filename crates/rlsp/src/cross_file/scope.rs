@@ -73,6 +73,7 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbols: Vec<String>,
+        function_scope: Option<(u32, u32, u32, u32)>,
     },
 }
 
@@ -114,25 +115,26 @@ pub struct ScopeAtPosition {
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
 }
-fn apply_removal(
-    scope: &mut ScopeAtPosition,
-    artifacts: &ScopeArtifacts,
-    active_function_scopes: &[(u32, u32, u32, u32)],
-    rm_line: u32,
-    rm_col: u32,
-    symbols: &[String],
-) {
-    let rm_function_scope = artifacts
-        .function_scopes
+fn find_containing_function_scope(
+    function_scopes: &[(u32, u32, u32, u32)],
+    line: u32,
+    column: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    function_scopes
         .iter()
         .filter(|(start_line, start_column, end_line, end_column)| {
-            (*start_line, *start_column) <= (rm_line, rm_col)
-                && (rm_line, rm_col) <= (*end_line, *end_column)
+            (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column)
         })
         .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
-        .copied();
-
-    match rm_function_scope {
+        .copied()
+}
+fn apply_removal(
+    scope: &mut ScopeAtPosition,
+    active_function_scopes: &[(u32, u32, u32, u32)],
+    removal_scope: Option<(u32, u32, u32, u32)>,
+    symbols: &[String],
+) {
+    match removal_scope {
         None => {
             for sym in symbols {
                 scope.symbols.remove(sym);
@@ -177,6 +179,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             line: rm_call.line,
             column: rm_call.column,
             symbols: rm_call.symbols,
+            function_scope: None,
         });
     }
 
@@ -198,6 +201,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             }
         })
         .collect();
+    for event in &mut artifacts.timeline {
+        if let ScopeEvent::Removal { line, column, function_scope, .. } = event {
+            *function_scope = find_containing_function_scope(&artifacts.function_scopes, *line, *column);
+        }
+    }
 
     // Compute interface hash
     artifacts.interface_hash = compute_interface_hash(&artifacts.exported_interface);
@@ -266,10 +274,10 @@ pub fn scope_at_position(
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(&mut scope, artifacts, &active_function_scopes, *rm_line, *rm_col, symbols);
+                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
                 }
             }
         }
@@ -429,34 +437,10 @@ where
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
-                // Only process if removal is before the query position
-                if (*rm_line, *rm_col) <= (line, column) {
-                    // Check function scope - removals inside functions only affect that function
-                    let rm_function_scope = artifacts.function_scopes.iter()
-                        .filter(|(start_line, start_column, end_line, end_column)| {
-                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
-                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
-                        })
-                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
-                        .copied();
-                    
-                    match rm_function_scope {
-                        None => {
-                            // Global removal - remove from scope
-                            for sym in symbols {
-                                scope.symbols.remove(sym);
-                            }
-                        }
-                        Some(rm_scope) => {
-                            // Function-local removal - only remove if we're in the same function
-                            if active_function_scopes.contains(&rm_scope) {
-                                for sym in symbols {
-                                    scope.symbols.remove(sym);
-                                }
-                            }
-                        }
-                    }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+                // Only process if removal is strictly before the query position
+                if (*rm_line, *rm_col) < (line, column) {
+                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
                 }
             }
         }
@@ -1134,34 +1118,10 @@ where
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
-                // Only process if removal is before the query position
-                if (*rm_line, *rm_col) <= (line, column) {
-                    // Check function scope - removals inside functions only affect that function
-                    let rm_function_scope = artifacts.function_scopes.iter()
-                        .filter(|(start_line, start_column, end_line, end_column)| {
-                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
-                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
-                        })
-                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
-                        .copied();
-                    
-                    match rm_function_scope {
-                        None => {
-                            // Global removal - remove from scope
-                            for sym in symbols {
-                                scope.symbols.remove(sym);
-                            }
-                        }
-                        Some(rm_scope) => {
-                            // Function-local removal - only remove if we're in the same function
-                            if active_function_scopes.contains(&rm_scope) {
-                                for sym in symbols {
-                                    scope.symbols.remove(sym);
-                                }
-                            }
-                        }
-                    }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+                // Only process if removal is strictly before the query position
+                if (*rm_line, *rm_col) < (line, column) {
+                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
                 }
             }
         }
@@ -1336,34 +1296,10 @@ where
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
-                // Only process if removal is before the query position
-                if (*rm_line, *rm_col) <= (line, column) {
-                    // Check function scope - removals inside functions only affect that function
-                    let rm_function_scope = artifacts.function_scopes.iter()
-                        .filter(|(start_line, start_column, end_line, end_column)| {
-                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
-                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
-                        })
-                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
-                        .copied();
-                    
-                    match rm_function_scope {
-                        None => {
-                            // Global removal - remove from scope
-                            for sym in symbols {
-                                scope.symbols.remove(sym);
-                            }
-                        }
-                        Some(rm_scope) => {
-                            // Function-local removal - only remove if we're in the same function
-                            if active_function_scopes.contains(&rm_scope) {
-                                for sym in symbols {
-                                    scope.symbols.remove(sym);
-                                }
-                            }
-                        }
-                    }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+                // Only process if removal is strictly before the query position
+                if (*rm_line, *rm_col) < (line, column) {
+                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
                 }
             }
         }
@@ -2404,10 +2340,11 @@ mod tests {
             line: 5,
             column: 0,
             symbols: vec!["x".to_string()],
+            function_scope: None,
         };
 
         match removal {
-            ScopeEvent::Removal { line, column, symbols } => {
+            ScopeEvent::Removal { line, column, symbols, .. } => {
                 assert_eq!(line, 5);
                 assert_eq!(column, 0);
                 assert_eq!(symbols.len(), 1);
@@ -2424,10 +2361,11 @@ mod tests {
             line: 10,
             column: 4,
             symbols: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            function_scope: None,
         };
 
         match removal {
-            ScopeEvent::Removal { line, column, symbols } => {
+            ScopeEvent::Removal { line, column, symbols, .. } => {
                 assert_eq!(line, 10);
                 assert_eq!(column, 4);
                 assert_eq!(symbols.len(), 3);
@@ -2446,10 +2384,11 @@ mod tests {
             line: 0,
             column: 0,
             symbols: vec![],
+            function_scope: None,
         };
 
         match removal {
-            ScopeEvent::Removal { line, column, symbols } => {
+            ScopeEvent::Removal { line, column, symbols, .. } => {
                 assert_eq!(line, 0);
                 assert_eq!(column, 0);
                 assert!(symbols.is_empty());
@@ -2462,10 +2401,30 @@ mod tests {
     fn test_removal_event_sorting_by_position() {
         // Test that Removal events are correctly sorted by (line, column) position
         let mut events = vec![
-            ScopeEvent::Removal { line: 5, column: 10, symbols: vec!["c".to_string()] },
-            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["a".to_string()] },
-            ScopeEvent::Removal { line: 5, column: 5, symbols: vec!["b".to_string()] },
-            ScopeEvent::Removal { line: 10, column: 0, symbols: vec!["d".to_string()] },
+            ScopeEvent::Removal {
+                line: 5,
+                column: 10,
+                symbols: vec!["c".to_string()],
+                function_scope: None,
+            },
+            ScopeEvent::Removal {
+                line: 2,
+                column: 0,
+                symbols: vec!["a".to_string()],
+                function_scope: None,
+            },
+            ScopeEvent::Removal {
+                line: 5,
+                column: 5,
+                symbols: vec!["b".to_string()],
+                function_scope: None,
+            },
+            ScopeEvent::Removal {
+                line: 10,
+                column: 0,
+                symbols: vec!["d".to_string()],
+                function_scope: None,
+            },
         ];
 
         // Sort using the same key as compute_artifacts
@@ -2489,9 +2448,24 @@ mod tests {
     fn test_removal_event_sorting_same_line_different_columns() {
         // Test that Removal events on the same line are sorted by column
         let mut events = vec![
-            ScopeEvent::Removal { line: 3, column: 20, symbols: vec!["c".to_string()] },
-            ScopeEvent::Removal { line: 3, column: 5, symbols: vec!["a".to_string()] },
-            ScopeEvent::Removal { line: 3, column: 10, symbols: vec!["b".to_string()] },
+            ScopeEvent::Removal {
+                line: 3,
+                column: 20,
+                symbols: vec!["c".to_string()],
+                function_scope: None,
+            },
+            ScopeEvent::Removal {
+                line: 3,
+                column: 5,
+                symbols: vec!["a".to_string()],
+                function_scope: None,
+            },
+            ScopeEvent::Removal {
+                line: 3,
+                column: 10,
+                symbols: vec!["b".to_string()],
+                function_scope: None,
+            },
         ];
 
         events.sort_by_key(|event| match event {
@@ -2515,7 +2489,12 @@ mod tests {
         // Test that Removal events sort correctly when mixed with Def events
         let uri = test_uri();
         let mut events = vec![
-            ScopeEvent::Removal { line: 3, column: 0, symbols: vec!["x".to_string()] },
+            ScopeEvent::Removal {
+                line: 3,
+                column: 0,
+                symbols: vec!["x".to_string()],
+                function_scope: None,
+            },
             ScopeEvent::Def {
                 line: 1,
                 column: 0,
@@ -2574,7 +2553,8 @@ mod tests {
         use super::super::types::ForwardSource;
 
         let mut events = vec![
-            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] },
+            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] 
+ function_scope: None,},
             ScopeEvent::Source {
                 line: 1,
                 column: 0,
@@ -2589,7 +2569,8 @@ mod tests {
                     sys_source_global_env: true,
                 },
             },
-            ScopeEvent::Removal { line: 4, column: 0, symbols: vec!["y".to_string()] },
+            ScopeEvent::Removal { line: 4, column: 0, symbols: vec!["y".to_string()] 
+ function_scope: None,},
         ];
 
         events.sort_by_key(|event| match event {
@@ -2616,7 +2597,8 @@ mod tests {
 
         let uri = test_uri();
         let mut events = vec![
-            ScopeEvent::Removal { line: 5, column: 0, symbols: vec!["z".to_string()] },
+            ScopeEvent::Removal { line: 5, column: 0, symbols: vec!["z".to_string()] 
+ function_scope: None,},
             ScopeEvent::Def {
                 line: 1,
                 column: 0,
@@ -2650,7 +2632,8 @@ mod tests {
                 end_column: 1,
                 parameters: vec![],
             },
-            ScopeEvent::Removal { line: 9, column: 0, symbols: vec!["w".to_string()] },
+            ScopeEvent::Removal { line: 9, column: 0, symbols: vec!["w".to_string()] 
+ function_scope: None,},
         ];
 
         events.sort_by_key(|event| match event {
@@ -2687,7 +2670,8 @@ mod tests {
         // (This is an edge case - in practice they would be at different positions)
         let uri = test_uri();
         let mut events = vec![
-            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] },
+            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] 
+ function_scope: None,},
             ScopeEvent::Def {
                 line: 2,
                 column: 0,
@@ -2729,14 +2713,17 @@ mod tests {
             line: 5,
             column: 10,
             symbols: vec!["x".to_string(), "y".to_string()],
+            function_scope: None,
         };
 
         let cloned = original.clone();
 
         match (original, cloned) {
             (
-                ScopeEvent::Removal { line: l1, column: c1, symbols: s1 },
-                ScopeEvent::Removal { line: l2, column: c2, symbols: s2 },
+                ScopeEvent::Removal { line: l1, column: c1, symbols: s1 
+ function_scope: None,},
+                ScopeEvent::Removal { line: l2, column: c2, symbols: s2 
+ function_scope: None,},
             ) => {
                 assert_eq!(l1, l2);
                 assert_eq!(c1, c2);
