@@ -159,9 +159,10 @@ pub fn scope_at_position(
 
     // First pass: collect all function scopes that contain the query position
     let mut active_function_scopes = Vec::new();
+    let is_eof_position = line == u32::MAX || column == u32::MAX;
     for event in &artifacts.timeline {
         if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
-            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+            if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                 active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
             }
         }
@@ -201,7 +202,9 @@ pub fn scope_at_position(
             }
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
-                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                // Skip EOF sentinel positions to avoid matching all functions
+                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
@@ -265,9 +268,10 @@ where
 
     // First pass: collect all function scopes that contain the query position
     let mut active_function_scopes = Vec::new();
+    let is_eof_position = line == u32::MAX || column == u32::MAX;
     for event in &artifacts.timeline {
         if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
-            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+            if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                 active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
             }
         }
@@ -335,7 +339,9 @@ where
             }
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
-                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                // Skip EOF sentinel positions to avoid matching all functions
+                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.entry(param.name.clone()).or_insert_with(|| param.clone());
                     }
@@ -856,9 +862,10 @@ where
     // STEP 2: Process timeline events (local definitions and forward sources)
     // First pass: collect all function scopes that contain the query position
     let mut active_function_scopes = Vec::new();
+    let is_eof_position = line == u32::MAX || column == u32::MAX;
     for event in &artifacts.timeline {
         if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
-            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+            if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                 active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
             }
         }
@@ -956,7 +963,9 @@ where
             }
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
-                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                // Skip EOF sentinel positions to avoid matching all functions
+                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
@@ -1049,9 +1058,10 @@ where
     // STEP 2: Process timeline events (local definitions and forward sources)
     // First pass: collect all function scopes that contain the query position
     let mut active_function_scopes = Vec::new();
+    let is_eof_position = line == u32::MAX || column == u32::MAX;
     for event in &artifacts.timeline {
         if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
-            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+            if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                 active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
             }
         }
@@ -1125,7 +1135,9 @@ where
             }
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
-                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                // Skip EOF sentinel positions to avoid matching all functions
+                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
@@ -2094,5 +2106,29 @@ mod tests {
         // Function name should still be available within body
         let scope_in_body = scope_at_position(&artifacts, 0, 25);
         assert!(scope_in_body.symbols.contains_key("my_func"));
+    }
+
+    #[test]
+    fn test_eof_position_does_not_match_all_functions() {
+        // Test that querying at EOF (u32::MAX) doesn't incorrectly include function parameters
+        let code = "func1 <- function(param1) { var1 <- 1 }\nfunc2 <- function(param2) { var2 <- 2 }\nglobal_var <- 3";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Query at EOF position
+        let scope_eof = scope_at_position(&artifacts, u32::MAX, u32::MAX);
+        
+        // Should have global symbols
+        assert!(scope_eof.symbols.contains_key("func1"), "func1 should be available at EOF");
+        assert!(scope_eof.symbols.contains_key("func2"), "func2 should be available at EOF");
+        assert!(scope_eof.symbols.contains_key("global_var"), "global_var should be available at EOF");
+        
+        // Should NOT have function parameters (this was the bug)
+        assert!(!scope_eof.symbols.contains_key("param1"), "param1 should NOT be available at EOF");
+        assert!(!scope_eof.symbols.contains_key("param2"), "param2 should NOT be available at EOF");
+        
+        // Should NOT have function-local variables
+        assert!(!scope_eof.symbols.contains_key("var1"), "var1 should NOT be available at EOF");
+        assert!(!scope_eof.symbols.contains_key("var2"), "var2 should NOT be available at EOF");
     }
 }
