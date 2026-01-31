@@ -6,7 +6,7 @@ This implementation adds support for tracking variable removals via `rm()` and `
 
 ## Tasks
 
-- [ ] 1. Add Removal event type to scope system
+- [x] 1. Add Removal event type to scope system
   - [x] 1.1 Add ScopeEvent::Removal variant to scope.rs
     - Add new variant with line, column, and symbols fields
     - Update timeline sorting to include Removal events
@@ -16,7 +16,7 @@ This implementation adds support for tracking variable removals via `rm()` and `
     - Test that Removal events are correctly created and sorted in timeline
     - _Requirements: 1.1, 1.2_
 
-- [ ] 2. Implement rm()/remove() call detection
+- [x] 2. Implement rm()/remove() call detection
   - [x] 2.1 Create detect_rm_calls function in source_detect.rs
     - Detect calls to rm() and remove() functions
     - Extract bare symbol arguments from positional args
@@ -65,7 +65,7 @@ This implementation adds support for tracking variable removals via `rm()` and `
 - [x] 3. Checkpoint - Ensure detection tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 4. Integrate rm() detection into scope artifacts
+- [x] 4. Integrate rm() detection into scope artifacts
   - [x] 4.1 Modify compute_artifacts to collect rm() calls
     - Call detect_rm_calls and add Removal events to timeline
     - Ensure proper sorting with other event types
@@ -76,7 +76,7 @@ This implementation adds support for tracking variable removals via `rm()` and `
     - Test mixed definitions and removals
     - _Requirements: 1.1, 7.1_
 
-- [ ] 5. Implement scope resolution with removals
+- [x] 5. Implement scope resolution with removals
   - [x] 5.1 Modify scope_at_position to handle Removal events
     - Remove symbols from scope when processing Removal events
     - Only process removals before the query position
@@ -110,7 +110,7 @@ This implementation adds support for tracking variable removals via `rm()` and `
 - [x] 6. Checkpoint - Ensure scope resolution tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 7. Cross-file scope integration
+- [x] 7. Cross-file scope integration
   - [x] 7.1 Update scope_at_position_with_backward_recursive for removals
     - Handle Removal events in backward directive resolution
     - _Requirements: 6.1, 6.2, 6.3_
@@ -124,7 +124,7 @@ This implementation adds support for tracking variable removals via `rm()` and `
     - **Property 7: Cross-File Removal Propagation**
     - **Validates: Requirements 6.1, 6.2, 6.3**
 
-- [ ] 8. Documentation
+- [x] 8. Documentation
   - [x] 8.1 Update README.md with rm()/remove() support documentation
     - Document supported patterns (bare symbols, list= with literals)
     - Document unsupported patterns (dynamic expressions, envir=)
