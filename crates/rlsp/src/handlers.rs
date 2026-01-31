@@ -795,8 +795,8 @@ fn collect_undefined_variables_position_aware(
     // First pass: collect all definitions
     collect_definitions(node, text, &mut defined);
 
-    // Second pass: collect all usages
-    collect_usages(node, text, &mut used);
+    // Second pass: collect all usages with NSE-aware context
+    collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
 
     // Report undefined variables with position-aware cross-file scope
     for (name, usage_node) in used {
@@ -860,7 +860,7 @@ fn collect_undefined_variables(
     collect_definitions(node, text, &mut defined);
 
     // Second pass: collect all usages
-    collect_usages(node, text, &mut used);
+    collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
 
     // Report undefined variables
     for (name, node) in used {
@@ -935,6 +935,18 @@ fn collect_parameters(node: Node, text: &str, defined: &mut std::collections::Ha
     }
 }
 
+/// Context for tracking NSE-related state during AST traversal
+#[derive(Clone, Default)]
+struct UsageContext {
+    /// True when inside a formula expression (~ operator)
+    in_formula: bool,
+    /// True when inside the arguments of a call-like node (call, subset, subset2)
+    in_call_like_arguments: bool,
+}
+
+/// Legacy version of collect_usages without NSE context tracking.
+/// Only used in tests for backward compatibility with existing property tests.
+#[cfg(test)]
 fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'a>)>) {
     if node.kind() == "identifier" {
         // Skip if this is the LHS of an assignment
@@ -967,6 +979,121 @@ fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_usages(child, text, used);
+    }
+}
+
+/// Context-aware version of collect_usages that tracks NSE-related state during AST traversal.
+/// This function skips undefined variable checks in contexts where R uses non-standard evaluation.
+fn collect_usages_with_context<'a>(
+    node: Node<'a>,
+    text: &str,
+    context: &UsageContext,
+    used: &mut Vec<(String, Node<'a>)>,
+) {
+    if node.kind() == "identifier" {
+        // Skip if we're in a formula or call-like arguments context
+        if context.in_formula || context.in_call_like_arguments {
+            return;
+        }
+
+        // Skip if this is the LHS of an assignment
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "binary_operator" {
+                let mut cursor = parent.walk();
+                let children: Vec<_> = parent.children(&mut cursor).collect();
+                if children.len() >= 2 && children[0].id() == node.id() {
+                    let op = children[1];
+                    let op_text = node_text(op, text);
+                    if matches!(op_text, "<-" | "=" | "<<-") {
+                        return; // Skip LHS of assignment
+                    }
+                }
+            }
+            
+            // Skip if this is a named argument (e.g., n = 1 in readLines(..., n = 1))
+            if parent.kind() == "argument" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.id() == node.id() {
+                        return; // Skip argument names
+                    }
+                }
+            }
+
+            // Skip if this is the RHS of an extract operator ($ or @)
+            // e.g., df$column or obj@slot - we don't want to check if column/slot is defined
+            // The LHS (df, obj) should still be checked for undefined variables
+            if parent.kind() == "extract_operator" {
+                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
+                    if rhs_node.id() == node.id() {
+                        return; // Skip RHS of extract operator
+                    }
+                }
+            }
+        }
+
+        used.push((node_text(node, text).to_string(), node));
+    }
+
+    // Check if we're entering a formula expression (~ operator)
+    // Tree-sitter-r represents formulas as:
+    // - `~ x` is a `unary_operator` node with `~` as the operator
+    // - `y ~ x` is a `binary_operator` node with `~` as the operator
+    let is_formula_node = match node.kind() {
+        "unary_operator" => {
+            // For unary operator, check if the operator is ~
+            // The first child is typically the operator
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            children.first().map_or(false, |op| node_text(*op, text) == "~")
+        }
+        "binary_operator" => {
+            // For binary operator, check if the operator (second child) is ~
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            children.get(1).map_or(false, |op| node_text(*op, text) == "~")
+        }
+        _ => false,
+    };
+
+    // Check if this is a call-like node (call, subset, subset2)
+    // These nodes have `function` and `arguments` fields
+    // We only set in_call_like_arguments when entering the `arguments` field
+    let is_call_like_node = matches!(node.kind(), "call" | "subset" | "subset2");
+
+    // Create updated context if entering a formula
+    let base_context = if is_formula_node {
+        UsageContext {
+            in_formula: true,
+            ..context.clone()
+        }
+    } else {
+        context.clone()
+    };
+
+    // Recurse into children with the (possibly updated) context
+    // For call-like nodes, we need to handle the `arguments` field specially
+    if is_call_like_node {
+        // For call-like nodes, recurse into children but set in_call_like_arguments
+        // only for the `arguments` field, not for the `function` field
+        if let Some(function_node) = node.child_by_field_name("function") {
+            // The function field should NOT have in_call_like_arguments set
+            // We still want to check if the function name is defined
+            collect_usages_with_context(function_node, text, &base_context, used);
+        }
+        if let Some(arguments_node) = node.child_by_field_name("arguments") {
+            // The arguments field SHOULD have in_call_like_arguments set
+            let args_context = UsageContext {
+                in_call_like_arguments: true,
+                ..base_context.clone()
+            };
+            collect_usages_with_context(arguments_node, text, &args_context, used);
+        }
+    } else {
+        // For non-call-like nodes, recurse normally
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_usages_with_context(child, text, &base_context, used);
+        }
     }
 }
 
@@ -2252,6 +2379,316 @@ mod tests {
         }
         None
     }
+
+    // ========================================================================
+    // Extract Operator Tests (Task 6.1)
+    // Tests for skip-nse-undefined-checks feature
+    // Validates: Requirements 1.1, 1.2, 1.3
+    // ========================================================================
+
+    /// Test that df$column does not produce a diagnostic for 'column'
+    /// Validates: Requirement 1.1 - RHS of $ operator should be skipped
+    #[test]
+    fn test_extract_operator_dollar_rhs_skipped() {
+        let code = "df$column";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'df' should be collected as a usage (LHS is checked)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(df_used, "LHS 'df' should be collected as usage");
+        
+        // 'column' should NOT be collected as a usage (RHS is skipped)
+        let column_used = used.iter().any(|(name, _)| name == "column");
+        assert!(!column_used, "RHS 'column' should NOT be collected as usage for $ operator");
+    }
+
+    /// Test that obj@slot does not produce a diagnostic for 'slot'
+    /// Validates: Requirement 1.2 - RHS of @ operator should be skipped
+    #[test]
+    fn test_extract_operator_at_rhs_skipped() {
+        let code = "obj@slot";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'obj' should be collected as a usage (LHS is checked)
+        let obj_used = used.iter().any(|(name, _)| name == "obj");
+        assert!(obj_used, "LHS 'obj' should be collected as usage");
+        
+        // 'slot' should NOT be collected as a usage (RHS is skipped)
+        let slot_used = used.iter().any(|(name, _)| name == "slot");
+        assert!(!slot_used, "RHS 'slot' should NOT be collected as usage for @ operator");
+    }
+
+    /// Test that undefined$column produces a diagnostic for 'undefined' (LHS is still checked)
+    /// Validates: Requirement 1.3 - LHS of extract operators should still be checked
+    #[test]
+    fn test_extract_operator_lhs_checked() {
+        let code = "undefined$column";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'undefined' should be collected as a usage (LHS is checked)
+        let undefined_used = used.iter().any(|(name, _)| name == "undefined");
+        assert!(undefined_used, "LHS 'undefined' should be collected as usage");
+        
+        // 'column' should NOT be collected as a usage (RHS is skipped)
+        let column_used = used.iter().any(|(name, _)| name == "column");
+        assert!(!column_used, "RHS 'column' should NOT be collected as usage");
+    }
+
+    // ==================== Call-Like Argument Tests ====================
+    // These tests verify that identifiers inside call-like arguments are skipped
+    // (Requirements 2.1, 2.2, 2.3, 2.4)
+
+    /// Test that subset(df, x > 5) does not produce a diagnostic for 'x'
+    /// Validates: Requirement 2.1 - Identifiers inside function call arguments should be skipped
+    #[test]
+    fn test_call_arguments_skipped() {
+        let code = "subset(df, x > 5)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'subset' should be collected as a usage (function name is checked)
+        let subset_used = used.iter().any(|(name, _)| name == "subset");
+        assert!(subset_used, "Function name 'subset' should be collected as usage");
+        
+        // 'df' should NOT be collected as a usage (inside call arguments)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(!df_used, "'df' inside call arguments should NOT be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside call arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside call arguments should NOT be collected as usage");
+    }
+
+    /// Test that df[x > 5, ] does not produce a diagnostic for 'x'
+    /// Validates: Requirement 2.2 - Identifiers inside subset ([) arguments should be skipped
+    #[test]
+    fn test_subset_arguments_skipped() {
+        let code = "df[x > 5, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'df' should be collected as a usage (the object being subsetted is checked)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(df_used, "'df' (object being subsetted) should be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside subset arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside subset arguments should NOT be collected as usage");
+    }
+
+    /// Test that df[[x]] does not produce a diagnostic for 'x'
+    /// Validates: Requirement 2.3 - Identifiers inside subset2 ([[) arguments should be skipped
+    #[test]
+    fn test_subset2_arguments_skipped() {
+        let code = "df[[x]]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'df' should be collected as a usage (the object being subsetted is checked)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(df_used, "'df' (object being subsetted) should be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside subset2 arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside subset2 arguments should NOT be collected as usage");
+    }
+
+    /// Test that undefined_func(x) produces a diagnostic for 'undefined_func'
+    /// Validates: Requirement 2.4 - Function names should still be checked
+    #[test]
+    fn test_function_name_checked() {
+        let code = "undefined_func(x)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'undefined_func' should be collected as a usage (function name is checked)
+        let func_used = used.iter().any(|(name, _)| name == "undefined_func");
+        assert!(func_used, "Function name 'undefined_func' should be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside call arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside call arguments should NOT be collected as usage");
+    }
+
+    // ==================== Formula Tests (Task 6.3) ====================
+    // These tests verify that identifiers inside formula expressions are skipped
+    // (Requirements 3.1, 3.2, 3.4)
+
+    /// Test that ~ x does not produce a diagnostic for 'x'
+    /// Validates: Requirement 3.1 - Identifiers inside unary formula expressions should be skipped
+    #[test]
+    fn test_unary_formula_skipped() {
+        let code = "~ x";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'x' should NOT be collected as a usage (inside formula)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside unary formula should NOT be collected as usage");
+    }
+
+    /// Test that y ~ x + z does not produce diagnostics for 'y', 'x', 'z'
+    /// Validates: Requirement 3.2 - Identifiers inside binary formula expressions should be skipped
+    #[test]
+    fn test_binary_formula_skipped() {
+        let code = "y ~ x + z";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'y' should NOT be collected as a usage (LHS of formula)
+        let y_used = used.iter().any(|(name, _)| name == "y");
+        assert!(!y_used, "'y' inside binary formula should NOT be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (RHS of formula)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside binary formula should NOT be collected as usage");
+        
+        // 'z' should NOT be collected as a usage (RHS of formula)
+        let z_used = used.iter().any(|(name, _)| name == "z");
+        assert!(!z_used, "'z' inside binary formula should NOT be collected as usage");
+    }
+
+    /// Test that lm(y ~ x, data = df) does not produce diagnostics for 'y', 'x'
+    /// Validates: Requirement 3.4 - Formulas nested inside call arguments should have both contexts apply
+    #[test]
+    fn test_formula_inside_call_arguments_skipped() {
+        let code = "lm(y ~ x, data = df)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'lm' should be collected as a usage (function name is checked)
+        let lm_used = used.iter().any(|(name, _)| name == "lm");
+        assert!(lm_used, "Function name 'lm' should be collected as usage");
+        
+        // 'y' should NOT be collected as a usage (inside formula inside call arguments)
+        let y_used = used.iter().any(|(name, _)| name == "y");
+        assert!(!y_used, "'y' inside formula in call arguments should NOT be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside formula inside call arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside formula in call arguments should NOT be collected as usage");
+        
+        // 'df' should NOT be collected as a usage (inside call arguments)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(!df_used, "'df' inside call arguments should NOT be collected as usage");
+    }
+
+    // ==================== Edge Case Tests (Task 6.4) ====================
+    // These tests verify edge cases for the NSE skip logic
+    // (Requirements 1.1, 1.2, 2.1, 3.1)
+
+    /// Test deeply nested formulas: ~ (~ (~ x)) - all identifiers should be skipped
+    /// Validates: Requirement 3.1 - Identifiers inside formula expressions should be skipped
+    #[test]
+    fn test_deeply_nested_formulas() {
+        let code = "~ (~ (~ x))";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'x' should NOT be collected as a usage (inside deeply nested formula)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside deeply nested formula should NOT be collected as usage");
+        
+        // No identifiers should be collected at all
+        assert!(used.is_empty(), "No identifiers should be collected from deeply nested formula");
+    }
+
+    /// Test nested call arguments: f(g(h(x))) - all identifiers in all argument levels should be skipped
+    /// Validates: Requirement 2.1 - Identifiers inside call arguments should be skipped
+    #[test]
+    fn test_nested_call_arguments() {
+        let code = "f(g(h(x)))";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'f' should be collected as a usage (outermost function name is checked)
+        let f_used = used.iter().any(|(name, _)| name == "f");
+        assert!(f_used, "Function name 'f' should be collected as usage");
+        
+        // 'g' should NOT be collected as a usage (inside f's arguments)
+        let g_used = used.iter().any(|(name, _)| name == "g");
+        assert!(!g_used, "'g' inside call arguments should NOT be collected as usage");
+        
+        // 'h' should NOT be collected as a usage (inside g's arguments, which is inside f's arguments)
+        let h_used = used.iter().any(|(name, _)| name == "h");
+        assert!(!h_used, "'h' inside nested call arguments should NOT be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside h's arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside deeply nested call arguments should NOT be collected as usage");
+        
+        // Only 'f' should be collected
+        assert_eq!(used.len(), 1, "Only the outermost function name should be collected");
+    }
+
+    /// Test mixed contexts: df$col[x > 5] - 'col' skipped (extract RHS), 'x' skipped (subset arguments), 'df' checked
+    /// Validates: Requirements 1.1, 1.2, 2.1 - Extract RHS and subset arguments should be skipped
+    #[test]
+    fn test_mixed_contexts() {
+        let code = "df$col[x > 5]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'df' should be collected as a usage (LHS of extract operator is checked)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(df_used, "'df' (LHS of extract operator) should be collected as usage");
+        
+        // 'col' should NOT be collected as a usage (RHS of extract operator)
+        let col_used = used.iter().any(|(name, _)| name == "col");
+        assert!(!col_used, "'col' (RHS of extract operator) should NOT be collected as usage");
+        
+        // 'x' should NOT be collected as a usage (inside subset arguments)
+        let x_used = used.iter().any(|(name, _)| name == "x");
+        assert!(!x_used, "'x' inside subset arguments should NOT be collected as usage");
+        
+        // Only 'df' should be collected
+        assert_eq!(used.len(), 1, "Only 'df' should be collected in mixed context");
+    }
+
+    /// Test chained extracts: df$a$b$c - only 'df' should be checked, all others are RHS of extract operators
+    /// Validates: Requirements 1.1, 1.2 - RHS of extract operators should be skipped
+    #[test]
+    fn test_chained_extracts() {
+        let code = "df$a$b$c";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        
+        // 'df' should be collected as a usage (leftmost identifier is checked)
+        let df_used = used.iter().any(|(name, _)| name == "df");
+        assert!(df_used, "'df' (leftmost identifier) should be collected as usage");
+        
+        // 'a' should NOT be collected as a usage (RHS of first extract operator)
+        let a_used = used.iter().any(|(name, _)| name == "a");
+        assert!(!a_used, "'a' (RHS of extract operator) should NOT be collected as usage");
+        
+        // 'b' should NOT be collected as a usage (RHS of second extract operator)
+        let b_used = used.iter().any(|(name, _)| name == "b");
+        assert!(!b_used, "'b' (RHS of extract operator) should NOT be collected as usage");
+        
+        // 'c' should NOT be collected as a usage (RHS of third extract operator)
+        let c_used = used.iter().any(|(name, _)| name == "c");
+        assert!(!c_used, "'c' (RHS of extract operator) should NOT be collected as usage");
+        
+        // Only 'df' should be collected
+        assert_eq!(used.len(), 1, "Only 'df' should be collected in chained extracts");
+    }
 }
 
 #[cfg(test)]
@@ -3189,6 +3626,171 @@ mod proptests {
                 prop_assert_eq!(&symbol.source_uri, &uri, "Should select definition from same file");
                 prop_assert_eq!(symbol.defined_line, 2, "Should select the definition that's in scope at reference position");
             }
+        }
+
+        // ========================================================================
+        // Feature: skip-nse-undefined-checks
+        // Property-based tests for NSE context skipping in undefined variable checks
+        // ========================================================================
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 1: Extract Operator RHS Skipped
+        /// For any R code containing an extract operator ($ or @), the identifier on the
+        /// right-hand side SHALL NOT be collected as a usage.
+        fn prop_skip_nse_extract_operator_rhs_skipped(
+            lhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            rhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["$", "@"])
+        ) {
+            let code = format!("{}{}{}", lhs, op, rhs);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let rhs_used = used.iter().any(|(name, _)| name == &rhs);
+            prop_assert!(!rhs_used, "RHS '{}' of extract operator should NOT be collected", rhs);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 2: Extract Operator LHS Checked
+        /// For any R code containing an extract operator ($ or @), the identifier on the
+        /// left-hand side SHALL be collected as a usage.
+        fn prop_skip_nse_extract_operator_lhs_checked(
+            lhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            rhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["$", "@"])
+        ) {
+            let code = format!("{}{}{}", lhs, op, rhs);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let lhs_used = used.iter().any(|(name, _)| name == &lhs);
+            prop_assert!(lhs_used, "LHS '{}' of extract operator should be collected", lhs);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 3: Call-Like Arguments Skipped
+        /// For any R code containing a call-like node (call, subset, subset2), identifiers
+        /// inside the arguments field SHALL NOT be collected as usages.
+        fn prop_skip_nse_call_like_arguments_skipped(
+            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            arg in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            call_type in prop::sample::select(vec!["call", "subset", "subset2"])
+        ) {
+            let code = match call_type {
+                "call" => format!("{}({})", func, arg),
+                "subset" => format!("{}[{}]", func, arg),
+                "subset2" => format!("{}[[{}]]", func, arg),
+                _ => unreachable!(),
+            };
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let arg_used = used.iter().any(|(name, _)| name == &arg);
+            prop_assert!(!arg_used, "Argument '{}' inside {} should NOT be collected", arg, call_type);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 4: Function Names Checked
+        /// For any R code containing a function call, the function name SHALL be collected
+        /// as a usage.
+        fn prop_skip_nse_function_names_checked(
+            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            arg in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!("{}({})", func, arg);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let func_used = used.iter().any(|(name, _)| name == &func);
+            prop_assert!(func_used, "Function name '{}' should be collected", func);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 5: Formula Expressions Skipped
+        /// For any R code containing a formula expression (unary ~ or binary ~), identifiers
+        /// inside the formula SHALL NOT be collected as usages.
+        fn prop_skip_nse_formula_expressions_skipped(
+            var in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            formula_type in prop::sample::select(vec!["unary", "binary"])
+        ) {
+            let code = match formula_type {
+                "unary" => format!("~ {}", var),
+                "binary" => format!("y ~ {}", var),
+                _ => unreachable!(),
+            };
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let var_used = used.iter().any(|(name, _)| name == &var);
+            prop_assert!(!var_used, "Variable '{}' inside {} formula should NOT be collected", var, formula_type);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 6: Nested Skip Contexts
+        /// For any R code where a formula appears inside call arguments, identifiers in the
+        /// formula SHALL NOT be collected (both skip contexts apply).
+        fn prop_skip_nse_nested_formula_in_call(
+            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            lhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            rhs in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!("{}({} ~ {})", func, lhs, rhs);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let lhs_used = used.iter().any(|(name, _)| name == &lhs);
+            let rhs_used = used.iter().any(|(name, _)| name == &rhs);
+            prop_assert!(!lhs_used, "Formula LHS '{}' inside call should NOT be collected", lhs);
+            prop_assert!(!rhs_used, "Formula RHS '{}' inside call should NOT be collected", rhs);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 7: Existing Skip Rules Preserved
+        /// For any R code containing assignments or named arguments, the existing skip rules
+        /// SHALL continue to work (assignment LHS and named argument names are skipped).
+        fn prop_skip_nse_existing_rules_preserved(
+            var in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["<-", "=", "<<-"]),
+            arg_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Test assignment LHS
+            let assign_code = format!("{} {} 42", var, op);
+            let tree = parse_r_code(&assign_code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &assign_code, &UsageContext::default(), &mut used);
+            let var_used = used.iter().any(|(name, _)| name == &var);
+            prop_assert!(!var_used, "Assignment LHS '{}' with '{}' should NOT be collected", var, op);
+
+            // Test named argument
+            let named_arg_code = format!("func({} = 1)", arg_name);
+            let tree2 = parse_r_code(&named_arg_code);
+            let mut used2 = Vec::new();
+            collect_usages_with_context(tree2.root_node(), &named_arg_code, &UsageContext::default(), &mut used2);
+            let arg_used = used2.iter().any(|(name, _)| name == &arg_name);
+            prop_assert!(!arg_used, "Named argument '{}' should NOT be collected", arg_name);
+        }
+
+        #[test]
+        /// Feature: skip-nse-undefined-checks, Property 8: Non-Skipped Contexts Checked
+        /// For any R code containing an identifier NOT in a skip context, the identifier
+        /// SHALL be collected as a usage.
+        fn prop_skip_nse_non_skipped_contexts_checked(
+            var in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Standalone identifier (not in any skip context)
+            let code = var.clone();
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let var_used = used.iter().any(|(name, _)| name == &var);
+            prop_assert!(var_used, "Standalone identifier '{}' should be collected", var);
         }
     }
 }
