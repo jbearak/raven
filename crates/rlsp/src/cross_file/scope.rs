@@ -164,8 +164,11 @@ pub fn scope_at_position_with_deps<F>(
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
 {
+    log::trace!("Resolving scope at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
-    scope_at_position_recursive(uri, line, column, get_artifacts, resolve_path, max_depth, 0, &mut visited)
+    let scope = scope_at_position_recursive(uri, line, column, get_artifacts, resolve_path, max_depth, 0, &mut visited);
+    log::trace!("Found {} symbols in scope", scope.symbols.len());
+    scope
 }
 
 fn scope_at_position_recursive<F>(
@@ -181,6 +184,7 @@ fn scope_at_position_recursive<F>(
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
 {
+    log::trace!("Traversing to file: {} (depth {})", uri, current_depth);
     let mut scope = ScopeAtPosition::default();
 
     if current_depth >= max_depth || visited.contains(uri) {
@@ -191,7 +195,10 @@ where
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
-        None => return scope,
+        None => {
+            log::trace!("No artifacts found for {}", uri);
+            return scope;
+        }
     };
 
     // Process timeline events up to the requested position
@@ -200,7 +207,13 @@ where
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
-                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| symbol.clone());
+                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| {
+                        log::trace!("  Found symbol: {} ({})", symbol.name, match symbol.kind {
+                            SymbolKind::Function => "function",
+                            SymbolKind::Variable => "variable",
+                        });
+                        symbol.clone()
+                    });
                 }
             }
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
@@ -236,6 +249,7 @@ where
         }
     }
 
+    log::trace!("File {} contributed {} symbols", uri, scope.symbols.len());
     scope
 }
 
@@ -438,11 +452,14 @@ where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
+    log::trace!("Resolving scope with backward directives at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
-    scope_at_position_with_backward_recursive(
+    let scope = scope_at_position_with_backward_recursive(
         uri, line, column, get_artifacts, get_metadata, resolve_path,
         max_depth, 0, &mut visited, parent_call_site,
-    )
+    );
+    log::trace!("Found {} symbols in scope (with backward directives)", scope.symbols.len());
+    scope
 }
 
 /// Extended scope resolution that also uses dependency graph edges.
@@ -461,6 +478,7 @@ where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
+    log::trace!("Resolving scope with dependency graph at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
     
     // Build initial PathContext for the root file
@@ -469,10 +487,12 @@ where
         .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
         .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
     
-    scope_at_position_with_graph_recursive(
+    let scope = scope_at_position_with_graph_recursive(
         uri, line, column, get_artifacts, get_metadata, graph, workspace_root,
         path_ctx, max_depth, 0, &mut visited,
-    )
+    );
+    log::trace!("Found {} symbols in scope (with dependency graph)", scope.symbols.len());
+    scope
 }
 
 fn scope_at_position_with_graph_recursive<F, G>(
@@ -492,6 +512,7 @@ where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
+    log::trace!("Traversing to file: {} (depth {})", uri, current_depth);
     let mut scope = ScopeAtPosition::default();
 
     if current_depth >= max_depth || visited.contains(uri) {
@@ -502,7 +523,10 @@ where
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
-        None => return scope,
+        None => {
+            log::trace!("No artifacts found for {}", uri);
+            return scope;
+        }
     };
 
     // STEP 1: Process parent context from dependency graph edges
@@ -572,7 +596,14 @@ where
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence over inherited symbols
+                    let is_new = !scope.symbols.contains_key(&symbol.name);
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    if is_new {
+                        log::trace!("  Found symbol: {} ({})", symbol.name, match symbol.kind {
+                            SymbolKind::Function => "function",
+                            SymbolKind::Variable => "variable",
+                        });
+                    }
                 }
             }
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
@@ -640,6 +671,7 @@ where
         }
     }
 
+    log::trace!("File {} contributed {} total symbols", uri, scope.symbols.len());
     scope
 }
 
@@ -659,6 +691,7 @@ where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
+    log::trace!("Traversing to file: {} (depth {}, with backward directives)", uri, current_depth);
     let mut scope = ScopeAtPosition::default();
 
     if current_depth >= max_depth || visited.contains(uri) {
@@ -669,7 +702,10 @@ where
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
-        None => return scope,
+        None => {
+            log::trace!("No artifacts found for {}", uri);
+            return scope;
+        }
     };
 
     // STEP 1: Process backward directives FIRST (parent context)
@@ -727,7 +763,14 @@ where
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence over inherited symbols
+                    let is_new = !scope.symbols.contains_key(&symbol.name);
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    if is_new {
+                        log::trace!("  Found symbol: {} ({})", symbol.name, match symbol.kind {
+                            SymbolKind::Function => "function",
+                            SymbolKind::Variable => "variable",
+                        });
+                    }
                 }
             }
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
@@ -765,6 +808,7 @@ where
         }
     }
 
+    log::trace!("File {} contributed {} total symbols", uri, scope.symbols.len());
     scope
 }
 

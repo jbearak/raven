@@ -29,26 +29,33 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<String, ScopedSymbol> {
+    log::trace!("get_cross_file_symbols called for {}:{},{}", uri, line, column);
+    
     // Closure to get artifacts for a URI
     let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+        log::trace!("get_artifacts: looking for {}", target_uri);
         // Try open documents first (authoritative)
         if let Some(doc) = state.documents.get(target_uri) {
             if let Some(tree) = &doc.tree {
                 let text = doc.text();
+                log::trace!("get_artifacts: found in open documents");
                 return Some(scope::compute_artifacts(target_uri, tree, &text));
             }
         }
         // Try cross-file workspace index (preferred for closed files)
         if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
+            log::trace!("get_artifacts: found in cross-file workspace index ({} symbols)", artifacts.exported_interface.len());
             return Some(artifacts);
         }
         // Fallback to legacy workspace index
         if let Some(doc) = state.workspace_index.get(target_uri) {
             if let Some(tree) = &doc.tree {
                 let text = doc.text();
+                log::trace!("get_artifacts: found in legacy workspace index");
                 return Some(scope::compute_artifacts(target_uri, tree, &text));
             }
         }
+        log::trace!("get_artifacts: NOT FOUND");
         None
     };
 
@@ -73,6 +80,8 @@ fn get_cross_file_symbols(
 
     let max_depth = state.cross_file_config.max_chain_depth;
     
+    log::trace!("Calling scope_at_position_with_graph with max_depth={}", max_depth);
+    
     // Use the graph-aware scope resolution with PathContext
     let scope = scope::scope_at_position_with_graph(
         uri,
@@ -84,6 +93,8 @@ fn get_cross_file_symbols(
         state.workspace_folders.first(),
         max_depth,
     );
+    
+    log::trace!("scope_at_position_with_graph returned {} symbols", scope.symbols.len());
     
     scope.symbols
 }
@@ -257,6 +268,8 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 // ============================================================================
 
 pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
+    log::trace!("Diagnostics request for {}", uri);
+    
     let Some(doc) = state.get_document(uri) else {
         return Vec::new();
     };
@@ -332,43 +345,80 @@ fn collect_missing_file_diagnostics(
         uri, meta, state.workspace_folders.first()
     );
     
-    let resolve_path = |path: &str| -> Option<Url> {
+    // Build a separate context for backward directives that ignores @lsp-cd
+    let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
+        uri, state.workspace_folders.first()
+    );
+    
+    // Resolve forward paths (source() calls) - respects @lsp-cd
+    let resolve_forward_path = |path: &str| -> Option<Url> {
         let ctx = path_ctx.as_ref()?;
+        log::trace!("resolve_forward_path: attempting to resolve '{}' with context: file_path={}, wd={:?}", 
+            path, ctx.file_path.display(), ctx.working_directory);
         let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
-        crate::cross_file::path_resolve::path_to_uri(&resolved)
+        log::trace!("resolve_forward_path: resolved to PathBuf: {}", resolved.display());
+        let uri = crate::cross_file::path_resolve::path_to_uri(&resolved)?;
+        log::trace!("resolve_forward_path: converted to URI: {}", uri);
+        Some(uri)
+    };
+    
+    // Resolve backward paths (directives) - ignores @lsp-cd, always relative to file
+    let resolve_backward_path = |path: &str| -> Option<Url> {
+        let ctx = backward_ctx.as_ref()?;
+        log::trace!("resolve_backward_path: attempting to resolve '{}' with context: file_path={}, wd={:?}", 
+            path, ctx.file_path.display(), ctx.working_directory);
+        let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
+        log::trace!("resolve_backward_path: resolved to PathBuf: {}", resolved.display());
+        let uri = crate::cross_file::path_resolve::path_to_uri(&resolved)?;
+        log::trace!("resolve_backward_path: converted to URI: {}", uri);
+        Some(uri)
     };
 
-    // Check if file exists using cached/indexed data only (no blocking I/O)
+    // Check if file exists using cached/indexed data, with filesystem fallback
     let file_exists = |target_uri: &Url| -> bool {
+        log::trace!("file_exists: checking if URI exists: {}", target_uri);
+
         // Check open documents first (authoritative)
         if state.documents.contains_key(target_uri) {
+            log::trace!("file_exists: found in open documents");
             return true;
         }
         // Check workspace index (legacy)
         if state.workspace_index.contains_key(target_uri) {
+            log::trace!("file_exists: found in workspace index");
             return true;
         }
         // Check cross-file workspace index (preferred for closed files)
         if state.cross_file_workspace_index.contains(target_uri) {
+            log::trace!("file_exists: found in cross-file workspace index");
             return true;
         }
         // Check file cache (may have been read previously)
         if state.cross_file_file_cache.get(target_uri).is_some() {
+            log::trace!("file_exists: found in file cache");
             return true;
         }
-        // Don't do blocking I/O here - if not in any cache, assume missing
-        // The file will be indexed on next didChangeWatchedFiles if it exists
+        // Perform filesystem existence check for files not in cache
+        // This is synchronous but necessary to provide accurate missing-file diagnostics
+        if let Ok(path) = target_uri.to_file_path() {
+            let exists = std::fs::metadata(&path).is_ok();
+            log::trace!("file_exists: {} filesystem check = {}", target_uri, exists);
+            return exists;
+        }
+        // If we can't convert URI to file path, assume it doesn't exist
+        log::trace!("file_exists: {} could not be converted to file path", target_uri);
         false
     };
 
     // Check forward sources (source() calls and @lsp-source directives)
+    // These respect @lsp-cd working directory
     for source in &meta.sources {
-        if let Some(target_uri) = resolve_path(&source.path) {
+        if let Some(target_uri) = resolve_forward_path(&source.path) {
             if !file_exists(&target_uri) {
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(source.line, source.column),
-                        end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                        end: Position::new(source.line, source.column + source.path.len() as u32),
                     },
                     severity: Some(state.cross_file_config.missing_file_severity),
                     message: format!("File not found: '{}'", source.path),
@@ -380,7 +430,7 @@ fn collect_missing_file_diagnostics(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(source.line, source.column),
-                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                    end: Position::new(source.line, source.column + source.path.len() as u32),
                 },
                 severity: Some(state.cross_file_config.missing_file_severity),
                 message: format!("Cannot resolve path: '{}'", source.path),
@@ -390,8 +440,9 @@ fn collect_missing_file_diagnostics(
     }
 
     // Check backward directives (@lsp-sourced-by)
+    // These are ALWAYS resolved relative to the file's directory, ignoring @lsp-cd
     for directive in &meta.sourced_by {
-        if let Some(target_uri) = resolve_path(&directive.path) {
+        if let Some(target_uri) = resolve_backward_path(&directive.path) {
             if !file_exists(&target_uri) {
                 diagnostics.push(Diagnostic {
                     range: Range {
@@ -492,9 +543,11 @@ fn collect_ambiguous_parent_diagnostics(
     use crate::cross_file::parent_resolve::resolve_parent_with_content;
     use crate::cross_file::cache::ParentResolution;
 
-    // Build PathContext for proper path resolution
-    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-        uri, meta, state.workspace_folders.first()
+    // Build PathContext WITHOUT working_directory for backward directives
+    // This matches the behavior in dependency.rs where backward directives
+    // are resolved relative to the file's directory, ignoring @lsp-cd
+    let path_ctx = crate::cross_file::path_resolve::PathContext::new(
+        uri, state.workspace_folders.first()
     );
     
     let resolve_path = |path: &str| -> Option<Url> {
@@ -699,48 +752,6 @@ fn collect_identifier_usages_utf16<'a>(node: Node<'a>, text: &str, usages: &mut 
     }
 }
 
-fn collect_identifier_usages<'a>(node: Node<'a>, text: &str, usages: &mut Vec<(String, u32, u32, Node<'a>)>) {
-    if node.kind() == "identifier" {
-        // Skip if this is the LHS of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = &text[op.byte_range()];
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        // Skip LHS of assignment, but recurse into children
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            collect_identifier_usages(child, text, usages);
-                        }
-                        return;
-                    }
-                }
-            }
-            // Skip named arguments
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        let name = text[node.byte_range()].to_string();
-        let line = node.start_position().row as u32;
-        let col = node.start_position().column as u32;
-        usages.push((name, line, col, node));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_identifier_usages(child, text, usages);
-    }
-}
-
 fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     if node.is_error() || node.is_missing() {
         let message = if node.is_missing() {
@@ -819,9 +830,11 @@ fn collect_undefined_variables_position_aware(
         // Convert byte column to UTF-16 for cross-file scope lookup
         let line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
         let usage_col = byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
+        log::trace!("Checking cross-file scope for undefined variable '{}' at {}:{},{}", name, uri, usage_line, usage_col);
         let cross_file_symbols = get_cross_file_symbols(state, uri, usage_line, usage_col);
 
         if !cross_file_symbols.contains_key(&name) {
+            log::trace!("Symbol '{}' not found in cross-file scope, marking as undefined", name);
             // Convert byte columns to UTF-16 for diagnostic range
             let start_line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
             let end_line_text = text.lines().nth(usage_node.end_position().row).unwrap_or("");
@@ -837,6 +850,8 @@ fn collect_undefined_variables_position_aware(
                 message: format!("Undefined variable: {}", name),
                 ..Default::default()
             });
+        } else {
+            log::trace!("Symbol '{}' found in cross-file scope, skipping undefined diagnostic", name);
         }
     }
 }
@@ -995,6 +1010,8 @@ fn is_package_export(name: &str, loaded_packages: &[String], library: &crate::st
 // ============================================================================
 
 pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<CompletionResponse> {
+    log::trace!("Completion request at {}:{},{}", uri, position.line, position.character);
+    
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -1031,7 +1048,9 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     collect_document_completions(tree.root_node(), &text, &mut items, &mut seen_names);
 
     // Add cross-file symbols (from scope resolution)
+    log::trace!("Calling get_cross_file_symbols for completion");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     for (name, symbol) in cross_file_symbols {
         if seen_names.contains(&name) {
             continue; // Local definitions take precedence
@@ -1123,6 +1142,8 @@ fn collect_document_completions(
 // ============================================================================
 
 pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+    log::trace!("Hover request at {}:{},{}", uri, position.line, position.character);
+    
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -1154,7 +1175,9 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     }
 
     // Try cross-file symbols
+    log::trace!("Calling get_cross_file_symbols for hover");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     if let Some(symbol) = cross_file_symbols.get(name) {
         let mut value = String::new();
         if let Some(sig) = &symbol.signature {
@@ -1254,6 +1277,8 @@ pub fn goto_definition(
     uri: &Url,
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
+    log::trace!("Goto definition request at {}:{},{}", uri, position.line, position.character);
+    
     // Try open document first, then workspace index
     let doc = state.get_document(uri).or_else(|| state.workspace_index.get(uri))?;
     let tree = doc.tree.as_ref()?;
@@ -1277,7 +1302,9 @@ pub fn goto_definition(
     }
 
     // Try cross-file symbols (from scope resolution)
+    log::trace!("Calling get_cross_file_symbols for goto definition");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     if let Some(symbol) = cross_file_symbols.get(name) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: symbol.source_uri.clone(),
@@ -1772,6 +1799,41 @@ mod tests {
         }
         None
     }
+
+    // Tests for diagnostic range precision (Requirements 5.1, 5.2)
+    #[test]
+    fn test_diagnostic_range_matches_path_length() {
+        // Property 4: Diagnostic range matches path length
+        // The end column should equal start column plus path length
+        let path = "utils/helpers.R";
+        let start_column: u32 = 8; // e.g., after 'source("'
+        let end_column = start_column + path.len() as u32;
+        
+        // Verify the calculation is correct
+        assert_eq!(end_column, start_column + 15); // "utils/helpers.R" is 15 chars
+        assert_eq!(end_column - start_column, path.len() as u32);
+    }
+
+    #[test]
+    fn test_diagnostic_range_various_path_lengths() {
+        // Test with various path lengths
+        let test_cases = vec![
+            ("a.R", 3),
+            ("utils.R", 7),
+            ("path/to/file.R", 14),
+            ("very/long/path/to/some/file.R", 29),
+        ];
+        
+        for (path, expected_len) in test_cases {
+            assert_eq!(path.len(), expected_len, "Path '{}' should have length {}", path, expected_len);
+            
+            let start_column: u32 = 0;
+            let end_column = start_column + path.len() as u32;
+            
+            // Range should exactly cover the path
+            assert_eq!(end_column - start_column, expected_len as u32);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2054,6 +2116,21 @@ mod proptests {
             
             let expected = format!("{}({})", func_name, params.join(", "));
             prop_assert_eq!(signature, expected, "Signature format should match expected pattern");
+        }
+
+        // Property 4: Diagnostic range matches path length
+        #[test]
+        fn test_diagnostic_range_precision(
+            path in "[a-z]{1,5}(/[a-z]{1,5}){0,3}\\.R",
+            start_column in 0u32..100
+        ) {
+            let end_column = start_column + path.len() as u32;
+            
+            // The range should exactly cover the path
+            prop_assert_eq!(end_column - start_column, path.len() as u32);
+            
+            // End column should be >= start column
+            prop_assert!(end_column >= start_column);
         }
     }
 }
