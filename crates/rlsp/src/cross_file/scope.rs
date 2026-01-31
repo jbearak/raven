@@ -59,6 +59,14 @@ pub enum ScopeEvent {
         column: u32,
         source: ForwardSource,
     },
+    /// A function definition that introduces parameter scope
+    FunctionScope {
+        start_line: u32,
+        start_column: u32,
+        end_line: u32,
+        end_column: u32,
+        parameters: Vec<ScopedSymbol>,
+    },
 }
 
 /// Per-file scope artifacts
@@ -117,6 +125,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts.timeline.sort_by_key(|event| match event {
         ScopeEvent::Def { line, column, .. } => (*line, *column),
         ScopeEvent::Source { line, column, .. } => (*line, *column),
+        ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
     });
 
     // Compute interface hash
@@ -133,17 +142,61 @@ pub fn scope_at_position(
 ) -> ScopeAtPosition {
     let mut scope = ScopeAtPosition::default();
 
-    // Include symbols defined before the given position
+    // First pass: collect all function scopes that contain the query position
+    let mut active_function_scopes = Vec::new();
+    for event in &artifacts.timeline {
+        if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
+            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
+            }
+        }
+    }
+
+    // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 // Include if definition is before or at the position
                 if (*def_line, *def_col) <= (line, column) {
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    // Check if this definition is inside any function scope
+                    let def_function_scope = artifacts.timeline.iter()
+                        .filter_map(|e| {
+                            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
+                                if (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column) {
+                                    Some((*start_line, *start_column, *end_line, *end_column))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .next();
+                    
+                    match def_function_scope {
+                        None => {
+                            // Global definition - always include
+                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                        }
+                        Some(def_scope) => {
+                            // Function-local definition - only include if we're inside the same function
+                            if active_function_scopes.contains(&def_scope) {
+                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                            }
+                        }
+                    }
                 }
             }
             ScopeEvent::Source { .. } => {
                 // Source events are handled by scope_at_position_with_deps
+            }
+            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+                // Include function parameters if position is within function body
+                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                    for param in parameters {
+                        scope.symbols.insert(param.name.clone(), param.clone());
+                    }
+                }
             }
         }
     }
@@ -233,6 +286,14 @@ where
                     }
                 }
             }
+            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+                // Include function parameters if position is within function body
+                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                    for param in parameters {
+                        scope.symbols.entry(param.name.clone()).or_insert_with(|| param.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -284,10 +345,116 @@ fn collect_definitions(
         }
     }
 
+    // Check for function definitions to extract parameter scope
+    if node.kind() == "function_definition" {
+        if let Some(function_scope) = try_extract_function_scope(node, content, uri) {
+            artifacts.timeline.push(function_scope);
+        }
+    }
+
     // Recurse into children
     for child in node.children(&mut node.walk()) {
         collect_definitions(child, content, uri, artifacts);
     }
+}
+
+/// Extract function parameter scope from function_definition nodes.
+/// Creates ScopedSymbol for each parameter and determines function body boundaries.
+fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<ScopeEvent> {
+    // Get the parameters node
+    let params_node = node.child_by_field_name("parameters")?;
+    
+    // Get the body node to determine boundaries
+    let body_node = node.child_by_field_name("body")?;
+    
+    // Extract parameters
+    let mut parameters = Vec::new();
+    for child in params_node.children(&mut params_node.walk()) {
+        if child.kind() == "parameter" {
+            if let Some(param_symbol) = extract_parameter_symbol(child, content, uri) {
+                parameters.push(param_symbol);
+            }
+        }
+    }
+    
+    // Determine function body boundaries
+    let body_start = body_node.start_position();
+    let body_end = body_node.end_position();
+    
+    // Convert to UTF-16 columns
+    let start_line_text = content.lines().nth(body_start.row).unwrap_or("");
+    let end_line_text = content.lines().nth(body_end.row).unwrap_or("");
+    let start_column = byte_offset_to_utf16_column(start_line_text, body_start.column);
+    let end_column = byte_offset_to_utf16_column(end_line_text, body_end.column);
+    
+    Some(ScopeEvent::FunctionScope {
+        start_line: body_start.row as u32,
+        start_column,
+        end_line: body_end.row as u32,
+        end_column,
+        parameters,
+    })
+}
+
+/// Extract a parameter symbol from a parameter node
+fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+    // Handle different parameter types
+    match param_node.kind() {
+        "parameter" => {
+            // Look for identifier child
+            for child in param_node.children(&mut param_node.walk()) {
+                if child.kind() == "identifier" {
+                    let name = node_text(child, content).to_string();
+                    let start = child.start_position();
+                    let line_text = content.lines().nth(start.row).unwrap_or("");
+                    let column = byte_offset_to_utf16_column(line_text, start.column);
+                    
+                    return Some(ScopedSymbol {
+                        name,
+                        kind: SymbolKind::Variable,
+                        source_uri: uri.clone(),
+                        defined_line: start.row as u32,
+                        defined_column: column,
+                        signature: None,
+                    });
+                }
+            }
+        }
+        "identifier" => {
+            // Direct identifier (for ellipsis or simple params)
+            let name = node_text(param_node, content).to_string();
+            let start = param_node.start_position();
+            let line_text = content.lines().nth(start.row).unwrap_or("");
+            let column = byte_offset_to_utf16_column(line_text, start.column);
+            
+            return Some(ScopedSymbol {
+                name,
+                kind: SymbolKind::Variable,
+                source_uri: uri.clone(),
+                defined_line: start.row as u32,
+                defined_column: column,
+                signature: None,
+            });
+        }
+        "dots" => {
+            // Handle ellipsis (...) parameter
+            let start = param_node.start_position();
+            let line_text = content.lines().nth(start.row).unwrap_or("");
+            let column = byte_offset_to_utf16_column(line_text, start.column);
+            
+            return Some(ScopedSymbol {
+                name: "...".to_string(),
+                kind: SymbolKind::Variable,
+                source_uri: uri.clone(),
+                defined_line: start.row as u32,
+                defined_column: column,
+                signature: None,
+            });
+        }
+        _ => {}
+    }
+    
+    None
 }
 
 /// Extract definition from assign("name", value) calls.
@@ -608,12 +775,48 @@ where
     }
 
     // STEP 2: Process timeline events (local definitions and forward sources)
+    // First pass: collect all function scopes that contain the query position
+    let mut active_function_scopes = Vec::new();
+    for event in &artifacts.timeline {
+        if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
+            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
+            }
+        }
+    }
+    
+    // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
-                    // Local definitions take precedence over inherited symbols
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    // Check if this definition is inside any function scope
+                    let def_function_scope = artifacts.timeline.iter()
+                        .filter_map(|e| {
+                            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
+                                if (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column) {
+                                    Some((*start_line, *start_column, *end_line, *end_column))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .next();
+                    
+                    match def_function_scope {
+                        None => {
+                            // Global definition - always include (local definitions take precedence over inherited symbols)
+                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                        }
+                        Some(def_scope) => {
+                            // Function-local definition - only include if we're inside the same function
+                            if active_function_scopes.contains(&def_scope) {
+                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                            }
+                        }
+                    }
                 }
             }
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
@@ -675,6 +878,14 @@ where
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
+                    }
+                }
+            }
+            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+                // Include function parameters if position is within function body
+                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                    for param in parameters {
+                        scope.symbols.insert(param.name.clone(), param.clone());
                     }
                 }
             }
@@ -763,12 +974,48 @@ where
     }
 
     // STEP 2: Process timeline events (local definitions and forward sources)
+    // First pass: collect all function scopes that contain the query position
+    let mut active_function_scopes = Vec::new();
+    for event in &artifacts.timeline {
+        if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
+            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
+            }
+        }
+    }
+    
+    // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
-                    // Local definitions take precedence over inherited symbols
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    // Check if this definition is inside any function scope
+                    let def_function_scope = artifacts.timeline.iter()
+                        .filter_map(|e| {
+                            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
+                                if (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column) {
+                                    Some((*start_line, *start_column, *end_line, *end_column))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .next();
+                    
+                    match def_function_scope {
+                        None => {
+                            // Global definition - local definitions take precedence over inherited symbols
+                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                        }
+                        Some(def_scope) => {
+                            // Function-local definition - only include if we're inside the same function
+                            if active_function_scopes.contains(&def_scope) {
+                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                            }
+                        }
+                    }
                 }
             }
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
@@ -800,6 +1047,14 @@ where
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
+                    }
+                }
+            }
+            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+                // Include function parameters if position is within function body
+                if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                    for param in parameters {
+                        scope.symbols.insert(param.name.clone(), param.clone());
                     }
                 }
             }
@@ -1507,5 +1762,184 @@ mod tests {
         );
 
         assert!(scope.symbols.contains_key("helper_func"), "helper_func should be available via working directory directive");
+    }
+
+    #[test]
+    fn test_function_parameters_available_inside_function() {
+        let code = "my_func <- function(x, y) { x + y }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Inside function body, parameters should be available
+        let scope_inside = scope_at_position(&artifacts, 0, 30); // Position within function body
+        assert!(scope_inside.symbols.contains_key("x"), "Parameter x should be available inside function");
+        assert!(scope_inside.symbols.contains_key("y"), "Parameter y should be available inside function");
+        assert!(scope_inside.symbols.contains_key("my_func"), "Function name should be available inside function");
+    }
+
+    #[test]
+    fn test_function_parameters_not_available_outside_function() {
+        let code = "my_func <- function(x, y) { x + y }\nresult <- 42";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Outside function, parameters should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 1, 10); // Position on second line
+        assert!(scope_outside.symbols.contains_key("my_func"), "Function name should be available outside function");
+        assert!(scope_outside.symbols.contains_key("result"), "Global variable should be available outside function");
+        assert!(!scope_outside.symbols.contains_key("x"), "Parameter x should NOT be available outside function");
+        assert!(!scope_outside.symbols.contains_key("y"), "Parameter y should NOT be available outside function");
+    }
+
+    #[test]
+    fn test_function_local_variables_not_available_outside() {
+        let code = "my_func <- function() { local_var <- 42; local_var }\nglobal_var <- 100";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Outside function, local variable should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_outside.symbols.contains_key("my_func"), "Function name should be available outside function");
+        assert!(scope_outside.symbols.contains_key("global_var"), "Global variable should be available outside function");
+        assert!(!scope_outside.symbols.contains_key("local_var"), "Function-local variable should NOT be available outside function");
+
+        // Inside function, local variable SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        assert!(scope_inside.symbols.contains_key("my_func"), "Function name should be available inside function");
+        assert!(scope_inside.symbols.contains_key("local_var"), "Function-local variable should be available inside function");
+        assert!(!scope_inside.symbols.contains_key("global_var"), "Global variable defined after function should NOT be available inside function");
+    }
+
+    #[test]
+    fn test_nested_functions_separate_scopes() {
+        let code = "outer <- function() { outer_var <- 1; inner <- function() { inner_var <- 2 } }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Outside all functions
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        assert!(scope_outside.symbols.contains_key("outer"), "Outer function should be available outside");
+        assert!(!scope_outside.symbols.contains_key("inner"), "Inner function should NOT be available outside outer function");
+        assert!(!scope_outside.symbols.contains_key("outer_var"), "Outer function variable should NOT be available outside");
+        assert!(!scope_outside.symbols.contains_key("inner_var"), "Inner function variable should NOT be available outside");
+
+        // Inside outer function but outside inner function
+        let scope_outer = scope_at_position(&artifacts, 0, 35);
+        assert!(scope_outer.symbols.contains_key("outer"), "Outer function should be available inside itself");
+        assert!(scope_outer.symbols.contains_key("outer_var"), "Outer function variable should be available inside outer function");
+        assert!(scope_outer.symbols.contains_key("inner"), "Inner function should be available inside outer function");
+        assert!(!scope_outer.symbols.contains_key("inner_var"), "Inner function variable should NOT be available outside inner function");
+
+        // Inside inner function
+        let scope_inner = scope_at_position(&artifacts, 0, 75);
+        assert!(scope_inner.symbols.contains_key("outer"), "Outer function should be available inside inner function");
+        assert!(scope_inner.symbols.contains_key("outer_var"), "Outer function variable should be available inside inner function");
+        assert!(scope_inner.symbols.contains_key("inner"), "Inner function should be available inside itself");
+        assert!(scope_inner.symbols.contains_key("inner_var"), "Inner function variable should be available inside inner function");
+    }
+
+    #[test]
+    fn test_function_scope_boundaries_with_multiple_functions() {
+        let code = "func1 <- function(a) { var1 <- a }\nfunc2 <- function(b) { var2 <- b }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Inside first function
+        let scope_func1 = scope_at_position(&artifacts, 0, 25);
+        assert!(scope_func1.symbols.contains_key("func1"), "Function 1 should be available inside itself");
+        assert!(scope_func1.symbols.contains_key("a"), "Parameter a should be available inside function 1");
+        assert!(scope_func1.symbols.contains_key("var1"), "Variable 1 should be available inside function 1");
+        assert!(!scope_func1.symbols.contains_key("func2"), "Function 2 should NOT be available inside function 1 (defined later)");
+        assert!(!scope_func1.symbols.contains_key("b"), "Parameter b should NOT be available inside function 1");
+        assert!(!scope_func1.symbols.contains_key("var2"), "Variable 2 should NOT be available inside function 1");
+
+        // Inside second function
+        let scope_func2 = scope_at_position(&artifacts, 1, 25);
+        assert!(scope_func2.symbols.contains_key("func1"), "Function 1 should be available inside function 2");
+        assert!(scope_func2.symbols.contains_key("func2"), "Function 2 should be available inside itself");
+        assert!(scope_func2.symbols.contains_key("b"), "Parameter b should be available inside function 2");
+        assert!(scope_func2.symbols.contains_key("var2"), "Variable 2 should be available inside function 2");
+        assert!(!scope_func2.symbols.contains_key("a"), "Parameter a should NOT be available inside function 2");
+        assert!(!scope_func2.symbols.contains_key("var1"), "Variable 1 should NOT be available inside function 2");
+
+        // Outside both functions
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        assert!(scope_outside.symbols.contains_key("func1"), "Function 1 should be available outside");
+        assert!(scope_outside.symbols.contains_key("func2"), "Function 2 should be available outside");
+        assert!(!scope_outside.symbols.contains_key("a"), "Parameter a should NOT be available outside");
+        assert!(!scope_outside.symbols.contains_key("b"), "Parameter b should NOT be available outside");
+        assert!(!scope_outside.symbols.contains_key("var1"), "Variable 1 should NOT be available outside");
+        assert!(!scope_outside.symbols.contains_key("var2"), "Variable 2 should NOT be available outside");
+    }
+
+    #[test]
+    fn test_function_with_default_parameter_values() {
+        let code = "my_func <- function(x = 1, y = 2) { x * y }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have FunctionScope event with parameters
+        let function_scope_event = artifacts.timeline.iter().find(|event| {
+            matches!(event, ScopeEvent::FunctionScope { .. })
+        });
+        assert!(function_scope_event.is_some());
+
+        if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
+            assert_eq!(parameters.len(), 2);
+            let param_names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+            assert!(param_names.contains(&"x"));
+            assert!(param_names.contains(&"y"));
+        }
+
+        // Parameters should be available within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 40);
+        assert!(scope_in_body.symbols.contains_key("x"));
+        assert!(scope_in_body.symbols.contains_key("y"));
+    }
+
+    #[test]
+    fn test_function_with_ellipsis_parameter() {
+        let code = "my_func <- function(x, ...) { list(x, ...) }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have FunctionScope event with parameters including ellipsis
+        let function_scope_event = artifacts.timeline.iter().find(|event| {
+            matches!(event, ScopeEvent::FunctionScope { .. })
+        });
+        assert!(function_scope_event.is_some());
+
+        if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
+            assert_eq!(parameters.len(), 2);
+            let param_names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+            assert!(param_names.contains(&"x"));
+            assert!(param_names.contains(&"..."));
+        }
+
+        // Parameters should be available within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 40);
+        assert!(scope_in_body.symbols.contains_key("x"));
+        assert!(scope_in_body.symbols.contains_key("..."));
+    }
+
+    #[test]
+    fn test_function_with_no_parameters() {
+        let code = "my_func <- function() { 42 }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have FunctionScope event with empty parameters
+        let function_scope_event = artifacts.timeline.iter().find(|event| {
+            matches!(event, ScopeEvent::FunctionScope { .. })
+        });
+        assert!(function_scope_event.is_some());
+
+        if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
+            assert_eq!(parameters.len(), 0);
+        }
+
+        // Function name should still be available within body
+        let scope_in_body = scope_at_position(&artifacts, 0, 25);
+        assert!(scope_in_body.symbols.contains_key("my_func"));
     }
 }

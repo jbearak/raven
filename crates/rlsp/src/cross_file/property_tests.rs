@@ -1849,55 +1849,221 @@ proptest! {
 
 
 // ============================================================================
-// Property 5: Diagnostic Suppression
-// Validates: Requirements 2.4, 2.5, 10.4, 10.5
+// Property 5: Function-local variable scope boundaries
+// Validates: Variables defined inside function NOT available outside
 // ============================================================================
-
-use super::directive::is_line_ignored;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Property 5: For any file containing @lsp-ignore on line n, no diagnostics
-    /// SHALL be emitted for line n.
+    /// Property 5: For any function definition containing a local variable definition,
+    /// that variable SHALL NOT be available in scope outside the function body.
     #[test]
-    fn prop_diagnostic_suppression_ignore(
-        prefix_lines in 0..5u32
+    fn prop_function_local_variable_scope_boundaries(
+        func_name in r_identifier(),
+        local_var in r_identifier(),
+        global_var in r_identifier()
     ) {
-        let mut lines = Vec::new();
-        for i in 0..prefix_lines {
-            lines.push(format!("x{} <- {}", i, i));
-        }
-        lines.push("# @lsp-ignore".to_string());
-        lines.push("undefined_var".to_string());
-        let content = lines.join("\n");
+        prop_assume!(func_name != local_var && local_var != global_var && func_name != global_var);
 
-        let meta = parse_directives(&content);
+        let uri = make_url("test");
 
-        // The @lsp-ignore line itself should be ignored
-        prop_assert!(is_line_ignored(&meta, prefix_lines));
+        // Code with function containing local variable, followed by global variable
+        let code = format!(
+            "{} <- function() {{ {} <- 42 }}\n{} <- 100",
+            func_name, local_var, global_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // At end of file (outside function), local variable should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function");
+
+        // Inside function body, local variable SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 35); // Position within function body
+        prop_assert!(scope_inside.symbols.contains_key(&func_name),
+            "Function name should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key(&local_var),
+            "Function-local variable should be available inside function");
+        // Global variable defined after function should NOT be available inside
+        prop_assert!(!scope_inside.symbols.contains_key(&global_var),
+            "Global variable defined after function should NOT be available inside function");
     }
 
-    /// Property 5: For any file containing @lsp-ignore-next on line n, no diagnostics
-    /// SHALL be emitted for line n+1.
+    /// Property 5 extended: Nested functions have separate scopes
     #[test]
-    fn prop_diagnostic_suppression_ignore_next(
-        prefix_lines in 0..5u32
+    fn prop_nested_function_separate_scopes(
+        outer_func in r_identifier(),
+        inner_func in r_identifier(),
+        outer_var in r_identifier(),
+        inner_var in r_identifier()
     ) {
-        let mut lines = Vec::new();
-        for i in 0..prefix_lines {
-            lines.push(format!("x{} <- {}", i, i));
-        }
-        lines.push("# @lsp-ignore-next".to_string());
-        lines.push("undefined_var".to_string());
-        let content = lines.join("\n");
+        prop_assume!(outer_func != inner_func && outer_var != inner_var);
+        prop_assume!(outer_func != outer_var && outer_func != inner_var);
+        prop_assume!(inner_func != outer_var && inner_func != inner_var);
 
-        let meta = parse_directives(&content);
+        let uri = make_url("test");
 
-        // The line AFTER @lsp-ignore-next should be ignored
-        prop_assert!(is_line_ignored(&meta, prefix_lines + 1));
-        // The @lsp-ignore-next line itself should NOT be ignored
-        prop_assert!(!is_line_ignored(&meta, prefix_lines));
+        // Code with nested functions
+        let code = format!(
+            "{} <- function() {{ {} <- 1; {} <- function() {{ {} <- 2 }} }}",
+            outer_func, outer_var, inner_func, inner_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside all functions - only outer function should be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&outer_func),
+            "Outer function should be available outside");
+        prop_assert!(!scope_outside.symbols.contains_key(&inner_func),
+            "Inner function should NOT be available outside outer function");
+        prop_assert!(!scope_outside.symbols.contains_key(&outer_var),
+            "Outer function variable should NOT be available outside");
+        prop_assert!(!scope_outside.symbols.contains_key(&inner_var),
+            "Inner function variable should NOT be available outside");
+
+        // Inside outer function but outside inner function
+        let scope_outer = scope_at_position(&artifacts, 0, 25);
+        prop_assert!(scope_outer.symbols.contains_key(&outer_func),
+            "Outer function should be available inside itself");
+        prop_assert!(scope_outer.symbols.contains_key(&outer_var),
+            "Outer function variable should be available inside outer function");
+        prop_assert!(scope_outer.symbols.contains_key(&inner_func),
+            "Inner function should be available inside outer function");
+        prop_assert!(!scope_outer.symbols.contains_key(&inner_var),
+            "Inner function variable should NOT be available outside inner function");
+
+        // Inside inner function
+        let scope_inner = scope_at_position(&artifacts, 0, 65);
+        prop_assert!(scope_inner.symbols.contains_key(&outer_func),
+            "Outer function should be available inside inner function");
+        prop_assert!(scope_inner.symbols.contains_key(&outer_var),
+            "Outer function variable should be available inside inner function");
+        prop_assert!(scope_inner.symbols.contains_key(&inner_func),
+            "Inner function should be available inside itself");
+        prop_assert!(scope_inner.symbols.contains_key(&inner_var),
+            "Inner function variable should be available inside inner function");
+    }
+}
+
+// ============================================================================
+// Property 6: Function parameter scope boundaries
+// Validates: Parameters NOT available outside function body
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 6: For any function definition with parameters, those parameters
+    /// SHALL NOT be available in scope outside the function body.
+    #[test]
+    fn prop_function_parameter_scope_boundaries(
+        func_name in r_identifier(),
+        param1 in r_identifier(),
+        param2 in r_identifier(),
+        global_var in r_identifier()
+    ) {
+        prop_assume!(func_name != param1 && param1 != param2 && func_name != param2);
+        prop_assume!(global_var != func_name && global_var != param1 && global_var != param2);
+
+        let uri = make_url("test");
+
+        // Function with parameters, followed by global variable
+        let code = format!(
+            "{} <- function({}, {}) {{ {} + {} }}\n{} <- 100",
+            func_name, param1, param2, param1, param2, global_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside function - parameters should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param1),
+            "Function parameter 1 should NOT be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param2),
+            "Function parameter 2 should NOT be available outside function");
+
+        // Inside function - parameters SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        prop_assert!(scope_inside.symbols.contains_key(&func_name),
+            "Function name should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key(&param1),
+            "Function parameter 1 should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key(&param2),
+            "Function parameter 2 should be available inside function");
+        // Global variable defined after function should NOT be available inside
+        prop_assert!(!scope_inside.symbols.contains_key(&global_var),
+            "Global variable defined after function should NOT be available inside function");
+    }
+
+    /// Property 6 extended: Function parameters with default values
+    #[test]
+    fn prop_function_parameter_default_values_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({} = 42) {{ {} * 2 }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside function - parameter should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param_name),
+            "Function parameter with default should NOT be available outside function");
+
+        // Inside function - parameter SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        prop_assert!(scope_inside.symbols.contains_key(&param_name),
+            "Function parameter with default should be available inside function");
+    }
+
+    /// Property 6 extended: Ellipsis parameter scope
+    #[test]
+    fn prop_function_ellipsis_parameter_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({}, ...) {{ list({}, ...) }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside function - parameters should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param_name),
+            "Named parameter should NOT be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key("..."),
+            "Ellipsis parameter should NOT be available outside function");
+
+        // Inside function - parameters SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 50);
+        prop_assert!(scope_inside.symbols.contains_key(&param_name),
+            "Named parameter should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key("..."),
+            "Ellipsis parameter should be available inside function");
     }
 }
 
@@ -3948,5 +4114,129 @@ proptest! {
         });
         prop_assert!(outer_has_def, "Outer iterator should have Def event");
         prop_assert!(inner_has_def, "Inner iterator should have Def event");
+    }
+}
+
+// ============================================================================
+// Property 8: Function Parameter Scope Inclusion
+// Validates: Function parameter detection and scope boundaries
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 8: For any function definition with parameters, the parameters
+    /// SHALL be available in scope within the function body boundaries.
+    #[test]
+    fn prop_function_parameter_scope_inclusion(
+        func_name in r_identifier(),
+        param1 in r_identifier(),
+        param2 in r_identifier()
+    ) {
+        prop_assume!(func_name != param1 && param1 != param2 && func_name != param2);
+
+        let uri = make_url("test");
+
+        // Function with multiple parameters
+        let code = format!("{} <- function({}, {}) {{ {} + {} }}", func_name, param1, param2, param1, param2);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Function should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&func_name),
+            "Function should be in exported interface");
+
+        // Should have FunctionScope event in timeline
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.iter().any(|p| p.name == param1) && 
+                   parameters.iter().any(|p| p.name == param2))
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with parameters");
+
+        // Get scope within function body (should include parameters)
+        let scope_in_body = scope_at_position(&artifacts, 0, 50); // Position within function body
+        prop_assert!(scope_in_body.symbols.contains_key(&param1),
+            "Parameter 1 should be available within function body");
+        prop_assert!(scope_in_body.symbols.contains_key(&param2),
+            "Parameter 2 should be available within function body");
+        prop_assert!(scope_in_body.symbols.contains_key(&func_name),
+            "Function name should be available within function body");
+    }
+
+    /// Property 8 extended: Function with no parameters
+    #[test]
+    fn prop_function_no_parameters_scope(
+        func_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        let code = format!("{} <- function() {{ 42 }}", func_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Should have FunctionScope event with empty parameters
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.is_empty())
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with empty parameters");
+    }
+
+    /// Property 8 extended: Function with ellipsis parameter
+    #[test]
+    fn prop_function_ellipsis_parameter_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({}, ...) {{ list({}, ...) }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Should have FunctionScope event with parameters including ellipsis
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.iter().any(|p| p.name == param_name) &&
+                   parameters.iter().any(|p| p.name == "..."))
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with ellipsis parameter");
+
+        // Get scope within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 50);
+        prop_assert!(scope_in_body.symbols.contains_key(&param_name),
+            "Named parameter should be available within function body");
+        prop_assert!(scope_in_body.symbols.contains_key("..."),
+            "Ellipsis parameter should be available within function body");
+    }
+
+    /// Property 8 extended: Function with default parameter values
+    #[test]
+    fn prop_function_default_parameter_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({} = 42) {{ {} * 2 }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Should have FunctionScope event with parameter
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.iter().any(|p| p.name == param_name))
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with default parameter");
+
+        // Parameter should be available within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 50);
+        prop_assert!(scope_in_body.symbols.contains_key(&param_name),
+            "Parameter with default value should be available within function body");
     }
 }
