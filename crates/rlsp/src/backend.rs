@@ -563,8 +563,8 @@ impl LanguageServer for Backend {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
                 }
                 
-                // Freshness guard before computing
-                let diagnostics_opt = {
+                // Extract data for async diagnostics while holding lock briefly
+                let diagnostics_data = {
                     let state = state_arc.read().await;
                     
                     let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
@@ -582,34 +582,52 @@ impl LanguageServer for Backend {
                         }
                     }
                     
-                    Some(handlers::diagnostics(&state, &affected_uri))
+                    let sync_diagnostics = handlers::diagnostics(&state, &affected_uri);
+                    let directive_meta = state.documents.get(&affected_uri)
+                        .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+                        .unwrap_or_default();
+                    let workspace_folder = state.workspace_folders.first().cloned();
+                    let missing_file_severity = state.cross_file_config.missing_file_severity;
+                    
+                    Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity))
                 };
                 
-                if let Some(diagnostics) = diagnostics_opt {
-                    // Second freshness check before publishing
-                    let can_publish = {
-                        let state = state_arc.read().await;
-                        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
-                        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
-                        
-                        if current_version != trigger_version || current_revision != trigger_revision {
-                            false
-                        } else if let Some(ver) = current_version {
-                            state.diagnostics_gate.can_publish(&affected_uri, ver)
-                        } else {
-                            true
-                        }
-                    };
+                let Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) = diagnostics_data else {
+                    return;
+                };
+                
+                // Perform async missing file existence checks (non-blocking I/O)
+                let diagnostics = handlers::diagnostics_async_standalone(
+                    &affected_uri,
+                    sync_diagnostics,
+                    &directive_meta,
+                    workspace_folder.as_ref(),
+                    missing_file_severity,
+                ).await;
+                
+                // Second freshness check before publishing
+                let can_publish = {
+                    let state = state_arc.read().await;
+                    let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
                     
-                    if can_publish {
-                        client.publish_diagnostics(affected_uri.clone(), diagnostics, None).await;
-                        
-                        let state = state_arc.read().await;
-                        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
-                            state.diagnostics_gate.record_publish(&affected_uri, ver);
-                        }
-                        state.cross_file_revalidation.complete(&affected_uri);
+                    if current_version != trigger_version || current_revision != trigger_revision {
+                        false
+                    } else if let Some(ver) = current_version {
+                        state.diagnostics_gate.can_publish(&affected_uri, ver)
+                    } else {
+                        true
                     }
+                };
+                
+                if can_publish {
+                    client.publish_diagnostics(affected_uri.clone(), diagnostics, None).await;
+                    
+                    let state = state_arc.read().await;
+                    if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
+                        state.diagnostics_gate.record_publish(&affected_uri, ver);
+                    }
+                    state.cross_file_revalidation.complete(&affected_uri);
                 }
             });
         }
@@ -739,8 +757,8 @@ impl LanguageServer for Backend {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
                 }
                 
-                // 3) Freshness guard before computing (Requirement 0.6)
-                let diagnostics_opt = {
+                // 3) Extract data for async diagnostics while holding lock briefly (Requirement 0.6)
+                let diagnostics_data = {
                     let state = state_arc.read().await;
                     
                     let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
@@ -760,41 +778,59 @@ impl LanguageServer for Backend {
                         }
                     }
                     
-                    Some(handlers::diagnostics(&state, &affected_uri))
+                    let sync_diagnostics = handlers::diagnostics(&state, &affected_uri);
+                    let directive_meta = state.documents.get(&affected_uri)
+                        .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+                        .unwrap_or_default();
+                    let workspace_folder = state.workspace_folders.first().cloned();
+                    let missing_file_severity = state.cross_file_config.missing_file_severity;
+                    
+                    Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity))
                 };
                 
-                if let Some(diagnostics) = diagnostics_opt {
-                    // 4) Second freshness check before publishing
-                    let can_publish = {
-                        let state = state_arc.read().await;
-                        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
-                        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
-                        
-                        if current_version != trigger_version || current_revision != trigger_revision {
-                            log::trace!("Skipping stale diagnostics publish for {}: revision changed during computation", affected_uri);
+                let Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) = diagnostics_data else {
+                    return;
+                };
+                
+                // Perform async missing file existence checks (non-blocking I/O)
+                let diagnostics = handlers::diagnostics_async_standalone(
+                    &affected_uri,
+                    sync_diagnostics,
+                    &directive_meta,
+                    workspace_folder.as_ref(),
+                    missing_file_severity,
+                ).await;
+                
+                // 4) Second freshness check before publishing
+                let can_publish = {
+                    let state = state_arc.read().await;
+                    let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    
+                    if current_version != trigger_version || current_revision != trigger_revision {
+                        log::trace!("Skipping stale diagnostics publish for {}: revision changed during computation", affected_uri);
+                        false
+                    } else if let Some(ver) = current_version {
+                        if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
+                            log::trace!("Skipping diagnostics for {}: monotonic gate (pre-publish)", affected_uri);
                             false
-                        } else if let Some(ver) = current_version {
-                            if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
-                                log::trace!("Skipping diagnostics for {}: monotonic gate (pre-publish)", affected_uri);
-                                false
-                            } else {
-                                true
-                            }
                         } else {
                             true
                         }
-                    };
-                    
-                    if can_publish {
-                        client.publish_diagnostics(affected_uri.clone(), diagnostics, None).await;
-                        
-                        // Record successful publish
-                        let state = state_arc.read().await;
-                        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
-                            state.diagnostics_gate.record_publish(&affected_uri, ver);
-                        }
-                        state.cross_file_revalidation.complete(&affected_uri);
+                    } else {
+                        true
                     }
+                };
+                
+                if can_publish {
+                    client.publish_diagnostics(affected_uri.clone(), diagnostics, None).await;
+                    
+                    // Record successful publish
+                    let state = state_arc.read().await;
+                    if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
+                        state.diagnostics_gate.record_publish(&affected_uri, ver);
+                    }
+                    state.cross_file_revalidation.complete(&affected_uri);
                 }
             });
         }
@@ -1306,27 +1342,52 @@ impl Backend {
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
-        let state = self.state.read().await;
-        let version = state.documents.get(uri).and_then(|d| d.version);
-        
-        // Check if we can publish (monotonic gate)
-        if let Some(ver) = version {
-            if !state.diagnostics_gate.can_publish(uri, ver) {
-                log::trace!("Skipping diagnostics for {}: monotonic gate (version={})", uri, ver);
-                return;
-            } else {
-                log::trace!("Publishing diagnostics for {}: monotonic gate allows (version={})", uri, ver);
+        // Extract needed data while holding read lock briefly
+        let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
+            let state = self.state.read().await;
+            let version = state.documents.get(uri).and_then(|d| d.version);
+            
+            // Check if we can publish (monotonic gate)
+            if let Some(ver) = version {
+                if !state.diagnostics_gate.can_publish(uri, ver) {
+                    log::trace!("Skipping diagnostics for {}: monotonic gate (version={})", uri, ver);
+                    return;
+                } else {
+                    log::trace!("Publishing diagnostics for {}: monotonic gate allows (version={})", uri, ver);
+                }
             }
-        }
+            
+            // Get sync diagnostics (uses cached-only existence checks)
+            let sync_diagnostics = handlers::diagnostics(&state, uri);
+            
+            // Extract metadata for async missing file checks
+            let directive_meta = state.documents.get(uri)
+                .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+                .unwrap_or_default();
+            
+            let workspace_folder = state.workspace_folders.first().cloned();
+            let missing_file_severity = state.cross_file_config.missing_file_severity;
+            
+            (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)
+        };
+        // Lock released here
         
-        let diagnostics = handlers::diagnostics(&state, uri);
+        // Perform async missing file existence checks (non-blocking I/O)
+        let diagnostics = handlers::diagnostics_async_standalone(
+            uri,
+            sync_diagnostics,
+            &directive_meta,
+            workspace_folder.as_ref(),
+            missing_file_severity,
+        ).await;
         
         // Record the publish (uses interior mutability, no write lock needed)
-        if let Some(ver) = version {
-            state.diagnostics_gate.record_publish(uri, ver);
+        {
+            let state = self.state.read().await;
+            if let Some(ver) = version {
+                state.diagnostics_gate.record_publish(uri, ver);
+            }
         }
-        
-        drop(state);
         
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
     }
