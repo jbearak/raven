@@ -550,13 +550,14 @@ impl LanguageServer for Backend {
                 let workspace_root = state.workspace_folders.first().cloned();
                 
                 // Pre-collect content for potential parent files to avoid borrow conflicts
-                // Use PathContext for proper path resolution
-                let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-                    &uri_clone, &meta, workspace_root.as_ref()
+                // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                // Backward directives should always be resolved relative to the file's directory
+                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                    &uri_clone, workspace_root.as_ref()
                 );
                 let parent_content: std::collections::HashMap<Url, String> = meta.sourced_by.iter()
                     .filter_map(|d| {
-                        let ctx = path_ctx.as_ref()?;
+                        let ctx = backward_path_ctx.as_ref()?;
                         let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
                         let parent_uri = Url::from_file_path(resolved).ok()?;
                         let content = state.documents.get(&parent_uri)
@@ -904,13 +905,14 @@ impl LanguageServer for Backend {
                         let workspace_root = state.workspace_folders.first().cloned();
                         
                         // Pre-collect content for potential parent files to avoid borrow conflicts
-                        // Use PathContext for proper path resolution
-                        let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-                            &uri_clone, &cross_file_meta, workspace_root.as_ref()
+                        // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                        // Backward directives should always be resolved relative to the file's directory
+                        let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                            &uri_clone, workspace_root.as_ref()
                         );
                         let parent_content: std::collections::HashMap<Url, String> = cross_file_meta.sourced_by.iter()
                             .filter_map(|d| {
-                                let ctx = path_ctx.as_ref()?;
+                                let ctx = backward_path_ctx.as_ref()?;
                                 let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
                                 let parent_uri = Url::from_file_path(resolved).ok()?;
                                 let content = state.documents.get(&parent_uri)
