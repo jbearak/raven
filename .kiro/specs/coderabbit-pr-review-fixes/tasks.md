@@ -116,7 +116,6 @@ This implementation plan addresses the CodeRabbit PR review feedback for PR #2. 
 
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for faster MVP
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation
 - Property tests validate universal correctness properties
