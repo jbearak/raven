@@ -2553,8 +2553,12 @@ mod tests {
         use super::super::types::ForwardSource;
 
         let mut events = vec![
-            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] 
- function_scope: None,},
+            ScopeEvent::Removal {
+                line: 2,
+                column: 0,
+                symbols: vec!["x".to_string()],
+                function_scope: None,
+            },
             ScopeEvent::Source {
                 line: 1,
                 column: 0,
@@ -2569,8 +2573,12 @@ mod tests {
                     sys_source_global_env: true,
                 },
             },
-            ScopeEvent::Removal { line: 4, column: 0, symbols: vec!["y".to_string()] 
- function_scope: None,},
+            ScopeEvent::Removal {
+                line: 4,
+                column: 0,
+                symbols: vec!["y".to_string()],
+                function_scope: None,
+            },
         ];
 
         events.sort_by_key(|event| match event {
@@ -2597,8 +2605,12 @@ mod tests {
 
         let uri = test_uri();
         let mut events = vec![
-            ScopeEvent::Removal { line: 5, column: 0, symbols: vec!["z".to_string()] 
- function_scope: None,},
+            ScopeEvent::Removal {
+                line: 5,
+                column: 0,
+                symbols: vec!["z".to_string()],
+                function_scope: None,
+            },
             ScopeEvent::Def {
                 line: 1,
                 column: 0,
@@ -2632,8 +2644,12 @@ mod tests {
                 end_column: 1,
                 parameters: vec![],
             },
-            ScopeEvent::Removal { line: 9, column: 0, symbols: vec!["w".to_string()] 
- function_scope: None,},
+            ScopeEvent::Removal {
+                line: 9,
+                column: 0,
+                symbols: vec!["w".to_string()],
+                function_scope: None,
+            },
         ];
 
         events.sort_by_key(|event| match event {
@@ -2670,8 +2686,12 @@ mod tests {
         // (This is an edge case - in practice they would be at different positions)
         let uri = test_uri();
         let mut events = vec![
-            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] 
- function_scope: None,},
+            ScopeEvent::Removal {
+                line: 2,
+                column: 0,
+                symbols: vec!["x".to_string()],
+                function_scope: None,
+            },
             ScopeEvent::Def {
                 line: 2,
                 column: 0,
@@ -2720,10 +2740,8 @@ mod tests {
 
         match (original, cloned) {
             (
-                ScopeEvent::Removal { line: l1, column: c1, symbols: s1 
- function_scope: None,},
-                ScopeEvent::Removal { line: l2, column: c2, symbols: s2 
- function_scope: None,},
+                ScopeEvent::Removal { line: l1, column: c1, symbols: s1, .. },
+                ScopeEvent::Removal { line: l2, column: c2, symbols: s2, .. },
             ) => {
                 assert_eq!(l1, l2);
                 assert_eq!(c1, c2);
@@ -3400,8 +3418,8 @@ mod tests {
     fn test_scope_removal_at_exact_position() {
         // Test scope at the exact position of the rm() call
         // Validates: Requirements 7.3, 7.4
-        // Note: The scope resolution uses <= comparison, so at the exact position
-        // of the rm() call, the removal is already processed.
+        // Note: The scope resolution uses strict-before comparison, so at the exact position
+        // of the rm() call, the removal is not yet processed.
         let code = "x <- 1\nrm(x)";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
@@ -3411,11 +3429,11 @@ mod tests {
         assert!(scope_before_rm_line.symbols.contains_key("x"), 
             "x should be in scope on line 0 (before rm line)");
 
-        // At position (1, 0) - at the start of rm(x) line, the removal is processed
-        // because scope resolution uses <= comparison
+        // At position (1, 0) - at the start of rm(x) line, the removal is not processed
+        // because scope resolution uses strict-before comparison
         let scope_at_rm_start = scope_at_position(&artifacts, 1, 0);
-        assert!(!scope_at_rm_start.symbols.contains_key("x"), 
-            "x should NOT be in scope at rm() position (removal is processed at <=)");
+        assert!(scope_at_rm_start.symbols.contains_key("x"),
+            "x should be in scope at rm() position (removal is processed strictly before)");
 
         // At position (1, 5) - after rm(x), x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 5);
