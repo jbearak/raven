@@ -953,6 +953,9 @@ impl Default for UsageContext {
     }
 }
 
+/// Legacy version of collect_usages without NSE context tracking.
+/// Only used in tests for backward compatibility with existing property tests.
+#[cfg(test)]
 fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'a>)>) {
     if node.kind() == "identifier" {
         // Skip if this is the LHS of an assignment
