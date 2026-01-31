@@ -102,13 +102,33 @@ impl PathContext {
 /// Resolve a path string to an absolute path
 pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
+        log::trace!("Path resolution: empty path provided");
         return None;
     }
 
+    let base_dir = context.effective_working_directory();
+    let working_dir = context.working_directory.as_ref();
+    
+    log::trace!(
+        "Resolving path '{}' with base_dir='{}', working_dir={:?}, file_path='{}'",
+        path,
+        base_dir.display(),
+        working_dir.as_ref().map(|p| p.display().to_string()),
+        context.file_path.display()
+    );
+
     let resolved = if path.starts_with('/') {
         // Workspace-root-relative path
-        let workspace_root = context.workspace_root.as_ref()?;
-        workspace_root.join(&path[1..])
+        let workspace_root = context.workspace_root.as_ref();
+        if workspace_root.is_none() {
+            log::warn!(
+                "Failed to resolve workspace-root-relative path '{}': no workspace root available, base_dir='{}'",
+                path,
+                base_dir.display()
+            );
+            return None;
+        }
+        workspace_root.unwrap().join(&path[1..])
     } else {
         // File-relative or working-directory-relative path
         let base = context.effective_working_directory();
@@ -116,26 +136,78 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     };
 
     // Normalize the path (resolve .. and .)
-    normalize_path(&resolved)
+    match normalize_path(&resolved) {
+        Some(canonical) => {
+            log::trace!("Resolved path '{}' to canonical path: '{}'", path, canonical.display());
+            Some(canonical)
+        }
+        None => {
+            log::warn!(
+                "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
+                path,
+                resolved.display(),
+                base_dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Resolve a working directory path
 pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
+        log::trace!("Working directory resolution: empty path provided");
         return None;
     }
 
+    let file_dir = context.file_path.parent();
+    
+    log::trace!(
+        "Resolving working directory '{}' with file_path='{}', file_dir={:?}",
+        path,
+        context.file_path.display(),
+        file_dir.as_ref().map(|p| p.display().to_string())
+    );
+
     let resolved = if path.starts_with('/') {
         // Workspace-root-relative
-        let workspace_root = context.workspace_root.as_ref()?;
-        workspace_root.join(&path[1..])
+        let workspace_root = context.workspace_root.as_ref();
+        if workspace_root.is_none() {
+            log::warn!(
+                "Failed to resolve workspace-root-relative working directory '{}': no workspace root available",
+                path
+            );
+            return None;
+        }
+        workspace_root.unwrap().join(&path[1..])
     } else {
         // File-relative
-        let file_dir = context.file_path.parent()?;
-        file_dir.join(path)
+        let file_dir = context.file_path.parent();
+        if file_dir.is_none() {
+            log::warn!(
+                "Failed to resolve working directory '{}': file has no parent directory, file_path='{}'",
+                path,
+                context.file_path.display()
+            );
+            return None;
+        }
+        file_dir.unwrap().join(path)
     };
 
-    normalize_path(&resolved)
+    match normalize_path(&resolved) {
+        Some(canonical) => {
+            log::trace!("Resolved working directory '{}' to canonical path: '{}'", path, canonical.display());
+            Some(canonical)
+        }
+        None => {
+            log::warn!(
+                "Failed to resolve working directory '{}': normalization failed, attempted_path='{}'",
+                path,
+                resolved.display()
+            );
+            None
+        }
+    }
 }
 
 /// Normalize a path by resolving . and .. components

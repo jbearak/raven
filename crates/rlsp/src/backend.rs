@@ -87,6 +87,22 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
         }
     }
     
+    log::info!("Cross-file configuration loaded from LSP settings:");
+    log::info!("  max_backward_depth: {}", config.max_backward_depth);
+    log::info!("  max_forward_depth: {}", config.max_forward_depth);
+    log::info!("  max_chain_depth: {}", config.max_chain_depth);
+    log::info!("  assume_call_site: {:?}", config.assume_call_site);
+    log::info!("  index_workspace: {}", config.index_workspace);
+    log::info!("  max_revalidations_per_trigger: {}", config.max_revalidations_per_trigger);
+    log::info!("  revalidation_debounce_ms: {}", config.revalidation_debounce_ms);
+    log::info!("  undefined_variables_enabled: {}", config.undefined_variables_enabled);
+    log::info!("  Diagnostic severities:");
+    log::info!("    missing_file: {:?}", config.missing_file_severity);
+    log::info!("    circular_dependency: {:?}", config.circular_dependency_severity);
+    log::info!("    out_of_scope: {:?}", config.out_of_scope_severity);
+    log::info!("    ambiguous_parent: {:?}", config.ambiguous_parent_severity);
+    log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
+    
     Some(config)
 }
 
@@ -182,13 +198,17 @@ impl LanguageServer for Backend {
         };
         
         // Scan workspace without holding lock (Requirement 13a)
-        let (index, imports) = tokio::task::spawn_blocking(move || {
+        let (index, imports, cross_file_entries) = tokio::task::spawn_blocking(move || {
             scan_workspace(&folders)
         }).await.unwrap_or_default();
         
         // Apply results under brief write lock
-        let mut state = self.state.write().await;
-        state.apply_workspace_index(index, imports);
+        {
+            let mut state = self.state.write().await;
+            state.apply_workspace_index(index, imports, cross_file_entries);
+        }
+        
+        log::info!("Workspace initialization complete");
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -202,7 +222,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
 
         // Compute affected files while holding write lock
-        let (work_items, debounce_ms) = {
+        let (work_items, debounce_ms, files_to_index) = {
             let mut state = self.state.write().await;
             state.open_document(uri.clone(), &text, Some(version));
             // Record as recently opened for activity prioritization
@@ -213,15 +233,57 @@ impl LanguageServer for Backend {
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
             
-            // Pre-collect content for potential parent files to avoid borrow conflicts
-            // The content provider needs to access documents/cache while graph is mutably borrowed
-            // Use PathContext for proper path resolution
+            // On-demand indexing: Collect sourced files that need indexing
+            // Priority 1: Files directly sourced by this open document
+            let mut files_to_index = Vec::new();
             let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
                 &uri_clone, &meta, workspace_root.as_ref()
             );
+            
+            for source in &meta.sources {
+                if let Some(ctx) = path_ctx.as_ref() {
+                    if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&source.path, ctx) {
+                        if let Ok(source_uri) = Url::from_file_path(resolved) {
+                            // Check if file needs indexing (not open, not in workspace index)
+                            if !state.documents.contains_key(&source_uri) 
+                                && !state.cross_file_workspace_index.contains(&source_uri) {
+                                log::trace!("Scheduling on-demand indexing for sourced file: {}", source_uri);
+                                files_to_index.push((source_uri, 1)); // Priority 1
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Priority 2: Files referenced by backward directives
+            let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
+                &uri_clone, workspace_root.as_ref()
+            );
+            
+            for directive in &meta.sourced_by {
+                if let Some(ctx) = backward_ctx.as_ref() {
+                    if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx) {
+                        if let Ok(parent_uri) = Url::from_file_path(resolved) {
+                            if !state.documents.contains_key(&parent_uri) 
+                                && !state.cross_file_workspace_index.contains(&parent_uri) {
+                                log::trace!("Scheduling on-demand indexing for parent file: {}", parent_uri);
+                                files_to_index.push((parent_uri, 2)); // Priority 2
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Pre-collect content for potential parent files to avoid borrow conflicts
+            // The content provider needs to access documents/cache while graph is mutably borrowed
+            // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+            // Backward directives should always be resolved relative to the file's directory
+            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                &uri_clone, workspace_root.as_ref()
+            );
             let parent_content: std::collections::HashMap<Url, String> = meta.sourced_by.iter()
                 .filter_map(|d| {
-                    let ctx = path_ctx.as_ref()?;
+                    let ctx = backward_path_ctx.as_ref()?;
                     let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
                     let parent_uri = Url::from_file_path(resolved).ok()?;
                     let content = state.documents.get(&parent_uri)
@@ -286,8 +348,26 @@ impl LanguageServer for Backend {
                 .collect();
             
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (work_items, debounce_ms)
+            (work_items, debounce_ms, files_to_index)
         };
+        
+        // Perform SYNCHRONOUS on-demand indexing for Priority 1 files (directly sourced)
+        // This ensures symbols are available BEFORE diagnostics run
+        let priority_1_files: Vec<Url> = files_to_index.iter()
+            .filter(|(_, priority)| *priority == 1)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        
+        if !priority_1_files.is_empty() {
+            log::info!("Synchronously indexing {} directly sourced files before diagnostics", priority_1_files.len());
+            for file_uri in priority_1_files {
+                self.index_file_on_demand(&file_uri).await;
+            }
+        }
+        
+        // Priority 2+ files (backward directives, transitive) can be indexed in background
+        // For now, we skip these to keep the implementation simple
+        // They will be indexed by the background workspace scan or on next access
 
         // Schedule debounced diagnostics for all affected files via revalidation system
         for (affected_uri, trigger_version, trigger_revision) in work_items {
@@ -557,6 +637,11 @@ impl LanguageServer for Backend {
         
         // Parse new configuration if provided
         let new_config = parse_cross_file_config(&params.settings);
+        
+        // Log if configuration parsing failed and defaults will be used
+        if new_config.is_none() {
+            log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
+        }
         
         let (open_uris, scope_changed) = {
             let mut state = self.state.write().await;
@@ -858,6 +943,113 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    /// Synchronously index a file on-demand (blocking operation)
+    /// Returns true if indexing succeeded, false otherwise
+    async fn index_file_on_demand(&self, file_uri: &Url) -> bool {
+        log::trace!("On-demand indexing: {}", file_uri);
+        
+        // Read file content
+        let path = match file_uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => {
+                log::trace!("Failed to convert URI to path: {}", file_uri);
+                return false;
+            }
+        };
+        
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::trace!("Failed to read file {}: {}", file_uri, e);
+                return false;
+            }
+        };
+        
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => {
+                log::trace!("Failed to get metadata for: {}", file_uri);
+                return false;
+            }
+        };
+        
+        // Compute cross-file metadata and artifacts
+        let cross_file_meta = crate::cross_file::extract_metadata(&content);
+        let artifacts = {
+            let mut parser = tree_sitter::Parser::new();
+            if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
+                if let Some(tree) = parser.parse(&content, None) {
+                    crate::cross_file::scope::compute_artifacts(&file_uri, &tree, &content)
+                } else {
+                    crate::cross_file::scope::ScopeArtifacts::default()
+                }
+            } else {
+                crate::cross_file::scope::ScopeArtifacts::default()
+            }
+        };
+        
+        let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+            &metadata,
+            &content,
+        );
+        
+        // Cache content for future resolution
+        self.state.read().await.cross_file_file_cache.insert(
+            file_uri.clone(),
+            snapshot.clone(),
+            content.clone(),
+        );
+        
+        // Update workspace index
+        {
+            let state = self.state.read().await;
+            let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
+            state.cross_file_workspace_index.update_from_disk(
+                &file_uri,
+                &open_docs,
+                snapshot,
+                cross_file_meta.clone(),
+                artifacts.clone(),
+            );
+        }
+        
+        // Update dependency graph
+        {
+            let mut state = self.state.write().await;
+            let file_uri_clone = file_uri.clone();
+            let workspace_root = state.workspace_folders.first().cloned();
+            
+            // Pre-collect content for potential parent files
+            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                &file_uri_clone, workspace_root.as_ref()
+            );
+            let parent_content: std::collections::HashMap<Url, String> = cross_file_meta.sourced_by.iter()
+                .filter_map(|d| {
+                    let ctx = backward_path_ctx.as_ref()?;
+                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                    let parent_uri = Url::from_file_path(resolved).ok()?;
+                    let content = state.documents.get(&parent_uri)
+                        .map(|doc| doc.text())
+                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    Some((parent_uri, content))
+                })
+                .collect();
+            
+            state.cross_file_graph.update_file(
+                &file_uri,
+                &cross_file_meta,
+                workspace_root.as_ref(),
+                |parent_uri| parent_content.get(parent_uri).cloned(),
+            );
+        }
+        
+        log::info!("On-demand indexed: {} (exported {} symbols)", file_uri, 
+            self.state.read().await.cross_file_workspace_index.get_artifacts(&file_uri)
+                .map(|a| a.exported_interface.len()).unwrap_or(0));
+        
+        true
+    }
+
     async fn publish_diagnostics(&self, uri: &Url) {
         let state = self.state.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
@@ -865,8 +1057,10 @@ impl Backend {
         // Check if we can publish (monotonic gate)
         if let Some(ver) = version {
             if !state.diagnostics_gate.can_publish(uri, ver) {
-                log::trace!("Skipping diagnostics for {}: monotonic gate", uri);
+                log::trace!("Skipping diagnostics for {}: monotonic gate (version={})", uri, ver);
                 return;
+            } else {
+                log::trace!("Publishing diagnostics for {}: monotonic gate allows (version={})", uri, ver);
             }
         }
         

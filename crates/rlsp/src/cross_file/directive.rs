@@ -43,6 +43,7 @@ fn patterns() -> &'static DirectivePatterns {
 
 /// Parse directives from file content
 pub fn parse_directives(content: &str) -> CrossFileMetadata {
+    log::trace!("Starting directive parsing");
     let patterns = patterns();
     let mut meta = CrossFileMetadata::default();
 
@@ -61,6 +62,12 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             } else {
                 CallSiteSpec::Default
             };
+            log::trace!(
+                "  Parsed backward directive at line {}: path='{}' call_site={:?}",
+                line_num,
+                path,
+                call_site
+            );
             meta.sourced_by.push(BackwardDirective {
                 path,
                 call_site,
@@ -72,6 +79,11 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // Check forward directive
         if let Some(caps) = patterns.forward.captures(line) {
             let path = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            log::trace!(
+                "  Parsed forward directive at line {}: path='{}'",
+                line_num,
+                path
+            );
             meta.sources.push(ForwardSource {
                 path,
                 line: line_num,
@@ -88,20 +100,35 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // Check working directory directive
         if let Some(caps) = patterns.working_dir.captures(line) {
             let path = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            log::trace!(
+                "  Parsed working directory directive at line {}: path='{}'",
+                line_num,
+                path
+            );
             meta.working_directory = Some(path);
             continue;
         }
 
         // Check ignore directives
         if patterns.ignore.is_match(line) {
+            log::trace!("  Parsed @lsp-ignore directive at line {}", line_num);
             meta.ignored_lines.insert(line_num);
             continue;
         }
 
         if patterns.ignore_next.is_match(line) {
+            log::trace!("  Parsed @lsp-ignore-next directive at line {}", line_num);
             meta.ignored_next_lines.insert(line_num + 1);
         }
     }
+
+    log::trace!(
+        "Completed directive parsing: {} backward directives, {} forward directives, working_dir={:?}, {} ignored lines",
+        meta.sourced_by.len(),
+        meta.sources.len(),
+        meta.working_directory,
+        meta.ignored_lines.len() + meta.ignored_next_lines.len()
+    );
 
     meta
 }

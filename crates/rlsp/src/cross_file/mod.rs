@@ -7,6 +7,7 @@
 // Allow dead code for infrastructure that's implemented for future use
 #![allow(dead_code)]
 
+pub mod background_indexer;
 pub mod cache;
 pub mod config;
 pub mod content_provider;
@@ -24,6 +25,10 @@ pub mod workspace_index;
 #[cfg(test)]
 mod property_tests;
 
+#[cfg(test)]
+pub mod integration_tests;
+
+pub use background_indexer::*;
 pub use cache::*;
 pub use config::*;
 #[allow(unused_imports)]
@@ -48,6 +53,8 @@ use tree_sitter::Parser;
 /// Extract cross-file metadata from R source code (Requirement 0.1)
 /// Combines directive parsing with AST-detected source() calls
 pub fn extract_metadata(content: &str) -> CrossFileMetadata {
+    log::trace!("Extracting cross-file metadata from content ({} bytes)", content.len());
+    
     // Parse directives first
     let mut meta = directive::parse_directives(content);
     
@@ -71,8 +78,20 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
             
             // Sort by line number for consistent ordering
             meta.sources.sort_by_key(|s| (s.line, s.column));
+        } else {
+            log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
         }
+    } else {
+        log::error!("Failed to set tree-sitter language to R during metadata extraction");
     }
+    
+    log::trace!(
+        "Metadata extraction complete: {} total sources ({} from directives, {} from AST), {} backward directives",
+        meta.sources.len(),
+        meta.sources.iter().filter(|s| s.is_directive).count(),
+        meta.sources.iter().filter(|s| !s.is_directive).count(),
+        meta.sourced_by.len()
+    );
     
     meta
 }

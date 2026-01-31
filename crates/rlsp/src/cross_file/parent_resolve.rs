@@ -203,7 +203,8 @@ where
 
                     if has_reverse_edge {
                         // Will be handled by reverse edge processing below
-                        (None, None, 3)
+                        // Don't add a candidate here - let the reverse edge add it
+                        continue;
                     } else {
                         // Try text-inference: scan parent for source() call to child
                         if let Some(parent_content) = get_content(&parent_uri) {
@@ -269,7 +270,16 @@ where
     });
 
     let selected = candidates.remove(0);
-    if candidates.is_empty() {
+    
+    // Filter out alternatives that point to the same parent as selected
+    // This prevents false ambiguity when the same parent appears from multiple sources
+    let unique_alternatives: Vec<Url> = candidates
+        .into_iter()
+        .filter(|c| c.parent != selected.parent)
+        .map(|c| c.parent)
+        .collect();
+    
+    if unique_alternatives.is_empty() {
         return ParentResolution::Single {
             parent_uri: selected.parent,
             call_site_line: selected.call_site_line,
@@ -281,7 +291,7 @@ where
         selected_uri: selected.parent,
         selected_line: selected.call_site_line,
         selected_column: selected.call_site_column,
-        alternatives: candidates.into_iter().map(|c| c.parent).collect(),
+        alternatives: unique_alternatives,
     }
 }
 
@@ -592,6 +602,69 @@ y <- 2"#;
                 assert_eq!(call_site_column, Some(0));
             }
             _ => panic!("Expected Single resolution"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_parent_no_false_ambiguity() {
+        // Test that when the same parent appears from both directive and reverse edge,
+        // it's not treated as ambiguous
+        use super::super::dependency::DependencyGraph;
+        use super::super::types::ForwardSource;
+
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../oos.r".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        // Create a graph with a reverse edge from the same parent
+        let mut graph = DependencyGraph::new();
+        let child = url("subdir/collate.r");
+        let parent = url("oos.r");
+        
+        // Simulate that the parent has a forward edge to the child
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "subdir/collate.r".to_string(),
+                line: 5,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file_simple(&parent, &parent_meta);
+
+        let config = CrossFileConfig::default();
+
+        let result = resolve_parent_with_content(
+            &meta,
+            &graph,
+            &child,
+            &config,
+            |p| if p == "../oos.r" { Some(parent.clone()) } else { None },
+            |_| None,
+        );
+
+        // Should be Single, not Ambiguous, because both sources point to the same parent
+        match result {
+            ParentResolution::Single { parent_uri, .. } => {
+                assert_eq!(parent_uri, parent);
+            }
+            ParentResolution::Ambiguous { selected_uri, alternatives, .. } => {
+                panic!(
+                    "Expected Single resolution, got Ambiguous with selected={} and alternatives={:?}",
+                    selected_uri, alternatives
+                );
+            }
+            _ => panic!("Expected Single resolution, got {:?}", result),
         }
     }
 }
