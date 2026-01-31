@@ -292,12 +292,15 @@ impl BackgroundIndexer {
         metadata: &CrossFileMetadata,
         current_depth: usize,
     ) {
-        let (max_depth, priority_3_enabled, workspace_root) = {
+        let (max_depth, max_queue_size, priority_3_enabled, workspace_root) = {
             let state_guard = state.read().await;
             (
                 state_guard
                     .cross_file_config
                     .on_demand_indexing_max_transitive_depth,
+                state_guard
+                    .cross_file_config
+                    .on_demand_indexing_max_queue_size,
                 state_guard
                     .cross_file_config
                     .on_demand_indexing_priority_3_enabled,
@@ -324,6 +327,18 @@ impl BackgroundIndexer {
 
                         if needs_indexing {
                             let mut q = queue.lock().unwrap();
+                            
+                            // Check queue size limit (Requirement 3.4)
+                            if q.len() >= max_queue_size {
+                                log::warn!(
+                                    "Background indexing queue full, dropping transitive task for {} ({}/{})",
+                                    source_uri,
+                                    q.len(),
+                                    max_queue_size
+                                );
+                                continue;
+                            }
+                            
                             if !q.iter().any(|t| t.uri == source_uri) {
                                 q.push_back(IndexTask {
                                     uri: source_uri.clone(),
