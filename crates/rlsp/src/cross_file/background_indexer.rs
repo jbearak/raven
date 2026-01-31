@@ -187,11 +187,10 @@ impl BackgroundIndexer {
                     symbol_count
                 );
 
-                // Queue transitive dependencies for Priority 2 tasks
-                if task.priority == 2 {
-                    Self::queue_transitive_deps(state, queue, &task.uri, &metadata, task.depth)
-                        .await;
-                }
+                // Queue transitive dependencies for both Priority 2 and Priority 3 tasks
+                // (as long as depth limit allows)
+                Self::queue_transitive_deps(state, queue, &task.uri, &metadata, task.depth)
+                    .await;
             }
             Err(e) => {
                 log::warn!("Failed to index {}: {}", task.uri, e);

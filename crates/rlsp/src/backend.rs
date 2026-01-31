@@ -388,10 +388,51 @@ impl LanguageServer for Backend {
             .map(|(uri, _)| uri.clone())
             .collect();
         
+        // Collect metadata from Priority 1 files for transitive dependency queuing
+        let mut priority_1_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
+        
         if !priority_1_files.is_empty() {
             log::info!("Synchronously indexing {} directly sourced files before diagnostics", priority_1_files.len());
             for file_uri in priority_1_files {
-                self.index_file_on_demand(&file_uri).await;
+                if let Some(meta) = self.index_file_on_demand(&file_uri).await {
+                    priority_1_metadata.push((file_uri, meta));
+                }
+            }
+        }
+        
+        // Queue transitive dependencies from Priority 1 files as Priority 3
+        let (priority_3_enabled, workspace_root) = {
+            let state = self.state.read().await;
+            (
+                state.cross_file_config.on_demand_indexing_priority_3_enabled,
+                state.workspace_folders.first().cloned(),
+            )
+        };
+        
+        if priority_3_enabled && !priority_1_metadata.is_empty() {
+            for (file_uri, meta) in &priority_1_metadata {
+                let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                    file_uri, meta, workspace_root.as_ref()
+                );
+                
+                for source in &meta.sources {
+                    if let Some(ctx) = path_ctx.as_ref() {
+                        if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&source.path, ctx) {
+                            if let Ok(source_uri) = Url::from_file_path(resolved) {
+                                let needs_indexing = {
+                                    let state = self.state.read().await;
+                                    !state.documents.contains_key(&source_uri)
+                                        && !state.cross_file_workspace_index.contains(&source_uri)
+                                };
+                                
+                                if needs_indexing {
+                                    log::trace!("Queuing transitive dependency from Priority 1: {}", source_uri);
+                                    self.background_indexer.submit(source_uri, 3, 1);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         
@@ -990,8 +1031,8 @@ impl LanguageServer for Backend {
 
 impl Backend {
     /// Synchronously index a file on-demand (blocking operation)
-    /// Returns true if indexing succeeded, false otherwise
-    async fn index_file_on_demand(&self, file_uri: &Url) -> bool {
+    /// Returns the cross-file metadata if indexing succeeded, None otherwise
+    async fn index_file_on_demand(&self, file_uri: &Url) -> Option<crate::cross_file::CrossFileMetadata> {
         log::trace!("On-demand indexing: {}", file_uri);
         
         // Read file content
@@ -999,7 +1040,7 @@ impl Backend {
             Ok(p) => p,
             Err(_) => {
                 log::trace!("Failed to convert URI to path: {}", file_uri);
-                return false;
+                return None;
             }
         };
         
@@ -1007,7 +1048,7 @@ impl Backend {
             Ok(c) => c,
             Err(e) => {
                 log::trace!("Failed to read file {}: {}", file_uri, e);
-                return false;
+                return None;
             }
         };
         
@@ -1015,7 +1056,7 @@ impl Backend {
             Ok(m) => m,
             Err(_) => {
                 log::trace!("Failed to get metadata for: {}", file_uri);
-                return false;
+                return None;
             }
         };
         
@@ -1093,7 +1134,7 @@ impl Backend {
             self.state.read().await.cross_file_workspace_index.get_artifacts(&file_uri)
                 .map(|a| a.exported_interface.len()).unwrap_or(0));
         
-        true
+        Some(cross_file_meta)
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
