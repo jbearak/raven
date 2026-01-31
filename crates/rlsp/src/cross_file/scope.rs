@@ -19,6 +19,7 @@ use super::types::{byte_offset_to_utf16_column, ForwardSource};
 pub enum SymbolKind {
     Function,
     Variable,
+    Parameter,
 }
 
 /// A symbol with its definition location
@@ -78,6 +79,8 @@ pub struct ScopeArtifacts {
     pub timeline: Vec<ScopeEvent>,
     /// Hash of exported interface for change detection
     pub interface_hash: u64,
+    /// Cached function scopes for O(1) lookup: (start_line, start_column, end_line, end_column)
+    pub function_scopes: Vec<(u32, u32, u32, u32)>,
 }
 
 impl Default for ScopeArtifacts {
@@ -86,6 +89,7 @@ impl Default for ScopeArtifacts {
             exported_interface: HashMap::new(),
             timeline: Vec::new(),
             interface_hash: 0,
+            function_scopes: Vec::new(),
         }
     }
 }
@@ -128,6 +132,17 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
     });
 
+    // Populate function_scopes cache for O(1) lookup
+    artifacts.function_scopes = artifacts.timeline.iter()
+        .filter_map(|e| {
+            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
+                Some((*start_line, *start_column, *end_line, *end_column))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Compute interface hash
     artifacts.interface_hash = compute_interface_hash(&artifacts.exported_interface);
 
@@ -158,20 +173,12 @@ pub fn scope_at_position(
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 // Include if definition is before or at the position
                 if (*def_line, *def_col) <= (line, column) {
-                    // Check if this definition is inside any function scope
-                    let def_function_scope = artifacts.timeline.iter()
-                        .filter_map(|e| {
-                            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
-                                if (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column) {
-                                    Some((*start_line, *start_column, *end_line, *end_column))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
+                    // Check if this definition is inside any function scope using cached lookup
+                    let def_function_scope = artifacts.function_scopes.iter()
+                        .find(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column)
                         })
-                        .next();
+                        .copied();
                     
                     match def_function_scope {
                         None => {
@@ -411,7 +418,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                     
                     return Some(ScopedSymbol {
                         name,
-                        kind: SymbolKind::Variable,
+                        kind: SymbolKind::Parameter,
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
                         defined_column: column,
@@ -429,7 +436,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             
             return Some(ScopedSymbol {
                 name,
-                kind: SymbolKind::Variable,
+                kind: SymbolKind::Parameter,
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
                 defined_column: column,
@@ -444,7 +451,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             
             return Some(ScopedSymbol {
                 name: "...".to_string(),
-                kind: SymbolKind::Variable,
+                kind: SymbolKind::Parameter,
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
                 defined_column: column,
@@ -821,20 +828,12 @@ where
         match event {
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
-                    // Check if this definition is inside any function scope
-                    let def_function_scope = artifacts.timeline.iter()
-                        .filter_map(|e| {
-                            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
-                                if (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column) {
-                                    Some((*start_line, *start_column, *end_line, *end_column))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
+                    // Check if this definition is inside any function scope using cached lookup
+                    let def_function_scope = artifacts.function_scopes.iter()
+                        .find(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column)
                         })
-                        .next();
+                        .copied();
                     
                     match def_function_scope {
                         None => {
