@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b882c81fda217f3b5f4e5180dcc0e2dda6113b469ea7c38f2e96389217f15555 # shrinks to max_documents = 3, ops = [Open(0), Open(10), Open(1), Open(10), Open(1), Open(2), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0), Open(0)]
+cc 3b01ce0005a318ba6f5e5c4af21626dd8ae07eae0959fe8e8e3881ffaea20c96 # shrinks to max_memory_kb = 5, max_documents = 50, ops = [(0, "var_1 <- 1"), (0, "var_1 <- 1"), (0, "var_1 <- 1"), (0, "var_1 <- 1"), (8, "var_1 <- 1"), (0, "var_1 <- 1"), (8, "func_16 <- function(x) {\n  x0 <- 0\n  x1 <- 10\n  x2 <- 20\n  x3 <- 30\n  x4 <- 40\n  x5 <- 50\n  x6 <- 60\n  x7 <- 70\n  x8 <- 80\n  x9 <- 90\n  x10 <- 100\n  x11 <- 110\n  x12 <- 120\n  x13 <- 130\n  x14 <- 140\n  x15 <- 150\n  x\n}"), (0, "var_1 <- 1"), (0, "var_1 <- 1"), (0, "var_1 <- 1")]

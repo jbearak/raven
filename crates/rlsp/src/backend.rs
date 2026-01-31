@@ -20,6 +20,52 @@ use crate::handlers;
 use crate::r_env;
 use crate::state::{scan_workspace, WorldState};
 
+/// Extract loaded packages from a parsed tree
+/// 
+/// This is a helper function for on-demand indexing that extracts
+/// library(), require(), and loadNamespace() calls from R code.
+fn extract_loaded_packages_from_tree(tree: &Option<tree_sitter::Tree>, text: &str) -> Vec<String> {
+    let Some(tree) = tree else {
+        return Vec::new();
+    };
+
+    let mut packages = Vec::new();
+    
+    fn visit_node(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
+        if node.kind() == "call" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let func_text = &text[func_node.byte_range()];
+                
+                if func_text == "library" || func_text == "require" || func_text == "loadNamespace" {
+                    if let Some(args_node) = node.child_by_field_name("arguments") {
+                        for i in 0..args_node.child_count() {
+                            if let Some(child) = args_node.child(i) {
+                                if child.kind() == "argument" {
+                                    if let Some(value_node) = child.child_by_field_name("value") {
+                                        let value_text = &text[value_node.byte_range()];
+                                        let pkg_name = value_text.trim_matches(|c: char| c == '"' || c == '\'');
+                                        packages.push(pkg_name.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                visit_node(child, text, packages);
+            }
+        }
+    }
+    
+    visit_node(tree.root_node(), text, &mut packages);
+    packages
+}
+
 /// Parameters for the rlsp/activeDocumentsChanged notification
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -228,14 +274,14 @@ impl LanguageServer for Backend {
         };
         
         // Scan workspace without holding lock (Requirement 13a)
-        let (index, imports, cross_file_entries) = tokio::task::spawn_blocking(move || {
+        let (index, imports, cross_file_entries, new_index_entries) = tokio::task::spawn_blocking(move || {
             scan_workspace(&folders)
         }).await.unwrap_or_default();
         
         // Apply results under brief write lock
         {
             let mut state = self.state.write().await;
-            state.apply_workspace_index(index, imports, cross_file_entries);
+            state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
         }
         
         log::info!("Workspace initialization complete");
@@ -280,6 +326,11 @@ impl LanguageServer for Backend {
         // Compute affected files while holding write lock
         let (work_items, debounce_ms, files_to_index, on_demand_enabled) = {
             let mut state = self.state.write().await;
+            
+            // Update new DocumentStore (Requirement 1.3)
+            state.document_store.open(uri.clone(), &text, version).await;
+            
+            // Update legacy documents HashMap (for migration compatibility)
             state.open_document(uri.clone(), &text, Some(version));
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
@@ -571,6 +622,11 @@ impl LanguageServer for Backend {
         // Compute affected files and debounce config while holding write lock
         let (work_items, debounce_ms) = {
             let mut state = self.state.write().await;
+            
+            // Update new DocumentStore (Requirement 1.4)
+            state.document_store.update(&uri, params.content_changes.clone(), version).await;
+            
+            // Update legacy documents HashMap (for migration compatibility)
             if let Some(doc) = state.documents.get_mut(&uri) {
                 doc.version = Some(version);
             }
@@ -752,6 +808,9 @@ impl LanguageServer for Backend {
         
         let mut state = self.state.write().await;
         
+        // Close in new DocumentStore (Requirement 1.5)
+        state.document_store.close(uri);
+        
         // Clear diagnostics gate state
         state.diagnostics_gate.clear(uri);
         
@@ -761,7 +820,7 @@ impl LanguageServer for Backend {
         // Remove from activity tracking
         state.cross_file_activity.remove(uri);
         
-        // Close the document
+        // Close the document (legacy)
         state.close_document(uri);
     }
 
@@ -848,7 +907,10 @@ impl LanguageServer for Backend {
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
                         
-                        // Schedule for async update
+                        // Schedule debounced update in new WorkspaceIndex (Requirement 5.1)
+                        state.workspace_index_new.schedule_update(uri.clone());
+                        
+                        // Schedule for async update (legacy)
                         to_update.push(uri.clone());
                         
                         // Find open documents that depend on this file
@@ -877,7 +939,10 @@ impl LanguageServer for Backend {
                             }
                         }
                         
-                        // Remove from dependency graph and caches
+                        // Remove from new WorkspaceIndex
+                        state.workspace_index_new.invalidate(uri);
+                        
+                        // Remove from dependency graph and caches (legacy)
                         state.cross_file_graph.remove_file(uri);
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
@@ -1165,7 +1230,32 @@ impl Backend {
             content.clone(),
         );
         
-        // Update workspace index
+        // Update new WorkspaceIndex (Requirement 12.1, 12.2, 12.3)
+        {
+            let state = self.state.read().await;
+            
+            // Parse tree for IndexEntry
+            let tree = crate::parser_pool::with_parser(|parser| {
+                parser.parse(&content, None)
+            });
+            
+            // Extract loaded packages from tree
+            let loaded_packages = extract_loaded_packages_from_tree(&tree, &content);
+            
+            let index_entry = crate::workspace_index::IndexEntry {
+                contents: ropey::Rope::from_str(&content),
+                tree,
+                loaded_packages,
+                snapshot: snapshot.clone(),
+                metadata: cross_file_meta.clone(),
+                artifacts: artifacts.clone(),
+                indexed_at_version: state.workspace_index_new.version(),
+            };
+            
+            state.workspace_index_new.insert(file_uri.clone(), index_entry);
+        }
+        
+        // Update legacy workspace index
         {
             let state = self.state.read().await;
             let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();

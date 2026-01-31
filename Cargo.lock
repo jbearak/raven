@@ -803,8 +803,10 @@ name = "rlsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dashmap",
  "env_logger",
+ "indexmap",
  "log",
  "proptest",
  "regex",

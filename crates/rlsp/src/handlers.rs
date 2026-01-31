@@ -11,6 +11,7 @@ use tower_lsp::lsp_types::*;
 use tree_sitter::Node;
 use tree_sitter::Point;
 
+use crate::content_provider::ContentProvider;
 use crate::cross_file::{scope, ScopedSymbol};
 use crate::state::WorldState;
 
@@ -23,52 +24,29 @@ use crate::builtins;
 /// Get cross-file symbols available at a position.
 /// This traverses the source() chain to include symbols from sourced files,
 /// and also includes symbols from parent files via backward directives.
+///
+/// Uses ContentProvider for unified access to file content, metadata, and artifacts.
+/// The ContentProvider already implements the open-docs-authoritative rule,
+/// so no manual fallback logic is needed.
+///
+/// **Validates: Requirements 7.2, 13.2**
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
     line: u32,
     column: u32,
 ) -> HashMap<String, ScopedSymbol> {
+    // Use ContentProvider for unified access
+    let content_provider = state.content_provider();
+
     // Closure to get artifacts for a URI
     let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
-        // Try open documents first (authoritative)
-        if let Some(doc) = state.documents.get(target_uri) {
-            if let Some(tree) = &doc.tree {
-                let text = doc.text();
-                return Some(scope::compute_artifacts(target_uri, tree, &text));
-            }
-        }
-        // Try cross-file workspace index (preferred for closed files)
-        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
-            return Some(artifacts);
-        }
-        // Fallback to legacy workspace index
-        if let Some(doc) = state.workspace_index.get(target_uri) {
-            if let Some(tree) = &doc.tree {
-                let text = doc.text();
-                return Some(scope::compute_artifacts(target_uri, tree, &text));
-            }
-        }
-        None
+        content_provider.get_artifacts(target_uri)
     };
 
     // Closure to get metadata for a URI
     let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-        // Try open documents first (authoritative)
-        if let Some(doc) = state.documents.get(target_uri) {
-            let text = doc.text();
-            return Some(crate::cross_file::extract_metadata(&text));
-        }
-        // Try cross-file workspace index (preferred for closed files)
-        if let Some(metadata) = state.cross_file_workspace_index.get_metadata(target_uri) {
-            return Some(metadata);
-        }
-        // Fallback to legacy workspace index
-        if let Some(doc) = state.workspace_index.get(target_uri) {
-            let text = doc.text();
-            return Some(crate::cross_file::extract_metadata(&text));
-        }
-        None
+        content_provider.get_metadata(target_uri)
     };
 
     let max_depth = state.cross_file_config.max_chain_depth;
@@ -321,12 +299,21 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
 }
 
 /// Collect diagnostics for missing files referenced in source() calls and directives
+/// 
+/// This is the synchronous version that only checks cached sources (no disk I/O).
+/// For async disk checking, use `collect_missing_file_diagnostics_async`.
+/// 
+/// Uses ContentProvider for unified access to cached file existence.
+/// 
+/// **Validates: Requirements 14.2, 14.5**
 fn collect_missing_file_diagnostics(
     state: &WorldState,
     uri: &Url,
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let content_provider = state.content_provider();
+    
     // Build PathContext for proper path resolution
     let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
         uri, meta, state.workspace_folders.first()
@@ -338,33 +325,11 @@ fn collect_missing_file_diagnostics(
         crate::cross_file::path_resolve::path_to_uri(&resolved)
     };
 
-    // Check if file exists using cached/indexed data only (no blocking I/O)
-    let file_exists = |target_uri: &Url| -> bool {
-        // Check open documents first (authoritative)
-        if state.documents.contains_key(target_uri) {
-            return true;
-        }
-        // Check workspace index (legacy)
-        if state.workspace_index.contains_key(target_uri) {
-            return true;
-        }
-        // Check cross-file workspace index (preferred for closed files)
-        if state.cross_file_workspace_index.contains(target_uri) {
-            return true;
-        }
-        // Check file cache (may have been read previously)
-        if state.cross_file_file_cache.get(target_uri).is_some() {
-            return true;
-        }
-        // Don't do blocking I/O here - if not in any cache, assume missing
-        // The file will be indexed on next didChangeWatchedFiles if it exists
-        false
-    };
-
     // Check forward sources (source() calls and @lsp-source directives)
     for source in &meta.sources {
         if let Some(target_uri) = resolve_path(&source.path) {
-            if !file_exists(&target_uri) {
+            // Use ContentProvider for cached existence check (no blocking I/O)
+            if !content_provider.exists_cached(&target_uri) {
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(source.line, source.column),
@@ -392,7 +357,8 @@ fn collect_missing_file_diagnostics(
     // Check backward directives (@lsp-sourced-by)
     for directive in &meta.sourced_by {
         if let Some(target_uri) = resolve_path(&directive.path) {
-            if !file_exists(&target_uri) {
+            // Use ContentProvider for cached existence check (no blocking I/O)
+            if !content_provider.exists_cached(&target_uri) {
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(directive.directive_line, 0),
@@ -415,6 +381,106 @@ fn collect_missing_file_diagnostics(
             });
         }
     }
+}
+
+/// Async version of missing file diagnostics that checks disk existence
+/// 
+/// This version uses `AsyncContentProvider::check_existence_batch` to perform
+/// non-blocking disk I/O for files not found in cache.
+/// 
+/// **Validates: Requirements 14.2, 14.5**
+pub async fn collect_missing_file_diagnostics_async(
+    content_provider: &impl crate::content_provider::AsyncContentProvider,
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    workspace_folders: Option<&Url>,
+    missing_file_severity: DiagnosticSeverity,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    
+    // Build PathContext for proper path resolution
+    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri, meta, workspace_folders
+    );
+    
+    let resolve_path = |path: &str| -> Option<Url> {
+        let ctx = path_ctx.as_ref()?;
+        let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
+        crate::cross_file::path_resolve::path_to_uri(&resolved)
+    };
+
+    // Collect all URIs to check
+    let mut uris_to_check: Vec<(Url, String, u32, u32, bool)> = Vec::new(); // (uri, path, line, col, is_backward)
+    
+    for source in &meta.sources {
+        if let Some(target_uri) = resolve_path(&source.path) {
+            uris_to_check.push((target_uri, source.path.clone(), source.line, source.column, false));
+        } else {
+            // Path couldn't be resolved at all - add diagnostic immediately
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(source.line, source.column),
+                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                },
+                severity: Some(missing_file_severity),
+                message: format!("Cannot resolve path: '{}'", source.path),
+                ..Default::default()
+            });
+        }
+    }
+    
+    for directive in &meta.sourced_by {
+        if let Some(target_uri) = resolve_path(&directive.path) {
+            uris_to_check.push((target_uri, directive.path.clone(), directive.directive_line, 0, true));
+        } else {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(directive.directive_line, 0),
+                    end: Position::new(directive.directive_line, u32::MAX),
+                },
+                severity: Some(missing_file_severity),
+                message: format!("Cannot resolve parent path: '{}'", directive.path),
+                ..Default::default()
+            });
+        }
+    }
+    
+    if uris_to_check.is_empty() {
+        return diagnostics;
+    }
+    
+    // Batch check existence (non-blocking)
+    let uris: Vec<Url> = uris_to_check.iter().map(|(u, _, _, _, _)| u.clone()).collect();
+    let existence = content_provider.check_existence_batch(&uris).await;
+    
+    // Generate diagnostics for missing files
+    for (target_uri, path, line, col, is_backward) in uris_to_check {
+        if !existence.get(&target_uri).copied().unwrap_or(false) {
+            if is_backward {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(line, 0),
+                        end: Position::new(line, u32::MAX),
+                    },
+                    severity: Some(missing_file_severity),
+                    message: format!("Parent file not found: '{}'", path),
+                    ..Default::default()
+                });
+            } else {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(line, col),
+                        end: Position::new(line, col + path.len() as u32 + 10),
+                    },
+                    severity: Some(missing_file_severity),
+                    message: format!("File not found: '{}'", path),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    
+    diagnostics
 }
 
 /// Collect diagnostics for max chain depth exceeded (Requirement 5.8)
@@ -1722,6 +1788,9 @@ pub fn goto_definition(
     uri: &Url,
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
+    // Use ContentProvider for unified access
+    let content_provider = state.content_provider();
+    
     // Try open document first, then workspace index
     let doc = state.get_document(uri).or_else(|| state.workspace_index.get(uri))?;
     let tree = doc.tree.as_ref()?;
@@ -1756,7 +1825,43 @@ pub fn goto_definition(
         }));
     }
 
-    // Search all open documents
+    // Search all open documents using ContentProvider
+    for file_uri in state.document_store.uris() {
+        if &file_uri == uri {
+            continue;
+        }
+        if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
+            if let Some(symbol) = artifacts.exported_interface.get(name) {
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: symbol.source_uri.clone(),
+                    range: Range {
+                        start: Position::new(symbol.defined_line, symbol.defined_column),
+                        end: Position::new(symbol.defined_line, symbol.defined_column + name.len() as u32),
+                    },
+                }));
+            }
+        }
+    }
+
+    // Search workspace index using ContentProvider
+    for (file_uri, _) in state.workspace_index_new.iter() {
+        if &file_uri == uri {
+            continue;
+        }
+        if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
+            if let Some(symbol) = artifacts.exported_interface.get(name) {
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: symbol.source_uri.clone(),
+                    range: Range {
+                        start: Position::new(symbol.defined_line, symbol.defined_column),
+                        end: Position::new(symbol.defined_line, symbol.defined_column + name.len() as u32),
+                    },
+                }));
+            }
+        }
+    }
+
+    // Fallback: Search legacy open documents
     for (file_uri, doc) in &state.documents {
         if file_uri == uri {
             continue;
@@ -1772,7 +1877,7 @@ pub fn goto_definition(
         }
     }
 
-    // Search workspace index
+    // Fallback: Search legacy workspace index
     for (file_uri, doc) in &state.workspace_index {
         if file_uri == uri {
             continue;
@@ -1832,6 +1937,9 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
 // ============================================================================
 
 pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<Vec<Location>> {
+    // Use ContentProvider for unified access
+    let content_provider = state.content_provider();
+    
     // Try open document first, then workspace index
     let doc = state.get_document(uri).or_else(|| state.workspace_index.get(uri))?;
     let tree = doc.tree.as_ref()?;
@@ -1850,10 +1958,40 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // Search current document
     find_references_in_tree(tree.root_node(), name, &text, uri, &mut locations);
 
-    // Search all open documents
+    // Search all open documents using new DocumentStore
+    for file_uri in state.document_store.uris() {
+        if &file_uri == uri {
+            continue; // Already searched
+        }
+        if let Some(content) = content_provider.get_content(&file_uri) {
+            // Parse the content to search for references
+            if let Some(doc_state) = state.document_store.get_without_touch(&file_uri) {
+                if let Some(tree) = &doc_state.tree {
+                    find_references_in_tree(tree.root_node(), name, &content, &file_uri, &mut locations);
+                }
+            }
+        }
+    }
+
+    // Search workspace index using new WorkspaceIndex
+    for (file_uri, entry) in state.workspace_index_new.iter() {
+        if &file_uri == uri {
+            continue; // Already searched
+        }
+        if let Some(tree) = &entry.tree {
+            let file_text = entry.contents.to_string();
+            find_references_in_tree(tree.root_node(), name, &file_text, &file_uri, &mut locations);
+        }
+    }
+
+    // Fallback: Search legacy open documents
     for (file_uri, doc) in &state.documents {
         if file_uri == uri {
             continue; // Already searched
+        }
+        // Skip if already found in new stores
+        if state.document_store.contains(file_uri) {
+            continue;
         }
         if let Some(tree) = &doc.tree {
             let file_text = doc.text();
@@ -1861,10 +1999,14 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         }
     }
 
-    // Search workspace index
+    // Fallback: Search legacy workspace index
     for (file_uri, doc) in &state.workspace_index {
         if file_uri == uri {
             continue; // Already searched
+        }
+        // Skip if already found in new stores
+        if state.workspace_index_new.contains(file_uri) {
+            continue;
         }
         if let Some(tree) = &doc.tree {
             let file_text = doc.text();
