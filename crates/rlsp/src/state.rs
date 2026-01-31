@@ -16,12 +16,15 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
 
+use crate::content_provider::DefaultContentProvider;
 use crate::cross_file::{
     ArtifactsCache, CrossFileActivityState, CrossFileConfig, CrossFileFileCache,
     CrossFileRevalidationState, CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
     ParentSelectionCache,
 };
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
+use crate::document_store::DocumentStore;
+use crate::workspace_index::WorkspaceIndex;
 
 /// A parsed document
 pub struct Document {
@@ -372,13 +375,22 @@ impl Library {
 
 /// Global LSP state
 pub struct WorldState {
-    // Existing fields
+    // Document management (new architecture)
+    pub document_store: DocumentStore,
+    pub workspace_index_new: WorkspaceIndex,
+    
+    // Legacy fields (kept for migration compatibility)
     pub documents: HashMap<Url, Document>,
-    pub workspace_folders: Vec<Url>,
-    pub library: Library,
     pub workspace_index: HashMap<Url, Document>,
     pub workspace_imports: Vec<String>, // Symbols imported via workspace NAMESPACE
+    
+    // Workspace configuration
+    pub workspace_folders: Vec<Url>,
+    pub library: Library,
+    
+    // Caches
     pub help_cache: crate::help::HelpCache,
+    pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
 
     // Cross-file state
@@ -386,7 +398,6 @@ pub struct WorldState {
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_cache: ArtifactsCache,
-    pub cross_file_file_cache: CrossFileFileCache,
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
@@ -416,24 +427,56 @@ impl WorldState {
         log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
         
         Self {
+            // New architecture components
+            document_store: DocumentStore::new(Default::default()),
+            workspace_index_new: WorkspaceIndex::new(Default::default()),
+            
+            // Legacy fields (kept for migration compatibility)
             documents: HashMap::new(),
-            workspace_folders: Vec::new(),
-            library: Library::new(library_paths),
             workspace_index: HashMap::new(),
             workspace_imports: Vec::new(),
+            
+            // Workspace configuration
+            workspace_folders: Vec::new(),
+            library: Library::new(library_paths),
+            
+            // Caches
             help_cache: crate::help::HelpCache::new(),
+            cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
+            
             // Cross-file state
             cross_file_config: config,
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_cache: ArtifactsCache::new(),
-            cross_file_file_cache: CrossFileFileCache::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
             cross_file_parent_cache: ParentSelectionCache::new(),
         }
+    }
+
+    /// Create a content provider for this state
+    /// 
+    /// The content provider provides a unified interface for accessing file content,
+    /// metadata, and artifacts. It respects the open-docs-authoritative rule:
+    /// open documents always take precedence over indexed data.
+    /// 
+    /// This method creates a content provider with legacy field support for
+    /// migration compatibility. During the migration period, both old and new
+    /// fields are checked.
+    /// 
+    /// **Validates: Requirements 4.1, 13.1, 13.2**
+    pub fn content_provider(&self) -> DefaultContentProvider<'_> {
+        DefaultContentProvider::with_legacy(
+            &self.document_store,
+            &self.workspace_index_new,
+            &self.cross_file_file_cache,
+            &self.documents,
+            &self.workspace_index,
+            &self.cross_file_workspace_index,
+        )
     }
 
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
@@ -471,20 +514,36 @@ impl WorldState {
     }
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization)
-    pub fn apply_workspace_index(&mut self, index: HashMap<Url, Document>, imports: Vec<String>, cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>) {
+    /// 
+    /// **Validates: Requirements 11.1, 13.1**
+    pub fn apply_workspace_index(
+        &mut self, 
+        index: HashMap<Url, Document>, 
+        imports: Vec<String>, 
+        cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
+        new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
+    ) {
         self.workspace_index = index;
         self.workspace_imports = imports;
         
-        // Populate cross-file workspace index
+        // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
             log::info!("Indexing cross-file entry: {} (exported symbols: {})", 
                 uri, entry.artifacts.exported_interface.len());
             self.cross_file_workspace_index.insert(uri, entry);
         }
         
-        log::info!("Applied {} workspace files, {} imports, {} cross-file entries", 
+        // Populate new unified WorkspaceIndex
+        for (uri, entry) in new_index_entries {
+            log::trace!("Indexing new workspace entry: {} (exported symbols: {})", 
+                uri, entry.artifacts.exported_interface.len());
+            self.workspace_index_new.insert(uri, entry);
+        }
+        
+        log::info!("Applied {} workspace files, {} imports, {} cross-file entries, {} new index entries", 
             self.workspace_index.len(), self.workspace_imports.len(), 
-            self.cross_file_workspace_index.uris().len());
+            self.cross_file_workspace_index.uris().len(),
+            self.workspace_index_new.len());
     }
     
     #[allow(dead_code)]
@@ -525,15 +584,29 @@ impl WorldState {
 }
 
 /// Scan workspace folders for R files without holding any locks (Requirement 13a)
-pub fn scan_workspace(folders: &[Url]) -> (HashMap<Url, Document>, Vec<String>, HashMap<Url, crate::cross_file::workspace_index::IndexEntry>) {
+/// 
+/// Returns:
+/// - `HashMap<Url, Document>` - Legacy index for backward compatibility
+/// - `Vec<String>` - Workspace imports from NAMESPACE
+/// - `HashMap<Url, crate::cross_file::workspace_index::IndexEntry>` - Cross-file entries (legacy)
+/// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
+/// 
+/// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
+pub fn scan_workspace(folders: &[Url]) -> (
+    HashMap<Url, Document>, 
+    Vec<String>, 
+    HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
+    HashMap<Url, crate::workspace_index::IndexEntry>,
+) {
     let mut index = HashMap::new();
     let mut imports = Vec::new();
     let mut cross_file_entries = HashMap::new();
+    let mut new_index_entries = HashMap::new();
 
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            scan_directory(&path, &mut index, &mut cross_file_entries);
+            scan_directory(&path, &mut index, &mut cross_file_entries, &mut new_index_entries);
             
             // Check for NAMESPACE file
             let namespace_path = path.join("NAMESPACE");
@@ -546,11 +619,17 @@ pub fn scan_workspace(folders: &[Url]) -> (HashMap<Url, Document>, Vec<String>, 
         }
     }
 
-    log::info!("Scanned {} workspace files ({} with cross-file metadata)", index.len(), cross_file_entries.len());
-    (index, imports, cross_file_entries)
+    log::info!("Scanned {} workspace files ({} with cross-file metadata, {} new index entries)", 
+        index.len(), cross_file_entries.len(), new_index_entries.len());
+    (index, imports, cross_file_entries, new_index_entries)
 }
 
-fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>, cross_file_entries: &mut HashMap<Url, crate::cross_file::workspace_index::IndexEntry>) {
+fn scan_directory(
+    dir: &std::path::Path, 
+    index: &mut HashMap<Url, Document>, 
+    cross_file_entries: &mut HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
+    new_index_entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -559,7 +638,7 @@ fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>, cro
         let path = entry.path();
         
         if path.is_dir() {
-            scan_directory(&path, index, cross_file_entries);
+            scan_directory(&path, index, cross_file_entries, new_index_entries);
         } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             // Match both .R and .r extensions (case-insensitive)
             if ext.eq_ignore_ascii_case("r") {
@@ -567,14 +646,13 @@ fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>, cro
                     if let Ok(uri) = Url::from_file_path(&path) {
                         log::trace!("Scanning file: {}", uri);
                         let doc = Document::new(&text, None);
-                        index.insert(uri.clone(), doc);
                         
                         // Also compute cross-file metadata and artifacts
                         if let Ok(metadata_result) = fs::metadata(&path) {
                             let cross_file_meta = crate::cross_file::extract_metadata(&text);
                             
                             // Compute artifacts if we have a tree
-                            let artifacts = if let Some(tree) = index.get(&uri).and_then(|d| d.tree.as_ref()) {
+                            let artifacts = if let Some(tree) = doc.tree.as_ref() {
                                 crate::cross_file::scope::compute_artifacts(&uri, tree, &text)
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
@@ -585,13 +663,28 @@ fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>, cro
                                 &text,
                             );
                             
-                            cross_file_entries.insert(uri, crate::cross_file::workspace_index::IndexEntry {
+                            // Create legacy cross-file entry
+                            cross_file_entries.insert(uri.clone(), crate::cross_file::workspace_index::IndexEntry {
+                                snapshot: snapshot.clone(),
+                                metadata: cross_file_meta.clone(),
+                                artifacts: artifacts.clone(),
+                                indexed_at_version: 0, // Initial version; not modified by insert()
+                            });
+                            
+                            // Create new unified IndexEntry with all derived data
+                            // **Validates: Requirements 11.1, 11.2, 11.3**
+                            new_index_entries.insert(uri.clone(), crate::workspace_index::IndexEntry {
+                                contents: doc.contents.clone(),
+                                tree: doc.tree.clone(),
+                                loaded_packages: doc.loaded_packages.clone(),
                                 snapshot,
                                 metadata: cross_file_meta,
                                 artifacts,
-                                indexed_at_version: 0, // Initial version; not modified by insert()
+                                indexed_at_version: 0, // Initial version
                             });
                         }
+                        
+                        index.insert(uri, doc);
                     }
                 }
             }

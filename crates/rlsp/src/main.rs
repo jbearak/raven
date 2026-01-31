@@ -7,12 +7,15 @@
 
 mod backend;
 mod builtins;
+mod content_provider;
 mod cross_file;
+mod document_store;
 mod handlers;
 mod help;
 mod parser_pool;
 mod r_env;
 mod state;
+mod workspace_index;
 
 use std::env;
 
