@@ -271,6 +271,19 @@ fn collect_definitions(
         }
     }
 
+    // Check for for loop iterators
+    if node.kind() == "for_statement" {
+        if let Some(symbol) = try_extract_for_loop_iterator(node, content, uri) {
+            let event = ScopeEvent::Def {
+                line: symbol.defined_line,
+                column: symbol.defined_column,
+                symbol: symbol.clone(),
+            };
+            artifacts.timeline.push(event);
+            artifacts.exported_interface.insert(symbol.name.clone(), symbol);
+        }
+    }
+
     // Recurse into children
     for child in node.children(&mut node.walk()) {
         collect_definitions(child, content, uri, artifacts);
@@ -328,6 +341,34 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
     
     // Get position with UTF-16 column
     let start = node.start_position();
+    let line_text = content.lines().nth(start.row).unwrap_or("");
+    let column = byte_offset_to_utf16_column(line_text, start.column);
+    
+    Some(ScopedSymbol {
+        name,
+        kind: SymbolKind::Variable,
+        source_uri: uri.clone(),
+        defined_line: start.row as u32,
+        defined_column: column,
+        signature: None,
+    })
+}
+
+/// Extract loop iterator from for_statement nodes.
+/// In R, loop iterators persist after the loop completes.
+fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+    // Get the variable field (iterator)
+    let var_node = node.child_by_field_name("variable")?;
+    
+    // Only handle identifier nodes
+    if var_node.kind() != "identifier" {
+        return None;
+    }
+    
+    let name = node_text(var_node, content).to_string();
+    
+    // Get position with UTF-16 column
+    let start = var_node.start_position();
     let line_text = content.lines().nth(start.row).unwrap_or("");
     let column = byte_offset_to_utf16_column(line_text, start.column);
     
@@ -902,6 +943,53 @@ mod tests {
 
         // Dynamic name should not be treated as a definition
         assert_eq!(artifacts.exported_interface.len(), 0);
+    }
+
+    #[test]
+    fn test_for_loop_iterator_extraction() {
+        let code = "for (i in 1:10) { print(i) }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        let symbol = artifacts.exported_interface.get("i").unwrap();
+        assert_eq!(symbol.kind, SymbolKind::Variable);
+        assert_eq!(symbol.name, "i");
+        assert!(symbol.signature.is_none());
+    }
+
+    #[test]
+    fn test_for_loop_iterator_with_complex_sequence() {
+        let code = "for (item in my_list) { process(item) }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        assert!(artifacts.exported_interface.contains_key("item"));
+    }
+
+    #[test]
+    fn test_for_loop_iterator_persists_after_loop() {
+        let code = "for (j in 1:5) { }\nresult <- j";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Both j (iterator) and result should be in scope
+        assert_eq!(artifacts.exported_interface.len(), 2);
+        assert!(artifacts.exported_interface.contains_key("j"));
+        assert!(artifacts.exported_interface.contains_key("result"));
+    }
+
+    #[test]
+    fn test_nested_for_loops() {
+        let code = "for (i in 1:3) { for (j in 1:2) { print(i, j) } }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Both iterators should be in scope
+        assert_eq!(artifacts.exported_interface.len(), 2);
+        assert!(artifacts.exported_interface.contains_key("i"));
+        assert!(artifacts.exported_interface.contains_key("j"));
     }
 
     #[test]

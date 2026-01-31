@@ -3844,3 +3844,109 @@ proptest! {
             "assign() with variable should NOT be recognized (dynamic)");
     }
 }
+
+// ============================================================================
+// Property 1: Loop Iterator Scope Inclusion
+// Validates: Loop iterator detection and scope persistence
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 1: For any for loop with iterator variable i, the iterator SHALL
+    /// be included in the exported interface and available in scope after the
+    /// for statement position.
+    #[test]
+    fn prop_loop_iterator_scope_inclusion(
+        iterator_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code with for loop
+        let code = format!("for ({} in 1:10) {{ print({}) }}", iterator_name, iterator_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Iterator should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&iterator_name),
+            "Loop iterator should be in exported interface");
+
+        // Iterator should have Variable kind
+        let symbol = artifacts.exported_interface.get(&iterator_name).unwrap();
+        prop_assert_eq!(symbol.kind, super::scope::SymbolKind::Variable,
+            "Loop iterator should have Variable kind");
+
+        // Iterator should be available in timeline as Def event
+        let has_def_event = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == iterator_name)
+        });
+        prop_assert!(has_def_event, "Loop iterator should have Def event in timeline");
+    }
+
+    /// Property 1 extended: Loop iterator persists after loop completion
+    #[test]
+    fn prop_loop_iterator_persists_after_loop(
+        iterator_name in r_identifier(),
+        var_name in r_identifier()
+    ) {
+        prop_assume!(iterator_name != var_name);
+
+        let uri = make_url("test");
+
+        // Code with for loop followed by variable assignment
+        let code = format!(
+            "for ({} in 1:5) {{ }}\n{} <- {}",
+            iterator_name, var_name, iterator_name
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Both iterator and variable should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&iterator_name),
+            "Loop iterator should persist after loop");
+        prop_assert!(artifacts.exported_interface.contains_key(&var_name),
+            "Variable should be in exported interface");
+
+        // Get scope at end of code - iterator should be available
+        let scope = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope.symbols.contains_key(&iterator_name),
+            "Loop iterator should be available in scope after loop");
+        prop_assert!(scope.symbols.contains_key(&var_name),
+            "Variable should be available in scope");
+    }
+
+    /// Property 1 extended: Nested loops create multiple iterators
+    #[test]
+    fn prop_nested_loops_multiple_iterators(
+        outer_iterator in r_identifier(),
+        inner_iterator in r_identifier()
+    ) {
+        prop_assume!(outer_iterator != inner_iterator);
+
+        let uri = make_url("test");
+
+        // Code with nested for loops
+        let code = format!(
+            "for ({} in 1:3) {{ for ({} in 1:2) {{ print({}, {}) }} }}",
+            outer_iterator, inner_iterator, outer_iterator, inner_iterator
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Both iterators should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&outer_iterator),
+            "Outer loop iterator should be in exported interface");
+        prop_assert!(artifacts.exported_interface.contains_key(&inner_iterator),
+            "Inner loop iterator should be in exported interface");
+
+        // Both should have Def events
+        let outer_has_def = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == outer_iterator)
+        });
+        let inner_has_def = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == inner_iterator)
+        });
+        prop_assert!(outer_has_def, "Outer iterator should have Def event");
+        prop_assert!(inner_has_def, "Inner iterator should have Def event");
+    }
+}
