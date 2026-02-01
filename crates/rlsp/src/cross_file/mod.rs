@@ -56,7 +56,7 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     // Parse directives first
     let mut meta = directive::parse_directives(content);
     
-    // Parse AST for source() calls using thread-local parser for efficiency
+    // Parse AST for source() calls and library() calls using thread-local parser for efficiency
     if let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(content, None)) {
         let detected = source_detect::detect_source_calls(&tree, content);
         
@@ -74,16 +74,23 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
         
         // Sort by line number for consistent ordering
         meta.sources.sort_by_key(|s| (s.line, s.column));
+        
+        // Detect library(), require(), loadNamespace() calls (Requirement 1.8)
+        let mut library_calls = source_detect::detect_library_calls(&tree, content);
+        // Sort by line/column for document order (Requirement 1.8)
+        library_calls.sort_by_key(|lc| (lc.line, lc.column));
+        meta.library_calls = library_calls;
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
     }
     
     log::trace!(
-        "Metadata extraction complete: {} total sources ({} from directives, {} from AST), {} backward directives",
+        "Metadata extraction complete: {} total sources ({} from directives, {} from AST), {} backward directives, {} library calls",
         meta.sources.len(),
         meta.sources.iter().filter(|s| s.is_directive).count(),
         meta.sources.iter().filter(|s| !s.is_directive).count(),
-        meta.sourced_by.len()
+        meta.sourced_by.len(),
+        meta.library_calls.len()
     );
     
     meta

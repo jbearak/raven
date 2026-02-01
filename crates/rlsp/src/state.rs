@@ -22,6 +22,7 @@ use crate::cross_file::{
     CrossFileRevalidationState, CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
     ParentSelectionCache,
 };
+use crate::package_library::PackageLibrary;
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 use crate::document_store::DocumentStore;
 use crate::workspace_index::WorkspaceIndex;
@@ -388,6 +389,13 @@ pub struct WorldState {
     pub workspace_folders: Vec<Url>,
     pub library: Library,
     
+    // Package function awareness
+    // Manages installed packages, their exports, and caching for package-aware scope resolution
+    // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
+    // Note: Will be used in tasks 7.2+ for scope resolution with package exports
+    #[allow(dead_code)]
+    pub package_library: PackageLibrary,
+    
     // Caches
     pub help_cache: crate::help::HelpCache,
     pub cross_file_file_cache: CrossFileFileCache,
@@ -439,6 +447,11 @@ impl WorldState {
             // Workspace configuration
             workspace_folders: Vec::new(),
             library: Library::new(library_paths),
+            
+            // Package function awareness
+            // Initialize with empty state - will be populated via initialize() or async initialization
+            // Requirement 13.4: THE Package_Cache SHALL support concurrent read access
+            package_library: PackageLibrary::new_empty(),
             
             // Caches
             help_cache: crate::help::HelpCache::new(),
