@@ -1056,8 +1056,6 @@ proptest! {
         // Test with parent directory navigation (common pattern for backward directives)
         let parent_path = format!("../{}.R", parent_file);
 
-        let parent_path = format!("../{}.R", parent_file);
-
         // Parse all backward directive synonyms to ensure synonym handling is exercised
         let sourced_by = format!("# @lsp-sourced-by {}", parent_path);
         let run_by = format!("# @lsp-run-by {}", parent_path);
