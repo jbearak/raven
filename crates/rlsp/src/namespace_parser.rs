@@ -203,13 +203,8 @@ fn normalize_multiline_directives(content: &str) -> String {
 /// assert_eq!(extract_directive_args("something(foo)", "export"), None);
 /// ```
 fn extract_directive_args(line: &str, directive: &str) -> Option<String> {
-    // Check if line starts with the directive name (case-sensitive)
-    if !line.starts_with(directive) {
-        return None;
-    }
-
     // Find the opening parenthesis
-    let after_directive = &line[directive.len()..];
+    let after_directive = line.strip_prefix(directive)?;
     if !after_directive.starts_with('(') {
         return None;
     }

@@ -218,11 +218,14 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
             config.packages_additional_library_paths = paths
                 .iter()
                 .filter_map(|p| p.as_str())
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
                 .map(std::path::PathBuf::from)
                 .collect();
         }
         if let Some(v) = packages.get("rPath").and_then(|v| v.as_str()) {
-            config.packages_r_path = Some(std::path::PathBuf::from(v));
+            if !v.is_empty() && !v.contains('\0') {
+                config.packages_r_path = Some(std::path::PathBuf::from(v));
+            }
         }
         if let Some(sev) = packages.get("missingPackageSeverity").and_then(|v| v.as_str()) {
             config.packages_missing_package_severity = parse_severity(sev);
