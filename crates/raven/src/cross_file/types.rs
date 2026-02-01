@@ -135,6 +135,28 @@ pub fn tree_sitter_point_to_lsp_position(
     }
 }
 
+/// Enrich metadata with inherited working directory from parent files.
+///
+/// Only sets `inherited_working_directory` when:
+/// - `sourced_by` is not empty (file has backward directives)
+/// - `working_directory` is None (no explicit @lsp-cd)
+///
+/// Uses `compute_inherited_working_directory` from dependency module.
+pub fn enrich_metadata_with_inherited_wd<F>(
+    meta: &mut CrossFileMetadata,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    get_metadata: F,
+) where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    if meta.sourced_by.is_empty() || meta.working_directory.is_some() {
+        return;
+    }
+    meta.inherited_working_directory =
+        super::dependency::compute_inherited_working_directory(uri, meta, workspace_root, get_metadata);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

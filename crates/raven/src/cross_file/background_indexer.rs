@@ -272,7 +272,28 @@ impl BackgroundIndexer {
         let metadata_fs = tokio::fs::metadata(&path).await?;
 
         // Extract cross-file metadata
-        let cross_file_meta = extract_metadata(&content);
+        let mut cross_file_meta = extract_metadata(&content);
+
+        // Enrich metadata with inherited working directory
+        {
+            let state_guard = state.read().await;
+            let workspace_root = state_guard.workspace_folders.first().cloned();
+            
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut cross_file_meta,
+                uri,
+                workspace_root.as_ref(),
+                |parent_uri| {
+                    state_guard.documents.get(parent_uri)
+                        .map(|doc| extract_metadata(&doc.text()))
+                        .or_else(|| state_guard.cross_file_workspace_index.get_metadata(parent_uri))
+                        .or_else(|| {
+                            state_guard.cross_file_file_cache.get(parent_uri)
+                                .map(|content| extract_metadata(&content))
+                        })
+                },
+            );
+        }
 
         // Compute scope artifacts using thread-local parser for efficiency
         let artifacts = crate::parser_pool::with_parser(|parser| {

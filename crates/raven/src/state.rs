@@ -635,6 +635,9 @@ pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
     let mut cross_file_entries = HashMap::new();
     let mut new_index_entries = HashMap::new();
 
+    // Get workspace root for path resolution
+    let workspace_root = folders.first().cloned();
+
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
@@ -649,6 +652,32 @@ pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
                 }
             }
         }
+    }
+
+    // Second pass: enrich metadata with inherited_working_directory
+    // Use scanned entries as the metadata source
+    // We need to collect metadata first to avoid borrow conflicts
+    let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
+        .iter()
+        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .collect();
+    
+    for (uri, entry) in new_index_entries.iter_mut() {
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut entry.metadata,
+            uri,
+            workspace_root.as_ref(),
+            |parent_uri| metadata_map.get(parent_uri).cloned(),
+        );
+    }
+    // Also update legacy cross_file_entries
+    for (uri, entry) in cross_file_entries.iter_mut() {
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut entry.metadata,
+            uri,
+            workspace_root.as_ref(),
+            |parent_uri| metadata_map.get(parent_uri).cloned(),
+        );
     }
 
     log::info!("Scanned {} workspace files ({} with cross-file metadata, {} new index entries)", 

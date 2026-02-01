@@ -462,18 +462,34 @@ impl LanguageServer for Backend {
         let (work_items, debounce_ms, files_to_index, on_demand_enabled, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
-            // Update new DocumentStore (Requirement 1.3)
-            state.document_store.open(uri.clone(), &text, version).await;
+            // Extract and enrich metadata with inherited working directory
+            let mut meta = crate::cross_file::extract_metadata(&text);
+            let uri_clone = uri.clone();
+            let workspace_root = state.workspace_folders.first().cloned();
+            
+            // Enrich metadata with inherited working directory before any use
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut meta,
+                &uri_clone,
+                workspace_root.as_ref(),
+                |parent_uri| {
+                    state.documents.get(parent_uri)
+                        .map(|doc| crate::cross_file::extract_metadata(&doc.text()))
+                        .or_else(|| state.cross_file_workspace_index.get_metadata(parent_uri))
+                        .or_else(|| {
+                            state.cross_file_file_cache.get(parent_uri)
+                                .map(|content| crate::cross_file::extract_metadata(&content))
+                        })
+                },
+            );
+            
+            // Update new DocumentStore with enriched metadata (Requirement 1.3)
+            state.document_store.open_with_metadata(uri.clone(), &text, version, meta.clone()).await;
             
             // Update legacy documents HashMap (for migration compatibility)
             state.open_document(uri.clone(), &text, Some(version));
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
-            
-            // Update dependency graph with cross-file metadata
-            let meta = crate::cross_file::extract_metadata(&text);
-            let uri_clone = uri.clone();
-            let workspace_root = state.workspace_folders.first().cloned();
             
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
             let packages_enabled = state.cross_file_config.packages_enabled;
@@ -805,19 +821,17 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
+        let changes = params.content_changes;
 
         // Compute affected files and debounce config while holding write lock
         let (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
-            // Update new DocumentStore (Requirement 1.4)
-            state.document_store.update(&uri, params.content_changes.clone(), version).await;
-            
-            // Update legacy documents HashMap (for migration compatibility)
+            // Update legacy documents HashMap first (for migration compatibility)
             if let Some(doc) = state.documents.get_mut(&uri) {
                 doc.version = Some(version);
             }
-            for change in params.content_changes {
+            for change in changes.clone() {
                 state.apply_change(&uri, change);
             }
             // Record as recently changed for activity prioritization
@@ -827,12 +841,28 @@ impl LanguageServer for Backend {
             let packages_enabled = state.cross_file_config.packages_enabled;
             let package_library = state.package_library.clone();
             
-            // Update dependency graph with new cross-file metadata
-            let packages_to_prefetch: Vec<String> = if let Some(doc) = state.documents.get(&uri) {
+            // Extract and enrich metadata with inherited working directory
+            let (packages_to_prefetch, enriched_meta) = if let Some(doc) = state.documents.get(&uri) {
                 let text = doc.text();
-                let meta = crate::cross_file::extract_metadata(&text);
+                let mut meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
                 let workspace_root = state.workspace_folders.first().cloned();
+                
+                // Enrich metadata with inherited working directory before any use
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut meta,
+                    &uri_clone,
+                    workspace_root.as_ref(),
+                    |parent_uri| {
+                        state.documents.get(parent_uri)
+                            .map(|doc| crate::cross_file::extract_metadata(&doc.text()))
+                            .or_else(|| state.cross_file_workspace_index.get_metadata(parent_uri))
+                            .or_else(|| {
+                                state.cross_file_file_cache.get(parent_uri)
+                                    .map(|content| crate::cross_file::extract_metadata(&content))
+                            })
+                    },
+                );
                 
                 // Collect package names for prefetch
                 let pkgs: Vec<String> = if packages_enabled {
@@ -866,10 +896,17 @@ impl LanguageServer for Backend {
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
                 
-                pkgs
+                (pkgs, Some(meta))
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
+            
+            // Update new DocumentStore with enriched metadata (Requirement 1.4)
+            if let Some(meta) = enriched_meta {
+                state.document_store.update_with_metadata(&uri, changes, version, meta).await;
+            } else {
+                state.document_store.update(&uri, changes, version).await;
+            }
             
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> = std::collections::HashSet::from([uri.clone()]);

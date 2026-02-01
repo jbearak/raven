@@ -308,6 +308,60 @@ impl DocumentStore {
         self.signal_update_complete(&uri);
     }
 
+    /// Open a document with pre-enriched metadata
+    /// 
+    /// Like `open`, but uses the provided metadata instead of extracting it.
+    /// Use this when metadata has been enriched with inherited_working_directory.
+    pub async fn open_with_metadata(&mut self, uri: Url, content: &str, version: i32, metadata: CrossFileMetadata) {
+        self.mark_update_started(&uri);
+        let contents = Rope::from_str(content);
+        let tree = Self::parse_content(content);
+        let loaded_packages = Self::extract_packages(&tree, content);
+        let artifacts = if let Some(ref tree) = tree {
+            crate::cross_file::scope::compute_artifacts(&uri, tree, content)
+        } else {
+            ScopeArtifacts::default()
+        };
+
+        let state = DocumentState {
+            uri: uri.clone(),
+            version,
+            contents,
+            tree,
+            loaded_packages,
+            metadata,
+            artifacts,
+            revision: 0,
+        };
+
+        let incoming_bytes = state.estimate_memory_bytes();
+        let existing_bytes = self.documents.get(&uri)
+            .map(|doc| doc.estimate_memory_bytes())
+            .unwrap_or(0);
+        
+        if !self.documents.contains_key(&uri) {
+            while self.documents.len() >= self.config.max_documents {
+                if !self.evict_lru_excluding(&uri) {
+                    break;
+                }
+            }
+        }
+        
+        let mut current_memory = self.estimate_memory_usage();
+        while current_memory.saturating_sub(existing_bytes) + incoming_bytes > self.config.max_memory_bytes {
+            if !self.evict_lru_excluding(&uri) {
+                break;
+            }
+            current_memory = self.estimate_memory_usage();
+        }
+
+        self.documents.insert(uri.clone(), state);
+        self.access_order.shift_remove(&uri);
+        self.access_order.insert(uri.clone());
+        self.metrics.documents_opened += 1;
+        self.signal_update_complete(&uri);
+    }
+
     /// Update a document with changes
     /// 
     /// Applies incremental changes and recomputes derived data.
@@ -352,6 +406,40 @@ impl DocumentStore {
 
             // Signal completion to any waiters
             // **Validates: Requirements 6.4**
+            self.signal_update_complete(uri);
+        }
+    }
+
+    /// Update a document with changes and pre-enriched metadata
+    /// 
+    /// Like `update`, but uses the provided metadata instead of extracting it.
+    /// Use this when metadata has been enriched with inherited_working_directory.
+    pub async fn update_with_metadata(
+        &mut self,
+        uri: &Url,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        version: i32,
+        metadata: CrossFileMetadata,
+    ) {
+        self.mark_update_started(uri);
+        if let Some(state) = self.documents.get_mut(uri) {
+            for change in changes {
+                Self::apply_change_to_rope(&mut state.contents, change);
+            }
+            state.version = version;
+            state.revision += 1;
+
+            let content = state.contents.to_string();
+            state.tree = Self::parse_content(&content);
+            state.loaded_packages = Self::extract_packages(&state.tree, &content);
+            state.metadata = metadata;
+            state.artifacts = if let Some(ref tree) = state.tree {
+                crate::cross_file::scope::compute_artifacts(uri, tree, &content)
+            } else {
+                ScopeArtifacts::default()
+            };
+
+            self.touch_access(uri);
             self.signal_update_complete(uri);
         }
     }
