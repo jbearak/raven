@@ -111,7 +111,10 @@ impl BackgroundIndexer {
             .map(|s| s.cross_file_config.on_demand_indexing_enabled)
             .unwrap_or(true);
         if !enabled {
-            log::trace!("Skipping indexing task for {} - on_demand_indexing disabled", uri);
+            log::trace!(
+                "Skipping indexing task for {} - on_demand_indexing disabled",
+                uri
+            );
             return;
         }
 
@@ -249,8 +252,7 @@ impl BackgroundIndexer {
 
                 // Queue transitive dependencies for both Priority 2 and Priority 3 tasks
                 // (as long as depth limit allows)
-                Self::queue_transitive_deps(state, queue, &task.uri, &metadata, task.depth)
-                    .await;
+                Self::queue_transitive_deps(state, queue, &task.uri, &metadata, task.depth).await;
             }
             Err(e) => {
                 log::warn!("Failed to index {}: {}", task.uri, e);
@@ -280,7 +282,7 @@ impl BackgroundIndexer {
             let state_guard = state.read().await;
             let workspace_root = state_guard.workspace_folders.first().cloned();
             let max_chain_depth = state_guard.cross_file_config.max_chain_depth;
-            
+
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut cross_file_meta,
                 uri,
@@ -304,9 +306,11 @@ impl BackgroundIndexer {
         // Update file cache and workspace index
         {
             let state_guard = state.read().await;
-            state_guard
-                .cross_file_file_cache
-                .insert(uri.clone(), snapshot.clone(), content.clone());
+            state_guard.cross_file_file_cache.insert(
+                uri.clone(),
+                snapshot.clone(),
+                content.clone(),
+            );
 
             let open_docs: HashSet<_> = state_guard.documents.keys().cloned().collect();
             state_guard.cross_file_workspace_index.update_from_disk(
@@ -381,7 +385,8 @@ impl BackgroundIndexer {
             return;
         }
 
-        let path_ctx = PathContext::from_metadata(uri, metadata, workspace_root.as_ref().map(|u| u as &Url));
+        let path_ctx =
+            PathContext::from_metadata(uri, metadata, workspace_root.as_ref().map(|u| u as &Url));
 
         for source in &metadata.sources {
             if let Some(ctx) = path_ctx.as_ref() {
@@ -396,7 +401,7 @@ impl BackgroundIndexer {
 
                         if needs_indexing {
                             let mut q = queue.lock().unwrap();
-                            
+
                             // Check queue size limit (Requirement 3.4)
                             if q.len() >= max_queue_size {
                                 log::warn!(
@@ -407,7 +412,7 @@ impl BackgroundIndexer {
                                 );
                                 continue;
                             }
-                            
+
                             if !q.iter().any(|t| t.uri == source_uri) {
                                 // Use saturating_add to prevent integer overflow at max depth
                                 let next_depth = current_depth.saturating_add(1);
@@ -446,7 +451,6 @@ impl Drop for BackgroundIndexer {
         self.shutdown();
     }
 }
-
 
 #[cfg(test)]
 mod tests {

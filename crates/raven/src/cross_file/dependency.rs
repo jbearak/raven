@@ -63,11 +63,12 @@ where
 ///
 /// # Returns
 /// * `Some(String)` - The parent's effective working directory as a string path
-/// * `None` - If the parent URI cannot be converted to a file path or depth is exhausted
+/// * `None` - If the parent URI cannot be converted to a file path
 ///
 /// # Fallback Behavior
-/// If parent metadata cannot be retrieved via `get_metadata`, the function falls back
-/// to using the parent file's directory as the inherited working directory.
+/// If parent metadata cannot be retrieved via `get_metadata`, or if the depth limit is
+/// reached, the function falls back to using the parent file's directory as the effective
+/// working directory.
 ///
 /// # Transitive Inheritance
 /// When the parent has an inherited_working_directory in its metadata (from its own parent),
@@ -109,16 +110,17 @@ where
 ///
 /// # Returns
 /// * `Some(String)` - The parent's effective working directory as a string path
-/// * `None` - If the parent URI cannot be converted to a file path or depth is exhausted
+/// * `None` - If the parent URI cannot be converted to a file path
 ///
 /// # Fallback Behavior
-/// If parent metadata cannot be retrieved via `get_metadata`, the function falls back
-/// to using the parent file's directory as the inherited working directory.
+/// If parent metadata cannot be retrieved via `get_metadata`, or if the depth limit is
+/// reached, the function falls back to using the parent file's directory as the effective
+/// working directory.
 ///
 /// # Cycle Detection
 /// When a URI is encountered that's already in the visited set, the function stops
-/// inheritance and uses the file's own directory. This prevents infinite loops in
-/// circular backward directive chains (e.g., A → B → A).
+/// inheritance and returns the *direct parent's directory*. This breaks the loop while still
+/// allowing the child to inherit from its parent.
 ///
 /// # Transitive Inheritance
 /// When the parent has an inherited_working_directory in its metadata (from its own parent),
@@ -170,7 +172,8 @@ where
         // Build parent's PathContext from metadata
         // This handles transitive inheritance: if parent has inherited_working_directory,
         // it will be used in effective_working_directory() (Requirement 9.1)
-        if let Some(parent_ctx) = PathContext::from_metadata(parent_uri, &parent_meta, workspace_root)
+        if let Some(parent_ctx) =
+            PathContext::from_metadata(parent_uri, &parent_meta, workspace_root)
         {
             // Get effective working directory
             let effective_wd = parent_ctx.effective_working_directory();
@@ -206,7 +209,7 @@ pub const DEFAULT_MAX_INHERITANCE_DEPTH: usize = 10;
 ///
 /// Uses the first backward directive's parent to determine inheritance.
 /// Returns None if no backward directives exist, if the child has an explicit working
-/// directory, or if parent metadata is unavailable.
+/// directory, or if the parent URI cannot be resolved to a file path.
 ///
 /// This is a convenience wrapper around `compute_inherited_working_directory_with_depth`
 /// that uses the default maximum depth.
@@ -367,19 +370,13 @@ where
 
     // Check depth limit to prevent infinite chains (Requirement 9.2)
     if max_depth == 0 {
-        log::trace!(
-            "Skipping WD inheritance for {}: max depth exceeded",
-            uri
-        );
+        log::trace!("Skipping WD inheritance for {}: max depth exceeded", uri);
         return None;
     }
 
     // Skip if file has explicit working directory (Requirement 3.1)
     if meta.working_directory.is_some() {
-        log::trace!(
-            "Skipping WD inheritance for {}: has explicit @lsp-cd",
-            uri
-        );
+        log::trace!("Skipping WD inheritance for {}: has explicit @lsp-cd", uri);
         return None;
     }
 
@@ -487,8 +484,11 @@ pub struct DependencyEdge {
     pub chdir: bool,
     /// True for sys.source(), false for source()
     pub is_sys_source: bool,
-    /// True if from @lsp-source directive, false if from AST detection
+    /// True if the edge was created from an LSP directive (@lsp-source or @lsp-sourced-by)
     pub is_directive: bool,
+    /// True if the directive origin is a backward directive (@lsp-sourced-by / @lsp-run-by).
+    /// False for forward directives (@lsp-source) and AST-detected edges.
+    pub is_backward_directive: bool,
 }
 
 /// Canonical key for edge deduplication (from, to pair only)
@@ -508,6 +508,7 @@ struct EdgeKey {
     local: bool,
     chdir: bool,
     is_sys_source: bool,
+    is_backward_directive: bool,
 }
 
 impl DependencyEdge {
@@ -520,6 +521,7 @@ impl DependencyEdge {
             local: self.local,
             chdir: self.chdir,
             is_sys_source: self.is_sys_source,
+            is_backward_directive: self.is_backward_directive,
         }
     }
 
@@ -637,6 +639,7 @@ impl DependencyGraph {
                         chdir: source.chdir,
                         is_sys_source: source.is_sys_source,
                         is_directive: true,
+                        is_backward_directive: false,
                     };
                     directive_from_to.insert(edge.as_from_to_pair());
                     directive_edges.push(edge);
@@ -650,16 +653,19 @@ impl DependencyGraph {
         for directive in &meta.sourced_by {
             if let Some(parent_uri) = do_resolve_backward(&directive.path) {
                 // Extract child filename for inference
-                let child_filename = uri.path_segments()
+                let child_filename = uri
+                    .path_segments()
                     .and_then(|mut s| s.next_back())
                     .unwrap_or("");
-                
+
                 let (call_site_line, call_site_column) = match &directive.call_site {
                     CallSiteSpec::Line(n) => (Some(*n), Some(u32::MAX)), // end-of-line
                     CallSiteSpec::Match(pattern) => {
                         // Resolve match pattern in parent content
                         if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) = resolve_match_pattern(&parent_content, pattern, child_filename) {
+                            if let Some((line, col)) =
+                                resolve_match_pattern(&parent_content, pattern, child_filename)
+                            {
                                 (Some(line), Some(col))
                             } else {
                                 (None, None) // Pattern not found
@@ -671,7 +677,9 @@ impl DependencyGraph {
                     CallSiteSpec::Default => {
                         // Try text-inference: scan parent for source() call to child
                         if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) = infer_call_site_from_parent(&parent_content, child_filename) {
+                            if let Some((line, col)) =
+                                infer_call_site_from_parent(&parent_content, child_filename)
+                            {
                                 (Some(line), Some(col))
                             } else {
                                 (None, None) // No source() call found
@@ -690,6 +698,7 @@ impl DependencyGraph {
                     chdir: false,
                     is_sys_source: false,
                     is_directive: true,
+                    is_backward_directive: true,
                 };
                 let pair = edge.as_from_to_pair();
                 if !directive_from_to.contains(&pair) {
@@ -713,13 +722,15 @@ impl DependencyGraph {
                         chdir: source.chdir,
                         is_sys_source: source.is_sys_source,
                         is_directive: false,
+                        is_backward_directive: false,
                     };
                     let pair = edge.as_from_to_pair();
 
                     // Check for directive-vs-AST conflict (Requirement 6.8)
                     if directive_from_to.contains(&pair) {
                         // Find the directive edge for this (from, to) pair
-                        let directive_edge = directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
+                        let directive_edge =
+                            directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
 
                         if let Some(dir_edge) = directive_edge {
                             // Check if directive has a known call site
@@ -728,7 +739,8 @@ impl DependencyGraph {
 
                             if directive_has_call_site {
                                 // Directive has known call site: only override AST edge at same call site
-                                let call_sites_match = dir_edge.call_site_line == edge.call_site_line
+                                let call_sites_match = dir_edge.call_site_line
+                                    == edge.call_site_line
                                     && dir_edge.call_site_column == edge.call_site_column;
 
                                 if call_sites_match {
@@ -742,12 +754,22 @@ impl DependencyGraph {
                             } else {
                                 // Directive has no call site: suppress all AST edges to this target
                                 // Emit warning about suppression
-                                let diag_line = meta.sourced_by.iter()
-                                    .find(|d| do_resolve(&d.path) == Some(dir_edge.from.clone()))
+                                let diag_line = meta
+                                    .sourced_by
+                                    .iter()
+                                    .find(|d| {
+                                        do_resolve_backward(&d.path) == Some(dir_edge.from.clone())
+                                    })
                                     .map(|d| d.directive_line)
-                                    .or_else(|| meta.sources.iter()
-                                        .find(|s| s.is_directive && do_resolve(&s.path) == Some(to_uri.clone()))
-                                        .map(|s| s.line))
+                                    .or_else(|| {
+                                        meta.sources
+                                            .iter()
+                                            .find(|s| {
+                                                s.is_directive
+                                                    && do_resolve(&s.path) == Some(to_uri.clone())
+                                            })
+                                            .map(|s| s.line)
+                                    })
                                     .unwrap_or(0);
 
                                 result.diagnostics.push(Diagnostic {
@@ -787,51 +809,69 @@ impl DependencyGraph {
 
         // Log total edge count after update
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
-        log::trace!("Dependency graph now has {} total edges after updating {}", total_edges, uri);
+        log::trace!(
+            "Dependency graph now has {} total edges after updating {}",
+            total_edges,
+            uri
+        );
 
         result
     }
 
     /// Simple update without content provider (for backward compatibility in tests)
     /// Uses file-relative path resolution only (no workspace root)
-    pub fn update_file_simple(
-        &mut self,
-        uri: &Url,
-        meta: &CrossFileMetadata,
-    ) {
+    pub fn update_file_simple(&mut self, uri: &Url, meta: &CrossFileMetadata) {
         let _ = self.update_file(uri, meta, None, |_| None);
     }
 
     /// Remove edges where the given URI is the child that were created from backward directives
     fn remove_backward_edges_for_child(&mut self, child_uri: &Url) {
         // Get edges where this file is the child
-        let edges_to_remove: Vec<DependencyEdge> = self.backward
+        let edges_to_remove: Vec<DependencyEdge> = self
+            .backward
             .get(child_uri)
             .map(|edges| {
-                edges.iter()
-                    .filter(|e| e.is_directive && &e.to == child_uri)
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive && &e.to == child_uri)
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
 
         if !edges_to_remove.is_empty() {
-            log::trace!("Removing {} backward directive edges for child {}", edges_to_remove.len(), child_uri);
+            log::trace!(
+                "Removing {} backward directive edges for child {}",
+                edges_to_remove.len(),
+                child_uri
+            );
         }
 
         // Remove from both forward and backward indices
         for edge in edges_to_remove {
-            log::trace!("  Removing backward directive edge: {} -> {}", edge.from, edge.to);
+            log::trace!(
+                "  Removing backward directive edge: {} -> {}",
+                edge.from,
+                edge.to
+            );
             // Remove from forward index
             if let Some(forward_edges) = self.forward.get_mut(&edge.from) {
-                forward_edges.retain(|e| !(e.to == edge.to && e.is_directive && e.call_site_line == edge.call_site_line));
+                forward_edges.retain(|e| {
+                    !(e.to == edge.to
+                        && e.is_backward_directive
+                        && e.call_site_line == edge.call_site_line)
+                });
                 if forward_edges.is_empty() {
                     self.forward.remove(&edge.from);
                 }
             }
             // Remove from backward index
             if let Some(backward_edges) = self.backward.get_mut(child_uri) {
-                backward_edges.retain(|e| !(e.from == edge.from && e.is_directive && e.call_site_line == edge.call_site_line));
+                backward_edges.retain(|e| {
+                    !(e.from == edge.from
+                        && e.is_backward_directive
+                        && e.call_site_line == edge.call_site_line)
+                });
                 if backward_edges.is_empty() {
                     self.backward.remove(child_uri);
                 }
@@ -903,17 +943,14 @@ impl DependencyGraph {
             edge.local,
             edge.chdir
         );
-        
+
         // Add to forward index
         self.forward
             .entry(edge.from.clone())
             .or_default()
             .push(edge.clone());
         // Add to backward index
-        self.backward
-            .entry(edge.to.clone())
-            .or_default()
-            .push(edge);
+        self.backward.entry(edge.to.clone()).or_default().push(edge);
     }
 
     fn remove_forward_edges(&mut self, uri: &Url) {
@@ -933,34 +970,38 @@ impl DependencyGraph {
 
     /// Remove forward edges from a file, but only those created by forward sources/directives
     /// in that file. Preserve edges created by backward directives in other files.
-    /// 
+    ///
     /// This is used during update_file to avoid removing edges that were created by
     /// backward directives in child files.
     fn remove_forward_edges_from_this_file(&mut self, uri: &Url) {
         // Get all current forward edges from this file
         let edges_to_check = self.forward.get(uri).cloned().unwrap_or_default();
-        
+
         if edges_to_check.is_empty() {
             return;
         }
-        
-        log::trace!("Checking {} forward edges from {} for removal", edges_to_check.len(), uri);
-        
+
+        log::trace!(
+            "Checking {} forward edges from {} for removal",
+            edges_to_check.len(),
+            uri
+        );
+
         // We'll rebuild the forward edges list, keeping only edges created by backward directives
         let mut edges_to_keep = Vec::new();
         let mut edges_to_remove = Vec::new();
-        
+
         for edge in edges_to_check {
             // Heuristic: if this is a directive edge, it might have been created by a backward
             // directive in the child file. We'll keep it for now and let it be removed when
             // the child file is updated (via remove_backward_edges_for_child).
-            // 
+            //
             // However, if it's NOT a directive edge, it was definitely created by a source()
             // call in THIS file, so we should remove it.
             //
             // Actually, this heuristic is not quite right. A directive edge could be from
             // either a forward directive in this file OR a backward directive in the child.
-            // 
+            //
             // Better approach: we'll remove ALL non-directive edges (source() calls), and
             // we'll also remove directive edges, but they'll be re-created if they're still
             // in the metadata. Edges from backward directives in other files will be preserved
@@ -981,7 +1022,7 @@ impl DependencyGraph {
             //
             // The downside: if we remove a forward directive from THIS file, the edge won't
             // be removed until we update the child file. But that's acceptable for now.
-            
+
             if edge.is_directive {
                 // Keep directive edges - they might be from backward directives in other files
                 edges_to_keep.push(edge);
@@ -990,19 +1031,24 @@ impl DependencyGraph {
                 edges_to_remove.push(edge);
             }
         }
-        
+
         // Update the forward index
         if edges_to_keep.is_empty() {
             self.forward.remove(uri);
         } else {
             self.forward.insert(uri.clone(), edges_to_keep);
         }
-        
+
         // Remove from backward index
         for edge in edges_to_remove {
-            log::trace!("  Removing non-directive edge: {} -> {}", edge.from, edge.to);
+            log::trace!(
+                "  Removing non-directive edge: {} -> {}",
+                edge.from,
+                edge.to
+            );
             if let Some(backward_edges) = self.backward.get_mut(&edge.to) {
-                backward_edges.retain(|e| !(e.from == edge.from && e.to == edge.to && !e.is_directive));
+                backward_edges
+                    .retain(|e| !(e.from == edge.from && e.to == edge.to && !e.is_directive));
                 if backward_edges.is_empty() {
                     self.backward.remove(&edge.to);
                 }
@@ -1036,19 +1082,28 @@ impl DependencyGraph {
     pub fn dump_state(&self) -> String {
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
         let mut output = String::new();
-        output.push_str(&format!("Dependency Graph State ({} total edges):\n", total_edges));
-        output.push_str(&format!("  {} parent files with outgoing edges\n", self.forward.len()));
-        output.push_str(&format!("  {} child files with incoming edges\n\n", self.backward.len()));
-        
+        output.push_str(&format!(
+            "Dependency Graph State ({} total edges):\n",
+            total_edges
+        ));
+        output.push_str(&format!(
+            "  {} parent files with outgoing edges\n",
+            self.forward.len()
+        ));
+        output.push_str(&format!(
+            "  {} child files with incoming edges\n\n",
+            self.backward.len()
+        ));
+
         if self.forward.is_empty() {
             output.push_str("  (no edges)\n");
             return output;
         }
-        
+
         // Sort parents for consistent output
         let mut parents: Vec<_> = self.forward.keys().collect();
         parents.sort();
-        
+
         for parent in parents {
             if let Some(edges) = self.forward.get(parent) {
                 output.push_str(&format!("  {}:\n", parent));
@@ -1060,17 +1115,29 @@ impl DependencyGraph {
                     };
                     let flags = {
                         let mut f = Vec::new();
-                        if edge.is_directive { f.push("directive"); }
-                        if edge.local { f.push("local"); }
-                        if edge.chdir { f.push("chdir"); }
-                        if edge.is_sys_source { f.push("sys.source"); }
-                        if f.is_empty() { "".to_string() } else { format!(" [{}]", f.join(", ")) }
+                        if edge.is_directive {
+                            f.push("directive");
+                        }
+                        if edge.local {
+                            f.push("local");
+                        }
+                        if edge.chdir {
+                            f.push("chdir");
+                        }
+                        if edge.is_sys_source {
+                            f.push("sys.source");
+                        }
+                        if f.is_empty() {
+                            "".to_string()
+                        } else {
+                            format!(" [{}]", f.join(", "))
+                        }
                     };
                     output.push_str(&format!("    -> {} ({}){}\n", edge.to, call_site, flags));
                 }
             }
         }
-        
+
         output
     }
 
@@ -1099,8 +1166,8 @@ impl DependencyGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::BackwardDirective;
+    use super::*;
 
     fn url(s: &str) -> Url {
         Url::parse(&format!("file:///project/{}", s)).unwrap()
@@ -1372,7 +1439,7 @@ mod tests {
         // because directive has known call site and doesn't suppress AST at different site
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 2);
-        
+
         // No warning since directive has known call site
         assert!(result.diagnostics.is_empty());
     }
@@ -1528,7 +1595,11 @@ z <- 3
 "#;
 
         graph.update_file(&child, &meta, Some(&workspace_root()), |uri| {
-            if uri == &parent { Some(parent_content.to_string()) } else { None }
+            if uri == &parent {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
         });
 
         // Should create forward edge from parent to child with resolved call site
@@ -1566,7 +1637,11 @@ z <- 3
 "#;
 
         graph.update_file(&child, &meta, Some(&workspace_root()), |uri| {
-            if uri == &parent { Some(parent_content.to_string()) } else { None }
+            if uri == &parent {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
         });
 
         // Should create forward edge from parent to child with inferred call site
@@ -1612,7 +1687,7 @@ z <- 3
 
         // Test dump_state
         let state = graph.dump_state();
-        
+
         // Verify output contains expected information
         assert!(state.contains("2 total edges"));
         assert!(state.contains("file:///project/main.R"));
@@ -1855,18 +1930,14 @@ z <- 3
             ..Default::default()
         };
 
-        let result = compute_inherited_working_directory(
-            &child_uri,
-            &child_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent_uri {
                     Some(parent_meta.clone())
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         assert!(result.is_some());
         let wd = result.unwrap();
@@ -1891,12 +1962,10 @@ z <- 3
             ..Default::default()
         };
 
-        let result = compute_inherited_working_directory(
-            &child_uri,
-            &child_meta,
-            Some(&workspace),
-            |_| panic!("Should not call get_metadata when child has explicit WD"),
-        );
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |_| {
+                panic!("Should not call get_metadata when child has explicit WD")
+            });
 
         assert!(result.is_none());
     }
@@ -1913,12 +1982,10 @@ z <- 3
             ..Default::default()
         };
 
-        let result = compute_inherited_working_directory(
-            &child_uri,
-            &child_meta,
-            Some(&workspace),
-            |_| panic!("Should not call get_metadata when no backward directives"),
-        );
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |_| {
+                panic!("Should not call get_metadata when no backward directives")
+            });
 
         assert!(result.is_none());
     }
@@ -1959,11 +2026,8 @@ z <- 3
             ..Default::default()
         };
 
-        let result = compute_inherited_working_directory(
-            &child_uri,
-            &child_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent1_uri {
                     Some(parent1_meta.clone())
                 } else if uri == &parent2_uri {
@@ -1971,8 +2035,7 @@ z <- 3
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         assert!(result.is_some());
         let wd = result.unwrap();
@@ -2003,18 +2066,14 @@ z <- 3
             ..Default::default()
         };
 
-        let result = compute_inherited_working_directory(
-            &child_uri,
-            &child_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent_uri {
                     Some(parent_meta.clone())
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         assert!(result.is_some());
         let wd = result.unwrap();
@@ -2173,11 +2232,8 @@ z <- 3
         };
 
         // Compute C's inherited WD - should get A's WD through B
-        let result = compute_inherited_working_directory(
-            &c_uri,
-            &c_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&c_uri, &c_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
                     Some(a_meta.clone())
                 } else if uri == &b_uri {
@@ -2185,8 +2241,7 @@ z <- 3
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         assert!(result.is_some());
         let wd = result.unwrap();
@@ -2306,11 +2361,8 @@ z <- 3
         };
 
         // Compute A's inherited WD - should detect cycle and return None or fallback
-        let result = compute_inherited_working_directory(
-            &a_uri,
-            &a_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
                     Some(a_meta.clone())
                 } else if uri == &b_uri {
@@ -2318,8 +2370,7 @@ z <- 3
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         // Should get B's directory as the result (B is the parent, and when we try to
         // resolve B's inherited WD, we detect the cycle back to A and fall back to B's directory)
@@ -2348,18 +2399,14 @@ z <- 3
         };
 
         // Compute A's inherited WD - should detect self-cycle
-        let result = compute_inherited_working_directory(
-            &a_uri,
-            &a_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
                     Some(a_meta.clone())
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         // Should get A's directory as fallback when cycle is detected
         assert!(result.is_some());
@@ -2411,11 +2458,8 @@ z <- 3
         };
 
         // Compute A's inherited WD - should detect cycle eventually
-        let result = compute_inherited_working_directory(
-            &a_uri,
-            &a_meta,
-            Some(&workspace),
-            |uri| {
+        let result =
+            compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
                     Some(a_meta.clone())
                 } else if uri == &b_uri {
@@ -2425,8 +2469,7 @@ z <- 3
                 } else {
                     None
                 }
-            },
-        );
+            });
 
         // Should get a result (fallback to some directory when cycle is detected)
         assert!(result.is_some());

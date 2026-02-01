@@ -209,7 +209,7 @@ if parent_wd_changed {
     // Find all children with backward directives to this parent
     let children = graph.get_dependents(&parent_uri);
     for child_edge in children {
-        if child_edge.is_directive {
+        if child_edge.is_backward_directive {
             // Invalidate child's metadata cache
             invalidate_metadata_cache(&child_edge.to);
         }
@@ -353,12 +353,12 @@ Based on the prework analysis, the following properties have been identified and
 
 **Validates: Requirements 9.3**
 
-## Error Handling
+## Error Handling Summary
 
 ### Error Categories
 
 | Error Type | Handling Strategy | User Feedback |
-|------------|-------------------|---------------|
+| ---------- | ----------------- | ------------- |
 | Parent file not found | Log warning, skip inheritance | Diagnostic on backward directive line |
 | Parent metadata unavailable | Use parent's directory as fallback | None (silent fallback) |
 | Circular dependency | Stop at cycle, use file's directory | Trace log for debugging |

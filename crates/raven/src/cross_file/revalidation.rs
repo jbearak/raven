@@ -211,7 +211,7 @@ impl CrossFileActivityState {
 /// - Compares the parent's effective working directory (explicit `working_directory` or inherited)
 /// - If they differ (including None -> Some, Some -> None, or Some(a) -> Some(b)),
 ///   finds all children that have backward directives to this parent
-/// - Only returns children where the edge `is_directive` is true (from backward directives)
+/// - Only returns children where the edge `is_backward_directive` is true (from backward directives)
 ///
 /// _Requirements: 8.1, 8.2_
 pub fn detect_parent_wd_change_affected_children(
@@ -235,11 +235,7 @@ pub fn detect_parent_wd_change_affected_children(
     let wd_changed = old_wd != new_wd;
 
     if !wd_changed {
-        log::trace!(
-            "Parent WD unchanged for {}: {:?}",
-            parent_uri,
-            new_wd
-        );
+        log::trace!("Parent WD unchanged for {}: {:?}", parent_uri, new_wd);
         return Vec::new();
     }
 
@@ -256,7 +252,7 @@ pub fn detect_parent_wd_change_affected_children(
     let children: Vec<Url> = graph
         .get_dependencies(parent_uri)
         .into_iter()
-        .filter(|edge| edge.is_directive) // Only edges from backward directives
+        .filter(|edge| edge.is_backward_directive) // Only edges from backward directives
         .map(|edge| edge.to.clone())
         .collect();
 
@@ -315,12 +311,8 @@ pub fn invalidate_children_on_parent_wd_change(
     metadata_cache: &super::cache::MetadataCache,
 ) -> Vec<Url> {
     // Find affected children
-    let affected_children = detect_parent_wd_change_affected_children(
-        parent_uri,
-        old_meta,
-        new_meta,
-        graph,
-    );
+    let affected_children =
+        detect_parent_wd_change_affected_children(parent_uri, old_meta, new_meta, graph);
 
     if affected_children.is_empty() {
         return affected_children;
@@ -740,23 +732,17 @@ mod tests {
         let child_uri = url("subdir/child.R");
         let mut graph = DependencyGraph::new();
 
-        // Add a directive edge from parent to child
+        // Add a backward-directive edge from parent to child
         // (simulating what happens when child has @lsp-sourced-by: ../parent.R)
-        // We use a forward source with is_directive=true to simulate the backward directive effect
-        let parent_meta = CrossFileMetadata {
-            sources: vec![crate::cross_file::types::ForwardSource {
-                path: "subdir/child.R".to_string(), // Relative path from parent
-                line: 0,
-                column: 0,
-                is_directive: true,
-                local: false,
-                chdir: false,
-                is_sys_source: false,
-                sys_source_global_env: true,
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![crate::cross_file::types::BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: crate::cross_file::types::CallSiteSpec::Default,
+                directive_line: 0,
             }],
             ..Default::default()
         };
-        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root()), |_| None);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root()), |_| None);
 
         let old_meta = CrossFileMetadata {
             working_directory: None,
@@ -874,21 +860,21 @@ mod tests {
         let mut graph = DependencyGraph::new();
         let metadata_cache = super::super::cache::MetadataCache::new();
 
-        // Add a directive edge from parent to child
-        let parent_meta = CrossFileMetadata {
-            sources: vec![crate::cross_file::types::ForwardSource {
-                path: "subdir/child.R".to_string(),
-                line: 0,
-                column: 0,
-                is_directive: true,
-                local: false,
-                chdir: false,
-                is_sys_source: false,
-                sys_source_global_env: true,
+        // Add a backward-directive edge from parent to child
+        let child_meta_for_graph = CrossFileMetadata {
+            sourced_by: vec![crate::cross_file::types::BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: crate::cross_file::types::CallSiteSpec::Default,
+                directive_line: 0,
             }],
             ..Default::default()
         };
-        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root()), |_| None);
+        graph.update_file(
+            &child_uri,
+            &child_meta_for_graph,
+            Some(&workspace_root()),
+            |_| None,
+        );
 
         // Add child's metadata to cache
         let child_meta = CrossFileMetadata {
@@ -942,33 +928,35 @@ mod tests {
         let mut graph = DependencyGraph::new();
         let metadata_cache = super::super::cache::MetadataCache::new();
 
-        // Add directive edges from parent to both children
-        let parent_meta = CrossFileMetadata {
-            sources: vec![
-                crate::cross_file::types::ForwardSource {
-                    path: "child1.R".to_string(),
-                    line: 0,
-                    column: 0,
-                    is_directive: true,
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                },
-                crate::cross_file::types::ForwardSource {
-                    path: "child2.R".to_string(),
-                    line: 1,
-                    column: 0,
-                    is_directive: true,
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                },
-            ],
+        // Add backward-directive edges from parent to both children
+        let child1_meta_for_graph = CrossFileMetadata {
+            sourced_by: vec![crate::cross_file::types::BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: crate::cross_file::types::CallSiteSpec::Default,
+                directive_line: 0,
+            }],
             ..Default::default()
         };
-        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root()), |_| None);
+        let child2_meta_for_graph = CrossFileMetadata {
+            sourced_by: vec![crate::cross_file::types::BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: crate::cross_file::types::CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(
+            &child1_uri,
+            &child1_meta_for_graph,
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &child2_uri,
+            &child2_meta_for_graph,
+            Some(&workspace_root()),
+            |_| None,
+        );
 
         // Add children's metadata to cache
         metadata_cache.insert(child1_uri.clone(), CrossFileMetadata::default());

@@ -19,9 +19,8 @@ use super::types::{CallSiteSpec, CrossFileMetadata};
 
 /// R reserved words and special values that cannot be used as identifiers
 const R_RESERVED: &[&str] = &[
-    "if", "else", "for", "in", "while", "repeat", "next", "break", "function",
-    "NA", "NaN", "Inf", "NULL", "TRUE", "FALSE", "T", "F",
-    "na", "nan", "inf", "null", "true", "false",
+    "if", "else", "for", "in", "while", "repeat", "next", "break", "function", "NA", "NaN", "Inf",
+    "NULL", "TRUE", "FALSE", "T", "F", "na", "nan", "inf", "null", "true", "false",
 ];
 
 /// Check if a name is a valid R identifier (not reserved)
@@ -513,7 +512,9 @@ use tree_sitter::Parser;
 
 fn parse_r(code: &str) -> tree_sitter::Tree {
     let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .unwrap();
     parser.parse(code, None).unwrap()
 }
 
@@ -1520,7 +1521,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 4: Local Symbol Precedence
 // Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3
@@ -1530,7 +1530,9 @@ use super::scope::{compute_artifacts, scope_at_position_with_deps, ScopeArtifact
 
 fn parse_r_tree(code: &str) -> tree_sitter::Tree {
     let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .unwrap();
     parser.parse(code, None).unwrap()
 }
 
@@ -1677,7 +1679,6 @@ proptest! {
         prop_assert!(scope_after.symbols.contains_key(&symbol_name));
     }
 }
-
 
 // ============================================================================
 // Property 22: Maximum Depth Enforcement
@@ -1849,7 +1850,6 @@ proptest! {
         prop_assert!(!scope.symbols.contains_key(&symbol_name));
     }
 }
-
 
 // ============================================================================
 // Property 51: Full Position Precision
@@ -2070,7 +2070,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 5: Function-local variable scope boundaries
 // Validates: Variables defined inside function NOT available outside
@@ -2101,7 +2100,7 @@ proptest! {
 
         // At end of file (outside function), local variable should NOT be available
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        
+
         prop_assert!(scope_outside.symbols.contains_key(&func_name),
             "Function name should be available outside function");
         prop_assert!(scope_outside.symbols.contains_key(&global_var),
@@ -2382,7 +2381,6 @@ proptest! {
         prop_assert!(meta.sources[0].is_directive);
     }
 }
-
 
 // ============================================================================
 // Property 24: Scope Cache Invalidation on Interface Change
@@ -2926,7 +2924,7 @@ proptest! {
     ) {
         // Test that the configuration flag exists and can be toggled
         let mut config = CrossFileConfig::default();
-        
+
         // Default should be true
         prop_assert!(config.undefined_variables_enabled,
             "Default undefined_variables_enabled should be true");
@@ -2951,8 +2949,10 @@ proptest! {
 // Validates: Requirements 5.10
 // ============================================================================
 
-use super::parent_resolve::{resolve_parent, compute_metadata_fingerprint, compute_reverse_edges_hash};
 use super::cache::ParentResolution;
+use super::parent_resolve::{
+    compute_metadata_fingerprint, compute_reverse_edges_hash, resolve_parent,
+};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -3190,14 +3190,16 @@ proptest! {
 // Validates: Requirements 0.4, 13.4
 // ============================================================================
 
-use super::revalidation::{CrossFileRevalidationState, CrossFileDiagnosticsGate, CrossFileActivityState};
+use super::revalidation::{
+    CrossFileActivityState, CrossFileDiagnosticsGate, CrossFileRevalidationState,
+};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     /// Property 35: For any file change that invalidates dependent files, all affected
     /// open files SHALL receive updated diagnostics without requiring user edits.
-    /// 
+    ///
     /// This test verifies the revalidation scheduling mechanism works correctly.
     #[test]
     fn prop_diagnostics_fanout_to_open_files(
@@ -3270,7 +3272,7 @@ proptest! {
     /// Property 41: For any debounced/background diagnostics task, if either the
     /// document version OR the document content hash/revision changes between task
     /// scheduling and publishing, the task SHALL NOT publish diagnostics.
-    /// 
+    ///
     /// This test verifies the diagnostics gate mechanism.
     #[test]
     fn prop_freshness_guard_prevents_stale(
@@ -3480,8 +3482,8 @@ proptest! {
 // Validates: Requirements 13.5
 // ============================================================================
 
+use super::file_cache::{CrossFileFileCache, FileSnapshot};
 use super::workspace_index::{CrossFileWorkspaceIndex, IndexEntry};
-use super::file_cache::{FileSnapshot, CrossFileFileCache};
 use std::time::SystemTime;
 
 proptest! {
@@ -3924,7 +3926,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 5: Diagnostic Suppression
 // Validates: Requirements 2.2, 2.3, 10.4, 10.5
@@ -4007,7 +4008,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 54: Diagnostics Gate Cleanup on Close
 // Validates: Requirements 0.7, 0.8
@@ -4047,7 +4047,6 @@ proptest! {
             "After clear, newer version should be publishable");
     }
 }
-
 
 // ============================================================================
 // Property 49: Client Activity Signal Processing
@@ -4100,7 +4099,6 @@ proptest! {
             "Non-visible, non-active document should have priority > 1");
     }
 }
-
 
 // ============================================================================
 // Integration Tests - Task 21
@@ -4399,8 +4397,8 @@ proptest! {
 
         // Should have FunctionScope event in timeline
         let has_function_scope = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
-                if parameters.iter().any(|p| p.name == param1) && 
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. }
+                if parameters.iter().any(|p| p.name == param1) &&
                    parameters.iter().any(|p| p.name == param2))
         });
         prop_assert!(has_function_scope, "Should have FunctionScope event with parameters");
@@ -4430,7 +4428,7 @@ proptest! {
 
         // Should have FunctionScope event with empty parameters
         let has_function_scope = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. }
                 if parameters.is_empty())
         });
         prop_assert!(has_function_scope, "Should have FunctionScope event with empty parameters");
@@ -4452,7 +4450,7 @@ proptest! {
 
         // Should have FunctionScope event with parameter
         let has_function_scope = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. }
                 if parameters.iter().any(|p| p.name == param_name))
         });
         prop_assert!(has_function_scope, "Should have FunctionScope event with default parameter");
@@ -4474,7 +4472,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     /// Property 25: Source local=FALSE global scope
-    /// For any file sourced with local=FALSE, all symbols defined in that file 
+    /// For any file sourced with local=FALSE, all symbols defined in that file
     /// should be available in the global scope.
     #[test]
     fn prop_source_local_false_global_scope(
@@ -4514,7 +4512,7 @@ proptest! {
     }
 
     /// Property 26: Source local=TRUE function scope
-    /// For any file sourced with local=TRUE inside a function, all symbols 
+    /// For any file sourced with local=TRUE inside a function, all symbols
     /// defined in that file should be available only within that function scope.
     #[test]
     fn prop_source_local_true_function_scope(
@@ -4579,7 +4577,7 @@ proptest! {
     }
 
     /// Property 27: Source local parameter default
-    /// For any source() call without an explicit local parameter, the system 
+    /// For any source() call without an explicit local parameter, the system
     /// should treat it as local=FALSE.
     #[test]
     fn prop_source_local_parameter_default(
@@ -4619,7 +4617,7 @@ proptest! {
 
         // Verify the source() call was detected with local=false by default
         let has_source_call = parent_artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::Source { source, .. } 
+            matches!(event, super::scope::ScopeEvent::Source { source, .. }
                 if source.path == "child.R" && !source.local)
         });
         prop_assert!(has_source_call,
@@ -4642,7 +4640,7 @@ proptest! {
         let uri = make_url("test");
 
         // For loop with iterator variable
-        let code = format!("for ({} in 1:10) {{ print({}) }}\nafter_loop <- {}", 
+        let code = format!("for ({} in 1:10) {{ print({}) }}\nafter_loop <- {}",
                           iterator_name, iterator_name, iterator_name);
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
@@ -4775,7 +4773,7 @@ proptest! {
         // Both should have Parameter kind
         let param_with_default_symbol = scope_in_body.symbols.get(&param_with_default).unwrap();
         let param_without_default_symbol = scope_in_body.symbols.get(&param_without_default).unwrap();
-        
+
         prop_assert_eq!(param_with_default_symbol.kind, super::scope::SymbolKind::Parameter,
             "Parameter with default should have Parameter kind");
         prop_assert_eq!(param_without_default_symbol.kind, super::scope::SymbolKind::Parameter,
@@ -5688,7 +5686,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: rm-remove-support, Property 5: envir= Argument Filtering
 // Validates: Requirements 4.1, 4.2, 4.3
@@ -6059,7 +6056,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: rm-remove-support, Property 6: Function Scope Isolation
 // Validates: Requirements 5.1, 5.2, 5.3
@@ -6330,7 +6326,6 @@ proptest! {
             "Function-local variable should NOT be available outside function");
     }
 }
-
 
 // ============================================================================
 // Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
@@ -6809,7 +6804,6 @@ proptest! {
             "Symbol should NOT be in scope after rm() on same line");
     }
 }
-
 
 // ============================================================================
 // Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
@@ -7301,7 +7295,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 3: Position-Aware Package Scope
 // Feature: package-function-awareness
@@ -7323,9 +7316,8 @@ use super::scope::ScopeEvent;
 
 /// R reserved words that cannot be used as package names
 const R_RESERVED_PKG: &[&str] = &[
-    "if", "else", "for", "in", "while", "repeat", "next", "break", "function",
-    "NA", "NaN", "Inf", "NULL", "TRUE", "FALSE", "T", "F",
-    "na", "nan", "inf", "null", "true", "false",
+    "if", "else", "for", "in", "while", "repeat", "next", "break", "function", "NA", "NaN", "Inf",
+    "NULL", "TRUE", "FALSE", "T", "F", "na", "nan", "inf", "null", "true", "false",
 ];
 
 /// Check if a name is a valid R package name (not reserved)
@@ -7340,19 +7332,15 @@ fn pkg_name() -> impl Strategy<Value = String> {
 
 /// Generate a library call function name
 fn library_func() -> impl Strategy<Value = &'static str> {
-    prop_oneof![
-        Just("library"),
-        Just("require"),
-        Just("loadNamespace"),
-    ]
+    prop_oneof![Just("library"), Just("require"), Just("loadNamespace"),]
 }
 
 /// Quote style for package names
 #[derive(Debug, Clone, Copy)]
 enum PkgQuoteStyle {
-    None,       // library(dplyr)
-    Double,     // library("dplyr")
-    Single,     // library('dplyr')
+    None,   // library(dplyr)
+    Double, // library("dplyr")
+    Single, // library('dplyr')
 }
 
 fn pkg_quote_style() -> impl Strategy<Value = PkgQuoteStyle> {
@@ -8074,7 +8062,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 2: Innermost Selection Correctness (Interval Tree)
 // Validates: Requirements 2.1, 2.2
@@ -8253,7 +8240,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Property 3: Backward Compatibility (Model-Based)
@@ -8886,7 +8872,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 10: Base Package Universal Availability
 // Feature: package-function-awareness
@@ -8919,32 +8904,46 @@ fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
         any::<bool>(),
         // Number of library calls (0-3)
         0..4usize,
-    ).prop_flat_map(|(num_statements, include_function, include_library, num_library_calls)| {
-        let statements = prop::collection::vec(r_identifier(), num_statements);
-        let func_name = r_identifier();
-        let func_body_statements = prop::collection::vec(r_identifier(), 0..3usize);
-        let library_packages = prop::collection::vec(pkg_name(), num_library_calls);
-        
-        (
-            Just(num_statements),
-            Just(include_function),
-            Just(include_library),
-            statements,
-            func_name,
-            func_body_statements,
-            library_packages,
+    )
+        .prop_flat_map(
+            |(num_statements, include_function, include_library, num_library_calls)| {
+                let statements = prop::collection::vec(r_identifier(), num_statements);
+                let func_name = r_identifier();
+                let func_body_statements = prop::collection::vec(r_identifier(), 0..3usize);
+                let library_packages = prop::collection::vec(pkg_name(), num_library_calls);
+
+                (
+                    Just(num_statements),
+                    Just(include_function),
+                    Just(include_library),
+                    statements,
+                    func_name,
+                    func_body_statements,
+                    library_packages,
+                )
+            },
         )
-    }).prop_map(|(num_statements, include_function, include_library, statements, func_name, func_body_statements, library_packages)| {
-        RCodeStructure {
-            num_statements,
-            include_function,
-            include_library,
-            statements,
-            func_name,
-            func_body_statements,
-            library_packages,
-        }
-    })
+        .prop_map(
+            |(
+                num_statements,
+                include_function,
+                include_library,
+                statements,
+                func_name,
+                func_body_statements,
+                library_packages,
+            )| {
+                RCodeStructure {
+                    num_statements,
+                    include_function,
+                    include_library,
+                    statements,
+                    func_name,
+                    func_body_statements,
+                    library_packages,
+                }
+            },
+        )
 }
 
 /// Structure representing generated R code for testing
@@ -8963,19 +8962,19 @@ impl RCodeStructure {
     /// Generate the R code string from this structure
     fn to_code(&self) -> String {
         let mut lines = Vec::new();
-        
+
         // Add some initial statements
         for (i, stmt) in self.statements.iter().enumerate() {
             lines.push(format!("{} <- {}", stmt, i));
         }
-        
+
         // Optionally add library calls
         if self.include_library {
             for pkg in &self.library_packages {
                 lines.push(format!("library({})", pkg));
             }
         }
-        
+
         // Optionally add a function definition
         if self.include_function {
             let mut func_lines = vec![format!("{} <- function() {{", self.func_name)];
@@ -8985,13 +8984,13 @@ impl RCodeStructure {
             func_lines.push("}".to_string());
             lines.extend(func_lines);
         }
-        
+
         // Add a final statement
         lines.push("final_result <- 42".to_string());
-        
+
         lines.join("\n")
     }
-    
+
     /// Get the total number of lines in the generated code
     fn line_count(&self) -> u32 {
         self.to_code().lines().count() as u32
@@ -9004,23 +9003,80 @@ fn base_exports_set() -> HashSet<String> {
     // These are common functions from base, methods, utils, grDevices, graphics, stats, datasets
     let exports = vec![
         // base package
-        "print", "cat", "sum", "mean", "length", "c", "list", "data.frame",
-        "paste", "paste0", "sprintf", "format", "as.character", "as.numeric",
-        "is.null", "is.na", "is.numeric", "is.character", "is.logical",
-        "if", "for", "while", "function", "return", "stop", "warning", "message",
-        "tryCatch", "try", "invisible", "suppressWarnings", "suppressMessages",
+        "print",
+        "cat",
+        "sum",
+        "mean",
+        "length",
+        "c",
+        "list",
+        "data.frame",
+        "paste",
+        "paste0",
+        "sprintf",
+        "format",
+        "as.character",
+        "as.numeric",
+        "is.null",
+        "is.na",
+        "is.numeric",
+        "is.character",
+        "is.logical",
+        "if",
+        "for",
+        "while",
+        "function",
+        "return",
+        "stop",
+        "warning",
+        "message",
+        "tryCatch",
+        "try",
+        "invisible",
+        "suppressWarnings",
+        "suppressMessages",
         // utils package
-        "head", "tail", "str", "help", "example", "install.packages",
+        "head",
+        "tail",
+        "str",
+        "help",
+        "example",
+        "install.packages",
         // stats package
-        "lm", "glm", "t.test", "cor", "var", "sd", "median", "quantile",
+        "lm",
+        "glm",
+        "t.test",
+        "cor",
+        "var",
+        "sd",
+        "median",
+        "quantile",
         // grDevices package
-        "pdf", "png", "jpeg", "dev.off", "rgb", "col2rgb",
+        "pdf",
+        "png",
+        "jpeg",
+        "dev.off",
+        "rgb",
+        "col2rgb",
         // graphics package
-        "plot", "lines", "points", "abline", "hist", "barplot", "boxplot",
+        "plot",
+        "lines",
+        "points",
+        "abline",
+        "hist",
+        "barplot",
+        "boxplot",
         // methods package
-        "setClass", "setMethod", "setGeneric", "new", "show",
+        "setClass",
+        "setMethod",
+        "setGeneric",
+        "new",
+        "show",
         // datasets package (common datasets)
-        "iris", "mtcars", "airquality", "faithful",
+        "iris",
+        "mtcars",
+        "airquality",
+        "faithful",
     ];
     exports.into_iter().map(String::from).collect()
 }
@@ -9031,17 +9087,50 @@ fn base_exports_set() -> HashSet<String> {
 fn base_exports_set_unlikely_shadowed() -> HashSet<String> {
     let exports = vec![
         // Names with dots (can't be generated by r_identifier)
-        "data.frame", "as.character", "as.numeric", "is.null", "is.na",
-        "is.numeric", "is.character", "is.logical", "paste0", "dev.off",
-        "col2rgb", "t.test", "install.packages",
+        "data.frame",
+        "as.character",
+        "as.numeric",
+        "is.null",
+        "is.na",
+        "is.numeric",
+        "is.character",
+        "is.logical",
+        "paste0",
+        "dev.off",
+        "col2rgb",
+        "t.test",
+        "install.packages",
         // Names with uppercase (can't be generated by r_identifier)
-        "TRUE", "FALSE", "NULL", "NA", "NaN", "Inf",
+        "TRUE",
+        "FALSE",
+        "NULL",
+        "NA",
+        "NaN",
+        "Inf",
         // Longer names (> 6 chars, unlikely to match [a-z][a-z0-9_]{0,5})
-        "suppressWarnings", "suppressMessages", "tryCatch", "invisible",
-        "setClass", "setMethod", "setGeneric", "quantile", "airquality",
-        "faithful", "barplot", "boxplot", "abline", "sprintf", "message",
-        "warning", "example", "install", "median", "format", "length",
-        "function", "return",
+        "suppressWarnings",
+        "suppressMessages",
+        "tryCatch",
+        "invisible",
+        "setClass",
+        "setMethod",
+        "setGeneric",
+        "quantile",
+        "airquality",
+        "faithful",
+        "barplot",
+        "boxplot",
+        "abline",
+        "sprintf",
+        "message",
+        "warning",
+        "example",
+        "install",
+        "median",
+        "format",
+        "length",
+        "function",
+        "return",
     ];
     exports.into_iter().map(String::from).collect()
 }
@@ -9067,25 +9156,25 @@ proptest! {
         let uri = make_url("test_base_pkg_availability");
         let code = code_structure.to_code();
         let line_count = code_structure.line_count();
-        
+
         // Ensure query position is within the file
         let query_line = query_line_offset % line_count.max(1);
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         // Create a mock package exports callback (returns empty for all packages)
         let get_exports = |_pkg: &str| -> HashSet<String> {
             HashSet::new()
         };
-        
+
         // Create base exports set - use exports that are unlikely to be shadowed
         // by generated variable names (which use r_identifier() pattern [a-z][a-z0-9_]{0,5})
         let base_exports = base_exports_set_unlikely_shadowed();
-        
+
         // Query scope at the generated position
         let scope = scope_at_position_with_packages(&artifacts, query_line, query_column, &get_exports, &base_exports);
-        
+
         // Verify that base exports are available at this position
         // (either from base package or shadowed by local definition)
         for export in &base_exports {
@@ -9094,7 +9183,7 @@ proptest! {
                 "Base export '{}' should be available at position ({}, {}) in code:\n{}",
                 export, query_line, query_column, code
             );
-            
+
             // Verify the symbol has the correct package:base URI
             // (since we use exports unlikely to be shadowed)
             let symbol = scope.symbols.get(export).unwrap();
@@ -9116,18 +9205,18 @@ proptest! {
     ) {
         let uri = make_url("test_base_pkg_start");
         let code = code_structure.to_code();
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         let get_exports = |_pkg: &str| -> HashSet<String> {
             HashSet::new()
         };
         let base_exports = base_exports_set();
-        
+
         // Query at the very start of the file
         let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
-        
+
         // All base exports should be available
         for export in &base_exports {
             prop_assert!(
@@ -9150,18 +9239,18 @@ proptest! {
         let code = code_structure.to_code();
         let last_line = code.lines().count().saturating_sub(1) as u32;
         let last_line_len = code.lines().last().map(|l| l.len()).unwrap_or(0) as u32;
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         let get_exports = |_pkg: &str| -> HashSet<String> {
             HashSet::new()
         };
         let base_exports = base_exports_set();
-        
+
         // Query at the end of the file
         let scope = scope_at_position_with_packages(&artifacts, last_line, last_line_len, &get_exports, &base_exports);
-        
+
         // All base exports should be available
         for export in &base_exports {
             prop_assert!(
@@ -9182,7 +9271,7 @@ proptest! {
         body_statements in prop::collection::vec(r_identifier(), 1..4usize),
     ) {
         let uri = make_url("test_base_pkg_func");
-        
+
         // Create code with a function
         let mut func_body = Vec::new();
         for (i, stmt) in body_statements.iter().enumerate() {
@@ -9193,18 +9282,18 @@ proptest! {
             func_name,
             func_body.join("\n")
         );
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         let get_exports = |_pkg: &str| -> HashSet<String> {
             HashSet::new()
         };
         let base_exports = base_exports_set();
-        
+
         // Query inside the function body (line 1, which is inside the function)
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
-        
+
         // All base exports should be available inside the function
         for export in &base_exports {
             prop_assert!(
@@ -9225,7 +9314,7 @@ proptest! {
         statements_before in prop::collection::vec(r_identifier(), 1..4usize),
     ) {
         let uri = make_url("test_base_pkg_before_lib");
-        
+
         // Create code with statements before a library call
         let mut lines = Vec::new();
         for (i, stmt) in statements_before.iter().enumerate() {
@@ -9234,18 +9323,18 @@ proptest! {
         lines.push(format!("library({})", pkg));
         lines.push("final <- 1".to_string());
         let code = lines.join("\n");
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         let get_exports = |_pkg: &str| -> HashSet<String> {
             HashSet::new()
         };
         let base_exports = base_exports_set();
-        
+
         // Query at line 0 (before the library call)
         let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
-        
+
         // All base exports should be available before library()
         for export in &base_exports {
             prop_assert!(
@@ -9266,21 +9355,21 @@ proptest! {
         pkg in pkg_name(),
     ) {
         let uri = make_url("test_base_pkg_not_overridden");
-        
+
         let code = format!("library({})\nx <- print(1)", pkg);
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         // Package exports callback returns empty (package has no exports)
         let get_exports = |_pkg: &str| -> HashSet<String> {
             HashSet::new()
         };
         let base_exports = base_exports_set();
-        
+
         // Query after the library call
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
-        
+
         // Base exports should still be available
         for export in &base_exports {
             prop_assert!(
@@ -9301,12 +9390,12 @@ proptest! {
         pkg in pkg_name(),
     ) {
         let uri = make_url("test_pkg_overrides_base");
-        
+
         let code = format!("library({})\nx <- print(1)", pkg);
-        
+
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
-        
+
         // Package exports callback returns "print" (same as base export)
         let get_exports = |p: &str| -> HashSet<String> {
             if p == pkg {
@@ -9317,14 +9406,14 @@ proptest! {
                 HashSet::new()
             }
         };
-        
+
         let mut base_exports = HashSet::new();
         base_exports.insert("print".to_string());
         base_exports.insert("cat".to_string());
-        
+
         // Query after the library call
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
-        
+
         // "print" should be from the loaded package, not base
         let print_symbol = scope.symbols.get("print").unwrap();
         prop_assert_eq!(
@@ -9332,7 +9421,7 @@ proptest! {
             "print should be from package '{}' after library() call, not base. Code:\n{}",
             pkg, code
         );
-        
+
         // "cat" should still be from base (not exported by the package)
         let cat_symbol = scope.symbols.get("cat").unwrap();
         prop_assert_eq!(
@@ -9817,7 +9906,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
@@ -11570,7 +11658,7 @@ proptest! {
 
         // Requirement 9.2: Each export should have the correct package attribution
         let expected_uri = format!("package:{}", package);
-        
+
         let symbol1 = scope.symbols.get(&export1).unwrap();
         prop_assert_eq!(
             symbol1.source_uri.as_str(), expected_uri.as_str(),
@@ -11913,7 +12001,7 @@ proptest! {
         // The effective working directory should be the inherited working directory
         // (already absolute, used directly)
         let expected_wd = PathBuf::from(&inherited_wd_path);
-        
+
         // Check equality first, then provide detailed error message if it fails
         prop_assert!(
             effective_wd == expected_wd,
@@ -11972,7 +12060,7 @@ proptest! {
 
         // The relative path "../relative_wd" from /workspace/subdir/ should resolve to /workspace/relative_wd
         let expected_wd = PathBuf::from(format!("/{}/{}", workspace, relative_wd));
-        
+
         prop_assert!(
             effective_wd == expected_wd,
             "Effective working directory should equal resolved inherited working directory. \
@@ -12011,7 +12099,7 @@ proptest! {
 
         // Should fall back to file's directory
         let expected_wd = PathBuf::from(format!("/{}/{}", workspace, subdir));
-        
+
         prop_assert!(
             effective_wd == expected_wd,
             "Effective working directory should fall back to file's directory when no inherited WD. \
@@ -12062,7 +12150,7 @@ proptest! {
 
         // The effective working directory should be the EXPLICIT working directory
         let expected_wd = PathBuf::from(format!("/{}/{}", workspace, explicit_wd_dir));
-        
+
         prop_assert!(
             effective_wd == expected_wd,
             "Effective working directory should equal explicit working directory (takes precedence). \
@@ -12341,7 +12429,7 @@ proptest! {
         // Compute effective working directory
         let effective_wd = ctx.effective_working_directory();
 
-        // The relative path "../relative_wd_dir" from /workspace/child_subdir/ 
+        // The relative path "../relative_wd_dir" from /workspace/child_subdir/
         // should resolve to /workspace/relative_wd_dir
         let expected_wd = PathBuf::from(format!("/{}/{}", workspace, relative_wd_dir));
 
@@ -12417,7 +12505,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: working-directory-inheritance
@@ -14082,7 +14169,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: working-directory-inheritance
 // Property 4: Backward Directive Paths Ignore Working Directory
@@ -14500,7 +14586,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: working-directory-inheritance
@@ -15148,7 +15233,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: working-directory-inheritance
 // Property 9: Depth Limiting
@@ -15590,7 +15674,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: working-directory-inheritance

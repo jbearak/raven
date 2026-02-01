@@ -102,8 +102,7 @@ impl ForwardSource {
 }
 
 /// Call site specification for backward directives
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CallSiteSpec {
     /// Use configuration default
     #[default]
@@ -113,7 +112,6 @@ pub enum CallSiteSpec {
     /// Pattern to match in parent file
     Match(String),
 }
-
 
 /// Convert a byte offset to UTF-16 column for a given line.
 /// Handles multi-byte UTF-8 characters correctly for LSP position conversion.
@@ -155,7 +153,13 @@ pub fn enrich_metadata_with_inherited_wd<F>(
         return;
     }
     meta.inherited_working_directory =
-        super::dependency::compute_inherited_working_directory_with_depth(uri, meta, workspace_root, get_metadata, max_depth);
+        super::dependency::compute_inherited_working_directory_with_depth(
+            uri,
+            meta,
+            workspace_root,
+            get_metadata,
+            max_depth,
+        );
 }
 
 #[cfg(test)]
@@ -209,7 +213,7 @@ mod tests {
         };
         let uri = Url::parse("file:///test.R").unwrap();
         let key = source.to_key(uri.clone());
-        
+
         assert_eq!(key.resolved_uri, uri);
         assert_eq!(key.call_site_line, 10);
         assert_eq!(key.call_site_column, 5);
@@ -242,11 +246,11 @@ mod tests {
             ignored_next_lines: HashSet::from([15]),
             library_calls: vec![],
         };
-        
+
         // Round-trip serialization
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: CrossFileMetadata = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(parsed.sourced_by.len(), 1);
         assert_eq!(parsed.sources.len(), 1);
         assert_eq!(parsed.working_directory, Some("/data".to_string()));
@@ -345,7 +349,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&meta).unwrap();
-        
+
         // Verify the field name appears in the JSON
         assert!(json.contains("inherited_working_directory"));
         assert!(json.contains("/test/path"));

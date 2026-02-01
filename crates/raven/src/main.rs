@@ -23,7 +23,10 @@ mod workspace_index;
 use std::env;
 
 fn print_usage() {
-    println!("raven {}, a static R Language Server.", env!("CARGO_PKG_VERSION"));
+    println!(
+        "raven {}, a static R Language Server.",
+        env!("CARGO_PKG_VERSION")
+    );
     print!(
         r#"
 Usage: raven [OPTIONS]
