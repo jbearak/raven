@@ -1003,8 +1003,6 @@ proptest! {
 
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child1_uri = make_url(&child1);
-        let child2_uri = make_url(&child2);
 
         let meta = make_meta_with_sources(vec![
             (&format!("{}.R", child1), 5),
@@ -1158,7 +1156,6 @@ proptest! {
     ) {
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child_uri = make_url(&child);
 
         // Create metadata with duplicate sources (directive and AST)
         let meta = CrossFileMetadata {
@@ -1204,7 +1201,6 @@ proptest! {
     ) {
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child_uri = make_url(&child);
 
         let meta = CrossFileMetadata {
             sources: vec![
@@ -1259,7 +1255,6 @@ proptest! {
     ) {
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child_uri = make_url(&child);
 
         // Directive comes first in the list
         let meta = CrossFileMetadata {

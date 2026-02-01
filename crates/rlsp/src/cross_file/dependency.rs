@@ -722,7 +722,6 @@ mod tests {
     fn test_edge_deduplication() {
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
 
         // Two sources to same file at same position should deduplicate
         use super::super::types::ForwardSource;
@@ -1107,8 +1106,6 @@ z <- 3
     fn test_dump_state() {
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
-        let helpers = url("helpers.R");
 
         // Add edges: main sources utils and helpers
         let meta = CrossFileMetadata {

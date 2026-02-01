@@ -5043,8 +5043,6 @@ mod integration_tests {
         };
         
         // Test hover on the symbol
-        let position = Position::new(1, 10); // Position of "my_var" in second line
-        
         // Mock get_cross_file_symbols to return our test symbol
         // Note: In a real test, we'd need to set up the cross-file state properly
         // For now, we'll test the definition extraction directly
@@ -5057,7 +5055,7 @@ mod integration_tests {
     #[test]
     fn test_hover_same_file_location_format() {
         let library_paths = r_env::find_library_paths();
-        let state = WorldState::new(library_paths);
+        let _state = WorldState::new(library_paths);
         
         let uri = Url::parse("file:///test.R").unwrap();
         let def_info = DefinitionInfo {

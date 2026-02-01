@@ -3074,7 +3074,6 @@ mod tests {
 
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let child_uri = Url::parse("file:///project/child.R").unwrap();
-        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent file: has @lsp-source directive on line 2 (0-based: line 1)
         // The directive is parsed into sources with is_directive=true
