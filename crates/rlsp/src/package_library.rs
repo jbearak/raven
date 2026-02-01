@@ -130,6 +130,9 @@ pub struct PackageLibrary {
     /// Cached package information (lazy-loaded)
     /// Uses RwLock for thread-safe concurrent read access
     packages: RwLock<HashMap<String, Arc<PackageInfo>>>,
+    /// Combined exports cache (package name -> all exports including Depends/attached)
+    /// Populated by get_all_exports for efficient repeated lookups
+    combined_exports: RwLock<HashMap<String, Arc<HashSet<String>>>>,
     /// Base packages (always available)
     base_packages: HashSet<String>,
     /// Base package exports (combined from all base packages)
@@ -150,6 +153,7 @@ impl PackageLibrary {
         Self {
             lib_paths: Vec::new(),
             packages: RwLock::new(HashMap::new()),
+            combined_exports: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
             base_exports: HashSet::new(),
             r_subprocess: None,
@@ -168,6 +172,7 @@ impl PackageLibrary {
         Self {
             lib_paths: Vec::new(),
             packages: RwLock::new(HashMap::new()),
+            combined_exports: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
             base_exports: HashSet::new(),
             r_subprocess,
@@ -205,7 +210,8 @@ impl PackageLibrary {
     /// Get all exports from loaded packages for completions (synchronous, cached-only)
     ///
     /// This method returns a map of symbol name to package name for all exports
-    /// from the given loaded packages. It uses only cached package information.
+    /// from the given loaded packages. It uses cached package information,
+    /// preferring combined_exports cache (includes Depends/attached) when available.
     ///
     /// This is a synchronous method suitable for use in completion handlers where
     /// we cannot use async. It uses `try_read()` to avoid blocking.
@@ -227,26 +233,40 @@ impl PackageLibrary {
         let mut result: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
-        // Try to acquire read lock without blocking
-        let cache = match self.packages.try_read() {
-            Ok(guard) => guard,
-            Err(_) => {
-                log::trace!(
-                    "Could not acquire package cache lock for completions, returning empty"
-                );
-                return result;
-            }
-        };
+        // Try combined_exports cache first (includes Depends/attached packages)
+        let combined_cache = self.combined_exports.try_read().ok();
+        let packages_cache = self.packages.try_read().ok();
+
+        if combined_cache.is_none() && packages_cache.is_none() {
+            log::trace!("Could not acquire any package cache lock for completions, returning empty");
+            return result;
+        }
 
         // Process packages in order (earlier packages appear first in the list)
         // Requirement 9.3: Show all packages that export the same symbol
         for pkg_name in loaded_packages {
-            if let Some(info) = cache.get(pkg_name) {
-                for export in &info.exports {
-                    result
-                        .entry(export.clone())
-                        .or_default()
-                        .push(pkg_name.clone());
+            // Try combined_exports first
+            if let Some(ref cache) = combined_cache {
+                if let Some(exports) = cache.get(pkg_name) {
+                    for export in exports.iter() {
+                        result
+                            .entry(export.clone())
+                            .or_default()
+                            .push(pkg_name.clone());
+                    }
+                    continue; // Found in combined cache, skip per-package lookup
+                }
+            }
+
+            // Fall back to per-package exports
+            if let Some(ref cache) = packages_cache {
+                if let Some(info) = cache.get(pkg_name) {
+                    for export in &info.exports {
+                        result
+                            .entry(export.clone())
+                            .or_default()
+                            .push(pkg_name.clone());
+                    }
                 }
             }
         }
@@ -257,8 +277,9 @@ impl PackageLibrary {
     /// Check if a symbol is exported by any of the given packages (synchronous, cached-only)
     ///
     /// This method checks if the symbol is exported by any of the loaded packages,
-    /// using only cached package information. It first checks base exports, then
-    /// checks each loaded package in the cache.
+    /// using cached package information. It first checks base exports, then
+    /// checks combined_exports cache (includes Depends/attached), then falls back
+    /// to per-package exports cache.
     ///
     /// This is a synchronous method suitable for use in diagnostic collection where
     /// we cannot use async. It uses `try_read()` to avoid blocking.
@@ -278,8 +299,18 @@ impl PackageLibrary {
             return true;
         }
 
-        // Try to acquire read lock without blocking
-        // If we can't get the lock, return false (conservative - may cause false positive warnings)
+        // Try combined_exports cache first (includes Depends/attached packages)
+        if let Ok(combined_cache) = self.combined_exports.try_read() {
+            for pkg_name in loaded_packages {
+                if let Some(exports) = combined_cache.get(pkg_name) {
+                    if exports.contains(symbol) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Fall back to per-package exports cache
         let cache = match self.packages.try_read() {
             Ok(guard) => guard,
             Err(_) => {
@@ -345,6 +376,72 @@ impl PackageLibrary {
     pub async fn clear_cache(&self) {
         let mut cache = self.packages.write().await;
         cache.clear();
+    }
+
+    /// Prefetch packages by loading their exports into cache
+    ///
+    /// This method asynchronously loads package exports for the given package names,
+    /// populating both the per-package cache and combined_exports cache.
+    /// Used for background warm-up after detecting library() calls.
+    ///
+    /// # Arguments
+    /// * `packages` - List of package names to prefetch
+    pub async fn prefetch_packages(&self, packages: &[String]) {
+        for pkg_name in packages {
+            log::trace!("Prefetching package exports for '{}'", pkg_name);
+            // get_all_exports populates both caches
+            let _ = self.get_all_exports(pkg_name).await;
+        }
+    }
+
+    /// Add additional library paths (deduplicating)
+    ///
+    /// This method adds paths to the library search paths, avoiding duplicates.
+    /// Used to apply user-configured additional library paths.
+    pub fn add_library_paths(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            if !self.lib_paths.contains(path) {
+                self.lib_paths.push(path.clone());
+            }
+        }
+    }
+
+    /// Get combined exports for a package from cache (synchronous)
+    ///
+    /// Returns the cached combined exports if available, None otherwise.
+    /// This is useful for hover to check package exports without blocking.
+    pub fn get_cached_combined_exports(&self, name: &str) -> Option<Arc<HashSet<String>>> {
+        self.combined_exports.try_read().ok()?.get(name).cloned()
+    }
+
+    /// Find which package exports a symbol (synchronous, cached-only)
+    ///
+    /// Searches through loaded packages to find which one exports the given symbol.
+    /// Returns the first package name that exports the symbol, or None.
+    pub fn find_package_for_symbol(&self, symbol: &str, loaded_packages: &[String]) -> Option<String> {
+        // Check combined_exports cache first
+        if let Ok(cache) = self.combined_exports.try_read() {
+            for pkg_name in loaded_packages {
+                if let Some(exports) = cache.get(pkg_name) {
+                    if exports.contains(symbol) {
+                        return Some(pkg_name.clone());
+                    }
+                }
+            }
+        }
+
+        // Fall back to per-package cache
+        if let Ok(cache) = self.packages.try_read() {
+            for pkg_name in loaded_packages {
+                if let Some(info) = cache.get(pkg_name) {
+                    if info.exports.contains(symbol) {
+                        return Some(pkg_name.clone());
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Set the library paths
@@ -751,12 +848,15 @@ impl PackageLibrary {
     /// and attached_packages for meta-packages), combining their exports into a single set.
     /// It tracks visited packages to handle circular dependencies.
     ///
+    /// Results are cached in combined_exports for efficient repeated lookups.
+    ///
     /// # Behavior
-    /// 1. Load the main package using `get_package()`
-    /// 2. Add the package's exports to the result set
-    /// 3. Recursively load all packages in `depends` and `attached_packages`
-    /// 4. Track visited packages to prevent infinite loops from circular dependencies
-    /// 5. Return the combined exports from all packages
+    /// 1. Check combined_exports cache first
+    /// 2. Load the main package using `get_package()`
+    /// 3. Add the package's exports to the result set
+    /// 4. Recursively load all packages in `depends` and `attached_packages`
+    /// 5. Track visited packages to prevent infinite loops from circular dependencies
+    /// 6. Cache and return the combined exports from all packages
     ///
     /// Requirement 4.2: WHEN a package has dependencies in the `Depends` field,
     /// THE Package_Resolver SHALL also load exports from those packages at the same position
@@ -764,10 +864,28 @@ impl PackageLibrary {
     /// Requirement 4.5: THE Package_Resolver SHALL handle circular dependencies in the
     /// `Depends` chain by tracking visited packages
     pub async fn get_all_exports(&self, name: &str) -> HashSet<String> {
+        // Check cache first
+        {
+            let cache = self.combined_exports.read().await;
+            if let Some(cached) = cache.get(name) {
+                log::trace!("Using cached combined exports for package '{}'", name);
+                return cached.as_ref().clone();
+            }
+        }
+
+        // Compute exports
         let mut visited = HashSet::new();
         let mut all_exports = HashSet::new();
         self.collect_exports_recursive(name, &mut visited, &mut all_exports)
             .await;
+
+        // Cache the result
+        {
+            let mut cache = self.combined_exports.write().await;
+            cache.insert(name.to_string(), Arc::new(all_exports.clone()));
+            log::trace!("Cached {} combined exports for package '{}'", all_exports.len(), name);
+        }
+
         all_exports
     }
 

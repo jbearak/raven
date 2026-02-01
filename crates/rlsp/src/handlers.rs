@@ -901,6 +901,11 @@ fn collect_missing_package_diagnostics(
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Skip if packages feature is disabled
+    if !state.cross_file_config.packages_enabled {
+        return;
+    }
+
     for lib_call in &meta.library_calls {
         // Skip if the line is ignored via @lsp-ignore or @lsp-ignore-next
         if crate::cross_file::directive::is_line_ignored(meta, lib_call.line) {
@@ -909,7 +914,7 @@ fn collect_missing_package_diagnostics(
 
         // Check if the package exists (is installed)
         if !state.package_library.package_exists(&lib_call.package) {
-            // Package not found - emit warning diagnostic
+            // Package not found - emit diagnostic with configured severity
             // The column in LibraryCall is already UTF-16 (end position of the call)
             // We want to highlight the library() call, so we use the line and estimate the range
             
@@ -922,7 +927,7 @@ fn collect_missing_package_diagnostics(
                     start: Position::new(lib_call.line, 0),
                     end: Position::new(lib_call.line, end_col),
                 },
-                severity: Some(DiagnosticSeverity::WARNING),
+                severity: Some(state.cross_file_config.packages_missing_package_severity),
                 message: format!("Package '{}' is not installed", lib_call.package),
                 ..Default::default()
             });
@@ -1169,17 +1174,20 @@ fn collect_undefined_variables_position_aware(
             continue;
         }
         
-        // Build position-aware package list: inherited packages + locally loaded packages
-        // Requirements 5.1, 5.2: Inherited packages from parent files
-        // Requirements 8.1, 8.3: Locally loaded packages before this position
-        let position_aware_packages: Vec<String> = scope.inherited_packages.iter()
-            .chain(scope.loaded_packages.iter())
-            .cloned()
-            .collect();
-        
-        // Check if symbol is exported by any package loaded at this position
-        if is_package_export(&name, &position_aware_packages, package_library) {
-            continue;
+        // Check package exports only if packages feature is enabled
+        if state.cross_file_config.packages_enabled {
+            // Build position-aware package list: inherited packages + locally loaded packages
+            // Requirements 5.1, 5.2: Inherited packages from parent files
+            // Requirements 8.1, 8.3: Locally loaded packages before this position
+            let position_aware_packages: Vec<String> = scope.inherited_packages.iter()
+                .chain(scope.loaded_packages.iter())
+                .cloned()
+                .collect();
+            
+            // Check if symbol is exported by any package loaded at this position
+            if is_package_export(&name, &position_aware_packages, package_library) {
+                continue;
+            }
         }
 
         // Symbol is undefined - emit diagnostic
@@ -1517,33 +1525,36 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     // Requirements 9.1, 9.2: Add package exports to completions with package attribution
     let scope = get_cross_file_scope(state, uri, position.line, position.character);
 
-    // Combine inherited and loaded packages
-    let mut all_packages: Vec<String> = scope.inherited_packages.clone();
-    for pkg in &scope.loaded_packages {
-        if !all_packages.contains(pkg) {
-            all_packages.push(pkg.clone());
+    // Add package exports only if packages feature is enabled
+    if state.cross_file_config.packages_enabled {
+        // Combine inherited and loaded packages
+        let mut all_packages: Vec<String> = scope.inherited_packages.clone();
+        for pkg in &scope.loaded_packages {
+            if !all_packages.contains(pkg) {
+                all_packages.push(pkg.clone());
+            }
         }
-    }
 
-    // Add package exports (after local definitions, before cross-file symbols)
-    // Requirement 9.4: Local definitions > package exports > cross-file symbols
-    // Requirement 9.3: When multiple packages export same symbol, show all with attribution
-    let package_exports = state.package_library.get_exports_for_completions(&all_packages);
-    for (export_name, package_names) in package_exports {
-        if seen_names.contains(&export_name) {
-            continue; // Local definitions take precedence
-        }
-        seen_names.insert(export_name.clone());
+        // Add package exports (after local definitions, before cross-file symbols)
+        // Requirement 9.4: Local definitions > package exports > cross-file symbols
+        // Requirement 9.3: When multiple packages export same symbol, show all with attribution
+        let package_exports = state.package_library.get_exports_for_completions(&all_packages);
+        for (export_name, package_names) in package_exports {
+            if seen_names.contains(&export_name) {
+                continue; // Local definitions take precedence
+            }
+            seen_names.insert(export_name.clone());
 
-        // Requirement 9.3: Show all packages that export this symbol
-        for package_name in package_names {
-            // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
-            items.push(CompletionItem {
-                label: export_name.clone(),
-                kind: Some(CompletionItemKind::FUNCTION), // Most package exports are functions
-                detail: Some(format!("{{{}}}", package_name)),
-                ..Default::default()
-            });
+            // Requirement 9.3: Show all packages that export this symbol
+            for package_name in package_names {
+                // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
+                items.push(CompletionItem {
+                    label: export_name.clone(),
+                    kind: Some(CompletionItemKind::FUNCTION), // Most package exports are functions
+                    detail: Some(format!("{{{}}}", package_name)),
+                    ..Default::default()
+                });
+            }
         }
     }
 
@@ -2085,6 +2096,36 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
             }),
             range: Some(node_range),
         });
+    }
+
+    // Check package exports from combined_exports cache (if packages enabled)
+    // This surfaces package exports without blocking on R subprocess
+    if state.cross_file_config.packages_enabled {
+        let scope = get_cross_file_scope(state, uri, position.line, position.character);
+        let all_packages: Vec<String> = scope.inherited_packages.iter()
+            .chain(scope.loaded_packages.iter())
+            .cloned()
+            .collect();
+        
+        if let Some(pkg_name) = state.package_library.find_package_for_symbol(name, &all_packages) {
+            let mut value = String::new();
+            
+            // Try to get function signature from R help
+            if let Some(signature) = crate::help::get_function_signature(name, &pkg_name) {
+                value.push_str(&format!("```r\n{}\n```\n", signature));
+            } else {
+                value.push_str(&format!("```r\n{}\n```\n", name));
+            }
+            value.push_str(&format!("\nfrom {{{}}}", pkg_name));
+            
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(node_range),
+            });
+        }
     }
 
     // Fallback to R help system for built-ins and undefined symbols
@@ -5509,10 +5550,12 @@ result <- helper_with_spaces(42)"#;
         });
 
         let mut state = WorldState::new(Vec::new());
-        // Ensure base is in base_packages
+        // Ensure base is in base_packages by creating a new PackageLibrary
         let mut base_packages = std::collections::HashSet::new();
         base_packages.insert("base".to_string());
-        state.package_library.set_base_packages(base_packages);
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_base_packages(base_packages);
+        state.package_library = std::sync::Arc::new(pkg_lib);
 
         let mut diagnostics = Vec::new();
 

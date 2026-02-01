@@ -392,9 +392,8 @@ pub struct WorldState {
     // Package function awareness
     // Manages installed packages, their exports, and caching for package-aware scope resolution
     // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
-    // Note: Will be used in tasks 7.2+ for scope resolution with package exports
-    #[allow(dead_code)]
-    pub package_library: PackageLibrary,
+    // Arc allows sharing across async tasks without holding WorldState lock
+    pub package_library: Arc<PackageLibrary>,
     
     // Caches
     pub help_cache: crate::help::HelpCache,
@@ -451,7 +450,7 @@ impl WorldState {
             // Package function awareness
             // Initialize with empty state - will be populated via initialize() or async initialization
             // Requirement 13.4: THE Package_Cache SHALL support concurrent read access
-            package_library: PackageLibrary::new_empty(),
+            package_library: Arc::new(PackageLibrary::new_empty()),
             
             // Caches
             help_cache: crate::help::HelpCache::new(),

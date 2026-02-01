@@ -323,6 +323,44 @@ impl LanguageServer for Backend {
             state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
         }
         
+        // Initialize PackageLibrary without holding WorldState lock
+        // Get config values under brief read lock
+        let (packages_enabled, packages_r_path, additional_paths) = {
+            let state = self.state.read().await;
+            (
+                state.cross_file_config.packages_enabled,
+                state.cross_file_config.packages_r_path.clone(),
+                state.cross_file_config.packages_additional_library_paths.clone(),
+            )
+        };
+        
+        let new_package_library = if packages_enabled {
+            // Create RSubprocess and initialize PackageLibrary
+            let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+            let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+            if let Err(e) = lib.initialize().await {
+                log::warn!("Failed to initialize PackageLibrary: {}", e);
+            }
+            // Add additional library paths (dedup)
+            lib.add_library_paths(&additional_paths);
+            log::info!(
+                "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
+                lib.lib_paths().len(),
+                lib.base_packages().len(),
+                lib.base_exports().len()
+            );
+            std::sync::Arc::new(lib)
+        } else {
+            log::info!("Package function awareness disabled");
+            std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty())
+        };
+        
+        // Replace package_library under brief write lock
+        {
+            let mut state = self.state.write().await;
+            state.package_library = new_package_library;
+        }
+        
         log::info!("Workspace initialization complete");
     }
 
@@ -363,7 +401,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
 
         // Compute affected files while holding write lock
-        let (work_items, debounce_ms, files_to_index, on_demand_enabled) = {
+        let (work_items, debounce_ms, files_to_index, on_demand_enabled, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
             // Update new DocumentStore (Requirement 1.3)
@@ -380,6 +418,15 @@ impl LanguageServer for Backend {
             let workspace_root = state.workspace_folders.first().cloned();
             
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+            let packages_enabled = state.cross_file_config.packages_enabled;
+            
+            // Collect package names from library calls for background prefetch
+            let packages_to_prefetch: Vec<String> = if packages_enabled {
+                meta.library_calls.iter().map(|c| c.package.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let package_library = state.package_library.clone();
             
             // On-demand indexing: Collect sourced files that need indexing
             // Priority 1: Files directly sourced by this open document
@@ -503,8 +550,17 @@ impl LanguageServer for Backend {
                 .collect();
             
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (work_items, debounce_ms, files_to_index, on_demand_enabled)
+            (work_items, debounce_ms, files_to_index, on_demand_enabled, packages_to_prefetch, packages_enabled, package_library)
         };
+        
+        // Background prefetch package exports (without holding WorldState lock)
+        if packages_enabled && !packages_to_prefetch.is_empty() {
+            let pkg_lib = package_library;
+            tokio::spawn(async move {
+                log::trace!("Background prefetching {} packages", packages_to_prefetch.len());
+                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+            });
+        }
         
         // Only perform on-demand indexing if enabled
         if on_demand_enabled {
@@ -677,7 +733,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
 
         // Compute affected files and debounce config while holding write lock
-        let (work_items, debounce_ms) = {
+        let (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
             // Update new DocumentStore (Requirement 1.4)
@@ -693,12 +749,23 @@ impl LanguageServer for Backend {
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
             
+            // Capture package settings for background prefetch
+            let packages_enabled = state.cross_file_config.packages_enabled;
+            let package_library = state.package_library.clone();
+            
             // Update dependency graph with new cross-file metadata
-            if let Some(doc) = state.documents.get(&uri) {
+            let packages_to_prefetch: Vec<String> = if let Some(doc) = state.documents.get(&uri) {
                 let text = doc.text();
                 let meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
                 let workspace_root = state.workspace_folders.first().cloned();
+                
+                // Collect package names for prefetch
+                let pkgs: Vec<String> = if packages_enabled {
+                    meta.library_calls.iter().map(|c| c.package.clone()).collect()
+                } else {
+                    Vec::new()
+                };
                 
                 // Pre-collect content for potential parent files to avoid borrow conflicts
                 // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
@@ -724,7 +791,11 @@ impl LanguageServer for Backend {
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
-            }
+                
+                pkgs
+            } else {
+                Vec::new()
+            };
             
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> = std::collections::HashSet::from([uri.clone()]);
@@ -775,8 +846,17 @@ impl LanguageServer for Backend {
                 .collect();
             
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (work_items, debounce_ms)
+            (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library)
         };
+
+        // Background prefetch package exports (without holding WorldState lock)
+        if packages_enabled && !packages_to_prefetch.is_empty() {
+            let pkg_lib = package_library;
+            tokio::spawn(async move {
+                log::trace!("Background prefetching {} packages", packages_to_prefetch.len());
+                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+            });
+        }
 
         // Schedule debounced diagnostics for all affected files (Requirement 0.5)
         for (affected_uri, trigger_version, trigger_revision) in work_items {
@@ -911,13 +991,33 @@ impl LanguageServer for Backend {
             log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
         }
         
-        let (open_uris, scope_changed) = {
+        let (open_uris, scope_changed, package_settings_changed, packages_enabled, packages_r_path, additional_paths) = {
             let mut state = self.state.write().await;
             
             // Check if scope-affecting settings changed
             let scope_changed = new_config.as_ref()
                 .map(|c| state.cross_file_config.scope_settings_changed(c))
                 .unwrap_or(false);
+            
+            // Check if package settings changed
+            let package_settings_changed = new_config.as_ref()
+                .map(|c| {
+                    c.packages_enabled != state.cross_file_config.packages_enabled
+                        || c.packages_r_path != state.cross_file_config.packages_r_path
+                        || c.packages_additional_library_paths != state.cross_file_config.packages_additional_library_paths
+                })
+                .unwrap_or(false);
+            
+            // Capture new package settings before applying config
+            let packages_enabled = new_config.as_ref()
+                .map(|c| c.packages_enabled)
+                .unwrap_or(state.cross_file_config.packages_enabled);
+            let packages_r_path = new_config.as_ref()
+                .and_then(|c| c.packages_r_path.clone())
+                .or_else(|| state.cross_file_config.packages_r_path.clone());
+            let additional_paths = new_config.as_ref()
+                .map(|c| c.packages_additional_library_paths.clone())
+                .unwrap_or_else(|| state.cross_file_config.packages_additional_library_paths.clone());
             
             // Apply new config if parsed
             if let Some(config) = new_config {
@@ -934,8 +1034,31 @@ impl LanguageServer for Backend {
                 state.diagnostics_gate.mark_force_republish(uri);
             }
             
-            (open_uris, scope_changed)
+            (open_uris, scope_changed, package_settings_changed, packages_enabled, packages_r_path, additional_paths)
         };
+        
+        // Reinitialize PackageLibrary if package settings changed
+        if package_settings_changed {
+            log::info!("Package settings changed, reinitializing PackageLibrary");
+            
+            let new_package_library = if packages_enabled {
+                let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+                if let Err(e) = lib.initialize().await {
+                    log::warn!("Failed to reinitialize PackageLibrary: {}", e);
+                }
+                lib.add_library_paths(&additional_paths);
+                std::sync::Arc::new(lib)
+            } else {
+                std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty())
+            };
+            
+            // Replace under brief write lock
+            {
+                let mut state = self.state.write().await;
+                state.package_library = new_package_library;
+            }
+        }
         
         if scope_changed {
             log::trace!("Scope-affecting settings changed, revalidating {} open documents", open_uris.len());
