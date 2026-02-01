@@ -1053,9 +1053,27 @@ proptest! {
             &meta_with_cd,
             Some(&workspace_uri)
         ).unwrap();
-
         // Test with parent directory navigation (common pattern for backward directives)
         let parent_path = format!("../{}.R", parent_file);
+
+        let parent_path = format!("../{}.R", parent_file);
+
+        // Parse all backward directive synonyms to ensure synonym handling is exercised
+        let sourced_by = format!("# @lsp-sourced-by {}", parent_path);
+        let run_by = format!("# @lsp-run-by {}", parent_path);
+        let included_by = format!("# @lsp-included-by {}", parent_path);
+
+        let meta_sourced = parse_directives(&sourced_by);
+        let meta_run = parse_directives(&run_by);
+        let meta_included = parse_directives(&included_by);
+
+        prop_assert_eq!(meta_sourced.sourced_by.len(), 1);
+        prop_assert_eq!(meta_run.sourced_by.len(), 1);
+        prop_assert_eq!(meta_included.sourced_by.len(), 1);
+
+        prop_assert_eq!(&meta_sourced.sourced_by[0].path, &parent_path);
+        prop_assert_eq!(&meta_run.sourced_by[0].path, &parent_path);
+        prop_assert_eq!(&meta_included.sourced_by[0].path, &parent_path);
 
         let resolved_new = resolve_path(&parent_path, &ctx_new);
 
