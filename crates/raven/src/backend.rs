@@ -1324,6 +1324,10 @@ impl LanguageServer for Backend {
                         Err(_) => continue,
                     };
                     
+                    let Some((version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) = diagnostics_data else {
+                        continue;
+                    };
+                    
                     let content = match tokio::fs::read_to_string(&path).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -1438,24 +1442,56 @@ impl LanguageServer for Backend {
                 for child_uri in wd_affected_children {
                     let diagnostics_data = {
                         let state = state_arc.read().await;
-                        let sync_diagnostics = crate::handlers::diagnostics(&state, &child_uri);
-                        let directive_meta = state.documents.get(&child_uri)
-                            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-                            .unwrap_or_default();
-                        let workspace_folder = state.workspace_folders.first().cloned();
-                        let missing_file_severity = state.cross_file_config.missing_file_severity;
-                        (sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)
+                        let version = state.documents.get(&child_uri).and_then(|d| d.version);
+                        let revision = state.documents.get(&child_uri).map(|d| d.revision);
+                        let can_publish = version
+                            .map(|ver| state.diagnostics_gate.can_publish(&child_uri, ver))
+                            .unwrap_or(true);
+                        if !can_publish {
+                            None
+                        } else {
+                            let sync_diagnostics = crate::handlers::diagnostics(&state, &child_uri);
+                            let directive_meta = state.documents.get(&child_uri)
+                                .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+                                .unwrap_or_default();
+                            let workspace_folder = state.workspace_folders.first().cloned();
+                            let missing_file_severity = state.cross_file_config.missing_file_severity;
+                            Some((version, revision, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity))
+                        }
+                    };
+                    
+                    let Some((version, revision, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) = diagnostics_data else {
+                        continue;
                     };
                     
                     let diagnostics = crate::handlers::diagnostics_async_standalone(
                         &child_uri,
-                        diagnostics_data.0,
-                        &diagnostics_data.1,
-                        diagnostics_data.2.as_ref(),
-                        diagnostics_data.3,
+                        sync_diagnostics,
+                        &directive_meta,
+                        workspace_folder.as_ref(),
+                        missing_file_severity,
                     ).await;
                     
-                    client.publish_diagnostics(child_uri, diagnostics, None).await;
+                    let can_publish = {
+                        let state = state_arc.read().await;
+                        let current_version = state.documents.get(&child_uri).and_then(|d| d.version);
+                        let current_revision = state.documents.get(&child_uri).map(|d| d.revision);
+                        if current_version != version || current_revision != revision {
+                            false
+                        } else if let Some(ver) = current_version {
+                            state.diagnostics_gate.can_publish(&child_uri, ver)
+                        } else {
+                            true
+                        }
+                    };
+                    
+                    if can_publish {
+                        client.publish_diagnostics(child_uri.clone(), diagnostics, None).await;
+                        let state = state_arc.read().await;
+                        if let Some(ver) = state.documents.get(&child_uri).and_then(|d| d.version) {
+                            state.diagnostics_gate.record_publish(&child_uri, ver);
+                        }
+                    }
                 }
             });
         }

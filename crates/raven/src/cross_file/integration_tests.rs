@@ -3635,6 +3635,7 @@ mod working_directory_inheritance_tests {
     use super::*;
     use crate::cross_file::dependency::compute_inherited_working_directory;
     use crate::cross_file::path_resolve::PathContext;
+    use std::path::PathBuf;
 
     /// Integration test for basic working directory inheritance scenario.
     ///
@@ -3776,10 +3777,13 @@ child_function <- function() {
         );
         let inherited_wd_value = inherited_wd.unwrap();
         
-        // The inherited WD should be /data (the parent's @lsp-cd value)
-        assert!(
-            inherited_wd_value.ends_with("/data") || inherited_wd_value == "/data",
-            "Child's inherited working directory should be /data. Got: {}",
+        // The inherited WD should be workspace_root/data (the parent's @lsp-cd value)
+        let expected_wd = workspace.root().join("data");
+        assert_eq!(
+            PathBuf::from(&inherited_wd_value),
+            expected_wd,
+            "Child's inherited working directory should be {}. Got: {}",
+            expected_wd.display(),
             inherited_wd_value
         );
         println!("  ✓ Child's inherited_working_directory: {}", inherited_wd_value);
@@ -3806,10 +3810,12 @@ child_function <- function() {
         // Get the effective working directory
         let effective_wd = ctx.effective_working_directory();
         
-        // The effective WD should be /data (inherited from parent)
-        assert!(
-            effective_wd.to_string_lossy().ends_with("/data") || effective_wd.to_string_lossy() == "/data",
-            "Child's effective working directory should be /data. Got: {}",
+        // The effective WD should be workspace_root/data (inherited from parent)
+        assert_eq!(
+            effective_wd,
+            expected_wd,
+            "Child's effective working directory should be {}. Got: {}",
+            expected_wd.display(),
             effective_wd.display()
         );
         println!("  ✓ Child's effective working directory: {}", effective_wd.display());
@@ -3825,10 +3831,13 @@ child_function <- function() {
         );
         let resolved = resolved_path.unwrap();
         
-        // The resolved path should be /data/utils.r
-        assert!(
-            resolved.to_string_lossy().ends_with("/data/utils.r") || resolved.to_string_lossy() == "/data/utils.r",
-            "source('utils.r') should resolve to /data/utils.r. Got: {}",
+        // The resolved path should be workspace_root/data/utils.r
+        let expected_utils = expected_wd.join("utils.r");
+        assert_eq!(
+            resolved,
+            expected_utils,
+            "source('utils.r') should resolve to {}. Got: {}",
+            expected_utils.display(),
             resolved.display()
         );
         println!("  ✓ source('utils.r') resolves to: {}", resolved.display());

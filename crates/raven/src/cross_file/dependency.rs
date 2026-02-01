@@ -143,6 +143,8 @@ where
             "Cycle detected when resolving parent WD for {}, falling back to parent's directory",
             parent_uri
         );
+        // In a cycle, still return the direct parent's directory so the child inherits from
+        // its parent (not itself), while breaking the loop.
         let parent_path = parent_uri.to_file_path().ok()?;
         let parent_dir = parent_path.parent()?;
         return Some(parent_dir.to_string_lossy().to_string());
@@ -414,7 +416,7 @@ where
         &parent_uri,
         get_metadata,
         workspace_root,
-        max_depth - 1,
+        max_depth,
         visited,
     );
 
@@ -441,7 +443,7 @@ where
                     &other_parent_uri,
                     get_metadata,
                     workspace_root,
-                    max_depth - 1,
+                    max_depth,
                     &mut other_visited,
                 );
                 if let Some(other_wd) = other_wd {
@@ -2087,9 +2089,7 @@ z <- 3
     #[test]
     fn test_compute_inherited_wd_with_depth_one() {
         // Validates: Requirement 9.2
-        // With depth 1, should resolve parent's metadata but depth is passed as 0 to
-        // resolve_parent_working_directory_with_depth, which still works because
-        // it can read the parent's metadata directly (no further recursion needed)
+        // With depth 1, should resolve parent's metadata directly (no further recursion needed)
         let child_uri = Url::parse("file:///project/src/child.R").unwrap();
         let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
         let workspace = Url::parse("file:///project").unwrap();
@@ -2122,7 +2122,7 @@ z <- 3
                     None
                 }
             },
-            2, // Depth of 2: 1 for compute, 1 for resolve_parent
+            1, // Depth of 1: allows direct parent lookup
         );
 
         assert!(result.is_some());

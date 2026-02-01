@@ -208,7 +208,7 @@ impl CrossFileActivityState {
 /// Returns an empty vector if the working directory hasn't changed.
 ///
 /// # Behavior
-/// - Compares `old_meta.working_directory` with `new_meta.working_directory`
+/// - Compares the parent's effective working directory (explicit `working_directory` or inherited)
 /// - If they differ (including None -> Some, Some -> None, or Some(a) -> Some(b)),
 ///   finds all children that have backward directives to this parent
 /// - Only returns children where the edge `is_directive` is true (from backward directives)
@@ -220,9 +220,16 @@ pub fn detect_parent_wd_change_affected_children(
     new_meta: &CrossFileMetadata,
     graph: &DependencyGraph,
 ) -> Vec<Url> {
-    // Get old and new working directories
-    let old_wd = old_meta.and_then(|m| m.working_directory.as_ref());
-    let new_wd = new_meta.working_directory.as_ref();
+    // Get old and new effective working directories (explicit > inherited)
+    let old_wd = old_meta.and_then(|m| {
+        m.working_directory
+            .as_ref()
+            .or(m.inherited_working_directory.as_ref())
+    });
+    let new_wd = new_meta
+        .working_directory
+        .as_ref()
+        .or(new_meta.inherited_working_directory.as_ref());
 
     // Check if working directory changed
     let wd_changed = old_wd != new_wd;
