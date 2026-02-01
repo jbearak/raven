@@ -1324,10 +1324,6 @@ impl LanguageServer for Backend {
                         Err(_) => continue,
                     };
                     
-                    let Some((version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) = diagnostics_data else {
-                        continue;
-                    };
-                    
                     let content = match tokio::fs::read_to_string(&path).await {
                         Ok(c) => c,
                         Err(e) => {

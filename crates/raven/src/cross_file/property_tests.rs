@@ -15220,21 +15220,20 @@ proptest! {
             "With max_depth=0, inheritance should stop immediately and return None"
         );
 
-        // Test with max_depth = 1: can resolve parent but depth is exhausted when
-        // trying to get parent's effective WD, so falls back to parent's directory
+        // Test with max_depth = 1: should resolve parent's effective WD
         let result_depth_1 = compute_inherited_working_directory_with_depth(
             &child_uri, &child_meta, Some(&workspace_uri), &get_metadata, 1,
         );
         prop_assert!(
             result_depth_1.is_some(),
-            "With max_depth=1, should get parent's directory as fallback"
+            "With max_depth=1, should get parent's effective WD"
         );
-        let expected_parent_dir = PathBuf::from(format!("/{}/{}", workspace, dir_parent));
+        let expected_parent_wd = PathBuf::from(format!("/{}/{}/{}", workspace, dir_parent, wd_parent));
         let result_path_1 = PathBuf::from(result_depth_1.as_ref().unwrap());
         prop_assert_eq!(
             result_path_1.clone(),
-            expected_parent_dir,
-            "With max_depth=1, should fall back to parent's directory"
+            expected_parent_wd,
+            "With max_depth=1, should inherit parent's explicit WD"
         );
 
         // Test with sufficient depth (2+): should get parent's explicit WD
@@ -15254,11 +15253,11 @@ proptest! {
             "With sufficient depth, should inherit parent's explicit WD"
         );
 
-        // Verify that insufficient depth gives different result than sufficient depth
-        prop_assert_ne!(
+        // With explicit parent WD and max_depth >= 1, depth should match sufficient depth
+        prop_assert_eq!(
             result_path_1,
             result_path_sufficient,
-            "Depth limiting should produce different results"
+            "With max_depth >= 1, should resolve parent's explicit WD"
         );
     }
 
@@ -15370,7 +15369,6 @@ proptest! {
         );
 
         // Test with depth 1: should get immediate parent's effective WD
-        // (which includes inherited WD from the chain)
         let result_depth_1 = compute_inherited_working_directory_with_depth(
             &uris[last_idx],
             &metadatas[last_idx],
@@ -15380,16 +15378,22 @@ proptest! {
         );
         prop_assert!(
             result_depth_1.is_some(),
-            "With max_depth=1, should get immediate parent's directory"
+            "With max_depth=1, should get immediate parent's effective WD"
         );
-        // With depth=1, we fall back to parent's directory (depth exhausted before resolving WD)
         let parent_idx = last_idx - 1;
-        let expected_parent_dir = PathBuf::from(format!("/{}/{}", workspace, dirs[parent_idx]));
+        let parent_meta = &metadatas[parent_idx];
+        let expected_parent_wd = if let Some(ref wd) = parent_meta.working_directory {
+            PathBuf::from(format!("/{}/{}/{}", workspace, dirs[parent_idx], wd))
+        } else if let Some(ref inherited) = parent_meta.inherited_working_directory {
+            PathBuf::from(inherited)
+        } else {
+            PathBuf::from(format!("/{}/{}", workspace, dirs[parent_idx]))
+        };
         let result_path_1 = PathBuf::from(result_depth_1.as_ref().unwrap());
         prop_assert_eq!(
             result_path_1.clone(),
-            expected_parent_dir,
-            "With max_depth=1, should fall back to immediate parent's directory"
+            expected_parent_wd,
+            "With max_depth=1, should match immediate parent's effective WD"
         );
 
         // Test with large depth: should get root's explicit WD (through metadata propagation)
@@ -15413,15 +15417,12 @@ proptest! {
             "With large depth, should inherit root's explicit WD"
         );
 
-        // Key property: insufficient depth gives different result than sufficient depth
-        // (unless chain_length == 1 and parent is the root)
-        if chain_length > 1 {
-            prop_assert_ne!(
-                result_path_1,
-                result_path_large,
-                "Depth limiting should produce different results for chain_length > 1"
-            );
-        }
+        // With propagated inherited WDs, depth=1 should already match the root WD.
+        prop_assert_eq!(
+            result_path_1,
+            result_path_large,
+            "With propagated inherited WDs, depth=1 should match large depth result"
+        );
     }
 
     /// Feature: working-directory-inheritance, Property 9 extended: Depth zero always stops
