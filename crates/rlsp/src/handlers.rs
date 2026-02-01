@@ -5021,7 +5021,6 @@ mod integration_tests {
     
     #[test]
     fn test_hover_shows_definition_statement() {
-        use std::collections::HashMap;
         use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
         
         let library_paths = r_env::find_library_paths();
@@ -5148,8 +5147,6 @@ mod integration_tests {
 
     #[test]
     fn test_cross_file_hover_resolution() {
-        use crate::cross_file::{dependency, scope};
-        
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
         
@@ -5893,8 +5890,6 @@ result <- helper_with_spaces(42)"#;
         // Test that when a local definition shadows a package export,
         // hover shows the local definition, not the package export.
         // Validates: Requirement 10.4
-        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
-        
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
         
