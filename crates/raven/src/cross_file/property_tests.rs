@@ -11894,8 +11894,10 @@ proptest! {
         let file_uri = Url::parse(&format!("file:///{}/{}/child.R", workspace, subdir)).unwrap();
         let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
 
-        // Create metadata with inherited_working_directory set (workspace-relative path)
-        let inherited_wd_path = format!("/{}", inherited_wd_dir);
+        // Create metadata with inherited_working_directory set as an absolute path.
+        // Per design doc: "The stored path is always absolute for consistent resolution"
+        // This simulates what compute_inherited_working_directory would return.
+        let inherited_wd_path = format!("/{}/{}", workspace, inherited_wd_dir);
         let meta = CrossFileMetadata {
             working_directory: None, // No explicit working directory
             inherited_working_directory: Some(inherited_wd_path.clone()),
@@ -11911,8 +11913,8 @@ proptest! {
         let effective_wd = ctx.effective_working_directory();
 
         // The effective working directory should be the inherited working directory
-        // (resolved as workspace-relative since it starts with /)
-        let expected_wd = PathBuf::from(format!("/{}/{}", workspace, inherited_wd_dir));
+        // (already absolute, used directly)
+        let expected_wd = PathBuf::from(&inherited_wd_path);
         
         // Check equality first, then provide detailed error message if it fails
         prop_assert!(
@@ -13736,13 +13738,13 @@ proptest! {
         let parent_ctx = parent_ctx.unwrap();
         let parent_effective_wd = parent_ctx.effective_working_directory();
 
-        // Child inherits parent's working directory
-        // The inherited_working_directory is stored as a workspace-relative path
-        // that will be resolved by from_metadata
+        // Child inherits parent's working directory.
+        // Per design doc: "The stored path is always absolute for consistent resolution"
+        // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None, // No explicit @lsp-cd
-            // Store as workspace-relative path (same as parent's @lsp-cd)
-            inherited_working_directory: Some(parent_explicit_wd_path.clone()),
+            // Store as absolute path (what compute_inherited_working_directory returns)
+            inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
 
@@ -13832,10 +13834,12 @@ proptest! {
             "Parent's effective WD should be workspace-relative resolved"
         );
 
-        // Child inherits parent's working directory (stored as workspace-relative path)
+        // Child inherits parent's working directory.
+        // Per design doc: "The stored path is always absolute for consistent resolution"
+        // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None,
-            inherited_working_directory: Some(parent_explicit_wd_path.clone()),
+            inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
 
@@ -13903,12 +13907,15 @@ proptest! {
         // Build parent's PathContext
         let parent_ctx = PathContext::from_metadata(&parent_uri, &parent_meta, Some(&workspace_uri));
         prop_assert!(parent_ctx.is_some(), "Parent PathContext should be created");
-        let _parent_ctx = parent_ctx.unwrap();
+        let parent_ctx = parent_ctx.unwrap();
+        let parent_effective_wd = parent_ctx.effective_working_directory();
 
-        // Child inherits parent's working directory (stored as workspace-relative path)
+        // Child inherits parent's working directory.
+        // Per design doc: "The stored path is always absolute for consistent resolution"
+        // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None,
-            inherited_working_directory: Some(parent_explicit_wd_path.clone()),
+            inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
 
@@ -13982,12 +13989,12 @@ proptest! {
             "Parent's effective WD should be its own directory when no @lsp-cd"
         );
 
-        // Child inherits parent's directory as working directory
-        // Store as workspace-relative path: /parent_subdir
-        let inherited_wd_path = format!("/{}", parent_subdir);
+        // Child inherits parent's directory as working directory.
+        // Per design doc: "The stored path is always absolute for consistent resolution"
+        // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None,
-            inherited_working_directory: Some(inherited_wd_path.clone()),
+            inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
 
@@ -14130,10 +14137,11 @@ proptest! {
             Some(&workspace_uri)
         ).unwrap();
 
-        // Case 3: Metadata with inherited working directory (workspace-root-relative)
+        // Case 3: Metadata with inherited working directory (stored as absolute path per design doc)
+        let inherited_wd_absolute = format!("/{}/{}", workspace, inherited_wd);
         let meta_with_inherited_wd = CrossFileMetadata {
             working_directory: None,
-            inherited_working_directory: Some(format!("/{}", inherited_wd)),
+            inherited_working_directory: Some(inherited_wd_absolute.clone()),
             ..Default::default()
         };
         let ctx_with_inherited_wd = PathContext::from_metadata(
@@ -14145,7 +14153,7 @@ proptest! {
         // Case 4: Metadata with both explicit and inherited WD
         let meta_with_both_wd = CrossFileMetadata {
             working_directory: Some(format!("/{}", explicit_wd)),
-            inherited_working_directory: Some(format!("/{}", inherited_wd)),
+            inherited_working_directory: Some(inherited_wd_absolute.clone()),
             ..Default::default()
         };
         let ctx_with_both_wd = PathContext::from_metadata(
@@ -14207,8 +14215,8 @@ proptest! {
             "from_metadata with explicit WD should use explicit WD"
         );
 
-        // from_metadata with inherited WD should use inherited WD
-        let expected_inherited_wd = PathBuf::from(format!("/{}/{}", workspace, inherited_wd));
+        // from_metadata with inherited WD should use inherited WD (stored as absolute)
+        let expected_inherited_wd = PathBuf::from(&inherited_wd_absolute);
         prop_assert_eq!(
             wd_inherited, expected_inherited_wd,
             "from_metadata with inherited WD should use inherited WD"
@@ -14439,10 +14447,12 @@ proptest! {
         let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
         let child_uri = Url::parse(&format!("file:///{}/{}/child.R", workspace, child_subdir)).unwrap();
 
-        // Child has inherited working directory from parent (workspace-root-relative)
+        // Child has inherited working directory from parent.
+        // Per design doc: "The stored path is always absolute for consistent resolution"
+        let inherited_wd_absolute = format!("/{}/{}", workspace, inherited_wd_subdir);
         let meta_with_inherited_wd = CrossFileMetadata {
             working_directory: None,
-            inherited_working_directory: Some(format!("/{}", inherited_wd_subdir)),
+            inherited_working_directory: Some(inherited_wd_absolute.clone()),
             ..Default::default()
         };
 
