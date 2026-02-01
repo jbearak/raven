@@ -622,12 +622,14 @@ impl WorldState {
 /// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
 /// 
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
-pub fn scan_workspace(folders: &[Url]) -> (
+pub type WorkspaceScanResult = (
     HashMap<Url, Document>, 
     Vec<String>, 
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
-) {
+);
+
+pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
     let mut index = HashMap::new();
     let mut imports = Vec::new();
     let mut cross_file_entries = HashMap::new();

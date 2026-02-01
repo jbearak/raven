@@ -1860,6 +1860,7 @@ where
 ///
 /// assert!(scope.symbols.is_empty());
 /// ```
+#[allow(clippy::too_many_arguments)]
 fn scope_at_position_with_graph_recursive<F, G>(
     uri: &Url,
     line: u32,

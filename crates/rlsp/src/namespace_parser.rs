@@ -44,9 +44,11 @@ pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
 /// Parse NAMESPACE file content to extract exported symbols and pattern markers.
 ///
 /// This function scans normalized NAMESPACE directives and collects:
+///
 /// - plain exported names from `export(...)` directives,
 /// - S3 methods from `S3method(generic, class[, method])` formatted as `generic.class`,
 /// - export patterns from `exportPattern(...)` stored as markers `__PATTERN__:<pattern>`.
+///
 /// Comments and blank lines are ignored; whitespace is trimmed and empty names are filtered out.
 ///
 /// # Examples
@@ -353,41 +355,23 @@ pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>>
 }
 
 /// Extracts the value of a named field from DESCRIPTION (DCF) content and parses it into package names.
-
 ///
-
 /// The function locates `field_name:` at the start of a line, accumulates its value including continuation
-
 /// lines that begin with whitespace, and stops when a new field or a non-continuation line is encountered.
-
 /// The collected field value is then parsed into package names (version constraints are stripped and the
-
 /// `R` entry is excluded).
-
 ///
-
 /// # Examples
-
 ///
-
 /// ```
-
 /// let desc = "\
-
 /// Package: foo
-
 /// Depends: R (>= 3.5.0), dplyr (>= 1.0.0),
-
 ///  tibble
-
 /// Imports: utils
-
 /// ";
-
 /// let deps = parse_description_field(desc, "Depends");
-
 /// assert_eq!(deps, vec!["dplyr".to_string(), "tibble".to_string()]);
-
 /// ```
 fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
     let mut field_value = String::new();

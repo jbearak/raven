@@ -539,10 +539,12 @@ fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<Lib
 /// return a `LibraryCall` containing the package name and the byte position (line and UTF-16 column) at the end of the call.
 ///
 /// Returns `Some(LibraryCall)` when:
+///
 /// - the function name is `library`, `require`, or `loadNamespace`,
 /// - the call's arguments are syntactically valid,
 /// - the package name is statically determinable from a bare identifier or string literal (including a named `package=` argument),
 /// - `character.only = TRUE` is not present (such calls are skipped as dynamic).
+///
 /// Returns `None` otherwise.
 ///
 /// # Examples
