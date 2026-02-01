@@ -59,6 +59,12 @@ impl PathContext {
                 if inherited_path.is_absolute() {
                     ctx.inherited_working_directory = Some(inherited_path);
                 } else {
+                    // Relative inherited paths should not occur in normal operation
+                    log::trace!(
+                        "Inherited WD is relative '{}' for {}, resolving relative to file directory",
+                        inherited_wd,
+                        file_uri
+                    );
                     ctx.inherited_working_directory = resolve_working_directory(inherited_wd, &ctx);
                 }
             }

@@ -195,8 +195,26 @@ where
     );
 
     // Convert parent URI to file path and get its directory
-    let parent_path = parent_uri.to_file_path().ok()?;
-    let parent_dir = parent_path.parent()?;
+    let parent_path = match parent_uri.to_file_path() {
+        Ok(path) => path,
+        Err(_) => {
+            log::trace!(
+                "Cannot convert parent URI to file path for WD inheritance: {}",
+                parent_uri
+            );
+            return None;
+        }
+    };
+    let parent_dir = match parent_path.parent() {
+        Some(dir) => dir,
+        None => {
+            log::trace!(
+                "Parent path has no parent directory: {}",
+                parent_path.display()
+            );
+            return None;
+        }
+    };
 
     Some(parent_dir.to_string_lossy().to_string())
 }

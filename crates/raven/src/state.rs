@@ -5,7 +5,7 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -731,49 +731,65 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     }
 
     // Second pass: iteratively enrich metadata with inherited_working_directory
-    // Use bounded loop to propagate transitive inheritance (parent's inherited_wd to children)
+    // Track only files that need enrichment to avoid O(n²) behavior
+    let mut files_needing_enrichment: HashSet<Url> = new_index_entries
+        .iter()
+        .filter(|(_, entry)| {
+            !entry.metadata.sourced_by.is_empty()
+                && entry.metadata.working_directory.is_none()
+                && entry.metadata.inherited_working_directory.is_none()
+        })
+        .map(|(uri, _)| uri.clone())
+        .collect();
+
     for iteration in 0..max_chain_depth {
-        // Build metadata map from current state (includes any enrichment from prior iterations)
+        if files_needing_enrichment.is_empty() {
+            log::trace!("Workspace scan enrichment converged after {} iteration(s)", iteration + 1);
+            break;
+        }
+
+        // Build metadata map from current state
         let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
             .iter()
             .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
             .collect();
 
-        let mut changed = false;
+        let mut newly_enriched = Vec::new();
 
-        for (uri, entry) in new_index_entries.iter_mut() {
-            let old_inherited = entry.metadata.inherited_working_directory.clone();
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut entry.metadata,
-                uri,
-                workspace_root.as_ref(),
-                |parent_uri| metadata_map.get(parent_uri).cloned(),
-                max_chain_depth,
-            );
-            if entry.metadata.inherited_working_directory != old_inherited {
-                changed = true;
+        // Only process files that need enrichment
+        for uri in &files_needing_enrichment {
+            if let Some(entry) = new_index_entries.get_mut(uri) {
+                let old_inherited = entry.metadata.inherited_working_directory.clone();
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut entry.metadata,
+                    uri,
+                    workspace_root.as_ref(),
+                    |parent_uri| metadata_map.get(parent_uri).cloned(),
+                    max_chain_depth,
+                );
+                if entry.metadata.inherited_working_directory != old_inherited {
+                    newly_enriched.push(uri.clone());
+                }
+            }
+            // Also update legacy cross_file_entries
+            if let Some(entry) = cross_file_entries.get_mut(uri) {
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut entry.metadata,
+                    uri,
+                    workspace_root.as_ref(),
+                    |parent_uri| metadata_map.get(parent_uri).cloned(),
+                    max_chain_depth,
+                );
             }
         }
-        // Also update legacy cross_file_entries
-        for (uri, entry) in cross_file_entries.iter_mut() {
-            let old_inherited = entry.metadata.inherited_working_directory.clone();
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut entry.metadata,
-                uri,
-                workspace_root.as_ref(),
-                |parent_uri| metadata_map.get(parent_uri).cloned(),
-                max_chain_depth,
-            );
-            if entry.metadata.inherited_working_directory != old_inherited {
-                changed = true;
-            }
+
+        // Remove enriched files from the set
+        for uri in &newly_enriched {
+            files_needing_enrichment.remove(uri);
         }
 
-        if !changed {
-            log::trace!(
-                "Workspace scan enrichment converged after {} iteration(s)",
-                iteration + 1
-            );
+        if newly_enriched.is_empty() {
+            log::trace!("Workspace scan enrichment converged after {} iteration(s)", iteration + 1);
             break;
         }
     }
