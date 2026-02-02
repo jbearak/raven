@@ -50,6 +50,8 @@ impl Default for HelpCache {
 /// }
 /// ```
 pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
+    log::trace!("get_help: topic={}, package={:?}", topic, package);
+
     let r_code = r#"
 args <- commandArgs(trailingOnly = TRUE)
 topic <- args[1]
@@ -76,16 +78,29 @@ cat(paste(txt, collapse = "\n"))
     if let Some(pkg) = package {
         cmd.arg(pkg);
     }
-    let output = cmd.output().ok()?;
 
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).to_string();
-        if !text.trim().is_empty() && !text.contains("No documentation") {
-            return Some(text);
+    match cmd.output() {
+        Ok(output) => {
+            log::trace!(
+                "get_help: exit_status={}, stdout_len={}, stderr_len={}",
+                output.status,
+                output.stdout.len(),
+                output.stderr.len()
+            );
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                if !text.trim().is_empty() && !text.contains("No documentation") {
+                    return Some(text);
+                }
+                log::trace!("get_help: empty or no documentation");
+            }
+            None
+        }
+        Err(e) => {
+            log::trace!("get_help: subprocess error: {}", e);
+            None
         }
     }
-
-    None
 }
 
 /// Extracts the first function signature from R help text.

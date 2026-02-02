@@ -7,6 +7,7 @@
 #![cfg(test)]
 
 use proptest::prelude::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use super::directive::parse_directives;
@@ -6866,21 +6867,21 @@ proptest! {
 
         // After source() but before rm() (line 0, after source call), symbol should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
             "Symbol from sourced file should be in scope after source() but before rm()");
 
         // After rm() (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after rm()");
 
         // At end of file, symbol should NOT be in scope
         let scope_eof = scope_at_position_with_graph(
-            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_eof.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope at end of file after rm()");
@@ -6933,7 +6934,7 @@ proptest! {
 
         // After rm(), only the removed symbol should be gone
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_to_remove),
             "Removed symbol should NOT be in scope after rm()");
@@ -6989,7 +6990,7 @@ proptest! {
 
         // Before rm() (line 0), all three symbols should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_rm.symbols.contains_key(&symbol_a),
             "symbol_a should be in scope before rm()");
@@ -7000,7 +7001,7 @@ proptest! {
 
         // After rm() (line 1), symbol_a and symbol_b should NOT be in scope, but symbol_c should be
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
             "symbol_a should NOT be in scope after rm()");
@@ -7050,14 +7051,14 @@ proptest! {
 
         // After source() but before remove() (line 0), symbol should be in scope
         let scope_before_remove = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_remove.symbols.contains_key(&symbol),
             "Symbol from sourced file should be in scope after source() but before remove()");
 
         // After remove() (line 1), symbol should NOT be in scope
         let scope_after_remove = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_remove.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after remove()");
@@ -7103,14 +7104,14 @@ proptest! {
 
         // After source() but before rm(list=...) (line 0), symbol should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
             "Symbol from sourced file should be in scope after source() but before rm(list=...)");
 
         // After rm(list=...) (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after rm(list=...)");
@@ -7167,7 +7168,7 @@ proptest! {
 
         // After rm(list=c(...)) (line 1), symbol_a and symbol_b should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
             "symbol_a should NOT be in scope after rm(list=c(...))");
@@ -7220,21 +7221,21 @@ proptest! {
 
         // After source() but before rm() (line 0), symbol should be in scope
         let scope_after_source = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_after_source.symbols.contains_key(&symbol),
             "Symbol should be in scope after source() but before rm()");
 
         // After rm() but before redefinition (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after rm() but before redefinition");
 
         // After redefinition (line 2), symbol should be in scope again
         let scope_after_redef = scope_at_position_with_graph(
-            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_after_redef.symbols.contains_key(&symbol),
             "Symbol should be in scope after redefinition");
@@ -7281,14 +7282,14 @@ proptest! {
 
         // In child file, the symbol should still be in scope (child's own definition)
         let scope_in_child = scope_at_position_with_graph(
-            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_in_child.symbols.contains_key(&symbol),
             "Symbol should still be in scope in child file (child's own definition)");
 
         // In parent file after rm(), the symbol should NOT be in scope
         let scope_in_parent = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_in_parent.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope in parent file after rm()");
@@ -8891,7 +8892,6 @@ proptest! {
 // ============================================================================
 
 use super::scope::scope_at_position_with_packages;
-use std::collections::HashSet;
 
 /// Generate a random R code structure for testing base package availability
 fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
@@ -9499,7 +9499,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited the package from parent
@@ -9559,7 +9559,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should NOT have the package (loaded after source() call)
@@ -9623,7 +9623,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited both packages from parent
@@ -9695,7 +9695,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited pkg_before (loaded before source())
@@ -9768,7 +9768,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should NOT have the package (it's function-scoped in parent)
@@ -9843,7 +9843,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited the package from grandparent (through parent)
@@ -9895,7 +9895,7 @@ proptest! {
 
         // Query child's scope at various positions
         let scope = scope_at_position_with_graph(
-            &child_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited the package at any position
@@ -9975,7 +9975,7 @@ proptest! {
 
         // Query parent's scope AFTER the source() call
         let scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Parent should have the package (loaded in child, available after source())
@@ -10048,7 +10048,7 @@ proptest! {
 
         // Query grandparent's scope after source() call
         let grandparent_scope = scope_at_position_with_graph(
-            &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Grandparent should have the package (loaded in grandchild)
@@ -10060,7 +10060,7 @@ proptest! {
 
         // Query parent's scope after source() call
         let parent_scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Parent should also have the package (loaded in child)
@@ -10123,7 +10123,7 @@ proptest! {
 
         // Query parent's scope after source() call
         let scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Symbols from child SHOULD be available in parent
@@ -10198,7 +10198,7 @@ proptest! {
 
         // Query child's scope - should have parent's package
         let child_scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child SHOULD have parent's package (forward propagation works)
@@ -10210,7 +10210,7 @@ proptest! {
 
         // Query parent's scope after source() call
         let parent_scope = scope_at_position_with_graph(
-            &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Parent should have child's package (propagated from child)
@@ -10261,7 +10261,7 @@ proptest! {
 
         // Query parent's scope at various positions
         let scope = scope_at_position_with_graph(
-            &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         if query_line == 0 {
@@ -10323,7 +10323,7 @@ proptest! {
 
         // Query parent's scope after source() call
         let scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Parent should have all of the child's packages

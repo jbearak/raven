@@ -89,6 +89,15 @@ fn get_cross_file_scope(
 
     let max_depth = state.cross_file_config.max_chain_depth;
 
+    // Get base_exports from package_library if ready, otherwise empty set.
+    // This ensures base R functions (stop, sprintf, exists, etc.) are available
+    // in cross-file scope resolution for hover, completions, and go-to-definition.
+    let base_exports = if state.package_library_ready {
+        state.package_library.base_exports().clone()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     // Use the graph-aware scope resolution with PathContext
     scope::scope_at_position_with_graph(
         uri,
@@ -99,6 +108,7 @@ fn get_cross_file_scope(
         &state.cross_file_graph,
         state.workspace_folders.first(),
         max_depth,
+        &base_exports,
     )
 }
 
@@ -922,6 +932,10 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
 
     let max_depth = state.cross_file_config.max_chain_depth;
 
+    // For depth-exceeded diagnostics, we don't need base_exports since we're only
+    // checking chain depth, not resolving symbols. Pass empty set for efficiency.
+    let empty_base_exports = std::collections::HashSet::new();
+
     // Use scope resolution to detect depth exceeded (now uses PathContext internally)
     let scope = scope::scope_at_position_with_graph(
         uri,
@@ -932,6 +946,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         &state.cross_file_graph,
         state.workspace_folders.first(),
         max_depth,
+        &empty_base_exports,
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file

@@ -1108,6 +1108,9 @@ impl LanguageServer for Backend {
                         content_provider.get_metadata(target_uri)
                     };
 
+                // For package prefetching, we only need the package lists, not base symbols.
+                // Pass empty base_exports since we're only collecting package names.
+                let empty_base_exports = std::collections::HashSet::new();
                 let scope = crate::cross_file::scope::scope_at_position_with_graph(
                     &uri,
                     0,
@@ -1117,6 +1120,7 @@ impl LanguageServer for Backend {
                     &state.cross_file_graph,
                     state.workspace_folders.first(),
                     state.cross_file_config.max_chain_depth,
+                    &empty_base_exports,
                 );
 
                 let mut pkgs: Vec<String> = scope.inherited_packages;

@@ -233,6 +233,8 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Add language identifiers (e.g., `text`) to ASCII diagram/timeline fences to satisfy markdownlint (MD040).
 - `tree_sitter::Tree` implements `Clone`; preserve ASTs in cloned index entries when reference searches depend on them.
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.
+- Base exports must be gated by `package_library_ready` to avoid using empty exports before R subprocess initialization completes.
+- When adding parameters to scope resolution functions, update all callers including test helpers.
 
 ### Rust/Clippy Best Practices
 

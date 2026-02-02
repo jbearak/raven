@@ -1931,6 +1931,12 @@ where
 
 /// Extended scope resolution that also uses dependency graph edges.
 /// This is the preferred entry point when a DependencyGraph is available.
+///
+/// The `base_exports` parameter contains the set of base R function names that should be
+/// available at all positions without explicit `library()` calls. When `package_library_ready`
+/// is true, callers should pass `package_library.base_exports()`. When not ready (before R
+/// subprocess has reported library paths), callers should pass an empty set to avoid using
+/// stale/empty base exports.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph<F, G>(
     uri: &Url,
@@ -1941,6 +1947,7 @@ pub fn scope_at_position_with_graph<F, G>(
     graph: &super::dependency::DependencyGraph,
     workspace_root: Option<&Url>,
     max_depth: usize,
+    base_exports: &HashSet<String>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -1968,6 +1975,7 @@ where
         0,
         &mut visited,
         &[],
+        base_exports,
     )
 }
 
@@ -2010,6 +2018,7 @@ where
 ///     0,
 ///     &mut visited,
 ///     &[], // no inherited packages
+///     &std::collections::HashSet::new(), // no base exports
 /// );
 ///
 /// assert!(scope.symbols.is_empty());
@@ -2028,6 +2037,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     current_depth: usize,
     visited: &mut HashSet<Url>,
     inherited_packages: &[String],
+    base_exports: &HashSet<String>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2039,6 +2049,28 @@ where
         inherited_packages: inherited_packages.to_vec(),
         ..Default::default()
     };
+
+    // Requirements 6.3, 6.4: Base packages are always available at all positions
+    // without requiring explicit library() calls. Add base exports first with lowest
+    // precedence - they will be overridden by local definitions via insert().
+    // Only inject at depth 0 (root file) to avoid duplicates during recursion.
+    if current_depth == 0 {
+        let base_uri =
+            Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+        for export_name in base_exports {
+            scope.symbols.insert(
+                export_name.clone(),
+                ScopedSymbol {
+                    name: export_name.clone(),
+                    kind: SymbolKind::Variable, // Base exports are treated as variables
+                    source_uri: base_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                },
+            );
+        }
+    }
 
     if current_depth >= max_depth || visited.contains(uri) {
         return scope;
@@ -2098,6 +2130,7 @@ where
         // Get parent's scope at the call site
         // Note: We pass empty inherited_packages here because the parent will collect
         // its own inherited packages from its parents via the dependency graph
+        // We pass base_exports since child files also need access to base R functions
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
             call_site_line,
@@ -2111,6 +2144,7 @@ where
             current_depth + 1,
             visited,
             &[], // Parent collects its own inherited packages
+            base_exports,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -2377,6 +2411,7 @@ where
                             current_depth + 1,
                             visited,
                             packages_slice, // Pass inherited packages to child
+                            base_exports,
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -3255,6 +3290,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -3328,6 +3364,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(
@@ -3491,6 +3528,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             2,
+            &HashSet::new(),
         );
 
         // Should have depth_exceeded entry
@@ -3678,6 +3716,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -3763,6 +3802,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(
@@ -5714,6 +5754,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -5730,6 +5771,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -5746,6 +5788,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -5820,6 +5863,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -5844,6 +5888,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6084,6 +6129,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -6100,6 +6146,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6116,6 +6163,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -6197,6 +6245,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6278,6 +6327,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -6294,6 +6344,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -6391,6 +6442,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -6407,6 +6459,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -8095,6 +8148,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should have inherited dplyr from parent
@@ -8169,6 +8223,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -8243,6 +8298,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should have both packages
@@ -8322,6 +8378,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -8402,6 +8459,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -8477,6 +8535,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Symbols from child SHOULD be available in parent
@@ -8590,6 +8649,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Grandparent should have stringr (loaded in grandchild)
@@ -8610,6 +8670,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Parent should also have stringr (loaded in child)
@@ -8687,6 +8748,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -8707,6 +8769,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Parent should have ggplot2 (loaded in child)
