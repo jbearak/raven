@@ -1401,8 +1401,8 @@ fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Check package exports only if packages feature is enabled
-        if state.cross_file_config.packages_enabled {
+        // Check package exports only if packages feature is enabled and library is ready
+        if state.cross_file_config.packages_enabled && state.package_library_ready {
             // Build position-aware package list: inherited packages + locally loaded packages
             // Requirements 5.1, 5.2: Inherited packages from parent files
             // Requirements 8.1, 8.3: Locally loaded packages before this position

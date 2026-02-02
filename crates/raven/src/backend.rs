@@ -16,6 +16,7 @@ use tower_lsp::LanguageServer;
 use tower_lsp::LspService;
 use tower_lsp::Server;
 
+use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::r_env;
 use crate::state::{scan_workspace, WorldState};
@@ -347,6 +348,49 @@ pub struct Backend {
 }
 
 impl Backend {
+    async fn ensure_package_library_initialized(&self) -> bool {
+        let (enabled, lib_paths_empty) = {
+            let state = self.state.read().await;
+            (
+                state.cross_file_config.packages_enabled,
+                state.package_library.lib_paths().is_empty(),
+            )
+        };
+
+        if !enabled {
+            return false;
+        }
+        if !lib_paths_empty {
+            return self.state.read().await.package_library_ready;
+        }
+
+        let (packages_r_path, additional_paths) = {
+            let state = self.state.read().await;
+            (
+                state.cross_file_config.packages_r_path.clone(),
+                state
+                    .cross_file_config
+                    .packages_additional_library_paths
+                    .clone(),
+            )
+        };
+
+        log::trace!("Initializing PackageLibrary on demand (lib_paths empty)");
+        let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+        let ready = match lib.initialize().await {
+            Ok(()) => !lib.lib_paths().is_empty(),
+            Err(e) => {
+                log::warn!("Failed to initialize PackageLibrary: {}", e);
+                false
+            }
+        };
+        lib.add_library_paths(&additional_paths);
+        let mut state = self.state.write().await;
+        state.package_library = std::sync::Arc::new(lib);
+        state.package_library_ready = ready;
+        ready
+    }
     pub fn new(client: Client) -> Self {
         let library_paths = r_env::find_library_paths();
         log::info!("Discovered R library paths: {:?}", library_paths);
@@ -467,13 +511,17 @@ impl LanguageServer for Backend {
             )
         };
 
-        let new_package_library = if packages_enabled {
+        let (new_package_library, package_library_ready) = if packages_enabled {
             // Create RSubprocess and initialize PackageLibrary
             let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
             let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-            if let Err(e) = lib.initialize().await {
-                log::warn!("Failed to initialize PackageLibrary: {}", e);
-            }
+            let ready = match lib.initialize().await {
+                Ok(()) => !lib.lib_paths().is_empty(),
+                Err(e) => {
+                    log::warn!("Failed to initialize PackageLibrary: {}", e);
+                    false
+                }
+            };
             // Add additional library paths (dedup)
             lib.add_library_paths(&additional_paths);
             log::info!(
@@ -482,16 +530,17 @@ impl LanguageServer for Backend {
                 lib.base_packages().len(),
                 lib.base_exports().len()
             );
-            std::sync::Arc::new(lib)
+            (std::sync::Arc::new(lib), ready)
         } else {
             log::info!("Package function awareness disabled");
-            std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty())
+            (std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()), false)
         };
 
         // Replace package_library under brief write lock
         {
             let mut state = self.state.write().await;
             state.package_library = new_package_library;
+            state.package_library_ready = package_library_ready;
         }
 
         log::info!("Workspace initialization complete");
@@ -851,12 +900,17 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Priority 2 files (backward directive targets) are indexed in background
-            let priority_2_enabled = {
+            // Priority 2 files (backward directive targets) are indexed synchronously
+            // so parent scopes are available before diagnostics.
+            let (priority_2_enabled, max_backward_depth, max_forward_depth) = {
                 let state = self.state.read().await;
-                state
-                    .cross_file_config
-                    .on_demand_indexing_priority_2_enabled
+                (
+                    state
+                        .cross_file_config
+                        .on_demand_indexing_priority_2_enabled,
+                    state.cross_file_config.max_backward_depth,
+                    state.cross_file_config.max_forward_depth,
+                )
             };
 
             if priority_2_enabled {
@@ -868,13 +922,233 @@ impl LanguageServer for Backend {
 
                 if !priority_2_files.is_empty() {
                     log::info!(
-                        "Submitting {} backward directive targets for background indexing",
+                        "Synchronously indexing {} backward directive targets before diagnostics",
                         priority_2_files.len()
                     );
-                    for file_uri in priority_2_files {
-                        self.background_indexer.submit(file_uri, 2, 0);
+                    self.index_backward_chain(
+                        priority_2_files,
+                        max_backward_depth,
+                        max_forward_depth,
+                    )
+                    .await;
+                }
+            }
+
+            // Re-enrich metadata now that backward/forward chains are indexed.
+            // This ensures working-directory inheritance is accurate before diagnostics.
+            {
+                let mut state = self.state.write().await;
+                let workspace_root = state.workspace_folders.first().cloned();
+                let max_chain_depth = state.cross_file_config.max_chain_depth;
+
+                let mut meta = crate::cross_file::extract_metadata(&text);
+                log::trace!(
+                    "did_open re-enrich: uri={}, sources={}, sourced_by={}",
+                    uri,
+                    meta.sources.len(),
+                    meta.sourced_by.len()
+                );
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut meta,
+                    &uri,
+                    workspace_root.as_ref(),
+                    |parent_uri| state.get_enriched_metadata(parent_uri),
+                    max_chain_depth,
+                );
+                log::trace!(
+                    "did_open re-enrich: uri={} working_directory={:?} inherited_working_directory={:?}",
+                    uri,
+                    meta.working_directory,
+                    meta.inherited_working_directory
+                );
+
+                state
+                    .document_store
+                    .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                    .await;
+                state.open_document(uri.clone(), &text, Some(version));
+
+                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                    &uri,
+                    workspace_root.as_ref(),
+                );
+                let parent_content: std::collections::HashMap<Url, String> = meta
+                    .sourced_by
+                    .iter()
+                    .filter_map(|d| {
+                        let ctx = backward_path_ctx.as_ref()?;
+                        let resolved =
+                            crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                        log::trace!(
+                            "did_open re-enrich: backward directive {} -> {}",
+                            d.path,
+                            resolved.display()
+                        );
+                        let parent_uri = Url::from_file_path(resolved).ok()?;
+                        let content = state
+                            .documents
+                            .get(&parent_uri)
+                            .map(|doc| doc.text())
+                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                        Some((parent_uri, content))
+                    })
+                    .collect();
+
+                if let Some(forward_ctx) =
+                    crate::cross_file::path_resolve::PathContext::from_metadata(
+                        &uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                    )
+                {
+                    for source in &meta.sources {
+                        if let Some(resolved) =
+                            crate::cross_file::path_resolve::resolve_path(&source.path, &forward_ctx)
+                        {
+                            log::trace!(
+                                "did_open re-enrich: source() {} -> {}",
+                                source.path,
+                                resolved.display()
+                            );
+                        } else {
+                            log::trace!(
+                                "did_open re-enrich: source() {} -> <unresolved>",
+                                source.path
+                            );
+                        }
                     }
                 }
+
+                state.cross_file_graph.update_file(
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                    |parent_uri| parent_content.get(parent_uri).cloned(),
+                );
+
+                // Ensure direct sources for this document are indexed using the re-enriched metadata.
+                if let Some(forward_ctx) =
+                    crate::cross_file::path_resolve::PathContext::from_metadata(
+                        &uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                    )
+                {
+                    for source in &meta.sources {
+                        if let Some(resolved) =
+                            crate::cross_file::path_resolve::resolve_path(&source.path, &forward_ctx)
+                        {
+                            if let Ok(child_uri) = Url::from_file_path(resolved) {
+                                let needs_indexing = {
+                                    !state.documents.contains_key(&child_uri)
+                                        && !state.cross_file_workspace_index.contains(&child_uri)
+                                };
+                                if needs_indexing {
+                                    log::trace!(
+                                        "did_open re-enrich: indexing direct source {}",
+                                        child_uri
+                                    );
+                                    drop(state);
+                                    let _ = self.index_file_on_demand(&child_uri).await;
+                                    state = self.state.write().await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prefetch packages for inherited scope to avoid transient undefined diagnostics.
+        if packages_enabled {
+            let _ = self.ensure_package_library_initialized().await;
+            // If package library wasn't initialized yet, reinitialize now so lib_paths are available.
+            let reinit = {
+                let state = self.state.read().await;
+                state.package_library.lib_paths().is_empty()
+                    && state.cross_file_config.packages_enabled
+            };
+
+            if reinit {
+                let (packages_r_path, additional_paths) = {
+                    let state = self.state.read().await;
+                    (
+                        state.cross_file_config.packages_r_path.clone(),
+                        state
+                            .cross_file_config
+                            .packages_additional_library_paths
+                            .clone(),
+                    )
+                };
+                log::trace!("Reinitializing PackageLibrary for did_open prefetch");
+                let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+                let ready = match lib.initialize().await {
+                    Ok(()) => !lib.lib_paths().is_empty(),
+                    Err(e) => {
+                        log::warn!("Failed to reinitialize PackageLibrary: {}", e);
+                        false
+                    }
+                };
+                lib.add_library_paths(&additional_paths);
+                let mut state = self.state.write().await;
+                state.package_library = std::sync::Arc::new(lib);
+                state.package_library_ready = ready;
+            }
+
+            let (package_library, scope_packages) = {
+                let state = self.state.read().await;
+                let content_provider = state.content_provider();
+                let get_artifacts =
+                    |target_uri: &Url| -> Option<crate::cross_file::scope::ScopeArtifacts> {
+                        content_provider.get_artifacts(target_uri)
+                    };
+                let get_metadata =
+                    |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                        content_provider.get_metadata(target_uri)
+                    };
+
+                let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                    &uri,
+                    0,
+                    0,
+                    &get_artifacts,
+                    &get_metadata,
+                    &state.cross_file_graph,
+                    state.workspace_folders.first(),
+                    state.cross_file_config.max_chain_depth,
+                );
+
+                let mut pkgs: Vec<String> = scope.inherited_packages;
+                for pkg in scope.loaded_packages {
+                    if !pkgs.contains(&pkg) {
+                        pkgs.push(pkg);
+                    }
+                }
+
+                (state.package_library.clone(), pkgs)
+            };
+
+            if !scope_packages.is_empty() {
+                log::trace!(
+                    "did_open prefetch: uri={} packages={:?}",
+                    uri,
+                    scope_packages
+                );
+                if self.state.read().await.package_library_ready {
+                    package_library.prefetch_packages(&scope_packages).await;
+                } else {
+                    log::trace!("did_open prefetch: package library not ready, skipping");
+                }
+                let has_ddply =
+                    package_library.is_symbol_from_loaded_packages("ddply", &scope_packages);
+                let has_row_medians = package_library
+                    .is_symbol_from_loaded_packages("rowMedians", &scope_packages);
+                log::trace!(
+                    "did_open prefetch: symbol check ddply={} rowMedians={}",
+                    has_ddply,
+                    has_row_medians
+                );
             }
         }
 
@@ -1449,22 +1723,27 @@ impl LanguageServer for Backend {
         if package_settings_changed {
             log::info!("Package settings changed, reinitializing PackageLibrary");
 
-            let new_package_library = if packages_enabled {
+            let (new_package_library, package_library_ready) = if packages_enabled {
                 let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
                 let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-                if let Err(e) = lib.initialize().await {
-                    log::warn!("Failed to reinitialize PackageLibrary: {}", e);
-                }
+                let ready = match lib.initialize().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("Failed to reinitialize PackageLibrary: {}", e);
+                        false
+                    }
+                };
                 lib.add_library_paths(&additional_paths);
-                std::sync::Arc::new(lib)
+                (std::sync::Arc::new(lib), ready)
             } else {
-                std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty())
+                (std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()), false)
             };
 
             // Replace under brief write lock
             {
                 let mut state = self.state.write().await;
                 state.package_library = new_package_library;
+                state.package_library_ready = package_library_ready;
             }
         }
 
@@ -1943,7 +2222,7 @@ impl Backend {
         };
 
         // Compute cross-file metadata and artifacts using thread-local parser
-        let cross_file_meta = crate::cross_file::extract_metadata(&content);
+        let mut cross_file_meta = crate::cross_file::extract_metadata(&content);
         let artifacts = crate::parser_pool::with_parser(|parser| {
             if let Some(tree) = parser.parse(&content, None) {
                 crate::cross_file::scope::compute_artifacts(file_uri, &tree, &content)
@@ -1951,6 +2230,20 @@ impl Backend {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
         });
+
+        // Enrich metadata with inherited working directory before indexing
+        {
+            let state = self.state.read().await;
+            let workspace_root = state.workspace_folders.first().cloned();
+            let max_chain_depth = state.cross_file_config.max_chain_depth;
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut cross_file_meta,
+                file_uri,
+                workspace_root.as_ref(),
+                |parent_uri| state.get_enriched_metadata(parent_uri),
+                max_chain_depth,
+            );
+        }
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -1963,6 +2256,7 @@ impl Backend {
         );
 
         // Update new WorkspaceIndex (Requirement 12.1, 12.2, 12.3)
+        let mut packages_to_prefetch: Vec<String> = Vec::new();
         {
             let state = self.state.read().await;
 
@@ -1971,6 +2265,9 @@ impl Backend {
 
             // Extract loaded packages from tree
             let loaded_packages = extract_loaded_packages_from_tree(&tree, &content);
+            if state.cross_file_config.packages_enabled {
+                packages_to_prefetch = loaded_packages.clone();
+            }
 
             let index_entry = crate::workspace_index::IndexEntry {
                 contents: ropey::Rope::from_str(&content),
@@ -1985,6 +2282,24 @@ impl Backend {
             state
                 .workspace_index_new
                 .insert(file_uri.clone(), index_entry);
+        }
+
+        if !packages_to_prefetch.is_empty() {
+            let ready = self.ensure_package_library_initialized().await;
+            if !ready {
+                log::trace!(
+                    "On-demand indexing: package library not ready, skipping prefetch for {}",
+                    file_uri
+                );
+            } else {
+            log::trace!(
+                "On-demand indexing: prefetching packages for {}: {:?}",
+                file_uri,
+                packages_to_prefetch
+            );
+            let pkg_lib = self.state.read().await.package_library.clone();
+            pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+            }
         }
 
         // Update legacy workspace index
@@ -2046,6 +2361,310 @@ impl Backend {
                 .map(|a| a.exported_interface.len())
                 .unwrap_or(0)
         );
+
+        Some(cross_file_meta)
+    }
+
+    async fn index_backward_chain(
+        &self,
+        start_uris: Vec<Url>,
+        max_backward_depth: usize,
+        max_forward_depth: usize,
+    ) {
+        use std::collections::{HashSet, VecDeque};
+
+        if start_uris.is_empty() || max_backward_depth == 0 {
+            return;
+        }
+
+        let workspace_root = self.state.read().await.workspace_folders.first().cloned();
+        let mut visited: HashSet<Url> = HashSet::new();
+        let mut queue: VecDeque<(Url, usize)> =
+            start_uris.into_iter().map(|u| (u, 0)).collect();
+
+        while let Some((uri, depth)) = queue.pop_front() {
+            if depth >= max_backward_depth || visited.contains(&uri) {
+                continue;
+            }
+            visited.insert(uri.clone());
+            log::trace!("index_backward_chain: visiting {} depth={}", uri, depth);
+
+            let needs_indexing = {
+                let state = self.state.read().await;
+                !state.documents.contains_key(&uri)
+                    && !state.cross_file_workspace_index.contains(&uri)
+            };
+
+            let meta = if needs_indexing {
+                self.index_file_on_demand(&uri).await
+            } else {
+                let state = self.state.read().await;
+                state.get_enriched_metadata(&uri)
+            };
+
+            let Some(meta) = meta else { continue };
+
+            if max_forward_depth > 0 {
+                self.index_forward_chain(&uri, max_forward_depth, workspace_root.as_ref())
+                    .await;
+            }
+
+            let ctx =
+                crate::cross_file::path_resolve::PathContext::new(&uri, workspace_root.as_ref());
+            let Some(ctx) = ctx.as_ref() else { continue };
+
+            for directive in &meta.sourced_by {
+                if let Some(resolved) =
+                    crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
+                {
+                    log::trace!(
+                        "index_backward_chain: {} -> parent {}",
+                        directive.path,
+                        resolved.display()
+                    );
+                    if let Ok(parent_uri) = Url::from_file_path(resolved) {
+                        queue.push_back((parent_uri, depth.saturating_add(1)));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn index_forward_chain(
+        &self,
+        start_uri: &Url,
+        max_depth: usize,
+        workspace_root: Option<&Url>,
+    ) {
+        use std::collections::{HashSet, VecDeque};
+
+        if max_depth == 0 {
+            return;
+        }
+
+        let mut visited: HashSet<Url> = HashSet::new();
+        let mut queue: VecDeque<(Url, usize)> = VecDeque::new();
+        queue.push_back((start_uri.clone(), 0));
+
+        while let Some((uri, depth)) = queue.pop_front() {
+            if depth >= max_depth || visited.contains(&uri) {
+                continue;
+            }
+            visited.insert(uri.clone());
+            log::trace!("index_forward_chain: visiting {} depth={}", uri, depth);
+
+            let needs_indexing = {
+                let state = self.state.read().await;
+                !state.documents.contains_key(&uri)
+                    && !state.cross_file_workspace_index.contains(&uri)
+            };
+
+            let meta = if needs_indexing {
+                self.index_file_on_demand(&uri).await
+            } else {
+                let state = self.state.read().await;
+                state.get_enriched_metadata(&uri)
+            };
+
+            let Some(meta) = meta else { continue };
+
+            let Some(forward_ctx) =
+                crate::cross_file::path_resolve::PathContext::from_metadata(
+                    &uri,
+                    &meta,
+                    workspace_root,
+                )
+            else {
+                continue;
+            };
+            let parent_effective_wd = forward_ctx.effective_working_directory();
+
+            for source in &meta.sources {
+                if let Some(resolved) =
+                    crate::cross_file::path_resolve::resolve_path(&source.path, &forward_ctx)
+                {
+                    log::trace!(
+                        "index_forward_chain: {} -> child {}",
+                        source.path,
+                        resolved.display()
+                    );
+                    if let Ok(child_uri) = Url::from_file_path(resolved) {
+                        let inherited_wd = if source.chdir {
+                            child_uri
+                                .to_file_path()
+                                .ok()
+                                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                .unwrap_or_else(|| parent_effective_wd.clone())
+                        } else {
+                            parent_effective_wd.clone()
+                        };
+                        let should_index = {
+                            let state = self.state.read().await;
+                            !state.documents.contains_key(&child_uri)
+                                && (!state.cross_file_workspace_index.contains(&child_uri)
+                                    || state
+                                        .get_enriched_metadata(&child_uri)
+                                        .and_then(|m| m.inherited_working_directory)
+                                        .is_none())
+                        };
+                        if should_index {
+                            let _ = self
+                                .index_file_on_demand_with_inherited_wd(
+                                    &child_uri,
+                                    &inherited_wd,
+                                )
+                                .await;
+                        }
+                        queue.push_back((child_uri, depth.saturating_add(1)));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn index_file_on_demand_with_inherited_wd(
+        &self,
+        file_uri: &Url,
+        inherited_wd: &std::path::Path,
+    ) -> Option<crate::cross_file::CrossFileMetadata> {
+        log::trace!(
+            "On-demand indexing (inherited wd={}): {}",
+            inherited_wd.display(),
+            file_uri
+        );
+
+        let path = match file_uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => {
+                log::trace!("Failed to convert URI to path: {}", file_uri);
+                return None;
+            }
+        };
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::trace!("Failed to read file {}: {}", file_uri, e);
+                return None;
+            }
+        };
+
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => {
+                log::trace!("Failed to get metadata for: {}", file_uri);
+                return None;
+            }
+        };
+
+        let mut cross_file_meta = crate::cross_file::extract_metadata(&content);
+        if cross_file_meta.working_directory.is_none()
+            && cross_file_meta.inherited_working_directory.is_none()
+        {
+            cross_file_meta.inherited_working_directory =
+                Some(inherited_wd.to_string_lossy().to_string());
+        }
+
+        let artifacts = crate::parser_pool::with_parser(|parser| {
+            if let Some(tree) = parser.parse(&content, None) {
+                crate::cross_file::scope::compute_artifacts(file_uri, &tree, &content)
+            } else {
+                crate::cross_file::scope::ScopeArtifacts::default()
+            }
+        });
+
+        let snapshot =
+            crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
+
+        self.state.read().await.cross_file_file_cache.insert(
+            file_uri.clone(),
+            snapshot.clone(),
+            content.clone(),
+        );
+
+        let mut packages_to_prefetch: Vec<String> = Vec::new();
+        {
+            let state = self.state.read().await;
+            let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
+            let loaded_packages = extract_loaded_packages_from_tree(&tree, &content);
+            if state.cross_file_config.packages_enabled {
+                packages_to_prefetch = loaded_packages.clone();
+            }
+            let index_entry = crate::workspace_index::IndexEntry {
+                contents: ropey::Rope::from_str(&content),
+                tree,
+                loaded_packages,
+                snapshot: snapshot.clone(),
+                metadata: cross_file_meta.clone(),
+                artifacts: artifacts.clone(),
+                indexed_at_version: state.workspace_index_new.version(),
+            };
+            state
+                .workspace_index_new
+                .insert(file_uri.clone(), index_entry);
+        }
+
+        if !packages_to_prefetch.is_empty() {
+            let ready = self.ensure_package_library_initialized().await;
+            if !ready {
+                log::trace!(
+                    "On-demand indexing (inherited wd): package library not ready, skipping prefetch for {}",
+                    file_uri
+                );
+            } else {
+            log::trace!(
+                "On-demand indexing (inherited wd): prefetching packages for {}: {:?}",
+                file_uri,
+                packages_to_prefetch
+            );
+            let pkg_lib = self.state.read().await.package_library.clone();
+            pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+            }
+        }
+
+        {
+            let state = self.state.read().await;
+            let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
+            state.cross_file_workspace_index.update_from_disk(
+                file_uri,
+                &open_docs,
+                snapshot,
+                cross_file_meta.clone(),
+                artifacts.clone(),
+            );
+        }
+
+        {
+            let mut state = self.state.write().await;
+            let file_uri_clone = file_uri.clone();
+            let workspace_root = state.workspace_folders.first().cloned();
+            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                &file_uri_clone,
+                workspace_root.as_ref(),
+            );
+            let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
+                .sourced_by
+                .iter()
+                .filter_map(|d| {
+                    let ctx = backward_path_ctx.as_ref()?;
+                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                    let parent_uri = Url::from_file_path(resolved).ok()?;
+                    let content = state
+                        .documents
+                        .get(&parent_uri)
+                        .map(|doc| doc.text())
+                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    Some((parent_uri, content))
+                })
+                .collect();
+
+            state.cross_file_graph.update_file(
+                file_uri,
+                &cross_file_meta,
+                workspace_root.as_ref(),
+                |parent_uri| parent_content.get(parent_uri).cloned(),
+            );
+        }
 
         Some(cross_file_meta)
     }

@@ -9908,27 +9908,25 @@ proptest! {
 }
 
 // ============================================================================
-// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-// **Validates: Requirement 5.4**
+// Feature: package-function-awareness, Property 9: Package Propagation via source()
 //
 // For any child file C that loads package P, scope resolution in the parent file
-// SHALL NOT include exports from P (packages do not propagate backward).
+// SHALL include P after the source() call.
 //
 // This test verifies that:
-// - Packages loaded in child files do NOT appear in parent's inherited_packages
-// - Packages loaded in deeply nested files do NOT propagate back through the chain
-// - While symbols from child files ARE merged into parent scope, packages are NOT
-// - Parent's packages propagate forward to child, but child's packages don't propagate back
+// - Packages loaded in child files appear in parent's inherited_packages after source()
+// - Packages loaded in deeply nested files propagate back through the chain
+// - Symbols and packages both propagate from sourced files to parent
+// - Parent's packages propagate forward to child, and child's packages propagate back
 // ============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
     /// For any child file C that loads package P, scope resolution in the parent file
-    /// SHALL NOT include exports from P in inherited_packages.
+    /// SHALL include exports from P in inherited_packages after source().
     ///
     /// Test pattern:
     /// ```r
@@ -9939,9 +9937,9 @@ proptest! {
     /// # child.R
     /// library(dplyr)      # Line 0
     /// ```
-    /// Parent file should NOT have "dplyr" in inherited_packages.
+    /// Parent file should have "dplyr" in inherited_packages after the source() call.
     #[test]
-    fn prop_forward_only_package_propagation_basic(
+    fn prop_package_propagation_basic(
         package in pkg_name(),
         func in library_func(),
     ) {
@@ -9980,19 +9978,17 @@ proptest! {
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
-        // Parent should NOT have the package (it was loaded in child, not parent)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have the package (loaded in child, available after source())
         prop_assert!(
-            !scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}. Child code:\n{}",
+            scope.inherited_packages.contains(&package),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}. Child code:\n{}",
             package, scope.inherited_packages, child_code
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Packages loaded in deeply nested files should NOT propagate back through the chain.
+    /// Packages loaded in deeply nested files should propagate back through the chain.
     ///
     /// Test pattern:
     /// ```r
@@ -10005,9 +10001,9 @@ proptest! {
     /// # child.R
     /// library(stringr)
     /// ```
-    /// Neither grandparent nor parent should have "stringr" in inherited_packages.
+    /// Both grandparent and parent should have the package in inherited_packages.
     #[test]
-    fn prop_forward_only_package_propagation_deep_chain(
+    fn prop_package_propagation_deep_chain(
         package in pkg_name(),
     ) {
         let grandparent_uri = make_url("grandparent");
@@ -10055,11 +10051,10 @@ proptest! {
             &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
-        // Grandparent should NOT have the package (loaded in grandchild)
-        // Requirement 5.4: Forward-only propagation
+        // Grandparent should have the package (loaded in grandchild)
         prop_assert!(
-            !grandparent_scope.inherited_packages.contains(&package),
-            "Grandparent should NOT inherit package '{}' from grandchild (forward-only propagation). Got inherited_packages: {:?}",
+            grandparent_scope.inherited_packages.contains(&package),
+            "Grandparent should inherit package '{}' from grandchild. Got inherited_packages: {:?}",
             package, grandparent_scope.inherited_packages
         );
 
@@ -10068,18 +10063,17 @@ proptest! {
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
-        // Parent should also NOT have the package (loaded in child)
+        // Parent should also have the package (loaded in child)
         prop_assert!(
-            !parent_scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            parent_scope.inherited_packages.contains(&package),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}",
             package, parent_scope.inherited_packages
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// While symbols from child files ARE merged into parent scope, packages are NOT.
+    /// Symbols and packages from child files are merged into parent scope.
     ///
     /// Test pattern:
     /// ```r
@@ -10091,9 +10085,9 @@ proptest! {
     /// library(ggplot2)
     /// helper_func <- function() { 1 }
     /// ```
-    /// Parent should have "helper_func" symbol but NOT "ggplot2" in inherited_packages.
+    /// Parent should have "helper_func" symbol and "ggplot2" in inherited_packages.
     #[test]
-    fn prop_forward_only_package_propagation_symbols_propagate_packages_dont(
+    fn prop_package_propagation_symbols_and_packages(
         package in pkg_name(),
         func_name in r_identifier(),
     ) {
@@ -10139,19 +10133,17 @@ proptest! {
             func_name, scope.symbols.keys().collect::<Vec<_>>()
         );
 
-        // But packages from child should NOT be in parent's inherited_packages
-        // Requirement 5.4: Forward-only propagation
+        // Packages from child should be in parent's inherited_packages
         prop_assert!(
-            !scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            scope.inherited_packages.contains(&package),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}",
             package, scope.inherited_packages
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Parent's packages propagate forward to child, but child's packages don't propagate back.
+    /// Parent's packages propagate forward to child, and child's packages propagate back.
     ///
     /// Test pattern:
     /// ```r
@@ -10165,9 +10157,9 @@ proptest! {
     /// x <- 1
     /// ```
     /// Child should have "dplyr" in inherited_packages.
-    /// Parent should NOT have "ggplot2" in inherited_packages.
+    /// Parent should have "ggplot2" in inherited_packages.
     #[test]
-    fn prop_forward_only_package_propagation_asymmetric(
+    fn prop_package_propagation_asymmetric(
         parent_pkg in pkg_name(),
         child_pkg in pkg_name(),
     ) {
@@ -10221,21 +10213,19 @@ proptest! {
             &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
-        // Parent should NOT have child's package (forward-only propagation)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have child's package (propagated from child)
         prop_assert!(
-            !parent_scope.inherited_packages.contains(&child_pkg),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            parent_scope.inherited_packages.contains(&child_pkg),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}",
             child_pkg, parent_scope.inherited_packages
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Packages loaded in child should not appear in parent at any query position.
+    /// Packages loaded in child should appear in parent after the source() call.
     #[test]
-    fn prop_forward_only_package_propagation_any_parent_position(
+    fn prop_package_propagation_any_parent_position(
         package in pkg_name(),
         query_line in 0..5u32,
     ) {
@@ -10274,21 +10264,26 @@ proptest! {
             &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
-        // Parent should NOT have the package at any position
-        // Requirement 5.4: Forward-only propagation
-        prop_assert!(
-            !scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child at line {} (forward-only propagation). Got inherited_packages: {:?}",
-            package, query_line, scope.inherited_packages
-        );
+        if query_line == 0 {
+            prop_assert!(
+                !scope.inherited_packages.contains(&package),
+                "Parent should NOT inherit package '{}' at the source() line. Got inherited_packages: {:?}",
+                package, scope.inherited_packages
+            );
+        } else {
+            prop_assert!(
+                scope.inherited_packages.contains(&package),
+                "Parent should inherit package '{}' from child at line {}. Got inherited_packages: {:?}",
+                package, query_line, scope.inherited_packages
+            );
+        }
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Multiple packages loaded in child should all NOT propagate to parent.
+    /// Multiple packages loaded in child should all propagate to parent.
     #[test]
-    fn prop_forward_only_package_propagation_multiple_packages(
+    fn prop_package_propagation_multiple_packages(
         pkg1 in pkg_name(),
         pkg2 in pkg_name(),
         pkg3 in pkg_name(),
@@ -10331,21 +10326,20 @@ proptest! {
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
         );
 
-        // Parent should NOT have any of the child's packages
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have all of the child's packages
         prop_assert!(
-            !scope.inherited_packages.contains(&pkg1),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            scope.inherited_packages.contains(&pkg1),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}",
             pkg1, scope.inherited_packages
         );
         prop_assert!(
-            !scope.inherited_packages.contains(&pkg2),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            scope.inherited_packages.contains(&pkg2),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}",
             pkg2, scope.inherited_packages
         );
         prop_assert!(
-            !scope.inherited_packages.contains(&pkg3),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            scope.inherited_packages.contains(&pkg3),
+            "Parent should inherit package '{}' from child. Got inherited_packages: {:?}",
             pkg3, scope.inherited_packages
         );
     }

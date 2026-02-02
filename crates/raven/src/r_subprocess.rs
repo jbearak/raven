@@ -423,6 +423,19 @@ impl RSubprocess {
 
         // Parse the output - one export name per line
         let exports = parse_packages_output(&output);
+        if exports.is_empty() {
+            let preview = if output.len() > 200 {
+                format!("{}...", &output[..200])
+            } else {
+                output.clone()
+            };
+            log::trace!(
+                "R returned empty exports for package '{}'; stdout_len={}, stdout_preview={:?}",
+                package,
+                output.len(),
+                preview
+            );
+        }
 
         log::trace!(
             "Got {} exports for package '{}': {:?}",

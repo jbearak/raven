@@ -704,8 +704,9 @@ impl PackageLibrary {
         // If we couldn't get any exports, the package might not be installed
         if exports.is_empty() {
             log::trace!(
-                "No exports found for package '{}', package may not be installed",
-                name
+                "No exports found for package '{}', package may not be installed. lib_paths={:?}",
+                name,
+                self.lib_paths
             );
             // Still create a PackageInfo with empty exports - this allows us to cache
             // the fact that we tried to load this package and it had no exports
@@ -900,6 +901,13 @@ impl PackageLibrary {
             log::trace!(
                 "Cached {} combined exports for package '{}'",
                 all_exports.len(),
+                name
+            );
+        }
+
+        if all_exports.is_empty() {
+            log::trace!(
+                "No exports collected for package '{}' (may be missing or unreadable)",
                 name
             );
         }

@@ -2178,6 +2178,14 @@ where
                 scope.inherited_packages.push(pkg.clone());
             }
         }
+
+        // Also propagate packages that are loaded in the parent at the call site.
+        // This includes packages loaded in sourced files before the call site.
+        for pkg in &parent_scope.loaded_packages {
+            if !scope.inherited_packages.contains(pkg) {
+                scope.inherited_packages.push(pkg.clone());
+            }
+        }
     }
 
     // STEP 2: Process timeline events (local definitions and forward sources)
@@ -2376,6 +2384,17 @@ where
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
+
+                        // Packages loaded in the sourced file become available after the source() call.
+                        for pkg in child_scope
+                            .loaded_packages
+                            .iter()
+                            .chain(child_scope.inherited_packages.iter())
+                        {
+                            if !scope.loaded_packages.contains(pkg) {
+                                scope.loaded_packages.push(pkg.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -2663,6 +2682,13 @@ where
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
+
+                        // Packages loaded in the sourced file become available after the source() call.
+                        for pkg in child_scope.loaded_packages {
+                            if !scope.loaded_packages.contains(&pkg) {
+                                scope.loaded_packages.push(pkg);
+                            }
+                        }
                     }
                 }
             }
@@ -8306,14 +8332,13 @@ x <- 1"#;
     }
 
     // ============================================================================
-    // Tests for forward-only package propagation (Task 9.2)
-    // Validates: Requirement 5.4
+    // Tests for package propagation from sourced files (Task 9.2)
     // ============================================================================
 
     #[test]
-    fn test_forward_only_package_propagation_child_packages_not_in_parent() {
-        // Requirement 5.4: Packages loaded in a sourced file should NOT propagate
-        // back to the parent file.
+    fn test_package_propagation_child_packages_in_parent() {
+        // Packages loaded in a sourced file should be available in the parent
+        // after the source() call.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8367,8 +8392,7 @@ x <- 1"#;
         };
 
         // Query parent's scope AFTER the source() call
-        // The parent should NOT have dplyr in inherited_packages because
-        // packages don't propagate backward from child to parent
+        // The parent should have dplyr available after sourcing the child
         let scope = scope_at_position_with_graph(
             &parent_uri,
             1,
@@ -8380,18 +8404,17 @@ x <- 1"#;
             10,
         );
 
-        // Parent should NOT have dplyr (it was loaded in child, not parent)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have dplyr (loaded in child, available after source())
         assert!(
-            !scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Parent should NOT inherit dplyr from child (forward-only propagation)"
+            scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Parent should inherit dplyr from child (package propagation)"
         );
     }
 
     #[test]
-    fn test_forward_only_package_propagation_child_symbols_available_but_not_packages() {
-        // Requirement 5.4: While symbols from child files ARE merged into parent scope,
-        // packages loaded in child files should NOT be propagated back.
+    fn test_package_propagation_child_symbols_and_packages_in_parent() {
+        // Symbols from child files are merged into parent scope, and packages
+        // loaded in child files should be available after source().
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8462,18 +8485,17 @@ x <- 1"#;
             "Parent should have helper_func from child (symbols propagate)"
         );
 
-        // But packages from child should NOT be in parent's inherited_packages
-        // Requirement 5.4: Forward-only propagation
+        // Packages from child should be in parent's inherited_packages
         assert!(
-            !scope.inherited_packages.contains(&"ggplot2".to_string()),
-            "Parent should NOT inherit ggplot2 from child (forward-only propagation)"
+            scope.inherited_packages.contains(&"ggplot2".to_string()),
+            "Parent should inherit ggplot2 from child (package propagation)"
         );
     }
 
     #[test]
-    fn test_forward_only_package_propagation_grandchild_packages_not_in_grandparent() {
-        // Requirement 5.4: Packages loaded in deeply nested sourced files
-        // should NOT propagate back through the chain.
+    fn test_package_propagation_grandchild_packages_in_grandparent() {
+        // Packages loaded in deeply nested sourced files should propagate
+        // back through the chain after source() calls.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8570,13 +8592,12 @@ x <- 1"#;
             10,
         );
 
-        // Grandparent should NOT have stringr (loaded in grandchild)
-        // Requirement 5.4: Forward-only propagation
+        // Grandparent should have stringr (loaded in grandchild)
         assert!(
-            !grandparent_scope
+            grandparent_scope
                 .inherited_packages
                 .contains(&"stringr".to_string()),
-            "Grandparent should NOT inherit stringr from grandchild (forward-only propagation)"
+            "Grandparent should inherit stringr from grandchild (package propagation)"
         );
 
         // Query parent's scope after source() call
@@ -8591,19 +8612,19 @@ x <- 1"#;
             10,
         );
 
-        // Parent should also NOT have stringr (loaded in child)
+        // Parent should also have stringr (loaded in child)
         assert!(
-            !parent_scope
+            parent_scope
                 .inherited_packages
                 .contains(&"stringr".to_string()),
-            "Parent should NOT inherit stringr from child (forward-only propagation)"
+            "Parent should inherit stringr from child (package propagation)"
         );
     }
 
     #[test]
-    fn test_forward_only_package_propagation_parent_packages_propagate_child_packages_dont() {
-        // Combined test: Parent's packages propagate to child, but child's packages
-        // don't propagate back to parent.
+    fn test_package_propagation_parent_and_child_packages_both_available() {
+        // Combined test: Parent's packages propagate to child, and child's packages
+        // propagate back to parent after source().
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8688,13 +8709,12 @@ x <- 1"#;
             10,
         );
 
-        // Parent should NOT have ggplot2 (loaded in child)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have ggplot2 (loaded in child)
         assert!(
-            !parent_scope
+            parent_scope
                 .inherited_packages
                 .contains(&"ggplot2".to_string()),
-            "Parent should NOT inherit ggplot2 from child (forward-only propagation)"
+            "Parent should inherit ggplot2 from child (package propagation)"
         );
     }
 
