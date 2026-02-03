@@ -1825,6 +1825,48 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
+    // Check for file path context first (source() calls and LSP directives)
+    // Requirements 1.1-1.6, 2.1-2.7: Provide file path completions in appropriate contexts
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
+    ) {
+        // Get enriched metadata from state for source() calls (includes inherited_working_directory)
+        // Directive contexts don't use @lsp-cd, so we use default metadata
+        let metadata = match file_path_context {
+            crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
+                // Use get_enriched_metadata to get metadata with inherited_working_directory
+                // from parent files, not just the current file's directives
+                state.get_enriched_metadata(uri).unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+        let workspace_root = state.workspace_folders.first();
+
+        // Generate file path completions
+        // NOTE: This uses blocking I/O (std::fs::read_dir) on the LSP request thread.
+        // This is acceptable because:
+        // 1. Directory reads are typically <1ms on modern systems
+        // 2. We only read a single directory level (no recursion)
+        // 3. The handler is already async, so we don't block the entire server
+        // 4. Making this async would add significant complexity (spawn_blocking,
+        //    cancellation, race conditions) without measurable benefit
+        // If performance issues arise with large directories, consider:
+        // - Caching directory listings
+        // - Using tokio::spawn_blocking for the read_dir call
+        // - Adding a timeout/cancellation mechanism
+        let items = crate::file_path_intellisense::file_path_completions(
+            &file_path_context,
+            uri,
+            &metadata,
+            workspace_root,
+            position, // Pass cursor position for text_edit range
+        );
+        return Some(CompletionResponse::Array(items));
+    }
+
     let point = Point::new(position.line as usize, position.character as usize);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
@@ -2729,6 +2771,38 @@ pub fn goto_definition(
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
+    // Check for file path context first (source() calls and LSP directives)
+    // Requirements 5.1-5.5, 6.1-6.5: Go-to-definition for file paths
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
+    ) {
+        // Get enriched metadata from state for source() calls (includes inherited_working_directory)
+        // Directive contexts don't use @lsp-cd, so we use default metadata
+        let metadata = match file_path_context {
+            crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
+                // Use get_enriched_metadata to get metadata with inherited_working_directory
+                // from parent files, not just the current file's directives
+                state.get_enriched_metadata(uri).unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+
+        if let Some(location) = crate::file_path_intellisense::file_path_definition(
+            tree,
+            &text,
+            position,
+            uri,
+            &metadata,
+            state.workspace_folders.first(),
+        ) {
+            return Some(GotoDefinitionResponse::Scalar(location));
+        }
+    }
+
+    // Continue with normal identifier-based go-to-definition
     let point = Point::new(position.line as usize, position.character as usize);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
