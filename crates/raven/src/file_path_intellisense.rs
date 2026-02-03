@@ -805,6 +805,9 @@ fn create_path_completion_item(name: &str, is_directory: bool) -> CompletionItem
 /// - SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
 /// - Directive: Uses PathContext::new() (ignores @lsp-cd)
 ///
+/// If workspace_root is provided, enforces workspace boundary: paths resolving
+/// outside the workspace return None.
+///
 /// # Arguments
 /// * `tree` - The tree-sitter parse tree
 /// * `content` - The document text content
@@ -814,7 +817,7 @@ fn create_path_completion_item(name: &str, is_directory: bool) -> CompletionItem
 /// * `workspace_root` - Optional workspace root URI
 ///
 /// # Returns
-/// Some(Location) at line 0, column 0 if file exists, None otherwise
+/// Some(Location) at line 0, column 0 if file exists and is within workspace, None otherwise
 pub fn file_path_definition(
     tree: &Tree,
     content: &str,
@@ -880,10 +883,30 @@ pub fn file_path_definition(
         return None;
     }
 
-    // 5. Convert the resolved path to a URI
+    // 5. Check workspace boundary if workspace_root is provided
+    if let Some(workspace_url) = workspace_root {
+        if let Ok(workspace_path) = workspace_url.to_file_path() {
+            // Canonicalize both paths for accurate comparison
+            let canonical_resolved = resolved_path.canonicalize().ok();
+            let canonical_workspace = workspace_path.canonicalize().ok();
+            
+            if let (Some(resolved), Some(workspace)) = (canonical_resolved, canonical_workspace) {
+                if !resolved.starts_with(&workspace) {
+                    log::trace!(
+                        "file_path_definition: Path '{}' is outside workspace '{}'",
+                        resolved_path.display(),
+                        workspace_path.display()
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
+    // 6. Convert the resolved path to a URI
     let target_uri = Url::from_file_path(&resolved_path).ok()?;
 
-    // 6. Return Location at line 0, column 0
+    // 7. Return Location at line 0, column 0
     Some(Location {
         uri: target_uri,
         range: tower_lsp::lsp_types::Range {
@@ -1186,7 +1209,7 @@ fn try_extract_full_directive_path(
 /// Determines the base directory based on context type and partial path:
 /// - For SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
 /// - For Directive: Uses PathContext::new() (ignores @lsp-cd)
-/// - For Directive with `/` prefix: Resolves relative to workspace root
+/// - For paths starting with `/`: Resolves relative to workspace root (both contexts)
 ///
 /// The partial path's directory component (e.g., `../`, `subdir/`) is joined
 /// with the base directory to get the final directory to list.
@@ -1198,7 +1221,8 @@ fn try_extract_full_directive_path(
 /// * `workspace_root` - Optional workspace root URI
 ///
 /// # Returns
-/// Some(PathBuf) with the resolved base directory, or None if resolution fails
+/// Some(PathBuf) with the resolved base directory, or None if resolution fails.
+/// Returns None for `/` paths when workspace_root is None.
 pub fn resolve_base_directory(
     context: &FilePathContext,
     file_uri: &Url,
@@ -1219,27 +1243,24 @@ pub fn resolve_base_directory(
     // e.g., "../data/file.R" -> "../data/", "file.R" -> "", "../" -> "../"
     let partial_dir = extract_directory_component(&normalized_partial);
 
-    // Handle workspace-root-relative paths for directives (paths starting with `/`)
-    // For directives: `/path` resolves relative to workspace root
-    // For source() calls: `/path` is an absolute filesystem path (handled normally)
-    if let FilePathContext::Directive { .. } = context {
-        if normalized_partial.starts_with('/') {
-            // Workspace-root-relative path for directive
-            let workspace_path = workspace_root
-                .and_then(|url| url.to_file_path().ok())?;
-            
-            // Strip the leading `/` from partial_dir and join with workspace root
-            let relative_dir = partial_dir.strip_prefix('/').unwrap_or(&partial_dir);
-            
-            if relative_dir.is_empty() {
-                // Just "/" - return workspace root
-                return Some(workspace_path);
-            }
-            
-            // Join workspace root with the relative directory
-            let joined = workspace_path.join(relative_dir);
-            return normalize_path_for_completion(&joined);
+    // Handle workspace-root-relative paths (paths starting with `/`)
+    // For BOTH SourceCall and Directive contexts: `/path` resolves relative to workspace root
+    // If workspace_root is None, return None (cannot resolve workspace-relative paths)
+    if normalized_partial.starts_with('/') {
+        let workspace_path = workspace_root
+            .and_then(|url| url.to_file_path().ok())?;
+        
+        // Strip the leading `/` from partial_dir and join with workspace root
+        let relative_dir = partial_dir.strip_prefix('/').unwrap_or(&partial_dir);
+        
+        if relative_dir.is_empty() {
+            // Just "/" - return workspace root
+            return Some(workspace_path);
         }
+        
+        // Join workspace root with the relative directory
+        let joined = workspace_path.join(relative_dir);
+        return normalize_path_for_completion(&joined);
     }
 
     // Create the appropriate PathContext based on context type
@@ -8061,9 +8082,9 @@ mod tests {
         }
 
         #[test]
-        fn test_resolve_base_directory_source_call_absolute_path() {
-            // source() with "/" - should be treated as absolute filesystem path
-            // This is different from directive behavior!
+        fn test_resolve_base_directory_source_call_workspace_root_relative() {
+            // source() with "/" - should be treated as workspace-root-relative
+            // Same behavior as directives now
             let file_uri = Url::parse("file:///project/src/main.R").unwrap();
             let workspace_root = Url::parse("file:///project").unwrap();
             let metadata = make_metadata(None);
@@ -8077,10 +8098,27 @@ mod tests {
             let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
             assert!(result.is_some());
-            // For source() calls, "/" is an absolute filesystem path
-            // The base directory is /project/src, joined with /data/ gives /data
-            // (because /data/ is an absolute path component)
-            assert_eq!(result.unwrap(), PathBuf::from("/data"));
+            // For source() calls, "/" is now workspace-root-relative
+            // Should resolve to /project/data
+            assert_eq!(result.unwrap(), PathBuf::from("/project/data"));
+        }
+
+        #[test]
+        fn test_resolve_base_directory_source_call_workspace_root_relative_no_workspace() {
+            // source() with "/" but no workspace root - should return None
+            let file_uri = Url::parse("file:///project/src/main.R").unwrap();
+            let metadata = make_metadata(None);
+
+            let context = FilePathContext::SourceCall {
+                partial_path: "/data/".to_string(),
+                content_start: Position { line: 0, character: 8 },
+                is_sys_source: false,
+            };
+
+            let result = resolve_base_directory(&context, &file_uri, &metadata, None);
+
+            // Without workspace root, workspace-root-relative paths cannot be resolved
+            assert!(result.is_none());
         }
 
         #[test]
@@ -8514,5 +8552,118 @@ source("utils.R")"#;
             assert!(result.is_some());
             let location = result.unwrap();
             assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+        }
+
+        #[test]
+        fn test_file_path_definition_workspace_boundary_parent_escape() {
+            // Test that paths escaping workspace via ../ return None
+            let temp_dir = TempDir::new().unwrap();
+            
+            // Create workspace as a subdirectory
+            let workspace = temp_dir.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            
+            // Create a file OUTSIDE the workspace
+            let outside_file = temp_dir.path().join("outside.R");
+            fs::write(&outside_file, "# outside file").unwrap();
+            
+            // Create main file inside workspace/subdir
+            let subdir = workspace.join("subdir");
+            fs::create_dir(&subdir).unwrap();
+            let main_path = subdir.join("main.R");
+            
+            // Try to access file outside workspace via ../../outside.R
+            let code = r#"source("../../outside.R")"#;
+            let tree = parse_r(code);
+
+            let file_uri = Url::from_file_path(&main_path).unwrap();
+            let workspace_root = Url::from_file_path(&workspace).unwrap();
+            let metadata = make_metadata(None);
+
+            let position = Position { line: 0, character: 12 };
+
+            let result = file_path_definition(
+                &tree,
+                code,
+                position,
+                &file_uri,
+                &metadata,
+                Some(&workspace_root),
+            );
+
+            // Should return None because file is outside workspace
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_file_path_definition_workspace_boundary_inside_allowed() {
+            // Test that paths inside workspace are allowed
+            let temp_dir = TempDir::new().unwrap();
+            let workspace = temp_dir.path();
+            
+            // Create a file inside workspace
+            let utils_path = workspace.join("utils.R");
+            fs::write(&utils_path, "# utils file").unwrap();
+            
+            // Create main file in subdir
+            let subdir = workspace.join("subdir");
+            fs::create_dir(&subdir).unwrap();
+            let main_path = subdir.join("main.R");
+            
+            // Access file via ../utils.R (still inside workspace)
+            let code = r#"source("../utils.R")"#;
+            let tree = parse_r(code);
+
+            let file_uri = Url::from_file_path(&main_path).unwrap();
+            let workspace_root = Url::from_file_path(workspace).unwrap();
+            let metadata = make_metadata(None);
+
+            let position = Position { line: 0, character: 12 };
+
+            let result = file_path_definition(
+                &tree,
+                code,
+                position,
+                &file_uri,
+                &metadata,
+                Some(&workspace_root),
+            );
+
+            // Should succeed because file is inside workspace
+            assert!(result.is_some());
+            let location = result.unwrap();
+            assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+        }
+
+        #[test]
+        fn test_file_path_definition_no_workspace_root_no_boundary_check() {
+            // Test that without workspace_root, no boundary check is performed
+            let temp_dir = TempDir::new().unwrap();
+            
+            // Create a file
+            let utils_path = temp_dir.path().join("utils.R");
+            fs::write(&utils_path, "# utils file").unwrap();
+            
+            let main_path = temp_dir.path().join("main.R");
+            let code = r#"source("utils.R")"#;
+            let tree = parse_r(code);
+
+            let file_uri = Url::from_file_path(&main_path).unwrap();
+            let metadata = make_metadata(None);
+
+            let position = Position { line: 0, character: 10 };
+
+            // No workspace_root provided
+            let result = file_path_definition(
+                &tree,
+                code,
+                position,
+                &file_uri,
+                &metadata,
+                None,
+            );
+
+            // Should succeed (no boundary check without workspace_root)
+            assert!(result.is_some());
         }
     }
