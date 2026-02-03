@@ -2464,6 +2464,11 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         cross_file_symbols.len()
     );
     if let Some(symbol) = cross_file_symbols.get(name) {
+        log::trace!(
+            "hover: found symbol '{}' in cross_file_symbols, source_uri={}",
+            name,
+            symbol.source_uri
+        );
         let mut value = String::new();
 
         // Check if this is a package export (source_uri starts with "package:")
@@ -2495,8 +2500,14 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 // Graceful fallback: show symbol info without definition statement
                 // For package exports, get full R help documentation
                 // Validates: Requirement 10.2
+                log::trace!(
+                    "hover: extract_definition_statement returned None for '{}', package_name={:?}",
+                    name,
+                    package_name
+                );
                 if let Some(pkg) = package_name {
                     // Try to get full help documentation from R
+                    log::trace!("hover: fetching R help for '{}' from package '{}'", name, pkg);
                     let name_owned = name.to_string();
                     let pkg_owned = pkg.to_string();
                     if let Ok(help_result) = tokio::task::spawn_blocking(move || {
@@ -2504,6 +2515,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     })
                     .await
                     {
+                        log::trace!(
+                            "hover: get_help returned {:?}",
+                            help_result.as_ref().map(|s| s.len())
+                        );
                         if let Some(help_text) = help_result {
                             // Show full R documentation
                             value.push_str(&format!("```\n{}\n```", help_text));

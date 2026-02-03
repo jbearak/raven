@@ -230,6 +230,7 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
 - Normalize markdown table spacing to match project lint expectations when adding spec tables.
 - Avoid interpolating user-controlled strings into R code; pass help topics/packages as command args instead.
+- R's `help()` function uses non-standard evaluation (NSE) for the `package` argument; wrap variables in parentheses to force evaluation: `help(topic, package = (pkg))` not `help(topic, package = pkg)`.
 - Add language identifiers (e.g., `text`) to ASCII diagram/timeline fences to satisfy markdownlint (MD040).
 - `tree_sitter::Tree` implements `Clone`; preserve ASTs in cloned index entries when reference searches depend on them.
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.

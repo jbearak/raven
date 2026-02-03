@@ -58,7 +58,7 @@ topic <- args[1]
 pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
 txt <- capture.output(
   tools::Rd2txt(
-    utils:::.getHelpFile(help(topic, package = pkg)),
+    utils:::.getHelpFile(help(topic, package = (pkg))),
     options = list(underline_titles = FALSE)
   )
 )
