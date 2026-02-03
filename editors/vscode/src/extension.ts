@@ -97,6 +97,60 @@ export function activate(context: vscode.ExtensionContext) {
             sendActivityNotification();
         })
     );
+
+    // Prompt for word separators configuration
+    promptWordSeparators(context);
+}
+
+async function promptWordSeparators(context: vscode.ExtensionContext) {
+    const PROMPT_KEY = 'rWordSeparatorsPromptShown';
+    const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
+
+    // Check if prompt was already shown
+    if (context.globalState.get(PROMPT_KEY)) {
+        return;
+    }
+
+    // Check if [r].editor.wordSeparators is already configured
+    const config = vscode.workspace.getConfiguration();
+    const rConfig = config.inspect('[r]');
+    const hasWordSeparators = 
+        (rConfig?.globalValue as any)?.['editor.wordSeparators'] !== undefined ||
+        (rConfig?.workspaceValue as any)?.['editor.wordSeparators'] !== undefined ||
+        (rConfig?.workspaceFolderValue as any)?.['editor.wordSeparators'] !== undefined;
+
+    if (hasWordSeparators) {
+        await context.globalState.update(PROMPT_KEY, true);
+        return;
+    }
+
+    // Show prompt
+    const choice = await vscode.window.showInformationMessage(
+        'This extension can treat dots as part of words in R files by updating editor.wordSeparators for [r]. Enable this behavior?',
+        'Enable',
+        'No thanks'
+    );
+
+    if (choice === 'Enable') {
+        const currentRConfig = config.get('[r]', {}) as Record<string, any>;
+        const updatedRConfig = {
+            ...currentRConfig,
+            'editor.wordSeparators': WORD_SEPARATORS
+        };
+        await config.update('[r]', updatedRConfig, vscode.ConfigurationTarget.Global);
+        await context.globalState.update(PROMPT_KEY, true);
+        
+        const reload = await vscode.window.showInformationMessage(
+            'R word separators updated: dots will now be part of words in R files. Reload window to apply?',
+            'Reload',
+            'Later'
+        );
+        if (reload === 'Reload') {
+            vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+    } else if (choice === 'No thanks') {
+        await context.globalState.update(PROMPT_KEY, true);
+    }
 }
 
 export function deactivate(): Thenable<void> | undefined {
