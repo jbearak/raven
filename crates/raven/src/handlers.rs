@@ -2759,18 +2759,30 @@ pub fn goto_definition(
 
     // Check for file path context first (source() calls and LSP directives)
     // Requirements 5.1-5.5, 6.1-6.5: Go-to-definition for file paths
-    let metadata = crate::cross_file::directive::parse_directives(&text);
-    let workspace_root = state.workspace_folders.first();
-
-    if let Some(location) = crate::file_path_intellisense::file_path_definition(
-        tree,
-        &text,
-        position,
-        uri,
-        &metadata,
-        workspace_root,
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
     ) {
-        return Some(GotoDefinitionResponse::Scalar(location));
+        // Only parse directives for source() calls (which need @lsp-cd)
+        let metadata = match file_path_context {
+            crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
+                crate::cross_file::directive::parse_directives(&text)
+            }
+            _ => Default::default(),
+        };
+
+        if let Some(location) = crate::file_path_intellisense::file_path_definition(
+            tree,
+            &text,
+            position,
+            uri,
+            &metadata,
+            state.workspace_folders.first(),
+        ) {
+            return Some(GotoDefinitionResponse::Scalar(location));
+        }
     }
 
     // Continue with normal identifier-based go-to-definition
