@@ -1825,6 +1825,28 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
+    // Check for file path context first (source() calls and LSP directives)
+    // Requirements 1.1-1.6, 2.1-2.7: Provide file path completions in appropriate contexts
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
+    ) {
+        // Get cross-file metadata for path resolution (needed for @lsp-cd support)
+        let metadata = crate::cross_file::directive::parse_directives(&text);
+        let workspace_root = state.workspace_folders.first();
+
+        // Generate file path completions
+        let items = crate::file_path_intellisense::file_path_completions(
+            &file_path_context,
+            uri,
+            &metadata,
+            workspace_root,
+        );
+        return Some(CompletionResponse::Array(items));
+    }
+
     let point = Point::new(position.line as usize, position.character as usize);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
@@ -2729,6 +2751,23 @@ pub fn goto_definition(
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
+    // Check for file path context first (source() calls and LSP directives)
+    // Requirements 5.1-5.5, 6.1-6.5: Go-to-definition for file paths
+    let metadata = crate::cross_file::directive::parse_directives(&text);
+    let workspace_root = state.workspace_folders.first();
+
+    if let Some(location) = crate::file_path_intellisense::file_path_definition(
+        tree,
+        &text,
+        position,
+        uri,
+        &metadata,
+        workspace_root,
+    ) {
+        return Some(GotoDefinitionResponse::Scalar(location));
+    }
+
+    // Continue with normal identifier-based go-to-definition
     let point = Point::new(position.line as usize, position.character as usize);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
