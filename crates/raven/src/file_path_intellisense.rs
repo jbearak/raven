@@ -688,18 +688,24 @@ fn list_directory_entries(
         // Check workspace boundary if workspace_root is provided
         if let Some(workspace) = workspace_root {
             // Canonicalize paths for accurate comparison
-            // If canonicalization fails, skip the entry to be safe
-            let canonical_path = match path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let canonical_workspace = match workspace.canonicalize() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+            // If canonicalization fails, fall back to non-canonical comparison
+            let canonical_path_opt = path.canonicalize().ok();
+            let canonical_workspace_opt = workspace.canonicalize().ok();
 
-            if !canonical_path.starts_with(&canonical_workspace) {
-                continue;
+            match (canonical_path_opt, canonical_workspace_opt) {
+                (Some(resolved), Some(ws)) => {
+                    if !resolved.starts_with(&ws) {
+                        continue;
+                    }
+                }
+                (None, _) => {
+                    // Path doesn't exist yet or can't be accessed
+                    // Fall back to checking if path starts with workspace
+                    if !path.starts_with(workspace) {
+                        continue;
+                    }
+                }
+                _ => continue, // Can't verify workspace boundary
             }
         }
 
