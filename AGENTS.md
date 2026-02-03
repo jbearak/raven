@@ -168,11 +168,32 @@ source("utils.r")
 
 - Metadata extraction on document change
 - Dependency graph update
-- Selective invalidation based on interface/edge changes
+- Selective invalidation based on interface hash comparison
 - Debounced diagnostics fanout to affected open files
 - Cancellation of outdated pending revalidations
 - Freshness guards prevent stale diagnostic publishes
 - Monotonic publishing: never publish older version than last published
+
+### Interface Hash Optimization
+
+When a file changes, Raven compares the old and new `interface_hash` to determine if dependents need revalidation:
+
+**What triggers dependent revalidation:**
+- Adding/removing/renaming exported functions or variables
+- Changes to library() calls (affects loaded_packages in hash)
+
+**What does NOT trigger dependent revalidation:**
+- Editing comments
+- Changing local variables inside functions
+- Modifying function bodies (without changing the function signature)
+- Whitespace changes
+
+**Implementation:**
+- `did_change`: Captures old interface_hash before applying changes, compares after
+- `did_open`: Compares against workspace index if file was previously indexed
+- Only calls `get_transitive_dependents()` and marks force republish when `interface_changed`
+
+This optimization significantly reduces cascading revalidation in codebases with deep transitive dependency chains.
 
 ### On-Demand Background Indexing
 

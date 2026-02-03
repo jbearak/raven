@@ -592,6 +592,17 @@ impl LanguageServer for Backend {
             // Capture old metadata before recomputing (for WD change detection)
             let old_meta = state.get_enriched_metadata(&uri);
 
+            // Capture old interface_hash from workspace index (for selective invalidation)
+            // This optimization avoids invalidating dependents when file content hasn't changed
+            let old_interface_hash = state
+                .cross_file_workspace_index
+                .get_artifacts(&uri)
+                .map(|a| a.interface_hash)
+                .or_else(|| {
+                    // Also check the new workspace index
+                    state.workspace_index_new.get_artifacts(&uri).map(|a| a.interface_hash)
+                });
+
             // Extract and enrich metadata with inherited working directory
             let mut meta = crate::cross_file::extract_metadata(&text);
             let uri_clone = uri.clone();
@@ -741,17 +752,50 @@ impl LanguageServer for Backend {
                 );
             }
 
+            // Compute new interface_hash after opening the document
+            let new_interface_hash = state
+                .documents
+                .get(&uri)
+                .and_then(|doc| doc.tree.as_ref())
+                .map(|tree| {
+                    let text = state.documents.get(&uri).map(|d| d.text()).unwrap_or_default();
+                    crate::cross_file::scope::compute_artifacts(&uri, tree, &text).interface_hash
+                });
+
+            // Determine if interface changed (selective invalidation optimization)
+            // Only invalidate dependents if the exported interface actually changed
+            let interface_changed = match (old_interface_hash, new_interface_hash) {
+                (Some(old), Some(new)) => old != new,
+                (None, Some(_)) => true,  // File wasn't indexed before, now has interface
+                (Some(_), None) => true,  // File lost its interface (parse error?)
+                (None, None) => false,    // No interface before or after
+            };
+
+            if interface_changed {
+                log::trace!(
+                    "Interface changed on open for {}: {:?} -> {:?}",
+                    uri,
+                    old_interface_hash,
+                    new_interface_hash
+                );
+            }
+
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
-            let dependents = state
-                .cross_file_graph
-                .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
-            // Filter to only open documents and mark for force republish
-            for dep in dependents {
-                if state.documents.contains_key(&dep) {
-                    state.diagnostics_gate.mark_force_republish(&dep);
-                    affected.insert(dep);
+
+            // Only invalidate dependents if interface changed (optimization)
+            // This avoids cascading revalidation when file content hasn't changed
+            if interface_changed {
+                let dependents = state
+                    .cross_file_graph
+                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
+                // Filter to only open documents and mark for force republish
+                for dep in dependents {
+                    if state.documents.contains_key(&dep) {
+                        state.diagnostics_gate.mark_force_republish(&dep);
+                        affected.insert(dep);
+                    }
                 }
             }
             // Include children affected by WD change (Requirement 8)
@@ -1281,6 +1325,17 @@ impl LanguageServer for Backend {
             // Capture old metadata before recomputing (for WD change detection)
             let old_meta = state.get_enriched_metadata(&uri);
 
+            // Capture old interface_hash before applying changes (for selective invalidation)
+            // This optimization avoids invalidating dependents when only comments/local vars change
+            let old_interface_hash = state
+                .documents
+                .get(&uri)
+                .and_then(|doc| doc.tree.as_ref())
+                .map(|tree| {
+                    let text = state.documents.get(&uri).map(|d| d.text()).unwrap_or_default();
+                    crate::cross_file::scope::compute_artifacts(&uri, tree, &text).interface_hash
+                });
+
             // Update legacy documents HashMap first (for migration compatibility)
             if let Some(doc) = state.documents.get_mut(&uri) {
                 doc.version = Some(version);
@@ -1380,19 +1435,52 @@ impl LanguageServer for Backend {
                 state.document_store.update(&uri, changes, version).await;
             }
 
+            // Compute new interface_hash after applying changes
+            let new_interface_hash = state
+                .documents
+                .get(&uri)
+                .and_then(|doc| doc.tree.as_ref())
+                .map(|tree| {
+                    let text = state.documents.get(&uri).map(|d| d.text()).unwrap_or_default();
+                    crate::cross_file::scope::compute_artifacts(&uri, tree, &text).interface_hash
+                });
+
+            // Determine if interface changed (selective invalidation optimization)
+            // Only invalidate dependents if the exported interface actually changed
+            let interface_changed = match (old_interface_hash, new_interface_hash) {
+                (Some(old), Some(new)) => old != new,
+                (None, Some(_)) => true,  // New file with interface
+                (Some(_), None) => true,  // File lost its interface (parse error?)
+                (None, None) => false,    // No interface before or after
+            };
+
+            if interface_changed {
+                log::trace!(
+                    "Interface changed for {}: {:?} -> {:?}",
+                    uri,
+                    old_interface_hash,
+                    new_interface_hash
+                );
+            }
+
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
-            let dependents = state
-                .cross_file_graph
-                .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
-            // Filter to only open documents and mark for force republish
-            for dep in dependents {
-                if state.documents.contains_key(&dep) {
-                    // Mark dependent files for force republish (Requirement 0.8)
-                    // This allows same-version republish when dependency changes
-                    state.diagnostics_gate.mark_force_republish(&dep);
-                    affected.insert(dep);
+
+            // Only invalidate dependents if interface changed (optimization)
+            // This avoids cascading revalidation when only comments/local variables change
+            if interface_changed {
+                let dependents = state
+                    .cross_file_graph
+                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
+                // Filter to only open documents and mark for force republish
+                for dep in dependents {
+                    if state.documents.contains_key(&dep) {
+                        // Mark dependent files for force republish (Requirement 0.8)
+                        // This allows same-version republish when dependency changes
+                        state.diagnostics_gate.mark_force_republish(&dep);
+                        affected.insert(dep);
+                    }
                 }
             }
             // Include children affected by WD change (Requirement 8)
