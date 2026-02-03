@@ -102,15 +102,11 @@ This implementation adds file path intellisense to Raven, providing completions 
     - For directives: always relative to file's directory
     - _Requirements: 2.3, 2.5_
   
-  - [x] 8.2 Implement workspace-root-relative paths for directives (starting with `/`)
-    - Resolve `/path` relative to workspace root for LSP directives
+  - [x] 8.2 Implement workspace-root-relative paths (starting with `/`)
+    - Resolve `/path` relative to workspace root for both directives and source() calls
     - _Requirements: 2.4_
   
-  - [x] 8.3 Implement absolute filesystem paths for source() calls (starting with `/`)
-    - Resolve `/path` as absolute filesystem path for source() calls
-    - _Requirements: 2.5_
-  
-  - [x] 8.4 Implement backslash normalization (convert `\\` to `/`)
+  - [x] 8.3 Implement backslash normalization (convert `\\` to `/`)
     - Normalize escaped backslashes before path resolution
     - _Requirements: 4.1, 4.2_
   
