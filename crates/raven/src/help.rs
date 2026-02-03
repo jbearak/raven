@@ -50,13 +50,15 @@ impl Default for HelpCache {
 /// }
 /// ```
 pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
+    log::trace!("get_help: topic={}, package={:?}", topic, package);
+
     let r_code = r#"
 args <- commandArgs(trailingOnly = TRUE)
 topic <- args[1]
 pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
 txt <- capture.output(
   tools::Rd2txt(
-    utils:::.getHelpFile(help(topic, package = pkg)),
+    utils:::.getHelpFile(help(topic, package = (pkg))),
     options = list(underline_titles = FALSE)
   )
 )
@@ -76,16 +78,29 @@ cat(paste(txt, collapse = "\n"))
     if let Some(pkg) = package {
         cmd.arg(pkg);
     }
-    let output = cmd.output().ok()?;
 
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).to_string();
-        if !text.trim().is_empty() && !text.contains("No documentation") {
-            return Some(text);
+    match cmd.output() {
+        Ok(output) => {
+            log::trace!(
+                "get_help: exit_status={}, stdout_len={}, stderr_len={}",
+                output.status,
+                output.stdout.len(),
+                output.stderr.len()
+            );
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                if !text.trim().is_empty() && !text.contains("No documentation") {
+                    return Some(text);
+                }
+                log::trace!("get_help: empty or no documentation");
+            }
+            None
+        }
+        Err(e) => {
+            log::trace!("get_help: subprocess error: {}", e);
+            None
         }
     }
-
-    None
 }
 
 /// Extracts the first function signature from R help text.
@@ -121,6 +136,7 @@ cat(paste(txt, collapse = "\n"))
 ///
 /// assert_eq!(extract_signature_from_help(help), Some("mean(x, ...)".to_string()));
 /// ```
+#[allow(dead_code)] // Used in tests, may be useful in the future
 pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
     let lines: Vec<&str> = help_text.lines().collect();
 
@@ -207,6 +223,7 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
 ///     println!("{}", s);
 /// }
 /// ```
+#[allow(dead_code)] // Used in tests, may be useful in the future
 pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
     let help_text = get_help(topic, Some(package))?;
     extract_signature_from_help(&help_text)

@@ -1893,44 +1893,14 @@ fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>, packages: &
     hasher.finish()
 }
 
-/// Compute scope at a position with backward directive support.
-/// This processes backward directives FIRST (parent context), then forward sources.
-///
-/// Property 19: Backward-First Resolution Order
-/// - Backward directives establish parent context (symbols available before this file runs)
-/// - Forward source() calls add symbols in document order
-#[allow(clippy::too_many_arguments)]
-pub fn scope_at_position_with_backward<F, G>(
-    uri: &Url,
-    line: u32,
-    column: u32,
-    get_artifacts: &F,
-    get_metadata: &G,
-    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
-    max_depth: usize,
-    parent_call_site: Option<(u32, u32)>, // (line, column) in parent where this file is sourced
-) -> ScopeAtPosition
-where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
-    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
-{
-    let mut visited = HashSet::new();
-    scope_at_position_with_backward_recursive(
-        uri,
-        line,
-        column,
-        get_artifacts,
-        get_metadata,
-        resolve_path,
-        max_depth,
-        0,
-        &mut visited,
-        parent_call_site,
-    )
-}
-
 /// Extended scope resolution that also uses dependency graph edges.
 /// This is the preferred entry point when a DependencyGraph is available.
+///
+/// The `base_exports` parameter contains the set of base R function names that should be
+/// available at all positions without explicit `library()` calls. When `package_library_ready`
+/// is true, callers should pass `package_library.base_exports()`. When not ready (before R
+/// subprocess has reported library paths), callers should pass an empty set to avoid using
+/// stale/empty base exports.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph<F, G>(
     uri: &Url,
@@ -1941,6 +1911,7 @@ pub fn scope_at_position_with_graph<F, G>(
     graph: &super::dependency::DependencyGraph,
     workspace_root: Option<&Url>,
     max_depth: usize,
+    base_exports: &HashSet<String>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -1968,6 +1939,7 @@ where
         0,
         &mut visited,
         &[],
+        base_exports,
     )
 }
 
@@ -2010,6 +1982,7 @@ where
 ///     0,
 ///     &mut visited,
 ///     &[], // no inherited packages
+///     &std::collections::HashSet::new(), // no base exports
 /// );
 ///
 /// assert!(scope.symbols.is_empty());
@@ -2028,6 +2001,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     current_depth: usize,
     visited: &mut HashSet<Url>,
     inherited_packages: &[String],
+    base_exports: &HashSet<String>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2039,6 +2013,28 @@ where
         inherited_packages: inherited_packages.to_vec(),
         ..Default::default()
     };
+
+    // Requirements 6.3, 6.4: Base packages are always available at all positions
+    // without requiring explicit library() calls. Add base exports first with lowest
+    // precedence - they will be overridden by local definitions via insert().
+    // Only inject at depth 0 (root file) to avoid duplicates during recursion.
+    if current_depth == 0 {
+        let base_uri =
+            Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+        for export_name in base_exports {
+            scope.symbols.insert(
+                export_name.clone(),
+                ScopedSymbol {
+                    name: export_name.clone(),
+                    kind: SymbolKind::Variable, // Base exports are treated as variables
+                    source_uri: base_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                },
+            );
+        }
+    }
 
     if current_depth >= max_depth || visited.contains(uri) {
         return scope;
@@ -2098,6 +2094,7 @@ where
         // Get parent's scope at the call site
         // Note: We pass empty inherited_packages here because the parent will collect
         // its own inherited packages from its parents via the dependency graph
+        // We pass base_exports since child files also need access to base R functions
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
             call_site_line,
@@ -2111,6 +2108,7 @@ where
             current_depth + 1,
             visited,
             &[], // Parent collects its own inherited packages
+            base_exports,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -2174,6 +2172,14 @@ where
         // Also propagate packages that the parent inherited from its parents
         // Requirement 5.2: Inherit loaded packages from parent up to call site
         for pkg in &parent_scope.inherited_packages {
+            if !scope.inherited_packages.contains(pkg) {
+                scope.inherited_packages.push(pkg.clone());
+            }
+        }
+
+        // Also propagate packages that are loaded in the parent at the call site.
+        // This includes packages loaded in sourced files before the call site.
+        for pkg in &parent_scope.loaded_packages {
             if !scope.inherited_packages.contains(pkg) {
                 scope.inherited_packages.push(pkg.clone());
             }
@@ -2369,6 +2375,7 @@ where
                             current_depth + 1,
                             visited,
                             packages_slice, // Pass inherited packages to child
+                            base_exports,
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -2376,6 +2383,17 @@ where
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
+
+                        // Packages loaded in the sourced file become available after the source() call.
+                        for pkg in child_scope
+                            .loaded_packages
+                            .iter()
+                            .chain(child_scope.inherited_packages.iter())
+                        {
+                            if !scope.loaded_packages.contains(pkg) {
+                                scope.loaded_packages.push(pkg.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -2389,293 +2407,6 @@ where
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
                 let is_eof_position = line == u32::MAX && column == u32::MAX;
-                if !is_eof_position
-                    && (*start_line, *start_column) <= (line, column)
-                    && (line, column) <= (*end_line, *end_column)
-                {
-                    for param in parameters {
-                        scope.symbols.insert(param.name.clone(), param.clone());
-                    }
-                }
-            }
-            ScopeEvent::Removal {
-                line: rm_line,
-                column: rm_col,
-                symbols,
-                function_scope,
-            } => {
-                // Only process if removal is strictly before the query position
-                if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(
-                        &mut scope,
-                        &active_function_scopes,
-                        *function_scope,
-                        symbols,
-                    );
-                }
-            }
-            ScopeEvent::PackageLoad {
-                line: pkg_line,
-                column: pkg_col,
-                package,
-                function_scope,
-            } => {
-                // Requirements 8.1, 8.3: Position-aware package loading
-                // Only include packages loaded before the query position
-                if (*pkg_line, *pkg_col) <= (line, column) {
-                    // Check function scope compatibility
-                    let should_include = match function_scope {
-                        None => true, // Global package load - always include
-                        Some(pkg_scope) => {
-                            // Function-scoped package load - only include if query is in same function
-                            active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line
-                                    && active_scope.1 == pkg_scope.start.column
-                                    && active_scope.2 == pkg_scope.end.line
-                                    && active_scope.3 == pkg_scope.end.column
-                            })
-                        }
-                    };
-
-                    if should_include && !scope.loaded_packages.contains(package) {
-                        scope.loaded_packages.push(package.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    scope
-}
-
-/// Compute the scope visible at a given position by first applying backward (parent) directives
-/// and then processing this file's timeline (local definitions, forward sources, function scopes,
-/// and removals), performing recursive cross-file traversal with cycle prevention and depth limits.
-///
-/// Parameters:
-/// - `uri`: URI of the file to compute scope for.
-/// - `line`, `column`: 0-based UTF-16 line and column of the query position (use `u32::MAX` to represent EOF sentinels when propagating full-file inclusion).
-/// - `get_artifacts`: function that returns `ScopeArtifacts` for a given `Url` (or `None` if unavailable).
-/// - `get_metadata`: function that returns cross-file metadata (backward directives) for a given `Url` (or `None`).
-/// - `resolve_path`: path resolution callback that maps a source path string and the current file `Url` to an optional target `Url`.
-/// - `max_depth`: maximum allowed recursion depth; when exceeded, the function records entries in `ScopeAtPosition::depth_exceeded`.
-/// - `current_depth`: current recursion depth (caller-managed).
-/// - `visited`: mutable set of visited URIs used to avoid cycles; the function inserts `uri` on entry.
-/// - `_parent_call_site`: reserved for future use; currently unused.
-///
-/// Behavior notes:
-/// - Backward directives (parents that source this file) are processed first and their symbols are treated
-///   as available at the start of this file but have lower precedence than local definitions.
-/// - Forward `source()` calls in the timeline are resolved and merged, respecting `max_depth` and visited cycles.
-/// - Function parameters are included only when the query position lies within the function body.
-/// - Removals are applied only for removal events that occur strictly before the query position and respect function-local scoping.
-/// - The function uses the file's `FunctionScopeTree` to determine function-local vs global definitions.
-///
-/// # Returns
-///
-/// A `ScopeAtPosition` describing symbols visible at the requested position, the chain of traversed URIs,
-/// and any depth-exceeded entries encountered during recursion.
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::HashSet;
-/// use url::Url;
-///
-/// // Minimal example: no artifacts or metadata available -> empty scope
-/// let uri = Url::parse("file:///example.R").unwrap();
-/// let get_artifacts = |_u: &Url| None;
-/// let get_metadata = |_u: &Url| None;
-/// let resolve = |_p: &str, _u: &Url| None;
-/// let mut visited = HashSet::new();
-///
-/// let scope = scope_at_position_with_backward_recursive(
-///     &uri,
-///     0,
-///     0,
-///     &get_artifacts,
-///     &get_metadata,
-///     &resolve,
-///     5,    // max_depth
-///     0,    // current_depth
-///     &mut visited,
-///     None, // parent call site
-/// );
-///
-/// assert!(scope.symbols.is_empty());
-/// ```
-#[allow(clippy::too_many_arguments)]
-fn scope_at_position_with_backward_recursive<F, G>(
-    uri: &Url,
-    line: u32,
-    column: u32,
-    get_artifacts: &F,
-    get_metadata: &G,
-    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
-    max_depth: usize,
-    current_depth: usize,
-    visited: &mut HashSet<Url>,
-    _parent_call_site: Option<(u32, u32)>, // Currently unused but reserved for future use
-) -> ScopeAtPosition
-where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
-    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
-{
-    let mut scope = ScopeAtPosition::default();
-
-    if current_depth >= max_depth || visited.contains(uri) {
-        return scope;
-    }
-    visited.insert(uri.clone());
-    scope.chain.push(uri.clone());
-
-    let artifacts = match get_artifacts(uri) {
-        Some(a) => a,
-        None => return scope,
-    };
-
-    // STEP 1: Process backward directives FIRST (parent context)
-    // This establishes symbols that are available at the START of this file
-    if let Some(metadata) = get_metadata(uri) {
-        for directive in &metadata.sourced_by {
-            if let Some(parent_uri) = resolve_path(&directive.path, uri) {
-                // Get the call site in the parent
-                let call_site = match &directive.call_site {
-                    super::types::CallSiteSpec::Line(n) => Some((*n, u32::MAX)), // end of line
-                    super::types::CallSiteSpec::Match(_) => {
-                        // Match resolution requires content provider - not available in this path
-                        // Fall back to end of file (conservative)
-                        Some((u32::MAX, u32::MAX))
-                    }
-                    super::types::CallSiteSpec::Default => Some((u32::MAX, u32::MAX)), // end of file
-                };
-
-                if let Some((call_line, call_col)) = call_site {
-                    // Check if we would exceed max depth
-                    if current_depth + 1 >= max_depth {
-                        scope
-                            .depth_exceeded
-                            .push((uri.clone(), directive.directive_line, 0));
-                        continue;
-                    }
-
-                    // Get parent's scope at the call site
-                    let parent_scope = scope_at_position_with_backward_recursive(
-                        &parent_uri,
-                        call_line,
-                        call_col,
-                        get_artifacts,
-                        get_metadata,
-                        resolve_path,
-                        max_depth,
-                        current_depth + 1,
-                        visited,
-                        None, // parent doesn't have a parent call site in this context
-                    );
-
-                    // Merge parent symbols (they are available at the START of this file)
-                    // These have lower precedence than local definitions
-                    for (name, symbol) in parent_scope.symbols {
-                        scope.symbols.entry(name).or_insert(symbol);
-                    }
-                    scope.chain.extend(parent_scope.chain);
-                    scope.depth_exceeded.extend(parent_scope.depth_exceeded);
-                }
-            }
-        }
-    }
-
-    // STEP 2: Process timeline events (local definitions and forward sources)
-    // Use interval tree for function scope queries (skip EOF sentinel)
-    let query_pos = Position::new(line, column);
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if query_pos.is_full_eof() {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(query_pos)
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
-
-    // Second pass: process events and apply function scope filtering
-    for event in &artifacts.timeline {
-        match event {
-            ScopeEvent::Def {
-                line: def_line,
-                column: def_col,
-                symbol,
-            } => {
-                if (*def_line, *def_col) <= (line, column) {
-                    // Check if this definition is inside any function scope using interval tree
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
-                        None => {
-                            // Global definition - local definitions take precedence over inherited symbols
-                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                        }
-                        Some(def_scope) => {
-                            // Function-local definition - only include if we're inside the same function
-                            if active_function_scopes.contains(&def_scope) {
-                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            ScopeEvent::Source {
-                line: src_line,
-                column: src_col,
-                source,
-            } => {
-                // Only include if source() call is before the position
-                if (*src_line, *src_col) < (line, column) {
-                    // Resolve the path and get symbols from sourced file
-                    if let Some(child_uri) = resolve_path(&source.path, uri) {
-                        // Check if we would exceed max depth
-                        if current_depth + 1 >= max_depth {
-                            scope
-                                .depth_exceeded
-                                .push((uri.clone(), *src_line, *src_col));
-                            continue;
-                        }
-
-                        let child_scope = scope_at_position_with_backward_recursive(
-                            &child_uri,
-                            u32::MAX, // Include all symbols from sourced file
-                            u32::MAX,
-                            get_artifacts,
-                            get_metadata,
-                            resolve_path,
-                            max_depth,
-                            current_depth + 1,
-                            visited,
-                            Some((*src_line, *src_col)), // pass the call site
-                        );
-                        // Merge child symbols (local definitions take precedence)
-                        for (name, symbol) in child_scope.symbols {
-                            scope.symbols.entry(name).or_insert(symbol);
-                        }
-                        scope.chain.extend(child_scope.chain);
-                        scope.depth_exceeded.extend(child_scope.depth_exceeded);
-                    }
-                }
-            }
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                parameters,
-            } => {
-                // Include function parameters if position is within function body
-                // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = line == u32::MAX || column == u32::MAX;
                 if !is_eof_position
                     && (*start_line, *start_column) <= (line, column)
                     && (line, column) <= (*end_line, *end_column)
@@ -2922,12 +2653,15 @@ mod tests {
 
     #[test]
     fn test_backward_directive_call_site_filtering() {
+        use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata};
 
-        let parent_uri = Url::parse("file:///parent.R").unwrap();
-        let child_uri = Url::parse("file:///child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
-        // Parent code: a on line 0, x1 on line 1, x2 on line 2, y on line 3
+        // Parent code: a on line 0, x1 on line 1, source(child) on line 1 (implicit), x2 on line 2, y on line 3
+        // We simulate parent sourcing child at line 1
         let parent_code = "a <- 1\nx1 <- 1\nx2 <- 2\ny <- 2";
         let parent_tree = parse_r(parent_code);
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
@@ -2954,12 +2688,27 @@ mod tests {
 
         let child_metadata = CrossFileMetadata {
             sourced_by: vec![BackwardDirective {
-                path: "../parent.R".to_string(),
+                path: "parent.R".to_string(), // Same directory, no ../
                 call_site: CallSiteSpec::Line(1), // 0-based line 1
                 directive_line: 0,
             }],
             ..Default::default()
         };
+
+        // Build dependency graph - the backward directive creates an edge from parent to child
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            },
+        );
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
@@ -2979,24 +2728,17 @@ mod tests {
             }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "../parent.R" {
-                Some(parent_uri.clone())
-            } else {
-                None
-            }
-        };
-
         // Test scope at end of child file (line 0, after z definition)
-        let scope = scope_at_position_with_backward(
+        let scope = scope_at_position_with_graph(
             &child_uri,
             0,
             10,
             &get_artifacts,
             &get_metadata,
-            &resolve_path,
+            &graph,
+            Some(&workspace_root),
             10,
-            None,
+            &HashSet::new(),
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -3229,6 +2971,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -3302,6 +3045,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(
@@ -3465,6 +3209,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             2,
+            &HashSet::new(),
         );
 
         // Should have depth_exceeded entry
@@ -3652,6 +3397,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -3737,6 +3483,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         assert!(
@@ -5688,6 +5435,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -5704,6 +5452,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -5720,6 +5469,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -5794,6 +5544,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -5818,6 +5569,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -5839,10 +5591,12 @@ mod tests {
         // Parent: defines x, sources child, then rm(x)
         // Child: should see x in scope (because it's sourced before rm)
         // Validates: Requirements 6.1, 6.2, 6.3
+        use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata};
 
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent code: defines x, sources child at line 1, then rm(x) at line 2
         let parent_code = "x <- 1\nsource(\"child.R\")\nrm(x)";
@@ -5864,6 +5618,21 @@ mod tests {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -5882,25 +5651,18 @@ mod tests {
             }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "parent.R" {
-                Some(parent_uri.clone())
-            } else {
-                None
-            }
-        };
-
         // In child file, x should be in scope (parent's scope at call site line 1)
         // At line 1 in parent, x is defined but rm(x) hasn't happened yet
-        let scope_in_child = scope_at_position_with_backward(
+        let scope_in_child = scope_at_position_with_graph(
             &child_uri,
             1,
             10,
             &get_artifacts,
             &get_metadata,
-            &resolve_path,
+            &graph,
+            Some(&workspace_root),
             10,
-            None,
+            &HashSet::new(),
         );
 
         assert!(
@@ -5918,10 +5680,12 @@ mod tests {
         // Test: Parent removes symbol BEFORE sourcing child
         // Child should NOT see the removed symbol
         // Validates: Requirements 6.1, 6.2, 6.3
+        use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata};
 
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent code: defines x, rm(x), then sources child
         let parent_code = "x <- 1\nrm(x)\nsource(\"child.R\")";
@@ -5943,6 +5707,21 @@ mod tests {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -5961,24 +5740,17 @@ mod tests {
             }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "parent.R" {
-                Some(parent_uri.clone())
-            } else {
-                None
-            }
-        };
-
         // In child file, x should NOT be in scope (removed before call site)
-        let scope_in_child = scope_at_position_with_backward(
+        let scope_in_child = scope_at_position_with_graph(
             &child_uri,
             1,
             10,
             &get_artifacts,
             &get_metadata,
-            &resolve_path,
+            &graph,
+            Some(&workspace_root),
             10,
-            None,
+            &HashSet::new(),
         );
 
         assert!(
@@ -6058,6 +5830,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -6074,6 +5847,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6090,6 +5864,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -6171,6 +5946,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6252,6 +6028,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -6268,6 +6045,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -6365,6 +6143,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -6381,6 +6160,7 @@ mod tests {
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -8069,6 +7849,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should have inherited dplyr from parent
@@ -8143,6 +7924,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -8217,6 +7999,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should have both packages
@@ -8296,6 +8079,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -8306,14 +8090,13 @@ x <- 1"#;
     }
 
     // ============================================================================
-    // Tests for forward-only package propagation (Task 9.2)
-    // Validates: Requirement 5.4
+    // Tests for package propagation from sourced files (Task 9.2)
     // ============================================================================
 
     #[test]
-    fn test_forward_only_package_propagation_child_packages_not_in_parent() {
-        // Requirement 5.4: Packages loaded in a sourced file should NOT propagate
-        // back to the parent file.
+    fn test_package_propagation_child_packages_in_parent() {
+        // Packages loaded in a sourced file should be available in the parent
+        // after the source() call.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8367,8 +8150,7 @@ x <- 1"#;
         };
 
         // Query parent's scope AFTER the source() call
-        // The parent should NOT have dplyr in inherited_packages because
-        // packages don't propagate backward from child to parent
+        // The parent should have dplyr available after sourcing the child
         let scope = scope_at_position_with_graph(
             &parent_uri,
             1,
@@ -8378,20 +8160,21 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
-        // Parent should NOT have dplyr (it was loaded in child, not parent)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have dplyr (loaded in child, available after source())
+        // Packages from sourced files go into loaded_packages, not inherited_packages
         assert!(
-            !scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Parent should NOT inherit dplyr from child (forward-only propagation)"
+            scope.loaded_packages.contains(&"dplyr".to_string()),
+            "Parent should have dplyr from child (package propagation via loaded_packages)"
         );
     }
 
     #[test]
-    fn test_forward_only_package_propagation_child_symbols_available_but_not_packages() {
-        // Requirement 5.4: While symbols from child files ARE merged into parent scope,
-        // packages loaded in child files should NOT be propagated back.
+    fn test_package_propagation_child_symbols_and_packages_in_parent() {
+        // Symbols from child files are merged into parent scope, and packages
+        // loaded in child files should be available after source().
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8454,6 +8237,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Symbols from child SHOULD be available in parent
@@ -8462,18 +8246,17 @@ x <- 1"#;
             "Parent should have helper_func from child (symbols propagate)"
         );
 
-        // But packages from child should NOT be in parent's inherited_packages
-        // Requirement 5.4: Forward-only propagation
+        // Packages from child should be in parent's loaded_packages (not inherited_packages)
         assert!(
-            !scope.inherited_packages.contains(&"ggplot2".to_string()),
-            "Parent should NOT inherit ggplot2 from child (forward-only propagation)"
+            scope.loaded_packages.contains(&"ggplot2".to_string()),
+            "Parent should have ggplot2 from child (package propagation via loaded_packages)"
         );
     }
 
     #[test]
-    fn test_forward_only_package_propagation_grandchild_packages_not_in_grandparent() {
-        // Requirement 5.4: Packages loaded in deeply nested sourced files
-        // should NOT propagate back through the chain.
+    fn test_package_propagation_grandchild_packages_in_grandparent() {
+        // Packages loaded in deeply nested sourced files should propagate
+        // back through the chain after source() calls.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8568,15 +8351,15 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
-        // Grandparent should NOT have stringr (loaded in grandchild)
-        // Requirement 5.4: Forward-only propagation
+        // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
         assert!(
-            !grandparent_scope
-                .inherited_packages
+            grandparent_scope
+                .loaded_packages
                 .contains(&"stringr".to_string()),
-            "Grandparent should NOT inherit stringr from grandchild (forward-only propagation)"
+            "Grandparent should have stringr from grandchild (package propagation via loaded_packages)"
         );
 
         // Query parent's scope after source() call
@@ -8589,21 +8372,22 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
-        // Parent should also NOT have stringr (loaded in child)
+        // Parent should also have stringr (loaded in child, propagated via loaded_packages)
         assert!(
-            !parent_scope
-                .inherited_packages
+            parent_scope
+                .loaded_packages
                 .contains(&"stringr".to_string()),
-            "Parent should NOT inherit stringr from child (forward-only propagation)"
+            "Parent should have stringr from child (package propagation via loaded_packages)"
         );
     }
 
     #[test]
-    fn test_forward_only_package_propagation_parent_packages_propagate_child_packages_dont() {
-        // Combined test: Parent's packages propagate to child, but child's packages
-        // don't propagate back to parent.
+    fn test_package_propagation_parent_and_child_packages_both_available() {
+        // Combined test: Parent's packages propagate to child, and child's packages
+        // propagate back to parent after source().
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -8666,6 +8450,7 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -8686,15 +8471,15 @@ x <- 1"#;
             &graph,
             Some(&workspace_root),
             10,
+            &HashSet::new(),
         );
 
-        // Parent should NOT have ggplot2 (loaded in child)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
         assert!(
-            !parent_scope
-                .inherited_packages
+            parent_scope
+                .loaded_packages
                 .contains(&"ggplot2".to_string()),
-            "Parent should NOT inherit ggplot2 from child (forward-only propagation)"
+            "Parent should have ggplot2 from child (package propagation via loaded_packages)"
         );
     }
 

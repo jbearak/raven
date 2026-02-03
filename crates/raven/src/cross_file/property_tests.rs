@@ -7,6 +7,7 @@
 #![cfg(test)]
 
 use proptest::prelude::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use super::directive::parse_directives;
@@ -2515,7 +2516,7 @@ proptest! {
 // Validates: Requirements 5.1, 5.2
 // ============================================================================
 
-use super::scope::scope_at_position_with_backward;
+use super::scope::scope_at_position_with_graph;
 use super::types::BackwardDirective;
 
 proptest! {
@@ -2536,6 +2537,7 @@ proptest! {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
         let sibling_uri = make_url("sibling");
+        let workspace_root = Url::parse("file:///workspace").unwrap();
 
         // Parent file: defines parent_symbol
         let parent_code = format!("{} <- 1", parent_symbol);
@@ -2567,6 +2569,21 @@ proptest! {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.clone())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
             else if uri == &child_uri { Some(child_artifacts.clone()) }
@@ -2579,18 +2596,10 @@ proptest! {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            match path {
-                "../parent.R" => Some(parent_uri.clone()),
-                "sibling.R" => Some(sibling_uri.clone()),
-                _ => None,
-            }
-        };
-
         // At line 0 (before any code), parent symbols should be available (from backward directive)
         // but sibling symbols should NOT be available (forward source hasn't been processed yet)
-        let scope_at_start = scope_at_position_with_backward(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope_at_start = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_at_start.symbols.contains_key(&parent_symbol),
             "Parent symbol should be available at start due to backward directive");
@@ -2598,8 +2607,8 @@ proptest! {
             "Sibling symbol should NOT be available at start (before source() call)");
 
         // At line 1 (after child_symbol definition, before source() call)
-        let scope_at_middle = scope_at_position_with_backward(
-            &child_uri, 1, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope_at_middle = scope_at_position_with_graph(
+            &child_uri, 1, 10, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_at_middle.symbols.contains_key(&parent_symbol),
             "Parent symbol should still be available");
@@ -2609,8 +2618,8 @@ proptest! {
             "Sibling symbol should NOT be available (before source() call)");
 
         // At line 3 (after source() call), all symbols should be available
-        let scope_at_end = scope_at_position_with_backward(
-            &child_uri, 3, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope_at_end = scope_at_position_with_graph(
+            &child_uri, 3, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_at_end.symbols.contains_key(&parent_symbol),
             "Parent symbol should be available at end");
@@ -2627,6 +2636,7 @@ proptest! {
     ) {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///workspace").unwrap();
 
         // Parent file: defines symbol
         let parent_code = format!("{} <- 42", parent_symbol);
@@ -2647,6 +2657,21 @@ proptest! {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.clone())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
             else if uri == &child_uri { Some(child_artifacts.clone()) }
@@ -2658,13 +2683,9 @@ proptest! {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
-        };
-
         // At position (0, 0), parent symbol should be available
-        let scope = scope_at_position_with_backward(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope.symbols.contains_key(&parent_symbol),
             "Parent symbol from backward directive should be available at (0, 0)");
@@ -2695,6 +2716,7 @@ proptest! {
 
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///workspace").unwrap();
 
         // Parent file: defines symbol_before on line 0, symbol_after on line call_site_line + 1
         // (one line AFTER the call site)
@@ -2725,6 +2747,21 @@ proptest! {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.clone())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
             else if uri == &child_uri { Some(child_artifacts.clone()) }
@@ -2736,13 +2773,9 @@ proptest! {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
-        };
-
         // Get scope at child
-        let scope = scope_at_position_with_backward(
-            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope = scope_at_position_with_graph(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // symbol_before (defined on line 0) should be available (before call site)
@@ -2773,6 +2806,7 @@ proptest! {
     ) {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///workspace").unwrap();
 
         // Parent file: defines symbol
         let parent_code = format!("{} <- 42", parent_symbol);
@@ -2793,6 +2827,21 @@ proptest! {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.clone())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
             else if uri == &child_uri { Some(child_artifacts.clone()) }
@@ -2804,13 +2853,9 @@ proptest! {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
-        };
-
         // With default call site (which defaults to "end"), all parent symbols should be available
-        let scope = scope_at_position_with_backward(
-            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope = scope_at_position_with_graph(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Default is "end", so all parent symbols should be included
@@ -2837,6 +2882,7 @@ proptest! {
     ) {
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///workspace").unwrap();
 
         // Parent file: defines symbol at line 5
         let parent_code = format!("x <- 1\ny <- 2\nz <- 3\nw <- 4\n{} <- 5", parent_symbol);
@@ -2857,6 +2903,21 @@ proptest! {
             ..Default::default()
         };
 
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &child_uri,
+            &child_metadata,
+            Some(&workspace_root),
+            |parent_uri_check| {
+                if parent_uri_check == &parent_uri {
+                    Some(parent_code.clone())
+                } else {
+                    None
+                }
+            },
+        );
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri { Some(parent_artifacts.clone()) }
             else if uri == &child_uri { Some(child_artifacts.clone()) }
@@ -2868,16 +2929,12 @@ proptest! {
             else { None }
         };
 
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
-        };
-
         // With default config (assume_call_site = End), parent symbol should be available
         let config_end = CrossFileConfig::default();
         prop_assert_eq!(config_end.assume_call_site, CallSiteDefault::End);
 
-        let scope_with_end = scope_at_position_with_backward(
-            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        let scope_with_end = scope_at_position_with_graph(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_with_end.symbols.contains_key(&parent_symbol),
             "With assume_call_site=End, parent symbol should be available");
@@ -6810,8 +6867,6 @@ proptest! {
 // Validates: Requirements 6.1, 6.2, 6.3
 // ============================================================================
 
-use super::scope::scope_at_position_with_graph;
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -6866,21 +6921,21 @@ proptest! {
 
         // After source() but before rm() (line 0, after source call), symbol should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
             "Symbol from sourced file should be in scope after source() but before rm()");
 
         // After rm() (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after rm()");
 
         // At end of file, symbol should NOT be in scope
         let scope_eof = scope_at_position_with_graph(
-            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_eof.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope at end of file after rm()");
@@ -6933,7 +6988,7 @@ proptest! {
 
         // After rm(), only the removed symbol should be gone
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_to_remove),
             "Removed symbol should NOT be in scope after rm()");
@@ -6989,7 +7044,7 @@ proptest! {
 
         // Before rm() (line 0), all three symbols should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_rm.symbols.contains_key(&symbol_a),
             "symbol_a should be in scope before rm()");
@@ -7000,7 +7055,7 @@ proptest! {
 
         // After rm() (line 1), symbol_a and symbol_b should NOT be in scope, but symbol_c should be
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
             "symbol_a should NOT be in scope after rm()");
@@ -7050,14 +7105,14 @@ proptest! {
 
         // After source() but before remove() (line 0), symbol should be in scope
         let scope_before_remove = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_remove.symbols.contains_key(&symbol),
             "Symbol from sourced file should be in scope after source() but before remove()");
 
         // After remove() (line 1), symbol should NOT be in scope
         let scope_after_remove = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_remove.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after remove()");
@@ -7103,14 +7158,14 @@ proptest! {
 
         // After source() but before rm(list=...) (line 0), symbol should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
             "Symbol from sourced file should be in scope after source() but before rm(list=...)");
 
         // After rm(list=...) (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after rm(list=...)");
@@ -7167,7 +7222,7 @@ proptest! {
 
         // After rm(list=c(...)) (line 1), symbol_a and symbol_b should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
             "symbol_a should NOT be in scope after rm(list=c(...))");
@@ -7220,21 +7275,21 @@ proptest! {
 
         // After source() but before rm() (line 0), symbol should be in scope
         let scope_after_source = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_after_source.symbols.contains_key(&symbol),
             "Symbol should be in scope after source() but before rm()");
 
         // After rm() but before redefinition (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope after rm() but before redefinition");
 
         // After redefinition (line 2), symbol should be in scope again
         let scope_after_redef = scope_at_position_with_graph(
-            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_after_redef.symbols.contains_key(&symbol),
             "Symbol should be in scope after redefinition");
@@ -7281,14 +7336,14 @@ proptest! {
 
         // In child file, the symbol should still be in scope (child's own definition)
         let scope_in_child = scope_at_position_with_graph(
-            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(scope_in_child.symbols.contains_key(&symbol),
             "Symbol should still be in scope in child file (child's own definition)");
 
         // In parent file after rm(), the symbol should NOT be in scope
         let scope_in_parent = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
         prop_assert!(!scope_in_parent.symbols.contains_key(&symbol),
             "Symbol should NOT be in scope in parent file after rm()");
@@ -8891,7 +8946,6 @@ proptest! {
 // ============================================================================
 
 use super::scope::scope_at_position_with_packages;
-use std::collections::HashSet;
 
 /// Generate a random R code structure for testing base package availability
 fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
@@ -9499,7 +9553,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited the package from parent
@@ -9559,7 +9613,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should NOT have the package (loaded after source() call)
@@ -9623,7 +9677,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited both packages from parent
@@ -9695,7 +9749,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited pkg_before (loaded before source())
@@ -9768,7 +9822,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should NOT have the package (it's function-scoped in parent)
@@ -9843,7 +9897,7 @@ proptest! {
 
         // Query child's scope at position (0, 0)
         let scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited the package from grandparent (through parent)
@@ -9895,7 +9949,7 @@ proptest! {
 
         // Query child's scope at various positions
         let scope = scope_at_position_with_graph(
-            &child_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child should have inherited the package at any position
@@ -9908,27 +9962,25 @@ proptest! {
 }
 
 // ============================================================================
-// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-// **Validates: Requirement 5.4**
+// Feature: package-function-awareness, Property 9: Package Propagation via source()
 //
 // For any child file C that loads package P, scope resolution in the parent file
-// SHALL NOT include exports from P (packages do not propagate backward).
+// SHALL include P after the source() call.
 //
 // This test verifies that:
-// - Packages loaded in child files do NOT appear in parent's inherited_packages
-// - Packages loaded in deeply nested files do NOT propagate back through the chain
-// - While symbols from child files ARE merged into parent scope, packages are NOT
-// - Parent's packages propagate forward to child, but child's packages don't propagate back
+// - Packages loaded in child files appear in parent's loaded_packages after source()
+// - Packages loaded in deeply nested files propagate back through the chain
+// - Symbols and packages both propagate from sourced files to parent
+// - Parent's packages propagate forward to child (via inherited_packages), and child's packages propagate back (via loaded_packages)
 // ============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
     /// For any child file C that loads package P, scope resolution in the parent file
-    /// SHALL NOT include exports from P in inherited_packages.
+    /// SHALL include exports from P in loaded_packages after source().
     ///
     /// Test pattern:
     /// ```r
@@ -9939,9 +9991,9 @@ proptest! {
     /// # child.R
     /// library(dplyr)      # Line 0
     /// ```
-    /// Parent file should NOT have "dplyr" in inherited_packages.
+    /// Parent file should have "dplyr" in loaded_packages after the source() call.
     #[test]
-    fn prop_forward_only_package_propagation_basic(
+    fn prop_package_propagation_basic(
         package in pkg_name(),
         func in library_func(),
     ) {
@@ -9977,22 +10029,21 @@ proptest! {
 
         // Query parent's scope AFTER the source() call
         let scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
-        // Parent should NOT have the package (it was loaded in child, not parent)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have the package (loaded in child, available after source())
+        // Packages from sourced files go into loaded_packages, not inherited_packages
         prop_assert!(
-            !scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}. Child code:\n{}",
-            package, scope.inherited_packages, child_code
+            scope.loaded_packages.contains(&package),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}. Child code:\n{}",
+            package, scope.loaded_packages, child_code
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Packages loaded in deeply nested files should NOT propagate back through the chain.
+    /// Packages loaded in deeply nested files should propagate back through the chain.
     ///
     /// Test pattern:
     /// ```r
@@ -10005,9 +10056,9 @@ proptest! {
     /// # child.R
     /// library(stringr)
     /// ```
-    /// Neither grandparent nor parent should have "stringr" in inherited_packages.
+    /// Both grandparent and parent should have the package in loaded_packages.
     #[test]
-    fn prop_forward_only_package_propagation_deep_chain(
+    fn prop_package_propagation_deep_chain(
         package in pkg_name(),
     ) {
         let grandparent_uri = make_url("grandparent");
@@ -10052,34 +10103,34 @@ proptest! {
 
         // Query grandparent's scope after source() call
         let grandparent_scope = scope_at_position_with_graph(
-            &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
-        // Grandparent should NOT have the package (loaded in grandchild)
-        // Requirement 5.4: Forward-only propagation
+        // Grandparent should have the package (loaded in grandchild)
+        // Packages from sourced files go into loaded_packages, not inherited_packages
         prop_assert!(
-            !grandparent_scope.inherited_packages.contains(&package),
-            "Grandparent should NOT inherit package '{}' from grandchild (forward-only propagation). Got inherited_packages: {:?}",
-            package, grandparent_scope.inherited_packages
+            grandparent_scope.loaded_packages.contains(&package),
+            "Grandparent should have package '{}' from grandchild (via loaded_packages). Got loaded_packages: {:?}",
+            package, grandparent_scope.loaded_packages
         );
 
         // Query parent's scope after source() call
         let parent_scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
-        // Parent should also NOT have the package (loaded in child)
+        // Parent should also have the package (loaded in child)
+        // Packages from sourced files go into loaded_packages, not inherited_packages
         prop_assert!(
-            !parent_scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
-            package, parent_scope.inherited_packages
+            parent_scope.loaded_packages.contains(&package),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}",
+            package, parent_scope.loaded_packages
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// While symbols from child files ARE merged into parent scope, packages are NOT.
+    /// Symbols and packages from child files are merged into parent scope.
     ///
     /// Test pattern:
     /// ```r
@@ -10091,9 +10142,9 @@ proptest! {
     /// library(ggplot2)
     /// helper_func <- function() { 1 }
     /// ```
-    /// Parent should have "helper_func" symbol but NOT "ggplot2" in inherited_packages.
+    /// Parent should have "helper_func" symbol and "ggplot2" in loaded_packages.
     #[test]
-    fn prop_forward_only_package_propagation_symbols_propagate_packages_dont(
+    fn prop_package_propagation_symbols_and_packages(
         package in pkg_name(),
         func_name in r_identifier(),
     ) {
@@ -10129,7 +10180,7 @@ proptest! {
 
         // Query parent's scope after source() call
         let scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Symbols from child SHOULD be available in parent
@@ -10139,19 +10190,17 @@ proptest! {
             func_name, scope.symbols.keys().collect::<Vec<_>>()
         );
 
-        // But packages from child should NOT be in parent's inherited_packages
-        // Requirement 5.4: Forward-only propagation
+        // Packages from child should be in parent's loaded_packages (not inherited_packages)
         prop_assert!(
-            !scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
-            package, scope.inherited_packages
+            scope.loaded_packages.contains(&package),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}",
+            package, scope.loaded_packages
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Parent's packages propagate forward to child, but child's packages don't propagate back.
+    /// Parent's packages propagate forward to child, and child's packages propagate back.
     ///
     /// Test pattern:
     /// ```r
@@ -10165,9 +10214,9 @@ proptest! {
     /// x <- 1
     /// ```
     /// Child should have "dplyr" in inherited_packages.
-    /// Parent should NOT have "ggplot2" in inherited_packages.
+    /// Parent should have "ggplot2" in loaded_packages.
     #[test]
-    fn prop_forward_only_package_propagation_asymmetric(
+    fn prop_package_propagation_asymmetric(
         parent_pkg in pkg_name(),
         child_pkg in pkg_name(),
     ) {
@@ -10206,7 +10255,7 @@ proptest! {
 
         // Query child's scope - should have parent's package
         let child_scope = scope_at_position_with_graph(
-            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
         // Child SHOULD have parent's package (forward propagation works)
@@ -10218,24 +10267,22 @@ proptest! {
 
         // Query parent's scope after source() call
         let parent_scope = scope_at_position_with_graph(
-            &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
-        // Parent should NOT have child's package (forward-only propagation)
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have child's package (propagated from child via loaded_packages)
         prop_assert!(
-            !parent_scope.inherited_packages.contains(&child_pkg),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
-            child_pkg, parent_scope.inherited_packages
+            parent_scope.loaded_packages.contains(&child_pkg),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}",
+            child_pkg, parent_scope.loaded_packages
         );
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Packages loaded in child should not appear in parent at any query position.
+    /// Packages loaded in child should appear in parent after the source() call.
     #[test]
-    fn prop_forward_only_package_propagation_any_parent_position(
+    fn prop_package_propagation_any_parent_position(
         package in pkg_name(),
         query_line in 0..5u32,
     ) {
@@ -10271,24 +10318,30 @@ proptest! {
 
         // Query parent's scope at various positions
         let scope = scope_at_position_with_graph(
-            &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
-        // Parent should NOT have the package at any position
-        // Requirement 5.4: Forward-only propagation
-        prop_assert!(
-            !scope.inherited_packages.contains(&package),
-            "Parent should NOT inherit package '{}' from child at line {} (forward-only propagation). Got inherited_packages: {:?}",
-            package, query_line, scope.inherited_packages
-        );
+        // Packages from sourced files go into loaded_packages, not inherited_packages
+        if query_line == 0 {
+            prop_assert!(
+                !scope.loaded_packages.contains(&package),
+                "Parent should NOT have package '{}' at the source() line. Got loaded_packages: {:?}",
+                package, scope.loaded_packages
+            );
+        } else {
+            prop_assert!(
+                scope.loaded_packages.contains(&package),
+                "Parent should have package '{}' from child at line {} (via loaded_packages). Got loaded_packages: {:?}",
+                package, query_line, scope.loaded_packages
+            );
+        }
     }
 
-    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
-    /// **Validates: Requirement 5.4**
+    /// Feature: package-function-awareness, Property 9: Package Propagation via source()
     ///
-    /// Multiple packages loaded in child should all NOT propagate to parent.
+    /// Multiple packages loaded in child should all propagate to parent.
     #[test]
-    fn prop_forward_only_package_propagation_multiple_packages(
+    fn prop_package_propagation_multiple_packages(
         pkg1 in pkg_name(),
         pkg2 in pkg_name(),
         pkg3 in pkg_name(),
@@ -10328,25 +10381,24 @@ proptest! {
 
         // Query parent's scope after source() call
         let scope = scope_at_position_with_graph(
-            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
 
-        // Parent should NOT have any of the child's packages
-        // Requirement 5.4: Forward-only propagation
+        // Parent should have all of the child's packages (via loaded_packages)
         prop_assert!(
-            !scope.inherited_packages.contains(&pkg1),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
-            pkg1, scope.inherited_packages
+            scope.loaded_packages.contains(&pkg1),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}",
+            pkg1, scope.loaded_packages
         );
         prop_assert!(
-            !scope.inherited_packages.contains(&pkg2),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
-            pkg2, scope.inherited_packages
+            scope.loaded_packages.contains(&pkg2),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}",
+            pkg2, scope.loaded_packages
         );
         prop_assert!(
-            !scope.inherited_packages.contains(&pkg3),
-            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
-            pkg3, scope.inherited_packages
+            scope.loaded_packages.contains(&pkg3),
+            "Parent should have package '{}' from child (via loaded_packages). Got loaded_packages: {:?}",
+            pkg3, scope.loaded_packages
         );
     }
 }

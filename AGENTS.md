@@ -1,22 +1,22 @@
-# AGENTS.md - LLM Guidance for Rlsp
+# AGENTS.md - LLM Guidance for Raven
 
 ## Project Overview
 
-Rlsp is a static R Language Server extracted from Ark. It provides LSP features without embedding R runtime. Uses tree-sitter for parsing, subprocess calls for help.
+Raven is a static R Language Server extracted from Ark. It provides LSP features without embedding R runtime. Uses tree-sitter for parsing, subprocess calls for help.
 
 ## Repository Structure
 
-- `crates/rlsp/`: Main LSP implementation
-- `crates/rlsp/src/cross_file/`: Cross-file awareness module
+- `crates/raven/`: Main LSP implementation
+- `crates/raven/src/cross_file/`: Cross-file awareness module
 - `editors/vscode/`: VS Code extension
 - `Cargo.toml`: Workspace root
 - `setup.sh`: Build and install script
 
 ## Build Commands
 
-- `cargo build -p rlsp` - Debug build
-- `cargo build --release -p rlsp` - Release build
-- `cargo test -p rlsp` - Run tests
+- `cargo build -p raven` - Debug build
+- `cargo build --release -p raven` - Release build
+- `cargo test -p raven` - Run tests
 - `./setup.sh` - Build and install everything
 
 ## LSP Architecture
@@ -32,7 +32,7 @@ Rlsp is a static R Language Server extracted from Ark. It provides LSP features 
 
 ### Overview
 
-Cross-file awareness enables Rlsp to understand symbol definitions and relationships across multiple R files connected via `source()` calls and LSP directives. This allows:
+Cross-file awareness enables Raven to understand symbol definitions and relationships across multiple R files connected via `source()` calls and LSP directives. This allows:
 
 - **Symbol resolution**: Functions and variables from sourced files appear in completions, hover, and go-to-definition
 - **Diagnostics suppression**: Symbols from sourced files are not marked as "undefined variable"
@@ -47,15 +47,15 @@ Cross-file awareness enables Rlsp to understand symbol definitions and relations
 5. **Cycle detection**: Prevents infinite loops in circular dependencies
 6. **Real-time updates**: Changes propagate to dependent files automatically
 
-### Module Structure (`crates/rlsp/src/cross_file/`)
+### Module Structure (`crates/raven/src/cross_file/`)
 
-- `background_indexer.rs` - Background indexing queue for Priority 2/3 files
+- `background_indexer.rs` - Background indexing queue for transitive dependencies
 - `types.rs` - Core types (CrossFileMetadata, BackwardDirective, ForwardSource, CallSiteSpec)
 - `directive.rs` - Directive parsing (@lsp-sourced-by, @lsp-source, etc.) with optional colon/quotes
 - `source_detect.rs` - Tree-sitter based source() call detection with UTF-16 columns
 - `path_resolve.rs` - Path resolution with working directory support
 - `dependency.rs` - Dependency graph with directive-vs-AST conflict resolution
-- `scope.rs` - Scope resolution and symbol extraction
+- `scope.rs` - Scope resolution and symbol extraction (graph-based via `scope_at_position_with_graph`)
 - `config.rs` - Configuration options including severity settings
 - `cache.rs` - Caching with interior mutability
 - `parent_resolve.rs` - Parent resolution with match= and call-site inference
@@ -168,24 +168,44 @@ source("utils.r")
 
 - Metadata extraction on document change
 - Dependency graph update
-- Selective invalidation based on interface/edge changes
+- Selective invalidation based on interface hash comparison
 - Debounced diagnostics fanout to affected open files
 - Cancellation of outdated pending revalidations
 - Freshness guards prevent stale diagnostic publishes
 - Monotonic publishing: never publish older version than last published
 
+### Interface Hash Optimization
+
+When a file changes, Raven compares the old and new `interface_hash` to determine if dependents need revalidation:
+
+**What triggers dependent revalidation:**
+- Adding/removing/renaming exported functions or variables
+- Changes to library() calls (affects loaded_packages in hash)
+
+**What does NOT trigger dependent revalidation:**
+- Editing comments
+- Changing local variables inside functions
+- Modifying function bodies (without changing the function signature)
+- Whitespace changes
+
+**Implementation:**
+- `did_change`: Captures old interface_hash before applying changes, compares after
+- `did_open`: Compares against workspace index if file was previously indexed
+- Only calls `get_transitive_dependents()` and marks force republish when `interface_changed`
+
+This optimization significantly reduces cascading revalidation in codebases with deep transitive dependency chains.
+
 ### On-Demand Background Indexing
 
 The BackgroundIndexer handles asynchronous indexing of files not currently open in the editor:
 
-**Priority Levels**:
-- Priority 1: Files directly sourced by open documents (synchronous, before diagnostics)
-- Priority 2: Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
-- Priority 3: Transitive dependencies (files sourced by Priority 2 files)
+**Indexing Categories**:
+- Sourced files: Files directly sourced by open documents (indexed synchronously before diagnostics)
+- Backward directive targets: Files referenced by @lsp-run-by, @lsp-sourced-by (indexed synchronously before diagnostics)
+- Transitive dependencies: Files sourced by indexed files (queued for background indexing)
 
 **Architecture**:
-- Single worker thread processes queue sequentially (avoids resource contention)
-- Priority queue ensures important files indexed first
+- Single worker thread processes queue sequentially (FIFO order)
 - Depth tracking prevents infinite transitive chains
 - Duplicate detection avoids redundant work
 
@@ -193,14 +213,13 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - `enabled`: Enable/disable on-demand indexing (default: true)
 - `maxTransitiveDepth`: Maximum depth for transitive indexing (default: 2)
 - `maxQueueSize`: Maximum queue size (default: 50)
-- `priority2Enabled`: Enable Priority 2 indexing (default: true)
-- `priority3Enabled`: Enable Priority 3 indexing (default: true)
 
 **Flow**:
-1. File opened with backward directive → Priority 2 task submitted
-2. Worker processes task → reads file, extracts metadata, computes artifacts
-3. Updates workspace index and dependency graph
-4. Queues transitive dependencies as Priority 3 tasks (if depth allows)
+1. File opened → sourced files and backward directive targets indexed synchronously
+2. Transitive dependencies queued for background indexing
+3. Worker processes queue → reads file, extracts metadata, computes artifacts
+4. Updates workspace index and dependency graph
+5. Queues further transitive dependencies (if depth allows)
 
 ## Learnings
 
@@ -230,9 +249,12 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
 - Normalize markdown table spacing to match project lint expectations when adding spec tables.
 - Avoid interpolating user-controlled strings into R code; pass help topics/packages as command args instead.
+- R's `help()` function uses non-standard evaluation (NSE) for the `package` argument; wrap variables in parentheses to force evaluation: `help(topic, package = (pkg))` not `help(topic, package = pkg)`.
 - Add language identifiers (e.g., `text`) to ASCII diagram/timeline fences to satisfy markdownlint (MD040).
 - `tree_sitter::Tree` implements `Clone`; preserve ASTs in cloned index entries when reference searches depend on them.
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.
+- Base exports must be gated by `package_library_ready` to avoid using empty exports before R subprocess initialization completes.
+- When adding parameters to scope resolution functions, update all callers including test helpers.
 
 ### Rust/Clippy Best Practices
 

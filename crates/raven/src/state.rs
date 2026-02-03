@@ -427,6 +427,7 @@ pub struct WorldState {
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
     #[allow(dead_code)]
     pub cross_file_parent_cache: ParentSelectionCache,
+    pub package_library_ready: bool,
 }
 
 impl WorldState {
@@ -516,6 +517,7 @@ impl WorldState {
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
             cross_file_parent_cache: ParentSelectionCache::new(),
+            package_library_ready: false,
         }
     }
 

@@ -89,6 +89,15 @@ fn get_cross_file_scope(
 
     let max_depth = state.cross_file_config.max_chain_depth;
 
+    // Get base_exports from package_library if ready, otherwise empty set.
+    // This ensures base R functions (stop, sprintf, exists, etc.) are available
+    // in cross-file scope resolution for hover, completions, and go-to-definition.
+    let base_exports = if state.package_library_ready {
+        state.package_library.base_exports().clone()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     // Use the graph-aware scope resolution with PathContext
     scope::scope_at_position_with_graph(
         uri,
@@ -99,6 +108,7 @@ fn get_cross_file_scope(
         &state.cross_file_graph,
         state.workspace_folders.first(),
         max_depth,
+        &base_exports,
     )
 }
 
@@ -922,6 +932,10 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
 
     let max_depth = state.cross_file_config.max_chain_depth;
 
+    // For depth-exceeded diagnostics, we don't need base_exports since we're only
+    // checking chain depth, not resolving symbols. Pass empty set for efficiency.
+    let empty_base_exports = std::collections::HashSet::new();
+
     // Use scope resolution to detect depth exceeded (now uses PathContext internally)
     let scope = scope::scope_at_position_with_graph(
         uri,
@@ -932,6 +946,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         &state.cross_file_graph,
         state.workspace_folders.first(),
         max_depth,
+        &empty_base_exports,
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -1401,8 +1416,8 @@ fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Check package exports only if packages feature is enabled
-        if state.cross_file_config.packages_enabled {
+        // Check package exports only if packages feature is enabled and library is ready
+        if state.cross_file_config.packages_enabled && state.package_library_ready {
             // Build position-aware package list: inherited packages + locally loaded packages
             // Requirements 5.1, 5.2: Inherited packages from parent files
             // Requirements 8.1, 8.3: Locally loaded packages before this position
@@ -2449,6 +2464,11 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         cross_file_symbols.len()
     );
     if let Some(symbol) = cross_file_symbols.get(name) {
+        log::trace!(
+            "hover: found symbol '{}' in cross_file_symbols, source_uri={}",
+            name,
+            symbol.source_uri
+        );
         let mut value = String::new();
 
         // Check if this is a package export (source_uri starts with "package:")
@@ -2478,32 +2498,44 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             }
             None => {
                 // Graceful fallback: show symbol info without definition statement
-                // For package exports, try to get function signature from R help
+                // For package exports, get full R help documentation
                 // Validates: Requirement 10.2
+                log::trace!(
+                    "hover: extract_definition_statement returned None for '{}', package_name={:?}",
+                    name,
+                    package_name
+                );
                 if let Some(pkg) = package_name {
-                    // Try to get function signature from R help
+                    // Try to get full help documentation from R
+                    log::trace!("hover: fetching R help for '{}' from package '{}'", name, pkg);
                     let name_owned = name.to_string();
                     let pkg_owned = pkg.to_string();
-                    if let Ok(signature) = tokio::task::spawn_blocking(move || {
-                        crate::help::get_function_signature(&name_owned, &pkg_owned)
+                    if let Ok(help_result) = tokio::task::spawn_blocking(move || {
+                        crate::help::get_help(&name_owned, Some(&pkg_owned))
                     })
                     .await
                     {
-                        if let Some(signature) = signature {
-                            value.push_str(&format!("```r\n{}\n```\n", signature));
+                        log::trace!(
+                            "hover: get_help returned {:?}",
+                            help_result.as_ref().map(|s| s.len())
+                        );
+                        if let Some(help_text) = help_result {
+                            // Show full R documentation
+                            value.push_str(&format!("```\n{}\n```", help_text));
                         } else if let Some(sig) = &symbol.signature {
                             value.push_str(&format!("```r\n{}\n```\n", sig));
+                            value.push_str(&format!("\nfrom {{{}}}", pkg));
                         } else {
                             value.push_str(&format!("```r\n{}\n```\n", name));
+                            value.push_str(&format!("\nfrom {{{}}}", pkg));
                         }
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
+                        value.push_str(&format!("\nfrom {{{}}}", pkg));
                     } else {
                         value.push_str(&format!("```r\n{}\n```\n", name));
+                        value.push_str(&format!("\nfrom {{{}}}", pkg));
                     }
-                    // Display package name prominently for package exports
-                    // Validates: Requirement 10.1
-                    value.push_str(&format!("\nfrom {{{}}}", pkg));
                 } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
                     if symbol.source_uri != *uri {
@@ -2548,23 +2580,25 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            // Try to get function signature from R help
+            // Try to get full help documentation from R
             let name_owned = name.to_string();
             let pkg_owned = pkg_name.to_string();
-            if let Ok(signature) = tokio::task::spawn_blocking(move || {
-                crate::help::get_function_signature(&name_owned, &pkg_owned)
+            if let Ok(help_result) = tokio::task::spawn_blocking(move || {
+                crate::help::get_help(&name_owned, Some(&pkg_owned))
             })
             .await
             {
-                if let Some(signature) = signature {
-                    value.push_str(&format!("```r\n{}\n```\n", signature));
+                if let Some(help_text) = help_result {
+                    // Show full R documentation
+                    value.push_str(&format!("```\n{}\n```", help_text));
                 } else {
                     value.push_str(&format!("```r\n{}\n```\n", name));
+                    value.push_str(&format!("\nfrom {{{}}}", pkg_name));
                 }
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
+                value.push_str(&format!("\nfrom {{{}}}", pkg_name));
             }
-            value.push_str(&format!("\nfrom {{{}}}", pkg_name));
 
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
