@@ -61,6 +61,21 @@ Sight is TypeScript-based while Raven is Rust-based, so implementations need ada
 - `RAVEN_PERF=1 cargo run -p raven -- --stdio` - Run with performance timing enabled
 - `./setup.sh` - Build and install everything
 
+### Profiling Scripts (`scripts/`)
+
+Python scripts for profiling LSP startup latency:
+
+- `profile_startup.py` - Full profiling: spawns LSP, opens files, measures time to first diagnostic
+- `profile_simple.py` - Simpler profiling: just initialize and track stderr timing
+
+Usage:
+```bash
+cargo build --release -p raven
+python3 scripts/profile_startup.py
+```
+
+Both scripts use `RAVEN_PERF=1` to enable timing logs and parse stderr for performance metrics.
+
 ## LSP Architecture
 
 - Static analysis using tree-sitter-r
