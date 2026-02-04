@@ -569,6 +569,71 @@ impl RSubprocess {
         Ok(depends)
     }
 
+    /// Retrieve exports for multiple packages in a single R subprocess call.
+    ///
+    /// This is significantly faster than calling `get_package_exports` multiple times,
+    /// as it eliminates the overhead of spawning multiple R processes (~75-350ms each).
+    ///
+    /// # Parameters
+    ///
+    /// - `packages` — List of package names whose exports to retrieve
+    ///
+    /// # Returns
+    ///
+    /// A HashMap mapping package name to its exports. Packages that couldn't be loaded
+    /// (not installed, errors) will have empty export lists.
+    ///
+    /// # Performance
+    ///
+    /// This method replaces N R subprocess calls with a single call, saving
+    /// approximately (N-1) * 75-350ms on typical systems.
+    pub async fn get_multiple_package_exports(
+        &self,
+        packages: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if packages.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Validate all package names
+        for pkg in packages {
+            if !is_valid_package_name(pkg) {
+                return Err(anyhow!(
+                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                    pkg
+                ));
+            }
+        }
+
+        // Build R code that queries all packages
+        let packages_vector = packages
+            .iter()
+            .map(|p| format!("\"{}\"", p))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let r_code = format!(
+            r#"
+pkgs <- c({})
+cat("__RAVEN_MULTI_EXPORTS__\n")
+for (pkg in pkgs) {{
+    cat(paste0("__PKG:", pkg, "__\n"))
+    tryCatch(
+        cat(getNamespaceExports(asNamespace(pkg)), sep="\n"),
+        error = function(e) {{}}
+    )
+}}
+cat("__RAVEN_END__\n")
+"#,
+            packages_vector
+        );
+
+        let output = self.execute_r_code(&r_code).await?;
+
+        // Parse the structured output
+        parse_multi_exports_output(&output)
+    }
+
     /// Batch initialization: retrieve lib_paths, base_packages, and all base package exports
     /// in a single R subprocess call.
     ///
@@ -728,6 +793,61 @@ fn parse_batch_init_output(output: &str) -> Result<BatchInitResult> {
         result.lib_paths.len(),
         result.base_packages.len(),
         result.package_exports.len()
+    );
+
+    Ok(result)
+}
+
+/// Parse the output of `get_multiple_package_exports()` into a HashMap
+fn parse_multi_exports_output(
+    output: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut result = std::collections::HashMap::new();
+
+    // Find the start marker
+    let exports_start = output
+        .find("__RAVEN_MULTI_EXPORTS__")
+        .ok_or_else(|| anyhow!("Missing __RAVEN_MULTI_EXPORTS__ marker in R output"))?;
+
+    // Parse exports section - each package is marked with __PKG:name__
+    let exports_section = &output[exports_start + "__RAVEN_MULTI_EXPORTS__".len()..];
+    let mut current_package: Option<String> = None;
+    let mut current_exports: Vec<String> = Vec::new();
+
+    for line in exports_section.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("__PKG:") && line.ends_with("__") {
+            // Save previous package exports
+            if let Some(pkg) = current_package.take() {
+                result.insert(pkg, std::mem::take(&mut current_exports));
+            }
+            // Start new package
+            let pkg_name = &line[6..line.len() - 2]; // Strip __PKG: and __
+            current_package = Some(pkg_name.to_string());
+        } else if line == "__RAVEN_END__" {
+            // End marker - save final package
+            if let Some(pkg) = current_package.take() {
+                result.insert(pkg, std::mem::take(&mut current_exports));
+            }
+            break;
+        } else if current_package.is_some() {
+            // Export name
+            current_exports.push(line.to_string());
+        }
+    }
+
+    // Handle case where __RAVEN_END__ was missing
+    if let Some(pkg) = current_package {
+        result.insert(pkg, std::mem::take(&mut current_exports));
+    }
+
+    log::trace!(
+        "Multi-export query: {} packages with exports",
+        result.len()
     );
 
     Ok(result)
