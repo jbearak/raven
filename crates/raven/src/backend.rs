@@ -376,7 +376,7 @@ impl Backend {
             return self.state.read().await.package_library_ready;
         }
 
-        let (packages_r_path, additional_paths) = {
+        let (packages_r_path, additional_paths, workspace_root) = {
             let state = self.state.read().await;
             (
                 state.cross_file_config.packages_r_path.clone(),
@@ -384,11 +384,16 @@ impl Backend {
                     .cross_file_config
                     .packages_additional_library_paths
                     .clone(),
+                state.workspace_folders.first().and_then(|url| url.to_file_path().ok()),
             )
         };
 
         log::trace!("Initializing PackageLibrary on demand (lib_paths empty)");
         let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+        let r_subprocess = match (r_subprocess, workspace_root) {
+            (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
+            (sub, _) => sub,
+        };
         let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
         let ready = match lib.initialize().await {
             Ok(()) => !lib.lib_paths().is_empty(),
@@ -1130,7 +1135,7 @@ impl LanguageServer for Backend {
             };
 
             if reinit {
-                let (packages_r_path, additional_paths) = {
+                let (packages_r_path, additional_paths, workspace_root) = {
                     let state = self.state.read().await;
                     (
                         state.cross_file_config.packages_r_path.clone(),
@@ -1138,10 +1143,15 @@ impl LanguageServer for Backend {
                             .cross_file_config
                             .packages_additional_library_paths
                             .clone(),
+                        state.workspace_folders.first().and_then(|url| url.to_file_path().ok()),
                     )
                 };
                 log::trace!("Reinitializing PackageLibrary for did_open prefetch");
                 let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+                let r_subprocess = match (r_subprocess, workspace_root) {
+                    (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
+                    (sub, _) => sub,
+                };
                 let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
                 let ready = match lib.initialize().await {
                     Ok(()) => !lib.lib_paths().is_empty(),
@@ -1766,6 +1776,7 @@ impl LanguageServer for Backend {
             packages_enabled,
             packages_r_path,
             additional_paths,
+            workspace_root,
         ) = {
             let mut state = self.state.write().await;
 
@@ -1812,6 +1823,7 @@ impl LanguageServer for Backend {
                         .packages_additional_library_paths
                         .clone()
                 });
+            let workspace_root = state.workspace_folders.first().and_then(|url| url.to_file_path().ok());
 
             // Apply new config if parsed
             if let Some(config) = new_config {
@@ -1836,9 +1848,10 @@ impl LanguageServer for Backend {
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
                 packages_enabled,
-                packages_r_path,
-                additional_paths,
-            )
+            packages_r_path,
+            additional_paths,
+            workspace_root,
+        )
         };
 
         // Log diagnostics_enabled change - Requirement 5.2
@@ -1856,6 +1869,10 @@ impl LanguageServer for Backend {
 
             let (new_package_library, package_library_ready) = if packages_enabled {
                 let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+                let r_subprocess = match (r_subprocess, workspace_root) {
+                    (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
+                    (sub, _) => sub,
+                };
                 let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
                 let ready = match lib.initialize().await {
                     Ok(()) => !lib.lib_paths().is_empty(),

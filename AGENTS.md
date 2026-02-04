@@ -63,7 +63,7 @@ To minimize startup time, the R interface initializes concurrently with workspac
 ### Project Environment Support (`renv`)
 Raven supports project-local package libraries (like `renv`):
 - **Working Directory**: The R subprocess is spawned with the workspace root as its working directory.
-- **Activation**: When querying `.libPaths()`, Raven checks for `renv/activate.R` in the project root and sources it if present. This ensures access to the correct project-specific library paths.
+- **Activation**: When querying `.libPaths()`, Raven checks for `renv/activate.R` in the project root. To prevent path traversal attacks, it verifies that the file resides within the `renv` directory of the workspace root before sourcing it.
 
 ## Cross-File Architecture
 

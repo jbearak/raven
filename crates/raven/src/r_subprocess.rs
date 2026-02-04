@@ -315,7 +315,8 @@ impl RSubprocess {
     pub async fn get_lib_paths(&self) -> Result<Vec<PathBuf>> {
         // Use cat() with sep="\n" to output each path on its own line without R's vector formatting
         // Check for renv/activate.R and source it if it exists (handles renv projects)
-        let r_code = r#"if (file.exists("renv/activate.R")) try(source("renv/activate.R"), silent=TRUE); cat(.libPaths(), sep="\n")"#;
+        // Security: Validate that renv/activate.R is in the working directory to prevent path traversal
+        let r_code = r#"renv_path <- normalizePath("renv/activate.R", mustWork=FALSE); if (file.exists(renv_path) && dirname(renv_path) == file.path(getwd(), "renv")) try(source(renv_path), silent=TRUE); cat(.libPaths(), sep="\n")"#;
 
         match self.execute_r_code(r_code).await {
             Ok(output) => {
