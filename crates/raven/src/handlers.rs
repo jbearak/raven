@@ -710,32 +710,55 @@ fn collect_missing_file_diagnostics(
     let backward_ctx =
         crate::cross_file::path_resolve::PathContext::new(uri, state.workspace_folders.first());
 
+    let workspace_root = state.workspace_folders.first().and_then(|w| w.to_file_path().ok());
+
     // Check forward sources (source() calls and @lsp-source directives)
     // Uses workspace-root fallback for files without @lsp-cd directives
     for source in &meta.sources {
-        let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            let path =
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?;
-            crate::cross_file::path_resolve::path_to_uri(&path)
+        let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
-        if let Some(target_uri) = resolved {
-            // Use ContentProvider for cached existence check (no blocking I/O)
-            if !content_provider.exists_cached(&target_uri) {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(source.line, source.column),
-                        end: Position::new(
-                            source.line,
-                            source
-                                .column
-                                .saturating_add(source.path.len() as u32)
-                                .saturating_add(10),
-                        ),
-                    },
-                    severity: Some(state.cross_file_config.missing_file_severity),
-                    message: format!("File not found: '{}'", source.path),
-                    ..Default::default()
-                });
+        if let Some(path) = resolved_path {
+            // Guard against paths outside workspace
+            if let Some(root) = &workspace_root {
+                if !path.starts_with(root) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::new(source.line, source.column),
+                            end: Position::new(
+                                source.line,
+                                source
+                                    .column
+                                    .saturating_add(source.path.len() as u32)
+                                    .saturating_add(10),
+                            ),
+                        },
+                        severity: Some(state.cross_file_config.missing_file_severity),
+                        message: format!("Path is outside workspace: '{}'", source.path),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            }
+            if let Some(target_uri) = crate::cross_file::path_resolve::path_to_uri(&path) {
+                // Use ContentProvider for cached existence check (no blocking I/O)
+                if !content_provider.exists_cached(&target_uri) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::new(source.line, source.column),
+                            end: Position::new(
+                                source.line,
+                                source
+                                    .column
+                                    .saturating_add(source.path.len() as u32)
+                                    .saturating_add(10),
+                            ),
+                        },
+                        severity: Some(state.cross_file_config.missing_file_severity),
+                        message: format!("File not found: '{}'", source.path),
+                        ..Default::default()
+                    });
+                }
             }
         } else {
             diagnostics.push(Diagnostic {
@@ -815,24 +838,47 @@ pub async fn collect_missing_file_diagnostics_async(
     // Backward directives IGNORE @lsp-cd - always resolve relative to file's directory
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_folders);
 
+    let workspace_root = workspace_folders.and_then(|w| w.to_file_path().ok());
+
     // Collect all URIs to check
     let mut uris_to_check: Vec<(Url, String, u32, u32, bool)> = Vec::new(); // (uri, path, line, col, is_backward)
 
     // Uses workspace-root fallback for files without @lsp-cd directives
     for source in &meta.sources {
-        let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            let path =
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?;
-            crate::cross_file::path_resolve::path_to_uri(&path)
+        let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
-        if let Some(target_uri) = resolved {
-            uris_to_check.push((
-                target_uri,
-                source.path.clone(),
-                source.line,
-                source.column,
-                false,
-            ));
+        if let Some(path) = resolved_path {
+            // Guard against paths outside workspace
+            if let Some(root) = &workspace_root {
+                if !path.starts_with(root) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::new(source.line, source.column),
+                            end: Position::new(
+                                source.line,
+                                source
+                                    .column
+                                    .saturating_add(source.path.len() as u32)
+                                    .saturating_add(10),
+                            ),
+                        },
+                        severity: Some(missing_file_severity),
+                        message: format!("Path is outside workspace: '{}'", source.path),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            }
+            if let Some(target_uri) = crate::cross_file::path_resolve::path_to_uri(&path) {
+                uris_to_check.push((
+                    target_uri,
+                    source.path.clone(),
+                    source.line,
+                    source.column,
+                    false,
+                ));
+            }
         } else {
             diagnostics.push(Diagnostic {
                 range: Range {

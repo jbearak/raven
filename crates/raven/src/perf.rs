@@ -10,7 +10,7 @@
 // Allow unused items that are part of the public API for benchmarks/diagnostics
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -212,7 +212,6 @@ pub fn record_first_diagnostic(duration: Duration) {
 }
 
 /// Atomic counter for R subprocess calls
-static R_SUBPROCESS_CALL_COUNT: AtomicBool = AtomicBool::new(false);
 static R_SUBPROCESS_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 

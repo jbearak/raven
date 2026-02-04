@@ -112,13 +112,13 @@ def main():
 
     print("Waiting for initialize response...")
     resp = read_message(proc, timeout=120)
+    if resp is None:
+        print("Error: initialize response timed out", file=sys.stderr)
+        proc.kill()
+        sys.exit(1)
     init_response_time = time.time()
     print(f"Initialize response received: {(init_response_time - start_time)*1000:.1f}ms")
-
-    if resp:
-        print(f"  Response id: {resp.get('id')}")
-    else:
-        print("  No response received!")
+    print(f"  Response id: {resp.get('id')}")
 
     # Send initialized
     print("Sending initialized notification...")

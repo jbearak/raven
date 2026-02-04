@@ -936,15 +936,9 @@ impl PackageLibrary {
                     name,
                     self.lib_paths
                 );
-                // Cache empty PackageInfo to avoid repeated lookups
-                let info = PackageInfo::with_details(
-                    name.to_string(),
-                    HashSet::new(),
-                    Vec::new(),
-                    Vec::new(),
-                );
-                self.insert_package(info).await;
-                return self.get_cached_package(name).await;
+                // Don't cache missing packages - return None directly so
+                // package_exists() can correctly report the package as missing
+                return None;
             }
         };
 
@@ -1123,7 +1117,26 @@ impl PackageLibrary {
     /// that contains a NAMESPACE or DESCRIPTION file (indicating a valid R package).
     /// Note: The `base` package doesn't have a NAMESPACE file, only DESCRIPTION.
     /// Returns the first match found.
+    ///
+    /// Validates package names to prevent path traversal attacks - rejects names
+    /// containing path separators or parent directory references.
     pub fn find_package_directory(&self, name: &str) -> Option<PathBuf> {
+        // Validate package name to prevent path traversal attacks
+        // Valid R package names contain only alphanumeric, '.', and '_' characters
+        // and must not contain path separators or '..'
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.starts_with('.')
+        {
+            log::trace!(
+                "Rejecting invalid package name '{}' (possible path traversal)",
+                name
+            );
+            return None;
+        }
+
         for lib_path in &self.lib_paths {
             let package_dir = lib_path.join(name);
             // Check for NAMESPACE or DESCRIPTION file to ensure it's a valid R package
@@ -1857,8 +1870,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_package_nonexistent_returns_empty_exports() {
+    async fn test_get_package_nonexistent_returns_none() {
         // Test that get_package handles non-existent packages gracefully
+        // by returning None (not caching missing packages, so package_exists()
+        // correctly reports them as missing)
         // Skip if R is not available
         let r_subprocess = match RSubprocess::new(None) {
             Some(s) => s,
@@ -1869,10 +1884,10 @@ mod tests {
 
         // Query a package that definitely doesn't exist
         let result = lib.get_package("__nonexistent_package_xyz__").await;
-        // Should return Some with empty exports (cached negative result)
-        assert!(result.is_some());
-        let pkg = result.unwrap();
-        assert!(pkg.exports.is_empty());
+        // Should return None for missing packages (not cached)
+        assert!(result.is_none());
+        // package_exists should also return false
+        assert!(!lib.package_exists("__nonexistent_package_xyz__"));
     }
 
     #[tokio::test]
@@ -1883,10 +1898,13 @@ mod tests {
         // Without R subprocess, we rely on fallback lib_paths
         // The method should not panic regardless of whether packages are found
         let result = lib.get_package("dplyr").await;
-        // Should return Some (we cache the result either way)
-        assert!(result.is_some());
-        // Note: exports may or may not be empty depending on whether
-        // fallback lib_paths contain the package
+        // Should return Some if dplyr is installed (common in most R environments)
+        // Returns None if package not found (not cached to allow package_exists to work)
+        if result.is_some() {
+            // Package is installed, test that it's cached for subsequent calls
+            let result2 = lib.get_package("dplyr").await;
+            assert!(result2.is_some());
+        }
     }
 
     #[tokio::test]

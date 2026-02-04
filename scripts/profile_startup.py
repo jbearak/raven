@@ -136,6 +136,10 @@ def main():
 
     # Wait for initialize response
     resp = read_message(proc)
+    if resp is None:
+        print("Error: initialize response timed out", file=sys.stderr)
+        proc.kill()
+        sys.exit(1)
     init_response_time = time.time()
     print(f"  Initialize response: {(init_response_time - start_time)*1000:.1f}ms")
 

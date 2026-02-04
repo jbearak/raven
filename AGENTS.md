@@ -74,7 +74,7 @@ cargo build --release -p raven
 python3 scripts/profile_startup.py
 ```
 
-Both scripts use `RAVEN_PERF=1` to enable timing logs and parse stderr for performance metrics.
+Both scripts set the `RAVEN_PERF` environment variable to enable timing logs and parse stderr for performance metrics (`profile_startup.py` uses `RAVEN_PERF=1`, `profile_simple.py` uses `RAVEN_PERF=verbose`).
 
 ## LSP Architecture
 
