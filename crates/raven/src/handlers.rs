@@ -1559,7 +1559,6 @@ pub(crate) fn collect_undefined_variables_position_aware(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     use crate::cross_file::types::byte_offset_to_utf16_column;
-    use std::collections::HashSet;
 
     let mut used: Vec<(String, Node)> = Vec::new();
 
@@ -1860,6 +1859,18 @@ fn collect_usages_with_context<'a>(
                         return; // Skip RHS of extract operator
                     }
                 }
+            }
+
+            // Skip if this is a function parameter definition
+            // Function parameters appear inside `parameter` or `default_parameter` nodes
+            // which are children of `parameters` nodes
+            if matches!(parent.kind(), "parameter" | "default_parameter") {
+                return; // Skip function parameter definitions
+            }
+
+            // Also check if we're directly inside a `parameters` node (some grammars)
+            if parent.kind() == "parameters" {
+                return; // Skip identifiers directly in parameters list
             }
         }
 
@@ -9296,8 +9307,7 @@ y <- x"#;
 
 #[cfg(test)]
 mod position_aware_tests {
-    use std::path::PathBuf;
-    use tower_lsp::lsp_types::{Position, Url, Range, Diagnostic};
+    use tower_lsp::lsp_types::{Position, Url};
     use crate::handlers::{goto_definition, collect_undefined_variables_position_aware};
     use crate::state::{WorldState, Document};
     use crate::cross_file::directive::parse_directives;
@@ -9531,5 +9541,131 @@ x
         };
         
         assert_eq!(location.range.start.line, 2, "Should resolve to latest definition (line 2)");
+    }
+}
+
+
+#[cfg(test)]
+mod function_parameter_tests {
+    use tower_lsp::lsp_types::Url;
+    use crate::handlers::collect_undefined_variables_position_aware;
+    use crate::state::{WorldState, Document};
+    use crate::cross_file::directive::parse_directives;
+
+    fn parse_r_code(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn create_test_state() -> WorldState {
+        WorldState::new(vec![])
+    }
+
+    fn add_document(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("Invalid URI");
+        let document = Document::new(content, None);
+        state.documents.insert(uri.clone(), document);
+        uri
+    }
+
+    #[test]
+    fn test_function_parameters_not_flagged_as_undefined() {
+        let mut state = create_test_state();
+        let code = r#"
+add <- function(a, b) {
+  result <- a + b
+  return(result)
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        // Filter to only undefined variable warnings
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable"))
+            .collect();
+        
+        // Print diagnostics for debugging
+        for diag in &undefined_var_diags {
+            println!("Diagnostic: {} at line {}", diag.message, diag.range.start.line);
+        }
+        
+        // Function parameters a and b should NOT be flagged as undefined
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: a")),
+            "Parameter 'a' should not be flagged as undefined"
+        );
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: b")),
+            "Parameter 'b' should not be flagged as undefined"
+        );
+    }
+
+    #[test]
+    fn test_nested_function_parameters_not_flagged() {
+        let mut state = create_test_state();
+        let code = r#"
+outer_func <- function(x) {
+  inner_func <- function(y) {
+    x + y
+  }
+  return(inner_func)
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        // Filter to only undefined variable warnings
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable"))
+            .collect();
+        
+        // Print diagnostics for debugging
+        for diag in &undefined_var_diags {
+            println!("Diagnostic: {} at line {}", diag.message, diag.range.start.line);
+        }
+        
+        // Function parameters x and y should NOT be flagged as undefined
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: x")),
+            "Parameter 'x' should not be flagged as undefined"
+        );
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: y")),
+            "Parameter 'y' should not be flagged as undefined"
+        );
     }
 }
