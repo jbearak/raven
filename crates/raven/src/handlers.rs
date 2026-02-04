@@ -1363,7 +1363,7 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
 /// // collect_undefined_variables_position_aware(&state, &uri, root_node, &text, &[], &workspace_imports, &package_library, &directive_meta, &mut diagnostics);
 /// ```
 #[allow(clippy::too_many_arguments)]
-fn collect_undefined_variables_position_aware(
+pub(crate) fn collect_undefined_variables_position_aware(
     state: &WorldState,
     uri: &Url,
     node: Node,
@@ -1377,11 +1377,7 @@ fn collect_undefined_variables_position_aware(
     use crate::cross_file::types::byte_offset_to_utf16_column;
     use std::collections::HashSet;
 
-    let mut defined: HashSet<String> = HashSet::new();
     let mut used: Vec<(String, Node)> = Vec::new();
-
-    // First pass: collect all definitions
-    collect_definitions(node, text, &mut defined);
 
     // Second pass: collect all usages with NSE-aware context
     collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
@@ -1395,8 +1391,9 @@ fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Skip if locally defined or builtin
-        if defined.contains(&name) || is_builtin(&name) || workspace_imports.contains(&name) {
+        // Skip if builtin or workspace import
+        // Local definitions are checked via position-aware scope below
+        if is_builtin(&name) || workspace_imports.contains(&name) {
             continue;
         }
 
@@ -2812,24 +2809,18 @@ pub fn goto_definition(
 
     let name = node_text(node, &text);
 
-    // Search current document first
-    if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &text) {
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: def_range,
-        }));
-    }
-
-    // Try cross-file symbols (from scope resolution)
-    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
-    if let Some(symbol) = cross_file_symbols.get(name) {
+    // Search using position-aware scope resolution
+    // This unifies same-file and cross-file lookups, respecting:
+    // 1. Position (definitions must be before usage)
+    // 2. Function scope (locals don't leak)
+    // 3. Shadowing (locals override globals)
+    let scope = get_cross_file_scope(state, uri, position.line, position.character);
+    
+    if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
         // Package exports have pseudo-URIs like "package:dplyr" that can't be navigated to
         // Validates: Requirements 11.1, 11.2
         if symbol.source_uri.as_str().starts_with("package:") {
-            // Package source is not available for navigation
-            // The hover handler shows package info; go-to-definition returns None
-            // to indicate no navigable location exists
             log::trace!(
                 "Symbol '{}' is from package '{}', no navigable source available",
                 name,
@@ -2848,7 +2839,7 @@ pub fn goto_definition(
                 start: Position::new(symbol.defined_line, symbol.defined_column),
                 end: Position::new(
                     symbol.defined_line,
-                    symbol.defined_column + name.len() as u32,
+                    symbol.defined_column + name.chars().map(|c| c.len_utf16() as u32).sum::<u32>(),
                 ),
             },
         }));
@@ -7429,13 +7420,254 @@ y <- x"#;
 
         if let Some(GotoDefinitionResponse::Scalar(location)) = result {
             assert_eq!(location.uri, uri, "Should navigate to the same file");
-            // find_definition_in_tree finds the first definition in document order
+            // Position-aware definition finding returns the latest definition before usage
+            // So it should be line 1 (x <- 2), not line 0 (x <- 1)
             assert_eq!(
-                location.range.start.line, 0,
-                "Should navigate to first definition on line 0"
+                location.range.start.line, 1,
+                "Should navigate to latest definition on line 1"
             );
         } else {
             panic!("Expected Scalar response");
         }
+    }
+}
+
+#[cfg(test)]
+mod position_aware_tests {
+    use std::path::PathBuf;
+    use tower_lsp::lsp_types::{Position, Url, Range, Diagnostic};
+    use crate::handlers::{goto_definition, collect_undefined_variables_position_aware};
+    use crate::state::{WorldState, Document};
+    use crate::cross_file::directive::parse_directives;
+
+    fn parse_r_code(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn create_test_state() -> WorldState {
+        WorldState::new(vec![])
+    }
+
+    fn add_document(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("Invalid URI");
+        let document = Document::new(content, None);
+        state.documents.insert(uri.clone(), document);
+        uri
+    }
+
+    #[test]
+    fn test_diagnostics_undefined_forward_reference() {
+        let mut state = create_test_state();
+        let code = "
+x
+x <- 1
+";
+        // Line 1: x (usage) - should be undefined
+        // Line 2: x <- 1 (definition)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[], // deprecated loaded_packages
+            &[], // workspace_imports
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
+        assert!(diagnostics[0].message.contains("Undefined variable: x"));
+        assert_eq!(diagnostics[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn test_diagnostics_defined_before_usage() {
+        let mut state = create_test_state();
+        let code = "
+x <- 1
+x
+";
+        // Line 1: x <- 1
+        // Line 2: x (usage)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
+    }
+
+    #[test]
+    fn test_diagnostics_redefined_later() {
+        let mut state = create_test_state();
+        let code = "
+x <- 1
+x
+x <- 2
+";
+        // Line 1: x <- 1
+        // Line 2: x (usage) - defined by line 1
+        // Line 3: x <- 2
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
+    }
+
+    #[test]
+    fn test_goto_definition_same_file_before_usage() {
+        let mut state = create_test_state();
+        let code = "
+x <- 1
+x
+";
+        // Line 1: x <- 1
+        // Line 2: x (usage)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        
+        // Usage at line 2, col 0
+        let pos = Position::new(2, 0);
+        let result = goto_definition(&state, &uri, pos);
+        
+        assert!(result.is_some(), "Should find definition");
+        let location = match result.unwrap() {
+            tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("Expected Scalar location"),
+        };
+        
+        assert_eq!(location.uri, uri);
+        assert_eq!(location.range.start.line, 1, "Definition should be on line 1");
+    }
+
+    #[test]
+    fn test_goto_definition_same_file_after_usage() {
+        let mut state = create_test_state();
+        let code = "
+x
+x <- 1
+";
+        // Line 1: x (usage)
+        // Line 2: x <- 1 (definition)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        
+        // Usage at line 1, col 0
+        let pos = Position::new(1, 0);
+        let result = goto_definition(&state, &uri, pos);
+        
+        assert!(result.is_none(), "Should NOT find definition appearing after usage");
+    }
+
+    #[test]
+    fn test_goto_definition_function_scope_no_leak() {
+        let mut state = create_test_state();
+        let code = "
+f <- function() {
+    local_var <- 1
+}
+local_var
+";
+        // Line 1: f <- ...
+        // Line 2:     local_var <- 1
+        // Line 3: }
+        // Line 4: local_var (usage)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        
+        // Usage at line 4, col 0
+        let pos = Position::new(4, 0);
+        let result = goto_definition(&state, &uri, pos);
+        
+        assert!(result.is_none(), "Function-local variable should not be visible outside");
+    }
+
+    #[test]
+    fn test_goto_definition_shadowing() {
+        let mut state = create_test_state();
+        let code = "
+x <- 1
+f <- function() {
+    x <- 2
+    x
+}
+";
+        // Line 1: x <- 1 (global)
+        // Line 2: f <- ...
+        // Line 3:     x <- 2 (local)
+        // Line 4:     x (usage)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        
+        // Usage at line 4, col 4
+        let pos = Position::new(4, 4);
+        let result = goto_definition(&state, &uri, pos);
+        
+        assert!(result.is_some());
+        let location = match result.unwrap() {
+            tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("Expected Scalar location"),
+        };
+        
+        assert_eq!(location.range.start.line, 3, "Should resolve to local definition (line 3)");
+    }
+
+    #[test]
+    fn test_goto_definition_sequential_redefinition() {
+        let mut state = create_test_state();
+        let code = "
+x <- 1
+x <- 2
+x
+";
+        // Line 1: x <- 1
+        // Line 2: x <- 2
+        // Line 3: x (usage)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        
+        // Usage at line 3, col 0
+        let pos = Position::new(3, 0);
+        let result = goto_definition(&state, &uri, pos);
+        
+        assert!(result.is_some());
+        let location = match result.unwrap() {
+            tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("Expected Scalar location"),
+        };
+        
+        assert_eq!(location.range.start.line, 2, "Should resolve to latest definition (line 2)");
     }
 }
