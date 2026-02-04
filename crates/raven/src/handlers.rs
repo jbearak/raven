@@ -720,6 +720,7 @@ fn collect_missing_file_diagnostics(
         });
         if let Some(path) = resolved_path {
             // Guard against paths outside workspace
+            // Uses missing_file_severity since the file is effectively inaccessible
             if let Some(root) = &workspace_root {
                 if !path.starts_with(root) {
                     diagnostics.push(Diagnostic {
@@ -850,6 +851,7 @@ pub async fn collect_missing_file_diagnostics_async(
         });
         if let Some(path) = resolved_path {
             // Guard against paths outside workspace
+            // Uses missing_file_severity since the file is effectively inaccessible
             if let Some(root) = &workspace_root {
                 if !path.starts_with(root) {
                     diagnostics.push(Diagnostic {

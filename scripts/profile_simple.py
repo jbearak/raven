@@ -12,9 +12,10 @@ import threading
 
 def send_message(proc, msg):
     content = json.dumps(msg)
-    header = f"Content-Length: {len(content)}\r\n\r\n"
-    proc.stdin.write(header.encode())
-    proc.stdin.write(content.encode())
+    content_bytes = content.encode('utf-8')
+    header = f"Content-Length: {len(content_bytes)}\r\n\r\n"
+    proc.stdin.write(header.encode('utf-8'))
+    proc.stdin.write(content_bytes)
     proc.stdin.flush()
 
 def read_stderr(proc, output_lines):
@@ -137,7 +138,10 @@ def main():
     send_message(proc, {"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": None})
     time.sleep(0.5)
     send_message(proc, {"jsonrpc": "2.0", "method": "exit", "params": None})
-    proc.wait(timeout=10)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
     print("\n" + "="*60)
     print("TIMING SUMMARY")

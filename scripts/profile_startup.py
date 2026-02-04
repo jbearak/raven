@@ -17,8 +17,10 @@ import select
 def send_message(proc, msg):
     """Send an LSP message to the server."""
     content = json.dumps(msg)
-    header = f"Content-Length: {len(content)}\r\n\r\n"
-    proc.stdin.write((header + content).encode('utf-8'))
+    content_bytes = content.encode('utf-8')
+    header = f"Content-Length: {len(content_bytes)}\r\n\r\n"
+    proc.stdin.write(header.encode('utf-8'))
+    proc.stdin.write(content_bytes)
     proc.stdin.flush()
 
 def read_stderr(proc, output_lines, start_time):
@@ -87,7 +89,7 @@ def main():
     env["RAVEN_PERF"] = "1"
     env["RUST_LOG"] = "raven=info"
 
-    print(f"Starting Raven LSP server...")
+    print("Starting Raven LSP server...")
     start_time = time.time()
     stderr_lines = []
 
