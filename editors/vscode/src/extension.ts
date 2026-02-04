@@ -38,6 +38,7 @@ interface RavenInitializationOptions {
         };
     };
     diagnostics?: {
+        enabled?: boolean;
         undefinedVariables?: boolean;
     };
     packages?: {
@@ -185,11 +186,16 @@ function getInitializationOptions(): RavenInitializationOptions {
     }
 
     // Diagnostics settings
+    // Always send diagnostics.enabled since it's a master switch that affects all diagnostics
+    const diagnosticsEnabled = config.get<boolean>('diagnostics.enabled');
     const undefinedVariables = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariables');
+    
+    // Always include diagnostics section with enabled value
+    options.diagnostics = {
+        enabled: diagnosticsEnabled,
+    };
     if (undefinedVariables !== undefined) {
-        options.diagnostics = {
-            undefinedVariables: undefinedVariables,
-        };
+        options.diagnostics.undefinedVariables = undefinedVariables;
     }
 
     // Package settings

@@ -154,84 +154,94 @@ pub(crate) fn parse_cross_file_config(
 ) -> Option<crate::cross_file::CrossFileConfig> {
     use crate::cross_file::{CallSiteDefault, CrossFileConfig};
 
-    let cross_file = settings.get("crossFile")?;
+    // crossFile section is optional - we can still parse diagnostics and packages without it
+    let cross_file = settings.get("crossFile");
     let diagnostics = settings.get("diagnostics");
+    let packages = settings.get("packages");
+
+    // Return None only if no relevant settings are present at all
+    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
+        return None;
+    }
 
     let mut config = CrossFileConfig::default();
 
-    if let Some(v) = cross_file.get("maxBackwardDepth").and_then(|v| v.as_u64()) {
-        config.max_backward_depth = v as usize;
-    }
-    if let Some(v) = cross_file.get("maxForwardDepth").and_then(|v| v.as_u64()) {
-        config.max_forward_depth = v as usize;
-    }
-    if let Some(v) = cross_file.get("maxChainDepth").and_then(|v| v.as_u64()) {
-        config.max_chain_depth = v as usize;
-    }
-    if let Some(v) = cross_file.get("assumeCallSite").and_then(|v| v.as_str()) {
-        config.assume_call_site = match v {
-            "start" => CallSiteDefault::Start,
-            _ => CallSiteDefault::End,
-        };
-    }
-    if let Some(v) = cross_file.get("indexWorkspace").and_then(|v| v.as_bool()) {
-        config.index_workspace = v;
-    }
-    if let Some(v) = cross_file
-        .get("maxRevalidationsPerTrigger")
-        .and_then(|v| v.as_u64())
-    {
-        config.max_revalidations_per_trigger = v as usize;
-    }
-    if let Some(v) = cross_file
-        .get("revalidationDebounceMs")
-        .and_then(|v| v.as_u64())
-    {
-        config.revalidation_debounce_ms = v;
-    }
-
-    // Parse diagnostic severities
-    if let Some(sev) = cross_file
-        .get("missingFileSeverity")
-        .and_then(|v| v.as_str())
-    {
-        config.missing_file_severity = parse_severity(sev);
-    }
-    if let Some(sev) = cross_file
-        .get("circularDependencySeverity")
-        .and_then(|v| v.as_str())
-    {
-        config.circular_dependency_severity = parse_severity(sev);
-    }
-    if let Some(sev) = cross_file
-        .get("outOfScopeSeverity")
-        .and_then(|v| v.as_str())
-    {
-        config.out_of_scope_severity = parse_severity(sev);
-    }
-    if let Some(sev) = cross_file
-        .get("ambiguousParentSeverity")
-        .and_then(|v| v.as_str())
-    {
-        config.ambiguous_parent_severity = parse_severity(sev);
-    }
-    if let Some(sev) = cross_file
-        .get("maxChainDepthSeverity")
-        .and_then(|v| v.as_str())
-    {
-        config.max_chain_depth_severity = parse_severity(sev);
-    }
-
-    // Parse on-demand indexing settings
-    if let Some(on_demand) = cross_file.get("onDemandIndexing") {
-        if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
-            config.on_demand_indexing_enabled = v;
+    // Parse crossFile settings if present
+    if let Some(cross_file) = cross_file {
+        if let Some(v) = cross_file.get("maxBackwardDepth").and_then(|v| v.as_u64()) {
+            config.max_backward_depth = v as usize;
         }
-        if let Some(v) = on_demand.get("maxTransitiveDepth").and_then(|v| v.as_u64()) {
-            config.on_demand_indexing_max_transitive_depth = v as usize;
+        if let Some(v) = cross_file.get("maxForwardDepth").and_then(|v| v.as_u64()) {
+            config.max_forward_depth = v as usize;
         }
-        if let Some(v) = on_demand.get("maxQueueSize").and_then(|v| v.as_u64()) {
-            config.on_demand_indexing_max_queue_size = v as usize;
+        if let Some(v) = cross_file.get("maxChainDepth").and_then(|v| v.as_u64()) {
+            config.max_chain_depth = v as usize;
+        }
+        if let Some(v) = cross_file.get("assumeCallSite").and_then(|v| v.as_str()) {
+            config.assume_call_site = match v {
+                "start" => CallSiteDefault::Start,
+                _ => CallSiteDefault::End,
+            };
+        }
+        if let Some(v) = cross_file.get("indexWorkspace").and_then(|v| v.as_bool()) {
+            config.index_workspace = v;
+        }
+        if let Some(v) = cross_file
+            .get("maxRevalidationsPerTrigger")
+            .and_then(|v| v.as_u64())
+        {
+            config.max_revalidations_per_trigger = v as usize;
+        }
+        if let Some(v) = cross_file
+            .get("revalidationDebounceMs")
+            .and_then(|v| v.as_u64())
+        {
+            config.revalidation_debounce_ms = v;
+        }
+
+        // Parse diagnostic severities
+        if let Some(sev) = cross_file
+            .get("missingFileSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.missing_file_severity = parse_severity(sev);
+        }
+        if let Some(sev) = cross_file
+            .get("circularDependencySeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.circular_dependency_severity = parse_severity(sev);
+        }
+        if let Some(sev) = cross_file
+            .get("outOfScopeSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.out_of_scope_severity = parse_severity(sev);
+        }
+        if let Some(sev) = cross_file
+            .get("ambiguousParentSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.ambiguous_parent_severity = parse_severity(sev);
+        }
+        if let Some(sev) = cross_file
+            .get("maxChainDepthSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.max_chain_depth_severity = parse_severity(sev);
+        }
+
+        // Parse on-demand indexing settings
+        if let Some(on_demand) = cross_file.get("onDemandIndexing") {
+            if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
+                config.on_demand_indexing_enabled = v;
+            }
+            if let Some(v) = on_demand.get("maxTransitiveDepth").and_then(|v| v.as_u64()) {
+                config.on_demand_indexing_max_transitive_depth = v as usize;
+            }
+            if let Some(v) = on_demand.get("maxQueueSize").and_then(|v| v.as_u64()) {
+                config.on_demand_indexing_max_queue_size = v as usize;
+            }
         }
     }
 
@@ -248,7 +258,7 @@ pub(crate) fn parse_cross_file_config(
     }
 
     // Parse package settings (Requirement 12, Task 14.2)
-    if let Some(packages) = settings.get("packages") {
+    if let Some(packages) = packages {
         if let Some(v) = packages.get("enabled").and_then(|v| v.as_bool()) {
             config.packages_enabled = v;
         }
