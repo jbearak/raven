@@ -43,9 +43,9 @@ if (1 == 1) {
 
 #### Acceptance Criteria
 
-1. WHEN the Else_Newline_Detector encounters an `else` keyword that starts on a different line than the closing brace of the preceding `if` block, THE Else_Newline_Detector SHALL emit a diagnostic.
-2. WHEN the Else_Newline_Detector encounters `else` on the same line as the closing brace of the preceding `if` block, THE Else_Newline_Detector SHALL NOT emit a diagnostic.
-3. WHEN the Else_Newline_Detector encounters a valid `if-else` statement where `else` immediately follows `}` on the same line, THE Else_Newline_Detector SHALL NOT emit a diagnostic.
+1. If the Else_Newline_Detector encounters an `else` keyword that starts on a different line than the closing brace of the preceding `if` block, THE Else_Newline_Detector SHALL emit a diagnostic.
+2. In cases where the Else_Newline_Detector encounters `else` on the same line as the closing brace of the preceding `if` block, THE Else_Newline_Detector SHALL NOT emit a diagnostic.
+3. For code containing a valid `if-else` statement where `else` immediately follows `}` on the same line, THE Else_Newline_Detector SHALL NOT emit a diagnostic.
 4. THE diagnostic message SHALL clearly indicate that `else` must appear on the same line as the closing brace.
 
 ### Requirement 2: Handle Various Code Patterns

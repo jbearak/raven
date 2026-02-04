@@ -10,7 +10,7 @@ The detector will be implemented as a new function in `handlers.rs` that travers
 
 The solution integrates into the existing diagnostics pipeline in `handlers.rs`:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    diagnostics() function                        │
 ├─────────────────────────────────────────────────────────────────┤
@@ -86,7 +86,7 @@ Algorithm: Detect Orphaned Else
 Tree-sitter-r parses if-else statements with the following structure:
 
 Valid if-else (same line):
-```
+```text
 (if_statement
   condition: (...)
   consequence: (brace_list ...)
@@ -95,7 +95,7 @@ Valid if-else (same line):
 ```
 
 Invalid else on newline - tree-sitter may parse this as:
-```
+```text
 (program
   (if_statement
     condition: (...)
