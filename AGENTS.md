@@ -1,5 +1,26 @@
 # AGENTS.md - LLM Guidance for Raven
 
+## Documentation Requirements
+
+**IMPORTANT**: When making significant changes to the codebase, you MUST update this file:
+
+1. **Architecture changes**: Update the relevant architecture section (LSP Architecture, R Integration Architecture, Cross-File Architecture, etc.) when adding new modules, changing initialization flow, or modifying how components interact.
+
+2. **New APIs or methods**: Document new public APIs in the appropriate section, including purpose and performance characteristics where relevant.
+
+3. **Learnings**: Add to the "Learnings" section when you discover:
+   - Non-obvious gotchas or pitfalls
+   - Performance insights
+   - Patterns that worked well (or didn't)
+   - Debugging techniques that helped
+
+4. **Performance optimizations**: Update the "Performance & Profiling" section with:
+   - What was optimized and why
+   - Measured before/after improvements
+   - New profiling tools or techniques added
+
+Do not wait to be asked - proactively update this documentation as part of completing any significant task.
+
 ## Project Overview
 
 Raven is a static R Language Server with cross-file awareness for scientific research workflows. It provides LSP features without embedding R runtime. Uses tree-sitter for parsing, subprocess calls for help.
