@@ -2839,7 +2839,7 @@ pub fn goto_definition(
                 start: Position::new(symbol.defined_line, symbol.defined_column),
                 end: Position::new(
                     symbol.defined_line,
-                    symbol.defined_column + name.len() as u32,
+                    symbol.defined_column + name.chars().map(|c| c.len_utf16() as u32).sum::<u32>(),
                 ),
             },
         }));
