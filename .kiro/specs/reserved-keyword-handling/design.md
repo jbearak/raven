@@ -17,18 +17,18 @@ The solution introduces a centralized `Reserved_Word_Module` that provides a con
 
 ```mermaid
 graph TD
-    RWM[reserved_words.rs] --> |is_reserved_word| DE[Definition Extractor<br/>scope.rs]
+    RWM[reserved_words.rs] --> |is_reserved_word| DE[Definition Extraction<br/>scope.rs (all extract_* entry points)]
     RWM --> |is_reserved_word| UVC[Undefined Variable Checker<br/>handlers.rs]
-    RWM --> |is_reserved_word| CP[Completion Provider<br/>handlers.rs]
-    RWM --> |is_reserved_word| DSP[Document Symbol Provider<br/>handlers.rs]
+    RWM --> |is_reserved_word| CP[Completion Provider<br/>handlers.rs<br/>scope + workspace + package sources]
+    RWM --> |is_reserved_word| DSP[Document Symbol Provider<br/>handlers.rs<br/>AST + scope fallback]
     
-    DE --> |ScopeArtifacts| SR[Scope Resolution]
+    DE --> |ScopeArtifacts + Interface| SR[Scope Resolution]
     UVC --> |Diagnostics| D[diagnostics()]
-    CP --> |CompletionItems| C[completion()]
-    DSP --> |SymbolInformation| DS[document_symbol()]
+    CP --> |CompletionItems (post-dedup)| C[completion()]
+    DSP --> |SymbolInformation (final filter)| DS[document_symbol()]
 ```
 
-The `reserved_words` module is a simple, stateless utility that can be called from any component. It uses a static `HashSet` for O(1) lookup performance.
+The `reserved_words` module remains stateless and callable from any component. It will use a zero-allocation lookup so hot paths pay minimal overhead.
 
 ## Components and Interfaces
 
@@ -37,70 +37,47 @@ The `reserved_words` module is a simple, stateless utility that can be called fr
 A new module at `crates/raven/src/reserved_words.rs`:
 
 ```rust
-use std::collections::HashSet;
-use std::sync::OnceLock;
-
-/// R reserved words that cannot be used as identifiers.
-/// These are language keywords and special constants.
-static RESERVED_WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
-
-/// Check if a name is an R reserved word.
-/// 
-/// Reserved words cannot be used as variable or function names.
-/// This includes control flow keywords (if, else, for, while, etc.)
-/// and special constants (TRUE, FALSE, NULL, NA variants, Inf, NaN).
 pub fn is_reserved_word(name: &str) -> bool {
-    let reserved = RESERVED_WORDS.get_or_init(|| {
-        let mut set = HashSet::new();
-        // Control flow keywords
-        set.insert("if");
-        set.insert("else");
-        set.insert("repeat");
-        set.insert("while");
-        set.insert("function");
-        set.insert("for");
-        set.insert("in");
-        set.insert("next");
-        set.insert("break");
-        // Logical constants
-        set.insert("TRUE");
-        set.insert("FALSE");
-        // Null value
-        set.insert("NULL");
-        // Special numeric values
-        set.insert("Inf");
-        set.insert("NaN");
-        // NA variants
-        set.insert("NA");
-        set.insert("NA_integer_");
-        set.insert("NA_real_");
-        set.insert("NA_complex_");
-        set.insert("NA_character_");
-        set
-    });
-    reserved.contains(name)
+    matches!(
+        name,
+        "if"
+            | "else"
+            | "repeat"
+            | "while"
+            | "function"
+            | "for"
+            | "in"
+            | "next"
+            | "break"
+            | "TRUE"
+            | "FALSE"
+            | "NULL"
+            | "Inf"
+            | "NaN"
+            | "NA"
+            | "NA_integer_"
+            | "NA_real_"
+            | "NA_complex_"
+            | "NA_character_"
+    )
 }
 ```
+
+This avoids heap allocation and hashing while keeping the check inlineable.
 
 ### Modified Components
 
-#### Definition Extractor (`scope.rs`)
+#### Definition Extraction (`scope.rs`)
 
-The `try_extract_assignment` function is modified to check for reserved words:
+Apply the reserved-word guard to **all definition entry points**, not only `try_extract_assignment`:
 
-```rust
-fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
-    // ... existing code to extract name ...
-    let name = node_text(lhs, content).to_string();
-    
-    // Skip reserved words - they cannot be valid definitions
-    if crate::reserved_words::is_reserved_word(&name) {
-        return None;
-    }
-    
-    // ... rest of existing code ...
-}
-```
+- `try_extract_assignment` (left/right assignments, including `=` forms where applicable)
+- `extract_function_definition` and helpers that record function names
+- `extract_replacement_function` or other specialized definition extractors
+- Any path that appends to `ScopeArtifacts` timeline or exported interface
+- Workspace-index ingestion that rehydrates definitions into scope artifacts
+
+Implementation detail: parse identifier text as `&str` and run `is_reserved_word` **before** cloning/allocating; if `true`, short-circuit and emit no definition event/export.
 
 #### Undefined Variable Checker (`handlers.rs`)
 
@@ -119,44 +96,23 @@ for (name, usage_node) in used {
 
 #### Completion Provider (`handlers.rs`)
 
-The `collect_document_completions` function is modified to skip reserved words:
+Filter reserved words at the **final aggregation point** for identifier completions so all sources are covered:
 
-```rust
-fn collect_document_completions(...) {
-    // ... existing code to extract name ...
-    let name = node_text(lhs, text).to_string();
-    
-    // Skip reserved words - they shouldn't appear as identifier completions
-    if crate::reserved_words::is_reserved_word(&name) {
-        // Don't add to completions, but continue recursion
-    } else if !seen.contains(&name) {
-        // ... existing completion item creation ...
-    }
-    
-    // ... recurse into children ...
-}
-```
+- Document-derived symbols (current file)
+- Scope-resolved symbols (other open files)
+- Workspace index symbols (closed files)
+- Package/built-in symbols included in identifier lists
+
+Just before emitting `CompletionItem`s, skip any `name` where `is_reserved_word(name)` is `true`; this prevents leakage even if an upstream collector misses a path. Keyword-specific completions remain unaffected.
 
 #### Document Symbol Provider (`handlers.rs`)
 
-The `collect_symbols` function is modified to skip reserved words:
+Apply the reserved-word filter in both symbol collection paths:
 
-```rust
-fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>) {
-    if node.kind() == "binary_operator" {
-        // ... existing code to extract name ...
-        let name = node_text(lhs, text).to_string();
-        
-        // Skip reserved words
-        if crate::reserved_words::is_reserved_word(&name) {
-            // Don't add to symbols, but continue recursion
-        } else {
-            // ... existing symbol creation ...
-        }
-    }
-    // ... recurse into children ...
-}
-```
+- AST traversal that extracts assignment-like symbols
+- Any fallback that derives symbols from `ScopeArtifacts` or workspace index
+
+Filter at the emission point so no symbol with a reserved name is added, regardless of source.
 
 ## Data Models
 
@@ -176,7 +132,7 @@ This list is based on R's official reserved words. Note that `library`, `require
 
 ### Lookup Performance
 
-The `HashSet` provides O(1) average-case lookup. The set is initialized once via `OnceLock` and reused for all subsequent calls, making the check extremely fast.
+The `matches!` expression is zero-allocation and inlineable, avoiding `HashSet` initialization while retaining O(1) lookup with lower constant cost.
 
 
 
@@ -192,7 +148,7 @@ The `HashSet` provides O(1) average-case lookup. The set is initialized once via
 
 ### Property 2: Definition Extraction Exclusion
 
-*For any* R code containing an assignment where the left-hand side is a reserved word (e.g., `else <- 1`, `if <- function() {}`), the definition extractor SHALL NOT include that reserved word in either the exported interface or the scope timeline.
+*For any* R code containing a definition in any supported form (left/right assignment, function definition, replacement function, or other extractor path) where the declared identifier is a reserved word, the definition extractor SHALL NOT include that reserved word in either the exported interface or the scope timeline.
 
 **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
 
@@ -204,13 +160,13 @@ The `HashSet` provides O(1) average-case lookup. The set is initialized once via
 
 ### Property 4: Completion Exclusion
 
-*For any* R code containing assignments to reserved words, when generating identifier completions, the completion provider SHALL NOT include those reserved words in the completion list (though they may still appear as keyword completions from the separate keyword list).
+*For any* completion request that aggregates identifiers from document, scope, workspace index, or package sources, the completion provider SHALL NOT include reserved words in the identifier completion list (keyword completions may still surface them as keywords).
 
 **Validates: Requirements 5.1, 5.2**
 
 ### Property 5: Document Symbol Exclusion
 
-*For any* R code containing assignments to reserved words, the document symbol provider SHALL NOT include those reserved words in the symbol list.
+*For any* document symbol collection (AST or scope-derived) where a candidate symbol name is a reserved word, the provider SHALL NOT include it in the emitted symbol list.
 
 **Validates: Requirements 6.1, 6.2**
 
@@ -241,31 +197,11 @@ When reserved words appear in invalid positions (e.g., `else` without preceding 
 
 ### Unit Tests
 
-Unit tests verify specific examples and edge cases:
-
-1. **Reserved word module tests**:
-   - Test each reserved word returns `true`
-   - Test common non-reserved identifiers return `false`
-   - Test edge cases: empty string, case variations, similar names
-
-2. **Definition extraction tests**:
-   - Test `else <- 1` produces no definition
-   - Test `if <- function() {}` produces no definition
-   - Test `myelse <- 1` produces a definition (not reserved)
-
-3. **Undefined variable tests**:
-   - Test `else` alone doesn't produce undefined variable diagnostic
-   - Test `if` alone doesn't produce undefined variable diagnostic
-   - Test actual undefined variables still produce diagnostics
-
-4. **Completion tests**:
-   - Test reserved word assignments don't appear in completions
-   - Test normal assignments still appear in completions
-   - Test keyword completions still include reserved words
-
-5. **Document symbol tests**:
-   - Test reserved word assignments don't appear in symbols
-   - Test normal assignments still appear in symbols
+1. **Reserved word module tests**: same coverage; implicitly zero allocation via `matches!`.
+2. **Definition extraction tests**: cover all extractor entry points (plain assignment, function definition, replacement function, right assignment). Non-reserved identifiers remain positive controls.
+3. **Undefined variable tests**: unchanged.
+4. **Completion tests**: verify filtering after final aggregation by injecting identifiers from document, workspace index, and package sources; keyword completions remain available separately.
+5. **Document symbol tests**: cover AST-based and scope-derived symbol sources.
 
 ### Property-Based Tests
 
