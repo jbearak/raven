@@ -83,19 +83,19 @@ Re-use existing `ScopedSymbol` and `ScopeArtifacts` from `cross_file/scope.rs`.
 
 ### Property 1: Position-Aware Definition Lookup
 
-*For any* R source file and any variable usage at position P, if `find_definition_in_tree_before_position` returns a definition, that definition's position SHALL be strictly less than P (lexicographically comparing (line, column)).
+*For any* R source file and any variable usage at position P, if `scope_at_position` returns a definition, that definition's position SHALL be strictly less than P (lexicographically comparing (line, column)).
 
 **Validates: Requirements 1.1, 1.5**
 
 ### Property 2: Closest Definition Selection
 
-*For any* R source file with multiple definitions of the same variable before position P, `find_definition_in_tree_before_position` SHALL return the definition with the largest position that is still less than P.
+*For any* R source file with multiple definitions of the same variable before position P, the resolution chosen by `scope_at_position` SHALL be the definition with the largest position that is still less than P.
 
 **Validates: Requirements 1.2**
 
 ### Property 3: No Definition Returns None
 
-*For any* R source file where a variable is used at position P and no definition of that variable exists at any position less than P, `find_definition_in_tree_before_position` SHALL return None.
+*For any* R source file where a variable is used at position P and no definition of that variable exists at any position less than P, `scope_at_position` SHALL lead to a None result for the lookup.
 
 **Validates: Requirements 1.3**
 
