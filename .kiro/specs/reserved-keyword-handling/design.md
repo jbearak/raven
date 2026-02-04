@@ -17,18 +17,18 @@ The solution introduces a centralized `Reserved_Word_Module` that provides a con
 
 ```mermaid
 graph TD
-    RWM[reserved_words.rs] --> |is_reserved_word| DE[Definition Extraction<br/>scope.rs (all extract_* entry points)]
+    RWM[reserved_words.rs] --> |is_reserved_word| DE[Definition Extraction<br/>scope.rs]
     RWM --> |is_reserved_word| UVC[Undefined Variable Checker<br/>handlers.rs]
-    RWM --> |is_reserved_word| CP[Completion Provider<br/>handlers.rs<br/>scope + workspace + package sources]
-    RWM --> |is_reserved_word| DSP[Document Symbol Provider<br/>handlers.rs<br/>AST + scope fallback]
+    RWM --> |is_reserved_word| CP[Completion Provider<br/>handlers.rs]
+    RWM --> |is_reserved_word| DSP[Document Symbol Provider<br/>handlers.rs]
     
     DE --> |ScopeArtifacts + Interface| SR[Scope Resolution]
     UVC --> |Diagnostics| D[diagnostics()]
-    CP --> |CompletionItems (post-dedup)| C[completion()]
-    DSP --> |SymbolInformation (final filter)| DS[document_symbol()]
+    CP --> |CompletionItems| C[completion()]
+    DSP --> |SymbolInformation| DS[document_symbol()]
 ```
 
-The `reserved_words` module remains stateless and callable from any component. It will use a zero-allocation lookup so hot paths pay minimal overhead.
+The `reserved_words` module is stateless and callable from any component. It uses a zero-allocation lookup via `matches!` macro for minimal overhead in hot paths.
 
 ## Components and Interfaces
 
@@ -37,6 +37,18 @@ The `reserved_words` module remains stateless and callable from any component. I
 A new module at `crates/raven/src/reserved_words.rs`:
 
 ```rust
+/// Complete list of R reserved words for this feature.
+/// These words cannot be used as user-defined identifiers.
+pub const RESERVED_WORDS: &[&str] = &[
+    "if", "else", "repeat", "while", "function", "for", "in", "next", "break",
+    "TRUE", "FALSE", "NULL", "Inf", "NaN",
+    "NA", "NA_integer_", "NA_real_", "NA_complex_", "NA_character_",
+];
+
+/// Check if a name is an R reserved word.
+/// 
+/// Returns `true` if `name` matches any of the R reserved words,
+/// `false` otherwise. The check is case-sensitive.
 pub fn is_reserved_word(name: &str) -> bool {
     matches!(
         name,
@@ -69,15 +81,26 @@ This avoids heap allocation and hashing while keeping the check inlineable.
 
 #### Definition Extraction (`scope.rs`)
 
-Apply the reserved-word guard to **all definition entry points**, not only `try_extract_assignment`:
+The `try_extract_assignment` function is modified to skip reserved words:
 
-- `try_extract_assignment` (left/right assignments, including `=` forms where applicable)
-- `extract_function_definition` and helpers that record function names
-- `extract_replacement_function` or other specialized definition extractors
-- Any path that appends to `ScopeArtifacts` timeline or exported interface
-- Workspace-index ingestion that rehydrates definitions into scope artifacts
+```rust
+fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+    // ... existing parsing logic to get name ...
+    
+    // Skip reserved words - they cannot be defined
+    if crate::reserved_words::is_reserved_word(&name) {
+        return None;
+    }
+    
+    // ... rest of function ...
+}
+```
 
-Implementation detail: parse identifier text as `&str` and run `is_reserved_word` **before** cloning/allocating; if `true`, short-circuit and emit no definition event/export.
+This ensures reserved words are excluded from:
+- The exported interface (Requirement 2.1)
+- The scope timeline (Requirement 2.2)
+
+Both left-assignment (`<-`, `=`, `<<-`) and right-assignment (`->`) forms are covered since they share the same extraction function.
 
 #### Undefined Variable Checker (`handlers.rs`)
 
@@ -85,7 +108,7 @@ The `collect_undefined_variables_position_aware` function is modified to skip re
 
 ```rust
 for (name, usage_node) in used {
-    // Skip reserved words BEFORE any other checks
+    // Skip reserved words BEFORE any other checks (Requirement 3.4)
     if crate::reserved_words::is_reserved_word(&name) {
         continue;
     }
@@ -94,25 +117,51 @@ for (name, usage_node) in used {
 }
 ```
 
+This ensures reserved words never produce "Undefined variable" diagnostics regardless of their position in the code.
+
 #### Completion Provider (`handlers.rs`)
 
-Filter reserved words at the **final aggregation point** for identifier completions so all sources are covered:
+The `completion` function already adds keywords as completions. The modification filters reserved words from identifier-derived completions:
 
-- Document-derived symbols (current file)
-- Scope-resolved symbols (other open files)
-- Workspace index symbols (closed files)
-- Package/built-in symbols included in identifier lists
+```rust
+// Add symbols from current document (local definitions take precedence)
+collect_document_completions(tree.root_node(), &text, &mut items, &mut seen_names);
 
-Just before emitting `CompletionItem`s, skip any `name` where `is_reserved_word(name)` is `true`; this prevents leakage even if an upstream collector misses a path. Keyword-specific completions remain unaffected.
+// Filter out reserved words from identifier completions
+// (Keywords are added separately with CompletionItemKind::KEYWORD)
+items.retain(|item| {
+    item.kind == Some(CompletionItemKind::KEYWORD) 
+        || !crate::reserved_words::is_reserved_word(&item.label)
+});
+```
+
+This ensures:
+- Reserved words are NOT suggested as identifier completions (Requirement 5.1)
+- Reserved words ARE still available as keyword completions (Requirement 5.3)
 
 #### Document Symbol Provider (`handlers.rs`)
 
-Apply the reserved-word filter in both symbol collection paths:
+The `collect_symbols` function is modified to skip reserved words:
 
-- AST traversal that extracts assignment-like symbols
-- Any fallback that derives symbols from `ScopeArtifacts` or workspace index
-
-Filter at the emission point so no symbol with a reserved name is added, regardless of source.
+```rust
+fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>) {
+    if node.kind() == "binary_operator" {
+        // ... existing parsing logic ...
+        
+        if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
+            let name = node_text(lhs, text).to_string();
+            
+            // Skip reserved words - they should not appear as document symbols
+            if crate::reserved_words::is_reserved_word(&name) {
+                // Continue to recurse but don't add this symbol
+            } else {
+                // ... add symbol to list ...
+            }
+        }
+    }
+    // ... recurse ...
+}
+```
 
 ## Data Models
 
@@ -128,13 +177,11 @@ The complete list of reserved words for this feature:
 | Special Numeric | `Inf`, `NaN` |
 | NA Variants | `NA`, `NA_integer_`, `NA_real_`, `NA_complex_`, `NA_character_` |
 
-This list is based on R's official reserved words. Note that `library`, `require`, `return`, `print` are NOT reserved words - they are regular functions that can be redefined.
+This list is based on R's official reserved words. Note that `library`, `require`, `return`, `print` are NOT reserved words—they are regular functions that can be redefined.
 
 ### Lookup Performance
 
-The `matches!` expression is zero-allocation and inlineable, avoiding `HashSet` initialization while retaining O(1) lookup with lower constant cost.
-
-
+The `matches!` expression compiles to a jump table or series of comparisons, providing O(1) lookup with zero allocation. This is more efficient than `HashSet` for small, fixed sets.
 
 ## Correctness Properties
 
@@ -142,13 +189,13 @@ The `matches!` expression is zero-allocation and inlineable, avoiding `HashSet` 
 
 ### Property 1: Reserved Word Identification
 
-*For any* string that is in the set of R reserved words (`if`, `else`, `repeat`, `while`, `function`, `for`, `in`, `next`, `break`, `TRUE`, `FALSE`, `NULL`, `Inf`, `NaN`, `NA`, `NA_integer_`, `NA_real_`, `NA_complex_`, `NA_character_`), `is_reserved_word()` SHALL return `true`. *For any* string that is a valid R identifier but NOT in this set, `is_reserved_word()` SHALL return `false`.
+*For any* string that is in the set of R reserved words (`if`, `else`, `repeat`, `while`, `function`, `for`, `in`, `next`, `break`, `TRUE`, `FALSE`, `NULL`, `Inf`, `NaN`, `NA`, `NA_integer_`, `NA_real_`, `NA_complex_`, `NA_character_`), `is_reserved_word()` SHALL return `true`. *For any* string that is NOT in this set, `is_reserved_word()` SHALL return `false`.
 
 **Validates: Requirements 1.1, 1.2**
 
 ### Property 2: Definition Extraction Exclusion
 
-*For any* R code containing a definition in any supported form (left/right assignment, function definition, replacement function, or other extractor path) where the declared identifier is a reserved word, the definition extractor SHALL NOT include that reserved word in either the exported interface or the scope timeline.
+*For any* R code containing an assignment (left-assignment `<-`, `=`, `<<-` or right-assignment `->`) where the target identifier is a reserved word, the definition extractor SHALL NOT include that reserved word in either the exported interface or the scope timeline.
 
 **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
 
@@ -156,17 +203,17 @@ The `matches!` expression is zero-allocation and inlineable, avoiding `HashSet` 
 
 *For any* R code containing a reserved word used as an identifier (in any syntactic position), the undefined variable checker SHALL NOT emit an "Undefined variable" diagnostic for that reserved word.
 
-**Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+**Validates: Requirements 3.1, 3.2, 3.3**
 
 ### Property 4: Completion Exclusion
 
-*For any* completion request that aggregates identifiers from document, scope, workspace index, or package sources, the completion provider SHALL NOT include reserved words in the identifier completion list (keyword completions may still surface them as keywords).
+*For any* completion request that aggregates identifiers from document, scope, workspace index, or package sources, the completion provider SHALL NOT include reserved words in the identifier completion list. Keyword completions (with `CompletionItemKind::KEYWORD`) may still include reserved words.
 
-**Validates: Requirements 5.1, 5.2**
+**Validates: Requirements 5.1, 5.2, 5.3**
 
 ### Property 5: Document Symbol Exclusion
 
-*For any* document symbol collection (AST or scope-derived) where a candidate symbol name is a reserved word, the provider SHALL NOT include it in the emitted symbol list.
+*For any* document symbol collection where a candidate symbol name is a reserved word, the provider SHALL NOT include it in the emitted symbol list.
 
 **Validates: Requirements 6.1, 6.2**
 
@@ -181,7 +228,7 @@ The `is_reserved_word()` function handles all string inputs gracefully:
 
 ### Parse Error Preservation
 
-When reserved words appear in invalid positions (e.g., `else` without preceding `if`), tree-sitter will report parse errors. This feature does NOT suppress or modify those errors. The only change is that we no longer report "Undefined variable: else" for such cases—the parse error is the correct diagnostic.
+When reserved words appear in invalid positions (e.g., `else` without preceding `if`), tree-sitter will report parse errors. This feature does NOT suppress or modify those errors (Requirement 4.2). The only change is that we no longer report "Undefined variable: else" for such cases—the parse error is the correct diagnostic (Requirement 4.1).
 
 ### Edge Cases
 
@@ -192,16 +239,42 @@ When reserved words appear in invalid positions (e.g., `else` without preceding 
 | `TRUE <- FALSE` | No definition created, no undefined variable warning |
 | `myelse <- 1` | Normal definition created (not a reserved word) |
 | `ELSE <- 1` | Normal definition created (case-sensitive, `ELSE` is not reserved) |
+| `el` completion | Suggests `el` if defined, does NOT suggest `else` as identifier |
 
 ## Testing Strategy
 
+### Dual Testing Approach
+
+This feature uses both unit tests and property-based tests:
+- **Unit tests**: Verify specific examples, edge cases, and error conditions
+- **Property tests**: Verify universal properties across all inputs
+
 ### Unit Tests
 
-1. **Reserved word module tests**: same coverage; implicitly zero allocation via `matches!`.
-2. **Definition extraction tests**: cover all extractor entry points (plain assignment, function definition, replacement function, right assignment). Non-reserved identifiers remain positive controls.
-3. **Undefined variable tests**: unchanged.
-4. **Completion tests**: verify filtering after final aggregation by injecting identifiers from document, workspace index, and package sources; keyword completions remain available separately.
-5. **Document symbol tests**: cover AST-based and scope-derived symbol sources.
+1. **Reserved word module tests**:
+   - Test each reserved word returns `true`
+   - Test non-reserved words return `false`
+   - Test edge cases: empty string, special characters, case sensitivity
+
+2. **Definition extraction tests**:
+   - Test `else <- 1` creates no definition
+   - Test `if <- function() {}` creates no definition
+   - Test `TRUE <- FALSE` creates no definition
+   - Test `myelse <- 1` creates normal definition (positive control)
+
+3. **Undefined variable tests**:
+   - Test `else` alone produces no "Undefined variable" diagnostic
+   - Test `if` alone produces no "Undefined variable" diagnostic
+   - Test `undefined_var` produces diagnostic (positive control)
+
+4. **Completion tests**:
+   - Test reserved words not in identifier completions
+   - Test reserved words still appear as keyword completions
+   - Test `el` prefix suggests `el` but not `else`
+
+5. **Document symbol tests**:
+   - Test `else <- 1` not in symbol list
+   - Test `myvar <- 1` in symbol list (positive control)
 
 ### Property-Based Tests
 
@@ -216,10 +289,10 @@ Property-based tests verify universal properties across many generated inputs. E
 
 1. **Property 1 Test**: Generate random strings from the reserved word set and verify `is_reserved_word()` returns `true`. Generate random valid R identifiers not in the set and verify it returns `false`.
 
-2. **Property 2 Test**: Generate R code with assignments to randomly selected reserved words. Parse and extract definitions. Verify the reserved word does not appear in exported interface or timeline.
+2. **Property 2 Test**: Generate R code with assignments to randomly selected reserved words (both left and right assignment forms). Parse and extract definitions. Verify the reserved word does not appear in exported interface or timeline.
 
-3. **Property 3 Test**: Generate R code with reserved words used as identifiers. Run undefined variable checking. Verify no "Undefined variable" diagnostic is emitted for reserved words.
+3. **Property 3 Test**: Generate R code with reserved words used as identifiers in various positions. Run undefined variable checking. Verify no "Undefined variable" diagnostic is emitted for reserved words.
 
-4. **Property 4 Test**: Generate R code with assignments to reserved words. Generate completions. Verify reserved words don't appear in identifier completion items.
+4. **Property 4 Test**: Generate R code with assignments to reserved words. Generate completions. Verify reserved words don't appear in identifier completion items (but may appear as keywords).
 
 5. **Property 5 Test**: Generate R code with assignments to reserved words. Collect document symbols. Verify reserved words don't appear in symbol list.
