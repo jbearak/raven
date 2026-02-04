@@ -372,6 +372,10 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Collect syntax errors (not suppressed by @lsp-ignore)
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
 
+    // Collect else-on-newline errors
+    // _Requirements: 4.1_
+    collect_else_newline_errors(tree.root_node(), &text, &mut diagnostics);
+
     // Check for circular dependencies
     if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
         let line = cycle_edge.call_site_line.unwrap_or(0);
@@ -1351,6 +1355,179 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     for child in node.children(&mut cursor) {
         collect_syntax_errors(child, diagnostics);
     }
+}
+
+/// Detect and report diagnostics for `else` keywords that appear on a new line
+/// after the closing brace of an `if` block.
+///
+/// In R, `else` must appear on the same line as the closing `}` of the `if` block.
+/// When `else` is on a new line, R treats the `if` as complete and `else` becomes
+/// an unexpected token.
+///
+/// # Implementation Note
+///
+/// When `else` appears on a new line after an `if` block, tree-sitter-r parses it
+/// as an `identifier` node (not an `"else"` keyword node) that is a sibling of the
+/// `if_statement` in the parent node. This function detects this pattern by:
+/// 1. Finding `identifier` nodes with text "else"
+/// 2. Checking if the preceding sibling is an `if_statement`
+/// 3. Comparing line numbers to determine if `else` is on a new line
+///
+/// # Arguments
+/// * `node` - The root AST node to traverse
+/// * `text` - The source text for extracting node content
+/// * `diagnostics` - Vector to append diagnostics to
+///
+/// # Examples
+///
+/// Invalid (emits diagnostic):
+/// ```r
+/// if (cond) { body }
+/// else { body2 }
+/// ```
+///
+/// Valid (no diagnostic):
+/// ```r
+/// if (cond) { body } else { body2 }
+/// ```
+///
+/// **Validates: Requirements 1.1, 1.2, 1.3, 4.2**
+fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    // Case 1: Check if this node is an identifier with text "else"
+    // When else is on a new line at the top level, tree-sitter parses it as an identifier
+    if node.kind() == "identifier" {
+        let node_text_str = node_text(node, text);
+        if node_text_str == "else" {
+            // Skip if this node is already marked as an error by tree-sitter
+            // to avoid duplicate diagnostics (Requirement 4.2)
+            if node.is_error() {
+                // Already handled by collect_syntax_errors
+            } else if let Some(parent) = node.parent() {
+                if parent.is_error() {
+                    // Parent is error, skip to avoid duplicate
+                } else {
+                    // Check if there's a preceding if_statement (skipping over comments)
+                    // This indicates an orphaned else on a new line
+                    // Validates: Requirement 5.3 - comments between `}` and `else` should not
+                    // prevent detection when else is on a new line
+                    let mut prev = node.prev_sibling();
+                    while let Some(sibling) = prev {
+                        if sibling.kind() == "comment" {
+                            // Skip comments and continue looking
+                            prev = sibling.prev_sibling();
+                        } else if sibling.kind() == "if_statement" {
+                            // Found the preceding if_statement
+                            let brace_line = find_closing_brace_line(&sibling, text);
+                            let else_start_line = node.start_position().row;
+
+                            if let Some(brace_line) = brace_line {
+                                // If else is on a different line than the closing brace, emit diagnostic
+                                if else_start_line > brace_line {
+                                    emit_else_newline_diagnostic(node, diagnostics);
+                                }
+                            } else {
+                                // Fallback: use the end line of the if_statement
+                                let if_end_line = sibling.end_position().row;
+                                if else_start_line > if_end_line {
+                                    emit_else_newline_diagnostic(node, diagnostics);
+                                }
+                            }
+                            break;
+                        } else {
+                            // Found something other than comment or if_statement, stop looking
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Case 2: Check if this is an if_statement with an else clause
+    // When else is on a new line inside a braced expression (nested), tree-sitter still parses
+    // it as part of the if_statement with an "else" keyword node
+    // Validates: Requirement 2.5 - nested if-else detection
+    if node.kind() == "if_statement" {
+        // Look for the "else" keyword child and the consequence (braced_expression)
+        let mut cursor = node.walk();
+        let mut consequence_end_line: Option<usize> = None;
+        let mut else_node: Option<Node> = None;
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "braced_expression" && else_node.is_none() {
+                // This is the consequence (the first braced_expression before else)
+                consequence_end_line = Some(child.end_position().row);
+            } else if child.kind() == "else" {
+                else_node = Some(child);
+                // Don't break - we want to capture the consequence before the else
+            }
+        }
+
+        // If we found both a consequence and an else, check line positions
+        if let (Some(brace_line), Some(else_kw)) = (consequence_end_line, else_node) {
+            let else_start_line = else_kw.start_position().row;
+            if else_start_line > brace_line {
+                emit_else_newline_diagnostic(else_kw, diagnostics);
+            }
+        }
+    }
+
+    // Recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_else_newline_errors(child, text, diagnostics);
+    }
+}
+
+/// Emit a diagnostic for an orphaned else keyword
+fn emit_else_newline_diagnostic(node: Node, diagnostics: &mut Vec<Diagnostic>) {
+    diagnostics.push(Diagnostic {
+        range: Range {
+            start: Position::new(
+                node.start_position().row as u32,
+                node.start_position().column as u32,
+            ),
+            end: Position::new(
+                node.end_position().row as u32,
+                node.end_position().column as u32,
+            ),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: "In R, 'else' must appear on the same line as the closing '}' of the if block"
+            .to_string(),
+        ..Default::default()
+    });
+}
+
+/// Helper function to find the line number of the closing brace in a node.
+/// Returns the line number of the last "}" in the node, or None if not found.
+fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
+    // For if_statement, we need to find the consequence (the braced_expression after the condition)
+    // The consequence is the last braced_expression child that is NOT the alternative
+    let mut cursor = node.walk();
+    let mut last_brace_line = None;
+
+    for child in node.children(&mut cursor) {
+        // Look for braced_expression which contains the closing brace
+        if child.kind() == "braced_expression" {
+            // The end position of braced_expression is where the "}" is
+            last_brace_line = Some(child.end_position().row);
+            // Don't break - we want the FIRST braced_expression (the consequence),
+            // not the alternative (which would be after the else keyword)
+            // But since we're looking at if_statement without else, there's only one
+            break;
+        }
+    }
+
+    // If we didn't find a braced_expression, check if the node's text ends with "}"
+    if last_brace_line.is_none() {
+        let node_text_str = node_text(*node, text);
+        if node_text_str.trim_end().ends_with('}') {
+            return Some(node.end_position().row);
+        }
+    }
+
+    last_brace_line
 }
 
 /// Report undefined variable usages in a document using position-aware cross-file scope.
@@ -4468,6 +4645,597 @@ x <- "#;
             "PathContext::new and PathContext::from_metadata should produce different results when @lsp-cd is present"
         );
     }
+
+    // ========================================================================
+    // Else Newline Syntax Error Tests (Task 1.3)
+    // Tests for else-newline-syntax-error feature
+    // Validates: Requirements 2.1, 2.2, 2.3, 2.4
+    // ========================================================================
+
+    /// Test that `if (x) {y}\nelse {z}` emits a diagnostic for orphaned else.
+    /// Validates: Requirement 2.1 - else on new line after closing brace should emit diagnostic
+    #[test]
+    fn test_else_newline_basic_invalid_pattern() {
+        let code = "if (x) {y}\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned else on new line"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Diagnostic severity should be ERROR"
+        );
+        assert!(
+            diagnostics[0].message.contains("else"),
+            "Diagnostic message should mention 'else'"
+        );
+        assert!(
+            diagnostics[0].message.contains("same line"),
+            "Diagnostic message should mention 'same line'"
+        );
+    }
+
+    /// Test that `if (x) {y} else {z}` does NOT emit a diagnostic.
+    /// Validates: Requirement 2.3 - else on same line as closing brace should not emit diagnostic
+    #[test]
+    fn test_else_newline_basic_valid_pattern() {
+        let code = "if (x) {y} else {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit diagnostic when else is on same line as closing brace"
+        );
+    }
+
+    /// Test that multi-line valid if-else does NOT emit a diagnostic.
+    /// `if (x) {\n  y\n} else {\n  z\n}` - else on same line as closing brace
+    /// Validates: Requirement 2.4 - multi-line with else on same line as brace should not emit diagnostic
+    #[test]
+    fn test_else_newline_multiline_valid_pattern() {
+        let code = "if (x) {\n  y\n} else {\n  z\n}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit diagnostic when else is on same line as closing brace (multi-line)"
+        );
+    }
+
+    /// Test that multi-line invalid if-else emits a diagnostic.
+    /// `if (x) {\n  y\n}\nelse {\n  z\n}` - else on new line after closing brace
+    /// Validates: Requirement 2.2 - multi-line if with else on new line after brace should emit diagnostic
+    #[test]
+    fn test_else_newline_multiline_invalid_pattern() {
+        let code = "if (x) {\n  y\n}\nelse {\n  z\n}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned else on new line (multi-line)"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Diagnostic severity should be ERROR"
+        );
+    }
+
+    /// Test that the diagnostic range covers the `else` keyword exactly.
+    /// Validates: Requirement 3.2 - diagnostic range should highlight the else keyword
+    #[test]
+    fn test_else_newline_diagnostic_range() {
+        let code = "if (x) {y}\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1, "Should emit exactly one diagnostic");
+
+        let diag = &diagnostics[0];
+        // "else" starts at line 1 (0-indexed), column 0
+        assert_eq!(
+            diag.range.start.line, 1,
+            "Diagnostic should start on line 1 (0-indexed)"
+        );
+        assert_eq!(
+            diag.range.start.character, 0,
+            "Diagnostic should start at column 0"
+        );
+        // "else" is 4 characters long
+        assert_eq!(
+            diag.range.end.line, 1,
+            "Diagnostic should end on line 1"
+        );
+        assert_eq!(
+            diag.range.end.character, 4,
+            "Diagnostic should end at column 4 (covering 'else')"
+        );
+    }
+
+    // ========================================================================
+    // Nested If-Else Tests (Task 2.1)
+    // Tests for nested if-else detection
+    // Validates: Requirements 2.5
+    // ========================================================================
+
+    /// Test that nested valid if-else does NOT emit a diagnostic.
+    /// `if (a) { if (b) {c} else {d} } else {e}` - all else on same line as closing brace
+    /// Validates: Requirement 2.5 - nested if-else with valid else placement should not emit diagnostic
+    #[test]
+    fn test_else_newline_nested_valid_pattern() {
+        let code = "if (a) { if (b) {c} else {d} } else {e}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit diagnostic when all else keywords are on same line as closing brace (nested)"
+        );
+    }
+
+    /// Test that nested invalid if-else emits a diagnostic for the inner orphaned else.
+    /// `if (a) { if (b) {c}\nelse {d} }` - inner else on new line after closing brace
+    /// Validates: Requirement 2.5 - nested if-else with orphaned else should emit diagnostic
+    #[test]
+    fn test_else_newline_nested_invalid_inner_else() {
+        let code = "if (a) { if (b) {c}\nelse {d} }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned inner else on new line (nested)"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Diagnostic severity should be ERROR"
+        );
+        // The inner else is on line 1 (0-indexed)
+        assert_eq!(
+            diagnostics[0].range.start.line, 1,
+            "Diagnostic should be on line 1 (0-indexed) where the orphaned else is"
+        );
+    }
+
+    /// Test that nested invalid if-else with outer orphaned else emits a diagnostic.
+    /// `if (a) { if (b) {c} else {d} }\nelse {e}` - outer else on new line
+    /// Validates: Requirement 2.5 - nested if-else with orphaned outer else should emit diagnostic
+    #[test]
+    fn test_else_newline_nested_invalid_outer_else() {
+        let code = "if (a) { if (b) {c} else {d} }\nelse {e}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned outer else on new line (nested)"
+        );
+        // The outer else is on line 1 (0-indexed)
+        assert_eq!(
+            diagnostics[0].range.start.line, 1,
+            "Diagnostic should be on line 1 (0-indexed) where the orphaned outer else is"
+        );
+    }
+
+    /// Test that deeply nested if-else with multiple orphaned else keywords emits multiple diagnostics.
+    /// Validates: Requirement 2.5 - all orphaned else at any nesting level should be detected
+    #[test]
+    fn test_else_newline_deeply_nested_multiple_invalid() {
+        // Both inner and outer else are on new lines
+        let code = "if (a) { if (b) {c}\nelse {d} }\nelse {e}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "Should emit two diagnostics for both orphaned else keywords (nested)"
+        );
+    }
+
+    // ========================================================================
+    // Else If Pattern Tests (Task 2.2)
+    // Tests for `else if` on new line detection
+    // Validates: Requirements 5.2
+    // ========================================================================
+
+    /// Test that `if (x) {y}\nelse if (z) {w}` emits a diagnostic for orphaned else.
+    /// Validates: Requirement 5.2 - `else if` on new line should emit diagnostic
+    #[test]
+    fn test_else_newline_else_if_on_new_line() {
+        let code = "if (x) {y}\nelse if (z) {w}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned 'else if' on new line"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Diagnostic severity should be ERROR"
+        );
+        // The else is on line 1 (0-indexed), column 0
+        assert_eq!(
+            diagnostics[0].range.start.line, 1,
+            "Diagnostic should start on line 1 (0-indexed)"
+        );
+        assert_eq!(
+            diagnostics[0].range.start.character, 0,
+            "Diagnostic should start at column 0"
+        );
+    }
+
+    /// Test that `if (x) {y} else if (z) {w}` does NOT emit a diagnostic.
+    /// Validates: Requirement 5.2 - valid `else if` on same line should not emit diagnostic
+    #[test]
+    fn test_else_newline_else_if_on_same_line() {
+        let code = "if (x) {y} else if (z) {w}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit diagnostic when 'else if' is on same line as closing brace"
+        );
+    }
+
+    /// Test that multi-line `else if` on new line emits a diagnostic.
+    /// `if (x) {\n  y\n}\nelse if (z) {\n  w\n}` - else if on new line after closing brace
+    /// Validates: Requirement 5.2 - multi-line `else if` on new line should emit diagnostic
+    #[test]
+    fn test_else_newline_else_if_multiline_invalid() {
+        let code = "if (x) {\n  y\n}\nelse if (z) {\n  w\n}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned 'else if' on new line (multi-line)"
+        );
+        // The else is on line 3 (0-indexed)
+        assert_eq!(
+            diagnostics[0].range.start.line, 3,
+            "Diagnostic should be on line 3 (0-indexed) where the orphaned else is"
+        );
+    }
+
+    /// Test that valid multi-line `else if` does NOT emit a diagnostic.
+    /// `if (x) {\n  y\n} else if (z) {\n  w\n}` - else if on same line as closing brace
+    /// Validates: Requirement 5.2 - valid multi-line `else if` should not emit diagnostic
+    #[test]
+    fn test_else_newline_else_if_multiline_valid() {
+        let code = "if (x) {\n  y\n} else if (z) {\n  w\n}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit diagnostic when 'else if' is on same line as closing brace (multi-line)"
+        );
+    }
+
+    // ========================================================================
+    // Blank Lines Tests (Task 2.3)
+    // Tests for blank lines between `}` and `else`
+    // Validates: Requirements 5.4
+    // ========================================================================
+
+    /// Test that `if (x) {y}\n\nelse {z}` emits a diagnostic for orphaned else.
+    /// Validates: Requirement 5.4 - blank lines between `}` and `else` should emit diagnostic
+    #[test]
+    fn test_else_newline_blank_lines_between_brace_and_else() {
+        let code = "if (x) {y}\n\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned else with blank line between"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Diagnostic severity should be ERROR"
+        );
+        // The else is on line 2 (0-indexed) due to the blank line
+        assert_eq!(
+            diagnostics[0].range.start.line, 2,
+            "Diagnostic should start on line 2 (0-indexed) after blank line"
+        );
+        assert_eq!(
+            diagnostics[0].range.start.character, 0,
+            "Diagnostic should start at column 0"
+        );
+    }
+
+    /// Test that multiple blank lines between `}` and `else` still emit a diagnostic.
+    /// Validates: Requirement 5.4 - multiple blank lines should still trigger diagnostic
+    #[test]
+    fn test_else_newline_multiple_blank_lines() {
+        let code = "if (x) {y}\n\n\n\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned else with multiple blank lines"
+        );
+        // The else is on line 4 (0-indexed) due to multiple blank lines
+        assert_eq!(
+            diagnostics[0].range.start.line, 4,
+            "Diagnostic should start on line 4 (0-indexed) after multiple blank lines"
+        );
+    }
+
+    /// Test that multi-line if with blank lines before else emits a diagnostic.
+    /// `if (x) {\n  y\n}\n\nelse {\n  z\n}` - blank line between closing brace and else
+    /// Validates: Requirement 5.4 - multi-line with blank lines should emit diagnostic
+    #[test]
+    fn test_else_newline_multiline_with_blank_lines() {
+        let code = "if (x) {\n  y\n}\n\nelse {\n  z\n}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit exactly one diagnostic for orphaned else with blank line (multi-line)"
+        );
+        // The closing brace is on line 2 (0-indexed), else is on line 4
+        assert_eq!(
+            diagnostics[0].range.start.line, 4,
+            "Diagnostic should be on line 4 (0-indexed) where the orphaned else is"
+        );
+    }
+
+    // ========================================================================
+    // Edge Case Tests (Task 2.4)
+    // Additional edge case tests for else-newline detection
+    // Validates: Requirements 5.1, 5.3
+    // ========================================================================
+
+    /// Test that standalone `else` without preceding `if` does NOT emit a duplicate diagnostic.
+    /// Tree-sitter handles this as a general syntax error, so we should not emit our
+    /// newline-specific diagnostic to avoid duplicates.
+    /// Validates: Requirement 5.1 - standalone else should not emit newline-specific diagnostic
+    #[test]
+    fn test_else_newline_standalone_else_no_duplicate() {
+        let code = "else {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        // The standalone else is a syntax error handled by tree-sitter.
+        // Our detector should NOT emit a diagnostic for this case to avoid duplicates.
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit newline-specific diagnostic for standalone else (tree-sitter handles this)"
+        );
+    }
+
+    /// Test that comments on the same line as closing brace, with else on new line, emits diagnostic.
+    /// `if (x) {y} # comment\nelse {z}` - else is on a new line, so diagnostic should be emitted
+    /// Validates: Requirement 5.3 - comments between `}` and `else` on same line should not prevent
+    /// diagnostic when else is actually on a new line
+    #[test]
+    fn test_else_newline_comment_same_line_else_new_line() {
+        let code = "if (x) {y} # comment\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit diagnostic when else is on new line even with comment after closing brace"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Diagnostic severity should be ERROR"
+        );
+        // The else is on line 1 (0-indexed)
+        assert_eq!(
+            diagnostics[0].range.start.line, 1,
+            "Diagnostic should start on line 1 (0-indexed) where the orphaned else is"
+        );
+    }
+
+    /// Test that comments between `}` and `else` on the SAME line does NOT emit diagnostic.
+    /// `if (x) {y} # comment else {z}` - this is actually invalid R syntax, but if else were
+    /// somehow on the same line, we should not emit diagnostic.
+    /// Note: In practice, `# comment else {z}` makes `else {z}` part of the comment.
+    /// This test verifies the valid case: `if (x) {y} else {z} # comment`
+    /// Validates: Requirement 5.3 - comments on same line should not affect detection
+    #[test]
+    fn test_else_newline_comment_after_else_same_line() {
+        let code = "if (x) {y} else {z} # comment";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should NOT emit diagnostic when else is on same line as closing brace (with trailing comment)"
+        );
+    }
+
+    // ========================================================================
+    // Diagnostic Properties Tests (Task 3.3)
+    // Comprehensive tests for diagnostic properties
+    // Validates: Requirements 3.1, 3.2, 3.3, 3.4
+    // ========================================================================
+
+    /// Comprehensive test for all diagnostic properties.
+    /// Validates: Requirements 3.1 (severity), 3.2 (range), 3.3 (message), 3.4 (source)
+    #[test]
+    fn test_else_newline_diagnostic_properties_comprehensive() {
+        let code = "if (x) {y}\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1, "Should emit exactly one diagnostic");
+
+        let diag = &diagnostics[0];
+
+        // Requirement 3.1: Diagnostic severity SHALL be ERROR
+        assert_eq!(
+            diag.severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Requirement 3.1: Diagnostic severity should be ERROR"
+        );
+
+        // Requirement 3.3: Diagnostic message SHALL be descriptive
+        assert_eq!(
+            diag.message,
+            "In R, 'else' must appear on the same line as the closing '}' of the if block",
+            "Requirement 3.3: Diagnostic message should match expected text exactly"
+        );
+
+        // Requirement 3.2: Diagnostic range SHALL highlight the `else` keyword
+        // "else" is on line 1 (0-indexed), columns 0-4
+        assert_eq!(
+            diag.range.start.line, 1,
+            "Requirement 3.2: Diagnostic range start line should be 1 (0-indexed)"
+        );
+        assert_eq!(
+            diag.range.start.character, 0,
+            "Requirement 3.2: Diagnostic range start character should be 0"
+        );
+        assert_eq!(
+            diag.range.end.line, 1,
+            "Requirement 3.2: Diagnostic range end line should be 1"
+        );
+        assert_eq!(
+            diag.range.end.character, 4,
+            "Requirement 3.2: Diagnostic range end character should be 4 (covering 'else')"
+        );
+    }
+
+    /// Test that diagnostic severity is ERROR for multi-line patterns.
+    /// Validates: Requirement 3.1 - severity should be ERROR
+    #[test]
+    fn test_else_newline_diagnostic_severity_multiline() {
+        let code = "if (condition) {\n  print(1)\n}\nelse {\n  print(2)\n}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1, "Should emit exactly one diagnostic");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "Requirement 3.1: Diagnostic severity should be ERROR for multi-line patterns"
+        );
+    }
+
+    /// Test that diagnostic range accurately covers the else keyword in various positions.
+    /// Validates: Requirement 3.2 - range should highlight else keyword
+    #[test]
+    fn test_else_newline_diagnostic_range_with_indentation() {
+        // else is indented with spaces
+        let code = "if (x) {y}\n    else {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1, "Should emit exactly one diagnostic");
+
+        let diag = &diagnostics[0];
+        // "else" starts at line 1, column 4 (after 4 spaces)
+        assert_eq!(
+            diag.range.start.line, 1,
+            "Diagnostic should start on line 1"
+        );
+        assert_eq!(
+            diag.range.start.character, 4,
+            "Diagnostic should start at column 4 (after indentation)"
+        );
+        assert_eq!(
+            diag.range.end.character, 8,
+            "Diagnostic should end at column 8 (covering 'else')"
+        );
+    }
+
+    /// Test that diagnostic message contains key information.
+    /// Validates: Requirement 3.3 - message should be descriptive
+    #[test]
+    fn test_else_newline_diagnostic_message_content() {
+        let code = "if (x) {y}\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1, "Should emit exactly one diagnostic");
+
+        let message = &diagnostics[0].message;
+
+        // Message should mention 'else'
+        assert!(
+            message.contains("else"),
+            "Requirement 3.3: Message should mention 'else'"
+        );
+
+        // Message should mention 'same line'
+        assert!(
+            message.contains("same line"),
+            "Requirement 3.3: Message should mention 'same line'"
+        );
+
+        // Message should mention the closing brace
+        assert!(
+            message.contains("}") || message.contains("closing"),
+            "Requirement 3.3: Message should mention the closing brace"
+        );
+
+        // Message should mention 'if'
+        assert!(
+            message.contains("if"),
+            "Requirement 3.3: Message should mention 'if'"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6125,6 +6893,547 @@ mod proptests {
                 !var_symbols.is_empty(),
                 "Non-reserved identifier '{}' SHOULD appear in document symbols",
                 var_name
+            );
+        }
+
+        // ========================================================================
+        // **Feature: else-newline-syntax-error, Property 1: Orphaned Else Detection**
+        // **Validates: Requirements 1.1, 2.1, 2.2**
+        //
+        // For any R code where an `else` keyword starts on a different line than
+        // the closing `}` of the preceding `if` block, the detector SHALL emit
+        // exactly one diagnostic for that `else`.
+        // ========================================================================
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 1: Orphaned Else Detection
+        ///
+        /// For any R code where an `else` keyword starts on a different line than
+        /// the closing `}` of the preceding `if` block, the detector SHALL emit
+        /// exactly one diagnostic for that `else`.
+        ///
+        /// **Validates: Requirements 1.1, 2.1, 2.2**
+        fn prop_orphaned_else_detection(
+            condition in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            blank_lines in 0usize..3
+        ) {
+            // Generate code with else on a new line after closing brace
+            // Pattern: if (condition) {body1}\n[blank_lines]\nelse {body2}
+            let newlines = "\n".repeat(blank_lines + 1);
+            let code = format!("if ({}) {{{}}}{newlines}else {{{}}}", condition, body1, body2);
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should emit exactly one diagnostic for the orphaned else
+            prop_assert_eq!(
+                diagnostics.len(),
+                1,
+                "Should emit exactly one diagnostic for orphaned else on new line. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+
+            // Verify diagnostic severity is ERROR
+            prop_assert_eq!(
+                diagnostics[0].severity,
+                Some(DiagnosticSeverity::ERROR),
+                "Diagnostic severity should be ERROR"
+            );
+
+            // Verify diagnostic message mentions 'else' and 'same line'
+            prop_assert!(
+                diagnostics[0].message.contains("else"),
+                "Diagnostic message should mention 'else'"
+            );
+            prop_assert!(
+                diagnostics[0].message.contains("same line"),
+                "Diagnostic message should mention 'same line'"
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 1: Orphaned Else Detection (Multi-line if block)
+        ///
+        /// For any R code with a multi-line if block where `else` appears on a new line
+        /// after the closing `}`, the detector SHALL emit exactly one diagnostic.
+        ///
+        /// **Validates: Requirements 1.1, 2.1, 2.2**
+        fn prop_orphaned_else_detection_multiline_if(
+            condition in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body_lines in 1usize..4,
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate multi-line if block with else on new line
+            // Pattern: if (condition) {\n  body_line1\n  body_line2\n}\nelse {body2}
+            let body_content: String = (0..body_lines)
+                .map(|i| format!("  line{}", i))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let code = format!(
+                "if ({}) {{\n{}\n}}\nelse {{{}}}",
+                condition, body_content, body2
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should emit exactly one diagnostic for the orphaned else
+            prop_assert_eq!(
+                diagnostics.len(),
+                1,
+                "Should emit exactly one diagnostic for orphaned else after multi-line if block. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+
+            // Verify diagnostic severity is ERROR
+            prop_assert_eq!(
+                diagnostics[0].severity,
+                Some(DiagnosticSeverity::ERROR),
+                "Diagnostic severity should be ERROR"
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 1: Orphaned Else Detection (else if pattern)
+        ///
+        /// For any R code where `else if` appears on a new line after the closing `}`,
+        /// the detector SHALL emit exactly one diagnostic for the orphaned `else`.
+        ///
+        /// **Validates: Requirements 1.1, 2.1, 2.2**
+        fn prop_orphaned_else_if_detection(
+            cond1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            cond2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate code with else if on a new line
+            // Pattern: if (cond1) {body1}\nelse if (cond2) {body2}
+            let code = format!(
+                "if ({}) {{{}}}\nelse if ({}) {{{}}}",
+                cond1, body1, cond2, body2
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should emit exactly one diagnostic for the orphaned else
+            prop_assert_eq!(
+                diagnostics.len(),
+                1,
+                "Should emit exactly one diagnostic for orphaned 'else if' on new line. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+
+            // Verify diagnostic severity is ERROR
+            prop_assert_eq!(
+                diagnostics[0].severity,
+                Some(DiagnosticSeverity::ERROR),
+                "Diagnostic severity should be ERROR"
+            );
+        }
+
+        // ========================================================================
+        // **Feature: else-newline-syntax-error, Property 2: Valid Else No Diagnostic**
+        // **Validates: Requirements 1.2, 1.3, 2.3, 2.4**
+        //
+        // For any R code where an `else` keyword appears on the same line as the
+        // closing `}` of the preceding `if` block, the detector SHALL NOT emit
+        // a diagnostic for that `else`.
+        // ========================================================================
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 2: Valid Else No Diagnostic (Single line)
+        ///
+        /// For any R code where `else` appears on the same line as the closing `}`
+        /// of the preceding `if` block (single line format), the detector SHALL NOT
+        /// emit a diagnostic.
+        ///
+        /// **Validates: Requirements 1.2, 1.3, 2.3**
+        fn prop_valid_else_no_diagnostic_single_line(
+            condition in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate valid single-line if-else code
+            // Pattern: if (condition) {body1} else {body2}
+            let code = format!("if ({}) {{{}}} else {{{}}}", condition, body1, body2);
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should NOT emit any diagnostic for valid else on same line
+            prop_assert_eq!(
+                diagnostics.len(),
+                0,
+                "Should NOT emit diagnostic for valid else on same line. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 2: Valid Else No Diagnostic (Multi-line with else on same line as brace)
+        ///
+        /// For any R code with a multi-line if block where `else` appears on the same
+        /// line as the closing `}`, the detector SHALL NOT emit a diagnostic.
+        ///
+        /// **Validates: Requirements 1.2, 1.3, 2.4**
+        fn prop_valid_else_no_diagnostic_multiline(
+            condition in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body_lines in 1usize..4,
+            body2_lines in 1usize..4
+        ) {
+            // Generate multi-line if block with else on same line as closing brace
+            // Pattern: if (condition) {\n  body_line1\n  body_line2\n} else {\n  body2_line1\n}
+            let body1_content: String = (0..body_lines)
+                .map(|i| format!("  line{}", i))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let body2_content: String = (0..body2_lines)
+                .map(|i| format!("  else_line{}", i))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let code = format!(
+                "if ({}) {{\n{}\n}} else {{\n{}\n}}",
+                condition, body1_content, body2_content
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should NOT emit any diagnostic for valid else on same line as closing brace
+            prop_assert_eq!(
+                diagnostics.len(),
+                0,
+                "Should NOT emit diagnostic for valid multi-line if-else. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 2: Valid Else No Diagnostic (else if on same line)
+        ///
+        /// For any R code where `else if` appears on the same line as the closing `}`
+        /// of the preceding `if` block, the detector SHALL NOT emit a diagnostic.
+        ///
+        /// **Validates: Requirements 1.2, 1.3, 2.3, 2.4**
+        fn prop_valid_else_if_no_diagnostic(
+            cond1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            cond2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate valid if-else if code with else if on same line as closing brace
+            // Pattern: if (cond1) {body1} else if (cond2) {body2}
+            let code = format!(
+                "if ({}) {{{}}} else if ({}) {{{}}}",
+                cond1, body1, cond2, body2
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should NOT emit any diagnostic for valid else if on same line
+            prop_assert_eq!(
+                diagnostics.len(),
+                0,
+                "Should NOT emit diagnostic for valid 'else if' on same line. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 2: Valid Else No Diagnostic (Nested valid if-else)
+        ///
+        /// For any nested if-else structure where all `else` keywords appear on the same
+        /// line as their preceding closing `}`, the detector SHALL NOT emit any diagnostic.
+        ///
+        /// **Validates: Requirements 1.2, 1.3, 2.3, 2.4**
+        fn prop_valid_nested_else_no_diagnostic(
+            outer_cond in "[a-z][a-z0-9_]{1,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            inner_cond in "[a-z][a-z0-9_]{1,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body3 in "[a-z][a-z0-9_]{1,6}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate valid nested if-else code
+            // Pattern: if (outer_cond) { if (inner_cond) {body1} else {body2} } else {body3}
+            let code = format!(
+                "if ({}) {{ if ({}) {{{}}} else {{{}}} }} else {{{}}}",
+                outer_cond, inner_cond, body1, body2, body3
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should NOT emit any diagnostic for valid nested if-else
+            prop_assert_eq!(
+                diagnostics.len(),
+                0,
+                "Should NOT emit diagnostic for valid nested if-else. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+        }
+
+        // ========================================================================
+        // **Feature: else-newline-syntax-error, Property 4: Diagnostic Range Accuracy**
+        // **Validates: Requirements 3.2**
+        //
+        // For any detected orphaned `else`, the diagnostic range SHALL start at the
+        // beginning of the `else` keyword and end at the end of the `else` keyword.
+        // ========================================================================
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 4: Diagnostic Range Accuracy
+        ///
+        /// For any detected orphaned `else`, the diagnostic range SHALL start at the
+        /// beginning of the `else` keyword and end at the end of the `else` keyword.
+        ///
+        /// **Validates: Requirements 3.2**
+        fn prop_diagnostic_range_accuracy(
+            condition in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            blank_lines in 0usize..3
+        ) {
+            // Generate code with else on a new line after closing brace
+            // Pattern: if (condition) {body1}\n[blank_lines]\nelse {body2}
+            let newlines = "\n".repeat(blank_lines + 1);
+            let code = format!("if ({}) {{{}}}{newlines}else {{{}}}", condition, body1, body2);
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should emit exactly one diagnostic
+            prop_assert_eq!(
+                diagnostics.len(),
+                1,
+                "Should emit exactly one diagnostic. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+
+            let diagnostic = &diagnostics[0];
+
+            // Calculate expected position of "else" in the generated code
+            // The "else" keyword starts after: "if (condition) {body1}" + newlines
+            let prefix = format!("if ({}) {{{}}}{newlines}", condition, body1);
+            let else_line = prefix.matches('\n').count() as u32;
+            let else_column = 0u32; // "else" starts at column 0 on its line
+
+            // Verify diagnostic range starts at the beginning of "else"
+            prop_assert_eq!(
+                diagnostic.range.start.line,
+                else_line,
+                "Diagnostic start line should match else position. Code: '{}', Expected line: {}, Got: {}",
+                code,
+                else_line,
+                diagnostic.range.start.line
+            );
+            prop_assert_eq!(
+                diagnostic.range.start.character,
+                else_column,
+                "Diagnostic start column should match else position. Code: '{}', Expected column: {}, Got: {}",
+                code,
+                else_column,
+                diagnostic.range.start.character
+            );
+
+            // Verify diagnostic range ends at the end of "else" (4 characters)
+            // The "else" keyword is 4 characters long
+            prop_assert_eq!(
+                diagnostic.range.end.line,
+                else_line,
+                "Diagnostic end line should be same as start line. Code: '{}', Expected: {}, Got: {}",
+                code,
+                else_line,
+                diagnostic.range.end.line
+            );
+            prop_assert_eq!(
+                diagnostic.range.end.character,
+                else_column + 4,
+                "Diagnostic end column should be start + 4 (length of 'else'). Code: '{}', Expected: {}, Got: {}",
+                code,
+                else_column + 4,
+                diagnostic.range.end.character
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 4: Diagnostic Range Accuracy (Multi-line if block)
+        ///
+        /// For any detected orphaned `else` after a multi-line if block, the diagnostic
+        /// range SHALL accurately cover the `else` keyword.
+        ///
+        /// **Validates: Requirements 3.2**
+        fn prop_diagnostic_range_accuracy_multiline(
+            condition in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body_lines in 1usize..4,
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate multi-line if block with else on new line
+            // Pattern: if (condition) {\n  body_line1\n  body_line2\n}\nelse {body2}
+            let body_content: String = (0..body_lines)
+                .map(|i| format!("  line{}", i))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let code = format!(
+                "if ({}) {{\n{}\n}}\nelse {{{}}}",
+                condition, body_content, body2
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should emit exactly one diagnostic
+            prop_assert_eq!(
+                diagnostics.len(),
+                1,
+                "Should emit exactly one diagnostic. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+
+            let diagnostic = &diagnostics[0];
+
+            // Calculate expected position of "else" in the generated code
+            // Line count: 1 (if line) + body_lines + 1 (closing brace line) = body_lines + 2
+            // But 0-indexed, so else is on line (body_lines + 2)
+            let else_line = (body_lines + 2) as u32;
+            let else_column = 0u32; // "else" starts at column 0 on its line
+
+            // Verify diagnostic range starts at the beginning of "else"
+            prop_assert_eq!(
+                diagnostic.range.start.line,
+                else_line,
+                "Diagnostic start line should match else position. Code: '{}', Expected line: {}, Got: {}",
+                code,
+                else_line,
+                diagnostic.range.start.line
+            );
+            prop_assert_eq!(
+                diagnostic.range.start.character,
+                else_column,
+                "Diagnostic start column should match else position. Code: '{}', Expected column: {}, Got: {}",
+                code,
+                else_column,
+                diagnostic.range.start.character
+            );
+
+            // Verify diagnostic range ends at the end of "else" (4 characters)
+            prop_assert_eq!(
+                diagnostic.range.end.line,
+                else_line,
+                "Diagnostic end line should be same as start line. Code: '{}', Expected: {}, Got: {}",
+                code,
+                else_line,
+                diagnostic.range.end.line
+            );
+            prop_assert_eq!(
+                diagnostic.range.end.character,
+                else_column + 4,
+                "Diagnostic end column should be start + 4 (length of 'else'). Code: '{}', Expected: {}, Got: {}",
+                code,
+                else_column + 4,
+                diagnostic.range.end.character
+            );
+        }
+
+        #[test]
+        /// Feature: else-newline-syntax-error, Property 4: Diagnostic Range Accuracy (else if pattern)
+        ///
+        /// For any detected orphaned `else if` on a new line, the diagnostic range SHALL
+        /// accurately cover the `else` keyword (not the entire `else if`).
+        ///
+        /// **Validates: Requirements 3.2**
+        fn prop_diagnostic_range_accuracy_else_if(
+            cond1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            cond2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body1 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            body2 in "[a-z][a-z0-9_]{1,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Generate code with else if on a new line
+            // Pattern: if (cond1) {body1}\nelse if (cond2) {body2}
+            let code = format!(
+                "if ({}) {{{}}}\nelse if ({}) {{{}}}",
+                cond1, body1, cond2, body2
+            );
+
+            let tree = parse_r_code(&code);
+            let mut diagnostics = Vec::new();
+            super::collect_else_newline_errors(tree.root_node(), &code, &mut diagnostics);
+
+            // Should emit exactly one diagnostic
+            prop_assert_eq!(
+                diagnostics.len(),
+                1,
+                "Should emit exactly one diagnostic. Code: '{}', Diagnostics: {:?}",
+                code,
+                diagnostics
+            );
+
+            let diagnostic = &diagnostics[0];
+
+            // The "else" keyword is on line 1 (0-indexed), column 0
+            let else_line = 1u32;
+            let else_column = 0u32;
+
+            // Verify diagnostic range starts at the beginning of "else"
+            prop_assert_eq!(
+                diagnostic.range.start.line,
+                else_line,
+                "Diagnostic start line should match else position. Code: '{}', Expected line: {}, Got: {}",
+                code,
+                else_line,
+                diagnostic.range.start.line
+            );
+            prop_assert_eq!(
+                diagnostic.range.start.character,
+                else_column,
+                "Diagnostic start column should match else position. Code: '{}', Expected column: {}, Got: {}",
+                code,
+                else_column,
+                diagnostic.range.start.character
+            );
+
+            // Verify diagnostic range ends at the end of "else" (4 characters)
+            // Note: The diagnostic should cover just "else", not "else if"
+            prop_assert_eq!(
+                diagnostic.range.end.line,
+                else_line,
+                "Diagnostic end line should be same as start line. Code: '{}', Expected: {}, Got: {}",
+                code,
+                else_line,
+                diagnostic.range.end.line
+            );
+            prop_assert_eq!(
+                diagnostic.range.end.character,
+                else_column + 4,
+                "Diagnostic end column should be start + 4 (length of 'else'). Code: '{}', Expected: {}, Got: {}",
+                code,
+                else_column + 4,
+                diagnostic.range.end.character
             );
         }
     }
