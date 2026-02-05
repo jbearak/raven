@@ -139,7 +139,7 @@ pub struct DeclaredSymbol {
 ScopeEvent::Declaration {
     /// 0-based line of the directive
     line: u32,
-    /// Column (always 0 for directives)
+    /// Column (u32::MAX for end-of-line sentinel, ensuring symbol is available from line+1)
     column: u32,
     /// The declared symbol with full metadata
     symbol: ScopedSymbol,
@@ -155,6 +155,30 @@ When creating a `ScopedSymbol` from a `DeclaredSymbol`:
 - `defined_line`: Line of the directive
 - `defined_column`: 0
 - `signature`: `None` (no signature info available)
+- `is_declared`: `true` (new field to distinguish declared symbols from parsed ones)
+
+### Hover Content Format
+
+When hovering over a declared symbol, the hover content SHALL use this format:
+
+**For declared variables:**
+```
+myvar (declared variable)
+
+Declared via @lsp-var directive at line 5
+```
+
+**For declared functions:**
+```
+myfunc (declared function)
+
+Declared via @lsp-func directive at line 10
+```
+
+The hover content uses markdown formatting and includes:
+1. Symbol name with kind annotation in parentheses
+2. Blank line separator
+3. Declaration source with directive type and 1-based line number (for user display)
 
 ## Correctness Properties
 
@@ -180,9 +204,9 @@ When creating a `ScopedSymbol` from a `DeclaredSymbol`:
 
 ### Property 4: Position-Aware Scope Inclusion
 
-*For any* file with declaration directives at various line positions and any query position (line, column), a declared symbol SHALL appear in scope if and only if its directive line is less than or equal to the query line.
+*For any* file with declaration directives at various line positions and any query position (line, column), a declared symbol SHALL appear in scope if and only if the query line is strictly greater than the directive line (i.e., directive_line < query_line). A symbol declared on line N is available starting from line N+1.
 
-**Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
+**Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6**
 
 ### Property 5: Diagnostic Suppression
 
@@ -198,15 +222,27 @@ When creating a `ScopedSymbol` from a `DeclaredSymbol`:
 
 ### Property 7: Cross-File Declaration Inheritance
 
-*For any* parent file with a declaration directive and a `source()` call, the declared symbol SHALL be available in the sourced child file if and only if the declaration directive appears before the `source()` call in the parent file.
+*For any* parent file with a declaration directive and a `source()` call, the declared symbol SHALL be available in the sourced child file if and only if the declaration directive appears before the `source()` call in the parent file. This holds regardless of whether `local=TRUE` is used in the source() call.
 
-**Validates: Requirements 9.1, 9.2, 9.3**
+**Validates: Requirements 9.1, 9.2, 9.3, 9.4**
 
 ### Property 8: Interface Hash Sensitivity
 
 *For any* file, the interface hash SHALL change when a declaration directive is added, removed, or when a declared symbol's name changes. The hash SHALL remain stable when only non-declaration content changes.
 
 **Validates: Requirements 10.1, 10.2, 10.3, 10.4**
+
+### Property 9: Conflicting Declaration Resolution
+
+*For any* file where the same symbol name is declared as both a variable and a function, the later declaration (by line number) SHALL determine the symbol kind for completions and hover. Diagnostic suppression SHALL apply regardless of which declaration comes first.
+
+**Validates: Requirements 11.1, 11.2, 11.3, 11.4**
+
+### Property 10: Workspace Index Declaration Extraction
+
+*For any* file indexed by the workspace indexer, declared symbols SHALL be extracted and stored such that when the file participates in a dependency chain, its declared symbols are available during scope resolution.
+
+**Validates: Requirements 12.1, 12.2, 12.3**
 
 ## Error Handling
 
@@ -225,10 +261,18 @@ When a directive has an empty or whitespace-only symbol name:
 
 ### Duplicate Declarations
 
-When the same symbol is declared multiple times:
+When the same symbol is declared multiple times with the same kind:
 - All declarations are stored in metadata
 - The first declaration (by line number) takes precedence for go-to-definition
 - All declarations suppress diagnostics for that symbol name
+
+### Conflicting Declaration Kinds
+
+When the same symbol is declared as both a variable and a function:
+- Both declarations are stored in metadata
+- The later declaration (by line number) determines the symbol kind for completions and hover
+- The first declaration (by line number) is used for go-to-definition
+- Diagnostic suppression applies regardless of kind (the symbol exists in either case)
 
 ### Invalid Characters in Symbol Names
 
@@ -254,28 +298,45 @@ R allows many characters in symbol names when backtick-quoted. For declaration d
    - Test round-trip serialization of declared symbols
    - Test default values for new fields
 
-3. **Scope Resolution Tests** (`scope.rs`)
-   - Test declared symbols appear in scope after directive line
+3. **Metadata Update Tests** (`directive.rs`)
+   - Test that re-parsing a file updates declared symbols to reflect current directives
+   - Test that removing a directive removes the declared symbol
+   - Test that adding a directive adds the declared symbol
+
+4. **Scope Resolution Tests** (`scope.rs`)
+   - Test declared symbols appear in scope after directive line (line N+1)
+   - Test declared symbols do NOT appear on directive line itself (line N)
    - Test declared symbols do NOT appear before directive line
    - Test function vs variable kind distinction
    - Test timeline ordering with mixed events
+   - Test same-line code and directive (symbol available from next line only)
 
-4. **Diagnostic Tests** (`handlers.rs`)
+5. **Diagnostic Tests** (`handlers.rs`)
    - Test undefined variable suppression for declared variables
    - Test undefined variable suppression for declared functions
    - Test diagnostics still emitted for undeclared symbols
    - Test diagnostics emitted when usage is before declaration
+   - Test diagnostics emitted when usage is on same line as declaration
 
-5. **Completion Tests** (`handlers.rs`)
+6. **Completion Tests** (`handlers.rs`)
    - Test declared symbols appear in completions
    - Test correct CompletionItemKind for functions vs variables
+   - Test declared symbols do NOT appear in completions on declaration line
 
-6. **Hover Tests** (`handlers.rs`)
-   - Test hover shows declaration info
-   - Test hover includes directive line number
+7. **Hover Tests** (`handlers.rs`)
+   - Test hover shows declaration info with correct format
+   - Test hover includes 1-based directive line number
+   - Test hover shows "declared variable" vs "declared function" appropriately
 
-7. **Go-to-Definition Tests** (`handlers.rs`)
+8. **Go-to-Definition Tests** (`handlers.rs`)
    - Test navigation to directive line
+   - Test navigation to first declaration when symbol declared multiple times
+   - Test navigation to first declaration when symbol has conflicting kinds
+
+9. **Conflicting Declaration Tests** (`scope.rs`, `handlers.rs`)
+   - Test later declaration determines symbol kind
+   - Test diagnostic suppression works regardless of declaration order
+   - Test go-to-definition uses first declaration
 
 ### Property-Based Tests
 
@@ -322,7 +383,8 @@ Property tests should run minimum 100 iterations each. Each test must be tagged 
    - Generate parent files with declarations and source() calls
    - Generate child files
    - Verify declared symbol availability follows source() position
-   - _Requirements: 9.1, 9.2, 9.3_
+   - Include tests with `local=TRUE` to verify declarations still propagate
+   - _Requirements: 9.1, 9.2, 9.3, 9.4_
 
 8. **Property 8: Interface Hash Sensitivity**
    - Generate files with and without declarations
@@ -331,15 +393,34 @@ Property tests should run minimum 100 iterations each. Each test must be tagged 
    - Verify hash stable when non-declaration content changes
    - _Requirements: 10.1, 10.2, 10.3, 10.4_
 
+9. **Property 9: Conflicting Declaration Resolution**
+   - Generate files with same symbol declared as both variable and function
+   - Verify later declaration determines symbol kind for completions
+   - Verify first declaration is used for go-to-definition
+   - Verify diagnostic suppression applies regardless of declaration order
+   - _Requirements: 11.1, 11.2, 11.3, 11.4_
+
+10. **Property 10: Workspace Index Declaration Extraction**
+    - Generate files with declarations, index them via workspace indexer
+    - Verify declared symbols are available when file is in dependency chain
+    - Verify re-opening file updates declarations from live content
+    - _Requirements: 12.1, 12.2, 12.3_
+
 ### Integration Tests
 
 1. **Cross-File Declaration Inheritance**
    - Parent file with declaration before source()
    - Verify child file has access to declared symbol
+   - Test with `local=TRUE` source() calls - declarations should still propagate
 
-2. **LSP Feature Integration**
+2. **Workspace Index Integration**
+   - Index file with declarations (without opening)
+   - Open dependent file that sources the indexed file
+   - Verify declared symbols from indexed file are available
+
+3. **LSP Feature Integration**
    - Test completion includes declared symbols
-   - Test hover shows declaration info
+   - Test hover shows declaration info with correct format
    - Test go-to-definition navigates to directive
 
 ## Implementation Notes
@@ -354,7 +435,13 @@ The regex patterns follow the existing directive pattern style:
 
 ### Timeline Ordering
 
-Declaration events are inserted into the timeline at their directive line position with column 0. This ensures correct ordering relative to other scope events (definitions, source calls, removals).
+Declaration events are inserted into the timeline at their directive line position with column set to `u32::MAX` (end-of-line sentinel). This ensures:
+
+1. The declared symbol is NOT available on the directive line itself
+2. The declared symbol IS available starting from the next line (line N+1)
+3. Correct ordering relative to other scope events on the same line
+
+This "available on next line" semantics matches the behavior of `source()` calls: symbols from a sourced file are available after the source() statement, not on the same line. Using the end-of-line sentinel column achieves this without special-casing the comparison logic.
 
 ### Interface Hash Computation
 
@@ -365,7 +452,7 @@ The interface hash must include declared symbols to ensure proper cache invalida
 
 ### Cross-File Propagation
 
-Declared symbols follow the same inheritance rules as regular symbols:
-- Available in child files sourced after the declaration
-- Not available in child files sourced before the declaration
-- Respect `local=TRUE` scoping rules
+Declared symbols follow position-based inheritance rules:
+- Available in child files sourced after the declaration line
+- Not available in child files sourced before the declaration line
+- **Note on `local=TRUE`**: Unlike regular symbols (which are not exported when `local=TRUE`), declared symbols are always visible in child files regardless of the `local` parameter. This is because declarations describe symbol existence for diagnostic suppression purposes, not runtime scoping behavior. A declared symbol represents "this symbol will exist at runtime" rather than "this symbol should be exported."

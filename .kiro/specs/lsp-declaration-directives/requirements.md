@@ -63,9 +63,10 @@ R code frequently creates symbols through dynamic mechanisms like `eval()`, `ass
 
 1. WHEN computing scope at a position, THE Scope_Resolution SHALL include declared symbols from directives appearing before that position
 2. WHEN computing scope at a position, THE Scope_Resolution SHALL NOT include declared symbols from directives appearing after that position
-3. WHEN a declared variable directive appears at line N, THE declared variable SHALL be available starting from line N
-4. WHEN a declared function directive appears at line N, THE declared function SHALL be available starting from line N
+3. WHEN a declared variable directive appears at line N, THE declared variable SHALL be available starting from line N+1 (the line after the directive)
+4. WHEN a declared function directive appears at line N, THE declared function SHALL be available starting from line N+1 (the line after the directive)
 5. THE Timeline SHALL include declaration events in document order alongside other scope events
+6. WHEN a directive appears on a line with code (e.g., `x <- 1 # @lsp-var foo`), THE declared symbol SHALL be available starting from line N+1, not on line N
 
 ### Requirement 5: Undefined Variable Diagnostic Suppression
 
@@ -117,6 +118,7 @@ R code frequently creates symbols through dynamic mechanisms like `eval()`, `ass
 1. WHEN a parent file declares a symbol before a source() call, THE declared symbol SHALL be available in the sourced child file
 2. WHEN a parent file declares a symbol after a source() call, THE declared symbol SHALL NOT be available in the sourced child file
 3. WHEN traversing the dependency chain, THE declared symbols SHALL follow the same inheritance rules as regular symbols
+4. WHEN a source() call uses `local=TRUE`, THE declared symbols from the parent SHALL still be visible in the child file (declarations describe symbol existence, not export behavior)
 
 ### Requirement 10: Interface Hash Update
 
@@ -128,3 +130,24 @@ R code frequently creates symbols through dynamic mechanisms like `eval()`, `ass
 2. WHEN a declaration directive is removed from a file, THE interface hash SHALL change
 3. WHEN a declaration directive's symbol name changes, THE interface hash SHALL change
 4. WHEN only non-declaration content changes, THE interface hash change behavior SHALL remain unchanged
+
+### Requirement 11: Conflicting Declaration Types
+
+**User Story:** As an R developer, I want clear behavior when the same symbol is declared as both a variable and a function.
+
+#### Acceptance Criteria
+
+1. WHEN the same symbol name is declared as both a variable (`@lsp-var`) and a function (`@lsp-func`), THE later declaration SHALL take precedence for symbol kind
+2. WHEN conflicting declarations exist, THE diagnostic suppression SHALL apply regardless of kind (the symbol exists)
+3. WHEN conflicting declarations exist, THE go-to-definition SHALL navigate to the first declaration by line number
+4. WHEN conflicting declarations exist, THE completion item kind SHALL reflect the later declaration's kind
+
+### Requirement 12: Workspace Index Integration
+
+**User Story:** As an R developer, I want declared symbols from indexed (but not open) files to be available when those files are part of the dependency chain.
+
+#### Acceptance Criteria
+
+1. WHEN a closed file is indexed by the workspace indexer, THE declared symbols SHALL be extracted and stored
+2. WHEN a dependency chain includes an indexed (closed) file with declarations, THE declared symbols SHALL be available in scope resolution
+3. WHEN an indexed file is opened, THE declared symbols SHALL be re-extracted from the live document content
