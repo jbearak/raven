@@ -23356,6 +23356,18 @@ proptest! {
         // This is what background_indexer.rs does when indexing a closed file
         let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
 
+        // Skip cases where the generated symbol name conflicts with real definitions
+        // in the test code ("y <- 42" or prefix vars "x0 <- 0", etc.). When a symbol
+        // has both a real definition and a declaration directive, the real definition
+        // correctly takes precedence (is_declared == false).
+        let prefix_names: Vec<String> = (0..prefix_lines)
+            .map(|i| format!("x{}", i))
+            .collect();
+        prop_assume!(
+            symbol_name != "y" && !prefix_names.contains(&symbol_name),
+            "Symbol name conflicts with a real definition in the test code"
+        );
+
         // Requirement 12.1: Declared symbols should be extracted and stored
         // Check that the declared symbol is in the exported interface
         prop_assert!(
@@ -23527,8 +23539,12 @@ proptest! {
 
         // Skip if old and new symbols are the same (can't test re-extraction)
         prop_assume!(old_symbol != new_symbol);
-        // Skip if symbols conflict with parent's own definitions
+        // Skip if symbols conflict with real definitions in test code.
+        // Old code has "y <- 42", new code has "z <- 99", parent has "parent_var <- 1".
+        // Real definitions take precedence over declarations, which would break assertions.
         prop_assume!(old_symbol != "parent_var" && new_symbol != "parent_var");
+        prop_assume!(old_symbol != "y" && new_symbol != "y");
+        prop_assume!(old_symbol != "z" && new_symbol != "z");
 
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");

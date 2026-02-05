@@ -1792,18 +1792,28 @@ where
                 // Include if declaration position is before or at the query position.
                 if (*decl_line, *decl_col) <= (line, column) {
                     // Declared symbols are always global scope (not function-local)
-                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| {
-                        log::trace!(
-                            "  Found declared symbol: {} ({})",
-                            symbol.name,
-                            match symbol.kind {
-                                SymbolKind::Function => "function",
-                                SymbolKind::Variable => "variable",
-                                SymbolKind::Parameter => "parameter",
+                    // Only insert if no real (non-declared) definition exists;
+                    // among declared symbols, later ones win (timeline is sorted).
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
                             }
-                        );
-                        symbol.clone()
-                    });
+                        })
+                        .or_insert_with(|| {
+                            log::trace!(
+                                "  Found declared symbol: {} ({})",
+                                symbol.name,
+                                match symbol.kind {
+                                    SymbolKind::Function => "function",
+                                    SymbolKind::Variable => "variable",
+                                    SymbolKind::Parameter => "parameter",
+                                }
+                            );
+                            symbol.clone()
+                        });
                 }
             }
         }
@@ -2268,13 +2278,16 @@ fn compute_interface_hash(
         package.hash(&mut hasher);
     }
 
-    // Include declared symbols in the hash (sorted by name for determinism)
+    // Include declared symbols in the hash (sorted for determinism)
     // This ensures cache invalidation when declarations change (Requirements 10.1-10.4)
+    // Line is included because moving a directive across a source() call changes
+    // which sourced files can see the symbol (position-aware visibility).
     let mut sorted_declared: Vec<_> = declared_symbols.iter().collect();
-    sorted_declared.sort_by_key(|d| &d.name);
+    sorted_declared.sort_by_key(|d| (&d.name, d.is_function, d.line));
     for decl in sorted_declared {
         decl.name.hash(&mut hasher);
         decl.is_function.hash(&mut hasher);
+        decl.line.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -2868,8 +2881,17 @@ where
                 // Include if declaration position is before or at the query position.
                 if (*decl_line, *decl_col) <= (line, column) {
                     // Declared symbols are always global scope (not function-local)
-                    // Local definitions take precedence over declared symbols
-                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| symbol.clone());
+                    // Only insert if no real (non-declared) definition exists;
+                    // among declared symbols, later ones win (timeline is sorted).
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| symbol.clone());
                 }
             }
         }
