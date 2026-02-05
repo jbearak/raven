@@ -42,24 +42,43 @@ pub struct BackwardDirective {
 }
 
 /// A forward source (directive or detected source() call)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ForwardSource {
+    #[serde(default)]
     pub path: String,
     /// 0-based line
+    #[serde(default)]
     pub line: u32,
     /// 0-based UTF-16 column
+    #[serde(default)]
     pub column: u32,
     /// true if @lsp-source directive, false if detected source()
+    #[serde(default)]
     pub is_directive: bool,
     /// source(..., local = TRUE)
+    #[serde(default)]
     pub local: bool,
     /// source(..., chdir = TRUE)
+    #[serde(default)]
     pub chdir: bool,
     /// true for sys.source(), false for source()
+    #[serde(default)]
     pub is_sys_source: bool,
     /// For sys.source: true if envir=globalenv()/.GlobalEnv, false otherwise
     /// When false for sys.source, symbols are NOT inherited (treated as local)
+    /// Default is true for regular source() calls
+    #[serde(default = "default_sys_source_global_env")]
     pub sys_source_global_env: bool,
+    /// true if the directive had an explicit `line=N` parameter
+    /// Used to determine if redundancy diagnostics should be emitted.
+    /// Only relevant when is_directive=true.
+    /// _Requirements: 6.2_
+    #[serde(default)]
+    pub explicit_line: bool,
+}
+
+fn default_sys_source_global_env() -> bool {
+    true
 }
 
 impl ForwardSource {
@@ -209,7 +228,7 @@ mod tests {
             local: true,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
+            sys_source_global_env: true, ..Default::default()
         };
         let uri = Url::parse("file:///test.R").unwrap();
         let key = source.to_key(uri.clone());
@@ -238,7 +257,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             working_directory: Some("/data".to_string()),
             inherited_working_directory: None,
@@ -314,7 +333,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             working_directory: Some("/child/explicit".to_string()),
             inherited_working_directory: Some("/parent/inherited".to_string()),
@@ -365,7 +384,7 @@ mod tests {
             local: true,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
+            sys_source_global_env: true, ..Default::default()
         };
         assert!(!source.inherits_symbols());
     }
@@ -380,7 +399,7 @@ mod tests {
             local: false,
             chdir: false,
             is_sys_source: true,
-            sys_source_global_env: false,
+            sys_source_global_env: false, ..Default::default()
         };
         assert!(!source.inherits_symbols());
     }
@@ -395,7 +414,7 @@ mod tests {
             local: false,
             chdir: false,
             is_sys_source: true,
-            sys_source_global_env: true,
+            sys_source_global_env: true, ..Default::default()
         };
         assert!(source.inherits_symbols());
     }
@@ -410,7 +429,7 @@ mod tests {
             local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
+            sys_source_global_env: true, ..Default::default()
         };
         assert!(source.inherits_symbols());
     }

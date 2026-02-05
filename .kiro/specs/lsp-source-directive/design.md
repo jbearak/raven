@@ -23,7 +23,7 @@ Forward directives are useful when:
 
 The implementation extends the existing cross-file awareness system with minimal changes:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Cross-File Architecture                       │
 ├─────────────────────────────────────────────────────────────────┤
@@ -113,7 +113,7 @@ let resolved = resolve_path(&directive.path, &backward_ctx)?;
 
 #### Conflict Resolution Logic
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │              Directive-vs-AST Conflict Resolution                │
 ├─────────────────────────────────────────────────────────────────┤

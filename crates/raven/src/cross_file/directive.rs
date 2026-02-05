@@ -108,17 +108,18 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             // Parse line=N parameter from capture group 4 if present
             // Convert from 1-based user input to 0-based internal (N-1)
             // Use directive's own line when no line= parameter
-            let call_site_line = if let Some(line_match) = caps.get(4) {
+            let (call_site_line, has_explicit_line) = if let Some(line_match) = caps.get(4) {
                 let user_line: u32 = line_match.as_str().parse().unwrap_or(1);
-                user_line.saturating_sub(1)
+                (user_line.saturating_sub(1), true)
             } else {
-                line_num
+                (line_num, false)
             };
             log::trace!(
-                "  Parsed forward directive at line {}: path='{}' call_site_line={}",
+                "  Parsed forward directive at line {}: path='{}' call_site_line={} explicit_line={}",
                 line_num,
                 path,
-                call_site_line
+                call_site_line,
+                has_explicit_line
             );
             meta.sources.push(ForwardSource {
                 path,
@@ -129,6 +130,7 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 chdir: false,
                 is_sys_source: false,
                 sys_source_global_env: true,
+                explicit_line: has_explicit_line,
             });
             continue;
         }

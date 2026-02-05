@@ -631,14 +631,14 @@ pub struct ScopeAtPosition {
 /// let s = ForwardSource {
 ///     local: true,
 ///     is_sys_source: false,
-///     sys_source_global_env: false,
+///     sys_source_global_env: false, ..Default::default()
 /// };
 /// assert!(should_apply_local_scoping(&s));
 ///
 /// let t = ForwardSource {
 ///     local: false,
 ///     is_sys_source: true,
-///     sys_source_global_env: false,
+///     sys_source_global_env: false, ..Default::default()
 /// };
 /// assert!(should_apply_local_scoping(&t));
 ///
@@ -909,10 +909,14 @@ pub fn compute_artifacts_with_metadata(
     // Collect source() calls from AST and add them to timeline.
     let ast_source_calls = detect_source_calls(tree, content);
     
-    // Track which (line, column) positions have AST sources to avoid duplicates
-    let ast_positions: std::collections::HashSet<(u32, u32)> = ast_source_calls
+    // Track which (line, path) pairs have AST sources to avoid duplicates
+    // We use (line, path) instead of just (line, column) because:
+    // 1. Directive sources have column=0, so column-based matching doesn't work
+    // 2. Multiple source() calls on the same line to different files should all be kept
+    // 3. A directive should only be suppressed if an AST source to the SAME file exists
+    let ast_line_paths: std::collections::HashSet<(u32, String)> = ast_source_calls
         .iter()
-        .map(|s| (s.line, s.column))
+        .map(|s| (s.line, s.path.clone()))
         .collect();
     
     // Add AST-detected sources to timeline
@@ -929,10 +933,10 @@ pub fn compute_artifacts_with_metadata(
     if let Some(meta) = metadata {
         for source in &meta.sources {
             if source.is_directive {
-                // Check if there's already an AST source at the same position
-                // (Directive sources have column=0, so we check by line only for directives)
-                let has_ast_at_same_line = ast_positions.iter().any(|(line, _)| *line == source.line);
-                if !has_ast_at_same_line {
+                // Check if there's already an AST source at the same line pointing to the same path
+                // Only suppress the directive if an AST source to the SAME file exists at the same line
+                let has_ast_same_line_and_path = ast_line_paths.contains(&(source.line, source.path.clone()));
+                if !has_ast_same_line_and_path {
                     artifacts.timeline.push(ScopeEvent::Source {
                         line: source.line,
                         column: source.column,
@@ -2974,7 +2978,7 @@ mod tests {
             local: false, // local=FALSE
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: false,
+            sys_source_global_env: false, ..Default::default()
         };
 
         assert!(
@@ -3018,7 +3022,7 @@ mod tests {
             local: true, // local=TRUE
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: false,
+            sys_source_global_env: false, ..Default::default()
         };
 
         assert!(
@@ -3135,7 +3139,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3209,7 +3213,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3354,7 +3358,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3367,7 +3371,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3443,7 +3447,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             },
         });
         parent_artifacts.timeline.sort_by_key(|e| match e {
@@ -3539,7 +3543,7 @@ mod tests {
                 local: false,
                 chdir: true, // chdir=TRUE
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3552,7 +3556,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3644,7 +3648,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -4342,7 +4346,7 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             },
             ScopeEvent::Removal {
@@ -4414,7 +4418,7 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             },
             ScopeEvent::FunctionScope {
@@ -5599,7 +5603,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -5708,7 +5712,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -5994,7 +5998,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6110,7 +6114,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6192,7 +6196,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6289,7 +6293,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6302,7 +6306,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8012,7 +8016,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8088,7 +8092,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8163,7 +8167,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8243,7 +8247,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8323,7 +8327,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8401,7 +8405,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8491,7 +8495,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8511,7 +8515,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8614,7 +8618,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };

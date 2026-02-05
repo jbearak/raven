@@ -1318,6 +1318,9 @@ fn collect_missing_package_diagnostics(
 /// target file exists at an earlier line. In this case, the directive provides no additional
 /// information since the source() call already makes the symbols available earlier.
 ///
+/// Directives WITH an explicit `line=N` parameter are never considered redundant because
+/// they explicitly specify a different call-site position for scope resolution purposes.
+///
 /// The diagnostic severity is configurable via `crossFile.redundantDirectiveSeverity`.
 /// Setting it to "off" disables this diagnostic entirely.
 ///
@@ -1351,13 +1354,17 @@ fn collect_redundant_directive_diagnostics(
         None => return,
     };
 
-    // Collect directive sources and AST sources separately
+    // Collect directive sources (without explicit line=) and AST sources separately
+    // Directives WITH explicit_line are never considered redundant (Requirement 6.2)
     let mut directive_sources: Vec<&crate::cross_file::types::ForwardSource> = Vec::new();
     let mut ast_sources: Vec<&crate::cross_file::types::ForwardSource> = Vec::new();
 
     for source in &meta.sources {
         if source.is_directive {
-            directive_sources.push(source);
+            // Only consider directives WITHOUT explicit line= for redundancy checking
+            if !source.explicit_line {
+                directive_sources.push(source);
+            }
         } else {
             ast_sources.push(source);
         }
@@ -2330,7 +2337,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
                 // from parent files, not just the current file's directives
                 state.get_enriched_metadata(uri).unwrap_or_default()
             }
-            _ => Default::default(),
+            _ => Default::default()
         };
         let workspace_root = state.workspace_folders.first();
 
@@ -3288,7 +3295,7 @@ pub fn goto_definition(
                 // from parent files, not just the current file's directives
                 state.get_enriched_metadata(uri).unwrap_or_default()
             }
-            _ => Default::default(),
+            _ => Default::default()
         };
 
         if let Some(location) = crate::file_path_intellisense::file_path_definition(
@@ -9010,7 +9017,7 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -9020,7 +9027,7 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -9074,7 +9081,7 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -9084,7 +9091,7 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -9132,7 +9139,7 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -9142,7 +9149,7 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()

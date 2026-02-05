@@ -1191,7 +1191,7 @@ fn make_meta_with_sources(sources: Vec<(&str, u32)>) -> CrossFileMetadata {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             })
             .collect(),
         ..Default::default()
@@ -1398,7 +1398,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
@@ -1408,7 +1408,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1442,7 +1442,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
@@ -1452,7 +1452,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1512,7 +1512,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: child_file,
@@ -1522,7 +1522,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18011,7 +18011,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -18122,7 +18122,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             })
             .collect();
 
@@ -18413,7 +18413,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // AST-detected source() call (is_directive=false)
                 ForwardSource {
@@ -18424,7 +18424,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18536,7 +18536,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // AST-detected source() at different column
                 ForwardSource {
@@ -18547,7 +18547,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18641,7 +18641,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // AST-detected source() at EXACT same position
                 ForwardSource {
@@ -18652,7 +18652,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18752,7 +18752,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // target1: source() at same call site
                 ForwardSource {
@@ -18763,7 +18763,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // target2: only source() (no conflict)
                 ForwardSource {
@@ -18774,7 +18774,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18876,7 +18876,7 @@ proptest! {
             local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
+            sys_source_global_env: true, ..Default::default()
         };
 
         let ast_source = ForwardSource {
@@ -18887,7 +18887,7 @@ proptest! {
             local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
+            sys_source_global_env: true, ..Default::default()
         };
 
         // Create metadata with sources in different orders based on directive_first
@@ -19013,7 +19013,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // AST-detected source() call (is_directive=false) at source_line
                 ForwardSource {
@@ -19024,7 +19024,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19151,7 +19151,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: target_filename.clone(),
@@ -19161,7 +19161,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19251,7 +19251,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: target_filename.clone(),
@@ -19261,7 +19261,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19366,7 +19366,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // target1: source()
                 ForwardSource {
@@ -19377,7 +19377,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 // target2: only source()
                 ForwardSource {
@@ -19388,7 +19388,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19499,7 +19499,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: target_filename.clone(),
@@ -19509,7 +19509,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19629,7 +19629,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19801,7 +19801,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19971,7 +19971,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -20137,7 +20137,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -20286,7 +20286,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -20380,7 +20380,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             })
             .collect();
 
@@ -20562,7 +20562,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -20656,7 +20656,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -20765,7 +20765,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -20829,7 +20829,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -20909,7 +20909,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -20933,7 +20933,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -21016,7 +21016,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: child_b_file.clone(),
@@ -21026,7 +21026,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -21048,7 +21048,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
                 ForwardSource {
                     path: child_c_file.clone(),
@@ -21058,7 +21058,7 @@ proptest! {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             ],
             ..Default::default()
@@ -21147,7 +21147,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -21171,7 +21171,7 @@ proptest! {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
