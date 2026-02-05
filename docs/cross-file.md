@@ -83,7 +83,27 @@ Path resolution:
 - Paths starting with `/` are workspace-root-relative (e.g., `/data` -> `<workspace>/data`)
 - Other paths are file-relative (e.g., `../shared` -> parent directory's `shared`)
 
-**Note:** Working directory directives affect path resolution for `source()` calls and forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`). Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) always resolve paths relative to the file's directory, ignoring any `@lsp-cd` setting.
+#### Critical: @lsp-cd Affects Forward Directives and source() Only
+
+| Directive Type | Examples | Uses @lsp-cd? | Rationale |
+|----------------|----------|---------------|-----------|
+| **Forward** | `@lsp-source`, `@lsp-run`, `@lsp-include` | **YES** | Semantically equivalent to `source()` calls |
+| **Backward** | `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by` | **NO** | Describes static file relationships |
+| **source() calls** | `source("file.R")` | **YES** | Runtime behavior affected by working directory |
+
+**Why this distinction?**
+- **Forward directives** and **source() calls** describe runtime execution behavior. They are semantically equivalent to R's `source()` function, which is affected by the current working directory at runtime.
+- **Backward directives** describe static file relationships from the child's perspective. They declare "this file is sourced by that parent file" - a relationship that should NOT change based on runtime working directory.
+
+**Example:**
+```r
+# File: subdir/child.R
+# @lsp-cd /some/other/directory
+# @lsp-run-by ../parent.R      # Resolves to parent.R in workspace root (ignores @lsp-cd)
+# @lsp-source utils.R          # Resolves to /some/other/directory/utils.R (uses @lsp-cd)
+
+source("helpers.R")            # Resolves to /some/other/directory/helpers.R (uses @lsp-cd)
+```
 
 ### Working Directory Inheritance
 

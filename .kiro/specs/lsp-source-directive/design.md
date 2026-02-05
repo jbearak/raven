@@ -19,6 +19,30 @@ Forward directives are useful when:
 
 3. **Both edges kept at different call sites**: When a directive and `source()` call point to the same file but at different lines, both edges are preserved (symbols become available at the earliest call site).
 
+### Critical: Forward vs Backward Directive Path Resolution
+
+**This distinction is fundamental to the cross-file architecture and MUST NOT be changed:**
+
+| Directive Type | Examples | Uses @lsp-cd? | Rationale |
+|----------------|----------|---------------|-----------|
+| **Forward** | `@lsp-source`, `@lsp-run`, `@lsp-include` | **YES** | Semantically equivalent to `source()` calls; describes runtime execution |
+| **Backward** | `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by` | **NO** | Describes static file relationships from child's perspective |
+| **source() calls** | `source("file.R")` | **YES** | Runtime behavior affected by working directory |
+
+**Implementation:**
+- Forward directives and source() calls use `PathContext::from_metadata()` which includes `@lsp-cd`
+- Backward directives use `PathContext::new()` which ignores `@lsp-cd`
+
+**Example:**
+```r
+# File: subdir/child.R
+# @lsp-cd: /some/other/directory
+# @lsp-run-by: ../parent.R      # Resolves to parent.R in workspace root (ignores @lsp-cd)
+# @lsp-source: utils.R          # Resolves to /some/other/directory/utils.R (uses @lsp-cd)
+
+source("helpers.R")             # Resolves to /some/other/directory/helpers.R (uses @lsp-cd)
+```
+
 ## Architecture
 
 The implementation extends the existing cross-file awareness system with minimal changes:

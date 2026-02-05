@@ -49,10 +49,22 @@ This document specifies the requirements for adding the `@lsp-source` forward di
 
 #### Acceptance Criteria
 
-1. WHEN the path is relative (e.g., `utils.R`, `../shared/common.R`), THE Path_Resolver SHALL resolve it relative to the directive's file directory
+1. WHEN the path is relative (e.g., `utils.R`, `../shared/common.R`) AND no `@lsp-cd` directive is present, THE Path_Resolver SHALL resolve it relative to the directive's file directory
 2. WHEN the path starts with `/` (workspace-root-relative), THE Path_Resolver SHALL resolve it relative to the workspace root
 3. WHEN the resolved path does not exist, THE Dependency_Graph SHALL NOT create an edge for that directive
 4. WHEN the file has an `@lsp-cd` directive, THE Path_Resolver SHALL use the working directory for resolving `@lsp-source` paths (unlike backward directives which ignore `@lsp-cd`)
+
+#### Critical Design Note: Forward vs Backward Directive Path Resolution
+
+**Forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`) MUST respect `@lsp-cd`** because they are semantically equivalent to `source()` calls. They describe runtime execution behavior ("this file sources that child file"), so they should resolve paths the same way R's `source()` function would at runtime.
+
+**Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) MUST ignore `@lsp-cd`** because they describe static file relationships from the child's perspective. They declare "this file is sourced by that parent file" - a relationship that should not change based on runtime working directory.
+
+| Directive Type | Examples | Uses @lsp-cd? | PathContext Constructor |
+|----------------|----------|---------------|------------------------|
+| Forward | `@lsp-source`, `@lsp-run`, `@lsp-include` | YES | `PathContext::from_metadata()` |
+| Backward | `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by` | NO | `PathContext::new()` |
+| source() calls | `source("file.R")` | YES | `PathContext::from_metadata()` |
 
 ### Requirement 4: Dependency Graph Integration
 
