@@ -63,6 +63,10 @@ pub struct CrossFileConfig {
     pub packages_r_path: Option<PathBuf>,
     /// Severity for missing package diagnostics
     pub packages_missing_package_severity: DiagnosticSeverity,
+    /// Severity for redundant directive diagnostics (when @lsp-source without line= targets
+    /// same file as earlier source() call)
+    /// _Requirements: 6.2_
+    pub redundant_directive_severity: Option<DiagnosticSeverity>,
 }
 
 impl Default for CrossFileConfig {
@@ -106,6 +110,7 @@ impl Default for CrossFileConfig {
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
             packages_missing_package_severity: DiagnosticSeverity::WARNING,
+            redundant_directive_severity: Some(DiagnosticSeverity::HINT),
         }
     }
 }
@@ -146,6 +151,11 @@ mod tests {
         assert_eq!(
             config.packages_missing_package_severity,
             DiagnosticSeverity::WARNING
+        );
+        // Redundant directive severity defaults
+        assert_eq!(
+            config.redundant_directive_severity,
+            Some(DiagnosticSeverity::HINT)
         );
     }
 

@@ -631,14 +631,14 @@ pub struct ScopeAtPosition {
 /// let s = ForwardSource {
 ///     local: true,
 ///     is_sys_source: false,
-///     sys_source_global_env: false,
+///     sys_source_global_env: false, ..Default::default()
 /// };
 /// assert!(should_apply_local_scoping(&s));
 ///
 /// let t = ForwardSource {
 ///     local: false,
 ///     is_sys_source: true,
-///     sys_source_global_env: false,
+///     sys_source_global_env: false, ..Default::default()
 /// };
 /// assert!(should_apply_local_scoping(&t));
 ///
@@ -846,6 +846,198 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
 
     // Extract package names from PackageLoad events for interface hash computation
     // (Requirement 14.5: interface hash must include loaded packages for cache invalidation)
+    let loaded_packages: Vec<String> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| {
+            if let ScopeEvent::PackageLoad { package, .. } = event {
+                Some(package.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Compute interface hash including both symbols and loaded packages
+    artifacts.interface_hash =
+        compute_interface_hash(&artifacts.exported_interface, &loaded_packages);
+
+    artifacts
+}
+
+/// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
+///
+/// This is an extended version of `compute_artifacts` that also includes forward directive sources
+/// (`@lsp-source`, `@lsp-run`, `@lsp-include`) from the metadata in the timeline. This ensures that
+/// symbols from files referenced by forward directives are available in scope resolution.
+///
+/// The function:
+/// - collects symbol and function-scope definitions from the AST,
+/// - records detected `source()` calls from the AST as timeline events,
+/// - records forward directive sources from metadata as timeline events (avoiding duplicates),
+/// - records `rm()/remove()` calls as timeline events,
+/// - sorts the timeline by position,
+/// - constructs a FunctionScopeTree from discovered function scopes,
+/// - computes the exported-interface hash.
+///
+/// # Arguments
+///
+/// * `uri` - The URI of the file being analyzed
+/// * `tree` - The parsed tree-sitter AST
+/// * `content` - The file content as a string
+/// * `metadata` - Optional cross-file metadata containing forward directive sources
+///
+/// # Examples
+///
+/// ```ignore
+/// // Given a parser-produced `tree`, file `content`, `uri`, and `metadata`:
+/// let artifacts = compute_artifacts_with_metadata(&uri, &tree, content, Some(&metadata));
+/// // `artifacts.timeline` contains both AST-detected and directive sources.
+/// ```
+pub fn compute_artifacts_with_metadata(
+    uri: &Url,
+    tree: &Tree,
+    content: &str,
+    metadata: Option<&super::types::CrossFileMetadata>,
+) -> ScopeArtifacts {
+    let mut artifacts = ScopeArtifacts::default();
+    let root = tree.root_node();
+
+    // Collect definitions from AST
+    collect_definitions(root, content, uri, &mut artifacts);
+
+    // Collect source() calls from AST and add them to timeline.
+    let ast_source_calls = detect_source_calls(tree, content);
+    
+    // Track which (line, path) pairs have AST sources to avoid duplicates
+    // We use (line, path) instead of just (line, column) because:
+    // 1. Directive sources have column=0, so column-based matching doesn't work
+    // 2. Multiple source() calls on the same line to different files should all be kept
+    // 3. A directive should only be suppressed if an AST source to the SAME file exists
+    let ast_line_paths: std::collections::HashSet<(u32, String)> = ast_source_calls
+        .iter()
+        .map(|s| (s.line, s.path.clone()))
+        .collect();
+    
+    // Add AST-detected sources to timeline
+    for source in ast_source_calls {
+        artifacts.timeline.push(ScopeEvent::Source {
+            line: source.line,
+            column: source.column,
+            source,
+        });
+    }
+    
+    // Add directive sources from metadata (if provided) that don't overlap with AST sources
+    // This ensures @lsp-source directives are included in scope resolution
+    if let Some(meta) = metadata {
+        for source in &meta.sources {
+            if source.is_directive {
+                // Check if there's already an AST source at the same line pointing to the same path
+                // Only suppress the directive if an AST source to the SAME file exists at the same line
+                let has_ast_same_line_and_path = ast_line_paths.contains(&(source.line, source.path.clone()));
+                if !has_ast_same_line_and_path {
+                    artifacts.timeline.push(ScopeEvent::Source {
+                        line: source.line,
+                        column: source.column,
+                        source: source.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Collect rm()/remove() calls and add them to timeline.
+    let rm_calls = detect_rm_calls(tree, content);
+    for rm_call in rm_calls {
+        artifacts.timeline.push(ScopeEvent::Removal {
+            line: rm_call.line,
+            column: rm_call.column,
+            symbols: rm_call.symbols,
+            function_scope: None,
+        });
+    }
+
+    // Collect library()/require()/loadNamespace() calls for later processing.
+    let library_calls = detect_library_calls(tree, content);
+
+    // Sort timeline by position for correct ordering
+    artifacts.timeline.sort_by_key(|event| match event {
+        ScopeEvent::Def { line, column, .. } => (*line, *column),
+        ScopeEvent::Source { line, column, .. } => (*line, *column),
+        ScopeEvent::FunctionScope {
+            start_line,
+            start_column,
+            ..
+        } => (*start_line, *start_column),
+        ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+    });
+
+    // Build interval tree from function scopes for O(log n) queries
+    let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|e| {
+            if let ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                ..
+            } = e
+            {
+                Some((*start_line, *start_column, *end_line, *end_column))
+            } else {
+                None
+            }
+        })
+        .collect();
+    artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
+    for event in &mut artifacts.timeline {
+        if let ScopeEvent::Removal {
+            line,
+            column,
+            function_scope,
+            ..
+        } = event
+        {
+            *function_scope =
+                find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+        }
+    }
+
+    // Add PackageLoad events for library calls with function_scope determined from the tree.
+    for lib_call in library_calls {
+        let function_scope = find_containing_function_scope(
+            &artifacts.function_scope_tree,
+            lib_call.line,
+            lib_call.column,
+        )
+        .map(FunctionScopeInterval::from_tuple);
+
+        artifacts.timeline.push(ScopeEvent::PackageLoad {
+            line: lib_call.line,
+            column: lib_call.column,
+            package: lib_call.package,
+            function_scope,
+        });
+    }
+
+    // Re-sort timeline to include PackageLoad events in correct position
+    artifacts.timeline.sort_by_key(|event| match event {
+        ScopeEvent::Def { line, column, .. } => (*line, *column),
+        ScopeEvent::Source { line, column, .. } => (*line, *column),
+        ScopeEvent::FunctionScope {
+            start_line,
+            start_column,
+            ..
+        } => (*start_line, *start_column),
+        ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+    });
+
+    // Extract package names from PackageLoad events for interface hash computation
     let loaded_packages: Vec<String> = artifacts
         .timeline
         .iter()
@@ -2786,7 +2978,7 @@ mod tests {
             local: false, // local=FALSE
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: false,
+            sys_source_global_env: false, ..Default::default()
         };
 
         assert!(
@@ -2830,7 +3022,7 @@ mod tests {
             local: true, // local=TRUE
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: false,
+            sys_source_global_env: false, ..Default::default()
         };
 
         assert!(
@@ -2947,7 +3139,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3021,7 +3213,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3166,7 +3358,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3179,7 +3371,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3255,7 +3447,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             },
         });
         parent_artifacts.timeline.sort_by_key(|e| match e {
@@ -3351,7 +3543,7 @@ mod tests {
                 local: false,
                 chdir: true, // chdir=TRUE
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3364,7 +3556,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -3456,7 +3648,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -4154,7 +4346,7 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             },
             ScopeEvent::Removal {
@@ -4226,7 +4418,7 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
+                    sys_source_global_env: true, ..Default::default()
                 },
             },
             ScopeEvent::FunctionScope {
@@ -5411,7 +5603,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -5520,7 +5712,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -5806,7 +5998,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -5922,7 +6114,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6004,7 +6196,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6101,7 +6293,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -6114,7 +6306,7 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -7824,7 +8016,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -7900,7 +8092,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -7975,7 +8167,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8055,7 +8247,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8135,7 +8327,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8213,7 +8405,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8303,7 +8495,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8323,7 +8515,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };
@@ -8426,7 +8618,7 @@ x <- 1"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };

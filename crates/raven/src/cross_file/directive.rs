@@ -51,7 +51,7 @@ fn patterns() -> &'static DirectivePatterns {
                 r#"#\s*@?lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
             ).unwrap(),
             forward: Regex::new(
-                r#"#\s*@?lsp-source\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"#\s*@?lsp-(?:source|run|include)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
             ).unwrap(),
             working_dir: Regex::new(
                 r#"#\s*@?lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
@@ -105,20 +105,38 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // Check forward directive
         if let Some(caps) = patterns.forward.captures(line) {
             let path = capture_path(&caps, 1).unwrap_or_default();
+            // Parse line=N parameter from capture group 4 if present
+            // Convert from 1-based user input to 0-based internal (N-1)
+            // Use directive's own line when no line= parameter
+            let (call_site_line, has_explicit_line, is_line_zero) = if let Some(line_match) = caps.get(4) {
+                let user_line: u32 = line_match.as_str().parse().unwrap_or(0);
+                let is_zero = user_line == 0;
+                // For line=0, treat as line=1 (internal 0) but flag it as invalid
+                let effective_line = if user_line == 0 { 0 } else { user_line.saturating_sub(1) };
+                (effective_line, true, is_zero)
+            } else {
+                (line_num, false, false)
+            };
             log::trace!(
-                "  Parsed forward directive at line {}: path='{}'",
+                "  Parsed forward directive at line {}: path='{}' call_site_line={} explicit_line={} user_line_zero={}",
                 line_num,
-                path
+                path,
+                call_site_line,
+                has_explicit_line,
+                is_line_zero
             );
             meta.sources.push(ForwardSource {
                 path,
-                line: line_num,
-                column: 0,
+                line: call_site_line,
+                column: 0, // Always 0 for directive-based sources
                 is_directive: true,
                 local: false,
                 chdir: false,
                 is_sys_source: false,
                 sys_source_global_env: true,
+                explicit_line: has_explicit_line,
+                directive_line: line_num,
+                user_line_zero: is_line_zero,
             });
             continue;
         }
@@ -361,6 +379,318 @@ x <- undefined"#;
         let meta = parse_directives(content);
         assert_eq!(meta.sources.len(), 1);
         assert_eq!(meta.sources[0].path, "utils folder/helpers.R");
+    }
+
+    // Tests for forward directive synonyms (@lsp-run, @lsp-include)
+    #[test]
+    fn test_forward_directive_lsp_run_synonym() {
+        let content = "# @lsp-run utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert!(meta.sources[0].is_directive);
+    }
+
+    #[test]
+    fn test_forward_directive_lsp_include_synonym() {
+        let content = "# @lsp-include utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert!(meta.sources[0].is_directive);
+    }
+
+    #[test]
+    fn test_forward_directive_synonyms_all() {
+        // Test all three synonyms produce identical results
+        for directive in ["@lsp-source", "@lsp-run", "@lsp-include"] {
+            let content = format!("# {} utils.R", directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.sources.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.sources[0].path,
+                "utils.R",
+                "Failed for {}",
+                directive
+            );
+            assert!(
+                meta.sources[0].is_directive,
+                "Failed for {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_directive_synonyms_no_at_prefix() {
+        for directive in ["lsp-source", "lsp-run", "lsp-include"] {
+            let content = format!("# {} utils.R", directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.sources.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.sources[0].path,
+                "utils.R",
+                "Failed for {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_directive_synonyms_with_colon() {
+        for directive in ["@lsp-source:", "@lsp-run:", "@lsp-include:"] {
+            let content = format!("# {} utils.R", directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.sources.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.sources[0].path,
+                "utils.R",
+                "Failed for {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_directive_synonyms_with_quotes() {
+        for directive in ["@lsp-source", "@lsp-run", "@lsp-include"] {
+            let content = format!(r#"# {} "path/to/file.R""#, directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.sources.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.sources[0].path,
+                "path/to/file.R",
+                "Failed for {}",
+                directive
+            );
+        }
+    }
+
+    // Tests for forward directive line=N parameter (regex capture verification)
+    #[test]
+    fn test_forward_directive_line_param_regex_capture() {
+        // Verify the regex correctly captures the line=N parameter
+        // The actual parsing of line= is done in task 1.2, but we verify the regex here
+        let patterns = patterns();
+        
+        // Test with line= parameter
+        let line = "# @lsp-source utils.R line=15";
+        let caps = patterns.forward.captures(line).expect("Should match");
+        
+        // Path should be in group 3 (unquoted)
+        assert_eq!(caps.get(3).map(|m| m.as_str()), Some("utils.R"));
+        // Line should be in group 4
+        assert_eq!(caps.get(4).map(|m| m.as_str()), Some("15"));
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_regex_capture_all_synonyms() {
+        let patterns = patterns();
+        
+        for directive in ["@lsp-source", "@lsp-run", "@lsp-include"] {
+            let line = format!("# {} utils.R line=42", directive);
+            let caps = patterns.forward.captures(&line).expect(&format!("Should match for {}", directive));
+            
+            // Path should be in group 3 (unquoted)
+            assert_eq!(caps.get(3).map(|m| m.as_str()), Some("utils.R"), "Path failed for {}", directive);
+            // Line should be in group 4
+            assert_eq!(caps.get(4).map(|m| m.as_str()), Some("42"), "Line failed for {}", directive);
+        }
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_regex_capture_with_quotes() {
+        let patterns = patterns();
+        
+        // Test with double-quoted path and line=
+        let line = r#"# @lsp-source "path/to/file.R" line=10"#;
+        let caps = patterns.forward.captures(line).expect("Should match");
+        
+        // Path should be in group 1 (double-quoted)
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("path/to/file.R"));
+        // Line should be in group 4
+        assert_eq!(caps.get(4).map(|m| m.as_str()), Some("10"));
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_regex_capture_with_colon() {
+        let patterns = patterns();
+        
+        // Test with colon and line=
+        let line = "# @lsp-source: utils.R line=5";
+        let caps = patterns.forward.captures(line).expect("Should match");
+        
+        // Path should be in group 3 (unquoted)
+        assert_eq!(caps.get(3).map(|m| m.as_str()), Some("utils.R"));
+        // Line should be in group 4
+        assert_eq!(caps.get(4).map(|m| m.as_str()), Some("5"));
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_regex_capture_without_line() {
+        let patterns = patterns();
+        
+        // Test without line= parameter (should still match, group 4 should be None)
+        let line = "# @lsp-source utils.R";
+        let caps = patterns.forward.captures(line).expect("Should match");
+        
+        // Path should be in group 3 (unquoted)
+        assert_eq!(caps.get(3).map(|m| m.as_str()), Some("utils.R"));
+        // Line should be None (not present)
+        assert_eq!(caps.get(4), None);
+    }
+
+    // Tests for forward directive line=N parameter parsing (Requirements 2.1, 2.2, 2.3, 2.4)
+    #[test]
+    fn test_forward_directive_line_param_parsing_basic() {
+        // Requirement 2.1: Convert from 1-based user input to 0-based internal (N-1)
+        let content = "# @lsp-source utils.R line=15";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources[0].line, 14); // 15 - 1 = 14 (0-based)
+        assert_eq!(meta.sources[0].column, 0); // Requirement 2.4: column=0 for directives
+        assert!(meta.sources[0].is_directive);
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_parsing_line_1() {
+        // Edge case: line=1 should become 0
+        let content = "# @lsp-source utils.R line=1";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].line, 0); // 1 - 1 = 0
+        assert!(meta.sources[0].explicit_line);
+        assert!(!meta.sources[0].user_line_zero);
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_parsing_line_0() {
+        // Edge case: line=0 is invalid (1-based numbering), should be flagged
+        let content = "# @lsp-source utils.R line=0";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].line, 0); // Treated as line 1 (internal 0)
+        assert!(meta.sources[0].explicit_line);
+        assert!(meta.sources[0].user_line_zero); // Flag that line=0 was specified
+        assert_eq!(meta.sources[0].directive_line, 0); // Directive is on line 0
+    }
+
+    #[test]
+    fn test_forward_directive_without_line_param_uses_directive_line() {
+        // Requirement 2.2: Use directive's own line when no line= parameter
+        let content = "x <- 1\ny <- 2\n# @lsp-source utils.R\nz <- 3";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources[0].line, 2); // Directive is on line 2 (0-based)
+        assert_eq!(meta.sources[0].column, 0);
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_all_synonyms() {
+        // Verify line= works with all synonyms
+        for directive in ["@lsp-source", "@lsp-run", "@lsp-include"] {
+            let content = format!("# {} utils.R line=10", directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.sources.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.sources[0].line,
+                9, // 10 - 1 = 9 (0-based)
+                "Line conversion failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.sources[0].column,
+                0,
+                "Column should be 0 for {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_with_quotes() {
+        // Test line= with quoted path
+        let content = r#"# @lsp-source "path/to/file.R" line=20"#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "path/to/file.R");
+        assert_eq!(meta.sources[0].line, 19); // 20 - 1 = 19
+        assert_eq!(meta.sources[0].column, 0);
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_with_colon() {
+        // Test line= with colon separator
+        let content = "# @lsp-source: utils.R line=5";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources[0].line, 4); // 5 - 1 = 4
+    }
+
+    #[test]
+    fn test_forward_directive_multiple_with_different_lines() {
+        // Requirement 2.3: Multiple directives create separate ForwardSource entries
+        let content = "# @lsp-source a.R line=10\n# @lsp-source b.R line=20\n# @lsp-source c.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 3);
+        
+        // First directive: explicit line=10 -> 9
+        assert_eq!(meta.sources[0].path, "a.R");
+        assert_eq!(meta.sources[0].line, 9);
+        
+        // Second directive: explicit line=20 -> 19
+        assert_eq!(meta.sources[1].path, "b.R");
+        assert_eq!(meta.sources[1].line, 19);
+        
+        // Third directive: no line=, uses directive's own line (2)
+        assert_eq!(meta.sources[2].path, "c.R");
+        assert_eq!(meta.sources[2].line, 2);
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_large_value() {
+        // Test with a large line number
+        let content = "# @lsp-source utils.R line=1000";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].line, 999); // 1000 - 1 = 999
+    }
+
+    #[test]
+    fn test_forward_directive_column_always_zero() {
+        // Requirement 2.4: column=0 for all directive-based sources
+        let content = "    # @lsp-source utils.R line=5"; // Indented directive
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].column, 0); // Column is always 0, not the indentation
     }
 
     #[test]

@@ -3,6 +3,28 @@
 //
 // Path resolution for cross-file awareness
 //
+// CRITICAL DESIGN NOTE: Forward vs Backward Directive Path Resolution
+// ====================================================================
+// This module provides two PathContext constructors with DIFFERENT behaviors:
+//
+// 1. PathContext::new() - For BACKWARD directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
+//    - IGNORES @lsp-cd working directory
+//    - Always resolves paths relative to the file's own directory
+//    - Rationale: Backward directives describe static file relationships from the child's
+//      perspective. They declare "this file is sourced by that parent file" - a relationship
+//      that should NOT change based on runtime working directory.
+//
+// 2. PathContext::from_metadata() - For FORWARD directives (@lsp-source, @lsp-run, @lsp-include)
+//                                   and source() calls
+//    - USES @lsp-cd working directory when present
+//    - Resolves paths relative to the working directory (or file's directory if no @lsp-cd)
+//    - Rationale: Forward directives and source() calls describe runtime execution behavior.
+//      They are semantically equivalent to R's source() function, which is affected by
+//      the current working directory at runtime.
+//
+// DO NOT change this behavior without understanding the full implications for cross-file
+// awareness. See AGENTS.md "Path Resolution: Critical Distinction" for detailed documentation.
+//
 
 use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::Url;
@@ -23,7 +45,17 @@ pub struct PathContext {
 }
 
 impl PathContext {
-    /// Create a new context for a file
+    /// Create a new context for a file WITHOUT working directory support.
+    ///
+    /// **USE FOR: Backward directives only** (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`)
+    ///
+    /// This constructor creates a PathContext that resolves paths relative to the file's
+    /// own directory, ignoring any `@lsp-cd` directive. This is intentional because backward
+    /// directives describe static file relationships that should not change based on runtime
+    /// working directory.
+    ///
+    /// **DO NOT USE FOR:** Forward directives (`@lsp-source`) or `source()` calls.
+    /// Use `PathContext::from_metadata()` instead, which respects `@lsp-cd`.
     pub fn new(file_uri: &Url, workspace_root: Option<&Url>) -> Option<Self> {
         let file_path = file_uri.to_file_path().ok()?;
         let workspace_root = workspace_root.and_then(|u| u.to_file_path().ok());
@@ -35,7 +67,17 @@ impl PathContext {
         })
     }
 
-    /// Create a context from a file URI and its metadata
+    /// Create a context from a file URI and its metadata WITH working directory support.
+    ///
+    /// **USE FOR: Forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`) **and source() calls**
+    ///
+    /// This constructor creates a PathContext that respects `@lsp-cd` working directory
+    /// directives. Paths are resolved relative to the working directory (if set) or the
+    /// file's directory (if no working directory). This matches R's runtime behavior where
+    /// `source()` calls are affected by the current working directory.
+    ///
+    /// **DO NOT USE FOR:** Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`).
+    /// Use `PathContext::new()` instead, which ignores `@lsp-cd`.
     ///
     /// Priority for path resolution: explicit working_directory > inherited > file's directory
     pub fn from_metadata(

@@ -755,7 +755,7 @@ y <- 2"#;
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
+                sys_source_global_env: true, ..Default::default()
             }],
             ..Default::default()
         };

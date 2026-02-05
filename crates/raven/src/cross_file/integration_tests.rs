@@ -4633,3 +4633,1082 @@ child_function <- function() {
         );
     }
 }
+
+// ============================================================================
+// Integration Tests for @lsp-source Forward Directive Scope Resolution
+// ============================================================================
+
+/// Integration test for @lsp-source forward directive scope resolution.
+///
+/// This test verifies that:
+/// 1. Symbols from files referenced by @lsp-source are available in scope after the directive line
+/// 2. The `line=N` parameter affects scope availability position
+/// 3. Forward directive edges are properly handled by scope resolution
+///
+/// **Validates: Requirements 5.1, 5.2, 5.3**
+#[cfg(test)]
+mod lsp_source_scope_tests {
+    use super::*;
+    use crate::cross_file::dependency::DependencyGraph;
+    use crate::cross_file::scope::{compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph, ScopeArtifacts};
+    use crate::cross_file::types::CrossFileMetadata;
+    use std::collections::HashSet;
+    use tree_sitter::Parser;
+
+    fn parse_r_tree(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    /// Test that symbols from @lsp-source directive are available after the directive line.
+    ///
+    /// **Validates: Requirements 5.1, 5.3**
+    #[test]
+    fn test_lsp_source_symbols_available_after_directive() {
+        println!("\n=== Test: @lsp-source symbols available after directive ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file with @lsp-source directive at line 1 (0-based)
+        // The directive points to child.r
+        let parent_content = r#"# Some comment
+# @lsp-source child.r
+# Code after directive
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Child file defines a function
+        let child_content = r#"child_func <- function() { 42 }
+child_var <- 100
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        println!("Step 1: Parse files and compute artifacts");
+
+        // Parse and compute artifacts for both files
+        // Use compute_artifacts_with_metadata to include forward directive sources in timeline
+        let parent_tree = parse_r_tree(parent_content);
+        let parent_metadata = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let parent_artifacts = compute_artifacts_with_metadata(&parent_uri, &parent_tree, parent_content, Some(&parent_metadata));
+
+        let child_tree = parse_r_tree(child_content);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+
+        // Verify parent has the forward directive in its sources
+        println!("  Parent sources: {:?}", parent_artifacts.timeline.iter()
+            .filter_map(|e| if let crate::cross_file::scope::ScopeEvent::Source { source, .. } = e {
+                Some(&source.path)
+            } else { None })
+            .collect::<Vec<_>>());
+
+        // Verify metadata has forward directive
+        println!("  Parent metadata sources: {:?}", parent_metadata.sources);
+
+        assert!(
+            parent_metadata.sources.iter().any(|s| s.is_directive && s.path == "child.r"),
+            "Parent should have @lsp-source directive for child.r"
+        );
+        println!("  ✓ Parent has @lsp-source directive for child.r");
+
+        println!("\nStep 2: Build dependency graph");
+
+        // Build dependency graph
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        // Update graph with parent's metadata
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+
+        // Verify edge was created
+        let children = get_children(&graph, &parent_uri);
+        assert!(
+            children.contains(&child_uri),
+            "Parent should have child.r as dependency"
+        );
+        println!("  ✓ Dependency edge created from parent.r to child.r");
+
+        println!("\nStep 3: Test scope resolution at different positions");
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata.clone())
+            } else {
+                None
+            }
+        };
+
+        // Test scope BEFORE the directive (line 0)
+        // Child symbols should NOT be available
+        let scope_before = scope_at_position_with_graph(
+            &parent_uri,
+            0, // Line 0 (before directive at line 1)
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            !scope_before.symbols.contains_key("child_func"),
+            "child_func should NOT be available before @lsp-source directive"
+        );
+        assert!(
+            !scope_before.symbols.contains_key("child_var"),
+            "child_var should NOT be available before @lsp-source directive"
+        );
+        println!("  ✓ Child symbols NOT available at line 0 (before directive)");
+
+        // Test scope AFTER the directive (line 2)
+        // Child symbols SHOULD be available
+        let scope_after = scope_at_position_with_graph(
+            &parent_uri,
+            2, // Line 2 (after directive at line 1)
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope_after.symbols.contains_key("child_func"),
+            "child_func should be available after @lsp-source directive"
+        );
+        assert!(
+            scope_after.symbols.contains_key("child_var"),
+            "child_var should be available after @lsp-source directive"
+        );
+        println!("  ✓ Child symbols available at line 2 (after directive)");
+
+        // Test scope at end of file
+        let scope_end = scope_at_position_with_graph(
+            &parent_uri,
+            10, // Well past the end
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope_end.symbols.contains_key("child_func"),
+            "child_func should be available at end of file"
+        );
+        assert!(
+            scope_end.symbols.contains_key("x"),
+            "Local variable x should be available at end of file"
+        );
+        println!("  ✓ Both child and local symbols available at end of file");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 5.1: Symbols from @lsp-source are available after directive line");
+        println!("  - 5.3: Symbols available for completions, hover, go-to-definition");
+    }
+
+    /// Test that the `line=N` parameter affects scope availability position.
+    ///
+    /// **Validates: Requirements 5.2**
+    #[test]
+    fn test_lsp_source_line_parameter_affects_scope() {
+        println!("\n=== Test: @lsp-source line=N parameter affects scope ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file with @lsp-source directive with line=5 parameter
+        // This means symbols should be available starting at line 4 (0-based)
+        let parent_content = r#"# Line 0
+# @lsp-source child.r line=5
+# Line 2
+# Line 3
+# Line 4 - symbols should be available here
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Child file defines a function
+        let child_content = r#"child_func <- function() { 42 }
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        println!("Step 1: Parse files and verify line parameter");
+
+        // Extract metadata and verify line parameter was parsed
+        let parent_metadata = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+
+        // The directive is at line 1, but line=5 means call site is at line 4 (0-based)
+        let forward_source = parent_metadata.sources.iter()
+            .find(|s| s.is_directive && s.path == "child.r")
+            .expect("Should have @lsp-source directive");
+
+        assert_eq!(
+            forward_source.line, 4, // line=5 converts to 0-based line 4
+            "line=5 parameter should convert to 0-based line 4"
+        );
+        println!("  ✓ line=5 parameter correctly converted to 0-based line 4");
+
+        println!("\nStep 2: Build dependency graph and test scope");
+
+        // Parse and compute artifacts
+        // Use compute_artifacts_with_metadata to include forward directive sources in timeline
+        let parent_tree = parse_r_tree(parent_content);
+        let parent_artifacts = compute_artifacts_with_metadata(&parent_uri, &parent_tree, parent_content, Some(&parent_metadata));
+
+        let child_tree = parse_r_tree(child_content);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+
+        // Build dependency graph
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata.clone())
+            } else {
+                None
+            }
+        };
+
+        // Test scope BEFORE line 4 (where line=5 specifies symbols become available)
+        let scope_before = scope_at_position_with_graph(
+            &parent_uri,
+            3, // Line 3 (before line 4 where symbols become available)
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            !scope_before.symbols.contains_key("child_func"),
+            "child_func should NOT be available before line 4 (line=5 parameter)"
+        );
+        println!("  ✓ Child symbols NOT available at line 3 (before line=5 position)");
+
+        // Test scope AT line 4 (where line=5 specifies symbols become available)
+        // Note: symbols are available AFTER the call site, so we need to be past line 4
+        let scope_at = scope_at_position_with_graph(
+            &parent_uri,
+            5, // Line 5 (after line 4 where symbols become available)
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope_at.symbols.contains_key("child_func"),
+            "child_func should be available after line 4 (line=5 parameter)"
+        );
+        println!("  ✓ Child symbols available at line 5 (after line=5 position)");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 5.2: line=N parameter affects scope availability position");
+    }
+
+    /// Test that @lsp-source synonyms (@lsp-run, @lsp-include) work identically.
+    ///
+    /// **Validates: Requirements 1.2, 1.3, 5.1**
+    #[test]
+    fn test_lsp_source_synonyms_scope_resolution() {
+        println!("\n=== Test: @lsp-source synonyms work identically ===\n");
+
+        let synonyms = ["@lsp-source", "@lsp-run", "@lsp-include"];
+
+        for synonym in &synonyms {
+            println!("Testing synonym: {}", synonym);
+
+            // Create test workspace
+            let mut workspace = TestWorkspace::new().unwrap();
+
+            // Parent file with the synonym directive
+            let parent_content = format!(
+                r#"# Comment
+# {} child.r
+x <- 1
+"#,
+                synonym
+            );
+            let parent_uri = workspace.add_file("parent.r", &parent_content).unwrap();
+
+            // Child file defines a function
+            let child_content = r#"child_func <- function() { 42 }
+"#;
+            let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+            // Extract metadata and verify directive was parsed
+            let parent_metadata = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+
+            assert!(
+                parent_metadata.sources.iter().any(|s| s.is_directive && s.path == "child.r"),
+                "{} should create a forward directive for child.r",
+                synonym
+            );
+
+            // Parse and compute artifacts
+            // Use compute_artifacts_with_metadata to include forward directive sources in timeline
+            let parent_tree = parse_r_tree(&parent_content);
+            let parent_artifacts = compute_artifacts_with_metadata(&parent_uri, &parent_tree, &parent_content, Some(&parent_metadata));
+
+            let child_tree = parse_r_tree(child_content);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+
+            // Build dependency graph
+            let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+            let mut graph = DependencyGraph::new();
+
+            let content_provider = |uri: &Url| -> Option<String> {
+                if uri == &child_uri {
+                    Some(child_content.to_string())
+                } else if uri == &parent_uri {
+                    Some(parent_content.to_string())
+                } else {
+                    None
+                }
+            };
+            graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri {
+                    Some(parent_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+
+            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+                if uri == &parent_uri {
+                    Some(parent_metadata.clone())
+                } else {
+                    None
+                }
+            };
+
+            // Test scope after directive
+            let scope = scope_at_position_with_graph(
+                &parent_uri,
+                3, // After directive
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+            );
+
+            assert!(
+                scope.symbols.contains_key("child_func"),
+                "{} should make child_func available after directive",
+                synonym
+            );
+            println!("  ✓ {} makes child symbols available", synonym);
+        }
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 1.2, 1.3: @lsp-run and @lsp-include are synonyms for @lsp-source");
+        println!("  - 5.1: All synonyms make symbols available after directive line");
+    }
+
+    // ============================================================================
+    // Forward Directive Revalidation Tests
+    // ============================================================================
+
+    /// Test that adding an @lsp-source directive triggers dependency graph update.
+    ///
+    /// **Validates: Requirements 7.1**
+    #[test]
+    fn test_adding_lsp_source_triggers_graph_update() {
+        println!("\n=== Test: Adding @lsp-source triggers dependency graph update ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file initially has no directive
+        let parent_content_v1 = r#"# No directive yet
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content_v1).unwrap();
+
+        // Child file defines a function
+        let child_content = r#"child_func <- function() { 42 }
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        println!("Step 1: Initial state - no directive");
+
+        // Extract metadata and build graph
+        let parent_metadata_v1 = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v1.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider);
+
+        // Verify no edge exists
+        let children_v1 = get_children(&graph, &parent_uri);
+        assert!(
+            children_v1.is_empty(),
+            "Initially, parent should have no children"
+        );
+        println!("  ✓ No dependency edge initially");
+
+        println!("\nStep 2: Add @lsp-source directive");
+
+        // Update parent file with directive
+        let parent_content_v2 = r#"# @lsp-source child.r
+x <- 1
+"#;
+        workspace.update_file("parent.r", parent_content_v2).unwrap();
+
+        // Extract new metadata and update graph
+        let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
+
+        let content_provider_v2 = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v2.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+
+        // Verify edge was created
+        let children_v2 = get_children(&graph, &parent_uri);
+        assert_eq!(
+            children_v2.len(), 1,
+            "After adding directive, parent should have one child"
+        );
+        assert_eq!(
+            children_v2[0], child_uri,
+            "Child should be child.r"
+        );
+        println!("  ✓ Dependency edge created after adding @lsp-source directive");
+
+        // Verify edge properties
+        let edges = graph.get_dependencies(&parent_uri);
+        assert!(edges[0].is_directive, "Edge should be marked as directive");
+        assert!(!edges[0].is_backward_directive, "Edge should NOT be marked as backward directive");
+        println!("  ✓ Edge has correct is_directive=true, is_backward_directive=false");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 7.1: Adding @lsp-source triggers dependency graph update");
+    }
+
+    /// Test that removing an @lsp-source directive removes the edge and triggers revalidation.
+    ///
+    /// **Validates: Requirements 7.2**
+    #[test]
+    fn test_removing_lsp_source_removes_edge() {
+        println!("\n=== Test: Removing @lsp-source removes edge ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file initially has directive
+        let parent_content_v1 = r#"# @lsp-source child.r
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content_v1).unwrap();
+
+        // Child file defines a function
+        let child_content = r#"child_func <- function() { 42 }
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        println!("Step 1: Initial state - with directive");
+
+        // Extract metadata and build graph
+        let parent_metadata_v1 = extract_metadata_from_content(parent_content_v1);
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v1.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider);
+
+        // Verify edge exists
+        let children_v1 = get_children(&graph, &parent_uri);
+        assert_eq!(
+            children_v1.len(), 1,
+            "Initially, parent should have one child"
+        );
+        println!("  ✓ Dependency edge exists initially");
+
+        println!("\nStep 2: Remove @lsp-source directive");
+
+        // Update parent file without directive
+        let parent_content_v2 = r#"# No directive anymore
+x <- 1
+"#;
+        workspace.update_file("parent.r", parent_content_v2).unwrap();
+
+        // Extract new metadata and update graph
+        let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
+
+        let content_provider_v2 = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v2.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+
+        // Verify edge was removed
+        let children_v2 = get_children(&graph, &parent_uri);
+        assert!(
+            children_v2.is_empty(),
+            "After removing directive, parent should have no children"
+        );
+        println!("  ✓ Dependency edge removed after removing @lsp-source directive");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 7.2: Removing @lsp-source removes edge and triggers revalidation");
+    }
+
+    /// Test that modifying an @lsp-source directive path updates the graph.
+    ///
+    /// **Validates: Requirements 7.3**
+    #[test]
+    fn test_modifying_lsp_source_path_updates_graph() {
+        println!("\n=== Test: Modifying @lsp-source path updates graph ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file initially sources child_a.r
+        let parent_content_v1 = r#"# @lsp-source child_a.r
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content_v1).unwrap();
+
+        // Two child files
+        let child_a_content = r#"func_a <- function() { 1 }
+"#;
+        let child_a_uri = workspace.add_file("child_a.r", child_a_content).unwrap();
+
+        let child_b_content = r#"func_b <- function() { 2 }
+"#;
+        let child_b_uri = workspace.add_file("child_b.r", child_b_content).unwrap();
+
+        println!("Step 1: Initial state - sourcing child_a.r");
+
+        // Extract metadata and build graph
+        let parent_metadata_v1 = extract_metadata_from_content(parent_content_v1);
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_a_uri {
+                Some(child_a_content.to_string())
+            } else if uri == &child_b_uri {
+                Some(child_b_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v1.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider);
+
+        // Verify edge to child_a exists
+        let children_v1 = get_children(&graph, &parent_uri);
+        assert_eq!(children_v1.len(), 1, "Parent should have one child");
+        assert_eq!(children_v1[0], child_a_uri, "Child should be child_a.r");
+        println!("  ✓ Dependency edge to child_a.r exists");
+
+        println!("\nStep 2: Modify directive to source child_b.r");
+
+        // Update parent file to source child_b.r instead
+        let parent_content_v2 = r#"# @lsp-source child_b.r
+x <- 1
+"#;
+        workspace.update_file("parent.r", parent_content_v2).unwrap();
+
+        // Extract new metadata and update graph
+        let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
+
+        let content_provider_v2 = |uri: &Url| -> Option<String> {
+            if uri == &child_a_uri {
+                Some(child_a_content.to_string())
+            } else if uri == &child_b_uri {
+                Some(child_b_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v2.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+
+        // Verify edge now points to child_b
+        let children_v2 = get_children(&graph, &parent_uri);
+        assert_eq!(children_v2.len(), 1, "Parent should still have one child");
+        assert_eq!(children_v2[0], child_b_uri, "Child should now be child_b.r");
+        println!("  ✓ Dependency edge updated to child_b.r");
+
+        // Verify old edge to child_a is gone
+        let parents_of_a = get_parents(&graph, &child_a_uri);
+        assert!(
+            parents_of_a.is_empty(),
+            "child_a.r should no longer have parent.r as parent"
+        );
+        println!("  ✓ Old edge to child_a.r removed");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 7.3: Modifying @lsp-source path updates dependency graph");
+    }
+
+    /// Test that adding multiple @lsp-source directives creates multiple edges.
+    ///
+    /// **Validates: Requirements 7.1, 2.3**
+    #[test]
+    fn test_adding_multiple_lsp_source_directives() {
+        println!("\n=== Test: Adding multiple @lsp-source directives ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file with multiple directives
+        let parent_content = r#"# @lsp-source child_a.r
+# @lsp-source child_b.r
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Two child files
+        let child_a_content = r#"func_a <- function() { 1 }
+"#;
+        let child_a_uri = workspace.add_file("child_a.r", child_a_content).unwrap();
+
+        let child_b_content = r#"func_b <- function() { 2 }
+"#;
+        let child_b_uri = workspace.add_file("child_b.r", child_b_content).unwrap();
+
+        println!("Step 1: Build graph with multiple directives");
+
+        // Extract metadata and build graph
+        let parent_metadata = extract_metadata_from_content(parent_content);
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_a_uri {
+                Some(child_a_content.to_string())
+            } else if uri == &child_b_uri {
+                Some(child_b_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+
+        // Verify both edges exist
+        let children = get_children(&graph, &parent_uri);
+        assert_eq!(children.len(), 2, "Parent should have two children");
+        assert!(children.contains(&child_a_uri), "Should have edge to child_a.r");
+        assert!(children.contains(&child_b_uri), "Should have edge to child_b.r");
+        println!("  ✓ Both dependency edges created");
+
+        // Verify both edges are directive edges
+        let edges = graph.get_dependencies(&parent_uri);
+        assert!(edges.iter().all(|e| e.is_directive), "All edges should be directive edges");
+        println!("  ✓ All edges marked as directive edges");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 7.1: Adding @lsp-source triggers dependency graph update");
+        println!("  - 2.3: Multiple directives create separate edges");
+    }
+
+    /// Test that scope resolution updates when @lsp-source directive is added.
+    ///
+    /// **Validates: Requirements 7.1, 5.1**
+    #[test]
+    fn test_scope_updates_when_directive_added() {
+        println!("\n=== Test: Scope updates when @lsp-source directive is added ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file initially has no directive
+        let parent_content_v1 = r#"# No directive yet
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content_v1).unwrap();
+
+        // Child file defines a function
+        let child_content = r#"child_func <- function() { 42 }
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        println!("Step 1: Initial state - no directive, child symbols not available");
+
+        // Parse and compute artifacts
+        let parent_tree_v1 = parse_r_tree(parent_content_v1);
+        let parent_metadata_v1 = extract_metadata_from_content(parent_content_v1);
+        let parent_artifacts_v1 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v1, parent_content_v1, Some(&parent_metadata_v1));
+
+        let child_tree = parse_r_tree(child_content);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+
+        // Build dependency graph
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider_v1 = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v1.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider_v1);
+
+        // Test scope - child symbols should NOT be available
+        let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts_v1.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata_v1 = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata_v1.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope_v1 = scope_at_position_with_graph(
+            &parent_uri,
+            2, // After the comment
+            0,
+            &get_artifacts_v1,
+            &get_metadata_v1,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            !scope_v1.symbols.contains_key("child_func"),
+            "child_func should NOT be available without directive"
+        );
+        println!("  ✓ child_func NOT available without directive");
+
+        println!("\nStep 2: Add @lsp-source directive");
+
+        // Update parent file with directive
+        let parent_content_v2 = r#"# @lsp-source child.r
+x <- 1
+"#;
+        workspace.update_file("parent.r", parent_content_v2).unwrap();
+
+        // Re-parse and compute artifacts
+        let parent_tree_v2 = parse_r_tree(parent_content_v2);
+        let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
+        let parent_artifacts_v2 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v2, parent_content_v2, Some(&parent_metadata_v2));
+
+        // Update graph
+        let content_provider_v2 = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v2.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+
+        // Test scope - child symbols SHOULD now be available
+        let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts_v2.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata_v2 = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata_v2.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope_v2 = scope_at_position_with_graph(
+            &parent_uri,
+            2, // After the directive
+            0,
+            &get_artifacts_v2,
+            &get_metadata_v2,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope_v2.symbols.contains_key("child_func"),
+            "child_func SHOULD be available after adding directive"
+        );
+        println!("  ✓ child_func available after adding directive");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 7.1: Adding @lsp-source triggers dependency graph update");
+        println!("  - 5.1: Symbols from sourced file available after directive");
+    }
+
+    /// Test that scope resolution updates when @lsp-source directive is removed.
+    ///
+    /// **Validates: Requirements 7.2, 5.1**
+    #[test]
+    fn test_scope_updates_when_directive_removed() {
+        println!("\n=== Test: Scope updates when @lsp-source directive is removed ===\n");
+
+        // Create test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Parent file initially has directive
+        let parent_content_v1 = r#"# @lsp-source child.r
+x <- 1
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content_v1).unwrap();
+
+        // Child file defines a function
+        let child_content = r#"child_func <- function() { 42 }
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        println!("Step 1: Initial state - with directive, child symbols available");
+
+        // Parse and compute artifacts
+        let parent_tree_v1 = parse_r_tree(parent_content_v1);
+        let parent_metadata_v1 = extract_metadata_from_content(parent_content_v1);
+        let parent_artifacts_v1 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v1, parent_content_v1, Some(&parent_metadata_v1));
+
+        let child_tree = parse_r_tree(child_content);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+
+        // Build dependency graph
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+        let mut graph = DependencyGraph::new();
+
+        let content_provider_v1 = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v1.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider_v1);
+
+        // Test scope - child symbols SHOULD be available
+        let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts_v1.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata_v1 = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata_v1.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope_v1 = scope_at_position_with_graph(
+            &parent_uri,
+            2, // After the directive
+            0,
+            &get_artifacts_v1,
+            &get_metadata_v1,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope_v1.symbols.contains_key("child_func"),
+            "child_func SHOULD be available with directive"
+        );
+        println!("  ✓ child_func available with directive");
+
+        println!("\nStep 2: Remove @lsp-source directive");
+
+        // Update parent file without directive
+        let parent_content_v2 = r#"# No directive anymore
+x <- 1
+"#;
+        workspace.update_file("parent.r", parent_content_v2).unwrap();
+
+        // Re-parse and compute artifacts
+        let parent_tree_v2 = parse_r_tree(parent_content_v2);
+        let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
+        let parent_artifacts_v2 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v2, parent_content_v2, Some(&parent_metadata_v2));
+
+        // Update graph
+        let content_provider_v2 = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.to_string())
+            } else if uri == &parent_uri {
+                Some(parent_content_v2.to_string())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+
+        // Test scope - child symbols should NOT be available anymore
+        let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts_v2.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata_v2 = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata_v2.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope_v2 = scope_at_position_with_graph(
+            &parent_uri,
+            2, // After the comment
+            0,
+            &get_artifacts_v2,
+            &get_metadata_v2,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            !scope_v2.symbols.contains_key("child_func"),
+            "child_func should NOT be available after removing directive"
+        );
+        println!("  ✓ child_func NOT available after removing directive");
+
+        println!("\n=== Test Passed ===");
+        println!("Requirements Validated:");
+        println!("  - 7.2: Removing @lsp-source removes edge and triggers revalidation");
+        println!("  - 5.1: Symbols no longer available after directive removed");
+    }
+}
