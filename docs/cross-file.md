@@ -44,10 +44,28 @@ Example with match pattern:
 
 ### Forward Directives
 
-Explicitly declare source() calls (useful for dynamic paths):
+Explicitly declare that this file sources another file (useful for dynamic or conditional paths):
 ```r
 # @lsp-source utils/helpers.R
+# @lsp-run utils/helpers.R        # synonym
+# @lsp-include utils/helpers.R    # synonym
 ```
+
+All syntax variations are supported:
+- With or without `@` prefix: `@lsp-source` or `lsp-source`
+- With or without colon: `@lsp-source: path` or `@lsp-source path`
+- With quotes: `@lsp-source "path/with spaces.R"` or `@lsp-source 'path.R'`
+- Without quotes: `@lsp-source path.R`
+
+Optional `line=N` parameter specifies the call-site (1-based line number):
+```r
+# @lsp-source utils/helpers.R line=25
+# Symbols from helpers.R become available at line 25 (not at this directive's line)
+```
+
+When `line=N` is omitted, symbols become available after the directive's own line.
+
+**Path resolution:** Forward directives use `@lsp-cd` for path resolution (unlike backward directives which ignore it). This matches the behavior of `source()` calls, since forward directives are semantically equivalent to `source()` calls.
 
 ### Working Directory Directives
 
@@ -65,7 +83,7 @@ Path resolution:
 - Paths starting with `/` are workspace-root-relative (e.g., `/data` -> `<workspace>/data`)
 - Other paths are file-relative (e.g., `../shared` -> parent directory's `shared`)
 
-**Note:** Working directory directives only affect `source()` call path resolution. All other LSP directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-source`, etc.) always resolve paths relative to the file's directory, ignoring any `@lsp-cd` setting.
+**Note:** Working directory directives affect path resolution for `source()` calls and forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`). Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) always resolve paths relative to the file's directory, ignoring any `@lsp-cd` setting.
 
 ### Working Directory Inheritance
 
@@ -211,6 +229,22 @@ source(config_file)  # LSP can't resolve this dynamically
 
 # @lsp-source configs/dev_config.R
 # Now the LSP knows about symbols from dev_config.R
+```
+
+### Forward Directive with Working Directory
+```r
+# scripts/runner.R
+# @lsp-cd /data/project
+# @lsp-source utils.R
+# utils.R resolves to <workspace>/data/project/utils.R (uses @lsp-cd)
+```
+
+### Forward Directive with Explicit Call-Site
+```r
+# main.R
+# @lsp-source helpers.R line=50
+# Symbols from helpers.R become available at line 50
+# This is useful when the actual source() call is later in the file
 ```
 
 ### Circular Dependency Detection

@@ -231,6 +231,14 @@ pub(crate) fn parse_cross_file_config(
         {
             config.max_chain_depth_severity = parse_severity(sev);
         }
+        // Parse redundant directive severity (Requirement 6.2)
+        // Supports "off" to disable the diagnostic entirely
+        if let Some(sev) = cross_file
+            .get("redundantDirectiveSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.redundant_directive_severity = parse_optional_severity(sev);
+        }
 
         // Parse on-demand indexing settings
         if let Some(on_demand) = cross_file.get("onDemandIndexing") {
@@ -328,6 +336,10 @@ pub(crate) fn parse_cross_file_config(
         config.ambiguous_parent_severity
     );
     log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
+    log::info!(
+        "    redundant_directive: {:?}",
+        config.redundant_directive_severity
+    );
     log::info!("  Package settings:");
     log::info!("    enabled: {}", config.packages_enabled);
     log::info!(
@@ -350,6 +362,19 @@ fn parse_severity(s: &str) -> DiagnosticSeverity {
         "information" | "info" => DiagnosticSeverity::INFORMATION,
         "hint" => DiagnosticSeverity::HINT,
         _ => DiagnosticSeverity::WARNING,
+    }
+}
+
+/// Parse severity with support for "off" to disable the diagnostic entirely
+/// _Requirements: 6.2_
+fn parse_optional_severity(s: &str) -> Option<DiagnosticSeverity> {
+    match s.to_lowercase().as_str() {
+        "off" | "none" | "disabled" => None,
+        "error" => Some(DiagnosticSeverity::ERROR),
+        "warning" => Some(DiagnosticSeverity::WARNING),
+        "information" | "info" => Some(DiagnosticSeverity::INFORMATION),
+        "hint" => Some(DiagnosticSeverity::HINT),
+        _ => Some(DiagnosticSeverity::HINT), // Default to hint for redundant directives
     }
 }
 

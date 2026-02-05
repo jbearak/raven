@@ -205,23 +205,35 @@ All directives support optional colon and quotes:
 - `# @lsp-sourced-by: "../main.R"`
 
 Backward directive synonyms: `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`
+Forward directive synonyms: `@lsp-source`, `@lsp-run`, `@lsp-include`
 Working directory synonyms: `@lsp-working-directory`, `@lsp-working-dir`, `@lsp-current-directory`, `@lsp-current-dir`, `@lsp-wd`, `@lsp-cd`
 
 ### Path Resolution: Critical Distinction
 
-**IMPORTANT**: Path resolution behaves differently for LSP directives vs. source() statements:
+**IMPORTANT**: Path resolution behaves differently depending on the directive type:
 
-#### LSP Directives (Backward/Forward)
+#### Backward Directives (Ignore @lsp-cd)
 **Always resolve relative to the file's directory, ignoring @lsp-cd:**
 - `@lsp-sourced-by: ../parent.R` - Resolved from file's directory
 - `@lsp-run-by: ../parent.R` - Resolved from file's directory
-- `@lsp-source: utils.R` - Resolved from file's directory
-- **Rationale**: Directives describe static file relationships that should not change based on runtime working directory
+- `@lsp-included-by: ../parent.R` - Resolved from file's directory
+- **Rationale**: Backward directives describe static file relationships from the child's perspective. They declare "this file is sourced by that parent file" - a relationship that should not change based on runtime working directory.
 
 **Implementation**:
 - Uses `PathContext::new()` which excludes working_directory from metadata
 - Applied in both `dependency.rs` (graph building) and `handlers.rs` (diagnostics)
 - See `do_resolve_backward()` helper in `dependency.rs`
+
+#### Forward Directives (Use @lsp-cd)
+**Resolve using @lsp-cd working directory when present:**
+- `@lsp-source: utils.R` - Resolved from @lsp-cd directory if specified, else file's directory
+- `@lsp-run: ../data.R` - Resolved from @lsp-cd directory if specified, else file's directory
+- `@lsp-include: helpers.R` - Resolved from @lsp-cd directory if specified, else file's directory
+- **Rationale**: Forward directives are semantically equivalent to `source()` calls. They describe runtime execution behavior ("this file sources that child file"), so they should respect the working directory just like actual `source()` calls.
+
+**Implementation**:
+- Uses `PathContext::from_metadata()` which includes working_directory from metadata
+- Applied via `do_resolve()` helper in `dependency.rs`
 
 #### source() Statements (AST-detected)
 **Resolve using @lsp-cd working directory when present:**
@@ -266,13 +278,15 @@ Resolution:
 # File: subdir/child.r
 # @lsp-cd: /some/other/directory
 # @lsp-run-by: ../parent.r
+# @lsp-source: utils.r
 
-source("utils.r")
+source("helpers.r")
 ```
 
 **Resolution behavior**:
-- `@lsp-run-by: ../parent.r` → Resolves to `parent.r` in workspace root (ignores @lsp-cd)
-- `source("utils.r")` → Resolves to `/some/other/directory/utils.r` (uses @lsp-cd)
+- `@lsp-run-by: ../parent.r` → Resolves to `parent.r` in workspace root (backward directive ignores @lsp-cd)
+- `@lsp-source: utils.r` → Resolves to `/some/other/directory/utils.r` (forward directive uses @lsp-cd)
+- `source("helpers.r")` → Resolves to `/some/other/directory/helpers.r` (uses @lsp-cd)
 
 #### Path Types
 1. **File-relative**: `utils.R`, `../parent.R`, `./data.R`
@@ -286,8 +300,8 @@ source("utils.r")
    - Both: used directly after canonicalization
 
 #### PathContext Types
-- `PathContext::new(uri, workspace_root)` - For LSP directives (no working_directory)
-- `PathContext::from_metadata(uri, metadata, workspace_root)` - For source() calls (includes working_directory)
+- `PathContext::new(uri, workspace_root)` - For backward directives (no working_directory)
+- `PathContext::from_metadata(uri, metadata, workspace_root)` - For forward directives and source() calls (includes working_directory)
 
 ### Call-Site Resolution
 
@@ -522,14 +536,15 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 3. Check scope resolution logs: Verify traversal reaches sourced file
 4. Test with simple two-file case to isolate issue
 
-#### @lsp-cd Not Affecting Directives (Expected Behavior)
+#### @lsp-cd Not Affecting Backward Directives (Expected Behavior)
 **Symptom**: Backward directive path resolution ignores @lsp-cd
 
-**This is correct behavior**: LSP directives always resolve relative to file's directory, ignoring @lsp-cd. Only source() statements use @lsp-cd for path resolution.
+**This is correct behavior**: Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) always resolve relative to file's directory, ignoring @lsp-cd. Forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`) and source() statements use @lsp-cd for path resolution.
 
 **If you need @lsp-cd to affect a path**:
-- Use `source()` call instead of directive
-- Or specify absolute/workspace-relative path in directive
+- Use a forward directive (`@lsp-source`) instead of a backward directive
+- Or use a `source()` call instead of a directive
+- Or specify absolute/workspace-relative path in the backward directive
 
 ## VS Code Extension
 

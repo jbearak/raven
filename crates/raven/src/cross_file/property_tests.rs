@@ -1477,20 +1477,35 @@ proptest! {
     /// Property 58: For any file where both @lsp-source directive and AST detection
     /// identify a relationship to the same target URI, the directive SHALL be
     /// authoritative (first one wins in deduplication).
+    ///
+    /// Note: This test uses actual files because forward directives skip edge creation
+    /// for non-existent files (Requirement 3.3).
     #[test]
     fn prop_directive_overrides_ast(
         parent in path_component(),
         child in path_component(),
         line in 0..100u32
     ) {
+        use std::fs::File;
+        use tempfile::TempDir;
+
+        // Create temp workspace with actual files
+        let temp_dir = TempDir::new().unwrap();
+        let parent_file = format!("{}.R", parent);
+        let child_file = format!("{}.R", child);
+        File::create(temp_dir.path().join(&parent_file)).unwrap();
+        File::create(temp_dir.path().join(&child_file)).unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let parent_uri = Url::from_file_path(temp_dir.path().join(&parent_file)).unwrap();
+
         let mut graph = DependencyGraph::new();
-        let parent_uri = make_url(&parent);
 
         // Directive comes first in the list
         let meta = CrossFileMetadata {
             sources: vec![
                 ForwardSource {
-                    path: format!("{}.R", child),
+                    path: child_file.clone(),
                     line,
                     column: 0,
                     is_directive: true, // Directive first
@@ -1500,7 +1515,7 @@ proptest! {
                     sys_source_global_env: true,
                 },
                 ForwardSource {
-                    path: format!("{}.R", child),
+                    path: child_file,
                     line,
                     column: 0,
                     is_directive: false, // AST second
@@ -1513,7 +1528,7 @@ proptest! {
             ..Default::default()
         };
 
-        graph.update_file(&parent_uri, &meta, None, |_| None);
+        graph.update_file(&parent_uri, &meta, Some(&workspace_url), |_| None);
 
         let deps = graph.get_dependencies(&parent_uri);
         prop_assert_eq!(deps.len(), 1);
@@ -16367,6 +16382,4811 @@ proptest! {
         prop_assert!(
             a_inherited_path.starts_with(&format!("/{}", workspace)),
             "Fallback directory should be within workspace"
+        );
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 1: Forward Directive Parsing Completeness
+// Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9
+// ============================================================================
+
+/// Generate a valid path that may contain spaces (for quoted paths)
+fn path_with_optional_spaces() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // Simple path without spaces
+        relative_path(),
+        // Path with spaces (requires quoting)
+        (path_component(), path_component()).prop_map(|(dir, file)| {
+            format!("{} folder/{}.R", dir, file)
+        }),
+    ]
+}
+
+/// Generate a forward directive synonym
+fn forward_directive_synonym() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("lsp-source"),
+        Just("lsp-run"),
+        Just("lsp-include"),
+    ]
+}
+
+/// Generate optional @ prefix
+fn optional_at_prefix() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("@"),
+        Just(""),
+    ]
+}
+
+/// Generate optional colon separator
+fn optional_colon() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just(":"),
+        Just(""),
+    ]
+}
+
+/// Quote style for paths
+#[derive(Debug, Clone, Copy)]
+enum QuoteStyle {
+    None,
+    Double,
+    Single,
+}
+
+fn quote_style() -> impl Strategy<Value = QuoteStyle> {
+    prop_oneof![
+        Just(QuoteStyle::None),
+        Just(QuoteStyle::Double),
+        Just(QuoteStyle::Single),
+    ]
+}
+
+/// Format a path with the given quote style
+fn format_path_with_quotes(path: &str, style: QuoteStyle) -> String {
+    match style {
+        QuoteStyle::None => path.to_string(),
+        QuoteStyle::Double => format!("\"{}\"", path),
+        QuoteStyle::Single => format!("'{}'", path),
+    }
+}
+
+/// Generate optional line=N parameter
+fn optional_line_param() -> impl Strategy<Value = Option<u32>> {
+    prop_oneof![
+        Just(None),
+        (1..1000u32).prop_map(Some),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 1: Forward Directive Parsing Completeness
+    ///
+    /// For any valid forward directive syntax variation (with/without @, with/without colon,
+    /// with single/double/no quotes, with/without line= parameter), the Directive_Parser
+    /// SHALL produce a ForwardSource entry with the correct path and `is_directive=true`.
+    ///
+    /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9**
+    #[test]
+    fn prop_forward_directive_parsing_completeness(
+        at_prefix in optional_at_prefix(),
+        synonym in forward_directive_synonym(),
+        colon in optional_colon(),
+        path in relative_path(),  // Use simple path for unquoted case
+        quotes in quote_style(),
+        line_param in optional_line_param(),
+        prefix_lines in 0..5u32,
+    ) {
+        // Skip unquoted paths with spaces (invalid syntax)
+        let formatted_path = format_path_with_quotes(&path, quotes);
+
+        // Build the directive line
+        let line_suffix = match line_param {
+            Some(n) => format!(" line={}", n),
+            None => String::new(),
+        };
+
+        // Build prefix lines to test directive line position
+        let mut lines = Vec::new();
+        for i in 0..prefix_lines {
+            lines.push(format!("x{} <- {}", i, i));
+        }
+        lines.push(format!("# {}{}{} {}{}", at_prefix, synonym, colon, formatted_path, line_suffix));
+        let content = lines.join("\n");
+
+        let meta = parse_directives(&content);
+
+        // Requirement 1.1-1.3: Should produce exactly one ForwardSource
+        prop_assert_eq!(
+            meta.sources.len(),
+            1,
+            "Expected 1 ForwardSource for directive: # {}{}{} {}{}",
+            at_prefix, synonym, colon, formatted_path, line_suffix
+        );
+
+        let source = &meta.sources[0];
+
+        // Requirement 1.6, 1.7, 1.9: Path should be extracted correctly (without quotes)
+        prop_assert_eq!(
+            &source.path,
+            &path,
+            "Path should be extracted without quotes"
+        );
+
+        // Requirement: is_directive should be true
+        prop_assert!(
+            source.is_directive,
+            "is_directive should be true for @lsp-source directive"
+        );
+
+        // Requirement 2.1, 2.2: Line should be correct
+        let expected_line = match line_param {
+            Some(n) => n.saturating_sub(1), // Convert 1-based to 0-based
+            None => prefix_lines,           // Use directive's own line
+        };
+        prop_assert_eq!(
+            source.line,
+            expected_line,
+            "Line should be {} (line_param={:?}, prefix_lines={})",
+            expected_line, line_param, prefix_lines
+        );
+
+        // Requirement 2.4: Column should always be 0 for directives
+        prop_assert_eq!(
+            source.column,
+            0,
+            "Column should always be 0 for directive-based sources"
+        );
+
+        // Directive-specific flags
+        prop_assert!(!source.local, "local should be false for directives");
+        prop_assert!(!source.chdir, "chdir should be false for directives");
+        prop_assert!(!source.is_sys_source, "is_sys_source should be false for directives");
+        prop_assert!(source.sys_source_global_env, "sys_source_global_env should be true for directives");
+    }
+
+    /// Feature: lsp-source-directive, Property 1 Extended: Paths with spaces require quotes
+    ///
+    /// For any path containing spaces, the directive MUST use quotes (single or double)
+    /// for the path to be correctly extracted.
+    ///
+    /// **Validates: Requirements 1.6, 1.7, 1.8**
+    #[test]
+    fn prop_forward_directive_paths_with_spaces(
+        at_prefix in optional_at_prefix(),
+        synonym in forward_directive_synonym(),
+        colon in optional_colon(),
+        dir in path_component(),
+        file in path_component(),
+        use_double_quotes in proptest::bool::ANY,
+    ) {
+        let path_with_spaces = format!("{} folder/{}.R", dir, file);
+
+        let formatted_path = if use_double_quotes {
+            format!("\"{}\"", path_with_spaces)
+        } else {
+            format!("'{}'", path_with_spaces)
+        };
+
+        let content = format!("# {}{}{} {}", at_prefix, synonym, colon, formatted_path);
+        let meta = parse_directives(&content);
+
+        // Should produce exactly one ForwardSource
+        prop_assert_eq!(meta.sources.len(), 1);
+
+        // Requirement 1.8: Path with spaces should be preserved
+        prop_assert_eq!(
+            &meta.sources[0].path,
+            &path_with_spaces,
+            "Path with spaces should be preserved"
+        );
+
+        prop_assert!(meta.sources[0].is_directive);
+    }
+
+    /// Feature: lsp-source-directive, Property 1 Extended: All syntax combinations
+    ///
+    /// Exhaustively test all combinations of @ prefix, colon, and quote styles
+    /// to ensure complete coverage of the directive syntax.
+    ///
+    /// **Validates: Requirements 1.4, 1.5, 1.6, 1.7, 1.9**
+    #[test]
+    fn prop_forward_directive_all_syntax_combinations(
+        path in relative_path(),
+    ) {
+        let at_prefixes = ["@", ""];
+        let synonyms = ["lsp-source", "lsp-run", "lsp-include"];
+        let colons = [":", ""];
+        let quote_styles = [QuoteStyle::None, QuoteStyle::Double, QuoteStyle::Single];
+
+        for at_prefix in &at_prefixes {
+            for synonym in &synonyms {
+                for colon in &colons {
+                    for quotes in &quote_styles {
+                        let formatted_path = format_path_with_quotes(&path, *quotes);
+                        let content = format!("# {}{}{} {}", at_prefix, synonym, colon, formatted_path);
+                        let meta = parse_directives(&content);
+
+                        prop_assert_eq!(
+                            meta.sources.len(),
+                            1,
+                            "Failed for: {}",
+                            content
+                        );
+                        prop_assert_eq!(
+                            &meta.sources[0].path,
+                            &path,
+                            "Path mismatch for: {}",
+                            content
+                        );
+                        prop_assert!(
+                            meta.sources[0].is_directive,
+                            "is_directive should be true for: {}",
+                            content
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 2: Synonym Equivalence
+    ///
+    /// For any path string, parsing `@lsp-source <path>`, `@lsp-run <path>`, and
+    /// `@lsp-include <path>` SHALL produce identical ForwardSource entries
+    /// (same path, same flags).
+    ///
+    /// **Validates: Requirements 1.2, 1.3**
+    #[test]
+    fn prop_forward_directive_synonym_equivalence(
+        path in relative_path_with_parents(),
+    ) {
+        let source_content = format!("# @lsp-source {}", path);
+        let run_content = format!("# @lsp-run {}", path);
+        let include_content = format!("# @lsp-include {}", path);
+
+        let meta_source = parse_directives(&source_content);
+        let meta_run = parse_directives(&run_content);
+        let meta_include = parse_directives(&include_content);
+
+        // All should produce exactly one ForwardSource
+        prop_assert_eq!(meta_source.sources.len(), 1, "@lsp-source should produce 1 ForwardSource");
+        prop_assert_eq!(meta_run.sources.len(), 1, "@lsp-run should produce 1 ForwardSource");
+        prop_assert_eq!(meta_include.sources.len(), 1, "@lsp-include should produce 1 ForwardSource");
+
+        let source = &meta_source.sources[0];
+        let run = &meta_run.sources[0];
+        let include = &meta_include.sources[0];
+
+        // All should have the same path
+        prop_assert_eq!(&source.path, &path, "@lsp-source path mismatch");
+        prop_assert_eq!(&run.path, &path, "@lsp-run path mismatch");
+        prop_assert_eq!(&include.path, &path, "@lsp-include path mismatch");
+
+        // All should have identical flags
+        prop_assert_eq!(source.is_directive, run.is_directive, "is_directive mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.is_directive, include.is_directive, "is_directive mismatch between @lsp-source and @lsp-include");
+        prop_assert!(source.is_directive, "is_directive should be true for all synonyms");
+
+        prop_assert_eq!(source.local, run.local, "local mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.local, include.local, "local mismatch between @lsp-source and @lsp-include");
+
+        prop_assert_eq!(source.chdir, run.chdir, "chdir mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.chdir, include.chdir, "chdir mismatch between @lsp-source and @lsp-include");
+
+        prop_assert_eq!(source.is_sys_source, run.is_sys_source, "is_sys_source mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.is_sys_source, include.is_sys_source, "is_sys_source mismatch between @lsp-source and @lsp-include");
+
+        prop_assert_eq!(source.sys_source_global_env, run.sys_source_global_env, "sys_source_global_env mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.sys_source_global_env, include.sys_source_global_env, "sys_source_global_env mismatch between @lsp-source and @lsp-include");
+
+        // All should have the same line (0, since directive is on first line)
+        prop_assert_eq!(source.line, run.line, "line mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.line, include.line, "line mismatch between @lsp-source and @lsp-include");
+
+        // All should have column = 0 for directives
+        prop_assert_eq!(source.column, run.column, "column mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.column, include.column, "column mismatch between @lsp-source and @lsp-include");
+        prop_assert_eq!(source.column, 0, "column should be 0 for all directive synonyms");
+    }
+
+    /// Feature: lsp-source-directive, Property 2 Extended: Synonym equivalence with colon
+    ///
+    /// Synonyms with colon separator should also produce identical ForwardSource entries.
+    ///
+    /// **Validates: Requirements 1.2, 1.3, 1.5**
+    #[test]
+    fn prop_forward_directive_synonym_equivalence_with_colon(
+        path in relative_path_with_parents(),
+    ) {
+        let source_content = format!("# @lsp-source: {}", path);
+        let run_content = format!("# @lsp-run: {}", path);
+        let include_content = format!("# @lsp-include: {}", path);
+
+        let meta_source = parse_directives(&source_content);
+        let meta_run = parse_directives(&run_content);
+        let meta_include = parse_directives(&include_content);
+
+        // All should produce exactly one ForwardSource
+        prop_assert_eq!(meta_source.sources.len(), 1);
+        prop_assert_eq!(meta_run.sources.len(), 1);
+        prop_assert_eq!(meta_include.sources.len(), 1);
+
+        // All should have the same path
+        prop_assert_eq!(&meta_source.sources[0].path, &path);
+        prop_assert_eq!(&meta_run.sources[0].path, &path);
+        prop_assert_eq!(&meta_include.sources[0].path, &path);
+
+        // All should have identical ForwardSource structures
+        prop_assert_eq!(&meta_source.sources[0], &meta_run.sources[0], "@lsp-source: and @lsp-run: should produce identical ForwardSource");
+        prop_assert_eq!(&meta_source.sources[0], &meta_include.sources[0], "@lsp-source: and @lsp-include: should produce identical ForwardSource");
+    }
+
+    /// Feature: lsp-source-directive, Property 2 Extended: Synonym equivalence with quotes
+    ///
+    /// Synonyms with quoted paths should also produce identical ForwardSource entries.
+    ///
+    /// **Validates: Requirements 1.2, 1.3, 1.6, 1.7**
+    #[test]
+    fn prop_forward_directive_synonym_equivalence_with_quotes(
+        path in relative_path_with_parents(),
+    ) {
+        // Test with double quotes
+        let source_double = format!("# @lsp-source \"{}\"", path);
+        let run_double = format!("# @lsp-run \"{}\"", path);
+        let include_double = format!("# @lsp-include \"{}\"", path);
+
+        let meta_source_double = parse_directives(&source_double);
+        let meta_run_double = parse_directives(&run_double);
+        let meta_include_double = parse_directives(&include_double);
+
+        prop_assert_eq!(meta_source_double.sources.len(), 1);
+        prop_assert_eq!(meta_run_double.sources.len(), 1);
+        prop_assert_eq!(meta_include_double.sources.len(), 1);
+
+        prop_assert_eq!(&meta_source_double.sources[0], &meta_run_double.sources[0], "@lsp-source and @lsp-run with double quotes should produce identical ForwardSource");
+        prop_assert_eq!(&meta_source_double.sources[0], &meta_include_double.sources[0], "@lsp-source and @lsp-include with double quotes should produce identical ForwardSource");
+
+        // Test with single quotes
+        let source_single = format!("# @lsp-source '{}'", path);
+        let run_single = format!("# @lsp-run '{}'", path);
+        let include_single = format!("# @lsp-include '{}'", path);
+
+        let meta_source_single = parse_directives(&source_single);
+        let meta_run_single = parse_directives(&run_single);
+        let meta_include_single = parse_directives(&include_single);
+
+        prop_assert_eq!(meta_source_single.sources.len(), 1);
+        prop_assert_eq!(meta_run_single.sources.len(), 1);
+        prop_assert_eq!(meta_include_single.sources.len(), 1);
+
+        prop_assert_eq!(&meta_source_single.sources[0], &meta_run_single.sources[0], "@lsp-source and @lsp-run with single quotes should produce identical ForwardSource");
+        prop_assert_eq!(&meta_source_single.sources[0], &meta_include_single.sources[0], "@lsp-source and @lsp-include with single quotes should produce identical ForwardSource");
+
+        // Double and single quotes should also produce identical results
+        prop_assert_eq!(&meta_source_double.sources[0], &meta_source_single.sources[0], "Double and single quotes should produce identical ForwardSource");
+    }
+
+    /// Feature: lsp-source-directive, Property 2 Extended: Synonym equivalence without @ prefix
+    ///
+    /// Synonyms without @ prefix should also produce identical ForwardSource entries.
+    ///
+    /// **Validates: Requirements 1.2, 1.3, 1.4**
+    #[test]
+    fn prop_forward_directive_synonym_equivalence_no_at_prefix(
+        path in relative_path_with_parents(),
+    ) {
+        let source_content = format!("# lsp-source {}", path);
+        let run_content = format!("# lsp-run {}", path);
+        let include_content = format!("# lsp-include {}", path);
+
+        let meta_source = parse_directives(&source_content);
+        let meta_run = parse_directives(&run_content);
+        let meta_include = parse_directives(&include_content);
+
+        // All should produce exactly one ForwardSource
+        prop_assert_eq!(meta_source.sources.len(), 1);
+        prop_assert_eq!(meta_run.sources.len(), 1);
+        prop_assert_eq!(meta_include.sources.len(), 1);
+
+        // All should have the same path
+        prop_assert_eq!(&meta_source.sources[0].path, &path);
+        prop_assert_eq!(&meta_run.sources[0].path, &path);
+        prop_assert_eq!(&meta_include.sources[0].path, &path);
+
+        // All should have identical ForwardSource structures
+        prop_assert_eq!(&meta_source.sources[0], &meta_run.sources[0], "lsp-source and lsp-run (no @) should produce identical ForwardSource");
+        prop_assert_eq!(&meta_source.sources[0], &meta_include.sources[0], "lsp-source and lsp-include (no @) should produce identical ForwardSource");
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 3: Call-Site Line Conversion
+// Validates: Requirements 2.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 3: Call-Site Line Conversion
+    ///
+    /// *For any* forward directive with `line=N` parameter where N is a positive integer,
+    /// the resulting ForwardSource SHALL have `line = N - 1` (converting from 1-based
+    /// user input to 0-based internal representation).
+    ///
+    /// **Validates: Requirements 2.1**
+    #[test]
+    fn prop_forward_directive_call_site_line_conversion(
+        path in relative_path(),
+        user_line in 1..10000u32,  // 1-based line numbers (user input)
+    ) {
+        // Create directive with line=N parameter
+        let content = format!("# @lsp-source {} line={}", path, user_line);
+        let meta = parse_directives(&content);
+
+        // Should produce exactly one ForwardSource
+        prop_assert_eq!(
+            meta.sources.len(),
+            1,
+            "Expected 1 ForwardSource for directive with line={}", user_line
+        );
+
+        let source = &meta.sources[0];
+
+        // Core property: line should be N-1 (0-based internal representation)
+        let expected_line = user_line.saturating_sub(1);
+        prop_assert_eq!(
+            source.line,
+            expected_line,
+            "For line={} (1-based), internal line should be {} (0-based), but got {}",
+            user_line, expected_line, source.line
+        );
+
+        // Verify path is correct
+        prop_assert_eq!(&source.path, &path);
+
+        // Verify is_directive flag
+        prop_assert!(source.is_directive, "is_directive should be true");
+
+        // Verify column is always 0 for directives
+        prop_assert_eq!(source.column, 0, "column should always be 0 for directives");
+    }
+
+    /// Feature: lsp-source-directive, Property 3 Extended: Line conversion with all synonyms
+    ///
+    /// The line=N to N-1 conversion should work identically for all forward directive
+    /// synonyms (@lsp-source, @lsp-run, @lsp-include).
+    ///
+    /// **Validates: Requirements 2.1**
+    #[test]
+    fn prop_forward_directive_call_site_line_conversion_all_synonyms(
+        path in relative_path(),
+        user_line in 1..1000u32,
+    ) {
+        let synonyms = ["@lsp-source", "@lsp-run", "@lsp-include"];
+        let expected_line = user_line.saturating_sub(1);
+
+        for synonym in &synonyms {
+            let content = format!("# {} {} line={}", synonym, path, user_line);
+            let meta = parse_directives(&content);
+
+            prop_assert_eq!(
+                meta.sources.len(),
+                1,
+                "Expected 1 ForwardSource for {} with line={}", synonym, user_line
+            );
+
+            prop_assert_eq!(
+                meta.sources[0].line,
+                expected_line,
+                "For {} line={}, internal line should be {}, but got {}",
+                synonym, user_line, expected_line, meta.sources[0].line
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 3 Extended: Line conversion with various syntax
+    ///
+    /// The line=N to N-1 conversion should work with all syntax variations
+    /// (with/without @, with/without colon, with/without quotes).
+    ///
+    /// **Validates: Requirements 2.1**
+    #[test]
+    fn prop_forward_directive_call_site_line_conversion_syntax_variations(
+        path in relative_path(),
+        user_line in 1..500u32,
+        at_prefix in optional_at_prefix(),
+        colon in optional_colon(),
+        quotes in quote_style(),
+    ) {
+        let formatted_path = format_path_with_quotes(&path, quotes);
+        let content = format!("# {}lsp-source{} {} line={}", at_prefix, colon, formatted_path, user_line);
+        let meta = parse_directives(&content);
+
+        let expected_line = user_line.saturating_sub(1);
+
+        prop_assert_eq!(
+            meta.sources.len(),
+            1,
+            "Expected 1 ForwardSource for directive: {}", content
+        );
+
+        prop_assert_eq!(
+            meta.sources[0].line,
+            expected_line,
+            "For '{}', internal line should be {} (0-based), but got {}",
+            content, expected_line, meta.sources[0].line
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 3 Extended: Edge case line=1
+    ///
+    /// The minimum valid line number (line=1) should convert to 0.
+    ///
+    /// **Validates: Requirements 2.1**
+    #[test]
+    fn prop_forward_directive_call_site_line_one_converts_to_zero(
+        path in relative_path(),
+    ) {
+        let content = format!("# @lsp-source {} line=1", path);
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(meta.sources.len(), 1);
+        prop_assert_eq!(
+            meta.sources[0].line,
+            0,
+            "line=1 (1-based) should convert to 0 (0-based)"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 3 Extended: Large line numbers
+    ///
+    /// Large line numbers should also be correctly converted.
+    ///
+    /// **Validates: Requirements 2.1**
+    #[test]
+    fn prop_forward_directive_call_site_large_line_numbers(
+        path in relative_path(),
+        user_line in 10000..100000u32,
+    ) {
+        let content = format!("# @lsp-source {} line={}", path, user_line);
+        let meta = parse_directives(&content);
+
+        let expected_line = user_line.saturating_sub(1);
+
+        prop_assert_eq!(meta.sources.len(), 1);
+        prop_assert_eq!(
+            meta.sources[0].line,
+            expected_line,
+            "For line={}, internal line should be {}", user_line, expected_line
+        );
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 4: Default Call-Site Assignment
+// Validates: Requirements 2.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 4: Default Call-Site Assignment
+    ///
+    /// *For any* forward directive without a `line=` parameter appearing at line L (0-based),
+    /// the resulting ForwardSource SHALL have `line = L`.
+    ///
+    /// **Validates: Requirements 2.2**
+    #[test]
+    fn prop_forward_directive_default_call_site_assignment(
+        path in relative_path(),
+        prefix_lines in 0..50u32,  // Number of lines before the directive
+    ) {
+        // Build content with prefix_lines lines before the directive
+        let mut lines = Vec::new();
+        for i in 0..prefix_lines {
+            lines.push(format!("x{} <- {}", i, i));
+        }
+        // Add the directive WITHOUT line= parameter
+        lines.push(format!("# @lsp-source {}", path));
+        let content = lines.join("\n");
+
+        let meta = parse_directives(&content);
+
+        // Should produce exactly one ForwardSource
+        prop_assert_eq!(
+            meta.sources.len(),
+            1,
+            "Expected 1 ForwardSource for directive at line {}", prefix_lines
+        );
+
+        let source = &meta.sources[0];
+
+        // Core property: line should equal the directive's own line position (0-based)
+        prop_assert_eq!(
+            source.line,
+            prefix_lines,
+            "For directive at line {} (0-based), ForwardSource.line should be {}, but got {}",
+            prefix_lines, prefix_lines, source.line
+        );
+
+        // Verify path is correct
+        prop_assert_eq!(&source.path, &path);
+
+        // Verify is_directive flag
+        prop_assert!(source.is_directive, "is_directive should be true");
+
+        // Verify column is always 0 for directives
+        prop_assert_eq!(source.column, 0, "column should always be 0 for directives");
+    }
+
+    /// Feature: lsp-source-directive, Property 4 Extended: Default call-site with all synonyms
+    ///
+    /// The default call-site assignment (using directive's own line) should work
+    /// identically for all forward directive synonyms.
+    ///
+    /// **Validates: Requirements 2.2**
+    #[test]
+    fn prop_forward_directive_default_call_site_all_synonyms(
+        path in relative_path(),
+        prefix_lines in 0..20u32,
+    ) {
+        let synonyms = ["@lsp-source", "@lsp-run", "@lsp-include"];
+
+        for synonym in &synonyms {
+            let mut lines = Vec::new();
+            for i in 0..prefix_lines {
+                lines.push(format!("y{} <- {}", i, i));
+            }
+            lines.push(format!("# {} {}", synonym, path));
+            let content = lines.join("\n");
+
+            let meta = parse_directives(&content);
+
+            prop_assert_eq!(
+                meta.sources.len(),
+                1,
+                "Expected 1 ForwardSource for {} at line {}", synonym, prefix_lines
+            );
+
+            prop_assert_eq!(
+                meta.sources[0].line,
+                prefix_lines,
+                "For {} at line {}, ForwardSource.line should be {}, but got {}",
+                synonym, prefix_lines, prefix_lines, meta.sources[0].line
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 4 Extended: Default call-site with syntax variations
+    ///
+    /// The default call-site assignment should work with all syntax variations
+    /// (with/without @, with/without colon, with/without quotes).
+    ///
+    /// **Validates: Requirements 2.2**
+    #[test]
+    fn prop_forward_directive_default_call_site_syntax_variations(
+        path in relative_path(),
+        prefix_lines in 0..15u32,
+        at_prefix in optional_at_prefix(),
+        colon in optional_colon(),
+        quotes in quote_style(),
+    ) {
+        let formatted_path = format_path_with_quotes(&path, quotes);
+
+        let mut lines = Vec::new();
+        for i in 0..prefix_lines {
+            lines.push(format!("z{} <- {}", i, i));
+        }
+        // Directive WITHOUT line= parameter
+        lines.push(format!("# {}lsp-source{} {}", at_prefix, colon, formatted_path));
+        let content = lines.join("\n");
+
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(
+            meta.sources.len(),
+            1,
+            "Expected 1 ForwardSource for directive at line {}", prefix_lines
+        );
+
+        prop_assert_eq!(
+            meta.sources[0].line,
+            prefix_lines,
+            "For directive at line {}, ForwardSource.line should be {}, but got {}",
+            prefix_lines, prefix_lines, meta.sources[0].line
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 4 Extended: Default call-site at line 0
+    ///
+    /// When the directive is on the first line (line 0), the ForwardSource.line should be 0.
+    ///
+    /// **Validates: Requirements 2.2**
+    #[test]
+    fn prop_forward_directive_default_call_site_line_zero(
+        path in relative_path(),
+    ) {
+        // Directive on the very first line (no prefix lines)
+        let content = format!("# @lsp-source {}", path);
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(meta.sources.len(), 1);
+        prop_assert_eq!(
+            meta.sources[0].line,
+            0,
+            "Directive on first line should have ForwardSource.line = 0"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 4 Extended: Default call-site vs explicit line=
+    ///
+    /// Verify that default call-site (no line=) differs from explicit line= parameter.
+    /// When directive is at line L and has line=N, the ForwardSource.line should be N-1, not L.
+    ///
+    /// **Validates: Requirements 2.2 (by contrast with 2.1)**
+    #[test]
+    fn prop_forward_directive_default_vs_explicit_call_site(
+        path in relative_path(),
+        prefix_lines in 1..20u32,  // At least 1 prefix line so directive is not at line 0
+        explicit_line in 1..100u32,
+    ) {
+        // Directive WITHOUT line= parameter
+        let mut lines_default = Vec::new();
+        for i in 0..prefix_lines {
+            lines_default.push(format!("a{} <- {}", i, i));
+        }
+        lines_default.push(format!("# @lsp-source {}", path));
+        let content_default = lines_default.join("\n");
+
+        // Directive WITH line= parameter
+        let mut lines_explicit = Vec::new();
+        for i in 0..prefix_lines {
+            lines_explicit.push(format!("b{} <- {}", i, i));
+        }
+        lines_explicit.push(format!("# @lsp-source {} line={}", path, explicit_line));
+        let content_explicit = lines_explicit.join("\n");
+
+        let meta_default = parse_directives(&content_default);
+        let meta_explicit = parse_directives(&content_explicit);
+
+        prop_assert_eq!(meta_default.sources.len(), 1);
+        prop_assert_eq!(meta_explicit.sources.len(), 1);
+
+        // Default should use directive's own line
+        prop_assert_eq!(
+            meta_default.sources[0].line,
+            prefix_lines,
+            "Default call-site should be directive's line ({})", prefix_lines
+        );
+
+        // Explicit should use line=N converted to 0-based
+        let expected_explicit = explicit_line.saturating_sub(1);
+        prop_assert_eq!(
+            meta_explicit.sources[0].line,
+            expected_explicit,
+            "Explicit line={} should convert to {}", explicit_line, expected_explicit
+        );
+
+        // They should differ (unless by coincidence prefix_lines == explicit_line - 1)
+        // This is just a sanity check, not a strict property
+    }
+
+    /// Feature: lsp-source-directive, Property 4 Extended: Multiple directives at different lines
+    ///
+    /// When multiple directives without line= appear at different lines, each should
+    /// have its ForwardSource.line set to its own line position.
+    ///
+    /// **Validates: Requirements 2.2, 2.3**
+    #[test]
+    fn prop_forward_directive_multiple_default_call_sites(
+        path1 in relative_path(),
+        path2 in relative_path(),
+        path3 in relative_path(),
+        gap1 in 0..5u32,  // Lines between start and first directive
+        gap2 in 1..5u32,  // Lines between first and second directive
+        gap3 in 1..5u32,  // Lines between second and third directive
+    ) {
+        let mut lines = Vec::new();
+
+        // Add gap1 lines before first directive
+        for i in 0..gap1 {
+            lines.push(format!("pre1_{} <- {}", i, i));
+        }
+        let line1 = lines.len() as u32;
+        lines.push(format!("# @lsp-source {}", path1));
+
+        // Add gap2 lines before second directive
+        for i in 0..gap2 {
+            lines.push(format!("pre2_{} <- {}", i, i));
+        }
+        let line2 = lines.len() as u32;
+        lines.push(format!("# @lsp-run {}", path2));
+
+        // Add gap3 lines before third directive
+        for i in 0..gap3 {
+            lines.push(format!("pre3_{} <- {}", i, i));
+        }
+        let line3 = lines.len() as u32;
+        lines.push(format!("# @lsp-include {}", path3));
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        // Should produce exactly 3 ForwardSource entries
+        prop_assert_eq!(
+            meta.sources.len(),
+            3,
+            "Expected 3 ForwardSource entries"
+        );
+
+        // Each should have its line set to its own position
+        prop_assert_eq!(
+            meta.sources[0].line,
+            line1,
+            "First directive at line {} should have ForwardSource.line = {}", line1, line1
+        );
+        prop_assert_eq!(
+            meta.sources[1].line,
+            line2,
+            "Second directive at line {} should have ForwardSource.line = {}", line2, line2
+        );
+        prop_assert_eq!(
+            meta.sources[2].line,
+            line3,
+            "Third directive at line {} should have ForwardSource.line = {}", line3, line3
+        );
+
+        // Verify paths are correct
+        prop_assert_eq!(&meta.sources[0].path, &path1);
+        prop_assert_eq!(&meta.sources[1].path, &path2);
+        prop_assert_eq!(&meta.sources[2].path, &path3);
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 5: Multiple Directive Independence
+// Validates: Requirements 2.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 5: Multiple Directive Independence
+    ///
+    /// *For any* file containing N forward directives, the Directive_Parser SHALL produce
+    /// exactly N ForwardSource entries, each with the correct path and line.
+    ///
+    /// This property verifies that:
+    /// 1. Each directive is parsed independently
+    /// 2. No directives are lost or duplicated
+    /// 3. Each ForwardSource has the correct path
+    /// 4. Each ForwardSource has the correct line (either from line= param or directive position)
+    ///
+    /// **Validates: Requirements 2.3**
+    #[test]
+    fn prop_forward_directive_multiple_independence(
+        num_directives in 1..=10usize,
+    ) {
+        // Generate unique paths for each directive
+        let paths: Vec<String> = (0..num_directives)
+            .map(|i| format!("file_{}.R", i))
+            .collect();
+
+        // Build file content with N directives, each on its own line
+        // Use different synonyms to also verify synonym handling
+        let synonyms = ["@lsp-source", "@lsp-run", "@lsp-include"];
+        let mut lines = Vec::new();
+        let mut expected_entries: Vec<(String, u32)> = Vec::new();
+
+        for (i, path) in paths.iter().enumerate() {
+            let synonym = synonyms[i % synonyms.len()];
+            let line_num = lines.len() as u32;
+            lines.push(format!("# {} {}", synonym, path));
+            expected_entries.push((path.clone(), line_num));
+        }
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        // Property: Exactly N ForwardSource entries
+        prop_assert_eq!(
+            meta.sources.len(),
+            num_directives,
+            "Expected {} ForwardSource entries, got {}",
+            num_directives,
+            meta.sources.len()
+        );
+
+        // Property: Each entry has correct path and line
+        for (i, (expected_path, expected_line)) in expected_entries.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.sources[i].path,
+                expected_path,
+                "Entry {} should have path '{}', got '{}'",
+                i,
+                expected_path,
+                meta.sources[i].path
+            );
+            prop_assert_eq!(
+                meta.sources[i].line,
+                *expected_line,
+                "Entry {} should have line {}, got {}",
+                i,
+                expected_line,
+                meta.sources[i].line
+            );
+            // All directive-based sources should have is_directive=true
+            prop_assert!(
+                meta.sources[i].is_directive,
+                "Entry {} should have is_directive=true",
+                i
+            );
+            // All directive-based sources should have column=0
+            prop_assert_eq!(
+                meta.sources[i].column,
+                0,
+                "Entry {} should have column=0",
+                i
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 5 Extended: Multiple directives with explicit line= params
+    ///
+    /// When multiple directives have explicit line= parameters, each should independently
+    /// convert its line number from 1-based to 0-based.
+    ///
+    /// **Validates: Requirements 2.1, 2.3**
+    #[test]
+    fn prop_forward_directive_multiple_with_explicit_lines(
+        num_directives in 1..=10usize,
+    ) {
+        // Generate unique paths and line numbers for each directive
+        let mut lines = Vec::new();
+        let mut expected_entries: Vec<(String, u32)> = Vec::new();
+
+        for i in 0..num_directives {
+            let path = format!("module_{}.R", i);
+            // Use different explicit line numbers (1-based user input)
+            let explicit_line = (i as u32 + 1) * 10; // 10, 20, 30, ...
+            let expected_line = explicit_line - 1; // Convert to 0-based
+
+            lines.push(format!("# @lsp-source {} line={}", path, explicit_line));
+            expected_entries.push((path, expected_line));
+        }
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        // Property: Exactly N ForwardSource entries
+        prop_assert_eq!(
+            meta.sources.len(),
+            num_directives,
+            "Expected {} ForwardSource entries, got {}",
+            num_directives,
+            meta.sources.len()
+        );
+
+        // Property: Each entry has correct path and converted line
+        for (i, (expected_path, expected_line)) in expected_entries.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.sources[i].path,
+                expected_path,
+                "Entry {} should have path '{}', got '{}'",
+                i,
+                expected_path,
+                meta.sources[i].path
+            );
+            prop_assert_eq!(
+                meta.sources[i].line,
+                *expected_line,
+                "Entry {} should have line {} (converted from {}), got {}",
+                i,
+                expected_line,
+                expected_line + 1,
+                meta.sources[i].line
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 5 Extended: Multiple directives with mixed line= usage
+    ///
+    /// When some directives have explicit line= and others don't, each should be
+    /// processed independently according to its own parameters.
+    ///
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    #[test]
+    fn prop_forward_directive_multiple_mixed_line_params(
+        num_directives in 2..=10usize,
+    ) {
+        let mut lines = Vec::new();
+        let mut expected_entries: Vec<(String, u32)> = Vec::new();
+
+        for i in 0..num_directives {
+            let path = format!("script_{}.R", i);
+            let directive_line = lines.len() as u32;
+
+            // Alternate between explicit line= and default (directive's own line)
+            if i % 2 == 0 {
+                // Even indices: use explicit line=
+                let explicit_line = (i as u32 + 1) * 5; // 5, 15, 25, ...
+                let expected_line = explicit_line - 1; // Convert to 0-based
+                lines.push(format!("# @lsp-source {} line={}", path, explicit_line));
+                expected_entries.push((path, expected_line));
+            } else {
+                // Odd indices: use default (directive's own line)
+                lines.push(format!("# @lsp-source {}", path));
+                expected_entries.push((path, directive_line));
+            }
+        }
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        // Property: Exactly N ForwardSource entries
+        prop_assert_eq!(
+            meta.sources.len(),
+            num_directives,
+            "Expected {} ForwardSource entries, got {}",
+            num_directives,
+            meta.sources.len()
+        );
+
+        // Property: Each entry has correct path and line (explicit or default)
+        for (i, (expected_path, expected_line)) in expected_entries.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.sources[i].path,
+                expected_path,
+                "Entry {} should have path '{}', got '{}'",
+                i,
+                expected_path,
+                meta.sources[i].path
+            );
+            prop_assert_eq!(
+                meta.sources[i].line,
+                *expected_line,
+                "Entry {} should have line {}, got {}",
+                i,
+                expected_line,
+                meta.sources[i].line
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 5 Extended: Multiple directives with interleaved code
+    ///
+    /// When directives are interleaved with regular R code, each directive should
+    /// still be parsed correctly with the right line number.
+    ///
+    /// **Validates: Requirements 2.2, 2.3**
+    #[test]
+    fn prop_forward_directive_multiple_interleaved_with_code(
+        num_directives in 1..=10usize,
+        code_lines_between in 0..5usize,
+    ) {
+        let mut lines = Vec::new();
+        let mut expected_entries: Vec<(String, u32)> = Vec::new();
+
+        for i in 0..num_directives {
+            // Add some R code lines before each directive
+            for j in 0..code_lines_between {
+                lines.push(format!("var_{}_{} <- {}", i, j, i * 10 + j));
+            }
+
+            let path = format!("helper_{}.R", i);
+            let directive_line = lines.len() as u32;
+            lines.push(format!("# @lsp-source {}", path));
+            expected_entries.push((path, directive_line));
+        }
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        // Property: Exactly N ForwardSource entries (code lines should not affect count)
+        prop_assert_eq!(
+            meta.sources.len(),
+            num_directives,
+            "Expected {} ForwardSource entries, got {}",
+            num_directives,
+            meta.sources.len()
+        );
+
+        // Property: Each entry has correct path and line
+        for (i, (expected_path, expected_line)) in expected_entries.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.sources[i].path,
+                expected_path,
+                "Entry {} should have path '{}', got '{}'",
+                i,
+                expected_path,
+                meta.sources[i].path
+            );
+            prop_assert_eq!(
+                meta.sources[i].line,
+                *expected_line,
+                "Entry {} should have line {}, got {}",
+                i,
+                expected_line,
+                meta.sources[i].line
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 5 Extended: Multiple directives preserve order
+    ///
+    /// The order of ForwardSource entries should match the order of directives in the file.
+    ///
+    /// **Validates: Requirements 2.3**
+    #[test]
+    fn prop_forward_directive_multiple_preserve_order(
+        num_directives in 2..=10usize,
+    ) {
+        // Generate paths in a specific order
+        let paths: Vec<String> = (0..num_directives)
+            .map(|i| format!("ordered_{}.R", i))
+            .collect();
+
+        let content = paths
+            .iter()
+            .map(|p| format!("# @lsp-source {}", p))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let meta = parse_directives(&content);
+
+        // Property: Exactly N ForwardSource entries
+        prop_assert_eq!(
+            meta.sources.len(),
+            num_directives,
+            "Expected {} ForwardSource entries, got {}",
+            num_directives,
+            meta.sources.len()
+        );
+
+        // Property: Order is preserved
+        for (i, expected_path) in paths.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.sources[i].path,
+                expected_path,
+                "Entry {} should have path '{}' (order preserved), got '{}'",
+                i,
+                expected_path,
+                meta.sources[i].path
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 6: Forward Directive Uses Working Directory
+// Validates: Requirements 3.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 6: Forward Directive Uses Working Directory
+    ///
+    /// *For any* file with both `@lsp-cd <wd>` and `@lsp-source <path>` directives,
+    /// the path resolution for the forward directive SHALL use the working directory
+    /// `<wd>` as the base for relative path resolution.
+    ///
+    /// This property verifies that:
+    /// 1. When @lsp-cd is present, forward directive paths resolve relative to the working directory
+    /// 2. The working directory takes precedence over the file's directory for path resolution
+    /// 3. PathContext::from_metadata() correctly includes the working directory
+    ///
+    /// **Validates: Requirements 3.4**
+    #[test]
+    fn prop_forward_directive_uses_working_directory(
+        wd_subdir in path_component(),
+        source_file in path_component(),
+    ) {
+        // Setup: File at /workspace/src/main.R with @lsp-cd pointing to /workspace/data
+        // and @lsp-source pointing to utils.R
+        //
+        // Expected: The path utils.R should resolve to /workspace/data/utils.R
+        // (using the working directory), NOT /workspace/src/utils.R (file's directory)
+
+        let workspace_root = PathBuf::from("/workspace");
+        let file_path = PathBuf::from("/workspace/src/main.R");
+        let working_dir_path = format!("../{}", wd_subdir); // e.g., "../data"
+        let source_path = format!("{}.R", source_file); // e.g., "utils.R"
+
+        // Build file content with @lsp-cd and @lsp-source
+        let content = format!(
+            "# @lsp-cd {}\n# @lsp-source {}",
+            working_dir_path, source_path
+        );
+
+        // Parse directives to get metadata
+        let meta = parse_directives(&content);
+
+        // Verify @lsp-cd was parsed
+        prop_assert!(
+            meta.working_directory.is_some(),
+            "Working directory should be parsed from @lsp-cd directive"
+        );
+        prop_assert_eq!(
+            meta.working_directory.as_ref().unwrap(),
+            &working_dir_path,
+            "Working directory should match the @lsp-cd path"
+        );
+
+        // Verify @lsp-source was parsed
+        prop_assert_eq!(
+            meta.sources.len(),
+            1,
+            "Should have exactly one forward source"
+        );
+        prop_assert_eq!(
+            &meta.sources[0].path,
+            &source_path,
+            "Forward source path should match"
+        );
+        prop_assert!(
+            meta.sources[0].is_directive,
+            "Forward source should be marked as directive"
+        );
+
+        // Create PathContext from metadata (this is what dependency.rs does)
+        let file_uri = Url::from_file_path(&file_path).unwrap();
+        let workspace_uri = Url::from_file_path(&workspace_root).unwrap();
+        let path_ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Verify the effective working directory is the @lsp-cd path, not the file's directory
+        let effective_wd = path_ctx.effective_working_directory();
+
+        // The working directory should be /workspace/{wd_subdir} (resolved from ../wd_subdir)
+        let expected_wd = PathBuf::from(format!("/workspace/{}", wd_subdir));
+        prop_assert_eq!(
+            effective_wd,
+            expected_wd,
+            "Effective working directory should be the @lsp-cd path, not file's directory"
+        );
+
+        // Verify that path resolution uses the working directory
+        let resolved = resolve_path(&source_path, &path_ctx);
+        prop_assert!(
+            resolved.is_some(),
+            "Path should resolve successfully"
+        );
+
+        // The resolved path should be /workspace/{wd_subdir}/{source_file}.R
+        let expected_resolved = PathBuf::from(format!("/workspace/{}/{}.R", wd_subdir, source_file));
+        prop_assert_eq!(
+            resolved.unwrap(),
+            expected_resolved,
+            "Forward directive path should resolve relative to working directory, not file's directory"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 6 Extended: Working directory with absolute path
+    ///
+    /// When @lsp-cd uses a workspace-root-relative path (starting with /), the forward
+    /// directive should still resolve relative to that working directory.
+    ///
+    /// **Validates: Requirements 3.4**
+    #[test]
+    fn prop_forward_directive_uses_absolute_working_directory(
+        wd_subdir in path_component(),
+        source_file in path_component(),
+    ) {
+        let workspace_root = PathBuf::from("/workspace");
+        let file_path = PathBuf::from("/workspace/src/main.R");
+        // Use workspace-root-relative path for @lsp-cd
+        let working_dir_path = format!("/{}", wd_subdir); // e.g., "/data"
+        let source_path = format!("{}.R", source_file);
+
+        let content = format!(
+            "# @lsp-cd {}\n# @lsp-source {}",
+            working_dir_path, source_path
+        );
+
+        let meta = parse_directives(&content);
+
+        // Verify @lsp-cd was parsed
+        prop_assert!(meta.working_directory.is_some());
+        prop_assert_eq!(
+            meta.working_directory.as_ref().unwrap(),
+            &working_dir_path
+        );
+
+        // Create PathContext from metadata
+        let file_uri = Url::from_file_path(&file_path).unwrap();
+        let workspace_uri = Url::from_file_path(&workspace_root).unwrap();
+        let path_ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // The effective working directory should be /workspace/{wd_subdir}
+        let effective_wd = path_ctx.effective_working_directory();
+        let expected_wd = PathBuf::from(format!("/workspace/{}", wd_subdir));
+        prop_assert_eq!(
+            effective_wd,
+            expected_wd,
+            "Effective working directory should be the workspace-root-relative @lsp-cd path"
+        );
+
+        // Verify path resolution uses the working directory
+        let resolved = resolve_path(&source_path, &path_ctx);
+        prop_assert!(resolved.is_some());
+
+        let expected_resolved = PathBuf::from(format!("/workspace/{}/{}.R", wd_subdir, source_file));
+        prop_assert_eq!(
+            resolved.unwrap(),
+            expected_resolved,
+            "Forward directive path should resolve relative to workspace-root-relative working directory"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 6 Extended: Without @lsp-cd, uses file's directory
+    ///
+    /// When no @lsp-cd directive is present, forward directive paths should resolve
+    /// relative to the file's directory (default behavior).
+    ///
+    /// **Validates: Requirements 3.1, 3.4**
+    #[test]
+    fn prop_forward_directive_without_working_directory(
+        source_file in path_component(),
+    ) {
+        let workspace_root = PathBuf::from("/workspace");
+        let file_path = PathBuf::from("/workspace/src/main.R");
+        let source_path = format!("{}.R", source_file);
+
+        // Only @lsp-source, no @lsp-cd
+        let content = format!("# @lsp-source {}", source_path);
+
+        let meta = parse_directives(&content);
+
+        // Verify no working directory
+        prop_assert!(
+            meta.working_directory.is_none(),
+            "No working directory should be set without @lsp-cd"
+        );
+
+        // Create PathContext from metadata
+        let file_uri = Url::from_file_path(&file_path).unwrap();
+        let workspace_uri = Url::from_file_path(&workspace_root).unwrap();
+        let path_ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // The effective working directory should be the file's directory
+        let effective_wd = path_ctx.effective_working_directory();
+        let expected_wd = PathBuf::from("/workspace/src");
+        prop_assert_eq!(
+            effective_wd,
+            expected_wd,
+            "Without @lsp-cd, effective working directory should be file's directory"
+        );
+
+        // Verify path resolution uses the file's directory
+        let resolved = resolve_path(&source_path, &path_ctx);
+        prop_assert!(resolved.is_some());
+
+        let expected_resolved = PathBuf::from(format!("/workspace/src/{}.R", source_file));
+        prop_assert_eq!(
+            resolved.unwrap(),
+            expected_resolved,
+            "Without @lsp-cd, forward directive path should resolve relative to file's directory"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 6 Extended: Working directory with nested path
+    ///
+    /// When @lsp-source uses a nested relative path (e.g., "subdir/file.R"), it should
+    /// resolve relative to the working directory.
+    ///
+    /// **Validates: Requirements 3.4**
+    #[test]
+    fn prop_forward_directive_nested_path_with_working_directory(
+        wd_subdir in path_component(),
+        source_subdir in path_component(),
+        source_file in path_component(),
+    ) {
+        let workspace_root = PathBuf::from("/workspace");
+        let file_path = PathBuf::from("/workspace/src/main.R");
+        let working_dir_path = format!("../{}", wd_subdir);
+        let source_path = format!("{}/{}.R", source_subdir, source_file);
+
+        let content = format!(
+            "# @lsp-cd {}\n# @lsp-source {}",
+            working_dir_path, source_path
+        );
+
+        let meta = parse_directives(&content);
+
+        // Create PathContext from metadata
+        let file_uri = Url::from_file_path(&file_path).unwrap();
+        let workspace_uri = Url::from_file_path(&workspace_root).unwrap();
+        let path_ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Verify path resolution uses the working directory
+        let resolved = resolve_path(&source_path, &path_ctx);
+        prop_assert!(resolved.is_some());
+
+        // Expected: /workspace/{wd_subdir}/{source_subdir}/{source_file}.R
+        let expected_resolved = PathBuf::from(format!(
+            "/workspace/{}/{}/{}.R",
+            wd_subdir, source_subdir, source_file
+        ));
+        prop_assert_eq!(
+            resolved.unwrap(),
+            expected_resolved,
+            "Nested forward directive path should resolve relative to working directory"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 6 Extended: Working directory with parent navigation
+    ///
+    /// When @lsp-source uses parent directory navigation (e.g., "../file.R"), it should
+    /// navigate relative to the working directory, not the file's directory.
+    ///
+    /// **Validates: Requirements 3.4**
+    #[test]
+    fn prop_forward_directive_parent_nav_with_working_directory(
+        wd_subdir1 in path_component(),
+        wd_subdir2 in path_component(),
+        source_file in path_component(),
+    ) {
+        let workspace_root = PathBuf::from("/workspace");
+        let file_path = PathBuf::from("/workspace/src/main.R");
+        // Working directory is /workspace/{wd_subdir1}/{wd_subdir2}
+        let working_dir_path = format!("../{}/{}", wd_subdir1, wd_subdir2);
+        // Source path navigates up one level from working directory
+        let source_path = format!("../{}.R", source_file);
+
+        let content = format!(
+            "# @lsp-cd {}\n# @lsp-source {}",
+            working_dir_path, source_path
+        );
+
+        let meta = parse_directives(&content);
+
+        // Create PathContext from metadata
+        let file_uri = Url::from_file_path(&file_path).unwrap();
+        let workspace_uri = Url::from_file_path(&workspace_root).unwrap();
+        let path_ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Verify the effective working directory
+        let effective_wd = path_ctx.effective_working_directory();
+        let expected_wd = PathBuf::from(format!("/workspace/{}/{}", wd_subdir1, wd_subdir2));
+        prop_assert_eq!(
+            effective_wd,
+            expected_wd,
+            "Effective working directory should be the nested @lsp-cd path"
+        );
+
+        // Verify path resolution navigates from working directory
+        let resolved = resolve_path(&source_path, &path_ctx);
+        prop_assert!(resolved.is_some());
+
+        // Expected: /workspace/{wd_subdir1}/{source_file}.R (one level up from working dir)
+        let expected_resolved = PathBuf::from(format!(
+            "/workspace/{}/{}.R",
+            wd_subdir1, source_file
+        ));
+        prop_assert_eq!(
+            resolved.unwrap(),
+            expected_resolved,
+            "Parent navigation in forward directive should be relative to working directory"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 6 Extended: Contrast with backward directive behavior
+    ///
+    /// This test verifies the key distinction: forward directives (@lsp-source) use @lsp-cd
+    /// for path resolution, while backward directives (@lsp-sourced-by) ignore @lsp-cd.
+    ///
+    /// **Validates: Requirements 3.4**
+    #[test]
+    fn prop_forward_vs_backward_directive_working_directory(
+        wd_subdir in path_component(),
+        path_file in path_component(),
+    ) {
+        let workspace_root = PathBuf::from("/workspace");
+        let file_path = PathBuf::from("/workspace/src/main.R");
+        let working_dir_path = format!("../{}", wd_subdir);
+        let target_path = format!("{}.R", path_file);
+
+        // File with both @lsp-cd, @lsp-source, and @lsp-sourced-by
+        let content = format!(
+            "# @lsp-cd {}\n# @lsp-source {}\n# @lsp-sourced-by {}",
+            working_dir_path, target_path, target_path
+        );
+
+        let meta = parse_directives(&content);
+
+        // Verify both directives were parsed
+        prop_assert_eq!(meta.sources.len(), 1, "Should have one forward source");
+        prop_assert_eq!(meta.sourced_by.len(), 1, "Should have one backward directive");
+
+        // Create PathContext WITH working directory (for forward directives)
+        let file_uri = Url::from_file_path(&file_path).unwrap();
+        let workspace_uri = Url::from_file_path(&workspace_root).unwrap();
+        let forward_ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Create PathContext WITHOUT working directory (for backward directives)
+        let backward_ctx = PathContext::new(&file_uri, Some(&workspace_uri)).unwrap();
+
+        // Forward directive path resolution (uses working directory)
+        let forward_resolved = resolve_path(&target_path, &forward_ctx);
+        prop_assert!(forward_resolved.is_some());
+        let forward_expected = PathBuf::from(format!("/workspace/{}/{}.R", wd_subdir, path_file));
+        prop_assert_eq!(
+            forward_resolved.clone().unwrap(),
+            forward_expected.clone(),
+            "Forward directive should resolve relative to working directory"
+        );
+
+        // Backward directive path resolution (ignores working directory)
+        let backward_resolved = resolve_path(&target_path, &backward_ctx);
+        prop_assert!(backward_resolved.is_some());
+        let backward_expected = PathBuf::from(format!("/workspace/src/{}.R", path_file));
+        prop_assert_eq!(
+            backward_resolved.clone().unwrap(),
+            backward_expected.clone(),
+            "Backward directive should resolve relative to file's directory (ignoring @lsp-cd)"
+        );
+
+        // The two resolutions should be different (unless wd_subdir == "src")
+        if wd_subdir != "src" {
+            prop_assert_ne!(
+                forward_expected,
+                backward_expected,
+                "Forward and backward directive resolutions should differ when @lsp-cd is not file's directory"
+            );
+        }
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 7: Directive Edge Creation
+// Validates: Requirements 4.1, 4.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 7: Directive Edge Creation
+    ///
+    /// *For any* forward directive pointing to an existing file, the Dependency_Graph
+    /// SHALL contain an edge with `is_directive=true` and `is_backward_directive=false`.
+    ///
+    /// This property verifies that:
+    /// 1. When a forward directive (@lsp-source) is processed, an edge is created
+    /// 2. The edge has is_directive=true (indicating it came from a directive)
+    /// 3. The edge has is_backward_directive=false (indicating it's a forward directive, not backward)
+    ///
+    /// **Validates: Requirements 4.1, 4.2**
+    #[test]
+    fn prop_forward_directive_edge_creation(
+        source_file in path_component(),
+        directive_line in 0..100u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Setup: Create a temp workspace with main.R and a target file
+        let target_filename = format!("{}.R", source_file);
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Create metadata with a forward directive (@lsp-source)
+        let meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: target_filename.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true, // This is a directive, not an AST-detected source()
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies from main.R
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Exactly one edge should be created
+        prop_assert_eq!(
+            deps.len(),
+            1,
+            "Forward directive should create exactly one edge, got {}",
+            deps.len()
+        );
+
+        // Property: Edge should point to the correct target
+        prop_assert_eq!(
+            &deps[0].to,
+            &target_uri,
+            "Edge should point to the target file"
+        );
+
+        // Property: Edge should have is_directive=true (Requirement 4.2)
+        prop_assert!(
+            deps[0].is_directive,
+            "Forward directive edge should have is_directive=true"
+        );
+
+        // Property: Edge should have is_backward_directive=false (Requirement 4.2)
+        prop_assert!(
+            !deps[0].is_backward_directive,
+            "Forward directive edge should have is_backward_directive=false"
+        );
+
+        // Property: Edge should have the correct call site line
+        prop_assert_eq!(
+            deps[0].call_site_line,
+            Some(directive_line),
+            "Edge should have the correct call site line"
+        );
+
+        // Property: Edge should have column=0 (directives always have column 0)
+        prop_assert_eq!(
+            deps[0].call_site_column,
+            Some(0),
+            "Directive edge should have column=0"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 7 Extended: Multiple forward directives
+    ///
+    /// When multiple forward directives exist, each should create an edge with the
+    /// correct flags.
+    ///
+    /// **Validates: Requirements 4.1, 4.2**
+    #[test]
+    fn prop_forward_directive_edge_creation_multiple(
+        num_directives in 1..=5usize,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Generate unique file names for each directive
+        let file_names: Vec<String> = (0..num_directives)
+            .map(|i| format!("file{}.R", i))
+            .collect();
+
+        // Create temp workspace with main.R and all target files
+        let mut all_files: Vec<&str> = vec!["main.R"];
+        all_files.extend(file_names.iter().map(|s| s.as_str()));
+        let (temp_dir, workspace_url) = create_temp_workspace(&all_files);
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Create metadata with multiple forward directives
+        let sources: Vec<ForwardSource> = file_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ForwardSource {
+                path: name.clone(),
+                line: i as u32 * 10, // Different lines for each directive
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            })
+            .collect();
+
+        let meta = CrossFileMetadata {
+            sources,
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies from main.R
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Should have exactly num_directives edges
+        prop_assert_eq!(
+            deps.len(),
+            num_directives,
+            "Should have {} edges, got {}",
+            num_directives,
+            deps.len()
+        );
+
+        // Property: All edges should have is_directive=true and is_backward_directive=false
+        for (i, edge) in deps.iter().enumerate() {
+            prop_assert!(
+                edge.is_directive,
+                "Edge {} should have is_directive=true",
+                i
+            );
+            prop_assert!(
+                !edge.is_backward_directive,
+                "Edge {} should have is_backward_directive=false",
+                i
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 7 Extended: Forward directive with all synonyms
+    ///
+    /// Verifies that forward directives created from any synonym (@lsp-source, @lsp-run,
+    /// @lsp-include) all result in edges with the same flags.
+    ///
+    /// **Validates: Requirements 4.1, 4.2**
+    #[test]
+    fn prop_forward_directive_edge_creation_all_synonyms(
+        source_file in path_component(),
+    ) {
+        use super::dependency::DependencyGraph;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Test each synonym
+        let synonyms = ["@lsp-source", "@lsp-run", "@lsp-include"];
+
+        for synonym in synonyms {
+            // Create temp workspace
+            let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+            let main_uri = temp_url(&temp_dir, "main.R");
+
+            // Parse the directive to get metadata
+            let content = format!("# {} {}", synonym, target_filename);
+            let meta = parse_directives(&content);
+
+            // Verify the directive was parsed
+            prop_assert_eq!(
+                meta.sources.len(),
+                1,
+                "Synonym {} should produce one ForwardSource",
+                synonym
+            );
+            prop_assert!(
+                meta.sources[0].is_directive,
+                "Synonym {} should have is_directive=true in ForwardSource",
+                synonym
+            );
+
+            // Create dependency graph and update with the metadata
+            let mut graph = DependencyGraph::new();
+            let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+            // Get the dependencies
+            let deps = graph.get_dependencies(&main_uri);
+
+            // Property: Should have exactly one edge
+            prop_assert_eq!(
+                deps.len(),
+                1,
+                "Synonym {} should create exactly one edge",
+                synonym
+            );
+
+            // Property: Edge should have correct flags
+            prop_assert!(
+                deps[0].is_directive,
+                "Synonym {} edge should have is_directive=true",
+                synonym
+            );
+            prop_assert!(
+                !deps[0].is_backward_directive,
+                "Synonym {} edge should have is_backward_directive=false",
+                synonym
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 7 Extended: Forward directive with line= parameter
+    ///
+    /// Verifies that forward directives with explicit line= parameter create edges
+    /// with the correct call site and flags.
+    ///
+    /// **Validates: Requirements 4.1, 4.2**
+    #[test]
+    fn prop_forward_directive_edge_creation_with_line_param(
+        source_file in path_component(),
+        user_line in 1..100u32,  // 1-based line number (user input)
+    ) {
+        use super::dependency::DependencyGraph;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Parse the directive with line= parameter
+        let content = format!("# @lsp-source {} line={}", target_filename, user_line);
+        let meta = parse_directives(&content);
+
+        // Verify the directive was parsed with correct line (converted to 0-based)
+        prop_assert_eq!(meta.sources.len(), 1);
+        prop_assert_eq!(
+            meta.sources[0].line,
+            user_line - 1,
+            "Line should be converted from 1-based ({}) to 0-based ({})",
+            user_line,
+            user_line - 1
+        );
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Should have exactly one edge
+        prop_assert_eq!(deps.len(), 1);
+
+        // Property: Edge should have correct flags
+        prop_assert!(
+            deps[0].is_directive,
+            "Edge should have is_directive=true"
+        );
+        prop_assert!(
+            !deps[0].is_backward_directive,
+            "Edge should have is_backward_directive=false"
+        );
+
+        // Property: Edge should have the correct call site line (0-based)
+        prop_assert_eq!(
+            deps[0].call_site_line,
+            Some(user_line - 1),
+            "Edge should have call_site_line={} (0-based)",
+            user_line - 1
+        );
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 8: Same Call-Site Conflict Resolution
+// Validates: Requirements 4.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 8: Same Call-Site Conflict Resolution
+    ///
+    /// *For any* file containing both a forward directive and a `source()` call pointing
+    /// to the same target file at the same line, the Dependency_Graph SHALL contain
+    /// exactly one edge (the directive edge).
+    ///
+    /// This property verifies that:
+    /// 1. When both a directive and source() call point to the same file at the same call site
+    /// 2. The directive wins (directive edge is kept)
+    /// 3. The AST-detected source() edge is suppressed
+    /// 4. The resulting edge has is_directive=true
+    ///
+    /// **Validates: Requirements 4.3**
+    #[test]
+    fn prop_same_call_site_conflict_resolution(
+        source_file in path_component(),
+        call_site_line in 0..100u32,  // 0-based line number
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace with main.R and target file
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Create metadata with BOTH:
+        // 1. A forward directive (@lsp-source) at call_site_line
+        // 2. An AST-detected source() call at the SAME call_site_line
+        //
+        // This simulates a file like:
+        //   # @lsp-source target.R line=5
+        //   source("target.R")  # at line 5
+        //
+        // The directive and source() call point to the same file at the same line.
+        let meta = CrossFileMetadata {
+            sources: vec![
+                // Forward directive (is_directive=true)
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: call_site_line,
+                    column: 0,  // Directives always have column 0
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // AST-detected source() call (is_directive=false)
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: call_site_line,
+                    column: 0,  // Same column for same call site
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies from main.R
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Exactly ONE edge should exist (directive wins, AST edge suppressed)
+        // (Requirement 4.3: When both directive and source() point to same file at same call site,
+        // keep only the directive edge)
+        prop_assert_eq!(
+            deps.len(),
+            1,
+            "When directive and source() point to same file at same call site, \
+             should have exactly 1 edge (directive wins), but got {} edges",
+            deps.len()
+        );
+
+        // Property: The edge should point to the correct target
+        prop_assert_eq!(
+            &deps[0].to,
+            &target_uri,
+            "Edge should point to the target file"
+        );
+
+        // Property: The edge should be the directive edge (is_directive=true)
+        // (Requirement 4.3: The directive edge is kept, not the AST edge)
+        prop_assert!(
+            deps[0].is_directive,
+            "The surviving edge should be the directive edge (is_directive=true), \
+             but got is_directive=false"
+        );
+
+        // Property: The edge should have is_backward_directive=false (it's a forward directive)
+        prop_assert!(
+            !deps[0].is_backward_directive,
+            "Forward directive edge should have is_backward_directive=false"
+        );
+
+        // Property: The edge should have the correct call site
+        prop_assert_eq!(
+            deps[0].call_site_line,
+            Some(call_site_line),
+            "Edge should have the correct call site line"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 8 Extended: Same call-site with different columns
+    ///
+    /// When directive and source() are at the same line but different columns,
+    /// they are still considered the same call site (directive wins).
+    ///
+    /// Note: Directives always have column=0, so if source() is at a different column
+    /// on the same line, the call sites are technically different. However, the conflict
+    /// resolution logic compares both line AND column, so this tests that behavior.
+    ///
+    /// **Validates: Requirements 4.3**
+    #[test]
+    fn prop_same_call_site_conflict_same_line_different_column(
+        source_file in path_component(),
+        call_site_line in 0..100u32,
+        source_column in 1..50u32,  // Non-zero column for source() call
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Create metadata with directive at column 0 and source() at different column
+        // Same line, different columns
+        let meta = CrossFileMetadata {
+            sources: vec![
+                // Forward directive at column 0
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: call_site_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // AST-detected source() at different column
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: call_site_line,
+                    column: source_column,  // Different column
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies
+        let deps = graph.get_dependencies(&main_uri);
+
+        // When columns differ, the call sites are considered different, so both edges are kept
+        // (Requirement 4.4: Different call sites - keep both edges)
+        // This is the expected behavior per the conflict resolution logic
+        prop_assert_eq!(
+            deps.len(),
+            2,
+            "When directive and source() are at same line but different columns, \
+             both edges should be kept (different call sites), but got {} edges",
+            deps.len()
+        );
+
+        // Verify one edge is directive and one is not
+        let directive_edges: Vec<_> = deps.iter().filter(|e| e.is_directive).collect();
+        let ast_edges: Vec<_> = deps.iter().filter(|e| !e.is_directive).collect();
+
+        prop_assert_eq!(
+            directive_edges.len(),
+            1,
+            "Should have exactly one directive edge"
+        );
+        prop_assert_eq!(
+            ast_edges.len(),
+            1,
+            "Should have exactly one AST edge"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 8 Extended: Same call-site with exact match
+    ///
+    /// When directive and source() have exactly the same line AND column,
+    /// only the directive edge should be kept.
+    ///
+    /// **Validates: Requirements 4.3**
+    #[test]
+    fn prop_same_call_site_conflict_exact_match(
+        source_file in path_component(),
+        call_site_line in 0..100u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Create metadata with EXACT same call site (same line AND column)
+        let meta = CrossFileMetadata {
+            sources: vec![
+                // Forward directive
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: call_site_line,
+                    column: 0,  // Same column
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // AST-detected source() at EXACT same position
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: call_site_line,
+                    column: 0,  // Same column
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Exactly ONE edge (directive wins at exact same call site)
+        prop_assert_eq!(
+            deps.len(),
+            1,
+            "When directive and source() have exact same call site (line AND column), \
+             should have exactly 1 edge, but got {} edges",
+            deps.len()
+        );
+
+        // Property: The edge should be the directive edge
+        prop_assert!(
+            deps[0].is_directive,
+            "The surviving edge should be the directive edge"
+        );
+
+        // Property: Edge points to correct target
+        prop_assert_eq!(
+            &deps[0].to,
+            &target_uri,
+            "Edge should point to the target file"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 8 Extended: Multiple targets, same call-site conflict
+    ///
+    /// When there are multiple targets, and one target has both directive and source()
+    /// at the same call site, only that target's directive edge should win.
+    /// Other targets should be unaffected.
+    ///
+    /// **Validates: Requirements 4.3**
+    #[test]
+    fn prop_same_call_site_conflict_multiple_targets(
+        file1 in path_component(),
+        file2 in path_component(),
+        conflict_line in 0..50u32,
+        other_line in 50..100u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Ensure file names are different
+        prop_assume!(file1 != file2);
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target1 = format!("{}.R", file1);
+        let target2 = format!("{}.R", file2);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target1, &target2]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target1_uri = temp_url(&temp_dir, &target1);
+        let target2_uri = temp_url(&temp_dir, &target2);
+
+        // Create metadata:
+        // - target1: has BOTH directive and source() at same call site (conflict)
+        // - target2: has only source() (no conflict)
+        let meta = CrossFileMetadata {
+            sources: vec![
+                // target1: directive
+                ForwardSource {
+                    path: target1.clone(),
+                    line: conflict_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // target1: source() at same call site
+                ForwardSource {
+                    path: target1.clone(),
+                    line: conflict_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // target2: only source() (no conflict)
+                ForwardSource {
+                    path: target2.clone(),
+                    line: other_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Should have exactly 2 edges (one for each target)
+        // - target1: directive edge (source() suppressed due to conflict)
+        // - target2: source() edge (no conflict)
+        prop_assert_eq!(
+            deps.len(),
+            2,
+            "Should have 2 edges (one per target), but got {} edges",
+            deps.len()
+        );
+
+        // Find edges by target
+        let target1_edges: Vec<_> = deps.iter().filter(|e| e.to == target1_uri).collect();
+        let target2_edges: Vec<_> = deps.iter().filter(|e| e.to == target2_uri).collect();
+
+        // Property: target1 should have exactly one edge (directive)
+        prop_assert_eq!(
+            target1_edges.len(),
+            1,
+            "target1 should have exactly 1 edge (directive wins)"
+        );
+        prop_assert!(
+            target1_edges[0].is_directive,
+            "target1 edge should be the directive edge"
+        );
+
+        // Property: target2 should have exactly one edge (source())
+        prop_assert_eq!(
+            target2_edges.len(),
+            1,
+            "target2 should have exactly 1 edge"
+        );
+        prop_assert!(
+            !target2_edges[0].is_directive,
+            "target2 edge should be the source() edge (no directive for this target)"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 8 Extended: Order independence
+    ///
+    /// The conflict resolution should work regardless of whether the directive
+    /// or source() appears first in the sources list.
+    ///
+    /// **Validates: Requirements 4.3**
+    #[test]
+    fn prop_same_call_site_conflict_order_independence(
+        source_file in path_component(),
+        call_site_line in 0..100u32,
+        directive_first in proptest::bool::ANY,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Create the two ForwardSource entries
+        let directive_source = ForwardSource {
+            path: target_filename.clone(),
+            line: call_site_line,
+            column: 0,
+            is_directive: true,
+            local: false,
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: true,
+        };
+
+        let ast_source = ForwardSource {
+            path: target_filename.clone(),
+            line: call_site_line,
+            column: 0,
+            is_directive: false,
+            local: false,
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: true,
+        };
+
+        // Create metadata with sources in different orders based on directive_first
+        let sources = if directive_first {
+            vec![directive_source, ast_source]
+        } else {
+            vec![ast_source, directive_source]
+        };
+
+        let meta = CrossFileMetadata {
+            sources,
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: Regardless of order, should have exactly 1 edge (directive wins)
+        prop_assert_eq!(
+            deps.len(),
+            1,
+            "Regardless of source order (directive_first={}), should have exactly 1 edge, but got {}",
+            directive_first,
+            deps.len()
+        );
+
+        // Property: The edge should be the directive edge
+        prop_assert!(
+            deps[0].is_directive,
+            "Regardless of source order (directive_first={}), the surviving edge should be the directive edge",
+            directive_first
+        );
+
+        // Property: Edge points to correct target
+        prop_assert_eq!(
+            &deps[0].to,
+            &target_uri,
+            "Edge should point to the target file"
+        );
+    }
+}
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 9: Different Call-Site Preservation
+// Validates: Requirements 4.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 9: Different Call-Site Preservation
+    ///
+    /// *For any* file containing both a forward directive at line A and a `source()` call
+    /// at line B (where A ≠ B) pointing to the same target file, the Dependency_Graph
+    /// SHALL contain edges for both call sites.
+    ///
+    /// This property verifies that:
+    /// 1. When directive and source() point to the same file at DIFFERENT call sites
+    /// 2. Both edges are preserved (neither is suppressed)
+    /// 3. One edge has is_directive=true, the other has is_directive=false
+    /// 4. Symbols become available at the earliest call site
+    ///
+    /// **Validates: Requirements 4.4**
+    #[test]
+    fn prop_different_call_site_preservation(
+        source_file in path_component(),
+        directive_line in 0..50u32,
+        source_line in 50..100u32,  // Ensure different from directive_line
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace with main.R and target file
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Create metadata with BOTH:
+        // 1. A forward directive (@lsp-source) at directive_line
+        // 2. An AST-detected source() call at source_line (different line)
+        //
+        // This simulates a file like:
+        //   # @lsp-source target.R line=10
+        //   ...
+        //   source("target.R")  # at line 60
+        //
+        // The directive and source() call point to the same file at DIFFERENT lines.
+        let meta = CrossFileMetadata {
+            sources: vec![
+                // Forward directive (is_directive=true) at directive_line
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: directive_line,
+                    column: 0,  // Directives always have column 0
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // AST-detected source() call (is_directive=false) at source_line
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: source_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Create dependency graph and update with the metadata
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        // Get the dependencies from main.R
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Property: BOTH edges should exist (different call sites are preserved)
+        // (Requirement 4.4: When directive and source() point to same file at different call sites,
+        // keep both edges)
+        prop_assert_eq!(
+            deps.len(),
+            2,
+            "When directive and source() point to same file at different call sites, \
+             should have 2 edges (both preserved), but got {} edges",
+            deps.len()
+        );
+
+        // Property: Both edges should point to the same target
+        for dep in &deps {
+            prop_assert_eq!(
+                &dep.to,
+                &target_uri,
+                "All edges should point to the target file"
+            );
+        }
+
+        // Property: One edge should be directive (is_directive=true), one should be AST (is_directive=false)
+        let directive_edges: Vec<_> = deps.iter().filter(|e| e.is_directive).collect();
+        let ast_edges: Vec<_> = deps.iter().filter(|e| !e.is_directive).collect();
+
+        prop_assert_eq!(
+            directive_edges.len(),
+            1,
+            "Should have exactly one directive edge, but got {}",
+            directive_edges.len()
+        );
+        prop_assert_eq!(
+            ast_edges.len(),
+            1,
+            "Should have exactly one AST edge, but got {}",
+            ast_edges.len()
+        );
+
+        // Property: Directive edge should have the directive_line as call site
+        prop_assert_eq!(
+            directive_edges[0].call_site_line,
+            Some(directive_line),
+            "Directive edge should have call_site_line = {}",
+            directive_line
+        );
+
+        // Property: AST edge should have the source_line as call site
+        prop_assert_eq!(
+            ast_edges[0].call_site_line,
+            Some(source_line),
+            "AST edge should have call_site_line = {}",
+            source_line
+        );
+
+        // Property: Directive edge should have is_backward_directive=false (it's a forward directive)
+        prop_assert!(
+            !directive_edges[0].is_backward_directive,
+            "Forward directive edge should have is_backward_directive=false"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 9 Extended: Directive before source()
+    ///
+    /// When directive is at an earlier line than source(), both edges should be preserved.
+    /// Symbols become available at the directive line (the earlier call site).
+    ///
+    /// **Validates: Requirements 4.4**
+    #[test]
+    fn prop_different_call_site_directive_before_source(
+        source_file in path_component(),
+        directive_line in 0..50u32,
+        source_line in 51..100u32,  // source() is after directive
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Directive at earlier line, source() at later line
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: source_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Both edges should be preserved
+        prop_assert_eq!(
+            deps.len(),
+            2,
+            "Both edges should be preserved when directive is before source()"
+        );
+
+        // Verify both point to target
+        for dep in &deps {
+            prop_assert_eq!(&dep.to, &target_uri);
+        }
+
+        // Find the earliest call site (should be directive_line)
+        let earliest_line = deps.iter()
+            .filter_map(|e| e.call_site_line)
+            .min()
+            .unwrap_or(u32::MAX);
+
+        prop_assert_eq!(
+            earliest_line,
+            directive_line,
+            "Earliest call site should be the directive line"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 9 Extended: Source() before directive
+    ///
+    /// When source() is at an earlier line than directive, both edges should be preserved.
+    /// Symbols become available at the source() line (the earlier call site).
+    ///
+    /// **Validates: Requirements 4.4**
+    #[test]
+    fn prop_different_call_site_source_before_directive(
+        source_file in path_component(),
+        source_line in 0..50u32,
+        directive_line in 51..100u32,  // directive is after source()
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Source() at earlier line, directive at later line
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: source_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Both edges should be preserved
+        prop_assert_eq!(
+            deps.len(),
+            2,
+            "Both edges should be preserved when source() is before directive"
+        );
+
+        // Verify both point to target
+        for dep in &deps {
+            prop_assert_eq!(&dep.to, &target_uri);
+        }
+
+        // Find the earliest call site (should be source_line)
+        let earliest_line = deps.iter()
+            .filter_map(|e| e.call_site_line)
+            .min()
+            .unwrap_or(u32::MAX);
+
+        prop_assert_eq!(
+            earliest_line,
+            source_line,
+            "Earliest call site should be the source() line"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 9 Extended: Multiple targets with different call sites
+    ///
+    /// When there are multiple targets, and one target has both directive and source()
+    /// at different call sites, both edges for that target should be preserved.
+    /// Other targets should be unaffected.
+    ///
+    /// **Validates: Requirements 4.4**
+    #[test]
+    fn prop_different_call_site_multiple_targets(
+        file1 in path_component(),
+        file2 in path_component(),
+        directive_line in 0..50u32,
+        source_line in 51..100u32,
+        other_line in 0..100u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Skip if file names are the same
+        prop_assume!(file1 != file2);
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target1_filename = format!("{}.R", file1);
+        let target2_filename = format!("{}.R", file2);
+
+        // Create temp workspace with main.R and both target files
+        let (temp_dir, workspace_url) = create_temp_workspace(&[
+            "main.R",
+            &target1_filename,
+            &target2_filename,
+        ]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target1_uri = temp_url(&temp_dir, &target1_filename);
+        let target2_uri = temp_url(&temp_dir, &target2_filename);
+
+        // Create metadata:
+        // - target1: directive at directive_line, source() at source_line (different call sites)
+        // - target2: only source() at other_line
+        let meta = CrossFileMetadata {
+            sources: vec![
+                // target1: directive
+                ForwardSource {
+                    path: target1_filename.clone(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // target1: source()
+                ForwardSource {
+                    path: target1_filename.clone(),
+                    line: source_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                // target2: only source()
+                ForwardSource {
+                    path: target2_filename.clone(),
+                    line: other_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Should have 3 edges total: 2 for target1, 1 for target2
+        prop_assert_eq!(
+            deps.len(),
+            3,
+            "Should have 3 edges total (2 for target1, 1 for target2), but got {}",
+            deps.len()
+        );
+
+        // Count edges to each target
+        let target1_edges: Vec<_> = deps.iter().filter(|e| e.to == target1_uri).collect();
+        let target2_edges: Vec<_> = deps.iter().filter(|e| e.to == target2_uri).collect();
+
+        prop_assert_eq!(
+            target1_edges.len(),
+            2,
+            "Should have 2 edges to target1 (different call sites preserved)"
+        );
+        prop_assert_eq!(
+            target2_edges.len(),
+            1,
+            "Should have 1 edge to target2"
+        );
+
+        // Verify target1 has one directive edge and one AST edge
+        let target1_directive_edges: Vec<_> = target1_edges.iter().filter(|e| e.is_directive).collect();
+        let target1_ast_edges: Vec<_> = target1_edges.iter().filter(|e| !e.is_directive).collect();
+
+        prop_assert_eq!(
+            target1_directive_edges.len(),
+            1,
+            "target1 should have exactly one directive edge"
+        );
+        prop_assert_eq!(
+            target1_ast_edges.len(),
+            1,
+            "target1 should have exactly one AST edge"
+        );
+
+        // Verify target2 edge is AST (not directive)
+        prop_assert!(
+            !target2_edges[0].is_directive,
+            "target2 edge should be AST edge (is_directive=false)"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 9 Extended: Adjacent lines (A and A+1)
+    ///
+    /// When directive and source() are on adjacent lines (e.g., line 5 and line 6),
+    /// both edges should still be preserved since they are different call sites.
+    ///
+    /// **Validates: Requirements 4.4**
+    #[test]
+    fn prop_different_call_site_adjacent_lines(
+        source_file in path_component(),
+        base_line in 0..99u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Helper to create temp workspace
+        fn create_temp_workspace(files: &[&str]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for file in files {
+                let path = temp_dir.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                File::create(&path).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", source_file);
+        let directive_line = base_line;
+        let source_line = base_line + 1;  // Adjacent line
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", &target_filename]);
+        let main_uri = temp_url(&temp_dir, "main.R");
+        let target_uri = temp_url(&temp_dir, &target_filename);
+
+        // Directive at base_line, source() at base_line + 1
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: target_filename.clone(),
+                    line: source_line,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        let _result = graph.update_file(&main_uri, &meta, Some(&workspace_url), |_| None);
+
+        let deps = graph.get_dependencies(&main_uri);
+
+        // Both edges should be preserved even for adjacent lines
+        prop_assert_eq!(
+            deps.len(),
+            2,
+            "Both edges should be preserved for adjacent lines (line {} and {})",
+            directive_line,
+            source_line
+        );
+
+        // Verify both point to target
+        for dep in &deps {
+            prop_assert_eq!(&dep.to, &target_uri);
+        }
+
+        // Verify one is directive, one is AST
+        let directive_count = deps.iter().filter(|e| e.is_directive).count();
+        let ast_count = deps.iter().filter(|e| !e.is_directive).count();
+
+        prop_assert_eq!(directive_count, 1, "Should have exactly one directive edge");
+        prop_assert_eq!(ast_count, 1, "Should have exactly one AST edge");
+    }
+}
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 10: Scope Availability After Directive
+// Validates: Requirements 5.1, 5.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 10: Scope Availability After Directive
+    ///
+    /// *For any* file with `@lsp-source <path>` at line L, symbols from the sourced file
+    /// SHALL be available in scope at positions after line L.
+    ///
+    /// This property verifies that:
+    /// 1. Symbols from the sourced file are NOT available before line L
+    /// 2. Symbols from the sourced file ARE available after line L
+    /// 3. The scope resolution correctly uses the dependency graph
+    ///
+    /// **Validates: Requirements 5.1, 5.2**
+    #[test]
+    fn prop_scope_availability_after_directive(
+        symbol_name in r_identifier(),
+        directive_line in 1..20u32,  // 0-based line where directive appears
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::scope::{compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::types::{CrossFileMetadata, ForwardSource};
+        use tempfile::TempDir;
+        use std::fs;
+
+        // Helper to create temp workspace with files
+        fn create_temp_workspace(files: &[(&str, &str)]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for (name, content) in files {
+                let path = temp_dir.path().join(name);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&path, content).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Build parent file content with @lsp-source directive at directive_line
+        // Lines before directive are comments, directive is at directive_line
+        let mut parent_lines: Vec<String> = Vec::new();
+        for i in 0..directive_line {
+            parent_lines.push(format!("# Comment line {}", i));
+        }
+        parent_lines.push("# @lsp-source child.R".to_string());
+        parent_lines.push("# Code after directive".to_string());
+        parent_lines.push("x <- 1".to_string());
+        let parent_content = parent_lines.join("\n");
+
+        // Child file defines a symbol
+        let child_content = format!("{} <- 42", symbol_name);
+
+        // Create temp workspace with both files
+        let (temp_dir, workspace_url) = create_temp_workspace(&[
+            ("parent.R", &parent_content),
+            ("child.R", &child_content),
+        ]);
+        let parent_uri = temp_url(&temp_dir, "parent.R");
+        let child_uri = temp_url(&temp_dir, "child.R");
+
+        // Parse and compute artifacts for both files
+        let parent_tree = parse_r_tree(&parent_content);
+        let child_tree = parse_r_tree(&child_content);
+
+        // Create metadata with forward directive
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "child.R".to_string(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Compute artifacts with metadata to include directive in timeline
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            &parent_content,
+            Some(&parent_metadata),
+        );
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_content);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.clone())
+            } else if uri == &parent_uri {
+                Some(parent_content.clone())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
+
+        // Create closures for scope resolution
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata.clone())
+            } else {
+                None
+            }
+        };
+
+        // Property 1: Symbols should NOT be available BEFORE the directive line
+        if directive_line > 0 {
+            let scope_before = scope_at_position_with_graph(
+                &parent_uri,
+                directive_line - 1,  // Line before directive
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_url),
+                10,
+                &HashSet::new(),
+            );
+
+            prop_assert!(
+                !scope_before.symbols.contains_key(&symbol_name),
+                "Symbol '{}' should NOT be available before @lsp-source directive at line {} \
+                 (checked at line {})",
+                symbol_name,
+                directive_line,
+                directive_line - 1
+            );
+        }
+
+        // Property 2: Symbols SHOULD be available AFTER the directive line
+        let scope_after = scope_at_position_with_graph(
+            &parent_uri,
+            directive_line + 1,  // Line after directive
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_url),
+            10,
+            &HashSet::new(),
+        );
+
+        prop_assert!(
+            scope_after.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should be available after @lsp-source directive at line {} \
+             (checked at line {})",
+            symbol_name,
+            directive_line,
+            directive_line + 1
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 10 Extended: Scope with line= parameter
+    ///
+    /// When @lsp-source uses line=N parameter, symbols should be available starting
+    /// at line N-1 (0-based), not at the directive's physical line.
+    ///
+    /// **Validates: Requirements 5.2**
+    #[test]
+    fn prop_scope_availability_with_line_parameter(
+        symbol_name in r_identifier(),
+        directive_physical_line in 0..5u32,  // Physical line of directive
+        effective_line in 6..15u32,  // line=N parameter (1-based, converts to N-1)
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::scope::{compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::types::{CrossFileMetadata, ForwardSource};
+        use tempfile::TempDir;
+        use std::fs;
+
+        // Helper to create temp workspace with files
+        fn create_temp_workspace(files: &[(&str, &str)]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for (name, content) in files {
+                let path = temp_dir.path().join(name);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&path, content).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // The effective 0-based line where symbols become available
+        let effective_line_0based = effective_line - 1;
+
+        // Build parent file content with enough lines
+        let mut parent_lines: Vec<String> = Vec::new();
+        for i in 0..20 {
+            if i == directive_physical_line {
+                parent_lines.push(format!("# @lsp-source child.R line={}", effective_line));
+            } else {
+                parent_lines.push(format!("# Line {}", i));
+            }
+        }
+        let parent_content = parent_lines.join("\n");
+
+        // Child file defines a symbol
+        let child_content = format!("{} <- 42", symbol_name);
+
+        // Create temp workspace with both files
+        let (temp_dir, workspace_url) = create_temp_workspace(&[
+            ("parent.R", &parent_content),
+            ("child.R", &child_content),
+        ]);
+        let parent_uri = temp_url(&temp_dir, "parent.R");
+        let child_uri = temp_url(&temp_dir, "child.R");
+
+        // Parse and compute artifacts
+        let parent_tree = parse_r_tree(&parent_content);
+        let child_tree = parse_r_tree(&child_content);
+
+        // Create metadata with forward directive using line= parameter
+        // The line field stores the 0-based effective line (N-1)
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "child.R".to_string(),
+                    line: effective_line_0based,  // 0-based effective line
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Compute artifacts with metadata
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            &parent_content,
+            Some(&parent_metadata),
+        );
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_content);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.clone())
+            } else if uri == &parent_uri {
+                Some(parent_content.clone())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
+
+        // Create closures for scope resolution
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata.clone())
+            } else {
+                None
+            }
+        };
+
+        // Property 1: Symbols should NOT be available BEFORE the effective line
+        if effective_line_0based > 0 {
+            let scope_before = scope_at_position_with_graph(
+                &parent_uri,
+                effective_line_0based - 1,  // Line before effective line
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_url),
+                10,
+                &HashSet::new(),
+            );
+
+            prop_assert!(
+                !scope_before.symbols.contains_key(&symbol_name),
+                "Symbol '{}' should NOT be available before effective line {} \
+                 (line={} parameter, checked at line {})",
+                symbol_name,
+                effective_line_0based,
+                effective_line,
+                effective_line_0based - 1
+            );
+        }
+
+        // Property 2: Symbols SHOULD be available AFTER the effective line
+        let scope_after = scope_at_position_with_graph(
+            &parent_uri,
+            effective_line_0based + 1,  // Line after effective line
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_url),
+            10,
+            &HashSet::new(),
+        );
+
+        prop_assert!(
+            scope_after.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should be available after effective line {} \
+             (line={} parameter, checked at line {})",
+            symbol_name,
+            effective_line_0based,
+            effective_line,
+            effective_line_0based + 1
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 10 Extended: Multiple symbols from sourced file
+    ///
+    /// When the sourced file defines multiple symbols, ALL of them should be available
+    /// after the directive line.
+    ///
+    /// **Validates: Requirements 5.1, 5.3**
+    #[test]
+    fn prop_scope_availability_multiple_symbols(
+        symbol1 in r_identifier(),
+        symbol2 in r_identifier(),
+        directive_line in 1..10u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::scope::{compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::types::{CrossFileMetadata, ForwardSource};
+        use tempfile::TempDir;
+        use std::fs;
+
+        // Skip if symbols are the same
+        prop_assume!(symbol1 != symbol2);
+
+        // Helper to create temp workspace with files
+        fn create_temp_workspace(files: &[(&str, &str)]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for (name, content) in files {
+                let path = temp_dir.path().join(name);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&path, content).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Build parent file content
+        let mut parent_lines: Vec<String> = Vec::new();
+        for i in 0..directive_line {
+            parent_lines.push(format!("# Comment line {}", i));
+        }
+        parent_lines.push("# @lsp-source child.R".to_string());
+        parent_lines.push("# After directive".to_string());
+        let parent_content = parent_lines.join("\n");
+
+        // Child file defines multiple symbols
+        let child_content = format!("{} <- 42\n{} <- function() {{ 1 }}", symbol1, symbol2);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&[
+            ("parent.R", &parent_content),
+            ("child.R", &child_content),
+        ]);
+        let parent_uri = temp_url(&temp_dir, "parent.R");
+        let child_uri = temp_url(&temp_dir, "child.R");
+
+        // Parse and compute artifacts
+        let parent_tree = parse_r_tree(&parent_content);
+        let child_tree = parse_r_tree(&child_content);
+
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "child.R".to_string(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            &parent_content,
+            Some(&parent_metadata),
+        );
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_content);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.clone())
+            } else if uri == &parent_uri {
+                Some(parent_content.clone())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata.clone())
+            } else {
+                None
+            }
+        };
+
+        // Property: Both symbols should be available after directive
+        let scope_after = scope_at_position_with_graph(
+            &parent_uri,
+            directive_line + 1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_url),
+            10,
+            &HashSet::new(),
+        );
+
+        prop_assert!(
+            scope_after.symbols.contains_key(&symbol1),
+            "Symbol '{}' should be available after @lsp-source directive",
+            symbol1
+        );
+        prop_assert!(
+            scope_after.symbols.contains_key(&symbol2),
+            "Symbol '{}' should be available after @lsp-source directive",
+            symbol2
+        );
+
+        // Property: Neither symbol should be available before directive
+        if directive_line > 0 {
+            let scope_before = scope_at_position_with_graph(
+                &parent_uri,
+                directive_line - 1,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_url),
+                10,
+                &HashSet::new(),
+            );
+
+            prop_assert!(
+                !scope_before.symbols.contains_key(&symbol1),
+                "Symbol '{}' should NOT be available before @lsp-source directive",
+                symbol1
+            );
+            prop_assert!(
+                !scope_before.symbols.contains_key(&symbol2),
+                "Symbol '{}' should NOT be available before @lsp-source directive",
+                symbol2
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 10 Extended: Scope at directive line boundary
+    ///
+    /// Symbols should be available starting at the line AFTER the directive,
+    /// not at the directive line itself.
+    ///
+    /// **Validates: Requirements 5.1**
+    #[test]
+    fn prop_scope_availability_at_directive_line(
+        symbol_name in r_identifier(),
+        directive_line in 1..15u32,
+    ) {
+        use super::dependency::DependencyGraph;
+        use super::scope::{compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::types::{CrossFileMetadata, ForwardSource};
+        use tempfile::TempDir;
+        use std::fs;
+
+        // Helper to create temp workspace with files
+        fn create_temp_workspace(files: &[(&str, &str)]) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            for (name, content) in files {
+                let path = temp_dir.path().join(name);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&path, content).unwrap();
+            }
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Build parent file content
+        let mut parent_lines: Vec<String> = Vec::new();
+        for i in 0..directive_line {
+            parent_lines.push(format!("# Comment line {}", i));
+        }
+        parent_lines.push("# @lsp-source child.R".to_string());
+        parent_lines.push("# After directive".to_string());
+        let parent_content = parent_lines.join("\n");
+
+        // Child file defines a symbol
+        let child_content = format!("{} <- 42", symbol_name);
+
+        // Create temp workspace
+        let (temp_dir, workspace_url) = create_temp_workspace(&[
+            ("parent.R", &parent_content),
+            ("child.R", &child_content),
+        ]);
+        let parent_uri = temp_url(&temp_dir, "parent.R");
+        let child_uri = temp_url(&temp_dir, "child.R");
+
+        // Parse and compute artifacts
+        let parent_tree = parse_r_tree(&parent_content);
+        let child_tree = parse_r_tree(&child_content);
+
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "child.R".to_string(),
+                    line: directive_line,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            &parent_content,
+            Some(&parent_metadata),
+        );
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_content);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let content_provider = |uri: &Url| -> Option<String> {
+            if uri == &child_uri {
+                Some(child_content.clone())
+            } else if uri == &parent_uri {
+                Some(parent_content.clone())
+            } else {
+                None
+            }
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_metadata.clone())
+            } else {
+                None
+            }
+        };
+
+        // Test at the directive line itself (column 0, start of line)
+        // Symbols should NOT be available at the start of the directive line
+        let scope_at_directive_start = scope_at_position_with_graph(
+            &parent_uri,
+            directive_line,
+            0,  // Start of directive line
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_url),
+            10,
+            &HashSet::new(),
+        );
+
+        prop_assert!(
+            !scope_at_directive_start.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should NOT be available at start of directive line {}",
+            symbol_name,
+            directive_line
+        );
+
+        // Test at the line after directive
+        // Symbols SHOULD be available
+        let scope_after = scope_at_position_with_graph(
+            &parent_uri,
+            directive_line + 1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_url),
+            10,
+            &HashSet::new(),
+        );
+
+        prop_assert!(
+            scope_after.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should be available at line {} (after directive at line {})",
+            symbol_name,
+            directive_line + 1,
+            directive_line
+        );
+    }
+}
+
+// ============================================================================
+// Feature: lsp-source-directive, Property 11: Missing File Diagnostic
+// Validates: Requirements 6.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 11: Missing File Diagnostic
+    ///
+    /// *For any* forward directive referencing a non-existent file, the system SHALL
+    /// emit a diagnostic at the directive's line.
+    ///
+    /// This property verifies that:
+    /// 1. When a forward directive (@lsp-source) references a file that doesn't exist,
+    ///    a diagnostic is emitted
+    /// 2. The diagnostic is positioned at the directive's line
+    /// 3. The diagnostic message mentions the missing file path
+    ///
+    /// **Validates: Requirements 6.1**
+    #[test]
+    fn prop_forward_directive_missing_file_diagnostic(
+        missing_file in path_component(),
+        directive_line in 0..100u32,
+    ) {
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // Helper to create temp workspace with only main.R (no target file)
+        fn create_temp_workspace_without_target() -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+            File::create(&main_path).unwrap();
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Setup: Create a temp workspace with only main.R (target file does NOT exist)
+        let missing_filename = format!("{}.R", missing_file);
+        let (temp_dir, workspace_url) = create_temp_workspace_without_target();
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Create metadata with a forward directive pointing to non-existent file
+        let meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: missing_filename.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true, // This is a directive, not an AST-detected source()
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        // Collect diagnostics using the standalone async function
+        // We use a blocking runtime to test the async function
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let diagnostics = rt.block_on(async {
+            crate::handlers::collect_missing_file_diagnostics_standalone_for_test(
+                &main_uri,
+                &meta,
+                Some(&workspace_url),
+                DiagnosticSeverity::WARNING,
+            ).await
+        });
+
+        // Property: At least one diagnostic should be emitted for the missing file
+        prop_assert!(
+            !diagnostics.is_empty(),
+            "Should emit at least one diagnostic for missing file '{}'",
+            missing_filename
+        );
+
+        // Property: The diagnostic should be at the directive's line
+        let has_diagnostic_at_line = diagnostics.iter().any(|d| d.range.start.line == directive_line);
+        prop_assert!(
+            has_diagnostic_at_line,
+            "Diagnostic should be at directive line {}, but found diagnostics at lines: {:?}",
+            directive_line,
+            diagnostics.iter().map(|d| d.range.start.line).collect::<Vec<_>>()
+        );
+
+        // Property: The diagnostic message should mention the missing file
+        let has_message_with_path = diagnostics.iter().any(|d| {
+            d.message.contains(&missing_filename) ||
+            d.message.contains("not found") ||
+            d.message.contains("@lsp-source")
+        });
+        prop_assert!(
+            has_message_with_path,
+            "Diagnostic message should mention the missing file '{}', but got messages: {:?}",
+            missing_filename,
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 11 Extended: Multiple missing files
+    ///
+    /// When multiple forward directives reference non-existent files, each should
+    /// generate a diagnostic at its respective line.
+    ///
+    /// **Validates: Requirements 6.1**
+    #[test]
+    fn prop_forward_directive_missing_file_diagnostic_multiple(
+        num_directives in 1..=5usize,
+    ) {
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // Helper to create temp workspace with only main.R
+        fn create_temp_workspace_without_target() -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+            File::create(&main_path).unwrap();
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        // Setup: Create a temp workspace with only main.R
+        let (temp_dir, workspace_url) = create_temp_workspace_without_target();
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Create metadata with multiple forward directives pointing to non-existent files
+        let sources: Vec<ForwardSource> = (0..num_directives)
+            .map(|i| ForwardSource {
+                path: format!("missing{}.R", i),
+                line: (i * 10) as u32, // Different lines for each directive
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            })
+            .collect();
+
+        let expected_lines: Vec<u32> = sources.iter().map(|s| s.line).collect();
+
+        let meta = CrossFileMetadata {
+            sources,
+            ..Default::default()
+        };
+
+        // Collect diagnostics
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let diagnostics = rt.block_on(async {
+            crate::handlers::collect_missing_file_diagnostics_standalone_for_test(
+                &main_uri,
+                &meta,
+                Some(&workspace_url),
+                DiagnosticSeverity::WARNING,
+            ).await
+        });
+
+        // Property: Should have at least num_directives diagnostics
+        prop_assert!(
+            diagnostics.len() >= num_directives,
+            "Should emit at least {} diagnostics for {} missing files, got {}",
+            num_directives,
+            num_directives,
+            diagnostics.len()
+        );
+
+        // Property: Each directive line should have a diagnostic
+        for expected_line in &expected_lines {
+            let has_diagnostic = diagnostics.iter().any(|d| d.range.start.line == *expected_line);
+            prop_assert!(
+                has_diagnostic,
+                "Should have diagnostic at line {}, but found diagnostics at lines: {:?}",
+                expected_line,
+                diagnostics.iter().map(|d| d.range.start.line).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 11 Extended: All directive synonyms
+    ///
+    /// Missing file diagnostics should work for all forward directive synonyms
+    /// (@lsp-source, @lsp-run, @lsp-include).
+    ///
+    /// **Validates: Requirements 6.1**
+    #[test]
+    fn prop_forward_directive_missing_file_diagnostic_synonyms(
+        missing_file in path_component(),
+        directive_line in 0..50u32,
+    ) {
+        use tempfile::TempDir;
+        use std::fs::File;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // Helper to create temp workspace with only main.R
+        fn create_temp_workspace_without_target() -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+            File::create(&main_path).unwrap();
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let missing_filename = format!("{}.R", missing_file);
+
+        // Test all three synonyms
+        let synonyms = ["@lsp-source", "@lsp-run", "@lsp-include"];
+
+        for synonym in synonyms {
+            // Build content with the directive at the specified line
+            let mut lines: Vec<String> = Vec::new();
+            for i in 0..directive_line {
+                lines.push(format!("# Comment line {}", i));
+            }
+            lines.push(format!("# {} {}", synonym, missing_filename));
+            let content = lines.join("\n");
+
+            // Parse directives
+            let meta = parse_directives(&content);
+
+            // Verify the directive was parsed
+            prop_assert!(
+                !meta.sources.is_empty(),
+                "Directive '{}' should be parsed",
+                synonym
+            );
+
+            // Setup temp workspace
+            let (temp_dir, workspace_url) = create_temp_workspace_without_target();
+            let main_uri = temp_url(&temp_dir, "main.R");
+
+            // Collect diagnostics
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let diagnostics = rt.block_on(async {
+                crate::handlers::collect_missing_file_diagnostics_standalone_for_test(
+                    &main_uri,
+                    &meta,
+                    Some(&workspace_url),
+                    DiagnosticSeverity::WARNING,
+                ).await
+            });
+
+            // Property: Should emit diagnostic for missing file
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Synonym '{}' should emit diagnostic for missing file '{}'",
+                synonym,
+                missing_filename
+            );
+
+            // Property: Diagnostic should be at directive line
+            let has_diagnostic_at_line = diagnostics.iter().any(|d| d.range.start.line == directive_line);
+            prop_assert!(
+                has_diagnostic_at_line,
+                "Synonym '{}': Diagnostic should be at line {}, found at lines: {:?}",
+                synonym,
+                directive_line,
+                diagnostics.iter().map(|d| d.range.start.line).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Feature: lsp-source-directive, Property 11 Extended: Diagnostic message format
+    ///
+    /// The diagnostic message for a missing file referenced by @lsp-source should
+    /// specifically mention "@lsp-source directive" to distinguish from source() calls.
+    ///
+    /// **Validates: Requirements 6.1**
+    #[test]
+    fn prop_forward_directive_missing_file_diagnostic_message_format(
+        missing_file in path_component(),
+    ) {
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // Helper to create temp workspace with only main.R
+        fn create_temp_workspace_without_target() -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+            File::create(&main_path).unwrap();
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let missing_filename = format!("{}.R", missing_file);
+        let (temp_dir, workspace_url) = create_temp_workspace_without_target();
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Create metadata with a forward directive (is_directive=true)
+        let meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: missing_filename.clone(),
+                line: 0,
+                column: 0,
+                is_directive: true, // This is a directive
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        // Collect diagnostics
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let diagnostics = rt.block_on(async {
+            crate::handlers::collect_missing_file_diagnostics_standalone_for_test(
+                &main_uri,
+                &meta,
+                Some(&workspace_url),
+                DiagnosticSeverity::WARNING,
+            ).await
+        });
+
+        // Property: Should have at least one diagnostic
+        prop_assert!(
+            !diagnostics.is_empty(),
+            "Should emit diagnostic for missing file"
+        );
+
+        // Property: Diagnostic message should mention "@lsp-source directive"
+        let has_directive_mention = diagnostics.iter().any(|d| {
+            d.message.contains("@lsp-source directive")
+        });
+        prop_assert!(
+            has_directive_mention,
+            "Diagnostic message should mention '@lsp-source directive', got messages: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Property: Diagnostic message should contain the file path
+        let has_path = diagnostics.iter().any(|d| {
+            d.message.contains(&missing_filename)
+        });
+        prop_assert!(
+            has_path,
+            "Diagnostic message should contain the file path '{}', got messages: {:?}",
+            missing_filename,
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 11 Extended: No diagnostic for existing files
+    ///
+    /// When a forward directive references an existing file, no missing file diagnostic
+    /// should be emitted.
+    ///
+    /// **Validates: Requirements 6.1 (inverse)**
+    #[test]
+    fn prop_forward_directive_no_diagnostic_for_existing_file(
+        target_file in path_component(),
+        directive_line in 0..100u32,
+    ) {
+        use super::types::ForwardSource;
+        use tempfile::TempDir;
+        use std::fs::File;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // Helper to create temp workspace with main.R AND target file
+        fn create_temp_workspace_with_target(target: &str) -> (TempDir, Url) {
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+            File::create(&main_path).unwrap();
+            let target_path = temp_dir.path().join(target);
+            File::create(&target_path).unwrap();
+            let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+            (temp_dir, workspace_url)
+        }
+
+        // Helper to create URL for file in temp workspace
+        fn temp_url(temp_dir: &TempDir, file: &str) -> Url {
+            Url::from_file_path(temp_dir.path().join(file)).unwrap()
+        }
+
+        let target_filename = format!("{}.R", target_file);
+        let (temp_dir, workspace_url) = create_temp_workspace_with_target(&target_filename);
+        let main_uri = temp_url(&temp_dir, "main.R");
+
+        // Create metadata with a forward directive pointing to EXISTING file
+        let meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: target_filename.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+
+        // Collect diagnostics
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let diagnostics = rt.block_on(async {
+            crate::handlers::collect_missing_file_diagnostics_standalone_for_test(
+                &main_uri,
+                &meta,
+                Some(&workspace_url),
+                DiagnosticSeverity::WARNING,
+            ).await
+        });
+
+        // Property: No diagnostics should be emitted for existing file
+        let missing_file_diagnostics: Vec<_> = diagnostics.iter()
+            .filter(|d| d.message.contains("not found") || d.message.contains("Cannot resolve"))
+            .collect();
+
+        prop_assert!(
+            missing_file_diagnostics.is_empty(),
+            "Should NOT emit missing file diagnostic for existing file '{}', but got: {:?}",
+            target_filename,
+            missing_file_diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
+
+// ============================================================================
+// Property 12: Revalidation on Directive Change
+// Feature: lsp-source-directive
+// Validates: Requirements 7.1, 7.2, 7.3
+// ============================================================================
+
+/// Enum representing the type of directive change operation
+#[derive(Debug, Clone)]
+enum DirectiveChangeOp {
+    /// Add a new forward directive
+    Add { target: String, line: u32 },
+    /// Remove an existing forward directive
+    Remove { target: String },
+    /// Modify an existing forward directive's target
+    Modify { old_target: String, new_target: String, line: u32 },
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-source-directive, Property 12: Revalidation on Directive Change
+    ///
+    /// For any change to a forward directive (add, remove, or modify), the dependency
+    /// graph SHALL be updated to reflect the change.
+    ///
+    /// This test verifies that:
+    /// 1. Adding an @lsp-source directive creates a new edge in the graph
+    /// 2. Removing an @lsp-source directive removes the edge from the graph
+    /// 3. Modifying an @lsp-source directive updates the edge in the graph
+    ///
+    /// **Validates: Requirements 7.1, 7.2, 7.3**
+    #[test]
+    fn prop_revalidation_on_directive_add(
+        parent in path_component(),
+        child in path_component(),
+        directive_line in 0..100u32,
+    ) {
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Create temp workspace with actual files (required for forward directive edge creation)
+        let temp_dir = TempDir::new().unwrap();
+        let parent_file = format!("{}.R", parent);
+        let child_file = format!("{}.R", child);
+        File::create(temp_dir.path().join(&parent_file)).unwrap();
+        File::create(temp_dir.path().join(&child_file)).unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let parent_uri = Url::from_file_path(temp_dir.path().join(&parent_file)).unwrap();
+        let child_uri = Url::from_file_path(temp_dir.path().join(&child_file)).unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        // Initial state: no directives, no edges
+        let meta_v1 = CrossFileMetadata::default();
+        graph.update_file(&parent_uri, &meta_v1, Some(&workspace_url), |_| None);
+
+        // Verify no edges exist initially
+        let deps_before = graph.get_dependencies(&parent_uri);
+        prop_assert!(
+            deps_before.is_empty(),
+            "Graph should have no edges initially"
+        );
+
+        // Add a forward directive (simulating user adding @lsp-source)
+        let meta_v2 = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_file.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v2, Some(&workspace_url), |_| None);
+
+        // Verify edge was created (Requirement 7.1)
+        let deps_after = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(
+            deps_after.len(), 1,
+            "Adding @lsp-source directive should create exactly one edge"
+        );
+        prop_assert_eq!(
+            &deps_after[0].to, &child_uri,
+            "Edge should point to the target file"
+        );
+        prop_assert!(
+            deps_after[0].is_directive,
+            "Edge should be marked as directive"
+        );
+        prop_assert_eq!(
+            deps_after[0].call_site_line, Some(directive_line),
+            "Edge should have correct call site line"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 12: Revalidation on Directive Remove
+    ///
+    /// When an @lsp-source directive is removed from a file, the corresponding edge
+    /// SHALL be removed from the dependency graph.
+    ///
+    /// **Validates: Requirements 7.2**
+    #[test]
+    fn prop_revalidation_on_directive_remove(
+        parent in path_component(),
+        child in path_component(),
+        directive_line in 0..100u32,
+    ) {
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Create temp workspace with actual files
+        let temp_dir = TempDir::new().unwrap();
+        let parent_file = format!("{}.R", parent);
+        let child_file = format!("{}.R", child);
+        File::create(temp_dir.path().join(&parent_file)).unwrap();
+        File::create(temp_dir.path().join(&child_file)).unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let parent_uri = Url::from_file_path(temp_dir.path().join(&parent_file)).unwrap();
+        let child_uri = Url::from_file_path(temp_dir.path().join(&child_file)).unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        // Initial state: file has a forward directive
+        let meta_v1 = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_file.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v1, Some(&workspace_url), |_| None);
+
+        // Verify edge exists
+        let deps_before = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(
+            deps_before.len(), 1,
+            "Graph should have one edge before removal"
+        );
+        prop_assert_eq!(
+            &deps_before[0].to, &child_uri,
+            "Edge should point to child file"
+        );
+
+        // Remove the directive (simulating user removing @lsp-source)
+        let meta_v2 = CrossFileMetadata::default();
+        graph.update_file(&parent_uri, &meta_v2, Some(&workspace_url), |_| None);
+
+        // Verify edge was removed (Requirement 7.2)
+        let deps_after = graph.get_dependencies(&parent_uri);
+        prop_assert!(
+            deps_after.is_empty(),
+            "Removing @lsp-source directive should remove the edge"
+        );
+
+        // Also verify backward lookup is cleared
+        let dependents = graph.get_dependents(&child_uri);
+        prop_assert!(
+            dependents.is_empty(),
+            "Child file should have no dependents after directive removal"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 12: Revalidation on Directive Modify
+    ///
+    /// When an @lsp-source directive's target is modified, the dependency graph
+    /// SHALL be updated to reflect the new target.
+    ///
+    /// **Validates: Requirements 7.3**
+    #[test]
+    fn prop_revalidation_on_directive_modify(
+        parent in path_component(),
+        child_a in path_component(),
+        child_b in path_component(),
+        directive_line in 0..100u32,
+    ) {
+        prop_assume!(child_a != child_b);
+
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Create temp workspace with actual files
+        let temp_dir = TempDir::new().unwrap();
+        let parent_file = format!("{}.R", parent);
+        let child_a_file = format!("{}.R", child_a);
+        let child_b_file = format!("{}.R", child_b);
+        File::create(temp_dir.path().join(&parent_file)).unwrap();
+        File::create(temp_dir.path().join(&child_a_file)).unwrap();
+        File::create(temp_dir.path().join(&child_b_file)).unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let parent_uri = Url::from_file_path(temp_dir.path().join(&parent_file)).unwrap();
+        let child_a_uri = Url::from_file_path(temp_dir.path().join(&child_a_file)).unwrap();
+        let child_b_uri = Url::from_file_path(temp_dir.path().join(&child_b_file)).unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        // Initial state: directive points to child_a
+        let meta_v1 = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_a_file.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v1, Some(&workspace_url), |_| None);
+
+        // Verify edge points to child_a
+        let deps_before = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps_before.len(), 1);
+        prop_assert_eq!(
+            &deps_before[0].to, &child_a_uri,
+            "Initial edge should point to child_a"
+        );
+
+        // Modify directive to point to child_b (simulating user changing @lsp-source target)
+        let meta_v2 = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_b_file.clone(),
+                line: directive_line,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v2, Some(&workspace_url), |_| None);
+
+        // Verify edge now points to child_b (Requirement 7.3)
+        let deps_after = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(
+            deps_after.len(), 1,
+            "Should still have exactly one edge after modification"
+        );
+        prop_assert_eq!(
+            &deps_after[0].to, &child_b_uri,
+            "Edge should now point to child_b after modification"
+        );
+
+        // Verify old edge to child_a is removed
+        let child_a_dependents = graph.get_dependents(&child_a_uri);
+        prop_assert!(
+            child_a_dependents.is_empty(),
+            "child_a should have no dependents after directive modification"
+        );
+
+        // Verify new edge to child_b exists
+        let child_b_dependents = graph.get_dependents(&child_b_uri);
+        prop_assert_eq!(
+            child_b_dependents.len(), 1,
+            "child_b should have one dependent after directive modification"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 12 Extended: Multiple directive changes
+    ///
+    /// When multiple forward directives are added, removed, or modified in a single
+    /// update, the dependency graph SHALL reflect all changes correctly.
+    ///
+    /// **Validates: Requirements 7.1, 7.2, 7.3**
+    #[test]
+    fn prop_revalidation_on_multiple_directive_changes(
+        parent in path_component(),
+        child_a in path_component(),
+        child_b in path_component(),
+        child_c in path_component(),
+        line_a in 0..30u32,
+        line_b in 30..60u32,
+        line_c in 60..100u32,
+    ) {
+        prop_assume!(child_a != child_b && child_b != child_c && child_a != child_c);
+
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Create temp workspace with actual files
+        let temp_dir = TempDir::new().unwrap();
+        let parent_file = format!("{}.R", parent);
+        let child_a_file = format!("{}.R", child_a);
+        let child_b_file = format!("{}.R", child_b);
+        let child_c_file = format!("{}.R", child_c);
+        File::create(temp_dir.path().join(&parent_file)).unwrap();
+        File::create(temp_dir.path().join(&child_a_file)).unwrap();
+        File::create(temp_dir.path().join(&child_b_file)).unwrap();
+        File::create(temp_dir.path().join(&child_c_file)).unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let parent_uri = Url::from_file_path(temp_dir.path().join(&parent_file)).unwrap();
+        let child_a_uri = Url::from_file_path(temp_dir.path().join(&child_a_file)).unwrap();
+        let child_b_uri = Url::from_file_path(temp_dir.path().join(&child_b_file)).unwrap();
+        let child_c_uri = Url::from_file_path(temp_dir.path().join(&child_c_file)).unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        // Initial state: directives to child_a and child_b
+        let meta_v1 = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: child_a_file.clone(),
+                    line: line_a,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: child_b_file.clone(),
+                    line: line_b,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v1, Some(&workspace_url), |_| None);
+
+        // Verify initial state
+        let deps_v1 = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps_v1.len(), 2, "Should have two edges initially");
+
+        // Change: remove child_a, keep child_b, add child_c
+        let meta_v2 = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: child_b_file.clone(),
+                    line: line_b,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                ForwardSource {
+                    path: child_c_file.clone(),
+                    line: line_c,
+                    column: 0,
+                    is_directive: true,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v2, Some(&workspace_url), |_| None);
+
+        // Verify final state
+        let deps_v2 = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(
+            deps_v2.len(), 2,
+            "Should still have two edges after changes"
+        );
+
+        // Collect target URIs
+        let targets: HashSet<_> = deps_v2.iter().map(|e| &e.to).collect();
+
+        // child_a should be removed
+        prop_assert!(
+            !targets.contains(&child_a_uri),
+            "child_a should be removed from graph"
+        );
+
+        // child_b should still be present
+        prop_assert!(
+            targets.contains(&child_b_uri),
+            "child_b should still be in graph"
+        );
+
+        // child_c should be added
+        prop_assert!(
+            targets.contains(&child_c_uri),
+            "child_c should be added to graph"
+        );
+
+        // Verify backward lookups
+        prop_assert!(
+            graph.get_dependents(&child_a_uri).is_empty(),
+            "child_a should have no dependents"
+        );
+        prop_assert_eq!(
+            graph.get_dependents(&child_b_uri).len(), 1,
+            "child_b should have one dependent"
+        );
+        prop_assert_eq!(
+            graph.get_dependents(&child_c_uri).len(), 1,
+            "child_c should have one dependent"
+        );
+    }
+
+    /// Feature: lsp-source-directive, Property 12 Extended: Line number change
+    ///
+    /// When a forward directive's line number changes (but target stays the same),
+    /// the dependency graph SHALL update the call site information.
+    ///
+    /// **Validates: Requirements 7.3**
+    #[test]
+    fn prop_revalidation_on_directive_line_change(
+        parent in path_component(),
+        child in path_component(),
+        line_v1 in 0..50u32,
+        line_v2 in 50..100u32,
+    ) {
+        use tempfile::TempDir;
+        use std::fs::File;
+
+        // Create temp workspace with actual files
+        let temp_dir = TempDir::new().unwrap();
+        let parent_file = format!("{}.R", parent);
+        let child_file = format!("{}.R", child);
+        File::create(temp_dir.path().join(&parent_file)).unwrap();
+        File::create(temp_dir.path().join(&child_file)).unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let parent_uri = Url::from_file_path(temp_dir.path().join(&parent_file)).unwrap();
+        let child_uri = Url::from_file_path(temp_dir.path().join(&child_file)).unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        // Initial state: directive at line_v1
+        let meta_v1 = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_file.clone(),
+                line: line_v1,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v1, Some(&workspace_url), |_| None);
+
+        // Verify initial call site
+        let deps_v1 = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps_v1.len(), 1);
+        prop_assert_eq!(
+            deps_v1[0].call_site_line, Some(line_v1),
+            "Initial call site should be at line_v1"
+        );
+
+        // Change directive line (simulating user moving the directive)
+        let meta_v2 = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_file.clone(),
+                line: line_v2,
+                column: 0,
+                is_directive: true,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &meta_v2, Some(&workspace_url), |_| None);
+
+        // Verify call site was updated
+        let deps_v2 = graph.get_dependencies(&parent_uri);
+        prop_assert_eq!(deps_v2.len(), 1);
+        prop_assert_eq!(
+            &deps_v2[0].to, &child_uri,
+            "Edge should still point to same child"
+        );
+        prop_assert_eq!(
+            deps_v2[0].call_site_line, Some(line_v2),
+            "Call site should be updated to line_v2"
         );
     }
 }
