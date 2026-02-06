@@ -7,5 +7,5 @@ out/
 bin/raven
 bin/raven.exe
 
-# Claude Code local settings
-.claude/
+# Claude Code local settings (but keep plans and rules)
+.claude/settings.local.json
