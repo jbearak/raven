@@ -985,7 +985,7 @@ impl<'a> SymbolExtractor<'a> {
                     // Compute UTF-16 column for the end of the line
                     let line_end_utf16 = line
                         .chars()
-                        .map(|c| if c.len_utf16() > 1 { 2 } else { 1 })
+                        .map(|c| c.len_utf16() as u32)
                         .sum::<u32>();
 
                     let range = Range {
@@ -1037,11 +1037,11 @@ impl<'a> SymbolExtractor<'a> {
                     if let Some(name) = extract_banner_name(lines[i]) {
                         let name_line_end_utf16: u32 = lines[i]
                             .chars()
-                            .map(|c| if c.len_utf16() > 1 { 2 } else { 1 })
+                            .map(|c| c.len_utf16() as u32)
                             .sum();
                         let bottom_line_end_utf16: u32 = lines[i + 1]
                             .chars()
-                            .map(|c| if c.len_utf16() > 1 { 2 } else { 1 })
+                            .map(|c| c.len_utf16() as u32)
                             .sum();
 
                         let range = Range {
@@ -9591,6 +9591,16 @@ result <- data %>% filter(x > 0)
     #[test]
     fn test_extract_banner_name_multiple_leading_hashes() {
         assert_eq!(extract_banner_name("## Section Name ##"), Some("Section Name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_banner_name_with_embedded_dash() {
+        assert_eq!(extract_banner_name("# My-Analysis"), Some("My-Analysis".to_string()));
+    }
+
+    #[test]
+    fn test_extract_banner_name_with_embedded_plus() {
+        assert_eq!(extract_banner_name("# Data+Processing"), Some("Data+Processing".to_string()));
     }
 
     // ========================================================================
