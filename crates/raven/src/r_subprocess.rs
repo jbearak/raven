@@ -295,15 +295,18 @@ impl RSubprocess {
             cmd.current_dir(wd);
         }
 
-        let output = match tokio::time::timeout(timeout, cmd.output()).await {
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn R subprocess: {e}"))?;
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(result) => {
-                result.map_err(|e| anyhow!("Failed to execute R subprocess: {}", e))?
+                result.map_err(|e| anyhow!("Failed to execute R subprocess: {e}"))?
             }
             Err(_) => {
-                return Err(anyhow!(
-                    "R subprocess timed out after {:?}",
-                    timeout
-                ));
+                return Err(anyhow!("R subprocess timed out after {timeout:?}"));
             }
         };
 

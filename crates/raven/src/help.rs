@@ -14,53 +14,63 @@ const HELP_CACHE_MAX_ENTRIES: usize = 512;
 /// Bounded cache for help content. Uses insertion-order eviction (FIFO) to
 /// prevent unbounded memory growth in long-running LSP sessions.
 pub struct HelpCache {
-    cache: Arc<RwLock<HashMap<String, Option<String>>>>,
-    /// Insertion order for FIFO eviction
-    order: Arc<RwLock<VecDeque<String>>>,
+    inner: Arc<RwLock<HelpCacheInner>>,
     max_entries: usize,
+}
+
+struct HelpCacheInner {
+    map: HashMap<String, Option<String>>,
+    /// Insertion order for FIFO eviction
+    order: VecDeque<String>,
 }
 
 impl HelpCache {
     pub fn new() -> Self {
         Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            order: Arc::new(RwLock::new(VecDeque::new())),
+            inner: Arc::new(RwLock::new(HelpCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            })),
             max_entries: HELP_CACHE_MAX_ENTRIES,
         }
     }
 
     pub fn get(&self, topic: &str) -> Option<Option<String>> {
-        self.cache.read().ok()?.get(topic).cloned()
+        self.inner.read().ok()?.map.get(topic).cloned()
     }
 
     pub fn insert(&self, topic: String, content: Option<String>) {
-        if let Ok(mut cache) = self.cache.write() {
-            // If key already present, just update the value (no reorder needed
-            // for a simple bounded cache)
-            if cache.contains_key(&topic) {
-                cache.insert(topic, content);
-                return;
-            }
-
-            // Evict oldest entries if at capacity
-            if let Ok(mut order) = self.order.write() {
-                while cache.len() >= self.max_entries {
-                    if let Some(oldest) = order.pop_front() {
-                        cache.remove(&oldest);
+        if let Ok(mut inner) = self.inner.write() {
+            let is_new = !inner.map.contains_key(&topic);
+            if is_new {
+                // Evict oldest entries if at capacity
+                while inner.map.len() >= self.max_entries {
+                    if let Some(oldest) = inner.order.pop_front() {
+                        inner.map.remove(&oldest);
                     } else {
                         break;
                     }
                 }
-                order.push_back(topic.clone());
+                inner.order.push_back(topic.clone());
             }
+            inner.map.insert(topic, content);
+        }
+    }
 
-            cache.insert(topic, content);
+    #[cfg(test)]
+    fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HelpCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            })),
+            max_entries,
         }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.cache.read().map(|c| c.len()).unwrap_or(0)
+        self.inner.read().map(|c| c.map.len()).unwrap_or(0)
     }
 }
 
@@ -360,11 +370,7 @@ Arguments:
 
     #[test]
     fn test_help_cache_bounded() {
-        let cache = HelpCache {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            order: Arc::new(RwLock::new(VecDeque::new())),
-            max_entries: 3,
-        };
+        let cache = HelpCache::with_max_entries(3);
 
         cache.insert("a".to_string(), Some("help_a".to_string()));
         cache.insert("b".to_string(), Some("help_b".to_string()));
@@ -380,11 +386,7 @@ Arguments:
 
     #[test]
     fn test_help_cache_update_existing() {
-        let cache = HelpCache {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            order: Arc::new(RwLock::new(VecDeque::new())),
-            max_entries: 3,
-        };
+        let cache = HelpCache::with_max_entries(3);
 
         cache.insert("a".to_string(), None);
         assert_eq!(cache.get("a"), Some(None));

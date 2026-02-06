@@ -2247,9 +2247,10 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 ///
 /// ```
 /// use std::collections::HashMap;
+/// use std::sync::Arc;
 /// use crate::cross_file::types::DeclaredSymbol;
 /// // Use an empty interface, no packages, and no declared symbols as the simplest example.
-/// let interface: HashMap<String, crate::ScopedSymbol> = HashMap::new();
+/// let interface: HashMap<Arc<str>, crate::ScopedSymbol> = HashMap::new();
 /// let packages: Vec<String> = Vec::new();
 /// let declared: Vec<DeclaredSymbol> = Vec::new();
 /// let h1 = crate::compute_interface_hash(&interface, &packages, &declared);

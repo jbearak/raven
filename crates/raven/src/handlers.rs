@@ -831,7 +831,7 @@ impl<'a> SymbolExtractor<'a> {
     /// // setGeneric("myGeneric", function(x) standardGeneric("myGeneric"))
     /// // → RawSymbol { name: "myGeneric", kind: Interface, ... }
     /// ```
-    #[allow(dead_code)] // Used in tests; production code uses extract_ast_symbols_recursive
+    #[cfg(test)]
     pub fn extract_s4_methods(&self, node: tree_sitter::Node<'a>) -> Vec<RawSymbol> {
         let mut symbols = Vec::new();
         self.extract_s4_methods_recursive(node, &mut symbols);
@@ -839,7 +839,7 @@ impl<'a> SymbolExtractor<'a> {
     }
 
     /// Recursively extract S4 method definitions from the AST.
-    #[allow(dead_code)] // Used in tests; production code uses extract_ast_symbols_recursive
+    #[cfg(test)]
     fn extract_s4_methods_recursive(
         &self,
         node: tree_sitter::Node<'a>,

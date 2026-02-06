@@ -92,7 +92,7 @@ impl CrossFileFileCache {
     /// Clears the cache when it exceeds `EXISTENCE_CACHE_MAX_ENTRIES` to bound memory.
     pub fn cache_existence(&self, path: &Path, exists: bool) {
         if let Ok(mut guard) = self.existence.write() {
-            if guard.len() >= EXISTENCE_CACHE_MAX_ENTRIES {
+            if !guard.contains_key(path) && guard.len() >= EXISTENCE_CACHE_MAX_ENTRIES {
                 guard.clear();
             }
             guard.insert(path.to_path_buf(), exists);

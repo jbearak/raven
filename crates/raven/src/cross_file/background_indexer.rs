@@ -123,16 +123,16 @@ impl BackgroundIndexer {
             return;
         }
 
-        // O(1) duplicate check via pending set
-        {
-            let pending = self.pending.lock().unwrap();
-            if pending.contains(&uri) {
-                log::trace!("Skipping indexing task for {} - already queued", uri);
-                return;
-            }
-        }
-
+        // Acquire queue lock first, then pending lock (same order as worker thread)
+        // to prevent deadlock and ensure atomicity of duplicate check + insert.
         let mut queue = self.queue.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap();
+
+        // O(1) duplicate check via pending set
+        if pending.contains(&uri) {
+            log::trace!("Skipping indexing task for {} - already queued", uri);
+            return;
+        }
 
         // Check queue size limit (use blocking try_read to avoid deadlock)
         let max_size = self
@@ -157,9 +157,9 @@ impl BackgroundIndexer {
             submitted_at: Instant::now(),
         };
 
-        // Simple FIFO ordering
+        // Simple FIFO ordering — insert into both under held locks
         queue.push_back(task.clone());
-        self.pending.lock().unwrap().insert(uri);
+        pending.insert(uri);
 
         log::trace!(
             "Submitted indexing task for {} (depth={}, queue_size={})",
