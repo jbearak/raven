@@ -2072,6 +2072,7 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
 /// // After calling, `symbols` will contain any exported symbols whose names contain "foo".
 
 /// ```
+#[allow(deprecated)] // SymbolInformation::deprecated is deprecated in favor of tags
 fn collect_workspace_symbols_from_artifacts(
     file_uri: &Url,
     artifacts: &crate::cross_file::scope::ScopeArtifacts,

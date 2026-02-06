@@ -64,7 +64,8 @@ impl SymbolConfig {
     /// Maximum allowed value for workspace_max_results
     pub const MAX_WORKSPACE_MAX_RESULTS: usize = 10000;
 
-    /// Default value for workspace_max_results
+    /// Default value for workspace_max_results (used in tests)
+    #[cfg(test)]
     pub const DEFAULT_WORKSPACE_MAX_RESULTS: usize = 1000;
 
     /// Create a new SymbolConfig with the given workspace_max_results value.
