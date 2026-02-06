@@ -61,6 +61,16 @@ fn section_pattern() -> &'static Regex {
     })
 }
 
+/// Returns true if the string consists entirely of delimiter characters
+/// (`#`, `-`, `=`, `*`, `+`) and/or whitespace. Used to filter out
+/// decorative separator lines (e.g. `# ==================`) from section
+/// detection. Returns true for empty strings, though this cannot occur in
+/// practice because the section regex requires at least 2 characters.
+fn is_delimiter_only(s: &str) -> bool {
+    const DELIMITER_CHARS: &[char] = &['#', '-', '=', '*', '+'];
+    s.chars().all(|c| c.is_whitespace() || DELIMITER_CHARS.contains(&c))
+}
+
 // ============================================================================
 // Document Symbol Types
 // ============================================================================
@@ -871,6 +881,12 @@ impl<'a> SymbolExtractor<'a> {
                 // Capture group 3: section name
                 if let Some(name_match) = caps.get(3) {
                     let name = name_match.as_str().trim().to_string();
+
+                    // Skip decorative separators where the "name" is only
+                    // delimiter characters (e.g. "# ==================")
+                    if is_delimiter_only(&name) {
+                        continue;
+                    }
 
                     // Compute UTF-16 column for the end of the line
                     let line_end_utf16 = line
@@ -9017,6 +9033,271 @@ result <- data %>% filter(x > 0)
     }
 
     // ========================================================================
+    // Decorative separator rejection tests (Requirement 3)
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sections_reject_equals_separator() {
+        // Decorative equals separator should NOT be detected
+        let code = "# ==================\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_long_hash_separator() {
+        // Long hash separator should NOT be detected
+        let code = "################################################################################\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_long_dashes() {
+        // Long dash separator should NOT be detected (regex captures "--" as name)
+        let code = "# --------\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_long_asterisks() {
+        // Long asterisk separator should NOT be detected
+        let code = "# ********\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_long_plus() {
+        // Long plus separator should NOT be detected
+        let code = "# ++++++++\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_single_delimiter_char_as_name() {
+        // Single delimiter character as name should NOT be detected
+        let code = "# = ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_two_delimiter_groups() {
+        // Two delimiter groups separated by space should NOT be detected
+        let code = "# ---- ====\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_mixed_delimiter_chars() {
+        // Mixed delimiter characters as name should NOT be detected
+        let code = "# =-==-= ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_reject_spaced_equals_groups() {
+        // Multiple equals groups with spaces should NOT be detected
+        let code = "# ==== ==== ====\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    // ========================================================================
+    // Edge case acceptance tests (Requirement 4)
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sections_accept_numbers_only() {
+        // Numbers-only section name should be detected (matches RStudio behavior)
+        let code = "# 123 ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "123").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_accept_dots_only() {
+        // Dots-only section name should be detected (dots are not delimiter chars)
+        let code = "# ... ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "...").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_accept_unicode() {
+        // Unicode section name should be detected
+        let code = "# 日本語 ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "日本語").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_accept_at_todo() {
+        // Special characters with letters should be detected
+        let code = "# @TODO: Fix this ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols
+            .iter()
+            .find(|s| s.name == "@TODO: Fix this")
+            .unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_accept_underscores() {
+        // Underscores with letters should be detected
+        let code = "# my_section ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "my_section").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    // ========================================================================
+    // is_delimiter_only() unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_delimiter_only_empty() {
+        assert!(is_delimiter_only(""));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_whitespace() {
+        assert!(is_delimiter_only("   "));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_dashes() {
+        assert!(is_delimiter_only("----"));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_mixed_delimiters() {
+        assert!(is_delimiter_only("=-==-="));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_delimiters_with_spaces() {
+        assert!(is_delimiter_only("==== ==== ===="));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_all_types() {
+        assert!(is_delimiter_only("#-=*+"));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_false_for_letter() {
+        assert!(!is_delimiter_only("a"));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_false_for_digit() {
+        assert!(!is_delimiter_only("1"));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_false_for_mixed_with_letter() {
+        assert!(!is_delimiter_only("--a--"));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_false_for_dot() {
+        assert!(!is_delimiter_only("..."));
+    }
+
+    #[test]
+    fn test_is_delimiter_only_false_for_unicode() {
+        assert!(!is_delimiter_only("日本"));
+    }
+
+    // ========================================================================
     // HierarchyBuilder::compute_section_ranges() tests
     // ========================================================================
 
@@ -15682,6 +15963,112 @@ setClass("{}", slots = c(value = "numeric"))
                 DocumentSymbolKind::Module,
                 "Section symbol should have kind=MODULE. Code: '{}', Actual kind: {:?}",
                 code, section.kind
+            );
+        }
+
+        // ====================================================================
+        // Feature: r-section-detection-fix property tests
+        // ====================================================================
+
+        #[test]
+        /// Feature: r-section-detection-fix, Property 1: Delimiter validation correctness
+        ///
+        /// For any string composed only of delimiter characters (#, -, =, *, +)
+        /// and/or whitespace, is_delimiter_only() SHALL return true.
+        ///
+        /// **Validates: Requirements 1.1, 1.2, 1.3**
+        fn prop_is_delimiter_only_true_for_delimiter_strings(
+            s in "[#=*+\\- ]{1,30}"
+        ) {
+            prop_assert!(
+                is_delimiter_only(&s),
+                "is_delimiter_only should return true for delimiter-only string: '{}'",
+                s
+            );
+        }
+
+        #[test]
+        /// Feature: r-section-detection-fix, Property 1: Delimiter validation correctness
+        ///
+        /// For any string containing at least one non-delimiter, non-whitespace
+        /// character, is_delimiter_only() SHALL return false.
+        ///
+        /// **Validates: Requirements 1.1, 1.2, 1.3**
+        fn prop_is_delimiter_only_false_for_non_delimiter_strings(
+            prefix in "[#=*+\\-]{0,5}",
+            non_delim in "[a-zA-Z0-9_.@!?:()]{1,10}",
+            suffix in "[#=*+\\-]{0,5}"
+        ) {
+            let s = format!("{}{}{}", prefix, non_delim, suffix);
+            prop_assert!(
+                !is_delimiter_only(&s),
+                "is_delimiter_only should return false for string with non-delimiter content: '{}'",
+                s
+            );
+        }
+
+        #[test]
+        /// Feature: r-section-detection-fix, Property 2: Section detection consistency
+        ///
+        /// For any R section comment with a name containing non-delimiter content,
+        /// extract_sections() SHALL detect it as a valid section.
+        ///
+        /// **Validates: Requirements 2.1-2.6, 4.1-4.6**
+        fn prop_section_with_non_delimiter_name_detected(
+            section_name in "[a-zA-Z0-9_.@]{1,5}[a-zA-Z0-9 _.@]{0,15}".prop_filter(
+                "Has non-delimiter content",
+                |s| !s.trim().is_empty() && !is_delimiter_only(s.trim())
+            ),
+            dash_count in 4usize..12
+        ) {
+            let delimiter = "-".repeat(dash_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Section with non-delimiter name should be detected. Code: '{}'",
+                code
+            );
+        }
+
+        #[test]
+        /// Feature: r-section-detection-fix, Property 2: Section detection consistency
+        ///
+        /// For any R comment line where the regex captures a delimiter-only name,
+        /// extract_sections() SHALL NOT detect it as a section.
+        ///
+        /// **Validates: Requirements 3.1-3.11**
+        fn prop_delimiter_only_name_rejected(
+            delim_name_count in 2usize..10,
+            trail_count in 4usize..12
+        ) {
+            // Build a "name" from delimiter chars and a trailing delimiter
+            let delim_name = "=".repeat(delim_name_count);
+            let trail = "-".repeat(trail_count);
+            let code = format!("# {} {}\nx <- 1", delim_name, trail);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                sections.is_empty(),
+                "Delimiter-only name should NOT produce a section. Code: '{}', Sections: {:?}",
+                code, sections.iter().map(|s| &s.name).collect::<Vec<_>>()
             );
         }
 
