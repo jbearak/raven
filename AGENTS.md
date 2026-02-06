@@ -481,6 +481,10 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Unbounded caches (`HashMap` with no eviction) are a memory leak in long-running LSP sessions. Always set a maximum size or use time-based expiry.
 - When multiple AST traversals extract different kinds of symbols (assignments, S4 methods), merge them into a single recursive walk to avoid redundant tree iteration.
 - Add early termination to workspace symbol collection (`break` when `max_results` reached) to avoid collecting thousands of symbols only to truncate them.
+- Use `Arc<str>` for frequently-cloned string fields (like `ScopedSymbol.name`) and corresponding HashMap keys to reduce O(n) String allocations to O(1) atomic refcount increments.
+- When converting a HashMap key type from `String` to `Arc<str>`, lookups via `.get()` and `.contains_key()` need `&str` arguments (e.g., `var.as_str()`) since `HashMap<Arc<str>, _>` implements `Borrow<str>`.
+- `Arc<str>` does NOT have a stable `.as_str()` method (it's behind the `str_as_str` feature gate); use `&*arc` instead to get a `&str` reference.
+- Invalidate per-file caches (e.g., ParentSelectionCache) in `did_close` to prevent stale entries from accumulating in long-running sessions.
 
 ### Performance & Profiling
 
