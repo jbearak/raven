@@ -402,11 +402,12 @@ When a comment partially matches the section pattern:
 - Do not create a section symbol
 - Process as a regular comment (ignored for symbols)
 
-### Unicode and Encoding
+### Unicode, Encoding, and LSP Position Bounds
 
 - All positions use UTF-16 code units (LSP standard)
 - Use existing `byte_offset_to_utf16_column` utility for conversion
 - Handle multi-byte characters correctly in range computation
+- **LSP `uinteger` constraint**: All `Position` values (`line`, `character`) in LSP responses MUST be in the range `0..=2_147_483_647` (`i32::MAX`). The LSP spec defines `uinteger` with this upper bound; values exceeding it cause `DocumentSymbol.is()` type guards in the VS Code client library to fail, which cascades into runtime errors. For end-of-line or end-of-file sentinels in LSP responses, use `LSP_EOL_CHARACTER` (`i32::MAX as u32`, i.e., `2_147_483_647`). The LSP spec treats any character value exceeding the actual line length as the end of the line. Note: internal scope resolution code (not serialized to LSP) may still use `u32::MAX`.
 
 ### Large Files
 

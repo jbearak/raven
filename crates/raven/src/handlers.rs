@@ -21,6 +21,17 @@ use crate::state::WorldState;
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
 
+/// Maximum valid character value for LSP positions.
+///
+/// The LSP specification defines position characters as `uinteger` (0..2147483647).
+/// Using `u32::MAX` (4294967295) exceeds this range and causes the VS Code client's
+/// `DocumentSymbol.is()` type guard to fail, which cascades into a runtime error
+/// when the client falls through to `asSymbolInformations()`.
+///
+/// Per the LSP spec, if the character value exceeds the line length, clients treat
+/// it as the end of the line — so any large valid value works as an end-of-line sentinel.
+const LSP_EOL_CHARACTER: u32 = i32::MAX as u32; // 2147483647
+
 // ============================================================================
 // Section Pattern
 // ============================================================================
@@ -1016,7 +1027,7 @@ impl HierarchyBuilder {
             // This means the range covers up to and including end_line
             self.symbols[current_idx].range.end = Position {
                 line: end_line,
-                character: u32::MAX, // End of line
+                character: LSP_EOL_CHARACTER, // End of line
             };
         }
     }
@@ -2465,7 +2476,7 @@ async fn collect_missing_file_diagnostics_standalone(
                     diagnostics.push(Diagnostic {
                         range: Range {
                             start: Position::new(directive.directive_line, 0),
-                            end: Position::new(directive.directive_line, u32::MAX),
+                            end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                         },
                         severity: Some(missing_file_severity),
                         message: format!("Path is outside workspace: '{}'", directive.path),
@@ -2487,7 +2498,7 @@ async fn collect_missing_file_diagnostics_standalone(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(directive.directive_line, 0),
-                    end: Position::new(directive.directive_line, u32::MAX),
+                    end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                 },
                 severity: Some(missing_file_severity),
                 message: format!("Cannot resolve parent path: '{}'", directive.path),
@@ -2525,7 +2536,7 @@ async fn collect_missing_file_diagnostics_standalone(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(line, 0),
-                        end: Position::new(line, u32::MAX),
+                        end: Position::new(line, LSP_EOL_CHARACTER),
                     },
                     severity: Some(missing_file_severity),
                     message: format!("Parent file not found: '{}'", path_str),
@@ -2719,7 +2730,7 @@ fn collect_missing_file_diagnostics(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(directive.directive_line, 0),
-                        end: Position::new(directive.directive_line, u32::MAX),
+                        end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                     },
                     severity: Some(state.cross_file_config.missing_file_severity),
                     message: format!("Parent file not found: '{}'", directive.path),
@@ -2730,7 +2741,7 @@ fn collect_missing_file_diagnostics(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(directive.directive_line, 0),
-                    end: Position::new(directive.directive_line, u32::MAX),
+                    end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                 },
                 severity: Some(state.cross_file_config.missing_file_severity),
                 message: format!("Cannot resolve parent path: '{}'", directive.path),
@@ -2863,7 +2874,7 @@ pub async fn collect_missing_file_diagnostics_async(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(directive.directive_line, 0),
-                    end: Position::new(directive.directive_line, u32::MAX),
+                    end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                 },
                 severity: Some(missing_file_severity),
                 message: format!("Cannot resolve parent path: '{}'", directive.path),
@@ -2890,7 +2901,7 @@ pub async fn collect_missing_file_diagnostics_async(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(line, 0),
-                        end: Position::new(line, u32::MAX),
+                        end: Position::new(line, LSP_EOL_CHARACTER),
                     },
                     severity: Some(missing_file_severity),
                     message: format!("Parent file not found: '{}'", path),
@@ -3076,7 +3087,7 @@ fn collect_ambiguous_parent_diagnostics(
         diagnostics.push(Diagnostic {
             range: Range {
                 start: Position::new(directive_line, 0),
-                end: Position::new(directive_line, u32::MAX),
+                end: Position::new(directive_line, LSP_EOL_CHARACTER),
             },
             severity: Some(state.cross_file_config.ambiguous_parent_severity),
             message: format!(
@@ -3237,7 +3248,7 @@ fn collect_redundant_directive_diagnostics(
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(directive.line, 0),
-                        end: Position::new(directive.line, u32::MAX),
+                        end: Position::new(directive.line, LSP_EOL_CHARACTER),
                     },
                     severity: Some(severity),
                     message: format!(
@@ -3274,7 +3285,7 @@ fn collect_invalid_line_param_diagnostics(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(source.directive_line, 0),
-                    end: Position::new(source.directive_line, u32::MAX),
+                    end: Position::new(source.directive_line, LSP_EOL_CHARACTER),
                 },
                 severity: Some(DiagnosticSeverity::WARNING),
                 message: format!(
@@ -9481,7 +9492,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 9, character: u32::MAX },
+                    end: Position { line: 9, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },
@@ -9528,7 +9539,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 19, character: u32::MAX },
+                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },
@@ -9543,7 +9554,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 5, character: 0 },
-                    end: Position { line: 14, character: u32::MAX },
+                    end: Position { line: 14, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 5, character: 0 },
@@ -9558,7 +9569,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 20, character: 0 },
-                    end: Position { line: 29, character: u32::MAX },
+                    end: Position { line: 29, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 20, character: 0 },
@@ -9595,7 +9606,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 19, character: u32::MAX },
+                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },
@@ -9610,7 +9621,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 5, character: 0 },
-                    end: Position { line: 14, character: u32::MAX },
+                    end: Position { line: 14, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 5, character: 0 },
@@ -9662,7 +9673,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 29, character: u32::MAX },
+                    end: Position { line: 29, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },
@@ -9677,7 +9688,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 5, character: 0 },
-                    end: Position { line: 24, character: u32::MAX },
+                    end: Position { line: 24, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 5, character: 0 },
@@ -9692,7 +9703,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 10, character: 0 },
-                    end: Position { line: 19, character: u32::MAX },
+                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 10, character: 0 },
@@ -9729,7 +9740,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 29, character: u32::MAX },
+                    end: Position { line: 29, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },
@@ -9744,7 +9755,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 5, character: 0 },
-                    end: Position { line: 14, character: u32::MAX },
+                    end: Position { line: 14, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 5, character: 0 },
@@ -9759,7 +9770,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 15, character: 0 },
-                    end: Position { line: 24, character: u32::MAX },
+                    end: Position { line: 24, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 15, character: 0 },
@@ -9808,7 +9819,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 5, character: 0 },
-                    end: Position { line: 19, character: u32::MAX },
+                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 5, character: 0 },
@@ -9841,7 +9852,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 9, character: u32::MAX },
+                    end: Position { line: 9, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },
@@ -10400,7 +10411,7 @@ result <- data %>% filter(x > 0)
                 kind: DocumentSymbolKind::Module,
                 range: Range {
                     start: Position { line: 0, character: 0 },
-                    end: Position { line: 9, character: u32::MAX },
+                    end: Position { line: 9, character: LSP_EOL_CHARACTER },
                 },
                 selection_range: Range {
                     start: Position { line: 0, character: 0 },

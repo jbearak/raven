@@ -39,6 +39,7 @@ This feature enhances Raven's document symbol and workspace symbol support to pr
 1. FOR ALL DocumentSymbol entries, THE Document_Symbol_Provider SHALL set `range` to the full extent of the construct (from start of assignment to end of value/body)
 2. FOR ALL DocumentSymbol entries, THE Document_Symbol_Provider SHALL set `selectionRange` to the identifier-only range (just the symbol name)
 3. THE selectionRange SHALL always be contained within the range
+4. FOR ALL Position values (`line`, `character`) in LSP responses (including DocumentSymbol, SymbolInformation, and Diagnostic ranges), values SHALL be in the range `0..=2_147_483_647` (LSP `uinteger` upper bound). For end-of-line sentinels, use `i32::MAX as u32` (`2_147_483_647`); the LSP spec treats any character value exceeding the actual line length as end-of-line.
 
 ### Requirement 3: Hierarchical Nesting of Children
 
