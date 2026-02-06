@@ -71,6 +71,11 @@ fn is_delimiter_only(s: &str) -> bool {
     s.chars().all(|c| c.is_whitespace() || DELIMITER_CHARS.contains(&c))
 }
 
+/// Computes the UTF-16 length of a string (number of UTF-16 code units).
+fn utf16_len(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
 // ============================================================================
 // Banner-Style Section Helpers
 // ============================================================================
@@ -95,11 +100,7 @@ enum DelimiterKind {
 /// Returns `Some(kind)` if the line is a delimiter line, `None` otherwise.
 fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || !trimmed.starts_with('#') {
-        return None;
-    }
-
-    let after_first_hash = &trimmed[1..];
+    let after_first_hash = trimmed.strip_prefix('#')?;
 
     // Case 1: all hashes (e.g., "################") — need 4+ total
     if !after_first_hash.is_empty()
@@ -983,10 +984,7 @@ impl<'a> SymbolExtractor<'a> {
                     }
 
                     // Compute UTF-16 column for the end of the line
-                    let line_end_utf16 = line
-                        .chars()
-                        .map(|c| c.len_utf16() as u32)
-                        .sum::<u32>();
+                    let line_end_utf16 = utf16_len(line);
 
                     let range = Range {
                         start: Position {
@@ -1035,14 +1033,8 @@ impl<'a> SymbolExtractor<'a> {
                     }
 
                     if let Some(name) = extract_banner_name(lines[i]) {
-                        let name_line_end_utf16: u32 = lines[i]
-                            .chars()
-                            .map(|c| c.len_utf16() as u32)
-                            .sum();
-                        let bottom_line_end_utf16: u32 = lines[i + 1]
-                            .chars()
-                            .map(|c| c.len_utf16() as u32)
-                            .sum();
+                        let name_line_end_utf16 = utf16_len(lines[i]);
+                        let bottom_line_end_utf16 = utf16_len(lines[i + 1]);
 
                         let range = Range {
                             start: Position {
