@@ -625,11 +625,11 @@ pub struct ScopeAtPosition {
     /// Packages inherited from parent files (loaded before the source() call site)
     /// These packages are available from position (0, 0) in the child file.
     /// Requirements 5.1, 5.2, 5.3: Cross-file package propagation
-    pub inherited_packages: Vec<String>,
+    pub inherited_packages: HashSet<String>,
     /// Packages loaded locally in the current file before the query position.
     /// Combined with inherited_packages, this gives all packages available at the position.
     /// Requirements 8.1, 8.3: Position-aware package loading for diagnostics
-    pub loaded_packages: Vec<String>,
+    pub loaded_packages: HashSet<String>,
 }
 
 /// Determine whether a `source()` call should use local scoping rules.
@@ -1271,8 +1271,8 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                         }
                     };
 
-                    if should_include && !scope.loaded_packages.contains(package) {
-                        scope.loaded_packages.push(package.clone());
+                    if should_include {
+                        scope.loaded_packages.insert(package.clone());
                     }
                 }
             }
@@ -2326,6 +2326,7 @@ where
         .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
         .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
 
+    let empty_packages = HashSet::new();
     scope_at_position_with_graph_recursive(
         uri,
         line,
@@ -2338,7 +2339,7 @@ where
         max_depth,
         0,
         &mut visited,
-        &[],
+        &empty_packages,
         base_exports,
     )
 }
@@ -2400,7 +2401,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<Url>,
-    inherited_packages: &[String],
+    inherited_packages: &HashSet<String>,
     base_exports: &HashSet<String>,
 ) -> ScopeAtPosition
 where
@@ -2410,7 +2411,7 @@ where
     // Initialize scope with inherited_packages from parameter
     // Requirements 5.1, 5.2: Packages inherited from parent files are available from position (0, 0)
     let mut scope = ScopeAtPosition {
-        inherited_packages: inherited_packages.to_vec(),
+        inherited_packages: inherited_packages.clone(),
         ..Default::default()
     };
 
@@ -2496,6 +2497,7 @@ where
         // Note: We pass empty inherited_packages here because the parent will collect
         // its own inherited packages from its parents via the dependency graph
         // We pass base_exports since child files also need access to base R functions
+        let empty_packages = HashSet::new();
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
             call_site_line,
@@ -2508,7 +2510,7 @@ where
             max_depth,
             current_depth + 1,
             visited,
-            &[], // Parent collects its own inherited packages
+            &empty_packages, // Parent collects its own inherited packages
             base_exports,
         );
 
@@ -2572,8 +2574,8 @@ where
                             }
                         };
 
-                        if should_propagate && !scope.inherited_packages.contains(package) {
-                            scope.inherited_packages.push(package.clone());
+                        if should_propagate {
+                            scope.inherited_packages.insert(package.clone());
                         }
                     }
                 }
@@ -2583,17 +2585,13 @@ where
         // Also propagate packages that the parent inherited from its parents
         // Requirement 5.2: Inherit loaded packages from parent up to call site
         for pkg in &parent_scope.inherited_packages {
-            if !scope.inherited_packages.contains(pkg) {
-                scope.inherited_packages.push(pkg.clone());
-            }
+            scope.inherited_packages.insert(pkg.clone());
         }
 
         // Also propagate packages that are loaded in the parent at the call site.
         // This includes packages loaded in sourced files before the call site.
         for pkg in &parent_scope.loaded_packages {
-            if !scope.inherited_packages.contains(pkg) {
-                scope.inherited_packages.push(pkg.clone());
-            }
+            scope.inherited_packages.insert(pkg.clone());
         }
     }
 
@@ -2690,7 +2688,7 @@ where
                             .query_innermost(Position::new(*src_line, *src_col))
                             .map(|interval| interval.as_tuple());
 
-                        let mut extra_packages: Vec<String> = Vec::new();
+                        let mut extra_packages: HashSet<String> = HashSet::new();
 
                         // Collect packages from this file's timeline that are loaded before the source() call
                         for pkg_event in &artifacts.timeline {
@@ -2721,28 +2719,20 @@ where
 
                                     if should_include
                                         && !scope.inherited_packages.contains(package)
-                                        && !extra_packages.contains(package)
                                     {
-                                        extra_packages.push(package.clone());
+                                        extra_packages.insert(package.clone());
                                     }
                                 }
                             }
                         }
 
-                        let mut packages_for_child: Vec<String>;
-                        let packages_slice: &[String];
-
-                        if extra_packages.is_empty() {
-                            packages_slice = scope.inherited_packages.as_slice();
+                        let owned_packages: HashSet<String>;
+                        let packages_for_child: &HashSet<String> = if extra_packages.is_empty() {
+                            &scope.inherited_packages
                         } else {
-                            packages_for_child = scope.inherited_packages.clone();
-                            for pkg in extra_packages {
-                                if !packages_for_child.contains(&pkg) {
-                                    packages_for_child.push(pkg);
-                                }
-                            }
-                            packages_slice = packages_for_child.as_slice();
-                        }
+                            owned_packages = scope.inherited_packages.union(&extra_packages).cloned().collect();
+                            &owned_packages
+                        };
 
                         // Build child PathContext, respecting chdir flag
                         let child_path = child_uri.to_file_path().ok();
@@ -2785,7 +2775,7 @@ where
                             max_depth,
                             current_depth + 1,
                             visited,
-                            packages_slice, // Pass inherited packages to child
+                            packages_for_child, // Pass inherited packages to child
                             base_exports,
                         );
                         // Merge child symbols (local definitions take precedence)
@@ -2801,9 +2791,7 @@ where
                             .iter()
                             .chain(child_scope.inherited_packages.iter())
                         {
-                            if !scope.loaded_packages.contains(pkg) {
-                                scope.loaded_packages.push(pkg.clone());
-                            }
+                            scope.loaded_packages.insert(pkg.clone());
                         }
                     }
                 }
@@ -2866,8 +2854,8 @@ where
                         }
                     };
 
-                    if should_include && !scope.loaded_packages.contains(package) {
-                        scope.loaded_packages.push(package.clone());
+                    if should_include {
+                        scope.loaded_packages.insert(package.clone());
                     }
                 }
             }

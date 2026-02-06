@@ -1384,12 +1384,9 @@ impl LanguageServer for Backend {
                     &empty_base_exports,
                 );
 
-                let mut pkgs: Vec<String> = scope.inherited_packages;
-                for pkg in scope.loaded_packages {
-                    if !pkgs.contains(&pkg) {
-                        pkgs.push(pkg);
-                    }
-                }
+                let mut pkgs = scope.inherited_packages;
+                pkgs.extend(scope.loaded_packages);
+                let pkgs: Vec<String> = pkgs.into_iter().collect();
 
                 (state.package_library.clone(), pkgs)
             };
@@ -1920,6 +1917,9 @@ impl LanguageServer for Backend {
 
         // Remove from activity tracking
         state.cross_file_activity.remove(uri);
+
+        // Invalidate parent selection cache for this file (stale after close)
+        state.cross_file_parent_cache.invalidate(uri);
 
         // Close the document (legacy)
         state.close_document(uri);
