@@ -1180,46 +1180,56 @@ impl HierarchyBuilder {
         // Sort section indices by their start line
         section_indices.sort_by_key(|&idx| self.symbols[idx].range.start.line);
 
-        // Compute the end line for each section (level-aware)
-        let section_count = section_indices.len();
-        for i in 0..section_count {
+        // Compute the end line for each section (level-aware, stack-based O(n)).
+        // Stack holds indices into section_indices for "open" sections whose end
+        // line hasn't been determined yet. Each section is pushed and popped at
+        // most once, so the total work is O(n).
+        let eof_line = if self.line_count > 0 {
+            self.line_count - 1
+        } else {
+            0
+        };
+        let mut stack: Vec<usize> = Vec::new();
+
+        for i in 0..section_indices.len() {
             let current_idx = section_indices[i];
             let current_level = self.symbols[current_idx]
                 .section_level
-                .unwrap_or(1);
+                .expect("section_level must be Some for symbols in section_indices");
+            let current_start = self.symbols[current_idx].range.start.line;
 
-            // Scan forward for the first section at level <= current_level
-            // (a sibling or ancestor section). Child sections (level > current)
-            // are contained within this section's range.
-            let mut end_line = if self.line_count > 0 {
-                self.line_count - 1
-            } else {
-                0
-            };
-            for j in (i + 1)..section_count {
-                let next_idx = section_indices[j];
-                let next_level = self.symbols[next_idx]
+            // Pop all stack entries with level >= current_level
+            // (they are siblings or children that end before this section)
+            while let Some(&top_i) = stack.last() {
+                let top_idx = section_indices[top_i];
+                let top_level = self.symbols[top_idx]
                     .section_level
-                    .unwrap_or(1);
-                if next_level <= current_level {
-                    let next_start_line = self.symbols[next_idx].range.start.line;
-                    // End at line before next sibling/ancestor section
-                    // (but guard against underflow when next section is at line 0)
-                    end_line = if next_start_line > 0 {
-                        next_start_line - 1
+                    .expect("section_level must be Some for symbols in section_indices");
+                if top_level >= current_level {
+                    let end_line = if current_start > 0 {
+                        current_start - 1
                     } else {
                         0
                     };
+                    self.symbols[top_idx].range.end = Position {
+                        line: end_line,
+                        character: LSP_EOL_CHARACTER,
+                    };
+                    stack.pop();
+                } else {
                     break;
                 }
             }
 
-            // Update the range's end position
-            // End character is set to 0 to indicate end of line (exclusive)
-            // This means the range covers up to and including end_line
-            self.symbols[current_idx].range.end = Position {
-                line: end_line,
-                character: LSP_EOL_CHARACTER, // End of line
+            stack.push(i);
+        }
+
+        // Remaining stack entries extend to EOF
+        while let Some(top_i) = stack.pop() {
+            let top_idx = section_indices[top_i];
+            self.symbols[top_idx].range.end = Position {
+                line: eof_line,
+                character: LSP_EOL_CHARACTER,
             };
         }
     }
