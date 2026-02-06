@@ -632,6 +632,18 @@ impl WorldState {
         )
     }
 
+    /// Resize all LRU caches based on configuration.
+    /// Called after parsing initialization options.
+    pub fn resize_caches(&self, config: &crate::cross_file::config::CrossFileConfig) {
+        self.cross_file_meta.resize(config.cache_metadata_max_entries);
+        self.cross_file_file_cache.resize(
+            config.cache_file_content_max_entries,
+            config.cache_existence_max_entries,
+        );
+        self.cross_file_workspace_index
+            .resize(config.cache_workspace_index_max_entries);
+    }
+
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
         self.documents.insert(uri, Document::new(text, version));
     }

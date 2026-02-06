@@ -4,10 +4,12 @@
 // Workspace index for cross-file awareness
 //
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+use lru::LruCache;
 use tower_lsp::lsp_types::Url;
 
 use super::file_cache::FileSnapshot;
@@ -27,18 +29,45 @@ pub struct IndexEntry {
     pub indexed_at_version: u64,
 }
 
-/// Workspace index for closed files
-#[derive(Debug, Default)]
+/// Default capacity for the cross-file workspace index
+const DEFAULT_WORKSPACE_INDEX_CAPACITY: usize = 5000;
+
+/// Workspace index for closed files with LRU eviction.
+///
+/// Uses `peek()` for reads (no LRU promotion, works under read lock) and
+/// `push()` for writes (promotes/evicts under write lock).
 pub struct CrossFileWorkspaceIndex {
-    /// Index entries by URI
-    inner: RwLock<HashMap<Url, IndexEntry>>,
+    /// Index entries by URI (LRU-bounded)
+    inner: RwLock<LruCache<Url, IndexEntry>>,
     /// Monotonic version counter
     version: AtomicU64,
+}
+
+impl std::fmt::Debug for CrossFileWorkspaceIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossFileWorkspaceIndex")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CrossFileWorkspaceIndex {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_WORKSPACE_INDEX_CAPACITY)
+    }
 }
 
 impl CrossFileWorkspaceIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = NonZeroUsize::new(cap)
+            .unwrap_or(NonZeroUsize::new(DEFAULT_WORKSPACE_INDEX_CAPACITY).unwrap());
+        Self {
+            inner: RwLock::new(LruCache::new(cap)),
+            version: AtomicU64::new(0),
+        }
     }
 
     /// Get current version
@@ -54,7 +83,7 @@ impl CrossFileWorkspaceIndex {
     /// Get index entry if it exists and is fresh
     pub fn get_if_fresh(&self, uri: &Url, current_snapshot: &FileSnapshot) -> Option<IndexEntry> {
         let guard = self.inner.read().ok()?;
-        guard.get(uri).and_then(|entry| {
+        guard.peek(uri).and_then(|entry| {
             if entry.snapshot.matches_disk(current_snapshot) {
                 Some(entry.clone())
             } else {
@@ -65,7 +94,7 @@ impl CrossFileWorkspaceIndex {
 
     /// Get metadata for a URI (without freshness check)
     pub fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
-        self.inner.read().ok()?.get(uri).map(|e| e.metadata.clone())
+        self.inner.read().ok()?.peek(uri).map(|e| e.metadata.clone())
     }
 
     /// Get artifacts for a URI (without freshness check)
@@ -73,7 +102,7 @@ impl CrossFileWorkspaceIndex {
         self.inner
             .read()
             .ok()?
-            .get(uri)
+            .peek(uri)
             .map(|e| e.artifacts.clone())
     }
 
@@ -103,7 +132,7 @@ impl CrossFileWorkspaceIndex {
         };
 
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(uri.clone(), entry);
+            guard.push(uri.clone(), entry);
         }
     }
 
@@ -111,7 +140,7 @@ impl CrossFileWorkspaceIndex {
     pub fn insert(&self, uri: Url, entry: IndexEntry) {
         self.increment_version();
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(uri, entry);
+            guard.push(uri, entry);
         }
     }
 
@@ -119,7 +148,7 @@ impl CrossFileWorkspaceIndex {
     pub fn invalidate(&self, uri: &Url) {
         self.increment_version();
         if let Ok(mut guard) = self.inner.write() {
-            guard.remove(uri);
+            guard.pop(uri);
         }
     }
 
@@ -136,7 +165,7 @@ impl CrossFileWorkspaceIndex {
         self.inner
             .read()
             .ok()
-            .map(|g| g.contains_key(uri))
+            .map(|g| g.contains(uri))
             .unwrap_or(false)
     }
 
@@ -145,8 +174,17 @@ impl CrossFileWorkspaceIndex {
         self.inner
             .read()
             .ok()
-            .map(|g| g.keys().cloned().collect())
+            .map(|g| g.iter().map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Resize the cache capacity. If shrinking, LRU entries are evicted.
+    pub fn resize(&self, cap: usize) {
+        let cap = NonZeroUsize::new(cap)
+            .unwrap_or(NonZeroUsize::new(DEFAULT_WORKSPACE_INDEX_CAPACITY).unwrap());
+        if let Ok(mut guard) = self.inner.write() {
+            guard.resize(cap);
+        }
     }
 }
 
@@ -279,5 +317,41 @@ mod tests {
 
         assert!(v2 > v1);
         assert!(v3 > v2);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let index = CrossFileWorkspaceIndex::with_capacity(2);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        index.insert(uri1.clone(), test_entry(1));
+        index.insert(uri2.clone(), test_entry(2));
+
+        assert!(index.contains(&uri1));
+        assert!(index.contains(&uri2));
+
+        // Third insert evicts uri1 (oldest by insertion time)
+        index.insert(uri3.clone(), test_entry(3));
+        assert!(!index.contains(&uri1), "LRU entry should be evicted");
+        assert!(index.contains(&uri2));
+        assert!(index.contains(&uri3));
+    }
+
+    #[test]
+    fn test_resize() {
+        let index = CrossFileWorkspaceIndex::with_capacity(5);
+        for i in 0..5 {
+            index.insert(test_uri(&format!("{}.R", i)), test_entry(i as u64));
+        }
+
+        // Shrink to 2
+        index.resize(2);
+        assert!(!index.contains(&test_uri("0.R")));
+        assert!(!index.contains(&test_uri("1.R")));
+        assert!(!index.contains(&test_uri("2.R")));
+        assert!(index.contains(&test_uri("3.R")));
+        assert!(index.contains(&test_uri("4.R")));
     }
 }

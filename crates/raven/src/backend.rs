@@ -252,6 +252,22 @@ pub(crate) fn parse_cross_file_config(
                 config.on_demand_indexing_max_queue_size = v as usize;
             }
         }
+
+        // Parse cache settings
+        if let Some(cache) = cross_file.get("cache") {
+            if let Some(v) = cache.get("metadataMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_metadata_max_entries = (v as usize).max(1);
+            }
+            if let Some(v) = cache.get("fileContentMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_file_content_max_entries = (v as usize).max(1);
+            }
+            if let Some(v) = cache.get("existenceMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_existence_max_entries = (v as usize).max(1);
+            }
+            if let Some(v) = cache.get("workspaceIndexMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_workspace_index_max_entries = (v as usize).max(1);
+            }
+        }
     }
 
     // Parse diagnostics settings
@@ -350,6 +366,23 @@ pub(crate) fn parse_cross_file_config(
     log::info!(
         "    missing_package_severity: {:?}",
         config.packages_missing_package_severity
+    );
+    log::info!("  Cache settings (LRU):");
+    log::info!(
+        "    metadata_max_entries: {}",
+        config.cache_metadata_max_entries
+    );
+    log::info!(
+        "    file_content_max_entries: {}",
+        config.cache_file_content_max_entries
+    );
+    log::info!(
+        "    existence_max_entries: {}",
+        config.cache_existence_max_entries
+    );
+    log::info!(
+        "    workspace_index_max_entries: {}",
+        config.cache_workspace_index_max_entries
     );
 
     Some(config)
@@ -550,6 +583,7 @@ impl LanguageServer for Backend {
         if let Some(ref init_options) = params.initialization_options {
             // Parse cross-file configuration
             if let Some(config) = parse_cross_file_config(init_options) {
+                state.resize_caches(&config);
                 state.cross_file_config = config;
             }
 
@@ -2018,6 +2052,7 @@ impl LanguageServer for Backend {
 
             // Apply new config if parsed
             if let Some(config) = new_config {
+                state.resize_caches(&config);
                 state.cross_file_config = config;
             }
 

@@ -367,7 +367,23 @@ source("helpers.r")
 
 ### Caching Strategy
 
-- Three caches with interior mutability: MetadataCache, ArtifactsCache, ParentSelectionCache
+All cross-file caches use **LRU eviction** via the `lru` crate (v0.14) with configurable capacity limits:
+
+| Cache | Default Capacity | Storage |
+|-------|-----------------|---------|
+| `MetadataCache` | 1000 | Per-file `CrossFileMetadata` (directives, source calls, symbols) |
+| `CrossFileFileCache` (content) | 500 | Full file text for cross-file resolution |
+| `CrossFileFileCache` (existence) | 2000 | Path existence checks (path + boolean) |
+| `CrossFileWorkspaceIndex` | 5000 | Parsed metadata + scope artifacts for closed files |
+| `WorkspaceIndex` | Configurable via `max_files` | Document symbols for workspace symbol search |
+
+**Configuration**: All cache limits are configurable via `raven.crossFile.cache.*` VS Code settings, parsed in `backend.rs` and applied via `state.resize_caches()` at initialization and on configuration change.
+
+**RwLock compatibility**: Reads use `peek()` (takes `&self`, no LRU promotion) under read locks for full concurrency. Writes use `push()` (takes `&mut self`, auto-evicts LRU entry) under write locks. This means eviction is "LRU by insertion/update time" not "LRU by access time."
+
+**Note**: `ArtifactsCache` and `ParentSelectionCache` in `cache.rs` are currently dead code (never populated in production, only invalidated). They remain as `HashMap`-based stubs.
+
+**Additional cache metadata**:
 - Fingerprinted entries: self_hash, edges_hash, upstream_interfaces_hash, workspace_index_version
 - Invalidation triggers: interface hash change OR edge set change
 
@@ -485,6 +501,11 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - When converting a HashMap key type from `String` to `Arc<str>`, lookups via `.get()` and `.contains_key()` need `&str` arguments (e.g., `var.as_str()`) since `HashMap<Arc<str>, _>` implements `Borrow<str>`.
 - `Arc<str>` does NOT have a stable `.as_str()` method (it's behind the `str_as_str` feature gate); use `&*arc` instead to get a `&str` reference.
 - Invalidate per-file caches (e.g., ParentSelectionCache) in `did_close` to prevent stale entries from accumulating in long-running sessions.
+- The `lru` crate's `LruCache::new()` requires `NonZeroUsize`; always clamp capacity with `.unwrap_or()` to a sensible default to avoid panics.
+- `LruCache` doesn't derive `Debug`; implement `Debug` manually using `finish_non_exhaustive()` when wrapping in a struct.
+- Use `peek()` (not `get()`) for LRU reads under `RwLock` read locks — `get()` promotes the entry (mutates) and requires `&mut self`, while `peek()` takes `&self` and keeps reads concurrent.
+- When migrating from reject-at-limit to LRU eviction, update property tests: entries can be silently evicted, so "was_present" tracking based on prior inserts becomes unreliable.
+- `ArtifactsCache` and `ParentSelectionCache` in `cache.rs` are dead code — never populated in production (only invalidated). Don't waste effort migrating unused caches.
 
 ### Performance & Profiling
 

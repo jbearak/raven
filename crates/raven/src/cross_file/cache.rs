@@ -5,8 +5,10 @@
 //
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::RwLock;
 
+use lru::LruCache;
 use tower_lsp::lsp_types::Url;
 
 use super::scope::ScopeArtifacts;
@@ -25,14 +27,28 @@ pub struct ScopeFingerprint {
     pub workspace_index_version: u64,
 }
 
-/// Maximum number of metadata cache entries before triggering a full clear.
-/// Entries are lazily repopulated so a clear is safe.
-const METADATA_CACHE_MAX_ENTRIES: usize = 1000;
+/// Default capacity for the metadata cache
+const DEFAULT_METADATA_CACHE_CAPACITY: usize = 1000;
 
-/// Metadata cache with interior mutability
-#[derive(Debug, Default)]
+/// Metadata cache with LRU eviction and interior mutability.
+///
+/// Uses `peek()` for reads (no LRU promotion, works under read lock) and
+/// `push()` for writes (promotes/evicts under write lock). This makes eviction
+/// "LRU by insertion/update time" which keeps the read path fully concurrent.
 pub struct MetadataCache {
-    inner: RwLock<HashMap<Url, CrossFileMetadata>>,
+    inner: RwLock<LruCache<Url, CrossFileMetadata>>,
+}
+
+impl std::fmt::Debug for MetadataCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataCache").finish_non_exhaustive()
+    }
+}
+
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_METADATA_CACHE_CAPACITY)
+    }
 }
 
 impl MetadataCache {
@@ -40,28 +56,27 @@ impl MetadataCache {
         Self::default()
     }
 
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = NonZeroUsize::new(cap)
+            .unwrap_or(NonZeroUsize::new(DEFAULT_METADATA_CACHE_CAPACITY).unwrap());
+        Self {
+            inner: RwLock::new(LruCache::new(cap)),
+        }
+    }
+
     pub fn get(&self, uri: &Url) -> Option<CrossFileMetadata> {
-        self.inner.read().ok()?.get(uri).cloned()
+        self.inner.read().ok()?.peek(uri).cloned()
     }
 
     pub fn insert(&self, uri: Url, meta: CrossFileMetadata) {
         if let Ok(mut guard) = self.inner.write() {
-            // Clear cache if it has grown too large. Entries are lazily repopulated.
-            if !guard.contains_key(&uri) && guard.len() >= METADATA_CACHE_MAX_ENTRIES {
-                log::trace!(
-                    "Metadata cache at capacity ({}/{}), clearing",
-                    guard.len(),
-                    METADATA_CACHE_MAX_ENTRIES
-                );
-                guard.clear();
-            }
-            guard.insert(uri, meta);
+            guard.push(uri, meta);
         }
     }
 
     pub fn remove(&self, uri: &Url) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.remove(uri);
+            guard.pop(uri);
         }
     }
 
@@ -81,13 +96,22 @@ impl MetadataCache {
         if let Ok(mut guard) = self.inner.write() {
             let mut count = 0;
             for uri in uris {
-                if guard.remove(uri).is_some() {
+                if guard.pop(uri).is_some() {
                     count += 1;
                 }
             }
             count
         } else {
             0
+        }
+    }
+
+    /// Resize the cache capacity. If shrinking, LRU entries are evicted.
+    pub fn resize(&self, cap: usize) {
+        let cap = NonZeroUsize::new(cap)
+            .unwrap_or(NonZeroUsize::new(DEFAULT_METADATA_CACHE_CAPACITY).unwrap());
+        if let Ok(mut guard) = self.inner.write() {
+            guard.resize(cap);
         }
     }
 }
@@ -229,6 +253,48 @@ mod tests {
 
         cache.remove(&uri);
         assert!(cache.get(&uri).is_none());
+    }
+
+    #[test]
+    fn test_metadata_cache_lru_eviction() {
+        let cache = MetadataCache::with_capacity(3);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+        let uri4 = test_uri("d.R");
+
+        cache.insert(uri1.clone(), CrossFileMetadata::default());
+        cache.insert(uri2.clone(), CrossFileMetadata::default());
+        cache.insert(uri3.clone(), CrossFileMetadata::default());
+
+        // All three should be present
+        assert!(cache.get(&uri1).is_some());
+        assert!(cache.get(&uri2).is_some());
+        assert!(cache.get(&uri3).is_some());
+
+        // Inserting a 4th evicts the LRU (uri1, oldest by insertion time)
+        cache.insert(uri4.clone(), CrossFileMetadata::default());
+        assert!(cache.get(&uri1).is_none(), "LRU entry should be evicted");
+        assert!(cache.get(&uri2).is_some());
+        assert!(cache.get(&uri3).is_some());
+        assert!(cache.get(&uri4).is_some());
+    }
+
+    #[test]
+    fn test_metadata_cache_resize() {
+        let cache = MetadataCache::with_capacity(5);
+        for i in 0..5 {
+            cache.insert(test_uri(&format!("{}.R", i)), CrossFileMetadata::default());
+        }
+
+        // Shrink to 2 — oldest 3 entries evicted
+        cache.resize(2);
+        // Only the 2 most recently inserted (3.R, 4.R) should remain
+        assert!(cache.get(&test_uri("0.R")).is_none());
+        assert!(cache.get(&test_uri("1.R")).is_none());
+        assert!(cache.get(&test_uri("2.R")).is_none());
+        assert!(cache.get(&test_uri("3.R")).is_some());
+        assert!(cache.get(&test_uri("4.R")).is_some());
     }
 
     #[test]
