@@ -8,7 +8,7 @@ The design leverages the existing tree-sitter parsing infrastructure and cross-f
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         LSP Request Flow                                     │
 ├─────────────────────────────────────────────────────────────────────────────┤

@@ -139,7 +139,7 @@ This implementation plan transforms Raven's document symbol and workspace symbol
     - Add R code section support (`# Section ----`) to feature list
     - Mention S4/R6 class detection in outline
   - [x] 11.3 Update `editors/vscode/package.json` with new configuration schema
-    - Add `rlsp.symbols.workspaceMaxResults` setting with description and default
+    - Add `raven.symbols.workspaceMaxResults` setting with description and default
   - [x] 11.4 Update `AGENTS.md` with new symbol provider architecture
     - Document SymbolExtractor and HierarchyBuilder components
     - Add to "Extension Guide" if relevant patterns emerge

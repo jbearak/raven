@@ -114,16 +114,6 @@ This feature enhances Raven's document symbol and workspace symbol support to pr
 2. THE Workspace_Symbol_Provider SHALL limit results to a configurable maximum (default: 1000 symbols)
 3. THE Workspace_Symbol_Provider SHALL search across open documents, workspace index, and legacy indices with proper deduplication
 
-### Requirement 11: Configuration Options
-
-**User Story:** As a developer, I want to configure symbol provider behavior, so that I can tune performance and results for my workspace size.
-
-#### Acceptance Criteria
-
-1. THE server SHALL expose a `symbols.workspaceMaxResults` configuration option with default value 1000
-2. WHEN `symbols.workspaceMaxResults` is set, THE Workspace_Symbol_Provider SHALL use that value as the maximum result limit
-3. THE configuration SHALL accept integer values between 100 and 10000
-
 ### Requirement 10: S4 Method Name Extraction
 
 **User Story:** As a developer, I want S4 methods to appear with meaningful names in the outline, so that I can navigate S4 class hierarchies.
@@ -133,3 +123,13 @@ This feature enhances Raven's document symbol and workspace symbol support to pr
 1. WHEN a `setMethod("methodName", ...)` call is detected, THE Document_Symbol_Provider SHALL use `methodName` as the symbol name
 2. WHEN a `setClass("ClassName", ...)` call is detected, THE Document_Symbol_Provider SHALL use `ClassName` as the symbol name
 3. WHEN a `setGeneric("genericName", ...)` call is detected, THE Document_Symbol_Provider SHALL use `genericName` as the symbol name
+
+### Requirement 11: Configuration Options
+
+**User Story:** As a developer, I want to configure symbol provider behavior, so that I can tune performance and results for my workspace size.
+
+#### Acceptance Criteria
+
+1. THE server SHALL expose a `symbols.workspaceMaxResults` configuration option with default value 1000
+2. WHEN `symbols.workspaceMaxResults` is set, THE Workspace_Symbol_Provider SHALL use that value as the maximum result limit
+3. THE configuration SHALL accept integer values between 100 and 10000

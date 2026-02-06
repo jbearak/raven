@@ -394,7 +394,7 @@ fn parse_optional_severity(s: &str) -> Option<DiagnosticSeverity> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use serde_json::json;
 /// let settings = json!({
 ///     "symbols": {
@@ -421,8 +421,15 @@ pub(crate) fn parse_symbol_config(settings: &serde_json::Value) -> Option<Symbol
     // Parse symbols.workspaceMaxResults
     // Requirement 11.2: Configurable via symbols.workspaceMaxResults
     // Requirement 11.3: Valid range 100-10000 with clamping
-    if let Some(v) = symbols.get("workspaceMaxResults").and_then(|v| v.as_u64()) {
-        config = SymbolConfig::with_max_results(v as usize);
+    if let Some(v) = symbols.get("workspaceMaxResults") {
+        if let Some(n) = v.as_u64() {
+            config = SymbolConfig::with_max_results(n as usize);
+        } else {
+            log::warn!(
+                "Invalid type for symbols.workspaceMaxResults: expected number, got {}; using default",
+                v
+            );
+        }
     }
 
     log::info!("Symbol configuration loaded from LSP settings:");
@@ -2016,7 +2023,9 @@ impl LanguageServer for Backend {
 
             // Apply new symbol config if parsed
             // Requirement 11.2: Apply symbols.workspaceMaxResults from settings
-            if let Some(config) = new_symbol_config {
+            if let Some(mut config) = new_symbol_config {
+                config.hierarchical_document_symbol_support =
+                    state.symbol_config.hierarchical_document_symbol_support;
                 state.symbol_config = config;
             }
 
