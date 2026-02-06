@@ -25,6 +25,10 @@ pub struct ScopeFingerprint {
     pub workspace_index_version: u64,
 }
 
+/// Maximum number of metadata cache entries before triggering a full clear.
+/// Entries are lazily repopulated so a clear is safe.
+const METADATA_CACHE_MAX_ENTRIES: usize = 1000;
+
 /// Metadata cache with interior mutability
 #[derive(Debug, Default)]
 pub struct MetadataCache {
@@ -42,6 +46,15 @@ impl MetadataCache {
 
     pub fn insert(&self, uri: Url, meta: CrossFileMetadata) {
         if let Ok(mut guard) = self.inner.write() {
+            // Clear cache if it has grown too large. Entries are lazily repopulated.
+            if !guard.contains_key(&uri) && guard.len() >= METADATA_CACHE_MAX_ENTRIES {
+                log::trace!(
+                    "Metadata cache at capacity ({}/{}), clearing",
+                    guard.len(),
+                    METADATA_CACHE_MAX_ENTRIES
+                );
+                guard.clear();
+            }
             guard.insert(uri, meta);
         }
     }

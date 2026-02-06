@@ -58,6 +58,14 @@ struct CachedFile {
     content: String,
 }
 
+/// Maximum number of file content entries in the cache. Prevents unbounded memory
+/// growth in workspaces with many files.
+const FILE_CACHE_MAX_ENTRIES: usize = 500;
+
+/// Maximum number of existence check entries. Prevents unbounded growth from
+/// path resolution probes.
+const EXISTENCE_CACHE_MAX_ENTRIES: usize = 2000;
+
 /// Disk file cache for closed files
 #[derive(Debug, Default)]
 pub struct CrossFileFileCache {
@@ -80,9 +88,13 @@ impl CrossFileFileCache {
         self.existence.read().ok()?.get(path).copied()
     }
 
-    /// Update existence cache (called after background check)
+    /// Update existence cache (called after background check).
+    /// Clears the cache when it exceeds `EXISTENCE_CACHE_MAX_ENTRIES` to bound memory.
     pub fn cache_existence(&self, path: &Path, exists: bool) {
         if let Ok(mut guard) = self.existence.write() {
+            if guard.len() >= EXISTENCE_CACHE_MAX_ENTRIES {
+                guard.clear();
+            }
             guard.insert(path.to_path_buf(), exists);
         }
     }
@@ -104,9 +116,25 @@ impl CrossFileFileCache {
         self.inner.read().ok()?.get(uri).map(|c| c.content.clone())
     }
 
-    /// Insert content into cache
+    /// Insert content into cache. Evicts all entries when the cache exceeds
+    /// `FILE_CACHE_MAX_ENTRIES` to bound memory usage.
     pub fn insert(&self, uri: Url, snapshot: FileSnapshot, content: String) {
         if let Ok(mut guard) = self.inner.write() {
+            // If already present, just update
+            if guard.contains_key(&uri) {
+                guard.insert(uri, CachedFile { snapshot, content });
+                return;
+            }
+            // Evict all entries when cache is too large. A full clear is simple
+            // and effective since file cache entries are lazily repopulated.
+            if guard.len() >= FILE_CACHE_MAX_ENTRIES {
+                log::trace!(
+                    "File cache at capacity ({}/{}), clearing",
+                    guard.len(),
+                    FILE_CACHE_MAX_ENTRIES
+                );
+                guard.clear();
+            }
             guard.insert(uri, CachedFile { snapshot, content });
         }
     }
@@ -121,6 +149,9 @@ impl CrossFileFileCache {
     /// Invalidate all cache entries
     pub fn invalidate_all(&self) {
         if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.existence.write() {
             guard.clear();
         }
     }
