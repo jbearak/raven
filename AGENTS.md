@@ -695,7 +695,7 @@ The document symbol and workspace symbol providers use a two-phase extraction an
 **Key Patterns:**
 
 - Single-line R code sections use regex: `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|-{4,}|={4,}|\*{4,}|\+{4,})\s*$`
-- Banner-style sections: delimiter line above and below a comment name line (e.g., `# ====` / `# Name` / `# ====`). Delimiters must use the same character type (`#`, `-`, `=`, `*`, `+`) but don't need to be the same length. Banner sections are always heading level 1.
+- Banner-style sections: delimiter line above and below a comment name line (e.g., `# ====` / `# Name` / `# ====`). Delimiters must use the same character type (`#`, `-`, `=`, `*`, `+`) but don't need to be the same length. Banner section heading level is determined by the number of `#` characters on the name line (`# Name` = level 1, `## Name` = level 2, etc.), matching the single-line section convention.
 - ALL_CAPS constants: `^[A-Z][A-Z0-9_.]+$` (min 2 chars)
 - Reserved words are filtered from both document and workspace symbols
 - Workspace symbols include `containerName` (filename without extension)

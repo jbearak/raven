@@ -138,18 +138,26 @@ fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
     }
 }
 
-/// Extracts a section name from the middle line of a banner-style section.
+/// Extracts a section name and heading level from the middle line of a
+/// banner-style section.
+///
+/// The heading level is determined by the number of leading `#` characters
+/// (`# Name` = level 1, `## Name` = level 2, etc.), matching the single-line
+/// section convention.
 ///
 /// Strips leading `#` characters and whitespace, then strips trailing delimiter
 /// characters (`#`, `-`, `=`, `*`, `+`) and whitespace. Returns `None` if the
 /// result is empty or consists only of delimiter characters.
-fn extract_banner_name(line: &str) -> Option<String> {
+fn extract_banner_name(line: &str) -> Option<(String, u32)> {
     const DELIMITER_CHARS: &[char] = &['#', '-', '=', '*', '+'];
 
     let trimmed = line.trim();
     if trimmed.is_empty() || !trimmed.starts_with('#') {
         return None;
     }
+
+    // Count leading # characters for heading level
+    let hash_count = trimmed.chars().take_while(|&c| c == '#').count() as u32;
 
     // Strip leading # characters, then whitespace
     let content = trimmed.trim_start_matches('#').trim();
@@ -160,7 +168,7 @@ fn extract_banner_name(line: &str) -> Option<String> {
         return None;
     }
 
-    Some(name.to_string())
+    Some((name.to_string(), hash_count))
 }
 
 // ============================================================================
@@ -1032,7 +1040,7 @@ impl<'a> SymbolExtractor<'a> {
                         continue;
                     }
 
-                    if let Some(name) = extract_banner_name(lines[i]) {
+                    if let Some((name, heading_level)) = extract_banner_name(lines[i]) {
                         let name_line_end_utf16 = utf16_len(lines[i]);
                         let bottom_line_end_utf16 = utf16_len(lines[i + 1]);
 
@@ -1066,7 +1074,7 @@ impl<'a> SymbolExtractor<'a> {
                             range,
                             selection_range,
                             detail: None,
-                            section_level: Some(1),
+                            section_level: Some(heading_level),
                             children: Vec::new(),
                         });
                     }
@@ -9537,22 +9545,22 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_extract_banner_name_basic() {
-        assert_eq!(extract_banner_name("# Section Name"), Some("Section Name".to_string()));
+        assert_eq!(extract_banner_name("# Section Name"), Some(("Section Name".to_string(), 1)));
     }
 
     #[test]
     fn test_extract_banner_name_with_trailing_hash() {
-        assert_eq!(extract_banner_name("# Section Name #"), Some("Section Name".to_string()));
+        assert_eq!(extract_banner_name("# Section Name #"), Some(("Section Name".to_string(), 1)));
     }
 
     #[test]
     fn test_extract_banner_name_with_trailing_hashes() {
-        assert_eq!(extract_banner_name("# Section Name ###"), Some("Section Name".to_string()));
+        assert_eq!(extract_banner_name("# Section Name ###"), Some(("Section Name".to_string(), 1)));
     }
 
     #[test]
     fn test_extract_banner_name_padded() {
-        assert_eq!(extract_banner_name("#  My Analysis  "), Some("My Analysis".to_string()));
+        assert_eq!(extract_banner_name("#  My Analysis  "), Some(("My Analysis".to_string(), 1)));
     }
 
     #[test]
@@ -9582,17 +9590,17 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_extract_banner_name_multiple_leading_hashes() {
-        assert_eq!(extract_banner_name("## Section Name ##"), Some("Section Name".to_string()));
+        assert_eq!(extract_banner_name("## Section Name ##"), Some(("Section Name".to_string(), 2)));
     }
 
     #[test]
     fn test_extract_banner_name_with_embedded_dash() {
-        assert_eq!(extract_banner_name("# My-Analysis"), Some("My-Analysis".to_string()));
+        assert_eq!(extract_banner_name("# My-Analysis"), Some(("My-Analysis".to_string(), 1)));
     }
 
     #[test]
     fn test_extract_banner_name_with_embedded_plus() {
-        assert_eq!(extract_banner_name("# Data+Processing"), Some("Data+Processing".to_string()));
+        assert_eq!(extract_banner_name("# Data+Processing"), Some(("Data+Processing".to_string(), 1)));
     }
 
     // ========================================================================
@@ -9786,15 +9794,30 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
-    fn test_banner_section_level_always_one() {
-        // Banner sections always have heading level 1
+    fn test_banner_section_heading_levels() {
+        // Level 1: single # on name line
         let code = "# ================\n# Section Name\n# ================";
         let tree = parse_r_code(code);
         let extractor = SymbolExtractor::new(code, tree.root_node());
         let symbols = extractor.extract_all();
-
         let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
         assert_eq!(section.section_level, Some(1));
+
+        // Level 2: double ## on name line
+        let code = "# ================\n## Subsection\n# ================";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+        let section = symbols.iter().find(|s| s.name == "Subsection").unwrap();
+        assert_eq!(section.section_level, Some(2));
+
+        // Level 3: triple ### on name line
+        let code = "# ================\n### Sub-subsection\n# ================";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+        let section = symbols.iter().find(|s| s.name == "Sub-subsection").unwrap();
+        assert_eq!(section.section_level, Some(3));
     }
 
     #[test]
@@ -9845,6 +9868,57 @@ result <- data %>% filter(x > 0)
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].name, "A");
         assert_eq!(sections[1].name, "B");
+    }
+
+    #[test]
+    fn test_banner_section_multi_level_hierarchy() {
+        // Banner sections with different # counts should nest correctly
+        let code = "\
+# ====\n\
+# Top Level\n\
+# ====\n\
+x <- 1\n\
+# ----\n\
+## Sub Level\n\
+# ----\n\
+y <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Verify extraction produces correct levels
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "Top Level");
+        assert_eq!(sections[0].section_level, Some(1));
+        assert_eq!(sections[1].name, "Sub Level");
+        assert_eq!(sections[1].section_level, Some(2));
+
+        // Verify hierarchy nesting
+        let mut builder = HierarchyBuilder::new(symbols, 8);
+        builder.compute_section_ranges();
+        builder.nest_in_sections();
+
+        // Root should have one section (Top Level)
+        let root_sections: Vec<_> = builder
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert_eq!(root_sections.len(), 1);
+        assert_eq!(root_sections[0].name, "Top Level");
+
+        // Sub Level should be nested inside Top Level
+        let children_sections: Vec<_> = root_sections[0]
+            .children
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert_eq!(children_sections.len(), 1);
+        assert_eq!(children_sections[0].name, "Sub Level");
     }
 
     // ========================================================================
