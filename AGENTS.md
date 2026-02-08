@@ -626,6 +626,46 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 
 Property-based tests with proptest, integration tests
 
+### AST Inspection Utility
+
+For debugging and understanding tree-sitter-r parser behavior, use the `inspect_ast()` utility in `handlers.rs`:
+
+```rust
+#[test]
+fn explore_parser_structure() {
+    inspect_ast("x <- TRUE", Some("boolean literal"));
+    inspect_ast("nums <- c(1, 2, 3)", Some("array creation"));
+}
+```
+
+**Output format:**
+```text
+=== AST for: boolean literal ===
+Code: x <- TRUE
+
+program
+  binary_operator
+    identifier "x"
+    <- "<-"
+    true "TRUE"
+```
+
+**When to use:**
+- Before implementing new symbol detection logic - verify actual node kinds
+- Debugging parser behavior - see what tree-sitter actually produces
+- Understanding complex R constructs - inspect nested node structures
+- Documenting parser behavior - capture actual AST examples
+
+**Key insight:** Never assume node kinds without verification. The utility reveals:
+- Boolean literals are `"true"/"false"` nodes, NOT `"identifier"`
+- Numeric literals like `42` are `"float"` nodes, NOT `"integer"`
+- R constants (NA, Inf, NaN) have dedicated node kinds (`"na"`, `"inf"`, `"nan"`)
+
+Run tests with `--nocapture` to see output:
+```bash
+cargo test test_inspect_ast_utility -- --nocapture
+```
+
 ## Built-in Functions
 
 `build_builtins.R` generates `src/builtins.rs` with 2,355 R functions

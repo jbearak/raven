@@ -24647,4 +24647,123 @@ result <- undefined_var
             "Default configuration should allow diagnostics to be computed"
         );
     }
+
+    // ============================================================================
+    // AST Inspection Utility
+    // ============================================================================
+    //
+    // This utility helps developers inspect the tree-sitter AST structure for R code.
+    // It was created after discovering that assumptions about node kinds were incorrect
+    // during symbol kind alignment work.
+    //
+    // Key discoveries that led to this utility:
+    // - Boolean literals (TRUE, FALSE) use "true"/"false" node kinds, NOT "identifier"
+    // - Numeric literals like 42 parse as "float", NOT "integer"
+    // - R constants (NA, Inf, NaN) have dedicated node kinds ("na", "inf", "nan")
+    //
+    // Usage in tests:
+    //   inspect_ast("x <- TRUE");
+    //   inspect_ast("nums <- c(1, 2, 3)");
+    //
+    // This prints the full AST tree with node kinds and text, making it easy to
+    // verify parser behavior without guessing.
+
+    /// Inspect and print the tree-sitter AST structure for R code.
+    ///
+    /// This utility function parses R code and prints the complete AST tree structure,
+    /// showing node kinds and text content. It's useful for:
+    /// - Understanding how tree-sitter-r represents different R constructs
+    /// - Debugging parser behavior when implementing new features
+    /// - Verifying assumptions about node kinds before writing detection logic
+    ///
+    /// # Example Output
+    ///
+    /// ```text
+    /// inspect_ast("x <- TRUE");
+    ///
+    /// Output:
+    /// === AST for: x <- TRUE ===
+    /// program
+    ///   binary_operator
+    ///     identifier "x"
+    ///     <- "<-"
+    ///     true "TRUE"
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The R code to parse and inspect
+    /// * `description` - Optional description printed in the header (defaults to the code itself)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #[test]
+    /// fn explore_parser_behavior() {
+    ///     inspect_ast("x <- 42", Some("numeric assignment"));
+    ///     inspect_ast("flag <- TRUE", Some("boolean assignment"));
+    ///     inspect_ast("data <- list(a=1)", Some("list creation"));
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    pub fn inspect_ast(code: &str, description: Option<&str>) {
+        use tree_sitter::Parser;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .expect("Failed to load R language");
+
+        let tree = parser.parse(code, None).expect("Failed to parse code");
+
+        let desc = description.unwrap_or(code);
+        eprintln!("\n=== AST for: {} ===", desc);
+        eprintln!("Code: {}", code);
+        eprintln!();
+
+        fn print_node(node: tree_sitter::Node, source: &str, depth: usize) {
+            let indent = "  ".repeat(depth);
+            let kind = node.kind();
+            let text = node.utf8_text(source.as_bytes()).unwrap_or("<error>");
+
+            // Format: indent + kind + "text" (if text differs from kind)
+            if text.trim() == kind || text.trim().is_empty() {
+                eprintln!("{}{}", indent, kind);
+            } else {
+                // Escape newlines and quotes for readability
+                let escaped_text = text.replace('\n', "\\n").replace('"', "\\\"");
+                eprintln!("{}{} \"{}\"", indent, kind, escaped_text);
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                print_node(child, source, depth + 1);
+            }
+        }
+
+        print_node(tree.root_node(), code, 0);
+        eprintln!();
+    }
+
+    #[test]
+    fn test_inspect_ast_utility() {
+        // This test demonstrates the inspect_ast utility and verifies it doesn't panic.
+        // Run with: cargo test test_inspect_ast_utility -- --nocapture
+        // to see the actual output.
+
+        inspect_ast("x <- TRUE", Some("boolean literal"));
+        inspect_ast("x <- 42", Some("numeric literal"));
+        inspect_ast("x <- \"hello\"", Some("string literal"));
+        inspect_ast("x <- NULL", Some("null literal"));
+        inspect_ast("x <- NA", Some("NA constant"));
+        inspect_ast("x <- c(1, 2, 3)", Some("array creation"));
+        inspect_ast("x <- list(a=1, b=2)", Some("list creation"));
+        inspect_ast(
+            "my_func <- function(x) { x + 1 }",
+            Some("function definition"),
+        );
+
+        // If we got here without panicking, the utility works
+        assert!(true, "inspect_ast utility executed successfully");
+    }
 }
