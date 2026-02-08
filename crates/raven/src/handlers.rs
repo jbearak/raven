@@ -4885,36 +4885,11 @@ pub fn completion_item_resolve(
         None => return item,
     };
 
-    // Check cache first
-    if let Some(cached) = help_cache.get(&topic, Some(&package)) {
-        let documentation = cached.and_then(|text| {
-            crate::help::extract_description_from_help(&text)
-        });
-        return CompletionItem {
-            documentation: documentation.map(|text| {
-                Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: text,
-                })
-            }),
-            ..item
-        };
-    }
+    // get_or_fetch handles cache check, R subprocess call, and caching the result
+    let help_text = help_cache.get_or_fetch(&topic, Some(&package));
 
-    // Fetch help text from R subprocess
-    let help_text = match crate::help::get_help(&topic, Some(&package)) {
-        Some(text) => text,
-        None => {
-            help_cache.insert(&topic, Some(&package), None);
-            return item;
-        }
-    };
-
-    // Cache the result
-    help_cache.insert(&topic, Some(&package), Some(help_text.clone()));
-
-    // Extract title + description for a concise completion documentation
-    let documentation = crate::help::extract_description_from_help(&help_text);
+    let documentation =
+        help_text.and_then(|text| crate::help::extract_description_from_help(&text));
 
     CompletionItem {
         documentation: documentation.map(|text| {
@@ -5324,6 +5299,29 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 // Hover
 // ============================================================================
 
+/// Fetches R help text with cache support, running the R subprocess on a
+/// blocking thread. Used by hover to avoid duplicating the
+/// cache-check → spawn_blocking → cache-result pattern.
+async fn get_help_cached(
+    cache: &crate::help::HelpCache,
+    topic: &str,
+    package: Option<&str>,
+) -> Option<String> {
+    // Fast path: return cached content without spawning a blocking task
+    if let Some(cached) = cache.get(topic, package) {
+        return cached;
+    }
+    // Cache miss — call R subprocess on a blocking thread.
+    // The clone shares state via Arc, so writes are visible to the original.
+    let cache = cache.clone();
+    let topic = topic.to_string();
+    let package = package.map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || cache.get_or_fetch(&topic, package.as_deref()))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Provide hover information for the symbol at a given text document position.
 ///
 /// Tries, in order:
@@ -5465,31 +5463,8 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
-                    // Try cache first, then R subprocess
-                    log::trace!(
-                        "hover: fetching R help for '{}' from package '{}'",
-                        name,
-                        pkg
-                    );
-                    let help_text = if let Some(cached) =
-                        state.help_cache.get(name, Some(pkg))
-                    {
-                        cached
-                    } else {
-                        let name_owned = name.to_string();
-                        let pkg_owned = pkg.to_string();
-                        let result =
-                            tokio::task::spawn_blocking(move || {
-                                crate::help::get_help(&name_owned, Some(&pkg_owned))
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                        state
-                            .help_cache
-                            .insert(name, Some(pkg), result.clone());
-                        result
-                    };
+                    let help_text =
+                        get_help_cached(&state.help_cache, name, Some(pkg)).await;
                     log::trace!(
                         "hover: get_help returned {:?}",
                         help_text.as_ref().map(|s| s.len())
@@ -5547,25 +5522,8 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            // Try cache first, then R subprocess
-            let help_text = if let Some(cached) =
-                state.help_cache.get(name, Some(&pkg_name))
-            {
-                cached
-            } else {
-                let name_owned = name.to_string();
-                let pkg_owned = pkg_name.to_string();
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::help::get_help(&name_owned, Some(&pkg_owned))
-                })
-                .await
-                .ok()
-                .flatten();
-                state
-                    .help_cache
-                    .insert(name, Some(&pkg_name), result.clone());
-                result
-            };
+            let help_text =
+                get_help_cached(&state.help_cache, name, Some(&pkg_name)).await;
             if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
             } else {
@@ -5584,31 +5542,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     }
 
     // Fallback to R help system for built-ins and undefined symbols
-    // Check cache first to avoid repeated R subprocess calls
-    if let Some(cached) = state.help_cache.get(name, None) {
-        if let Some(help_text) = cached {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("```\n{}\n```", help_text),
-                }),
-                range: Some(node_range),
-            });
-        }
-        // Cached as None - no help available
-        return None;
-    }
-
-    // Try to get help from R subprocess
-    let name_owned = name.to_string();
-    if let Ok(Some(help_text)) =
-        tokio::task::spawn_blocking(move || crate::help::get_help(&name_owned, None)).await
-    {
-        // Cache successful result
-        state
-            .help_cache
-            .insert(name, None, Some(help_text.clone()));
-
+    if let Some(help_text) = get_help_cached(&state.help_cache, name, None).await {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -5617,9 +5551,6 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             range: Some(node_range),
         });
     }
-
-    // Cache negative result to avoid repeated failed lookups
-    state.help_cache.insert(name, None, None);
     None
 }
 // Signature Help

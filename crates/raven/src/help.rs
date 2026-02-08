@@ -3,6 +3,7 @@
 // This module calls R as a subprocess to get help documentation.
 // It's "static" in that it doesn't embed R, but can still access help.
 
+use std::io::Read;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -13,44 +14,91 @@ use lru::LruCache;
 /// the least-recently-used entries are evicted to make room for new ones.
 const HELP_CACHE_MAX_ENTRIES: usize = 512;
 
+/// Duration after which negative cache entries (no help found) expire.
+/// Positive entries never expire since help text doesn't change during a session.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// A cached help lookup result, with a timestamp for TTL-based expiry of
+/// negative entries.
+#[derive(Clone)]
+struct CachedHelp {
+    content: Option<String>,
+    cached_at: Instant,
+}
+
 /// Bounded cache for help content. Uses LRU eviction to prevent unbounded
 /// memory growth in long-running LSP sessions.
 ///
-/// Keys use composite format: `"package::topic"` for package-qualified lookups,
-/// plain `"topic"` for unqualified lookups. This prevents collisions when
-/// different packages export the same function name (e.g., `dplyr::filter`
-/// vs `stats::filter`).
+/// Keys use composite format: `"package\0topic"` for package-qualified lookups,
+/// plain `"topic"` for unqualified lookups. The null-byte separator prevents
+/// collisions since R identifiers cannot contain null bytes.
+///
+/// Negative entries (no help found) expire after a configurable TTL so that
+/// transient R failures don't permanently suppress help lookups.
 ///
 /// Uses `peek()` for reads (no LRU promotion, works under read lock) and
 /// `push()` for writes (promotes/evicts under write lock).
 #[derive(Clone)]
 pub struct HelpCache {
-    inner: Arc<RwLock<LruCache<String, Option<String>>>>,
+    inner: Arc<RwLock<LruCache<String, CachedHelp>>>,
+    negative_ttl: Duration,
 }
 
 /// Builds a cache key from a topic and optional package.
+///
+/// Uses `\0` as separator since R identifiers cannot contain null bytes,
+/// preventing collisions between e.g. unqualified topic `"a::b"` and
+/// package `"a"` + topic `"b"`.
 fn cache_key(topic: &str, package: Option<&str>) -> String {
     match package {
-        Some(pkg) => format!("{pkg}::{topic}"),
+        Some(pkg) => format!("{pkg}\0{topic}"),
         None => topic.to_string(),
     }
 }
 
 impl HelpCache {
     pub fn new() -> Self {
-        Self::with_max_entries(HELP_CACHE_MAX_ENTRIES)
+        Self::with_config(HELP_CACHE_MAX_ENTRIES, NEGATIVE_CACHE_TTL)
     }
 
+    /// Returns cached help content, or `None` on cache miss.
+    ///
+    /// Returns `Some(None)` for a negative cache hit (topic was looked up but
+    /// had no help). Expired negative entries are treated as cache misses.
+    /// Returns `Some(Some(text))` for a positive cache hit.
     pub fn get(&self, topic: &str, package: Option<&str>) -> Option<Option<String>> {
         let key = cache_key(topic, package);
-        self.inner.read().ok()?.peek(&key).cloned()
+        let guard = self.inner.read().ok()?;
+        let entry = guard.peek(&key)?;
+        // Positive entries never expire; negative entries expire after TTL
+        if entry.content.is_none() && entry.cached_at.elapsed() > self.negative_ttl {
+            return None;
+        }
+        Some(entry.content.clone())
     }
 
     pub fn insert(&self, topic: &str, package: Option<&str>, content: Option<String>) {
         let key = cache_key(topic, package);
+        let entry = CachedHelp {
+            content,
+            cached_at: Instant::now(),
+        };
         if let Ok(mut guard) = self.inner.write() {
-            guard.push(key, content);
+            guard.push(key, entry);
         }
+    }
+
+    /// Looks up help text, using the cache to avoid redundant R subprocess calls.
+    ///
+    /// On cache hit, returns the cached content. On cache miss, calls `get_help()`
+    /// to spawn an R subprocess, caches the result (including negative), and returns it.
+    pub fn get_or_fetch(&self, topic: &str, package: Option<&str>) -> Option<String> {
+        if let Some(cached) = self.get(topic, package) {
+            return cached;
+        }
+        let result = get_help(topic, package);
+        self.insert(topic, package, result.clone());
+        result
     }
 
     #[cfg(test)]
@@ -58,11 +106,22 @@ impl HelpCache {
         self.inner.read().map(|c| c.len()).unwrap_or(0)
     }
 
-    fn with_max_entries(cap: usize) -> Self {
+    fn with_config(cap: usize, negative_ttl: Duration) -> Self {
         let cap = crate::cross_file::cache::non_zero_or(cap, HELP_CACHE_MAX_ENTRIES);
         Self {
             inner: Arc::new(RwLock::new(LruCache::new(cap))),
+            negative_ttl,
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_entries(cap: usize) -> Self {
+        Self::with_config(cap, NEGATIVE_CACHE_TTL)
+    }
+
+    #[cfg(test)]
+    fn with_max_entries_and_ttl(cap: usize, negative_ttl: Duration) -> Self {
+        Self::with_config(cap, negative_ttl)
     }
 }
 
@@ -72,10 +131,20 @@ impl Default for HelpCache {
     }
 }
 
+/// Timeout for R help subprocess calls. Prevents hung R processes from
+/// blocking threads indefinitely.
+const HELP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval when waiting for R subprocess to finish.
+const HELP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Fetches help text for an R topic by invoking R and returns the rendered help if available.
 ///
 /// Returns `Some(String)` containing the help text when R executes successfully, the output is not empty,
 /// and the output does not contain the phrase "No documentation". Returns `None` otherwise.
+///
+/// The subprocess is killed after [`HELP_TIMEOUT`] to prevent hung R processes from
+/// blocking threads indefinitely.
 ///
 /// # Examples
 ///
@@ -85,13 +154,6 @@ impl Default for HelpCache {
 ///     assert!(text.contains("Usage:"));
 /// }
 /// ```
-/// Timeout for R help subprocess calls. Prevents hung R processes from
-/// blocking threads indefinitely.
-const HELP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Poll interval when waiting for R subprocess to finish.
-const HELP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
     log::trace!("get_help: topic={}, package={:?}", topic, package);
 
@@ -122,8 +184,14 @@ cat(paste(txt, collapse = "\n"))
         cmd.arg(pkg);
     }
 
-    // Spawn as child process so we can enforce a timeout
-    let mut child = match cmd.stdout(std::process::Stdio::piped()).spawn() {
+    // Spawn as child process so we can enforce a timeout.
+    // Pipe both stdout (for help text) and stderr (to prevent it polluting
+    // the LSP server's stderr stream).
+    let mut child = match cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => {
             log::trace!("get_help: subprocess spawn error: {}", e);
@@ -135,16 +203,32 @@ cat(paste(txt, collapse = "\n"))
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Process exited — read output
-                let output = child.wait_with_output().ok()?;
+                // Process exited — read remaining pipe data directly.
+                // (Don't use wait_with_output() here: try_wait() already reaped the
+                // process, and wait_with_output() calls wait() internally which would
+                // be a redundant waitpid on an already-reaped child.)
+                let mut stdout_bytes = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_end(&mut stdout_bytes);
+                }
+                let mut stderr_bytes = Vec::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_end(&mut stderr_bytes);
+                }
                 log::trace!(
                     "get_help: exit_status={}, stdout_len={}, stderr_len={}",
                     status,
-                    output.stdout.len(),
-                    output.stderr.len()
+                    stdout_bytes.len(),
+                    stderr_bytes.len()
                 );
+                if !stderr_bytes.is_empty() {
+                    log::trace!(
+                        "get_help: stderr: {}",
+                        String::from_utf8_lossy(&stderr_bytes)
+                    );
+                }
                 if status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout).to_string();
+                    let text = String::from_utf8_lossy(&stdout_bytes).to_string();
                     if !text.trim().is_empty() && !text.contains("No documentation") {
                         return Some(text);
                     }
@@ -603,6 +687,83 @@ Arguments:
             cache2.get("filter", Some("dplyr")),
             Some(Some("dplyr help".to_string())),
             "Writes through original must be visible through clone"
+        );
+    }
+
+    #[test]
+    fn test_help_cache_negative_ttl_expiry() {
+        // Negative entries should expire after the TTL so that transient R
+        // failures (e.g., timeout, R busy) don't permanently suppress lookups.
+        let cache = HelpCache::with_max_entries_and_ttl(10, Duration::from_millis(50));
+
+        cache.insert("hung_func", Some("slow_pkg"), None);
+
+        // Immediately after insertion, negative entry should be a cache hit
+        assert_eq!(
+            cache.get("hung_func", Some("slow_pkg")),
+            Some(None),
+            "Fresh negative entry should be a cache hit"
+        );
+
+        // Wait for TTL to expire
+        std::thread::sleep(Duration::from_millis(80));
+
+        // After TTL, negative entry should be treated as a cache miss
+        assert!(
+            cache.get("hung_func", Some("slow_pkg")).is_none(),
+            "Expired negative entry should be treated as cache miss, allowing retry"
+        );
+    }
+
+    #[test]
+    fn test_help_cache_positive_entries_never_expire() {
+        // Positive entries (actual help text) should never expire — help text
+        // doesn't change during an LSP session.
+        let cache = HelpCache::with_max_entries_and_ttl(10, Duration::from_millis(50));
+
+        cache.insert("mean", Some("base"), Some("help text".to_string()));
+
+        // Wait well past the negative TTL
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Positive entry should still be a cache hit
+        assert_eq!(
+            cache.get("mean", Some("base")),
+            Some(Some("help text".to_string())),
+            "Positive cache entries must never expire"
+        );
+    }
+
+    #[test]
+    fn test_help_cache_get_or_fetch_uses_cache() {
+        // get_or_fetch should return cached content without calling get_help().
+        // We verify this by pre-populating the cache with synthetic help text
+        // that R would never produce, then checking get_or_fetch returns it.
+        let cache = HelpCache::with_max_entries(10);
+        let synthetic = "SYNTHETIC_HELP_TEXT_NOT_FROM_R";
+        cache.insert("fake_topic", Some("fake_pkg"), Some(synthetic.to_string()));
+
+        let result = cache.get_or_fetch("fake_topic", Some("fake_pkg"));
+        assert_eq!(
+            result,
+            Some(synthetic.to_string()),
+            "get_or_fetch should return cached content without spawning R"
+        );
+    }
+
+    #[test]
+    fn test_help_cache_get_or_fetch_caches_negative() {
+        // When get_help returns None (nonexistent package), get_or_fetch should
+        // cache the negative result so subsequent calls don't spawn R again.
+        let cache = HelpCache::with_max_entries(10);
+
+        let _ = cache.get_or_fetch("no_such_func", Some("nonexistent_pkg_xyzzy"));
+
+        let cached = cache.get("no_such_func", Some("nonexistent_pkg_xyzzy"));
+        assert_eq!(
+            cached,
+            Some(None),
+            "get_or_fetch should cache negative results from R subprocess"
         );
     }
 
