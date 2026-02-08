@@ -272,6 +272,46 @@ pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
 /// assert!(text.contains("Arithmetic Mean"));
 /// assert!(text.contains("arithmetic mean"));
 /// ```
+/// Converts R help text's Unicode curly quotes to markdown inline code.
+///
+/// R help uses U+2018 (') and U+2019 (') to wrap code references.
+/// This converts `'code'` patterns to `` `code` `` for markdown rendering.
+fn r_quotes_to_markdown(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{2018}' {
+            // Left curly quote — collect until matching right curly quote
+            let mut code = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == '\u{2019}' {
+                    found_close = true;
+                    break;
+                }
+                code.push(inner);
+            }
+            if found_close && !code.is_empty() {
+                result.push('`');
+                result.push_str(&code);
+                result.push('`');
+            } else {
+                // Unmatched quote — emit as-is
+                result.push('\u{2018}');
+                result.push_str(&code);
+            }
+        } else if ch == '\u{2019}' {
+            // Stray right curly quote — pass through
+            result.push(ch);
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 pub fn extract_description_from_help(help_text: &str) -> Option<String> {
     let lines: Vec<&str> = help_text.lines().collect();
     if lines.is_empty() {
@@ -308,14 +348,14 @@ pub fn extract_description_from_help(help_text: &str) -> Option<String> {
     }
 
     if desc_lines.is_empty() {
-        return Some(title.to_string());
+        return Some(r_quotes_to_markdown(title));
     }
 
     let description = desc_lines.join(" ");
     // Collapse multiple spaces from line joining
     let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    Some(format!("{title}\n\n{description}"))
+    Some(r_quotes_to_markdown(&format!("{title}\n\n{description}")))
 }
 
 #[cfg(test)]
@@ -464,22 +504,30 @@ Usage:
 
     #[test]
     fn test_extract_description_multiline() {
-        let help_text = r#"Read R Code from a File, a Connection or Expressions
-
-Description:
-
-     'source' causes R to accept its input from the named file or URL
-     or connection or expressions directly.  Input is read and 'parse'd
-     from that file until the end of the file is reached.
-
-Usage:
-
-     source(file, local = FALSE)
-"#;
+        // Use Unicode curly quotes (U+2018, U+2019) matching actual R help output
+        let help_text = "Read R Code from a File, a Connection or Expressions\n\
+            \n\
+            Description:\n\
+            \n\
+            \x20\x20\x20\x20\x20\u{2018}source\u{2019} causes R to accept its input from the named file or URL\n\
+            \x20\x20\x20\x20\x20or connection or expressions directly.  Input is read and \u{2018}parse\u{2019}d\n\
+            \x20\x20\x20\x20\x20from that file until the end of the file is reached.\n\
+            \n\
+            Usage:\n\
+            \n\
+            \x20\x20\x20\x20\x20source(file, local = FALSE)\n";
 
         let desc = extract_description_from_help(help_text).unwrap();
         assert!(desc.starts_with("Read R Code from a File"));
-        assert!(desc.contains("source"));
+        // Unicode curly quotes should be converted to markdown backticks
+        assert!(
+            desc.contains("`source`"),
+            "should convert curly quotes to backticks: {desc}"
+        );
+        assert!(
+            desc.contains("`parse`"),
+            "should convert curly quotes to backticks: {desc}"
+        );
         assert!(desc.contains("named file or URL"));
         // Should not include Usage section
         assert!(!desc.contains("local = FALSE"));
@@ -501,5 +549,41 @@ Usage:
         let help_text = "My Function\n\nDescription:\n\n";
         let desc = extract_description_from_help(help_text).unwrap();
         assert_eq!(desc, "My Function");
+    }
+
+    #[test]
+    fn test_r_quotes_to_markdown_basic() {
+        let input = "\u{2018}source\u{2019} causes R to do things";
+        let result = r_quotes_to_markdown(input);
+        assert_eq!(result, "`source` causes R to do things");
+    }
+
+    #[test]
+    fn test_r_quotes_to_markdown_multiple() {
+        let input = "\u{2018}foo\u{2019} and \u{2018}bar\u{2019}";
+        let result = r_quotes_to_markdown(input);
+        assert_eq!(result, "`foo` and `bar`");
+    }
+
+    #[test]
+    fn test_r_quotes_to_markdown_with_parens() {
+        let input = "\u{2018}withAutoprint(exprs)\u{2019} is a wrapper";
+        let result = r_quotes_to_markdown(input);
+        assert_eq!(result, "`withAutoprint(exprs)` is a wrapper");
+    }
+
+    #[test]
+    fn test_r_quotes_to_markdown_no_quotes() {
+        let input = "No special quotes here";
+        let result = r_quotes_to_markdown(input);
+        assert_eq!(result, "No special quotes here");
+    }
+
+    #[test]
+    fn test_r_quotes_to_markdown_unmatched() {
+        // Unmatched left quote should be preserved
+        let input = "text \u{2018}unmatched";
+        let result = r_quotes_to_markdown(input);
+        assert_eq!(result, "text \u{2018}unmatched");
     }
 }

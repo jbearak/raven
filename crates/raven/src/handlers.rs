@@ -4893,7 +4893,7 @@ pub fn completion_item_resolve(item: CompletionItem) -> CompletionItem {
     CompletionItem {
         documentation: documentation.map(|text| {
             Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::PlainText,
+                kind: MarkupKind::Markdown,
                 value: text,
             })
         }),
