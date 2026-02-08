@@ -248,6 +248,76 @@ pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
     extract_signature_from_help(&help_text)
 }
 
+/// Extracts the title and description from R help text for use in completion documentation.
+///
+/// Returns a formatted string with the title (first line) and the "Description:" section content.
+/// Stops at the next section header (e.g., "Usage:", "Arguments:").
+///
+/// # Examples
+///
+/// ```
+/// let help = r#"Arithmetic Mean
+///
+/// Description:
+///
+///      Generic function for the (trimmed) arithmetic mean.
+///
+/// Usage:
+///      mean(x, ...)
+/// "#;
+///
+/// let desc = rlsp::help::extract_description_from_help(help);
+/// assert!(desc.is_some());
+/// let text = desc.unwrap();
+/// assert!(text.contains("Arithmetic Mean"));
+/// assert!(text.contains("arithmetic mean"));
+/// ```
+pub fn extract_description_from_help(help_text: &str) -> Option<String> {
+    let lines: Vec<&str> = help_text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // First non-empty line is the title
+    let title = lines.iter().find(|l| !l.trim().is_empty())?.trim();
+
+    // Find the "Description:" section
+    let desc_idx = lines
+        .iter()
+        .position(|line| line.trim() == "Description:")?;
+
+    // Collect lines after "Description:" until we hit another section header
+    let mut desc_lines: Vec<&str> = Vec::new();
+    for line in lines.iter().skip(desc_idx + 1) {
+        let trimmed = line.trim();
+
+        // Stop at the next section header (non-empty, ends with ':', no parens)
+        if !trimmed.is_empty() && trimmed.ends_with(':') && !trimmed.contains('(') {
+            break;
+        }
+
+        desc_lines.push(trimmed);
+    }
+
+    // Trim leading/trailing empty lines
+    while desc_lines.first() == Some(&"") {
+        desc_lines.remove(0);
+    }
+    while desc_lines.last() == Some(&"") {
+        desc_lines.pop();
+    }
+
+    if desc_lines.is_empty() {
+        return Some(title.to_string());
+    }
+
+    let description = desc_lines.join(" ");
+    // Collapse multiple spaces from line joining
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    Some(format!("{title}\n\n{description}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +440,66 @@ Arguments:
         cache.insert("a".to_string(), Some("updated".to_string()));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get("a"), Some(Some("updated".to_string())));
+    }
+
+    #[test]
+    fn test_extract_description_basic() {
+        let help_text = r#"Arithmetic Mean
+
+Description:
+
+     Generic function for the (trimmed) arithmetic mean.
+
+Usage:
+
+     mean(x, ...)
+"#;
+
+        let desc = extract_description_from_help(help_text);
+        assert!(desc.is_some());
+        let text = desc.unwrap();
+        assert!(text.starts_with("Arithmetic Mean"));
+        assert!(text.contains("arithmetic mean"));
+    }
+
+    #[test]
+    fn test_extract_description_multiline() {
+        let help_text = r#"Read R Code from a File, a Connection or Expressions
+
+Description:
+
+     'source' causes R to accept its input from the named file or URL
+     or connection or expressions directly.  Input is read and 'parse'd
+     from that file until the end of the file is reached.
+
+Usage:
+
+     source(file, local = FALSE)
+"#;
+
+        let desc = extract_description_from_help(help_text).unwrap();
+        assert!(desc.starts_with("Read R Code from a File"));
+        assert!(desc.contains("source"));
+        assert!(desc.contains("named file or URL"));
+        // Should not include Usage section
+        assert!(!desc.contains("local = FALSE"));
+    }
+
+    #[test]
+    fn test_extract_description_no_description_section() {
+        let help_text = "Some Title\n\nUsage:\n    foo(x)\n";
+        assert!(extract_description_from_help(help_text).is_none());
+    }
+
+    #[test]
+    fn test_extract_description_empty() {
+        assert!(extract_description_from_help("").is_none());
+    }
+
+    #[test]
+    fn test_extract_description_title_only() {
+        let help_text = "My Function\n\nDescription:\n\n";
+        let desc = extract_description_from_help(help_text).unwrap();
+        assert_eq!(desc, "My Function");
     }
 }

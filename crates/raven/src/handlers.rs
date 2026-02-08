@@ -4734,6 +4734,11 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
                     kind: Some(CompletionItemKind::FUNCTION),
                     detail: Some(format!("{{{}}}", package_name)),
                     sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
+                    // Store topic and package for completionItem/resolve documentation lookup
+                    data: Some(serde_json::json!({
+                        "topic": export_name,
+                        "package": package_name,
+                    })),
                     ..Default::default()
                 });
             }
@@ -4848,6 +4853,51 @@ fn collect_document_completions(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_document_completions(child, text, items, seen);
+    }
+}
+
+// ============================================================================
+// Completion Item Resolve
+// ============================================================================
+
+/// Resolves additional details for a completion item (completionItem/resolve).
+///
+/// For package exports, fetches R help documentation and populates the
+/// `documentation` field with the function title and description.
+pub fn completion_item_resolve(item: CompletionItem) -> CompletionItem {
+    // Only resolve items with data containing topic and package
+    let data = match &item.data {
+        Some(data) => data,
+        None => return item,
+    };
+
+    let topic = match data.get("topic").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return item,
+    };
+
+    let package = match data.get("package").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return item,
+    };
+
+    // Fetch help text from R subprocess
+    let help_text = match crate::help::get_help(&topic, Some(&package)) {
+        Some(text) => text,
+        None => return item,
+    };
+
+    // Extract title + description for a concise completion documentation
+    let documentation = crate::help::extract_description_from_help(&help_text);
+
+    CompletionItem {
+        documentation: documentation.map(|text| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: text,
+            })
+        }),
+        ..item
     }
 }
 

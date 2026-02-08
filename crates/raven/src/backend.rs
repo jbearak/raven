@@ -632,6 +632,7 @@ impl LanguageServer for Backend {
                         String::from("/"),  // File path navigation
                         String::from("\""), // String literal start for source() calls
                     ]),
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -2570,6 +2571,14 @@ impl LanguageServer for Backend {
             &params.text_document_position.text_document.uri,
             params.text_document_position.position,
         ))
+    }
+
+    async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        // Run in spawn_blocking since get_help() calls R subprocess (blocking I/O)
+        match tokio::task::spawn_blocking(move || handlers::completion_item_resolve(item)).await {
+            Ok(resolved) => Ok(resolved),
+            Err(_) => Err(tower_lsp::jsonrpc::Error::internal_error()),
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
