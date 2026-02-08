@@ -39,4 +39,4 @@ This pushes snippet completions below LSP completions, so Raven's results (with 
 
 ## More Information
 
-See the [main repository README](https://github.com/jbearak/Raven) for full documentation including installation, cross-file directives, and configuration details.
+See the [main repository README](https://github.com/jbearak/raven) for full documentation including installation, cross-file directives, and configuration details.

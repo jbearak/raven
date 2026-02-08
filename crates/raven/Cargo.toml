@@ -33,6 +33,7 @@ ropey = "1.6"
 lru = "0.16"
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 xdg = "2.5.2"
 
 [dev-dependencies]

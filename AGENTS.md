@@ -632,9 +632,15 @@ For debugging and understanding tree-sitter-r parser behavior, use the `inspect_
 
 ```rust
 #[test]
-fn explore_parser_structure() {
+fn test_inspect_ast_utility() {
     inspect_ast("x <- TRUE", Some("boolean literal"));
-    inspect_ast("nums <- c(1, 2, 3)", Some("array creation"));
+    inspect_ast("x <- 42", Some("numeric literal"));
+    inspect_ast("x <- \"hello\"", Some("string literal"));
+    inspect_ast("x <- NULL", Some("null literal"));
+    inspect_ast("x <- NA", Some("NA constant"));
+    inspect_ast("x <- c(1, 2, 3)", Some("array creation"));
+    inspect_ast("x <- list(a=1, b=2)", Some("list creation"));
+    inspect_ast("my_func <- function(x) { x + 1 }", Some("function definition"));
 }
 ```
 

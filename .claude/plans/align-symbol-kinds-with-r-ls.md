@@ -124,7 +124,7 @@ Raven uses:
 - `"from {path}"` for cross-file symbols (shows full file path)
 - `"{package}"` for package symbols ✓
 
-**Decision:** Keep Raven's current approach (`"from {path}"`). Showing the actual file path and line number is more informative than a generic `"[workspace]"` label, especially in cross-file aware workflows where understanding symbol provenance matters.
+**Decision:** Keep Raven's current approach (`"from {path}"`). Showing the actual file path and line number is more informative than a generic `"[workspace]"` label, especially in cross-file-aware workflows where understanding symbol provenance matters.
 
 ### 4. Missing Sort Order Control
 
@@ -262,12 +262,10 @@ Add analysis of assigned values to determine specific types matching R-LS behavi
 
    a. **Boolean literals:**
    ```rust
-   // Detect TRUE, FALSE in right-hand side of assignment
-   if right_node.kind() == "identifier" {
-       let text = right_node.utf8_text(source.as_bytes()).unwrap_or("");
-       if text == "TRUE" || text == "FALSE" {
-           kind = DocumentSymbolKind::Boolean;
-       }
+   // Detect TRUE, FALSE in right-hand side of assignment.
+   // Note: tree-sitter-r uses "true"/"false" node kinds, NOT "identifier".
+   if matches!(right_node.kind(), "true" | "false") {
+       kind = DocumentSymbolKind::Boolean;
    }
    ```
 
@@ -280,6 +278,8 @@ Add analysis of assigned values to determine specific types matching R-LS behavi
 
    c. **Numeric literals:**
    ```rust
+   // Note: tree-sitter-r uses "float" for plain numbers like 42,
+   // "integer" for explicit integer literals like 42L.
    if matches!(right_node.kind(), "integer" | "float" | "complex") {
        kind = DocumentSymbolKind::Number;
    }

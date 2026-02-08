@@ -813,12 +813,18 @@ impl PackageLibrary {
         // Track per-package exports for completion attribution (e.g., {base}, {utils})
         let mut all_base_exports = HashSet::new();
         let mut per_package_exports: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut per_package_depends: HashMap<String, Vec<String>> = HashMap::new();
         let mut pattern_packages: Vec<String> = Vec::new();
 
         for package in &base_packages_list {
             if let Some(pkg_dir) = self.find_package_directory(package) {
                 if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
                     let pkg_exports = per_package_exports.entry(package.clone()).or_default();
+                    // Preserve depends from DESCRIPTION for transitive dependency resolution
+                    if !parse_result.depends.is_empty() {
+                        per_package_depends
+                            .insert(package.clone(), parse_result.depends.clone());
+                    }
                     // Add explicit exports
                     for export in &parse_result.explicit_exports {
                         all_base_exports.insert(export.clone());
@@ -873,9 +879,11 @@ impl PackageLibrary {
 
         // Step 5: Store per-package exports in the packages cache for completion attribution
         // This allows get_exports_for_completions() to find base packages with correct
-        // package names (e.g., {base}, {utils}, {stats})
+        // package names (e.g., {base}, {utils}, {stats}).
+        // Preserve depends so get_all_exports() can follow transitive dependencies.
         for (pkg_name, exports) in per_package_exports {
-            let info = PackageInfo::new(pkg_name.clone(), exports);
+            let depends = per_package_depends.remove(&pkg_name).unwrap_or_default();
+            let info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
             self.insert_package(info).await;
         }
 

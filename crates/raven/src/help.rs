@@ -156,8 +156,32 @@ impl Default for HelpCache {
 /// blocking threads indefinitely.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Poll interval when waiting for R subprocess to finish.
-const HELP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Kill a process by PID. Used by the help subprocess watchdog on timeout.
+///
+/// On Unix, sends SIGKILL directly. On Windows, delegates to `taskkill /F`.
+/// If the process has already exited, the call is harmless on all platforms.
+#[cfg(unix)]
+fn kill_process_by_pid(pid: u32) {
+    // SAFETY: Sending SIGKILL to a known child PID. If the process already
+    // exited, kill() returns ESRCH harmlessly.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_by_pid(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_process_by_pid(_pid: u32) {
+    log::trace!("get_help: timeout kill not supported on this platform");
+}
 
 /// Fetches help text for an R topic by invoking R and returns the rendered help if available.
 ///
@@ -220,64 +244,82 @@ cat(paste(txt, collapse = "\n"))
         }
     };
 
-    let deadline = Instant::now() + HELP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — read remaining pipe data directly.
-                // (Don't use wait_with_output() here: try_wait() already reaped the
-                // process, and wait_with_output() calls wait() internally which would
-                // be a redundant waitpid on an already-reaped child.)
-                let mut stdout_bytes = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    if let Err(e) = pipe.read_to_end(&mut stdout_bytes) {
-                        log::trace!("get_help: failed to read stdout pipe: {}", e);
-                    }
-                }
-                let mut stderr_bytes = Vec::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    if let Err(e) = pipe.read_to_end(&mut stderr_bytes) {
-                        log::trace!("get_help: failed to read stderr pipe: {}", e);
-                    }
-                }
+    let child_pid = child.id();
+
+    // Take pipe handles before spawning threads. Reading pipes in separate
+    // threads prevents deadlock when pipe buffers fill before the child exits.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            if let Err(e) = pipe.read_to_end(&mut buf) {
+                log::trace!("get_help: failed to read stdout pipe: {}", e);
+            }
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            if let Err(e) = pipe.read_to_end(&mut buf) {
+                log::trace!("get_help: failed to read stderr pipe: {}", e);
+            }
+        }
+        buf
+    });
+
+    // Watchdog thread: kills the subprocess after HELP_TIMEOUT if it hasn't
+    // exited. An atomic flag prevents killing a recycled PID after the child
+    // has already exited naturally.
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited_clone = exited.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(HELP_TIMEOUT);
+        if !exited_clone.load(std::sync::atomic::Ordering::SeqCst) {
+            log::trace!(
+                "get_help: timeout after {:?}, killing pid {}",
+                HELP_TIMEOUT,
+                child_pid
+            );
+            kill_process_by_pid(child_pid);
+        }
+    });
+
+    // Block efficiently via waitpid() instead of polling with try_wait()+sleep().
+    let wait_result = child.wait();
+    exited.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
+    match wait_result {
+        Ok(status) => {
+            log::trace!(
+                "get_help: exit_status={}, stdout_len={}, stderr_len={}",
+                status,
+                stdout_bytes.len(),
+                stderr_bytes.len()
+            );
+            if !stderr_bytes.is_empty() {
                 log::trace!(
-                    "get_help: exit_status={}, stdout_len={}, stderr_len={}",
-                    status,
-                    stdout_bytes.len(),
-                    stderr_bytes.len()
+                    "get_help: stderr: {}",
+                    String::from_utf8_lossy(&stderr_bytes)
                 );
-                if !stderr_bytes.is_empty() {
-                    log::trace!(
-                        "get_help: stderr: {}",
-                        String::from_utf8_lossy(&stderr_bytes)
-                    );
-                }
-                if status.success() {
-                    let text = String::from_utf8_lossy(&stdout_bytes).to_string();
-                    if !text.trim().is_empty() && !text.contains("No documentation") {
-                        return Some(text);
-                    }
-                    log::trace!("get_help: empty or no documentation");
-                }
-                return None;
             }
-            Ok(None) => {
-                // Still running — check timeout
-                if Instant::now() >= deadline {
-                    log::trace!(
-                        "get_help: timeout after {:?}, killing subprocess",
-                        HELP_TIMEOUT
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap zombie
-                    return None;
+            if status.success() {
+                let text = String::from_utf8_lossy(&stdout_bytes).to_string();
+                if !text.trim().is_empty() && !text.contains("No documentation") {
+                    return Some(text);
                 }
-                std::thread::sleep(HELP_POLL_INTERVAL);
+                log::trace!("get_help: empty or no documentation");
             }
-            Err(e) => {
-                log::trace!("get_help: try_wait error: {}", e);
-                return None;
-            }
+            None
+        }
+        Err(e) => {
+            log::trace!("get_help: wait error: {}", e);
+            None
         }
     }
 }
@@ -500,12 +542,12 @@ pub fn extract_description_from_help(help_text: &str) -> Option<String> {
     }
 
     // Trim leading/trailing empty lines
-    while desc_lines.first() == Some(&"") {
-        desc_lines.remove(0);
-    }
-    while desc_lines.last() == Some(&"") {
-        desc_lines.pop();
-    }
+    let start = desc_lines.iter().position(|l| !l.is_empty()).unwrap_or(desc_lines.len());
+    let end = desc_lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(start, |i| i + 1);
+    let desc_lines = &desc_lines[start..end];
 
     if desc_lines.is_empty() {
         return Some(r_quotes_to_markdown(title));
