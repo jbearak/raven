@@ -154,22 +154,26 @@ pub struct ParameterResolver<'a> {
 }
 
 impl<'a> ParameterResolver<'a> {
-    /// Resolve parameters for a function.
+    /// Resolve parameters for a function (synchronous, may block).
+    ///
     /// Resolution order:
-    /// 1. Cache lookup
-    /// 2. User-defined (current file AST, then cross-file scope)
-    /// 3. Package function (namespace-qualified or guess_package + R subprocess)
-    pub async fn resolve(
-        &self,
-        function_name: &str,
-        namespace: Option<&str>,
-        current_uri: &Url,
-        position: Position,
-    ) -> Option<FunctionSignature>;
-
-    /// Synchronous resolve for use in completion handler.
-    /// Returns cached result or triggers async fetch for next request.
-    pub fn resolve_sync(
+    /// 1. Cache lookup (instant)
+    /// 2. User-defined: current file AST, then cross-file scope (instant)
+    /// 3. Package: namespace-qualified or guess_package + R subprocess (blocks)
+    ///
+    /// For package functions on cache miss, this calls R subprocess via
+    /// `get_function_formals()` with a short timeout (5 seconds). The first
+    /// request for a given package function may take up to the timeout
+    /// duration; subsequent requests are instant via cache.
+    ///
+    /// **Threading model**: The backend's `completion()` async wrapper runs
+    /// parameter resolution inside `tokio::task::spawn_blocking` to prevent
+    /// R subprocess calls from blocking the async runtime. Standard completion
+    /// collection (keywords, symbols, etc.) runs first under the WorldState
+    /// read lock, then parameter resolution runs in `spawn_blocking` with
+    /// cloned `SignatureCache` and `PackageLibrary` Arc references. This
+    /// follows the same pattern used by `completion_resolve()` in backend.rs.
+    pub fn resolve(
         &self,
         function_name: &str,
         namespace: Option<&str>,
@@ -190,6 +194,21 @@ impl<'a> ParameterResolver<'a> {
 2. **Local AST**: Search current file for function definition, extract params from `formal_parameters` node
 3. **Cross-file**: Use cross-file scope to find function in sourced files
 4. **Package**: If namespace is provided (`dplyr::filter`), query `formals(dplyr::filter)` directly. Otherwise, use the scope resolver's position-aware package list (the same `loaded_packages` + `inherited_packages` used by the completion handler) to determine which packages are in scope at the cursor position, then check which of those packages exports the function. This ensures that when multiple packages export the same name, the one actually loaded at the cursor's position wins — not a global "most recently loaded" heuristic.
+
+**Package resolution example** — ambiguous function names:
+```r
+library(stats)      # line 1: stats::filter (time series)
+x <- filter(data, ) # line 2: cursor here → uses stats::filter
+library(dplyr)      # line 3: dplyr::filter (data frame subsetting)
+y <- filter(df, )   # line 4: cursor here → uses dplyr::filter
+```
+At line 2, `loaded_packages` = `[stats]` at this position, so `filter` resolves to `stats::filter`. At line 4, `loaded_packages` = `[stats, dplyr]`, and since `dplyr` loads after `stats`, it masks `stats::filter`, so `filter` resolves to `dplyr::filter`.
+
+**Edge cases**:
+- **No loaded package exports the function**: Fall back to cross-file scope and user-defined function resolution. If no match, return no parameter completions (standard completions still appear).
+- **Function name exists in multiple loaded packages**: The last `library()` call before the cursor position wins (R's masking semantics). This is already handled by the scope resolver's position-aware package list.
+
+**Performance**: Resolution checks only `loaded_packages` + `inherited_packages` at the cursor position (typically 5-15 packages), not all installed packages. Package export lookups use the pre-loaded `PackageLibrary` cache, so no R subprocess is needed for the lookup itself — only `formals()` requires R subprocess on cache miss.
 
 ### 3. R Subprocess Extensions
 
@@ -220,6 +239,8 @@ tryCatch({
   }
 }, error = function(e) cat("__RLSP_ERROR__:", conditionMessage(e), sep = ""))
 ```
+
+**Output parsing convention**: Each line is `name\tdefault\n`. An empty string after the tab (i.e., `name\t\n`) means the parameter has no default value — the parser should treat this as `default_value = None`, not as an empty-string default.
 
 ### 4. Roxygen Comment Extraction (Shared Utility)
 
@@ -282,17 +303,25 @@ For user-defined function name completions (no `param_name`):
 }
 ```
 
-The resolve handler:
+**Resolve handler dispatch order** (in `completion_item_resolve()`):
 
-**For parameter completions** (has `param_name` in data):
-1. For package functions: fetch R help text via `help_cache.get_or_fetch()`, then extract the `@param` description for that parameter name.
-2. For user-defined functions: use `uri` and `func_line` to locate the function definition, call `extract_roxygen_block()`, then `get_param_doc()`.
-3. If no documentation found, return the item unchanged.
+The resolve handler inspects the `data` field of the completion item to determine which resolution path to use. Dispatch proceeds in this order:
 
-**For function name completions** (has `func_line` but no `param_name`):
-1. For package functions: existing resolve logic (already works via `help_cache`).
-2. For user-defined functions: use `uri` and `func_line`, call `extract_roxygen_block()`, then `get_function_doc()` to get the title/description.
-3. If no documentation found, return the item unchanged.
+1. **Parameter completion** (has `param_name` in data):
+   - For package functions (has `package`): fetch R help text via `help_cache.get_or_fetch()`, then extract the `@param` description for that parameter name.
+   - For user-defined functions (has `uri` + `func_line`): locate the function definition, call `extract_roxygen_block()`, then `get_param_doc()`.
+   - If no documentation found, return the item unchanged.
+
+2. **User-defined function name completion** (has `func_line` but no `param_name`):
+   - Use `uri` and `func_line`, call `extract_roxygen_block()`, then `get_function_doc()` to get the title/description.
+   - If no roxygen block found, return the item unchanged.
+
+3. **Package export completion** (has `topic` and `package`, no `param_name`):
+   - Existing resolve logic (unchanged) — fetches R help via `help_cache`.
+
+4. **No recognized data**: Return the item unchanged.
+
+Note: The new `package` key in parameter completion data (step 1) has a different semantic from the existing `package` key in package export data (step 3). They are disambiguated by the presence of `param_name`.
 
 ```rust
 /// Extract @param description for a specific parameter from R help text
@@ -343,7 +372,9 @@ fn get_parameter_completions(
     position: Position,
 ) -> Vec<CompletionItem> {
     let resolver = ParameterResolver::new(state, &state.signature_cache);
-    let signature = match resolver.resolve_sync(function_name, namespace, uri, position) {
+    // resolve() is synchronous: instant for user-defined (AST), may block
+    // briefly for package functions (R subprocess with 5s timeout on cache miss)
+    let signature = match resolver.resolve(function_name, namespace, uri, position) {
         Some(sig) => sig,
         None => return Vec::new(),
     };
@@ -353,6 +384,9 @@ fn get_parameter_completions(
         .filter(|p| !existing_params.contains(&p.name))  // Exclude already-specified
         .map(|p| {
             let detail = p.default_value.as_ref().map(|d| format!("= {}", d));
+            // Note: filter_text is intentionally omitted. The LSP spec says
+            // "when falsy the label is used" for filtering, and label alone
+            // (the parameter name) is sufficient for client-side prefix matching.
             CompletionItem {
                 label: p.name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
@@ -370,6 +404,15 @@ fn get_parameter_completions(
         .collect()
 }
 ```
+
+**Backend threading model**: The `completion()` async wrapper in `backend.rs` must use `tokio::task::spawn_blocking` to wrap the parameter resolution path, since `resolve()` may block on R subprocess. The pattern is:
+
+1. Acquire WorldState read lock, collect standard completions and detect function call context (fast, non-blocking)
+2. Release the read lock
+3. If function call context detected, clone `SignatureCache` and `PackageLibrary` `Arc` references, then run `get_parameter_completions()` inside `spawn_blocking`
+4. Merge parameter items into the completion list and return
+
+This follows the same pattern already used by `completion_resolve()` in `backend.rs`, which clones `help_cache` Arc and runs the sync handler inside `spawn_blocking`.
 
 **User-defined function name completions**: The existing `collect_document_completions` and cross-file symbol completions should be extended to include `data` with `uri` and `func_line` for function symbols, so that `completionItem/resolve` can locate the roxygen block. This applies to items with `CompletionItemKind::FUNCTION` that come from the current file or cross-file scope (not package exports, which already have resolve data).
 
@@ -389,9 +432,12 @@ User functions:    "file:///path/to/file.R#my_func"
 "0-" — function parameters (highest priority, new)
 "1-" — local scope definitions
 "2-" — cross-file workspace symbols
+"3-" — (reserved, unused)
 "4-" — package exports
 "5-" — keywords / constants (lowest priority)
 ```
+
+Note: `"3-"` is intentionally unused (reserved for future use). This gap is consistent with the existing codebase sort prefix constants in `handlers.rs`.
 
 ### Cache Configuration
 
@@ -401,6 +447,8 @@ User functions:    "file:///path/to/file.R#my_func"
 | `SignatureCache` (user) | `LruCache<String, FunctionSignature>` | 200 | LRU |
 
 All caches use `RwLock` with `peek()` for reads (no LRU promotion under read lock) and `push()` for writes, consistent with existing Raven cache patterns.
+
+**`invalidate_file()` implementation note**: The user-defined signature cache keys are strings like `"file:///path/to/file.R#my_func"`. To invalidate all entries for a given URI, the implementation must iterate the LRU cache and collect keys matching the URI prefix, then remove them. This is O(n) in cache size but acceptable given the small capacity (200 entries). An alternative is a secondary index (`HashMap<Url, Vec<String>>`) mapping URIs to cache keys for O(1) invalidation, but this adds complexity that is not warranted at the default capacity.
 
 
 ## Correctness Properties
@@ -489,7 +537,7 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 
 ### R Subprocess Failures
 
-1. **Timeout**: If R subprocess query exceeds the configured timeout (30s default), return `Err` and log at trace level. The completion handler returns standard completions without parameters.
+1. **Timeout**: If R subprocess query exceeds the configured timeout (30s default for general queries, 5s for completion-path `formals()` queries), return `Err` and log at **warn** level with the timeout duration and function name. Timeouts indicate a potentially serious issue (hung R process, expensive query, or configuration problem) and warrant operator visibility. The completion handler returns standard completions without parameters.
 2. **Invalid Output**: If R output cannot be parsed (missing tab separators, unexpected format), return empty parameter list.
 3. **Package Not Found**: If package doesn't exist, return empty parameter list.
 4. **Function Not Found**: If function doesn't exist in package, return empty parameter list.
@@ -499,6 +547,8 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 1. **Malformed Code**: If tree-sitter cannot parse, fall back to standard completions (no function call context detected).
 2. **Missing Nodes**: If expected AST nodes are missing (e.g., no `formal_parameters` child), return empty parameter list.
 3. **Invalid Position**: If cursor position is outside document bounds, return None.
+
+Note: Non-timeout errors in AST parsing and cache operations are logged at trace level per Requirement 11.3, since these are expected edge cases rather than operational issues.
 
 ### Cache Failures
 
@@ -510,6 +560,18 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 1. **No Help Text**: If R help text is unavailable for a package function, return the completion item without documentation.
 2. **No Roxygen**: If user-defined function has no roxygen comments, return the completion item without documentation.
 3. **Param Not Found**: If `@param` for the specific parameter name is not found in the help text, return the completion item without documentation.
+
+## Out of Scope
+
+The following are explicitly excluded from this spec and may be addressed in follow-up work:
+
+1. **Pipe operator argument exclusion**: R's pipe operators (`|>` and `%>%`) supply the first argument implicitly (e.g., `df |> filter(col > 5)` pipes `df` as `.data`). This spec does not exclude the piped-in parameter from completions. The official R-LS does not handle this either.
+
+2. **Anonymous and lambda function calls**: Parameter completions do not fire for calls to anonymous functions (`(function(x, y) x + y)(1, )`) or R 4.1+ lambda syntax (`(\(x, y) x + y)(1, )`). The context detector only handles identifier and namespace-qualified callees.
+
+3. **Dollar-sign completions**: `list$` and `dataframe$` member completions are deferred to a separate follow-up spec.
+
+4. **Cross-session cache persistence**: Requirement 9.3 has been deferred (see requirements.md). The signature cache is in-memory only and rebuilt each session.
 
 ## Testing Strategy
 

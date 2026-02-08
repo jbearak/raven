@@ -33,9 +33,9 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Define `FunctionSignature`, `ParameterInfo`, `SignatureSource` structs
     - Define `SignatureCache` with `RwLock<LruCache>` for package and user signatures (use `peek()` for reads, `push()` for writes)
     - Implement `extract_from_ast()`: extract params from `formal_parameters` tree-sitter node, including default values and `...` detection
-    - Implement `resolve_sync()` with resolution priority: cache → local AST → cross-file scope → package
+    - Implement `resolve()` (synchronous, may block for package functions) with resolution priority: cache → local AST → cross-file scope → package (R subprocess with 5s timeout on cache miss)
     - Add `pub mod parameter_resolver;` to `lib.rs`
-    - _Requirements: 4.1, 4.2, 4.3, 4.4, 8.1, 8.4_
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 9.1, 9.4_
 
   - [ ]* 3.2 Write property test for parameter extraction round-trip
     - **Property 3: Parameter Extraction Round-Trip**
@@ -51,8 +51,8 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Parse output into `Vec<ParameterInfo>` (name, default_value, is_dots)
     - Validate function and package names against `[a-zA-Z0-9._]` to prevent injection
     - Handle `__RLSP_ERROR__` marker in output
-    - Wrap with timeout (reuse existing `execute_r_code_with_timeout`)
-    - _Requirements: 9.1, 9.2, 9.3, 9.4_
+    - Wrap with timeout (reuse existing `execute_r_code_with_timeout`; use 5s timeout for completion-path queries, log timeouts at warn level)
+    - _Requirements: 10.1, 10.2, 10.3, 10.4_
 
   - [ ]* 4.2 Write property test for R subprocess input validation
     - **Property 10: R Subprocess Input Validation**
@@ -65,13 +65,14 @@ This implementation adds function parameter completions to Raven's LSP. When the
   - [ ] 6.1 Add `SignatureCache` to `WorldState` and initialize in `WorldState::new()`
     - Add `signature_cache: Arc<SignatureCache>` field to `WorldState`
     - Initialize with default capacities (500 package, 200 user)
-    - _Requirements: 8.1_
+    - _Requirements: 9.1_
 
-  - [ ] 6.2 Modify `completion()` function in `handlers.rs` to support mixed completions
+  - [ ] 6.2 Modify `completion()` function in `handlers.rs` and `backend.rs` to support mixed completions
     - Add `SORT_PREFIX_PARAM: &str = "0-"` constant
     - After building standard completions, call `detect_function_call_context()`
     - If inside function call, call `get_parameter_completions()` and prepend results
-    - Implement `get_parameter_completions()`: resolve signature, filter dots and already-specified params, format items with `CompletionItemKind::FIELD`, `insert_text = "name = "`, `sort_text = "0-name"`, and `data` field for resolve
+    - Implement `get_parameter_completions()`: call `resolver.resolve()` (synchronous, may block for package functions), filter dots and already-specified params, format items with `CompletionItemKind::FIELD`, `insert_text = "name = "`, `sort_text = "0-name"`, and `data` field for resolve
+    - Update backend.rs `completion()` async wrapper to use `spawn_blocking` for the parameter resolution path: collect standard completions + detect context under read lock (fast), release lock, then run parameter resolution in `spawn_blocking` with cloned Arc references
     - Standard completions remain unchanged (keywords, document symbols, package exports, cross-file symbols)
     - _Requirements: 5.1, 5.2, 5.3, 5.5, 5.6, 6.1, 6.2, 6.3, 6.4_
 
@@ -112,7 +113,13 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - **Validates: Requirements 8.1, 8.2, 8.3**
 
 - [ ] 9. Implement documentation on resolve (parameters and functions)
-  - [ ] 9.1 Extend `completion_item_resolve()` in `handlers.rs` for parameter documentation
+  - [ ] 9.1 Add `data` field to user-defined function completion items
+    - Extend `collect_document_completions` to include `uri` and definition line in `data` for function items
+    - Extend cross-file function completion items similarly
+    - This must be done first since 9.2 and 9.3 depend on this data being present
+    - _Requirements: 8.1_
+
+  - [ ] 9.2 Extend `completion_item_resolve()` in `handlers.rs` for parameter documentation
     - Check for `param_name` in completion item's `data` field
     - For package functions: use `help_cache.get_or_fetch()` to get R help text, then extract `@param` description
     - For user-defined functions: use `uri` and `func_line` from data, call `extract_roxygen_block()`, then `get_param_doc()`
@@ -120,16 +127,11 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Return item unchanged if no documentation found
     - _Requirements: 7.1, 7.2, 7.3, 7.4_
 
-  - [ ] 9.2 Extend `completion_item_resolve()` for user-defined function name documentation
+  - [ ] 9.3 Extend `completion_item_resolve()` for user-defined function name documentation
     - Check for `func_line` without `param_name` in data (indicates function name completion)
     - Use `uri` and `func_line`, call `extract_roxygen_block()`, then `get_function_doc()`
     - Return item unchanged if no roxygen block found
     - _Requirements: 8.1, 8.2, 8.3, 8.4_
-
-  - [ ] 9.3 Add `data` field to user-defined function completion items
-    - Extend `collect_document_completions` to include `uri` and definition line in `data` for function items
-    - Extend cross-file function completion items similarly
-    - _Requirements: 8.1_
 
   - [ ]* 9.4 Write property test for parameter documentation extraction
     - **Property 11: Parameter Documentation Extraction**
@@ -138,7 +140,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
 - [ ] 10. Implement cache invalidation
   - [ ] 10.1 Invalidate user-defined function signatures on file change
     - Hook into `did_change` handler to call `signature_cache.invalidate_file(uri)`
-    - Clear all user signatures keyed to the changed file URI
+    - Clear all user signatures keyed to the changed file URI (O(n) scan over LRU, acceptable at 200 capacity)
     - _Requirements: 9.2_
 
   - [ ]* 10.2 Write property test for cache invalidation
@@ -149,7 +151,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
   - [ ] 11.1 Handle R subprocess unavailability and unknown functions
     - When R subprocess fails or times out, fall back to AST-based extraction for user-defined functions
     - When function signature cannot be determined at all, return standard completions without parameter suggestions
-    - Log errors at trace level
+    - Log R subprocess timeouts at warn level; log other errors at trace level
     - _Requirements: 11.1, 11.2, 11.3_
 
 - [ ] 12. Final checkpoint - Ensure all tests pass

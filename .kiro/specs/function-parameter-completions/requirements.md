@@ -118,7 +118,7 @@ This feature adds function parameter completions to Raven (an R language server)
 
 1. THE Parameter_Resolver SHALL store cached signatures in a thread-safe data structure
 2. THE Parameter_Resolver SHALL invalidate user-defined function signatures when the defining file changes
-3. THE Parameter_Resolver SHALL persist package function signatures across LSP sessions where possible
+3. ~~THE Parameter_Resolver SHALL persist package function signatures across LSP sessions where possible~~ **(Deferred)**: Cross-session persistence adds significant complexity (disk serialization, versioning, cache invalidation across R upgrades). The in-memory LRU cache provides sufficient performance since package `formals()` queries are fast (~100-300ms) and cached for the session duration. May revisit if profiling shows repeated cold-start latency is a problem.
 4. WHEN cache memory exceeds a configurable threshold, THE Parameter_Resolver SHALL evict least-recently-used entries
 
 ### Requirement 10: R Subprocess Query Interface
@@ -140,4 +140,14 @@ This feature adds function parameter completions to Raven (an R language server)
 
 1. IF R subprocess is unavailable, THEN THE Completion_Handler SHALL fall back to AST-based parameter extraction where possible
 2. IF function signature cannot be determined, THEN THE Completion_Handler SHALL return standard completions without parameter suggestions
-3. THE Completion_Handler SHALL log errors at trace level without displaying error messages to the user
+3. THE Completion_Handler SHALL log errors at trace level without displaying error messages to the user (except R subprocess timeouts, which SHALL be logged at warn level for operator visibility)
+
+## Out of Scope
+
+The following are explicitly excluded from this spec:
+
+1. **Pipe operator argument exclusion**: R's pipe operators (`|>` and `%>%`) implicitly supply the first argument. This spec does not detect or exclude the piped-in parameter from completions. The official R language server does not handle this either.
+
+2. **Anonymous and lambda function calls**: Parameter completions are not provided for calls to anonymous functions (`(function(x, y) x + y)(1, )`) or R 4.1+ lambda syntax (`(\(x, y) x + y)(1, )`). Only identifier and namespace-qualified callees are supported.
+
+3. **Dollar-sign completions**: `list$` and `dataframe$` member completions are deferred to a separate follow-up spec.
