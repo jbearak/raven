@@ -7294,6 +7294,162 @@ x <- "#;
     }
 
     // ========================================================================
+    // Package export completion data field and resolve tests
+    // ========================================================================
+
+    /// Test that package export completion items include data field for resolve.
+    #[test]
+    fn test_completion_package_exports_have_data_field() {
+        use crate::package_library::PackageInfo;
+        use crate::state::WorldState;
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let mut exports = std::collections::HashSet::new();
+            exports.insert("my_func".to_string());
+            let pkg_info = PackageInfo::new("testpkg".to_string(), exports);
+            state.package_library.insert_package(pkg_info).await;
+
+            let code = "library(testpkg)\nx <- ";
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = crate::state::Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(1, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                let my_func = items.iter().find(|i| i.label == "my_func");
+                assert!(my_func.is_some(), "Should find my_func in completions");
+
+                let item = my_func.unwrap();
+                assert!(item.data.is_some(), "Package export should have data field");
+
+                let data = item.data.as_ref().unwrap();
+                assert_eq!(
+                    data.get("topic").and_then(|v| v.as_str()),
+                    Some("my_func"),
+                    "data.topic should be the export name"
+                );
+                assert_eq!(
+                    data.get("package").and_then(|v| v.as_str()),
+                    Some("testpkg"),
+                    "data.package should be the package name"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that completion_item_resolve passes through items without data.
+    #[test]
+    fn test_completion_resolve_no_data_passthrough() {
+        let item = CompletionItem {
+            label: "local_var".to_string(),
+            kind: Some(CompletionItemKind::FIELD),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item.clone());
+        assert_eq!(resolved.label, "local_var");
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not add documentation to items without data"
+        );
+    }
+
+    /// Test that completion_item_resolve passes through items with unrecognized data.
+    #[test]
+    fn test_completion_resolve_unrecognized_data_passthrough() {
+        let item = CompletionItem {
+            label: "something".to_string(),
+            data: Some(serde_json::json!({"unrelated": "value"})),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item);
+        assert_eq!(resolved.label, "something");
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not add documentation for unrecognized data"
+        );
+    }
+
+    /// Test that base package exports have correct package attribution in completions.
+    #[test]
+    fn test_completion_base_package_attribution() {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Build a PackageLibrary with base packages set, then wrap in Arc
+            let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+            let mut base_pkgs = std::collections::HashSet::new();
+            base_pkgs.insert("base".to_string());
+            base_pkgs.insert("utils".to_string());
+            pkg_lib.set_base_packages(base_pkgs);
+            state.package_library = std::sync::Arc::new(pkg_lib);
+
+            // Insert per-package exports (uses interior mutability, works through Arc)
+            let mut base_exports = std::collections::HashSet::new();
+            base_exports.insert("source".to_string());
+            base_exports.insert("cat".to_string());
+            let base_info = PackageInfo::new("base".to_string(), base_exports);
+            state.package_library.insert_package(base_info).await;
+
+            let mut utils_exports = std::collections::HashSet::new();
+            utils_exports.insert("read.csv".to_string());
+            let utils_info = PackageInfo::new("utils".to_string(), utils_exports);
+            state.package_library.insert_package(utils_info).await;
+
+            state.package_library_ready = true;
+
+            // Create a document with no library() calls - base exports should still appear
+            let code = "x <- ";
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(0, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // "source" should appear with {base} attribution
+                let source_item = items
+                    .iter()
+                    .find(|i| i.label == "source")
+                    .expect("Should find 'source' in completions");
+                assert_eq!(source_item.detail.as_deref(), Some("{base}"));
+                assert!(
+                    source_item.data.is_some(),
+                    "source should have data for resolve"
+                );
+
+                // "read.csv" should appear with {utils} attribution
+                let read_csv = items
+                    .iter()
+                    .find(|i| i.label == "read.csv")
+                    .expect("Should find 'read.csv' in completions");
+                assert_eq!(read_csv.detail.as_deref(), Some("{utils}"));
+                assert!(
+                    read_csv.data.is_some(),
+                    "read.csv should have data for resolve"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    // ========================================================================
     // Backward Directive Path Resolution Tests
     // Tests for fix-backward-directive-path-resolution spec
     // Validates: Requirements 1.2, 3.2
