@@ -64,21 +64,38 @@ impl HelpCache {
     /// Returns cached help content, or `None` on cache miss.
     ///
     /// Returns `Some(None)` for a negative cache hit (topic was looked up but
-    /// had no help). Expired negative entries are treated as cache misses.
-    /// Returns `Some(Some(text))` for a positive cache hit.
+    /// had no help). Expired negative entries are evicted and treated as cache
+    /// misses. Returns `Some(Some(text))` for a positive cache hit.
     pub fn get(&self, topic: &str, package: Option<&str>) -> Option<Option<String>> {
         let key = cache_key(topic, package);
-        let guard = self.inner.read().ok()?;
-        let entry = guard.peek(&key)?;
-        // Positive entries never expire; negative entries expire after TTL.
-        // Note: expired entries are not eagerly removed here — we only hold a read
-        // lock and eviction requires a write lock. The stale entry lingers until
-        // overwritten by a subsequent insert() or evicted by normal LRU pressure.
-        // With 512 slots and infrequent help lookups this is a negligible cost.
-        if entry.content.is_none() && entry.cached_at.elapsed() > self.negative_ttl {
-            return None;
+
+        // Check under read lock (concurrent reads allowed)
+        {
+            let guard = self.inner.read().ok()?;
+            let entry = guard.peek(&key)?;
+            if entry.content.is_some() {
+                return Some(entry.content.clone());
+            }
+            // Negative entry — return if still fresh
+            if entry.cached_at.elapsed() <= self.negative_ttl {
+                return Some(None);
+            }
+            // Expired — drop read lock, fall through to evict
         }
-        Some(entry.content.clone())
+
+        // Evict the expired entry under a write lock so it doesn't waste a slot
+        if let Ok(mut guard) = self.inner.write() {
+            // Re-check: another thread may have refreshed or removed it
+            let still_expired = guard
+                .peek(&key)
+                .map(|e| e.content.is_none() && e.cached_at.elapsed() > self.negative_ttl)
+                .unwrap_or(false);
+            if still_expired {
+                guard.pop(&key);
+            }
+        }
+
+        None
     }
 
     pub fn insert(&self, topic: &str, package: Option<&str>, content: Option<String>) {
@@ -705,6 +722,7 @@ Arguments:
         let cache = HelpCache::with_max_entries_and_ttl(10, Duration::from_millis(50));
 
         cache.insert("hung_func", Some("slow_pkg"), None);
+        assert_eq!(cache.len(), 1);
 
         // Immediately after insertion, negative entry should be a cache hit
         assert_eq!(
@@ -720,6 +738,14 @@ Arguments:
         assert!(
             cache.get("hung_func", Some("slow_pkg")).is_none(),
             "Expired negative entry should be treated as cache miss, allowing retry"
+        );
+
+        // The expired entry should have been evicted from the LRU map, not just
+        // hidden — it should not waste a cache slot
+        assert_eq!(
+            cache.len(),
+            0,
+            "Expired negative entry should be evicted from the cache, not left as a stale slot"
         );
     }
 
