@@ -9,7 +9,8 @@ Key design decisions informed by research on the official R language server (lan
 - **Mixed completions**: Parameters are ADDED to standard completions, not replacing them. This matches R-LS behavior where `filter(df, ` shows both `filter`'s params AND local variables needed as argument values.
 - **AST-based context detection**: Raven uses tree-sitter for context detection (more robust than R-LS's character-level backward scanning).
 - **Dots exclusion**: `...` is excluded from parameter completions (R-LS includes it, but excluding is better UX).
-- **Sort prefix `"0-"`**: Parameters sort before all other completion types, matching R-LS's `"0-"` prefix convention.
+- **Sort prefix `0-` with index**: Parameters sort before all other completion types. Within parameters, they sort by definition order (e.g., `0-001`, `0-002`) rather than alphabetically, to match R-LS behavior and user expectation.
+- **`options()` support**: Special handling for `base::options()` to suggest global option names (e.g., `width`, `digits`) as parameters.
 - **`CompletionItemKind::FIELD`**: Chosen over R-LS's `Variable` kind because FIELD better communicates "named parameter of a function" semantically.
 - **Parameter documentation on resolve**: `completionItem/resolve` lazily loads `@param` descriptions from R help docs or roxygen comments.
 
@@ -68,6 +69,8 @@ pub struct FunctionCallContext {
     pub function_name: String,
     /// Optional namespace qualifier (e.g., "dplyr" in dplyr::filter)
     pub namespace: Option<String>,
+    /// Whether the call uses internal access (:::)
+    pub is_internal: bool,
     /// Parameters already specified as named arguments in the call
     pub existing_params: Vec<String>,
 }
@@ -98,7 +101,7 @@ fn extract_existing_parameters(call_node: Node, text: &str) -> Vec<String>;
 2. Walk up ancestors looking for `call` nodes
 3. Verify cursor is inside the argument list (between `(` and `)`)
 4. For nested calls: the innermost `call` ancestor wins
-5. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node
+5. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node. Detect if operator is `::` or `:::` and set `is_internal` accordingly.
 6. Skip if cursor is inside a `string` node (no parameter completions inside string literals)
 
 ### 2. Parameter Resolver
@@ -177,6 +180,7 @@ impl<'a> ParameterResolver<'a> {
         &self,
         function_name: &str,
         namespace: Option<&str>,
+        is_internal: bool,
         current_uri: &Url,
         position: Position,
     ) -> Option<FunctionSignature>;
@@ -217,12 +221,13 @@ Extensions to `crates/raven/src/r_subprocess.rs`:
 ```rust
 impl RSubprocess {
     /// Query function parameters using formals().
-    /// For package functions: formals(pkg::func)
+    /// For package functions: formals(pkg::func) or formals(pkg:::func)
     /// For unqualified functions: formals(func)
     pub async fn get_function_formals(
         &self,
         function_name: &str,
         package: Option<&str>,
+        exported_only: bool,
     ) -> Result<Vec<ParameterInfo>>;
 }
 ```
@@ -230,7 +235,12 @@ impl RSubprocess {
 R code for querying formals (tab-separated output, one param per line):
 ```r
 tryCatch({
-  f <- formals(pkg::func)
+  # Use ::: if not exported_only, otherwise ::
+  # If package is NULL, use direct name
+  f <- if (is.null(pkg_name)) formals(func_name)
+       else if (exported_only) formals(getExportedValue(pkg_name, func_name))
+       else formals(get(func_name, envir = asNamespace(pkg_name)))
+  
   if (is.null(f)) cat("")
   else for (name in names(f)) {
     default <- if (is.symbol(f[[name]]) && nchar(as.character(f[[name]])) == 0) ""
@@ -355,7 +365,7 @@ pub fn completion(
     if let Some(ctx) = call_context {
         let param_items = get_parameter_completions(
             state, uri, &ctx.function_name, ctx.namespace.as_deref(),
-            &ctx.existing_params, position,
+            ctx.is_internal, &ctx.existing_params, position,
         );
         items.splice(0..0, param_items);
     }
@@ -368,31 +378,42 @@ fn get_parameter_completions(
     uri: &Url,
     function_name: &str,
     namespace: Option<&str>,
+    is_internal: bool,
     existing_params: &[String],
     position: Position,
 ) -> Vec<CompletionItem> {
     let resolver = ParameterResolver::new(state, &state.signature_cache);
     // resolve() is synchronous: instant for user-defined (AST), may block
     // briefly for package functions (R subprocess with 5s timeout on cache miss)
-    let signature = match resolver.resolve(function_name, namespace, uri, position) {
+    let signature = match resolver.resolve(function_name, namespace, is_internal, uri, position) {
         Some(sig) => sig,
         None => return Vec::new(),
     };
+    
+    // Special handling for base::options()
+    let mut parameters = signature.parameters;
+    if function_name == "options" && (namespace.is_none() || namespace == Some("base")) {
+        // In a real implementation we might query names(.Options) from R
+        // For now, we assume RSubprocess returns them if we requested them special-case
+        // OR we can append them here if we have a list.
+        // Given the spec requirement is to match R-LS, and R-LS appends them in `arg_completion`.
+        // We will leave this implementation detail to the coder but note it in the design.
+    }
 
-    signature.parameters.iter()
-        .filter(|p| !p.is_dots)                          // Exclude ...
-        .filter(|p| !existing_params.contains(&p.name))  // Exclude already-specified
-        .map(|p| {
+    parameters.iter()
+        .enumerate() // Capture index for stable sorting
+        .filter(|(_, p)| !p.is_dots)                          // Exclude ...
+        .filter(|(_, p)| !existing_params.contains(&p.name))  // Exclude already-specified
+        .map(|(idx, p)| {
             let detail = p.default_value.as_ref().map(|d| format!("= {}", d));
-            // Note: filter_text is intentionally omitted. The LSP spec says
-            // "when falsy the label is used" for filtering, and label alone
-            // (the parameter name) is sufficient for client-side prefix matching.
+            // Note: filter_text is intentionally omitted.
             CompletionItem {
                 label: p.name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
                 detail,
                 insert_text: Some(format!("{} = ", p.name)),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_PARAM, p.name)),
+                // Sort by index (0-001, 0-002) to preserve definition order
+                sort_text: Some(format!("{}{:03}", SORT_PREFIX_PARAM, idx)),
                 data: Some(serde_json::json!({
                     "param_name": p.name,
                     "function_name": function_name,
@@ -487,7 +508,7 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 
 ### Property 6: Parameter Completion Formatting
 
-*For any* parameter completion item, the item SHALL have `kind = CompletionItemKind::FIELD`, `insert_text` ending with ` = `, and `sort_text` starting with `"0-"`.
+*For any* parameter completion item, the item SHALL have `kind = CompletionItemKind::FIELD`, `insert_text` ending with ` = `, and `sort_text` starting with `0-` followed by digits.
 
 **Validates: Requirements 5.1, 5.3, 5.6**
 

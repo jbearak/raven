@@ -8,10 +8,10 @@ This implementation adds function parameter completions to Raven's LSP. When the
 
 - [ ] 1. Create completion context detection module
   - [ ] 1.1 Create `crates/raven/src/completion_context.rs` with `FunctionCallContext` struct and `detect_function_call_context()` function
-    - Define `FunctionCallContext` with `function_name: String`, `namespace: Option<String>`, `existing_params: Vec<String>` fields
+    - Define `FunctionCallContext` with `function_name: String`, `namespace: Option<String>`, `is_internal: bool`, `existing_params: Vec<String>` fields
     - Implement `detect_function_call_context(tree, text, position) -> Option<FunctionCallContext>` using tree-sitter AST walk
     - Implement `find_enclosing_function_call()`: find node at cursor position, walk up ancestors looking for `call` nodes, return innermost match
-    - Handle namespace-qualified calls: extract namespace and function name from `namespace_operator` nodes (e.g., `dplyr::filter`)
+    - Handle namespace-qualified calls: extract namespace and function name from `namespace_operator` nodes. Check operator text: `::` -> `is_internal = false`, `:::` -> `is_internal = true`
     - Implement `extract_existing_parameters()`: scan argument nodes for `name = value` patterns, return list of already-specified parameter names
     - Return `None` if cursor is inside a `string` node or outside all function call parentheses
     - Add `mod completion_context;` to `main.rs`
@@ -37,8 +37,8 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Implement `SignatureCache::new()`, `get_package()`, `get_user()` (use `peek()` for reads), `insert_package()`, `insert_user()` (use `push()` for writes)
     - Implement `SignatureCache::invalidate_file(uri)`: iterate user LRU cache, collect keys matching URI prefix, remove them
     - Implement `ParameterResolver::extract_from_ast()`: extract params from `formal_parameters` tree-sitter node, detect `...` via `dots` node kind, extract default values from `default_parameter` nodes
-    - Implement `ParameterResolver::resolve()` with resolution priority: cache → local AST → cross-file scope → package (R subprocess with 5s timeout on cache miss)
-    - For package resolution: use scope resolver's position-aware `loaded_packages` + `inherited_packages` to determine which package exports the function at cursor position (R masking semantics: last `library()` call wins)
+    - Implement `ParameterResolver::resolve(..., is_internal: bool)` with resolution priority: cache → local AST → cross-file scope → package (R subprocess with 5s timeout on cache miss)
+    - For package resolution: use scope resolver's position-aware `loaded_packages` + `inherited_packages` to determine which package exports the function at cursor position. If `is_internal` is true, pass `exported_only = false` to R query.
     - Add `mod parameter_resolver;` to `main.rs`
     - _Requirements: 2.1, 2.5, 3.1, 3.2, 3.3, 3.4, 4.1, 4.2, 4.3, 4.4, 9.1, 9.4_
 
@@ -54,8 +54,8 @@ This implementation adds function parameter completions to Raven's LSP. When the
 
 - [ ] 4. Extend R subprocess for function formals queries
   - [ ] 4.1 Add `get_function_formals()` method to `RSubprocess` in `crates/raven/src/r_subprocess.rs`
-    - Implement `get_function_formals(function_name, package: Option<&str>) -> Result<Vec<ParameterInfo>>`
-    - Generate R code: `tryCatch({ f <- formals(pkg::func); ... cat(name, "\t", default, "\n") ... }, error = ...)`
+    - Implement `get_function_formals(function_name, package: Option<&str>, exported_only: bool) -> Result<Vec<ParameterInfo>>`
+    - Generate R code: `tryCatch({ f <- if (exported_only) formals(pkg::func) else formals(pkg:::func); ... }, error = ...)`
     - Parse tab-separated output: each line is `name\tdefault\n`; empty string after tab means `default_value = None`
     - Validate function and package names against `[a-zA-Z0-9._]` regex to prevent R code injection (reject names with other characters)
     - Handle `__RLSP_ERROR__` marker in output
@@ -80,14 +80,18 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Add `const SORT_PREFIX_PARAM: &str = "0-";` constant alongside existing sort prefix constants
     - After building standard completions, call `detect_function_call_context(tree, &text, position)`
     - If inside function call, call `get_parameter_completions()` and prepend parameter items to the completion list
-    - Implement `get_parameter_completions()`: call `resolver.resolve()`, filter out `is_dots` params and already-specified params, format each as `CompletionItem` with `kind = FIELD`, `insert_text = "name = "`, `sort_text = "0-name"`, `detail = "= default"` (if default exists), and `data` JSON with `param_name`, `function_name`, `package`/`uri`+`func_line`
+    - Implement `get_parameter_completions()`: 
+      - Call `resolver.resolve()`
+      - Handle `base::options()` special case: if function is `options` and package is `base` (or inferred as base), add `names(.Options)` to parameter list
+      - Filter out `is_dots` params and already-specified params
+      - Format each as `CompletionItem` with `kind = FIELD`, `insert_text = "name = "`, `sort_text = "0-{index}-name"` (preserving definition order), `detail = "= default"` (if default exists), and `data` JSON with `param_name`, `function_name`, `package`/`uri`+`func_line`
     - Update `backend.rs` `completion()` async wrapper: collect standard completions + detect context under WorldState read lock (fast), release lock, then run parameter resolution in `tokio::task::spawn_blocking` with cloned `Arc<SignatureCache>` and `Arc<PackageLibrary>` references
     - Standard completions remain unchanged when not in function call context
-    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.1, 6.2, 6.3, 6.4_
+    - _Requirements: 2.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.1, 6.2, 6.3, 6.4_
 
   - [ ]* 6.3 Write property test for parameter completion formatting
     - **Property 6: Parameter Completion Formatting**
-    - For any parameter completion item, verify `kind = FIELD`, `insert_text` ends with ` = `, and `sort_text` starts with `"0-"`
+    - For any parameter completion item, verify `kind = FIELD`, `insert_text` ends with ` = `, and `sort_text` starts with `0-` followed by digits
     - **Validates: Requirements 5.1, 5.3, 5.6**
 
   - [ ]* 6.4 Write property test for already-specified parameter exclusion

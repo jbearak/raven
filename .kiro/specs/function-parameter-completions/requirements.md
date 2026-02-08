@@ -40,6 +40,7 @@ This feature adds function parameter completions to Raven (an R language server)
 3. WHEN a parameter has a default value, THE Completion_Handler SHALL include the default value in the completion detail
 4. IF R subprocess is unavailable, THEN THE Parameter_Resolver SHALL return an empty parameter list gracefully
 5. THE Parameter_Resolver SHALL cache function signatures to avoid repeated R subprocess queries
+6. WHEN the function is `options()` (in package `base`), THE Completion_Handler SHALL include `names(.Options)` (global option names) in the completion list, matching the behavior of the official R language server
 
 ### Requirement 3: Package Function Parameter Completions
 
@@ -48,9 +49,10 @@ This feature adds function parameter completions to Raven (an R language server)
 #### Acceptance Criteria
 
 1. WHEN the cursor is inside a call to a function from a loaded package, THE Parameter_Resolver SHALL resolve the function's package and query its parameters
-2. WHEN using namespace-qualified calls (e.g., `dplyr::filter(`), THE Parameter_Resolver SHALL query parameters for the specified package's function directly
-3. WHEN multiple packages export the same function name, THE Parameter_Resolver SHALL use the scope resolver to determine which package's function is in scope at the cursor position (based on which `library()` calls precede the cursor in the current file and its sourced dependencies)
-4. THE Parameter_Resolver SHALL cache package function signatures per package to minimize R subprocess queries
+2. WHEN using namespace-qualified calls (e.g., `dplyr::filter(` or `stats:::filter(`), THE Parameter_Resolver SHALL query parameters for the specified package's function directly
+3. WHEN using the triple-colon operator (`:::`), THE Parameter_Resolver SHALL attempt to query formals for internal/non-exported functions
+4. WHEN multiple packages export the same function name, THE Parameter_Resolver SHALL use the scope resolver to determine which package's function is in scope at the cursor position (based on which `library()` calls precede the cursor in the current file and its sourced dependencies)
+5. THE Parameter_Resolver SHALL cache package function signatures per package to minimize R subprocess queries
 
 ### Requirement 4: User-Defined Function Parameter Completions
 
@@ -74,7 +76,7 @@ This feature adds function parameter completions to Raven (an R language server)
 3. WHEN inserting a parameter completion, THE Completion_Handler SHALL append an equals sign followed by a space (`= `) after the parameter name
 4. THE Completion_Handler SHALL filter parameter completions based on the user's typed prefix
 5. THE Completion_Handler SHALL exclude parameters that have already been specified in the current function call
-6. THE Completion_Handler SHALL assign parameter completions a sort prefix of `"0-"` so they appear before all other completion types in the list
+6. THE Completion_Handler SHALL assign parameter completions a sort prefix of `0-{index}-` (e.g., `0-001-`, `0-002-`) corresponding to their definition order, ensuring they appear before all other completion types AND preserve their original order in the function signature
 
 ### Requirement 6: Mixed Completions in Function Call Context
 
