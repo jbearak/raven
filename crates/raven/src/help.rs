@@ -70,7 +70,11 @@ impl HelpCache {
         let key = cache_key(topic, package);
         let guard = self.inner.read().ok()?;
         let entry = guard.peek(&key)?;
-        // Positive entries never expire; negative entries expire after TTL
+        // Positive entries never expire; negative entries expire after TTL.
+        // Note: expired entries are not eagerly removed here — we only hold a read
+        // lock and eviction requires a write lock. The stale entry lingers until
+        // overwritten by a subsequent insert() or evicted by normal LRU pressure.
+        // With 512 slots and infrequent help lookups this is a negligible cost.
         if entry.content.is_none() && entry.cached_at.elapsed() > self.negative_ttl {
             return None;
         }
@@ -209,11 +213,15 @@ cat(paste(txt, collapse = "\n"))
                 // be a redundant waitpid on an already-reaped child.)
                 let mut stdout_bytes = Vec::new();
                 if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_end(&mut stdout_bytes);
+                    if let Err(e) = pipe.read_to_end(&mut stdout_bytes) {
+                        log::trace!("get_help: failed to read stdout pipe: {}", e);
+                    }
                 }
                 let mut stderr_bytes = Vec::new();
                 if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_end(&mut stderr_bytes);
+                    if let Err(e) = pipe.read_to_end(&mut stderr_bytes) {
+                        log::trace!("get_help: failed to read stderr pipe: {}", e);
+                    }
                 }
                 log::trace!(
                     "get_help: exit_status={}, stdout_len={}, stderr_len={}",
@@ -764,6 +772,43 @@ Arguments:
             cached,
             Some(None),
             "get_or_fetch should cache negative results from R subprocess"
+        );
+    }
+
+    #[test]
+    fn test_help_cache_negative_ttl_refresh_end_to_end() {
+        // End-to-end test: a negative entry expires after TTL, and a subsequent
+        // get_or_fetch() re-populates the cache (rather than returning stale data
+        // or permanently treating the topic as missing).
+        let cache = HelpCache::with_max_entries_and_ttl(10, Duration::from_millis(50));
+
+        // Simulate a failed lookup by inserting a negative entry directly
+        cache.insert("some_func", Some("nonexistent_pkg_xyzzy"), None);
+        assert_eq!(
+            cache.get("some_func", Some("nonexistent_pkg_xyzzy")),
+            Some(None),
+            "Fresh negative entry should be a cache hit"
+        );
+
+        // Wait for the TTL to expire
+        std::thread::sleep(Duration::from_millis(80));
+
+        // get() should now treat the expired entry as a cache miss
+        assert!(
+            cache.get("some_func", Some("nonexistent_pkg_xyzzy")).is_none(),
+            "Expired negative entry should be a cache miss"
+        );
+
+        // get_or_fetch() should re-fetch from R (which will fail again for this
+        // fake package) and re-populate the cache with a fresh negative entry
+        let result = cache.get_or_fetch("some_func", Some("nonexistent_pkg_xyzzy"));
+        assert!(result.is_none(), "R should still not find this fake package");
+
+        // The cache should now have a fresh negative entry (not expired)
+        assert_eq!(
+            cache.get("some_func", Some("nonexistent_pkg_xyzzy")),
+            Some(None),
+            "get_or_fetch should have re-cached a fresh negative entry after TTL expiry"
         );
     }
 
