@@ -4864,7 +4864,11 @@ fn collect_document_completions(
 ///
 /// For package exports, fetches R help documentation and populates the
 /// `documentation` field with the function title and description.
-pub fn completion_item_resolve(item: CompletionItem) -> CompletionItem {
+/// Uses the shared `HelpCache` to avoid redundant R subprocess calls.
+pub fn completion_item_resolve(
+    item: CompletionItem,
+    help_cache: &crate::help::HelpCache,
+) -> CompletionItem {
     // Only resolve items with data containing topic and package
     let data = match &item.data {
         Some(data) => data,
@@ -4881,11 +4885,33 @@ pub fn completion_item_resolve(item: CompletionItem) -> CompletionItem {
         None => return item,
     };
 
+    // Check cache first
+    if let Some(cached) = help_cache.get(&topic, Some(&package)) {
+        let documentation = cached.and_then(|text| {
+            crate::help::extract_description_from_help(&text)
+        });
+        return CompletionItem {
+            documentation: documentation.map(|text| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: text,
+                })
+            }),
+            ..item
+        };
+    }
+
     // Fetch help text from R subprocess
     let help_text = match crate::help::get_help(&topic, Some(&package)) {
         Some(text) => text,
-        None => return item,
+        None => {
+            help_cache.insert(&topic, Some(&package), None);
+            return item;
+        }
     };
+
+    // Cache the result
+    help_cache.insert(&topic, Some(&package), Some(help_text.clone()));
 
     // Extract title + description for a concise completion documentation
     let documentation = crate::help::extract_description_from_help(&help_text);
@@ -5439,33 +5465,37 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
-                    // Try to get full help documentation from R
+                    // Try cache first, then R subprocess
                     log::trace!(
                         "hover: fetching R help for '{}' from package '{}'",
                         name,
                         pkg
                     );
-                    let name_owned = name.to_string();
-                    let pkg_owned = pkg.to_string();
-                    if let Ok(help_result) = tokio::task::spawn_blocking(move || {
-                        crate::help::get_help(&name_owned, Some(&pkg_owned))
-                    })
-                    .await
+                    let help_text = if let Some(cached) =
+                        state.help_cache.get(name, Some(pkg))
                     {
-                        log::trace!(
-                            "hover: get_help returned {:?}",
-                            help_result.as_ref().map(|s| s.len())
-                        );
-                        if let Some(help_text) = help_result {
-                            // Show full R documentation
-                            value.push_str(&format!("```\n{}\n```", help_text));
-                        } else if let Some(sig) = &symbol.signature {
-                            value.push_str(&format!("```r\n{}\n```\n", sig));
-                            value.push_str(&format!("\nfrom {{{}}}", pkg));
-                        } else {
-                            value.push_str(&format!("```r\n{}\n```\n", name));
-                            value.push_str(&format!("\nfrom {{{}}}", pkg));
-                        }
+                        cached
+                    } else {
+                        let name_owned = name.to_string();
+                        let pkg_owned = pkg.to_string();
+                        let result =
+                            tokio::task::spawn_blocking(move || {
+                                crate::help::get_help(&name_owned, Some(&pkg_owned))
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                        state
+                            .help_cache
+                            .insert(name, Some(pkg), result.clone());
+                        result
+                    };
+                    log::trace!(
+                        "hover: get_help returned {:?}",
+                        help_text.as_ref().map(|s| s.len())
+                    );
+                    if let Some(help_text) = help_text {
+                        value.push_str(&format!("```\n{}\n```", help_text));
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
                         value.push_str(&format!("\nfrom {{{}}}", pkg));
@@ -5517,15 +5547,26 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            // Try to get full help documentation from R
-            let name_owned = name.to_string();
-            let pkg_owned = pkg_name.to_string();
-            if let Ok(Some(help_text)) = tokio::task::spawn_blocking(move || {
-                crate::help::get_help(&name_owned, Some(&pkg_owned))
-            })
-            .await
+            // Try cache first, then R subprocess
+            let help_text = if let Some(cached) =
+                state.help_cache.get(name, Some(&pkg_name))
             {
-                // Show full R documentation
+                cached
+            } else {
+                let name_owned = name.to_string();
+                let pkg_owned = pkg_name.to_string();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::help::get_help(&name_owned, Some(&pkg_owned))
+                })
+                .await
+                .ok()
+                .flatten();
+                state
+                    .help_cache
+                    .insert(name, Some(&pkg_name), result.clone());
+                result
+            };
+            if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
@@ -5544,7 +5585,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 
     // Fallback to R help system for built-ins and undefined symbols
     // Check cache first to avoid repeated R subprocess calls
-    if let Some(cached) = state.help_cache.get(name) {
+    if let Some(cached) = state.help_cache.get(name, None) {
         if let Some(help_text) = cached {
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -5566,7 +5607,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         // Cache successful result
         state
             .help_cache
-            .insert(name.to_string(), Some(help_text.clone()));
+            .insert(name, None, Some(help_text.clone()));
 
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -5578,7 +5619,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     }
 
     // Cache negative result to avoid repeated failed lookups
-    state.help_cache.insert(name.to_string(), None);
+    state.help_cache.insert(name, None, None);
     None
 }
 // Signature Help
@@ -7354,7 +7395,8 @@ x <- "#;
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item.clone());
+        let cache = crate::help::HelpCache::new();
+        let resolved = super::completion_item_resolve(item.clone(), &cache);
         assert_eq!(resolved.label, "local_var");
         assert!(
             resolved.documentation.is_none(),
@@ -7371,11 +7413,177 @@ x <- "#;
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item);
+        let cache = crate::help::HelpCache::new();
+        let resolved = super::completion_item_resolve(item, &cache);
         assert_eq!(resolved.label, "something");
         assert!(
             resolved.documentation.is_none(),
             "Should not add documentation for unrecognized data"
+        );
+    }
+
+    /// Test that completion_item_resolve returns documentation from a pre-populated
+    /// cache without calling R subprocess. This verifies the cache-first architecture:
+    /// if help text is already cached, no R process should be spawned.
+    #[test]
+    fn test_completion_resolve_returns_cached_help() {
+        let cache = crate::help::HelpCache::new();
+
+        // Pre-populate cache with realistic R help text
+        let help_text = "Arithmetic Mean\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20Generic function for the (trimmed) arithmetic mean.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20mean(x, ...)\n";
+        cache.insert("mean", Some("base"), Some(help_text.to_string()));
+
+        let item = CompletionItem {
+            label: "mean".to_string(),
+            data: Some(serde_json::json!({"topic": "mean", "package": "base"})),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache);
+
+        // Should have documentation populated from the cached help text
+        let doc = resolved.documentation.expect("Should have documentation from cache");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert!(
+                    content.value.contains("Arithmetic Mean"),
+                    "Documentation should contain the title from cached help: {}",
+                    content.value
+                );
+                assert!(
+                    content.value.contains("arithmetic mean"),
+                    "Documentation should contain the description from cached help: {}",
+                    content.value
+                );
+            }
+            _ => panic!("Expected MarkupContent documentation"),
+        }
+    }
+
+    /// Test that completion_item_resolve caches a negative result when R subprocess
+    /// returns no help. On subsequent calls for the same (topic, package), the cache
+    /// should prevent another R subprocess spawn.
+    #[test]
+    fn test_completion_resolve_caches_negative_on_miss() {
+        let cache = crate::help::HelpCache::new();
+
+        // Use a fake package name that R won't have help for
+        let item = CompletionItem {
+            label: "no_such_func".to_string(),
+            data: Some(serde_json::json!({
+                "topic": "no_such_func",
+                "package": "nonexistent_pkg_xyzzy"
+            })),
+            ..Default::default()
+        };
+
+        // First call — R subprocess will fail (no such package), should cache None
+        let resolved = super::completion_item_resolve(item.clone(), &cache);
+        assert!(
+            resolved.documentation.is_none(),
+            "Should have no documentation for nonexistent package"
+        );
+
+        // Verify the negative result was cached
+        let cached = cache.get("no_such_func", Some("nonexistent_pkg_xyzzy"));
+        assert_eq!(
+            cached,
+            Some(None),
+            "Failed lookup should be cached as Some(None) to prevent repeated R subprocess calls"
+        );
+
+        // Second call — should hit the negative cache entry and NOT spawn R again.
+        // (We can't directly assert "no subprocess was spawned", but we can verify
+        // the cache is consulted by checking it returns the same result quickly.)
+        let resolved2 = super::completion_item_resolve(item, &cache);
+        assert!(
+            resolved2.documentation.is_none(),
+            "Negative cache hit should still return no documentation"
+        );
+    }
+
+    /// Test that a cached negative result (None) for one package does not affect
+    /// lookups for the same topic in a different package. This verifies the composite
+    /// key architecture: `"dplyr::filter"` and `"stats::filter"` are independent entries.
+    #[test]
+    fn test_completion_resolve_cache_isolation_across_packages() {
+        let cache = crate::help::HelpCache::new();
+
+        // Cache a negative result for filter in a nonexistent package
+        cache.insert("filter", Some("nonexistent_pkg"), None);
+
+        // Pre-populate a positive result for filter in dplyr
+        let dplyr_help = "Subset rows using column values\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20The filter() function is used to subset a data frame.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20filter(.data, ...)\n";
+        cache.insert("filter", Some("dplyr"), Some(dplyr_help.to_string()));
+
+        // Resolve for dplyr::filter should get the positive cached result
+        let item_dplyr = CompletionItem {
+            label: "filter".to_string(),
+            data: Some(serde_json::json!({"topic": "filter", "package": "dplyr"})),
+            ..Default::default()
+        };
+        let resolved = super::completion_item_resolve(item_dplyr, &cache);
+        let doc = resolved
+            .documentation
+            .expect("dplyr::filter should have cached documentation");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert!(
+                    content.value.contains("Subset rows"),
+                    "Should return dplyr's help, not be blocked by nonexistent_pkg's negative entry"
+                );
+            }
+            _ => panic!("Expected MarkupContent"),
+        }
+
+        // Resolve for nonexistent_pkg::filter should hit the negative cache
+        let item_bad = CompletionItem {
+            label: "filter".to_string(),
+            data: Some(serde_json::json!({"topic": "filter", "package": "nonexistent_pkg"})),
+            ..Default::default()
+        };
+        let resolved_bad = super::completion_item_resolve(item_bad, &cache);
+        assert!(
+            resolved_bad.documentation.is_none(),
+            "nonexistent_pkg::filter should return no documentation from negative cache"
+        );
+    }
+
+    /// Test that the cache shared between completion_item_resolve and hover works
+    /// bidirectionally: a help lookup cached by resolve should be available to hover
+    /// (and vice versa), since they share the same HelpCache instance.
+    #[test]
+    fn test_completion_resolve_and_hover_share_cache() {
+        let cache = crate::help::HelpCache::new();
+
+        // Simulate what hover would do: cache a help result
+        let help_text = "Read Comma Separated Files\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20Read a CSV file into a tibble.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20read_csv(file, ...)\n";
+        cache.insert("read_csv", Some("readr"), Some(help_text.to_string()));
+
+        // Now completion_item_resolve should find it in the cache
+        let item = CompletionItem {
+            label: "read_csv".to_string(),
+            data: Some(serde_json::json!({"topic": "read_csv", "package": "readr"})),
+            ..Default::default()
+        };
+        let resolved = super::completion_item_resolve(item, &cache);
+
+        assert!(
+            resolved.documentation.is_some(),
+            "Resolve should find help text cached by hover"
         );
     }
 

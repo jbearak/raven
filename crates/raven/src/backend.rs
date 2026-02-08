@@ -2574,8 +2574,14 @@ impl LanguageServer for Backend {
     }
 
     async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        // Clone the help cache Arc before moving into spawn_blocking
+        let help_cache = self.state.read().await.help_cache.clone();
         // Run in spawn_blocking since get_help() calls R subprocess (blocking I/O)
-        match tokio::task::spawn_blocking(move || handlers::completion_item_resolve(item)).await {
+        match tokio::task::spawn_blocking(move || {
+            handlers::completion_item_resolve(item, &help_cache)
+        })
+        .await
+        {
             Ok(resolved) => Ok(resolved),
             Err(_) => Err(tower_lsp::jsonrpc::Error::internal_error()),
         }

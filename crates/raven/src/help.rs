@@ -5,6 +5,7 @@
 
 use std::process::Command;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
@@ -15,10 +16,24 @@ const HELP_CACHE_MAX_ENTRIES: usize = 512;
 /// Bounded cache for help content. Uses LRU eviction to prevent unbounded
 /// memory growth in long-running LSP sessions.
 ///
+/// Keys use composite format: `"package::topic"` for package-qualified lookups,
+/// plain `"topic"` for unqualified lookups. This prevents collisions when
+/// different packages export the same function name (e.g., `dplyr::filter`
+/// vs `stats::filter`).
+///
 /// Uses `peek()` for reads (no LRU promotion, works under read lock) and
 /// `push()` for writes (promotes/evicts under write lock).
+#[derive(Clone)]
 pub struct HelpCache {
     inner: Arc<RwLock<LruCache<String, Option<String>>>>,
+}
+
+/// Builds a cache key from a topic and optional package.
+fn cache_key(topic: &str, package: Option<&str>) -> String {
+    match package {
+        Some(pkg) => format!("{pkg}::{topic}"),
+        None => topic.to_string(),
+    }
 }
 
 impl HelpCache {
@@ -26,13 +41,15 @@ impl HelpCache {
         Self::with_max_entries(HELP_CACHE_MAX_ENTRIES)
     }
 
-    pub fn get(&self, topic: &str) -> Option<Option<String>> {
-        self.inner.read().ok()?.peek(topic).cloned()
+    pub fn get(&self, topic: &str, package: Option<&str>) -> Option<Option<String>> {
+        let key = cache_key(topic, package);
+        self.inner.read().ok()?.peek(&key).cloned()
     }
 
-    pub fn insert(&self, topic: String, content: Option<String>) {
+    pub fn insert(&self, topic: &str, package: Option<&str>, content: Option<String>) {
+        let key = cache_key(topic, package);
         if let Ok(mut guard) = self.inner.write() {
-            guard.push(topic, content);
+            guard.push(key, content);
         }
     }
 
@@ -68,6 +85,13 @@ impl Default for HelpCache {
 ///     assert!(text.contains("Usage:"));
 /// }
 /// ```
+/// Timeout for R help subprocess calls. Prevents hung R processes from
+/// blocking threads indefinitely.
+const HELP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval when waiting for R subprocess to finish.
+const HELP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
     log::trace!("get_help: topic={}, package={:?}", topic, package);
 
@@ -98,26 +122,53 @@ cat(paste(txt, collapse = "\n"))
         cmd.arg(pkg);
     }
 
-    match cmd.output() {
-        Ok(output) => {
-            log::trace!(
-                "get_help: exit_status={}, stdout_len={}, stderr_len={}",
-                output.status,
-                output.stdout.len(),
-                output.stderr.len()
-            );
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout).to_string();
-                if !text.trim().is_empty() && !text.contains("No documentation") {
-                    return Some(text);
-                }
-                log::trace!("get_help: empty or no documentation");
-            }
-            None
-        }
+    // Spawn as child process so we can enforce a timeout
+    let mut child = match cmd.stdout(std::process::Stdio::piped()).spawn() {
+        Ok(c) => c,
         Err(e) => {
-            log::trace!("get_help: subprocess error: {}", e);
-            None
+            log::trace!("get_help: subprocess spawn error: {}", e);
+            return None;
+        }
+    };
+
+    let deadline = Instant::now() + HELP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited — read output
+                let output = child.wait_with_output().ok()?;
+                log::trace!(
+                    "get_help: exit_status={}, stdout_len={}, stderr_len={}",
+                    status,
+                    output.stdout.len(),
+                    output.stderr.len()
+                );
+                if status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout).to_string();
+                    if !text.trim().is_empty() && !text.contains("No documentation") {
+                        return Some(text);
+                    }
+                    log::trace!("get_help: empty or no documentation");
+                }
+                return None;
+            }
+            Ok(None) => {
+                // Still running — check timeout
+                if Instant::now() >= deadline {
+                    log::trace!(
+                        "get_help: timeout after {:?}, killing subprocess",
+                        HELP_TIMEOUT
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap zombie
+                    return None;
+                }
+                std::thread::sleep(HELP_POLL_INTERVAL);
+            }
+            Err(e) => {
+                log::trace!("get_help: try_wait error: {}", e);
+                return None;
+            }
         }
     }
 }
@@ -457,29 +508,102 @@ Arguments:
     fn test_help_cache_bounded() {
         let cache = HelpCache::with_max_entries(3);
 
-        cache.insert("a".to_string(), Some("help_a".to_string()));
-        cache.insert("b".to_string(), Some("help_b".to_string()));
-        cache.insert("c".to_string(), Some("help_c".to_string()));
+        cache.insert("a", None, Some("help_a".to_string()));
+        cache.insert("b", None, Some("help_b".to_string()));
+        cache.insert("c", None, Some("help_c".to_string()));
         assert_eq!(cache.len(), 3);
 
         // Inserting a 4th entry should evict the LRU ("a")
-        cache.insert("d".to_string(), Some("help_d".to_string()));
+        cache.insert("d", None, Some("help_d".to_string()));
         assert_eq!(cache.len(), 3);
-        assert!(cache.get("a").is_none());
-        assert!(cache.get("d").is_some());
+        assert!(cache.get("a", None).is_none());
+        assert!(cache.get("d", None).is_some());
     }
 
     #[test]
     fn test_help_cache_update_existing() {
         let cache = HelpCache::with_max_entries(3);
 
-        cache.insert("a".to_string(), None);
-        assert_eq!(cache.get("a"), Some(None));
+        cache.insert("a", None, None);
+        assert_eq!(cache.get("a", None), Some(None));
 
         // Updating same key should not grow the cache
-        cache.insert("a".to_string(), Some("updated".to_string()));
+        cache.insert("a", None, Some("updated".to_string()));
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get("a"), Some(Some("updated".to_string())));
+        assert_eq!(cache.get("a", None), Some(Some("updated".to_string())));
+    }
+
+    #[test]
+    fn test_help_cache_composite_key() {
+        let cache = HelpCache::with_max_entries(10);
+
+        // Same topic, different packages should be separate entries
+        cache.insert("filter", Some("dplyr"), Some("dplyr filter".to_string()));
+        cache.insert("filter", Some("stats"), Some("stats filter".to_string()));
+        cache.insert("filter", None, Some("unqualified filter".to_string()));
+
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            cache.get("filter", Some("dplyr")),
+            Some(Some("dplyr filter".to_string()))
+        );
+        assert_eq!(
+            cache.get("filter", Some("stats")),
+            Some(Some("stats filter".to_string()))
+        );
+        assert_eq!(
+            cache.get("filter", None),
+            Some(Some("unqualified filter".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_help_cache_negative_caching() {
+        let cache = HelpCache::with_max_entries(10);
+
+        // Insert a negative result (topic exists in cache but has no help)
+        cache.insert("nonexistent_func", Some("somepkg"), None);
+
+        // get() should return Some(None) — "we looked it up and there's nothing"
+        // This is distinct from a cache miss which returns None
+        let result = cache.get("nonexistent_func", Some("somepkg"));
+        assert_eq!(
+            result,
+            Some(None),
+            "Negative cache entry should return Some(None), not a cache miss"
+        );
+
+        // A different package for the same topic should be a cache miss
+        let result = cache.get("nonexistent_func", Some("otherpkg"));
+        assert!(
+            result.is_none(),
+            "Different package should be a cache miss, not a negative hit"
+        );
+    }
+
+    #[test]
+    fn test_help_cache_clone_shares_state() {
+        // This property is critical: backend.rs clones the cache before
+        // spawn_blocking, so writes in the blocking thread must be visible
+        // to the original cache (and vice versa).
+        let cache1 = HelpCache::with_max_entries(10);
+        let cache2 = cache1.clone();
+
+        // Write through clone, read through original
+        cache2.insert("mean", Some("base"), Some("help text".to_string()));
+        assert_eq!(
+            cache1.get("mean", Some("base")),
+            Some(Some("help text".to_string())),
+            "Clone and original must share underlying storage"
+        );
+
+        // Write through original, read through clone
+        cache1.insert("filter", Some("dplyr"), Some("dplyr help".to_string()));
+        assert_eq!(
+            cache2.get("filter", Some("dplyr")),
+            Some(Some("dplyr help".to_string())),
+            "Writes through original must be visible through clone"
+        );
     }
 
     #[test]
