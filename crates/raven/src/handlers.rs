@@ -32,6 +32,40 @@ use crate::reserved_words::is_reserved_word;
 /// it as the end of the line — so any large valid value works as an end-of-line sentinel.
 const LSP_EOL_CHARACTER: u32 = i32::MAX as u32; // 2147483647
 
+/// R built-in constants that should use CompletionItemKind::CONSTANT.
+///
+/// These are special R literals that are distinct from regular keywords and variables.
+/// Aligns with official R language server behavior.
+const R_CONSTANTS: &[&str] = &[
+    "TRUE",
+    "FALSE",
+    "NULL",
+    "NA",
+    "Inf",
+    "NaN",
+    "NA_integer_",
+    "NA_real_",
+    "NA_complex_",
+    "NA_character_",
+];
+
+/// Sort prefixes for completion item ordering.
+///
+/// Controls the display order of completion items to prioritize more relevant symbols.
+/// Lower prefixes appear first in the completion list. Aligns with R language server behavior.
+///
+/// Prefix allocation (matching R-LS conventions):
+///   "0-" — function arguments (reserved for future use)
+///   "1-" — local scope
+///   "2-" — workspace
+///   "3-" — imported objects (reserved for future use)
+///   "4-" — package globals
+///   "5-" — keywords / text tokens
+const SORT_PREFIX_SCOPE: &str = "1-";
+const SORT_PREFIX_WORKSPACE: &str = "2-";
+const SORT_PREFIX_PACKAGE: &str = "4-";
+const SORT_PREFIX_KEYWORD: &str = "5-";
+
 // ============================================================================
 // Section Pattern
 // ============================================================================
@@ -68,7 +102,8 @@ fn section_pattern() -> &'static Regex {
 /// practice because the section regex requires at least 2 characters.
 fn is_delimiter_only(s: &str) -> bool {
     const DELIMITER_CHARS: &[char] = &['#', '-', '=', '*', '+'];
-    s.chars().all(|c| c.is_whitespace() || DELIMITER_CHARS.contains(&c))
+    s.chars()
+        .all(|c| c.is_whitespace() || DELIMITER_CHARS.contains(&c))
 }
 
 /// Computes the UTF-16 length of a string (number of UTF-16 code units).
@@ -178,16 +213,29 @@ fn extract_banner_name(line: &str) -> Option<(String, u32)> {
 /// Extended symbol kind for document symbols.
 ///
 /// Maps to LSP SymbolKind with richer categorization for R-specific constructs.
-/// This enum provides more granular classification than the basic function/variable
-/// distinction, supporting R6 classes, S4 methods, constants, and code sections.
+/// This enum provides granular classification based on value types, supporting
+/// R6 classes, S4 methods, constants, typed literals, and code sections.
+/// Aligns with official R language server behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentSymbolKind {
     /// Regular function definition (SymbolKind::FUNCTION)
     Function,
-    /// Variable assignment (SymbolKind::VARIABLE)
+    /// Generic variable assignment, fallback case (SymbolKind::FIELD)
     Variable,
     /// ALL_CAPS constant pattern (SymbolKind::CONSTANT)
     Constant,
+    /// Boolean literal: TRUE, FALSE (SymbolKind::BOOLEAN)
+    Boolean,
+    /// Numeric literal: integer, double, complex (SymbolKind::NUMBER)
+    Number,
+    /// String literal: character values (SymbolKind::STRING)
+    String,
+    /// NULL literal (SymbolKind::NULL)
+    Null,
+    /// Array-like: c(), vector(), matrix(), array() (SymbolKind::ARRAY)
+    Array,
+    /// List structure: list() (SymbolKind::STRUCT)
+    List,
     /// R6Class or setRefClass/setClass definition (SymbolKind::CLASS)
     Class,
     /// setMethod definition (SymbolKind::METHOD)
@@ -201,6 +249,8 @@ pub enum DocumentSymbolKind {
 impl DocumentSymbolKind {
     /// Convert to LSP SymbolKind for protocol responses.
     ///
+    /// Aligns with official R language server mapping for consistent icons across editors.
+    ///
     /// # Examples
     ///
     /// ```
@@ -209,12 +259,20 @@ impl DocumentSymbolKind {
     ///
     /// assert_eq!(DocumentSymbolKind::Function.to_lsp_kind(), SymbolKind::FUNCTION);
     /// assert_eq!(DocumentSymbolKind::Constant.to_lsp_kind(), SymbolKind::CONSTANT);
+    /// assert_eq!(DocumentSymbolKind::Boolean.to_lsp_kind(), SymbolKind::BOOLEAN);
+    /// assert_eq!(DocumentSymbolKind::Variable.to_lsp_kind(), SymbolKind::FIELD);
     /// ```
     pub fn to_lsp_kind(self) -> SymbolKind {
         match self {
             Self::Function => SymbolKind::FUNCTION,
-            Self::Variable => SymbolKind::VARIABLE,
+            Self::Variable => SymbolKind::FIELD, // Changed from VARIABLE to align with R-LS
             Self::Constant => SymbolKind::CONSTANT,
+            Self::Boolean => SymbolKind::BOOLEAN,
+            Self::Number => SymbolKind::NUMBER,
+            Self::String => SymbolKind::STRING,
+            Self::Null => SymbolKind::NULL,
+            Self::Array => SymbolKind::ARRAY,
+            Self::List => SymbolKind::STRUCT,
             Self::Class => SymbolKind::CLASS,
             Self::Method => SymbolKind::METHOD,
             Self::Interface => SymbolKind::INTERFACE,
@@ -553,8 +611,11 @@ impl<'a> SymbolExtractor<'a> {
     /// // Function detection
     /// // my_func <- function(x) x + 1 → FUNCTION
     ///
-    /// // Variable detection
-    /// // x <- 42 → VARIABLE
+    /// // Value-based type detection
+    /// // x <- 42 → NUMBER
+    /// // flag <- TRUE → BOOLEAN
+    /// // name <- "hello" → STRING
+    /// // other <- some_call() → VARIABLE (fallback, maps to FIELD)
     /// ```
     fn classify_symbol(&self, name: &str, rhs: tree_sitter::Node<'a>) -> DocumentSymbolKind {
         // Priority 1: Check for R6Class() or setRefClass() call
@@ -572,8 +633,97 @@ impl<'a> SymbolExtractor<'a> {
             return DocumentSymbolKind::Function;
         }
 
-        // Priority 4: Default to variable
+        // Priority 4: Check for value-based type (Boolean, Number, String, Null, Array, List)
+        if let Some(value_kind) = self.detect_value_type(rhs) {
+            return value_kind;
+        }
+
+        // Priority 5: Default to variable (maps to FIELD in LSP)
         DocumentSymbolKind::Variable
+    }
+
+    /// Detect value-based type from RHS node for granular symbol classification.
+    ///
+    /// Aligns with official R language server behavior by analyzing assigned values
+    /// to determine specific types (Boolean, Number, String, Null, Array, List).
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - The RHS node of an assignment
+    ///
+    /// # Returns
+    ///
+    /// - `Some(DocumentSymbolKind)` if a specific type is detected
+    /// - `None` if type cannot be determined (falls back to Variable)
+    ///
+    /// # Detection Logic
+    ///
+    /// 1. **Boolean**: TRUE, FALSE identifiers
+    /// 2. **Null**: NULL identifier or null node
+    /// 3. **Constant**: NA, Inf, NaN identifiers (R constants)
+    /// 4. **Number**: integer, float, complex literals
+    /// 5. **String**: string literals
+    /// 6. **Array**: c(), vector(), matrix(), array() calls
+    /// 7. **List**: list() calls
+    fn detect_value_type(&self, node: tree_sitter::Node<'a>) -> Option<DocumentSymbolKind> {
+        match node.kind() {
+            // Boolean literals: TRUE, FALSE (tree-sitter-r uses 'true' and 'false' node kinds)
+            "true" | "false" => Some(DocumentSymbolKind::Boolean),
+
+            // NULL literal (tree-sitter-r uses 'null' node kind)
+            "null" => Some(DocumentSymbolKind::Null),
+
+            // R constants (tree-sitter-r uses special node kinds)
+            "na" | "inf" | "nan" => Some(DocumentSymbolKind::Constant),
+
+            // Typed NA constants (NA_integer_, etc.) are parsed as identifiers
+            "identifier" => {
+                let text = node_text(node, self.text);
+                if R_CONSTANTS.contains(&text) {
+                    Some(DocumentSymbolKind::Constant)
+                } else {
+                    None
+                }
+            }
+
+            // Numeric literals
+            "integer" | "float" | "complex" => Some(DocumentSymbolKind::Number),
+
+            // String literals
+            "string" => Some(DocumentSymbolKind::String),
+
+            // Function calls: check for array-like or list constructors
+            "call" => {
+                // The first child of a call node is the function identifier
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.children(&mut cursor).collect();
+                if let Some(func_node) = children.first() {
+                    if func_node.kind() == "identifier" {
+                        let func_name = node_text(*func_node, self.text);
+                        return match func_name {
+                            "c" | "vector" | "matrix" | "array" => Some(DocumentSymbolKind::Array),
+                            "list" => Some(DocumentSymbolKind::List),
+                            _ => None,
+                        };
+                    }
+                }
+                None
+            }
+
+            // Parenthesized expressions: unwrap and recurse
+            "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.is_named() {
+                        return self.detect_value_type(child);
+                    }
+                }
+                None
+            }
+
+            // Complex expressions: cannot determine type
+            _ => None,
+        }
     }
 
     /// Check if a node is an R6Class() or setRefClass() function call.
@@ -664,8 +814,10 @@ impl<'a> SymbolExtractor<'a> {
         let start_line_text = self.text.lines().nth(start_pos.row).unwrap_or("");
         let end_line_text = self.text.lines().nth(end_pos.row).unwrap_or("");
 
-        let start_column =
-            crate::cross_file::types::byte_offset_to_utf16_column(start_line_text, start_pos.column);
+        let start_column = crate::cross_file::types::byte_offset_to_utf16_column(
+            start_line_text,
+            start_pos.column,
+        );
         let end_column =
             crate::cross_file::types::byte_offset_to_utf16_column(end_line_text, end_pos.column);
 
@@ -1347,11 +1499,7 @@ impl HierarchyBuilder {
     }
 
     /// Add a child symbol at the given path and return the child's index.
-    fn add_child_at_path(
-        result: &mut [RawSymbol],
-        path: &[usize],
-        child: RawSymbol,
-    ) -> usize {
+    fn add_child_at_path(result: &mut [RawSymbol], path: &[usize], child: RawSymbol) -> usize {
         if path.is_empty() {
             panic!("Empty path in add_child_at_path");
         }
@@ -1468,7 +1616,8 @@ impl HierarchyBuilder {
         let mut symbols: Vec<RawSymbol> = symbols
             .into_iter()
             .map(|mut sym| {
-                sym.children = Self::nest_symbols_in_functions_recursive(std::mem::take(&mut sym.children));
+                sym.children =
+                    Self::nest_symbols_in_functions_recursive(std::mem::take(&mut sym.children));
                 sym
             })
             .collect();
@@ -1479,7 +1628,7 @@ impl HierarchyBuilder {
         // Build the hierarchy by finding which symbols are contained by which functions
         // A symbol is contained by a function if it starts after the function starts
         // and ends before or at the function's end line
-        
+
         // We'll use a simple approach: repeatedly find symbols that should be nested
         // and move them into their containing functions
         loop {
@@ -1490,10 +1639,10 @@ impl HierarchyBuilder {
                 .filter(|(_, s)| matches!(s.kind, DocumentSymbolKind::Function))
                 .map(|(i, _)| i)
                 .collect();
-            
+
             // For each symbol, check if it should be nested in a function
             let mut nested_indices: Vec<usize> = Vec::new();
-            
+
             for (i, sym) in symbols.iter().enumerate() {
                 // Skip functions when checking if they should be nested
                 // (we handle function-in-function separately)
@@ -1508,20 +1657,21 @@ impl HierarchyBuilder {
                     }
                 }
             }
-            
+
             if nested_indices.is_empty() {
                 // No more nesting needed
                 return symbols;
             }
-            
+
             // Move nested symbols into their containing functions
             // We need to be careful about the order of operations
-            let nested_set: std::collections::HashSet<usize> = nested_indices.iter().cloned().collect();
-            
+            let nested_set: std::collections::HashSet<usize> =
+                nested_indices.iter().cloned().collect();
+
             // Collect symbols to nest
             let mut to_nest: Vec<RawSymbol> = Vec::new();
             let mut remaining: Vec<RawSymbol> = Vec::new();
-            
+
             for (i, sym) in symbols.into_iter().enumerate() {
                 if nested_set.contains(&i) {
                     to_nest.push(sym);
@@ -1529,7 +1679,7 @@ impl HierarchyBuilder {
                     remaining.push(sym);
                 }
             }
-            
+
             // Insert nested symbols into their containing functions
             for sym in to_nest {
                 let mut inserted = false;
@@ -1547,7 +1697,7 @@ impl HierarchyBuilder {
                     remaining.push(sym);
                 }
             }
-            
+
             symbols = remaining;
             symbols.sort_by_key(|s| s.range.start.line);
         }
@@ -2050,7 +2200,7 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
                     let kind = if rhs.kind() == "function_definition" {
                         SymbolKind::FUNCTION
                     } else {
-                        SymbolKind::VARIABLE
+                        SymbolKind::FIELD
                     };
 
                     symbols.push(SymbolInformation {
@@ -2111,16 +2261,14 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 /// assert_eq!(extract_container_name(&uri), Some("utils".to_string()));
 /// ```
 fn extract_container_name(uri: &Url) -> Option<String> {
-    uri.path_segments()?
-        .next_back()
-        .map(|filename| {
-            // Remove extension if present
-            if let Some(dot_pos) = filename.rfind('.') {
-                filename[..dot_pos].to_string()
-            } else {
-                filename.to_string()
-            }
-        })
+    uri.path_segments()?.next_back().map(|filename| {
+        // Remove extension if present
+        if let Some(dot_pos) = filename.rfind('.') {
+            filename[..dot_pos].to_string()
+        } else {
+            filename.to_string()
+        }
+    })
 }
 
 /// Collects workspace symbols whose names contain the given query as a case-insensitive substring.
@@ -2312,7 +2460,7 @@ fn collect_workspace_symbols_from_artifacts(
     symbols: &mut Vec<SymbolInformation>,
 ) {
     let container_name = extract_container_name(file_uri);
-    
+
     for scoped_symbol in artifacts.exported_interface.values() {
         if !scoped_symbol.name.to_lowercase().contains(lower_query) {
             continue;
@@ -2330,8 +2478,8 @@ fn collect_workspace_symbols_from_artifacts(
 
         let kind = match scoped_symbol.kind {
             crate::cross_file::scope::SymbolKind::Function => SymbolKind::FUNCTION,
-            crate::cross_file::scope::SymbolKind::Variable => SymbolKind::VARIABLE,
-            crate::cross_file::scope::SymbolKind::Parameter => SymbolKind::VARIABLE,
+            crate::cross_file::scope::SymbolKind::Variable => SymbolKind::FIELD,
+            crate::cross_file::scope::SymbolKind::Parameter => SymbolKind::FIELD,
         };
 
         symbols.push(SymbolInformation {
@@ -2659,7 +2807,14 @@ async fn collect_missing_file_diagnostics_standalone(
                     continue;
                 }
             }
-            paths_to_check.push((path, source.path.clone(), source.line, source.column, false, source.is_directive));
+            paths_to_check.push((
+                path,
+                source.path.clone(),
+                source.line,
+                source.column,
+                false,
+                source.is_directive,
+            ));
         } else {
             let message = if source.is_directive {
                 format!(
@@ -2751,7 +2906,9 @@ async fn collect_missing_file_diagnostics_standalone(
 
     // Generate diagnostics for missing files
     // _Requirements: 6.1_ (for @lsp-source directive missing file diagnostics)
-    for (i, (_, path_str, line, col, is_backward, is_directive)) in paths_to_check.into_iter().enumerate() {
+    for (i, (_, path_str, line, col, is_backward, is_directive)) in
+        paths_to_check.into_iter().enumerate()
+    {
         if !existence.get(i).copied().unwrap_or(false) {
             if is_backward {
                 diagnostics.push(Diagnostic {
@@ -3438,10 +3595,11 @@ fn collect_redundant_directive_diagnostics(
     // For each directive source, check if there's an AST source to the same file at an earlier line
     for directive in &directive_sources {
         // Resolve the directive's target path
-        let directive_target = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-            &directive.path,
-            &path_ctx,
-        );
+        let directive_target =
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                &directive.path,
+                &path_ctx,
+            );
         let directive_target = match directive_target {
             Some(path) => path,
             None => continue,
@@ -4467,7 +4625,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
                 // from parent files, not just the current file's directives
                 state.get_enriched_metadata(uri).unwrap_or_default()
             }
-            _ => Default::default()
+            _ => Default::default(),
         };
         let workspace_root = state.workspace_folders.first();
 
@@ -4505,40 +4663,31 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         return Some(CompletionResponse::Array(items));
     }
 
-    // Add R keywords
+    // Add R keywords (control flow and common functions)
     let keywords = [
-        "if",
-        "else",
-        "repeat",
-        "while",
-        "function",
-        "for",
-        "in",
-        "next",
-        "break",
-        "TRUE",
-        "FALSE",
-        "NULL",
-        "Inf",
-        "NaN",
-        "NA",
-        "NA_integer_",
-        "NA_real_",
-        "NA_complex_",
-        "NA_character_",
-        "library",
-        "require",
-        "return",
-        "print",
+        "if", "else", "repeat", "while", "function", "for", "in", "next", "break", "library",
+        "require", "return", "print",
     ];
 
     for kw in keywords {
         items.push(CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
             ..Default::default()
         });
         seen_names.insert(kw.to_string());
+    }
+
+    // Add R constants (distinct from keywords, aligned with R-LS)
+    for constant in R_CONSTANTS {
+        items.push(CompletionItem {
+            label: constant.to_string(),
+            kind: Some(CompletionItemKind::CONSTANT),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, constant)),
+            ..Default::default()
+        });
+        seen_names.insert(constant.to_string());
     }
 
     // Add symbols from current document (local definitions take precedence)
@@ -4550,10 +4699,26 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
-        // Combine inherited and loaded packages using a set for O(1) dedup
+        // Combine base packages, inherited, and loaded packages using a set for O(1) dedup
+        // Requirement 6.3: Base packages SHALL be available at all positions
         let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut all_packages: Vec<String> = Vec::new();
-        for pkg in scope.inherited_packages.iter().chain(scope.loaded_packages.iter()) {
+
+        // Base packages first (always available without library() calls)
+        if state.package_library_ready {
+            for pkg in state.package_library.base_packages() {
+                if pkg_set.insert(pkg.as_str()) {
+                    all_packages.push(pkg.clone());
+                }
+            }
+        }
+
+        // Then inherited and explicitly loaded packages
+        for pkg in scope
+            .inherited_packages
+            .iter()
+            .chain(scope.loaded_packages.iter())
+        {
             if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
             }
@@ -4576,8 +4741,14 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
                 // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
                 items.push(CompletionItem {
                     label: export_name.clone(),
-                    kind: Some(CompletionItemKind::FUNCTION), // Most package exports are functions
+                    kind: Some(CompletionItemKind::FUNCTION),
                     detail: Some(format!("{{{}}}", package_name)),
+                    sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
+                    // Store topic and package for completionItem/resolve documentation lookup
+                    data: Some(serde_json::json!({
+                        "topic": export_name,
+                        "package": package_name,
+                    })),
                     ..Default::default()
                 });
             }
@@ -4593,10 +4764,18 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         let name_string = name.to_string();
         seen_names.insert(name_string.clone());
 
+        // Align with R-LS: use FIELD for variables/parameters, FUNCTION for functions
         let kind = match symbol.kind {
             crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
-            crate::cross_file::SymbolKind::Variable => CompletionItemKind::VARIABLE,
-            crate::cross_file::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
+            crate::cross_file::SymbolKind::Variable => CompletionItemKind::FIELD,
+            crate::cross_file::SymbolKind::Parameter => CompletionItemKind::FIELD,
+        };
+
+        // Determine sort prefix: same file (scope) vs other files (workspace)
+        let sort_prefix = if symbol.source_uri == *uri {
+            SORT_PREFIX_SCOPE
+        } else {
+            SORT_PREFIX_WORKSPACE
         };
 
         // Add source file info to detail if from another file
@@ -4607,19 +4786,22 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         };
 
         items.push(CompletionItem {
-            label: name_string,
+            label: name_string.clone(),
             kind: Some(kind),
             detail,
+            sort_text: Some(format!("{}{}", sort_prefix, name_string)),
             ..Default::default()
         });
     }
 
     // Filter out reserved words from identifier completions
-    // (Keywords are added separately with CompletionItemKind::KEYWORD)
+    // (Keywords and constants are added separately with specific CompletionItemKind)
     // Requirements 5.1, 5.2, 5.3: Reserved words should not appear as identifier completions
     items.retain(|item| {
-        item.kind == Some(CompletionItemKind::KEYWORD)
-            || !crate::reserved_words::is_reserved_word(&item.label)
+        matches!(
+            item.kind,
+            Some(CompletionItemKind::KEYWORD) | Some(CompletionItemKind::CONSTANT)
+        ) || !crate::reserved_words::is_reserved_word(&item.label)
     });
 
     Some(CompletionResponse::Array(items))
@@ -4660,15 +4842,17 @@ fn collect_document_completions(
                 let name = node_text(lhs, text).to_string();
                 if !seen.contains(&name) {
                     seen.insert(name.clone());
+                    // Align with R-LS: use FIELD for variables, FUNCTION for functions
                     let kind = if rhs.kind() == "function_definition" {
                         CompletionItemKind::FUNCTION
                     } else {
-                        CompletionItemKind::VARIABLE
+                        CompletionItemKind::FIELD
                     };
 
                     items.push(CompletionItem {
-                        label: name,
+                        label: name.clone(),
                         kind: Some(kind),
+                        sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
                         ..Default::default()
                     });
                 }
@@ -4679,6 +4863,52 @@ fn collect_document_completions(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_document_completions(child, text, items, seen);
+    }
+}
+
+// ============================================================================
+// Completion Item Resolve
+// ============================================================================
+
+/// Resolves additional details for a completion item (completionItem/resolve).
+///
+/// For package exports, fetches R help documentation and populates the
+/// `documentation` field with the function title and description.
+/// Uses the shared `HelpCache` to avoid redundant R subprocess calls.
+pub fn completion_item_resolve(
+    item: CompletionItem,
+    help_cache: &crate::help::HelpCache,
+) -> CompletionItem {
+    // Only resolve items with data containing topic and package
+    let data = match &item.data {
+        Some(data) => data,
+        None => return item,
+    };
+
+    let topic = match data.get("topic").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return item,
+    };
+
+    let package = match data.get("package").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return item,
+    };
+
+    // get_or_fetch handles cache check, R subprocess call, and caching the result
+    let help_text = help_cache.get_or_fetch(&topic, Some(&package));
+
+    let documentation =
+        help_text.and_then(|text| crate::help::extract_description_from_help(&text));
+
+    CompletionItem {
+        documentation: documentation.map(|text| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: text,
+            })
+        }),
+        ..item
     }
 }
 
@@ -5079,6 +5309,29 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 // Hover
 // ============================================================================
 
+/// Fetches R help text with cache support, running the R subprocess on a
+/// blocking thread. Used by hover to avoid duplicating the
+/// cache-check → spawn_blocking → cache-result pattern.
+async fn get_help_cached(
+    cache: &crate::help::HelpCache,
+    topic: &str,
+    package: Option<&str>,
+) -> Option<String> {
+    // Fast path: return cached content without spawning a blocking task
+    if let Some(cached) = cache.get(topic, package) {
+        return cached;
+    }
+    // Cache miss — call R subprocess on a blocking thread.
+    // The clone shares state via Arc, so writes are visible to the original.
+    let cache = cache.clone();
+    let topic = topic.to_string();
+    let package = package.map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || cache.get_or_fetch(&topic, package.as_deref()))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Provide hover information for the symbol at a given text document position.
 ///
 /// Tries, in order:
@@ -5148,7 +5401,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             symbol.source_uri,
             symbol.is_declared
         );
-        
+
         // Handle declared symbols (from @lsp-var or @lsp-func directives)
         // Validates: Requirements 7.1, 7.2, 7.3
         if symbol.is_declared {
@@ -5182,7 +5435,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 range: Some(node_range),
             });
         }
-        
+
         let mut value = String::new();
 
         // Check if this is a package export (source_uri starts with "package:")
@@ -5220,33 +5473,14 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
-                    // Try to get full help documentation from R
+                    let help_text =
+                        get_help_cached(&state.help_cache, name, Some(pkg)).await;
                     log::trace!(
-                        "hover: fetching R help for '{}' from package '{}'",
-                        name,
-                        pkg
+                        "hover: get_help returned {:?}",
+                        help_text.as_ref().map(|s| s.len())
                     );
-                    let name_owned = name.to_string();
-                    let pkg_owned = pkg.to_string();
-                    if let Ok(help_result) = tokio::task::spawn_blocking(move || {
-                        crate::help::get_help(&name_owned, Some(&pkg_owned))
-                    })
-                    .await
-                    {
-                        log::trace!(
-                            "hover: get_help returned {:?}",
-                            help_result.as_ref().map(|s| s.len())
-                        );
-                        if let Some(help_text) = help_result {
-                            // Show full R documentation
-                            value.push_str(&format!("```\n{}\n```", help_text));
-                        } else if let Some(sig) = &symbol.signature {
-                            value.push_str(&format!("```r\n{}\n```\n", sig));
-                            value.push_str(&format!("\nfrom {{{}}}", pkg));
-                        } else {
-                            value.push_str(&format!("```r\n{}\n```\n", name));
-                            value.push_str(&format!("\nfrom {{{}}}", pkg));
-                        }
+                    if let Some(help_text) = help_text {
+                        value.push_str(&format!("```\n{}\n```", help_text));
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
                         value.push_str(&format!("\nfrom {{{}}}", pkg));
@@ -5298,15 +5532,9 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            // Try to get full help documentation from R
-            let name_owned = name.to_string();
-            let pkg_owned = pkg_name.to_string();
-            if let Ok(Some(help_text)) = tokio::task::spawn_blocking(move || {
-                crate::help::get_help(&name_owned, Some(&pkg_owned))
-            })
-            .await
-            {
-                // Show full R documentation
+            let help_text =
+                get_help_cached(&state.help_cache, name, Some(&pkg_name)).await;
+            if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
@@ -5324,31 +5552,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     }
 
     // Fallback to R help system for built-ins and undefined symbols
-    // Check cache first to avoid repeated R subprocess calls
-    if let Some(cached) = state.help_cache.get(name) {
-        if let Some(help_text) = cached {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("```\n{}\n```", help_text),
-                }),
-                range: Some(node_range),
-            });
-        }
-        // Cached as None - no help available
-        return None;
-    }
-
-    // Try to get help from R subprocess
-    let name_owned = name.to_string();
-    if let Ok(Some(help_text)) =
-        tokio::task::spawn_blocking(move || crate::help::get_help(&name_owned, None)).await
-    {
-        // Cache successful result
-        state
-            .help_cache
-            .insert(name.to_string(), Some(help_text.clone()));
-
+    if let Some(help_text) = get_help_cached(&state.help_cache, name, None).await {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -5357,9 +5561,6 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             range: Some(node_range),
         });
     }
-
-    // Cache negative result to avoid repeated failed lookups
-    state.help_cache.insert(name.to_string(), None);
     None
 }
 // Signature Help
@@ -5456,7 +5657,7 @@ pub fn goto_definition(
                 // from parent files, not just the current file's directives
                 state.get_enriched_metadata(uri).unwrap_or_default()
             }
-            _ => Default::default()
+            _ => Default::default(),
         };
 
         if let Some(location) = crate::file_path_intellisense::file_path_definition(
@@ -5514,7 +5715,7 @@ pub fn goto_definition(
             if let Some(metadata) = content_provider.get_metadata(&symbol.source_uri) {
                 // Find all declarations of this symbol name (both variables and functions)
                 let mut first_line: Option<u32> = None;
-                
+
                 for decl in &metadata.declared_variables {
                     if decl.name == name {
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
@@ -5525,10 +5726,10 @@ pub fn goto_definition(
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
                     }
                 }
-                
+
                 // Use the first declaration line, or fall back to symbol's defined_line
                 let definition_line = first_line.unwrap_or(symbol.defined_line);
-                
+
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: symbol.source_uri.clone(),
                     range: Range {
@@ -5537,7 +5738,7 @@ pub fn goto_definition(
                     },
                 }));
             }
-            
+
             // Fallback if metadata not available: use symbol's stored location
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: symbol.source_uri.clone(),
@@ -7075,6 +7276,329 @@ x <- "#;
     }
 
     // ========================================================================
+    // Package export completion data field and resolve tests
+    // ========================================================================
+
+    /// Test that package export completion items include data field for resolve.
+    #[test]
+    fn test_completion_package_exports_have_data_field() {
+        use crate::package_library::PackageInfo;
+        use crate::state::WorldState;
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let mut exports = std::collections::HashSet::new();
+            exports.insert("my_func".to_string());
+            let pkg_info = PackageInfo::new("testpkg".to_string(), exports);
+            state.package_library.insert_package(pkg_info).await;
+
+            let code = "library(testpkg)\nx <- ";
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = crate::state::Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(1, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                let my_func = items.iter().find(|i| i.label == "my_func");
+                assert!(my_func.is_some(), "Should find my_func in completions");
+
+                let item = my_func.unwrap();
+                assert!(item.data.is_some(), "Package export should have data field");
+
+                let data = item.data.as_ref().unwrap();
+                assert_eq!(
+                    data.get("topic").and_then(|v| v.as_str()),
+                    Some("my_func"),
+                    "data.topic should be the export name"
+                );
+                assert_eq!(
+                    data.get("package").and_then(|v| v.as_str()),
+                    Some("testpkg"),
+                    "data.package should be the package name"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that completion_item_resolve passes through items without data.
+    #[test]
+    fn test_completion_resolve_no_data_passthrough() {
+        let item = CompletionItem {
+            label: "local_var".to_string(),
+            kind: Some(CompletionItemKind::FIELD),
+            ..Default::default()
+        };
+
+        let cache = crate::help::HelpCache::new();
+        let resolved = super::completion_item_resolve(item.clone(), &cache);
+        assert_eq!(resolved.label, "local_var");
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not add documentation to items without data"
+        );
+    }
+
+    /// Test that completion_item_resolve passes through items with unrecognized data.
+    #[test]
+    fn test_completion_resolve_unrecognized_data_passthrough() {
+        let item = CompletionItem {
+            label: "something".to_string(),
+            data: Some(serde_json::json!({"unrelated": "value"})),
+            ..Default::default()
+        };
+
+        let cache = crate::help::HelpCache::new();
+        let resolved = super::completion_item_resolve(item, &cache);
+        assert_eq!(resolved.label, "something");
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not add documentation for unrecognized data"
+        );
+    }
+
+    /// Test that completion_item_resolve returns documentation from a pre-populated
+    /// cache without calling R subprocess. This verifies the cache-first architecture:
+    /// if help text is already cached, no R process should be spawned.
+    #[test]
+    fn test_completion_resolve_returns_cached_help() {
+        let cache = crate::help::HelpCache::new();
+
+        // Pre-populate cache with realistic R help text
+        let help_text = "Arithmetic Mean\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20Generic function for the (trimmed) arithmetic mean.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20mean(x, ...)\n";
+        cache.insert("mean", Some("base"), Some(help_text.to_string()));
+
+        let item = CompletionItem {
+            label: "mean".to_string(),
+            data: Some(serde_json::json!({"topic": "mean", "package": "base"})),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache);
+
+        // Should have documentation populated from the cached help text
+        let doc = resolved.documentation.expect("Should have documentation from cache");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert!(
+                    content.value.contains("Arithmetic Mean"),
+                    "Documentation should contain the title from cached help: {}",
+                    content.value
+                );
+                assert!(
+                    content.value.contains("arithmetic mean"),
+                    "Documentation should contain the description from cached help: {}",
+                    content.value
+                );
+            }
+            _ => panic!("Expected MarkupContent documentation"),
+        }
+    }
+
+    /// Test that completion_item_resolve caches a negative result when R subprocess
+    /// returns no help. On subsequent calls for the same (topic, package), the cache
+    /// should prevent another R subprocess spawn.
+    #[test]
+    fn test_completion_resolve_caches_negative_on_miss() {
+        let cache = crate::help::HelpCache::new();
+
+        // Use a fake package name that R won't have help for
+        let item = CompletionItem {
+            label: "no_such_func".to_string(),
+            data: Some(serde_json::json!({
+                "topic": "no_such_func",
+                "package": "nonexistent_pkg_xyzzy"
+            })),
+            ..Default::default()
+        };
+
+        // First call — R subprocess will fail (no such package), should cache None
+        let resolved = super::completion_item_resolve(item.clone(), &cache);
+        assert!(
+            resolved.documentation.is_none(),
+            "Should have no documentation for nonexistent package"
+        );
+
+        // Verify the negative result was cached
+        let cached = cache.get("no_such_func", Some("nonexistent_pkg_xyzzy"));
+        assert_eq!(
+            cached,
+            Some(None),
+            "Failed lookup should be cached as Some(None) to prevent repeated R subprocess calls"
+        );
+
+        // Second call — should hit the negative cache entry and NOT spawn R again.
+        // (We can't directly assert "no subprocess was spawned", but we can verify
+        // the cache is consulted by checking it returns the same result quickly.)
+        let resolved2 = super::completion_item_resolve(item, &cache);
+        assert!(
+            resolved2.documentation.is_none(),
+            "Negative cache hit should still return no documentation"
+        );
+    }
+
+    /// Test that a cached negative result (None) for one package does not affect
+    /// lookups for the same topic in a different package. This verifies the composite
+    /// key architecture: `"dplyr::filter"` and `"stats::filter"` are independent entries.
+    #[test]
+    fn test_completion_resolve_cache_isolation_across_packages() {
+        let cache = crate::help::HelpCache::new();
+
+        // Cache a negative result for filter in a nonexistent package
+        cache.insert("filter", Some("nonexistent_pkg"), None);
+
+        // Pre-populate a positive result for filter in dplyr
+        let dplyr_help = "Subset rows using column values\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20The filter() function is used to subset a data frame.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20filter(.data, ...)\n";
+        cache.insert("filter", Some("dplyr"), Some(dplyr_help.to_string()));
+
+        // Resolve for dplyr::filter should get the positive cached result
+        let item_dplyr = CompletionItem {
+            label: "filter".to_string(),
+            data: Some(serde_json::json!({"topic": "filter", "package": "dplyr"})),
+            ..Default::default()
+        };
+        let resolved = super::completion_item_resolve(item_dplyr, &cache);
+        let doc = resolved
+            .documentation
+            .expect("dplyr::filter should have cached documentation");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert!(
+                    content.value.contains("Subset rows"),
+                    "Should return dplyr's help, not be blocked by nonexistent_pkg's negative entry"
+                );
+            }
+            _ => panic!("Expected MarkupContent"),
+        }
+
+        // Resolve for nonexistent_pkg::filter should hit the negative cache
+        let item_bad = CompletionItem {
+            label: "filter".to_string(),
+            data: Some(serde_json::json!({"topic": "filter", "package": "nonexistent_pkg"})),
+            ..Default::default()
+        };
+        let resolved_bad = super::completion_item_resolve(item_bad, &cache);
+        assert!(
+            resolved_bad.documentation.is_none(),
+            "nonexistent_pkg::filter should return no documentation from negative cache"
+        );
+    }
+
+    /// Test that the cache shared between completion_item_resolve and hover works
+    /// bidirectionally: a help lookup cached by resolve should be available to hover
+    /// (and vice versa), since they share the same HelpCache instance.
+    #[test]
+    fn test_completion_resolve_and_hover_share_cache() {
+        let cache = crate::help::HelpCache::new();
+
+        // Simulate what hover would do: cache a help result
+        let help_text = "Read Comma Separated Files\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20Read a CSV file into a tibble.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20read_csv(file, ...)\n";
+        cache.insert("read_csv", Some("readr"), Some(help_text.to_string()));
+
+        // Now completion_item_resolve should find it in the cache
+        let item = CompletionItem {
+            label: "read_csv".to_string(),
+            data: Some(serde_json::json!({"topic": "read_csv", "package": "readr"})),
+            ..Default::default()
+        };
+        let resolved = super::completion_item_resolve(item, &cache);
+
+        assert!(
+            resolved.documentation.is_some(),
+            "Resolve should find help text cached by hover"
+        );
+    }
+
+    /// Test that base package exports have correct package attribution in completions.
+    #[test]
+    fn test_completion_base_package_attribution() {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Build a PackageLibrary with base packages set, then wrap in Arc
+            let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+            let mut base_pkgs = std::collections::HashSet::new();
+            base_pkgs.insert("base".to_string());
+            base_pkgs.insert("utils".to_string());
+            pkg_lib.set_base_packages(base_pkgs);
+            state.package_library = std::sync::Arc::new(pkg_lib);
+
+            // Insert per-package exports (uses interior mutability, works through Arc)
+            let mut base_exports = std::collections::HashSet::new();
+            base_exports.insert("source".to_string());
+            base_exports.insert("cat".to_string());
+            let base_info = PackageInfo::new("base".to_string(), base_exports);
+            state.package_library.insert_package(base_info).await;
+
+            let mut utils_exports = std::collections::HashSet::new();
+            utils_exports.insert("read.csv".to_string());
+            let utils_info = PackageInfo::new("utils".to_string(), utils_exports);
+            state.package_library.insert_package(utils_info).await;
+
+            state.package_library_ready = true;
+
+            // Create a document with no library() calls - base exports should still appear
+            let code = "x <- ";
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(0, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // "source" should appear with {base} attribution
+                let source_item = items
+                    .iter()
+                    .find(|i| i.label == "source")
+                    .expect("Should find 'source' in completions");
+                assert_eq!(source_item.detail.as_deref(), Some("{base}"));
+                assert!(
+                    source_item.data.is_some(),
+                    "source should have data for resolve"
+                );
+
+                // "read.csv" should appear with {utils} attribution
+                let read_csv = items
+                    .iter()
+                    .find(|i| i.label == "read.csv")
+                    .expect("Should find 'read.csv' in completions");
+                assert_eq!(read_csv.detail.as_deref(), Some("{utils}"));
+                assert!(
+                    read_csv.data.is_some(),
+                    "read.csv should have data for resolve"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    // ========================================================================
     // Backward Directive Path Resolution Tests
     // Tests for fix-backward-directive-path-resolution spec
     // Validates: Requirements 1.2, 3.2
@@ -7797,8 +8321,8 @@ x <- "#;
                 let declared_item = declared_items[0];
                 assert_eq!(
                     declared_item.kind,
-                    Some(CompletionItemKind::VARIABLE),
-                    "Requirement 6.4: Declared variable should have CompletionItemKind::VARIABLE"
+                    Some(CompletionItemKind::FIELD),
+                    "Requirement 6.4: Declared variable should have CompletionItemKind::FIELD (aligned with R-LS)"
                 );
             } else {
                 panic!("Expected CompletionResponse::Array");
@@ -7938,18 +8462,16 @@ x <- "#;
 
             if let Some(CompletionResponse::Array(items)) = completions {
                 // Find declared variable
-                let var_items: Vec<_> = items
-                    .iter()
-                    .filter(|item| item.label == "my_var")
-                    .collect();
+                let var_items: Vec<_> =
+                    items.iter().filter(|item| item.label == "my_var").collect();
                 assert!(
                     !var_items.is_empty(),
                     "Declared variable 'my_var' should appear in completions"
                 );
                 assert_eq!(
                     var_items[0].kind,
-                    Some(CompletionItemKind::VARIABLE),
-                    "Declared variable should have VARIABLE kind"
+                    Some(CompletionItemKind::FIELD),
+                    "Declared variable should have FIELD kind (aligned with R-LS)"
                 );
 
                 // Find declared function
@@ -8009,7 +8531,8 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "x");
-        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+        // 42 is detected as Number type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Number);
 
         // Check range spans entire assignment
         assert_eq!(symbols[0].range.start.line, 0);
@@ -8033,7 +8556,8 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "y");
-        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+        // 100 is detected as Number type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Number);
     }
 
     #[test]
@@ -8045,7 +8569,8 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "z");
-        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+        // 'global' is detected as String type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::String);
     }
 
     #[test]
@@ -8057,11 +8582,199 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "answer");
-        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+        // 42 is detected as Number type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Number);
 
         // Check selection_range is the RHS identifier
         assert_eq!(symbols[0].selection_range.start.character, 6); // "answer" starts at position 6
         assert_eq!(symbols[0].selection_range.end.character, 12); // "answer" ends at position 12
+    }
+
+    // ============================================================================
+    // Tests for CompletionItemKind alignment with R-LS
+    // ============================================================================
+
+    #[test]
+    fn test_r_constants_have_constant_kind() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionItemKind, CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let code = r#"x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(0, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some());
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Check R constants
+                let constants = vec![
+                    "TRUE",
+                    "FALSE",
+                    "NULL",
+                    "NA",
+                    "Inf",
+                    "NaN",
+                    "NA_integer_",
+                    "NA_real_",
+                    "NA_complex_",
+                    "NA_character_",
+                ];
+
+                for const_name in constants {
+                    let const_items: Vec<_> = items
+                        .iter()
+                        .filter(|item| item.label == const_name)
+                        .collect();
+
+                    assert!(
+                        !const_items.is_empty(),
+                        "R constant '{}' should appear in completions",
+                        const_name
+                    );
+                    assert_eq!(
+                        const_items[0].kind,
+                        Some(CompletionItemKind::CONSTANT),
+                        "R constant '{}' should have CONSTANT kind, not KEYWORD",
+                        const_name
+                    );
+                }
+
+                // Check that regular keywords still use KEYWORD kind
+                let keyword_items: Vec<_> =
+                    items.iter().filter(|item| item.label == "if").collect();
+                assert!(!keyword_items.is_empty());
+                assert_eq!(keyword_items[0].kind, Some(CompletionItemKind::KEYWORD));
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    #[test]
+    fn test_local_variables_use_field_kind() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionItemKind, CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let code = r#"my_var <- 42
+my_func <- function(x) { x + 1 }
+result <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(2, 10);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some());
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Check that variable uses FIELD kind (not VARIABLE)
+                let var_items: Vec<_> =
+                    items.iter().filter(|item| item.label == "my_var").collect();
+                assert!(
+                    !var_items.is_empty(),
+                    "Variable should appear in completions"
+                );
+                assert_eq!(
+                    var_items[0].kind,
+                    Some(CompletionItemKind::FIELD),
+                    "Non-function variable should have FIELD kind, not VARIABLE (aligns with R-LS)"
+                );
+
+                // Check that function still uses FUNCTION kind
+                let func_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "my_func")
+                    .collect();
+                assert!(
+                    !func_items.is_empty(),
+                    "Function should appear in completions"
+                );
+                assert_eq!(
+                    func_items[0].kind,
+                    Some(CompletionItemKind::FUNCTION),
+                    "Function should have FUNCTION kind"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    #[test]
+    fn test_completion_sort_text_applied() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let code = r#"local_var <- 1
+x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(1, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some());
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Check that local variable has scope sort prefix
+                let local_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "local_var")
+                    .collect();
+
+                if !local_items.is_empty() {
+                    assert!(
+                        local_items[0].sort_text.is_some(),
+                        "Completion items should have sortText"
+                    );
+                    assert!(
+                        local_items[0].sort_text.as_ref().unwrap().starts_with("1-"),
+                        "Local symbols should have scope prefix (1-), got: {:?}",
+                        local_items[0].sort_text
+                    );
+                }
+
+                // Check that keywords have keyword sort prefix
+                let keyword_items: Vec<_> =
+                    items.iter().filter(|item| item.label == "if").collect();
+
+                if !keyword_items.is_empty() {
+                    assert!(
+                        keyword_items[0].sort_text.is_some(),
+                        "Keywords should have sortText"
+                    );
+                    assert!(
+                        keyword_items[0]
+                            .sort_text
+                            .as_ref()
+                            .unwrap()
+                            .starts_with("5-"),
+                        "Keywords should have keyword prefix (5-), got: {:?}",
+                        keyword_items[0].sort_text
+                    );
+                }
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
     }
 
     #[test]
@@ -8079,7 +8792,10 @@ x <- "#;
         // For now, this will be classified as Variable since the immediate LHS is not function_definition
         // This is acceptable behavior - the classify_symbol() method in task 2.3 will handle this better
         assert!(
-            matches!(symbols[0].kind, DocumentSymbolKind::Variable | DocumentSymbolKind::Function),
+            matches!(
+                symbols[0].kind,
+                DocumentSymbolKind::Variable | DocumentSymbolKind::Function
+            ),
             "Expected Variable or Function, got {:?}",
             symbols[0].kind
         );
@@ -8094,9 +8810,11 @@ x <- "#;
 
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[0].name, "a");
-        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+        // 1 is detected as Number type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Number);
         assert_eq!(symbols[1].name, "b");
-        assert!(matches!(symbols[1].kind, DocumentSymbolKind::Variable));
+        // 2 is detected as Number type
+        assert_eq!(symbols[1].kind, DocumentSymbolKind::Number);
         assert_eq!(symbols[2].name, "c");
         assert!(matches!(symbols[2].kind, DocumentSymbolKind::Function));
     }
@@ -8320,9 +9038,11 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "A");
-        assert!(
-            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
-            "Single char should be classified as VARIABLE, got {:?}",
+        // Single char is not constant, and 1 is detected as Number
+        assert_eq!(
+            symbols[0].kind,
+            DocumentSymbolKind::Number,
+            "Single char with numeric value should be Number, got {:?}",
             symbols[0].kind
         );
     }
@@ -8337,9 +9057,11 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "MaxValue");
-        assert!(
-            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
-            "Mixed case should be classified as VARIABLE, got {:?}",
+        // Mixed case is not constant, and 100 is detected as Number
+        assert_eq!(
+            symbols[0].kind,
+            DocumentSymbolKind::Number,
+            "Mixed case with numeric value should be Number, got {:?}",
             symbols[0].kind
         );
     }
@@ -8354,9 +9076,11 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "my_var");
-        assert!(
-            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
-            "Lowercase should be classified as VARIABLE, got {:?}",
+        // Lowercase is not constant, and 42 is detected as Number
+        assert_eq!(
+            symbols[0].kind,
+            DocumentSymbolKind::Number,
+            "Lowercase with numeric value should be Number, got {:?}",
             symbols[0].kind
         );
     }
@@ -8467,9 +9191,11 @@ x <- "#;
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "result");
-        assert!(
-            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
-            "list() call should be classified as VARIABLE, got {:?}",
+        // list() is now detected as List type (aligned with R-LS)
+        assert_eq!(
+            symbols[0].kind,
+            DocumentSymbolKind::List,
+            "list() call should be classified as List, got {:?}",
             symbols[0].kind
         );
     }
@@ -8602,9 +9328,18 @@ x <- "#;
 
         let detail = symbols[0].detail.as_ref().unwrap();
         // Should be truncated with "..." at the end
-        assert!(detail.ends_with("..."), "Detail should end with '...': {}", detail);
+        assert!(
+            detail.ends_with("..."),
+            "Detail should end with '...': {}",
+            detail
+        );
         // Total length should be at most 60 characters
-        assert!(detail.len() <= 60, "Detail should be at most 60 chars, got {}: {}", detail.len(), detail);
+        assert!(
+            detail.len() <= 60,
+            "Detail should be at most 60 chars, got {}: {}",
+            detail.len(),
+            detail
+        );
     }
 
     #[test]
@@ -8619,7 +9354,11 @@ x <- "#;
         assert_eq!(symbols.len(), 1);
         let detail = symbols[0].detail.as_ref().unwrap();
         // Should not be truncated if exactly 60 chars
-        assert!(!detail.ends_with("...") || detail.len() <= 60, "Detail: {}", detail);
+        assert!(
+            !detail.ends_with("...") || detail.len() <= 60,
+            "Detail: {}",
+            detail
+        );
     }
 
     #[test]
@@ -8812,7 +9551,8 @@ setMethod("show", "MyClass", function(object) { print(object@value) })
 
         assert!(matches!(func.kind, DocumentSymbolKind::Function));
         assert!(matches!(class.kind, DocumentSymbolKind::Class));
-        assert!(matches!(var.kind, DocumentSymbolKind::Variable));
+        // 42 is detected as Number type
+        assert!(matches!(var.kind, DocumentSymbolKind::Number));
         assert!(matches!(method.kind, DocumentSymbolKind::Method));
     }
 
@@ -9044,7 +9784,10 @@ setMethod("show", "MyClass", function(object) { print(object@value) })
         let extractor = SymbolExtractor::new(code, tree.root_node());
         let symbols = extractor.extract_all();
 
-        let section = symbols.iter().find(|s| s.name == "Indented Section").unwrap();
+        let section = symbols
+            .iter()
+            .find(|s| s.name == "Indented Section")
+            .unwrap();
         assert!(matches!(section.kind, DocumentSymbolKind::Module));
     }
 
@@ -9195,7 +9938,10 @@ setMethod("show", "MyClass", function(object) { print(object@value) })
         let extractor = SymbolExtractor::new(code, tree.root_node());
         let symbols = extractor.extract_all();
 
-        let section = symbols.iter().find(|s| s.name == "日本語セクション").unwrap();
+        let section = symbols
+            .iter()
+            .find(|s| s.name == "日本語セクション")
+            .unwrap();
         assert!(matches!(section.kind, DocumentSymbolKind::Module));
         // The range should cover the entire line in UTF-16 code units
         assert_eq!(section.range.start.character, 0);
@@ -9534,7 +10280,10 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_classify_delimiter_line_all_hashes() {
-        assert_eq!(classify_delimiter_line("################"), Some(DelimiterKind::Hash));
+        assert_eq!(
+            classify_delimiter_line("################"),
+            Some(DelimiterKind::Hash)
+        );
     }
 
     #[test]
@@ -9549,27 +10298,42 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_classify_delimiter_line_equals() {
-        assert_eq!(classify_delimiter_line("# ================"), Some(DelimiterKind::Equals));
+        assert_eq!(
+            classify_delimiter_line("# ================"),
+            Some(DelimiterKind::Equals)
+        );
     }
 
     #[test]
     fn test_classify_delimiter_line_dashes() {
-        assert_eq!(classify_delimiter_line("# ----------------"), Some(DelimiterKind::Dash));
+        assert_eq!(
+            classify_delimiter_line("# ----------------"),
+            Some(DelimiterKind::Dash)
+        );
     }
 
     #[test]
     fn test_classify_delimiter_line_asterisks() {
-        assert_eq!(classify_delimiter_line("# ****************"), Some(DelimiterKind::Asterisk));
+        assert_eq!(
+            classify_delimiter_line("# ****************"),
+            Some(DelimiterKind::Asterisk)
+        );
     }
 
     #[test]
     fn test_classify_delimiter_line_plus() {
-        assert_eq!(classify_delimiter_line("# ++++++++++++++++"), Some(DelimiterKind::Plus));
+        assert_eq!(
+            classify_delimiter_line("# ++++++++++++++++"),
+            Some(DelimiterKind::Plus)
+        );
     }
 
     #[test]
     fn test_classify_delimiter_line_hash_after_hash_space() {
-        assert_eq!(classify_delimiter_line("# ################"), Some(DelimiterKind::Hash));
+        assert_eq!(
+            classify_delimiter_line("# ################"),
+            Some(DelimiterKind::Hash)
+        );
     }
 
     #[test]
@@ -9599,8 +10363,14 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_classify_delimiter_line_leading_whitespace() {
-        assert_eq!(classify_delimiter_line("  ################"), Some(DelimiterKind::Hash));
-        assert_eq!(classify_delimiter_line("  # ================"), Some(DelimiterKind::Equals));
+        assert_eq!(
+            classify_delimiter_line("  ################"),
+            Some(DelimiterKind::Hash)
+        );
+        assert_eq!(
+            classify_delimiter_line("  # ================"),
+            Some(DelimiterKind::Equals)
+        );
     }
 
     // ========================================================================
@@ -9609,22 +10379,34 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_extract_banner_name_basic() {
-        assert_eq!(extract_banner_name("# Section Name"), Some(("Section Name".to_string(), 1)));
+        assert_eq!(
+            extract_banner_name("# Section Name"),
+            Some(("Section Name".to_string(), 1))
+        );
     }
 
     #[test]
     fn test_extract_banner_name_with_trailing_hash() {
-        assert_eq!(extract_banner_name("# Section Name #"), Some(("Section Name".to_string(), 1)));
+        assert_eq!(
+            extract_banner_name("# Section Name #"),
+            Some(("Section Name".to_string(), 1))
+        );
     }
 
     #[test]
     fn test_extract_banner_name_with_trailing_hashes() {
-        assert_eq!(extract_banner_name("# Section Name ###"), Some(("Section Name".to_string(), 1)));
+        assert_eq!(
+            extract_banner_name("# Section Name ###"),
+            Some(("Section Name".to_string(), 1))
+        );
     }
 
     #[test]
     fn test_extract_banner_name_padded() {
-        assert_eq!(extract_banner_name("#  My Analysis  "), Some(("My Analysis".to_string(), 1)));
+        assert_eq!(
+            extract_banner_name("#  My Analysis  "),
+            Some(("My Analysis".to_string(), 1))
+        );
     }
 
     #[test]
@@ -9654,17 +10436,26 @@ result <- data %>% filter(x > 0)
 
     #[test]
     fn test_extract_banner_name_multiple_leading_hashes() {
-        assert_eq!(extract_banner_name("## Section Name ##"), Some(("Section Name".to_string(), 2)));
+        assert_eq!(
+            extract_banner_name("## Section Name ##"),
+            Some(("Section Name".to_string(), 2))
+        );
     }
 
     #[test]
     fn test_extract_banner_name_with_embedded_dash() {
-        assert_eq!(extract_banner_name("# My-Analysis"), Some(("My-Analysis".to_string(), 1)));
+        assert_eq!(
+            extract_banner_name("# My-Analysis"),
+            Some(("My-Analysis".to_string(), 1))
+        );
     }
 
     #[test]
     fn test_extract_banner_name_with_embedded_plus() {
-        assert_eq!(extract_banner_name("# Data+Processing"), Some(("Data+Processing".to_string(), 1)));
+        assert_eq!(
+            extract_banner_name("# Data+Processing"),
+            Some(("Data+Processing".to_string(), 1))
+        );
     }
 
     // ========================================================================
@@ -9996,12 +10787,24 @@ y <- 2";
             name: "Section 1".to_string(),
             kind: DocumentSymbolKind::Module,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 20 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 20 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
             },
             detail: None,
             section_level: Some(1),
@@ -10027,12 +10830,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10042,12 +10857,24 @@ y <- 2";
                 name: "Section 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10074,12 +10901,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10089,12 +10928,24 @@ y <- 2";
                 name: "Section 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 20 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 20 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10104,12 +10955,24 @@ y <- 2";
                 name: "Section 3".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 7, character: 0 },
-                    end: Position { line: 7, character: 20 },
+                    start: Position {
+                        line: 7,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 7,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 7, character: 0 },
-                    end: Position { line: 7, character: 20 },
+                    start: Position {
+                        line: 7,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 7,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10139,12 +11002,24 @@ y <- 2";
                 name: "Section 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10154,12 +11029,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10171,8 +11058,16 @@ y <- 2";
         builder.compute_section_ranges();
 
         // Find sections by name since order in vec may differ
-        let section1 = builder.symbols.iter().find(|s| s.name == "Section 1").unwrap();
-        let section2 = builder.symbols.iter().find(|s| s.name == "Section 2").unwrap();
+        let section1 = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "Section 1")
+            .unwrap();
+        let section2 = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "Section 2")
+            .unwrap();
 
         // Section 1: line 0 to line 4
         assert_eq!(section1.range.start.line, 0);
@@ -10190,12 +11085,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 3, character: 1 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 7 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None, // Not a section
@@ -10205,12 +11112,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10220,12 +11139,24 @@ y <- 2";
                 name: "Section 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10237,9 +11168,21 @@ y <- 2";
         builder.compute_section_ranges();
 
         // Find symbols by name
-        let func = builder.symbols.iter().find(|s| s.name == "my_func").unwrap();
-        let section1 = builder.symbols.iter().find(|s| s.name == "Section 1").unwrap();
-        let section2 = builder.symbols.iter().find(|s| s.name == "Section 2").unwrap();
+        let func = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "my_func")
+            .unwrap();
+        let section1 = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "Section 1")
+            .unwrap();
+        let section2 = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "Section 2")
+            .unwrap();
 
         // Function should be unchanged
         assert_eq!(func.range.start.line, 1);
@@ -10260,12 +11203,24 @@ y <- 2";
             name: "my_func".to_string(),
             kind: DocumentSymbolKind::Function,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 2, character: 1 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 2,
+                    character: 1,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 7 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 7,
+                },
             },
             detail: Some("()".to_string()),
             section_level: None,
@@ -10297,12 +11252,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10312,12 +11279,24 @@ y <- 2";
                 name: "Section 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 20 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 20 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10343,12 +11322,24 @@ y <- 2";
             name: "Section 1".to_string(),
             kind: DocumentSymbolKind::Module,
             range: Range {
-                start: Position { line: 2, character: 0 },
-                end: Position { line: 2, character: 20 },
+                start: Position {
+                    line: 2,
+                    character: 0,
+                },
+                end: Position {
+                    line: 2,
+                    character: 20,
+                },
             },
             selection_range: Range {
-                start: Position { line: 2, character: 0 },
-                end: Position { line: 2, character: 20 },
+                start: Position {
+                    line: 2,
+                    character: 0,
+                },
+                end: Position {
+                    line: 2,
+                    character: 20,
+                },
             },
             detail: None,
             section_level: Some(1),
@@ -10375,12 +11366,24 @@ y <- 2";
             name: "Section 1".to_string(),
             kind: DocumentSymbolKind::Module,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 20 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 20 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
             },
             detail: None,
             section_level: Some(1),
@@ -10405,12 +11408,24 @@ y <- 2";
                 name: "Parent Section".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 25 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 25,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 25 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10420,12 +11435,24 @@ y <- 2";
                 name: "Child Subsection".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 28 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 28,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 28 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 28,
+                    },
                 },
                 detail: None,
                 section_level: Some(2),
@@ -10435,12 +11462,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 6, character: 0 },
-                    end: Position { line: 8, character: 1 },
+                    start: Position {
+                        line: 6,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 8,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 6, character: 0 },
-                    end: Position { line: 6, character: 7 },
+                    start: Position {
+                        line: 6,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10452,14 +11491,29 @@ y <- 2";
         builder.compute_section_ranges();
 
         // Find symbols by name
-        let parent = builder.symbols.iter().find(|s| s.name == "Parent Section").unwrap();
-        let child = builder.symbols.iter().find(|s| s.name == "Child Subsection").unwrap();
-        let func = builder.symbols.iter().find(|s| s.name == "my_func").unwrap();
+        let parent = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "Parent Section")
+            .unwrap();
+        let child = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "Child Subsection")
+            .unwrap();
+        let func = builder
+            .symbols
+            .iter()
+            .find(|s| s.name == "my_func")
+            .unwrap();
 
         // Level-1 parent section: should span from line 0 to line 9 (EOF)
         // because there is no subsequent section at level <= 1
         assert_eq!(parent.range.start.line, 0);
-        assert_eq!(parent.range.end.line, 9, "Parent section must span to EOF over subsection");
+        assert_eq!(
+            parent.range.end.line, 9,
+            "Parent section must span to EOF over subsection"
+        );
 
         // Level-2 child subsection: should also span to line 9 (EOF)
         // because there is no subsequent section at level <= 2
@@ -10497,12 +11551,24 @@ y <- 2";
                 name: "Level 1 Section".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 25 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 25,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 25 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10512,12 +11578,24 @@ y <- 2";
                 name: "func_in_l1".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 2, character: 1 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 10 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 10,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10527,12 +11605,24 @@ y <- 2";
                 name: "Level 2 Section".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 25 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 25,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 25 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(2),
@@ -10542,12 +11632,24 @@ y <- 2";
                 name: "func_in_l2".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 4, character: 0 },
-                    end: Position { line: 5, character: 1 },
+                    start: Position {
+                        line: 4,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 0 },
-                    end: Position { line: 4, character: 10 },
+                    start: Position {
+                        line: 4,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 10,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10557,12 +11659,24 @@ y <- 2";
                 name: "Level 3 Section".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 6, character: 0 },
-                    end: Position { line: 6, character: 25 },
+                    start: Position {
+                        line: 6,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 25,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 6, character: 0 },
-                    end: Position { line: 6, character: 25 },
+                    start: Position {
+                        line: 6,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(3),
@@ -10572,12 +11686,24 @@ y <- 2";
                 name: "func_in_l3".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 7, character: 0 },
-                    end: Position { line: 8, character: 1 },
+                    start: Position {
+                        line: 7,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 8,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 7, character: 0 },
-                    end: Position { line: 7, character: 10 },
+                    start: Position {
+                        line: 7,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 7,
+                        character: 10,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10587,12 +11713,24 @@ y <- 2";
                 name: "Another Level 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 10, character: 0 },
-                    end: Position { line: 10, character: 25 },
+                    start: Position {
+                        line: 10,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 25,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 10, character: 0 },
-                    end: Position { line: 10, character: 25 },
+                    start: Position {
+                        line: 10,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10610,13 +11748,21 @@ y <- 2";
 
         // Level 1 Section should contain: func_in_l1 and Level 2 Section
         let l1_children = result[0].children.as_ref().unwrap();
-        assert_eq!(l1_children.len(), 2, "Level 1 should have 2 children (func + level-2 section)");
+        assert_eq!(
+            l1_children.len(),
+            2,
+            "Level 1 should have 2 children (func + level-2 section)"
+        );
         assert_eq!(l1_children[0].name, "func_in_l1");
         assert_eq!(l1_children[1].name, "Level 2 Section");
 
         // Level 2 Section should contain: func_in_l2 and Level 3 Section
         let l2_children = l1_children[1].children.as_ref().unwrap();
-        assert_eq!(l2_children.len(), 2, "Level 2 should have 2 children (func + level-3 section)");
+        assert_eq!(
+            l2_children.len(),
+            2,
+            "Level 2 should have 2 children (func + level-3 section)"
+        );
         assert_eq!(l2_children[0].name, "func_in_l2");
         assert_eq!(l2_children[1].name, "Level 3 Section");
 
@@ -10632,7 +11778,6 @@ y <- 2";
             "Second level-1 section should have no children"
         );
     }
-
 
     // ========================================================================
     // Tests for nest_in_sections()
@@ -10655,12 +11800,24 @@ y <- 2";
                 name: "func1".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 2, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 5 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10670,12 +11827,24 @@ y <- 2";
                 name: "func2".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 5, character: 1 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 5 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10700,12 +11869,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 9, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 9,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10715,12 +11896,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 4, character: 1 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 7 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10747,12 +11940,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 19,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1), // # Section
@@ -10762,12 +11967,24 @@ y <- 2";
                 name: "Subsection 1.1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 14, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 14,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 25 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(2), // ## Subsection
@@ -10777,12 +11994,24 @@ y <- 2";
                 name: "Section 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 20, character: 0 },
-                    end: Position { line: 29, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 20,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 29,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 20, character: 0 },
-                    end: Position { line: 20, character: 20 },
+                    start: Position {
+                        line: 20,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 20,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1), // # Section
@@ -10814,12 +12043,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 19,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10829,12 +12070,24 @@ y <- 2";
                 name: "Subsection 1.1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 14, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 14,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 25 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: Some(2),
@@ -10844,12 +12097,24 @@ y <- 2";
                 name: "nested_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 7, character: 0 },
-                    end: Position { line: 9, character: 1 },
+                    start: Position {
+                        line: 7,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 9,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 7, character: 0 },
-                    end: Position { line: 7, character: 11 },
+                    start: Position {
+                        line: 7,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 7,
+                        character: 11,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -10870,7 +12135,10 @@ y <- 2";
 
         // Subsection 1.1 should have nested_func as a child
         assert_eq!(builder.symbols[0].children[0].children.len(), 1);
-        assert_eq!(builder.symbols[0].children[0].children[0].name, "nested_func");
+        assert_eq!(
+            builder.symbols[0].children[0].children[0].name,
+            "nested_func"
+        );
     }
 
     #[test]
@@ -10881,12 +12149,24 @@ y <- 2";
                 name: "Level 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 29, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 29,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 15 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 15,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10896,12 +12176,24 @@ y <- 2";
                 name: "Level 2".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 24, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 24,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 15 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 15,
+                    },
                 },
                 detail: None,
                 section_level: Some(2),
@@ -10911,12 +12203,24 @@ y <- 2";
                 name: "Level 3".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 10, character: 0 },
-                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 10,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 19,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 10, character: 0 },
-                    end: Position { line: 10, character: 15 },
+                    start: Position {
+                        line: 10,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 15,
+                    },
                 },
                 detail: None,
                 section_level: Some(3),
@@ -10948,12 +12252,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 29, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 29,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -10963,12 +12279,24 @@ y <- 2";
                 name: "Subsection A".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 14, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 14,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(2),
@@ -10978,12 +12306,24 @@ y <- 2";
                 name: "Subsection B".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 15, character: 0 },
-                    end: Position { line: 24, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 15,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 24,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 15, character: 0 },
-                    end: Position { line: 15, character: 20 },
+                    start: Position {
+                        line: 15,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 15,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(2),
@@ -11012,12 +12352,24 @@ y <- 2";
                 name: "early_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 2, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 10 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 10,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11027,12 +12379,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 19, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 19,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -11060,12 +12424,24 @@ y <- 2";
                 name: "Section 1".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 9, character: LSP_EOL_CHARACTER },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 9,
+                        character: LSP_EOL_CHARACTER,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -11075,12 +12451,24 @@ y <- 2";
                 name: "late_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 15, character: 0 },
-                    end: Position { line: 17, character: 1 },
+                    start: Position {
+                        line: 15,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 17,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 15, character: 0 },
-                    end: Position { line: 15, character: 9 },
+                    start: Position {
+                        line: 15,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 15,
+                        character: 9,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11120,12 +12508,24 @@ y <- 2";
                 name: "MY_CONST".to_string(),
                 kind: DocumentSymbolKind::Constant,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 15 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 15,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 8 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 8,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11135,12 +12535,24 @@ y <- 2";
                 name: "my_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 10 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 10,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 6 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 6,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11169,12 +12581,24 @@ y <- 2";
                 name: "outer".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 4, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 5 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11184,12 +12608,24 @@ y <- 2";
                 name: "inner_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 2, character: 17 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 17,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 2, character: 11 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 11,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11222,12 +12658,24 @@ y <- 2";
                 name: "outer".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 8, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 8,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 5 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11237,12 +12685,24 @@ y <- 2";
                 name: "inner".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 6, character: 3 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 3,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 2, character: 7 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11252,12 +12712,24 @@ y <- 2";
                 name: "deepest".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 4, character: 4 },
-                    end: Position { line: 4, character: 16 },
+                    start: Position {
+                        line: 4,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 16,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 4 },
-                    end: Position { line: 4, character: 11 },
+                    start: Position {
+                        line: 4,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 11,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11297,12 +12769,24 @@ y <- 2";
                 name: "level1".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 12, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 12,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 6 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 6,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11312,12 +12796,24 @@ y <- 2";
                 name: "level2".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 10, character: 3 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 3,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 2, character: 8 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 8,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11327,12 +12823,24 @@ y <- 2";
                 name: "level3".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 4, character: 4 },
-                    end: Position { line: 8, character: 5 },
+                    start: Position {
+                        line: 4,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 8,
+                        character: 5,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 4 },
-                    end: Position { line: 4, character: 10 },
+                    start: Position {
+                        line: 4,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 10,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11342,12 +12850,24 @@ y <- 2";
                 name: "x".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 6, character: 6 },
-                    end: Position { line: 6, character: 12 },
+                    start: Position {
+                        line: 6,
+                        character: 6,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 12,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 6, character: 6 },
-                    end: Position { line: 6, character: 7 },
+                    start: Position {
+                        line: 6,
+                        character: 6,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 7,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11372,7 +12892,10 @@ y <- 2";
 
         // level3 -> x
         assert_eq!(builder.symbols[0].children[0].children[0].children.len(), 1);
-        assert_eq!(builder.symbols[0].children[0].children[0].children[0].name, "x");
+        assert_eq!(
+            builder.symbols[0].children[0].children[0].children[0].name,
+            "x"
+        );
     }
 
     #[test]
@@ -11386,12 +12909,24 @@ y <- 2";
                 name: "func1".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 2, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 5 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11401,12 +12936,24 @@ y <- 2";
                 name: "func2".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 5, character: 1 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 5 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11434,12 +12981,24 @@ y <- 2";
                 name: "top_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 12 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 12,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 7 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11449,12 +13008,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 4, character: 1 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 7 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11482,12 +13053,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 2, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 7 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11497,12 +13080,24 @@ y <- 2";
                 name: "after_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 4, character: 0 },
-                    end: Position { line: 4, character: 14 },
+                    start: Position {
+                        line: 4,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 14,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 0 },
-                    end: Position { line: 4, character: 9 },
+                    start: Position {
+                        line: 4,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 9,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11533,12 +13128,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 6, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 7 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11548,12 +13155,24 @@ y <- 2";
                 name: "var1".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 2, character: 12 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 12,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 2 },
-                    end: Position { line: 2, character: 6 },
+                    start: Position {
+                        line: 2,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 6,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11563,12 +13182,24 @@ y <- 2";
                 name: "var2".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 3, character: 2 },
-                    end: Position { line: 3, character: 12 },
+                    start: Position {
+                        line: 3,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 12,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 2 },
-                    end: Position { line: 3, character: 6 },
+                    start: Position {
+                        line: 3,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 6,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11578,12 +13209,24 @@ y <- 2";
                 name: "var3".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 4, character: 2 },
-                    end: Position { line: 4, character: 12 },
+                    start: Position {
+                        line: 4,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 12,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 2 },
-                    end: Position { line: 4, character: 6 },
+                    start: Position {
+                        line: 4,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 6,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11614,54 +13257,88 @@ y <- 2";
         // my_func <- function() {  # line 2-6
         //   inner_var <- 1         # line 4
         // }
-        let symbols = vec![
-            RawSymbol {
-                name: "Section 1".to_string(),
-                kind: DocumentSymbolKind::Module,
-                range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 9, character: LSP_EOL_CHARACTER },
+        let symbols = vec![RawSymbol {
+            name: "Section 1".to_string(),
+            kind: DocumentSymbolKind::Module,
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
                 },
-                selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 15 },
+                end: Position {
+                    line: 9,
+                    character: LSP_EOL_CHARACTER,
                 },
-                detail: None,
-                section_level: Some(1),
-                children: vec![
-                    RawSymbol {
-                        name: "my_func".to_string(),
-                        kind: DocumentSymbolKind::Function,
-                        range: Range {
-                            start: Position { line: 2, character: 0 },
-                            end: Position { line: 6, character: 1 },
-                        },
-                        selection_range: Range {
-                            start: Position { line: 2, character: 0 },
-                            end: Position { line: 2, character: 7 },
-                        },
-                        detail: Some("()".to_string()),
-                        section_level: None,
-                        children: Vec::new(),
-                    },
-                    RawSymbol {
-                        name: "inner_var".to_string(),
-                        kind: DocumentSymbolKind::Variable,
-                        range: Range {
-                            start: Position { line: 4, character: 2 },
-                            end: Position { line: 4, character: 16 },
-                        },
-                        selection_range: Range {
-                            start: Position { line: 4, character: 2 },
-                            end: Position { line: 4, character: 11 },
-                        },
-                        detail: None,
-                        section_level: None,
-                        children: Vec::new(),
-                    },
-                ],
             },
-        ];
+            selection_range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 15,
+                },
+            },
+            detail: None,
+            section_level: Some(1),
+            children: vec![
+                RawSymbol {
+                    name: "my_func".to_string(),
+                    kind: DocumentSymbolKind::Function,
+                    range: Range {
+                        start: Position {
+                            line: 2,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 6,
+                            character: 1,
+                        },
+                    },
+                    selection_range: Range {
+                        start: Position {
+                            line: 2,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 2,
+                            character: 7,
+                        },
+                    },
+                    detail: Some("()".to_string()),
+                    section_level: None,
+                    children: Vec::new(),
+                },
+                RawSymbol {
+                    name: "inner_var".to_string(),
+                    kind: DocumentSymbolKind::Variable,
+                    range: Range {
+                        start: Position {
+                            line: 4,
+                            character: 2,
+                        },
+                        end: Position {
+                            line: 4,
+                            character: 16,
+                        },
+                    },
+                    selection_range: Range {
+                        start: Position {
+                            line: 4,
+                            character: 2,
+                        },
+                        end: Position {
+                            line: 4,
+                            character: 11,
+                        },
+                    },
+                    detail: None,
+                    section_level: None,
+                    children: Vec::new(),
+                },
+            ],
+        }];
 
         let mut builder = HierarchyBuilder::new(symbols, 10);
         // nest_in_sections was already called (symbols are pre-nested in section)
@@ -11692,12 +13369,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 32 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 32,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 7 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11707,12 +13396,24 @@ y <- 2";
                 name: "x".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 0, character: 24 },
-                    end: Position { line: 0, character: 30 },
+                    start: Position {
+                        line: 0,
+                        character: 24,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 30,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 24 },
-                    end: Position { line: 0, character: 25 },
+                    start: Position {
+                        line: 0,
+                        character: 24,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 25,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11748,12 +13449,24 @@ y <- 2";
             name: "my_func".to_string(),
             kind: DocumentSymbolKind::Function,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 5, character: 1 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 5,
+                    character: 1,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 7 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 7,
+                },
             },
             detail: Some("(x, y)".to_string()),
             section_level: None,
@@ -11780,12 +13493,24 @@ y <- 2";
                 name: "outer_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 5, character: 1 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 10 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 10,
+                    },
                 },
                 detail: Some("(x)".to_string()),
                 section_level: None,
@@ -11795,12 +13520,24 @@ y <- 2";
                 name: "inner_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 2, character: 4 },
-                    end: Position { line: 2, character: 20 },
+                    start: Position {
+                        line: 2,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 4 },
-                    end: Position { line: 2, character: 13 },
+                    start: Position {
+                        line: 2,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 13,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11818,7 +13555,7 @@ y <- 2";
         let children = result[0].children.as_ref().unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, "inner_var");
-        assert_eq!(children[0].kind, SymbolKind::VARIABLE);
+        assert_eq!(children[0].kind, SymbolKind::FIELD); // Variable now maps to FIELD
     }
 
     #[test]
@@ -11829,12 +13566,24 @@ y <- 2";
                 name: "My Section".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 20 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 20,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -11844,12 +13593,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 5, character: 1 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 7 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 7,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -11878,12 +13639,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 10 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 10,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 7 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11893,12 +13666,24 @@ y <- 2";
                 name: "my_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 10 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 10,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 6 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 6,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11908,12 +13693,24 @@ y <- 2";
                 name: "MY_CONST".to_string(),
                 kind: DocumentSymbolKind::Constant,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 15 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 15,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 8 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 8,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11923,12 +13720,24 @@ y <- 2";
                 name: "MyClass".to_string(),
                 kind: DocumentSymbolKind::Class,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 20 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 7 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 7,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11938,12 +13747,24 @@ y <- 2";
                 name: "myMethod".to_string(),
                 kind: DocumentSymbolKind::Method,
                 range: Range {
-                    start: Position { line: 4, character: 0 },
-                    end: Position { line: 4, character: 20 },
+                    start: Position {
+                        line: 4,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 0 },
-                    end: Position { line: 4, character: 8 },
+                    start: Position {
+                        line: 4,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 8,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11953,12 +13774,24 @@ y <- 2";
                 name: "myGeneric".to_string(),
                 kind: DocumentSymbolKind::Interface,
                 range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 20 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 5, character: 0 },
-                    end: Position { line: 5, character: 9 },
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 9,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -11971,7 +13804,7 @@ y <- 2";
 
         assert_eq!(result.len(), 6);
         assert_eq!(result[0].kind, SymbolKind::FUNCTION);
-        assert_eq!(result[1].kind, SymbolKind::VARIABLE);
+        assert_eq!(result[1].kind, SymbolKind::FIELD); // Variable now maps to FIELD
         assert_eq!(result[2].kind, SymbolKind::CONSTANT);
         assert_eq!(result[3].kind, SymbolKind::CLASS);
         assert_eq!(result[4].kind, SymbolKind::METHOD);
@@ -11986,12 +13819,24 @@ y <- 2";
                 name: "Section".to_string(),
                 kind: DocumentSymbolKind::Module,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 15 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 15,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 15 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 15,
+                    },
                 },
                 detail: None,
                 section_level: Some(1),
@@ -12001,12 +13846,24 @@ y <- 2";
                 name: "outer".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 10, character: 1 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 5 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 section_level: None,
@@ -12016,12 +13873,24 @@ y <- 2";
                 name: "inner".to_string(),
                 kind: DocumentSymbolKind::Function,
                 range: Range {
-                    start: Position { line: 4, character: 4 },
-                    end: Position { line: 8, character: 5 },
+                    start: Position {
+                        line: 4,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 8,
+                        character: 5,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 4, character: 4 },
-                    end: Position { line: 4, character: 9 },
+                    start: Position {
+                        line: 4,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 4,
+                        character: 9,
+                    },
                 },
                 detail: Some("(x)".to_string()),
                 section_level: None,
@@ -12031,12 +13900,24 @@ y <- 2";
                 name: "deep_var".to_string(),
                 kind: DocumentSymbolKind::Variable,
                 range: Range {
-                    start: Position { line: 6, character: 8 },
-                    end: Position { line: 6, character: 20 },
+                    start: Position {
+                        line: 6,
+                        character: 8,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 6, character: 8 },
-                    end: Position { line: 6, character: 16 },
+                    start: Position {
+                        line: 6,
+                        character: 8,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 16,
+                    },
                 },
                 detail: None,
                 section_level: None,
@@ -12088,12 +13969,24 @@ y <- 2";
             name: "my_func".to_string(),
             kind: SymbolKind::FUNCTION,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 5, character: 1 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 5,
+                    character: 1,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 7 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 7,
+                },
             },
             detail: Some("(x, y)".to_string()),
             children: None,
@@ -12122,24 +14015,48 @@ y <- 2";
             name: "outer_func".to_string(),
             kind: SymbolKind::FUNCTION,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 10, character: 1 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 10,
+                    character: 1,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 10 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 10,
+                },
             },
             detail: Some("()".to_string()),
             children: Some(vec![DocumentSymbol {
                 name: "inner_var".to_string(),
                 kind: SymbolKind::VARIABLE,
                 range: Range {
-                    start: Position { line: 2, character: 4 },
-                    end: Position { line: 2, character: 20 },
+                    start: Position {
+                        line: 2,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 4 },
-                    end: Position { line: 2, character: 13 },
+                    start: Position {
+                        line: 2,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 13,
+                    },
                 },
                 detail: None,
                 children: None,
@@ -12154,13 +14071,13 @@ y <- 2";
         let result = flatten_document_symbols(&doc_symbols, &uri);
 
         assert_eq!(result.len(), 2);
-        
+
         // First symbol: outer_func (no container)
         assert_eq!(result[0].name, "outer_func");
         assert_eq!(result[0].kind, SymbolKind::FUNCTION);
         assert_eq!(result[0].location.uri, uri);
         assert!(result[0].container_name.is_none());
-        
+
         // Second symbol: inner_var (container = outer_func)
         assert_eq!(result[1].name, "inner_var");
         assert_eq!(result[1].kind, SymbolKind::VARIABLE);
@@ -12176,48 +14093,96 @@ y <- 2";
             name: "section".to_string(),
             kind: SymbolKind::MODULE,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 20, character: 0 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 20,
+                    character: 0,
+                },
             },
             selection_range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 15 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 15,
+                },
             },
             detail: None,
             children: Some(vec![DocumentSymbol {
                 name: "outer".to_string(),
                 kind: SymbolKind::FUNCTION,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 15, character: 1 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 15,
+                        character: 1,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 5 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 5,
+                    },
                 },
                 detail: Some("()".to_string()),
                 children: Some(vec![DocumentSymbol {
                     name: "inner".to_string(),
                     kind: SymbolKind::FUNCTION,
                     range: Range {
-                        start: Position { line: 4, character: 4 },
-                        end: Position { line: 10, character: 5 },
+                        start: Position {
+                            line: 4,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 10,
+                            character: 5,
+                        },
                     },
                     selection_range: Range {
-                        start: Position { line: 4, character: 4 },
-                        end: Position { line: 4, character: 9 },
+                        start: Position {
+                            line: 4,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 4,
+                            character: 9,
+                        },
                     },
                     detail: Some("(x)".to_string()),
                     children: Some(vec![DocumentSymbol {
                         name: "deep_var".to_string(),
                         kind: SymbolKind::VARIABLE,
                         range: Range {
-                            start: Position { line: 6, character: 8 },
-                            end: Position { line: 6, character: 20 },
+                            start: Position {
+                                line: 6,
+                                character: 8,
+                            },
+                            end: Position {
+                                line: 6,
+                                character: 20,
+                            },
                         },
                         selection_range: Range {
-                            start: Position { line: 6, character: 8 },
-                            end: Position { line: 6, character: 16 },
+                            start: Position {
+                                line: 6,
+                                character: 8,
+                            },
+                            end: Position {
+                                line: 6,
+                                character: 16,
+                            },
                         },
                         detail: None,
                         children: None,
@@ -12238,23 +14203,23 @@ y <- 2";
         let result = flatten_document_symbols(&doc_symbols, &uri);
 
         assert_eq!(result.len(), 4);
-        
+
         // section (no container)
         assert_eq!(result[0].name, "section");
         assert!(result[0].container_name.is_none());
-        
+
         // outer (container = section)
         assert_eq!(result[1].name, "outer");
         assert_eq!(result[1].container_name, Some("section".to_string()));
-        
+
         // inner (container = outer)
         assert_eq!(result[2].name, "inner");
         assert_eq!(result[2].container_name, Some("outer".to_string()));
-        
+
         // deep_var (container = inner)
         assert_eq!(result[3].name, "deep_var");
         assert_eq!(result[3].container_name, Some("inner".to_string()));
-        
+
         // All should have correct URI
         for sym in &result {
             assert_eq!(sym.location.uri, uri);
@@ -12270,12 +14235,24 @@ y <- 2";
                 name: "my_func".to_string(),
                 kind: SymbolKind::FUNCTION,
                 range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 10 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 10,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 0, character: 0 },
-                    end: Position { line: 0, character: 7 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
                 },
                 detail: None,
                 children: None,
@@ -12286,12 +14263,24 @@ y <- 2";
                 name: "my_var".to_string(),
                 kind: SymbolKind::VARIABLE,
                 range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 10 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 10,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 6 },
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 6,
+                    },
                 },
                 detail: None,
                 children: None,
@@ -12302,12 +14291,24 @@ y <- 2";
                 name: "MY_CONST".to_string(),
                 kind: SymbolKind::CONSTANT,
                 range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 15 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 15,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 2, character: 0 },
-                    end: Position { line: 2, character: 8 },
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 8,
+                    },
                 },
                 detail: None,
                 children: None,
@@ -12318,12 +14319,24 @@ y <- 2";
                 name: "MyClass".to_string(),
                 kind: SymbolKind::CLASS,
                 range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 20 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 20,
+                    },
                 },
                 selection_range: Range {
-                    start: Position { line: 3, character: 0 },
-                    end: Position { line: 3, character: 7 },
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 7,
+                    },
                 },
                 detail: None,
                 children: None,
@@ -12341,6 +14354,312 @@ y <- 2";
         assert_eq!(result[2].kind, SymbolKind::CONSTANT);
         assert_eq!(result[3].kind, SymbolKind::CLASS);
     }
+
+    // ============================================================================
+    // Tests for symbol kind alignment with R-LS
+    // ============================================================================
+
+    #[test]
+    fn test_debug_ast_structure() {
+        // Debug test to understand tree-sitter-r AST structure
+        let test_cases = vec![
+            ("x <- 42", "number"),
+            ("x <- TRUE", "boolean"),
+            ("x <- \"hello\"", "string"),
+            ("x <- NULL", "null"),
+            ("x <- c(1,2,3)", "array"),
+            ("x <- NA_integer_", "constant"),
+            ("x <- NA", "constant"),
+            ("x <- Inf", "constant"),
+            ("x <- NaN", "constant"),
+        ];
+
+        for (code, expected) in test_cases {
+            eprintln!("\n=== Testing: {} (expect {}) ===", code, expected);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+
+            // Find the binary_operator node
+            let mut cursor = root.walk();
+            for child in root.children(&mut cursor) {
+                if child.kind() == "binary_operator" {
+                    let mut op_cursor = child.walk();
+                    let children: Vec<_> = child.children(&mut op_cursor).collect();
+                    if children.len() >= 3 {
+                        let rhs = children[2];
+                        eprintln!("  RHS node kind: '{}'", rhs.kind());
+                        eprintln!("  RHS text: '{}'", rhs.utf8_text(code.as_bytes()).unwrap());
+
+                        // Print children of RHS if it has any
+                        let mut rhs_cursor = rhs.walk();
+                        let rhs_children: Vec<_> = rhs.children(&mut rhs_cursor).collect();
+                        if !rhs_children.is_empty() {
+                            eprintln!("  RHS has {} children:", rhs_children.len());
+                            for (i, child) in rhs_children.iter().enumerate() {
+                                eprintln!(
+                                    "    [{}] kind='{}' text='{}'",
+                                    i,
+                                    child.kind(),
+                                    child.utf8_text(code.as_bytes()).unwrap_or("<error>")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_boolean_symbol_detection() {
+        let code = r#"
+            flag <- TRUE
+            enabled <- FALSE
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "flag");
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Boolean);
+        assert_eq!(symbols[0].kind.to_lsp_kind(), SymbolKind::BOOLEAN);
+
+        assert_eq!(symbols[1].name, "enabled");
+        assert_eq!(symbols[1].kind, DocumentSymbolKind::Boolean);
+        assert_eq!(symbols[1].kind.to_lsp_kind(), SymbolKind::BOOLEAN);
+    }
+
+    #[test]
+    fn test_number_symbol_detection() {
+        let code = r#"
+            count <- 42
+            ratio <- 3.14
+            imaginary <- 2i
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert!(symbols.len() >= 3);
+        let count_sym = symbols.iter().find(|s| s.name == "count").unwrap();
+        assert_eq!(count_sym.kind, DocumentSymbolKind::Number);
+        assert_eq!(count_sym.kind.to_lsp_kind(), SymbolKind::NUMBER);
+
+        let ratio_sym = symbols.iter().find(|s| s.name == "ratio").unwrap();
+        assert_eq!(ratio_sym.kind, DocumentSymbolKind::Number);
+        assert_eq!(ratio_sym.kind.to_lsp_kind(), SymbolKind::NUMBER);
+
+        let imaginary_sym = symbols.iter().find(|s| s.name == "imaginary").unwrap();
+        assert_eq!(imaginary_sym.kind, DocumentSymbolKind::Number);
+        assert_eq!(imaginary_sym.kind.to_lsp_kind(), SymbolKind::NUMBER);
+    }
+
+    #[test]
+    fn test_string_symbol_detection() {
+        let code = r#"
+            name <- "test"
+            path <- 'data.csv'
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "name");
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::String);
+        assert_eq!(symbols[0].kind.to_lsp_kind(), SymbolKind::STRING);
+
+        assert_eq!(symbols[1].name, "path");
+        assert_eq!(symbols[1].kind, DocumentSymbolKind::String);
+        assert_eq!(symbols[1].kind.to_lsp_kind(), SymbolKind::STRING);
+    }
+
+    #[test]
+    fn test_null_symbol_detection() {
+        let code = r#"
+            empty <- NULL
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "empty");
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Null);
+        assert_eq!(symbols[0].kind.to_lsp_kind(), SymbolKind::NULL);
+    }
+
+    #[test]
+    fn test_array_symbol_detection() {
+        let code = r#"
+            nums <- c(1, 2, 3)
+            mat <- matrix(1:9, nrow=3)
+            arr <- array(1:27, dim=c(3,3,3))
+            vec <- vector("numeric", 10)
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 4);
+        for symbol in &symbols {
+            assert_eq!(symbol.kind, DocumentSymbolKind::Array);
+            assert_eq!(symbol.kind.to_lsp_kind(), SymbolKind::ARRAY);
+        }
+    }
+
+    #[test]
+    fn test_list_symbol_detection() {
+        let code = r#"
+            data <- list(a=1, b=2)
+            config <- list(
+                name = "test",
+                values = c(1, 2, 3)
+            )
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "data");
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::List);
+        assert_eq!(symbols[0].kind.to_lsp_kind(), SymbolKind::STRUCT);
+
+        assert_eq!(symbols[1].name, "config");
+        assert_eq!(symbols[1].kind, DocumentSymbolKind::List);
+        assert_eq!(symbols[1].kind.to_lsp_kind(), SymbolKind::STRUCT);
+    }
+
+    #[test]
+    fn test_symbol_type_precedence() {
+        let code = r#"
+            my_func <- function(x) { x + 1 }
+            MyClass <- R6Class("MyClass")
+            MAX_SIZE <- 100
+            flag <- TRUE
+            other <- some_call()
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let my_func = symbols.iter().find(|s| s.name == "my_func").unwrap();
+        assert_eq!(my_func.kind, DocumentSymbolKind::Function);
+
+        let my_class = symbols.iter().find(|s| s.name == "MyClass").unwrap();
+        assert_eq!(my_class.kind, DocumentSymbolKind::Class);
+
+        let max_size = symbols.iter().find(|s| s.name == "MAX_SIZE").unwrap();
+        assert_eq!(max_size.kind, DocumentSymbolKind::Constant);
+
+        let flag = symbols.iter().find(|s| s.name == "flag").unwrap();
+        assert_eq!(flag.kind, DocumentSymbolKind::Boolean);
+
+        let other = symbols.iter().find(|s| s.name == "other").unwrap();
+        assert_eq!(other.kind, DocumentSymbolKind::Variable);
+        assert_eq!(other.kind.to_lsp_kind(), SymbolKind::FIELD);
+    }
+
+    #[test]
+    fn test_variable_fallback_mapped_to_field() {
+        let code = r#"
+            result <- some_function()
+            data <- x + y
+            obj <- ComplexExpression(a, b, c)
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // All should be Variable kind (maps to FIELD in LSP)
+        for symbol in &symbols {
+            assert_eq!(symbol.kind, DocumentSymbolKind::Variable);
+            assert_eq!(symbol.kind.to_lsp_kind(), SymbolKind::FIELD);
+        }
+    }
+
+    #[test]
+    fn test_r_constants_as_constant_kind() {
+        let code = r#"
+            x <- NA_integer_
+            y <- NA_real_
+            z <- NA_complex_
+            w <- NA_character_
+            a <- NA
+            b <- Inf
+            c <- NaN
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // All should be Constant kind
+        for symbol in &symbols {
+            assert_eq!(symbol.kind, DocumentSymbolKind::Constant);
+            assert_eq!(symbol.kind.to_lsp_kind(), SymbolKind::CONSTANT);
+        }
+    }
+
+    #[test]
+    fn test_multiline_assignment_type_detection() {
+        let code = r#"
+            data <- list(
+                a = 1,
+                b = 2,
+                c = 3
+            )
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "data");
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::List);
+    }
+
+    #[test]
+    fn test_complex_rhs_falls_back_to_variable() {
+        let code = r#"
+            result <- if (x > 0) TRUE else FALSE
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "result");
+        // Complex expression falls back to Variable (maps to FIELD)
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Variable);
+        assert_eq!(symbols[0].kind.to_lsp_kind(), SymbolKind::FIELD);
+    }
+
+    #[test]
+    fn test_parenthesized_value_type_detection() {
+        let code = r#"
+            flag <- (TRUE)
+            num <- (42)
+            text <- ("hello")
+            empty <- (NULL)
+        "#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let flag = symbols.iter().find(|s| s.name == "flag").unwrap();
+        assert_eq!(flag.kind, DocumentSymbolKind::Boolean);
+
+        let num = symbols.iter().find(|s| s.name == "num").unwrap();
+        assert_eq!(num.kind, DocumentSymbolKind::Number);
+
+        let text = symbols.iter().find(|s| s.name == "text").unwrap();
+        assert_eq!(text.kind, DocumentSymbolKind::String);
+
+        let empty = symbols.iter().find(|s| s.name == "empty").unwrap();
+        assert_eq!(empty.kind, DocumentSymbolKind::Null);
+    }
 }
 
 #[cfg(test)]
@@ -12349,8 +14668,8 @@ mod proptests {
     use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
     use crate::state::Document;
     use proptest::prelude::*;
-    use std::sync::Arc;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     // Helper to parse R code for property tests
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
@@ -13752,29 +16071,35 @@ mod proptests {
                         item.label == reserved_word
                             && matches!(
                                 item.kind,
-                                Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::VARIABLE)
+                                Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::FIELD)
                             )
                     })
                     .collect();
 
                 prop_assert!(
                     identifier_completions.is_empty(),
-                    "Reserved word '{}' should NOT appear as identifier completion (FUNCTION/VARIABLE), but found: {:?}",
+                    "Reserved word '{}' should NOT appear as identifier completion (FUNCTION/FIELD), but found: {:?}",
                     reserved_word,
                     identifier_completions
                 );
 
                 // Verify reserved word DOES appear as keyword completion (positive control)
+                // R constants (TRUE, FALSE, NULL, etc.) now use CONSTANT kind instead of KEYWORD
                 let keyword_completions: Vec<_> = items
                     .iter()
                     .filter(|item| {
-                        item.label == reserved_word && item.kind == Some(CompletionItemKind::KEYWORD)
+                        item.label == reserved_word
+                            && matches!(
+                                item.kind,
+                                Some(CompletionItemKind::KEYWORD)
+                                    | Some(CompletionItemKind::CONSTANT)
+                            )
                     })
                     .collect();
 
                 prop_assert!(
                     !keyword_completions.is_empty(),
-                    "Reserved word '{}' SHOULD appear as keyword completion (KEYWORD kind)",
+                    "Reserved word '{}' SHOULD appear as keyword/constant completion",
                     reserved_word
                 );
             }
@@ -15051,7 +17376,7 @@ mod proptests {
         ///
         /// For any file with a variable declaration directive (@lsp-var) and a completion
         /// request at a position after the directive line, the declared variable SHALL
-        /// appear in the completion list with CompletionItemKind::VARIABLE.
+        /// appear in the completion list with CompletionItemKind::FIELD.
         ///
         /// **Validates: Requirements 6.1, 6.4**
         fn prop_declared_variable_appears_in_completions_with_variable_kind(
@@ -15099,8 +17424,8 @@ mod proptests {
                 if let Some(item) = var_completion {
                     prop_assert_eq!(
                         item.kind,
-                        Some(CompletionItemKind::VARIABLE),
-                        "Declared variable '{}' should have CompletionItemKind::VARIABLE. \
+                        Some(CompletionItemKind::FIELD),
+                        "Declared variable '{}' should have CompletionItemKind::FIELD. \
                          Directive form: '{}', Code:\n{}\nActual kind: {:?}",
                         var_name, directive_form, code, item.kind
                     );
@@ -15230,8 +17555,8 @@ mod proptests {
                 if let Some(item) = var_completion {
                     prop_assert_eq!(
                         item.kind,
-                        Some(CompletionItemKind::VARIABLE),
-                        "Declared variable '{}' should have CompletionItemKind::VARIABLE. \
+                        Some(CompletionItemKind::FIELD),
+                        "Declared variable '{}' should have CompletionItemKind::FIELD. \
                          Code:\n{}\nActual kind: {:?}",
                         var_name, code, item.kind
                     );
@@ -15313,7 +17638,7 @@ mod proptests {
                     let expected_kind = if is_function {
                         CompletionItemKind::FUNCTION
                     } else {
-                        CompletionItemKind::VARIABLE
+                        CompletionItemKind::FIELD
                     };
 
                     prop_assert_eq!(
@@ -15436,8 +17761,8 @@ mod proptests {
                 if let Some(item) = var1_completion {
                     prop_assert_eq!(
                         item.kind,
-                        Some(CompletionItemKind::VARIABLE),
-                        "'{}' should have CompletionItemKind::VARIABLE",
+                        Some(CompletionItemKind::FIELD),
+                        "'{}' should have CompletionItemKind::FIELD",
                         var1
                     );
                 }
@@ -15480,8 +17805,8 @@ mod proptests {
                 if let Some(item) = var1_completion {
                     prop_assert_eq!(
                         item.kind,
-                        Some(CompletionItemKind::VARIABLE),
-                        "'{}' should have CompletionItemKind::VARIABLE",
+                        Some(CompletionItemKind::FIELD),
+                        "'{}' should have CompletionItemKind::FIELD",
                         var1
                     );
                 }
@@ -15489,8 +17814,8 @@ mod proptests {
                 if let Some(item) = var2_completion {
                     prop_assert_eq!(
                         item.kind,
-                        Some(CompletionItemKind::VARIABLE),
-                        "'{}' should have CompletionItemKind::VARIABLE",
+                        Some(CompletionItemKind::FIELD),
+                        "'{}' should have CompletionItemKind::FIELD",
                         var2
                     );
                 }
@@ -16030,10 +18355,11 @@ mod proptests {
             );
 
             let symbol = &symbols[0];
+            // Numeric values are now detected as Number type (value-based detection)
             prop_assert_eq!(
                 symbol.kind,
-                DocumentSymbolKind::Variable,
-                "Variable assignment '{}' should be classified as VARIABLE. \
+                DocumentSymbolKind::Number,
+                "Numeric assignment '{}' should be classified as NUMBER. \
                  Code: '{}', Actual kind: {:?}",
                 var_name, code, symbol.kind
             );
@@ -16278,10 +18604,11 @@ mod proptests {
             prop_assert!(func_symbol.is_some(), "Should find function symbol '{}'", func_name);
             prop_assert!(const_symbol.is_some(), "Should find constant symbol '{}'", const_name);
 
+            // 42 is detected as Number type (value-based detection)
             prop_assert_eq!(
                 var_symbol.unwrap().kind,
-                DocumentSymbolKind::Variable,
-                "Variable '{}' should be classified as VARIABLE",
+                DocumentSymbolKind::Number,
+                "Numeric variable '{}' should be classified as NUMBER",
                 var_name
             );
 
@@ -16613,10 +18940,11 @@ setClass("{}", slots = c(value = "numeric"))
                 DocumentSymbolKind::Class,
                 "setClass symbol should be CLASS"
             );
+            // Numeric values are detected as NUMBER (value-based detection)
             prop_assert_eq!(
                 var_symbol.unwrap().kind,
-                DocumentSymbolKind::Variable,
-                "Variable symbol should be VARIABLE"
+                DocumentSymbolKind::Number,
+                "Variable symbol with numeric value should be NUMBER"
             );
         }
 
@@ -17340,10 +19668,11 @@ setClass("{}", slots = c(value = "numeric"))
                 "Should find variable symbol '{}'. Found: {:?}",
                 var_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
             );
+            // Numeric values are detected as NUMBER (value-based detection)
             prop_assert_eq!(
                 var.unwrap().kind,
-                DocumentSymbolKind::Variable,
-                "Variable should have kind=VARIABLE"
+                DocumentSymbolKind::Number,
+                "Variable with numeric value should have kind=NUMBER"
             );
 
             // Verify function
@@ -17443,10 +19772,11 @@ setClass("{}", slots = c(value = "numeric"))
                 &var_name,
                 "Child symbol should be the variable"
             );
+            // Numeric values are detected as NUMBER (value-based detection)
             prop_assert_eq!(
                 var_symbol.kind,
-                tower_lsp::lsp_types::SymbolKind::VARIABLE,
-                "Child symbol should have kind=VARIABLE"
+                tower_lsp::lsp_types::SymbolKind::NUMBER,
+                "Child symbol with numeric value should have kind=NUMBER"
             );
         }
 
@@ -17488,10 +19818,11 @@ setClass("{}", slots = c(value = "numeric"))
                 &var_name,
                 "Root symbol should be the variable"
             );
+            // Numeric values are detected as NUMBER (value-based detection)
             prop_assert_eq!(
                 var_symbol.kind,
-                tower_lsp::lsp_types::SymbolKind::VARIABLE,
-                "Root symbol should have kind=VARIABLE"
+                tower_lsp::lsp_types::SymbolKind::NUMBER,
+                "Root symbol with numeric value should have kind=NUMBER"
             );
 
             // Variable should have no children
@@ -17658,10 +19989,11 @@ setClass("{}", slots = c(value = "numeric"))
                 inner_func_name, children.iter().map(|s| &s.name).collect::<Vec<_>>()
             );
 
+            // Numeric values are detected as NUMBER (value-based detection)
             prop_assert_eq!(
                 var_child.unwrap().kind,
-                tower_lsp::lsp_types::SymbolKind::VARIABLE,
-                "Variable child should have kind=VARIABLE"
+                tower_lsp::lsp_types::SymbolKind::NUMBER,
+                "Variable child with numeric value should have kind=NUMBER"
             );
             prop_assert_eq!(
                 func_child.unwrap().kind,
@@ -17828,7 +20160,8 @@ setClass("{}", slots = c(value = "numeric"))
 
             let inner = &middle_children[0];
             prop_assert_eq!(&inner.name, &inner_var_name, "Inner should be the variable");
-            prop_assert_eq!(inner.kind, tower_lsp::lsp_types::SymbolKind::VARIABLE, "Inner should be VARIABLE");
+            // Numeric values are detected as NUMBER (value-based detection)
+            prop_assert_eq!(inner.kind, tower_lsp::lsp_types::SymbolKind::NUMBER, "Inner should be NUMBER");
         }
 
         // ========================================================================
@@ -18486,14 +20819,16 @@ setClass("{}", slots = c(value = "numeric"))
         let mut state = WorldState::new(vec![]);
 
         let uri1 = Url::parse("file:///test1.R").unwrap();
-        state
-            .documents
-            .insert(uri1.clone(), Document::new("my_func <- function(x) x + 1\nmy_var <- 42", None));
+        state.documents.insert(
+            uri1.clone(),
+            Document::new("my_func <- function(x) x + 1\nmy_var <- 42", None),
+        );
 
         let uri2 = Url::parse("file:///test2.R").unwrap();
-        state
-            .documents
-            .insert(uri2.clone(), Document::new("helper_func <- function(y) y * 2", None));
+        state.documents.insert(
+            uri2.clone(),
+            Document::new("helper_func <- function(y) y * 2", None),
+        );
 
         let result = workspace_symbol(&state, "func").unwrap();
         assert_eq!(result.len(), 2);
@@ -18511,9 +20846,10 @@ setClass("{}", slots = c(value = "numeric"))
 
         let mut state = WorldState::new(vec![]);
         let uri = Url::parse("file:///test.R").unwrap();
-        state
-            .documents
-            .insert(uri.clone(), Document::new("MyFunction <- function() {}", None));
+        state.documents.insert(
+            uri.clone(),
+            Document::new("MyFunction <- function() {}", None),
+        );
 
         let result = workspace_symbol(&state, "myfunction").unwrap();
         assert_eq!(result.len(), 1);
@@ -18596,7 +20932,7 @@ setClass("{}", slots = c(value = "numeric"))
         assert_eq!(func_sym.kind, tower_lsp::lsp_types::SymbolKind::FUNCTION);
 
         let var_sym = result.iter().find(|s| s.name == "my_var").unwrap();
-        assert_eq!(var_sym.kind, tower_lsp::lsp_types::SymbolKind::VARIABLE);
+        assert_eq!(var_sym.kind, tower_lsp::lsp_types::SymbolKind::FIELD);
     }
 
     // ========================================================================
@@ -18636,20 +20972,14 @@ setClass("{}", slots = c(value = "numeric"))
                             name: format!("Section_{}", i),
                             kind: DocumentSymbolKind::Module,
                             range: Range {
-                                start: Position {
-                                    line,
-                                    character: 0,
-                                },
+                                start: Position { line, character: 0 },
                                 end: Position {
                                     line,
                                     character: 20,
                                 },
                             },
                             selection_range: Range {
-                                start: Position {
-                                    line,
-                                    character: 0,
-                                },
+                                start: Position { line, character: 0 },
                                 end: Position {
                                     line,
                                     character: 20,
@@ -18670,9 +21000,7 @@ setClass("{}", slots = c(value = "numeric"))
     /// Returns `(Vec<RawSymbol>, u32)` where the symbols include both sections (with
     /// `section_level = Some(1..=4)`) and non-section symbols (with `section_level = None`),
     /// all with unique start lines, plus the line_count.
-    fn mixed_symbols_strategy(
-        max_line_count: u32,
-    ) -> impl Strategy<Value = (Vec<RawSymbol>, u32)> {
+    fn mixed_symbols_strategy(max_line_count: u32) -> impl Strategy<Value = (Vec<RawSymbol>, u32)> {
         (1u32..=max_line_count).prop_flat_map(move |line_count| {
             // Generate 0..min(line_count, 20) unique start lines for all symbols
             let max_symbols = std::cmp::min(line_count, 20) as usize;
@@ -18703,40 +21031,39 @@ setClass("{}", slots = c(value = "numeric"))
                             .zip(sel_starts.iter())
                             .zip(sel_lengths.iter())
                             .enumerate()
-                            .map(|(i, ((((&line, &is_section), &level), &sel_start), &sel_len))| {
-                                let sel_end = sel_start + sel_len;
-                                RawSymbol {
-                                    name: format!("Symbol_{}", i),
-                                    kind: if is_section {
-                                        DocumentSymbolKind::Module
-                                    } else {
-                                        DocumentSymbolKind::Function
-                                    },
-                                    range: Range {
-                                        start: Position {
-                                            line,
-                                            character: 0,
+                            .map(
+                                |(i, ((((&line, &is_section), &level), &sel_start), &sel_len))| {
+                                    let sel_end = sel_start + sel_len;
+                                    RawSymbol {
+                                        name: format!("Symbol_{}", i),
+                                        kind: if is_section {
+                                            DocumentSymbolKind::Module
+                                        } else {
+                                            DocumentSymbolKind::Function
                                         },
-                                        end: Position {
-                                            line,
-                                            character: 20,
+                                        range: Range {
+                                            start: Position { line, character: 0 },
+                                            end: Position {
+                                                line,
+                                                character: 20,
+                                            },
                                         },
-                                    },
-                                    selection_range: Range {
-                                        start: Position {
-                                            line,
-                                            character: sel_start,
+                                        selection_range: Range {
+                                            start: Position {
+                                                line,
+                                                character: sel_start,
+                                            },
+                                            end: Position {
+                                                line,
+                                                character: sel_end,
+                                            },
                                         },
-                                        end: Position {
-                                            line,
-                                            character: sel_end,
-                                        },
-                                    },
-                                    detail: None,
-                                    section_level: if is_section { Some(level) } else { None },
-                                    children: Vec::new(),
-                                }
-                            })
+                                        detail: None,
+                                        section_level: if is_section { Some(level) } else { None },
+                                        children: Vec::new(),
+                                    }
+                                },
+                            )
                             .collect();
                         (symbols, lc)
                     },
@@ -19343,8 +21670,14 @@ mod integration_tests {
             symbol.name, kind_str, directive_type, display_line
         );
 
-        assert!(value.contains("myvar (declared variable)"), "Should show symbol name with kind");
-        assert!(value.contains("Declared via @lsp-var directive at line 5"), "Should show directive info with 1-based line");
+        assert!(
+            value.contains("myvar (declared variable)"),
+            "Should show symbol name with kind"
+        );
+        assert!(
+            value.contains("Declared via @lsp-var directive at line 5"),
+            "Should show directive info with 1-based line"
+        );
     }
 
     #[test]
@@ -19384,8 +21717,14 @@ mod integration_tests {
             symbol.name, kind_str, directive_type, display_line
         );
 
-        assert!(value.contains("myfunc (declared function)"), "Should show symbol name with kind");
-        assert!(value.contains("Declared via @lsp-func directive at line 10"), "Should show directive info with 1-based line");
+        assert!(
+            value.contains("myfunc (declared function)"),
+            "Should show symbol name with kind"
+        );
+        assert!(
+            value.contains("Declared via @lsp-func directive at line 10"),
+            "Should show directive info with 1-based line"
+        );
     }
 
     #[test]
@@ -19396,8 +21735,8 @@ mod integration_tests {
 
         // Test various line numbers
         let test_cases = vec![
-            (0, 1),   // Line 0 -> display line 1
-            (4, 5),   // Line 4 -> display line 5
+            (0, 1),    // Line 0 -> display line 1
+            (4, 5),    // Line 4 -> display line 5
             (99, 100), // Line 99 -> display line 100
         ];
 
@@ -19446,18 +21785,29 @@ x <- myvar + 1"#;
 
         // Update cross-file graph with metadata
         let metadata = parse_directives(code);
-        state.cross_file_graph.update_file(&uri, &metadata, None, |_| None);
+        state
+            .cross_file_graph
+            .update_file(&uri, &metadata, None, |_| None);
 
         // Test go-to-definition on "myvar" usage (line 1, position 5)
         let position = Position::new(1, 5);
         let result = goto_definition(&state, &uri, position);
 
-        assert!(result.is_some(), "Should find definition for declared variable");
+        assert!(
+            result.is_some(),
+            "Should find definition for declared variable"
+        );
 
         if let Some(GotoDefinitionResponse::Scalar(location)) = result {
             assert_eq!(location.uri, uri, "Should navigate to same file");
-            assert_eq!(location.range.start.line, 0, "Should navigate to directive line (0-based)");
-            assert_eq!(location.range.start.character, 0, "Should navigate to start of line (column 0)");
+            assert_eq!(
+                location.range.start.line, 0,
+                "Should navigate to directive line (0-based)"
+            );
+            assert_eq!(
+                location.range.start.character, 0,
+                "Should navigate to start of line (column 0)"
+            );
         } else {
             panic!("Expected Scalar response");
         }
@@ -19484,18 +21834,29 @@ result <- myfunc(42)"#;
 
         // Update cross-file graph with metadata
         let metadata = parse_directives(code);
-        state.cross_file_graph.update_file(&uri, &metadata, None, |_| None);
+        state
+            .cross_file_graph
+            .update_file(&uri, &metadata, None, |_| None);
 
         // Test go-to-definition on "myfunc" usage (line 1, position 10)
         let position = Position::new(1, 10);
         let result = goto_definition(&state, &uri, position);
 
-        assert!(result.is_some(), "Should find definition for declared function");
+        assert!(
+            result.is_some(),
+            "Should find definition for declared function"
+        );
 
         if let Some(GotoDefinitionResponse::Scalar(location)) = result {
             assert_eq!(location.uri, uri, "Should navigate to same file");
-            assert_eq!(location.range.start.line, 0, "Should navigate to directive line (0-based)");
-            assert_eq!(location.range.start.character, 0, "Should navigate to start of line (column 0)");
+            assert_eq!(
+                location.range.start.line, 0,
+                "Should navigate to directive line (0-based)"
+            );
+            assert_eq!(
+                location.range.start.character, 0,
+                "Should navigate to start of line (column 0)"
+            );
         } else {
             panic!("Expected Scalar response");
         }
@@ -19525,19 +21886,30 @@ result <- mysymbol"#;
 
         // Update cross-file graph with metadata
         let metadata = parse_directives(code);
-        state.cross_file_graph.update_file(&uri, &metadata, None, |_| None);
+        state
+            .cross_file_graph
+            .update_file(&uri, &metadata, None, |_| None);
 
         // Test go-to-definition on "mysymbol" usage (line 2, position 10)
         let position = Position::new(2, 10);
         let result = goto_definition(&state, &uri, position);
 
-        assert!(result.is_some(), "Should find definition for declared symbol");
+        assert!(
+            result.is_some(),
+            "Should find definition for declared symbol"
+        );
 
         if let Some(GotoDefinitionResponse::Scalar(location)) = result {
             assert_eq!(location.uri, uri, "Should navigate to same file");
             // Should navigate to FIRST declaration (line 0), not the later one (line 1)
-            assert_eq!(location.range.start.line, 0, "Should navigate to first declaration (line 0)");
-            assert_eq!(location.range.start.character, 0, "Should navigate to start of line (column 0)");
+            assert_eq!(
+                location.range.start.line, 0,
+                "Should navigate to first declaration (line 0)"
+            );
+            assert_eq!(
+                location.range.start.character, 0,
+                "Should navigate to start of line (column 0)"
+            );
         } else {
             panic!("Expected Scalar response");
         }
@@ -20607,7 +22979,8 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -20617,7 +22990,8 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -20671,7 +23045,8 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -20681,7 +23056,8 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -20729,7 +23105,8 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -20739,7 +23116,8 @@ result <- helper_with_spaces(42)"#;
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -21535,7 +23913,11 @@ myvar
             &mut diagnostics,
         );
 
-        assert_eq!(diagnostics.len(), 0, "Declared variable should suppress undefined diagnostic");
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Declared variable should suppress undefined diagnostic"
+        );
     }
 
     #[test]
@@ -21566,7 +23948,11 @@ myfunc()
             &mut diagnostics,
         );
 
-        assert_eq!(diagnostics.len(), 0, "Declared function should suppress undefined diagnostic");
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Declared function should suppress undefined diagnostic"
+        );
     }
 
     #[test]
@@ -21597,7 +23983,11 @@ myfunc()
             &mut diagnostics,
         );
 
-        assert_eq!(diagnostics.len(), 1, "Usage before declaration should emit diagnostic");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Usage before declaration should emit diagnostic"
+        );
         assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
         assert_eq!(diagnostics[0].range.start.line, 0);
     }
@@ -21632,7 +24022,11 @@ MyVar
             &mut diagnostics,
         );
 
-        assert_eq!(diagnostics.len(), 1, "Only case-mismatched usage should emit diagnostic");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Only case-mismatched usage should emit diagnostic"
+        );
         assert!(diagnostics[0].message.contains("Undefined variable: MyVar"));
         assert_eq!(diagnostics[0].range.start.line, 2);
     }
@@ -21640,7 +24034,12 @@ MyVar
     #[test]
     fn test_declared_variable_all_synonyms() {
         // Test all 4 synonym forms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
-        for directive in ["@lsp-declare-variable", "@lsp-declare-var", "@lsp-variable", "@lsp-var"] {
+        for directive in [
+            "@lsp-declare-variable",
+            "@lsp-declare-var",
+            "@lsp-variable",
+            "@lsp-var",
+        ] {
             let mut state = create_test_state();
             let code = format!("# {} myvar\nmyvar\n", directive);
             let uri = add_document(&mut state, "file:///test.R", &code);
@@ -21673,7 +24072,12 @@ MyVar
     #[test]
     fn test_declared_function_all_synonyms() {
         // Test all 4 synonym forms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
-        for directive in ["@lsp-declare-function", "@lsp-declare-func", "@lsp-function", "@lsp-func"] {
+        for directive in [
+            "@lsp-declare-function",
+            "@lsp-declare-func",
+            "@lsp-function",
+            "@lsp-func",
+        ] {
             let mut state = create_test_state();
             let code = format!("# {} myfunc\nmyfunc()\n", directive);
             let uri = add_document(&mut state, "file:///test.R", &code);
@@ -21733,7 +24137,11 @@ myvar
 
         // The usage on line 0 should be flagged (same line as declaration)
         // The usage on line 1 should NOT be flagged (after declaration)
-        assert_eq!(diagnostics.len(), 1, "Usage on same line as declaration should emit diagnostic");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Usage on same line as declaration should emit diagnostic"
+        );
         assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
         assert_eq!(diagnostics[0].range.start.line, 0);
     }
@@ -21806,7 +24214,7 @@ mysymbol
         // Requirement 11.2: WHEN conflicting declarations exist,
         // THE diagnostic suppression SHALL apply regardless of kind (the symbol exists)
         let mut state = create_test_state();
-        
+
         // Test case 1: variable first, function second
         let code1 = "# @lsp-var mysymbol
 # @lsp-func mysymbol
@@ -21873,7 +24281,7 @@ mysymbol
         use crate::cross_file::scope::{compute_artifacts_with_metadata, scope_at_position};
 
         let mut state = create_test_state();
-        
+
         // Test case 1: variable first (line 0), function second (line 1)
         let code1 = "# @lsp-var mysymbol
 # @lsp-func mysymbol
@@ -21881,7 +24289,8 @@ mysymbol
         let uri1 = add_document(&mut state, "file:///test1.R", code1);
         let tree1 = parse_r_code(code1);
         let directive_meta1 = parse_directives(code1);
-        let artifacts1 = compute_artifacts_with_metadata(&uri1, &tree1, code1, Some(&directive_meta1));
+        let artifacts1 =
+            compute_artifacts_with_metadata(&uri1, &tree1, code1, Some(&directive_meta1));
 
         // Get scope at line 2 (after both declarations)
         let scope1 = scope_at_position(&artifacts1, 2, 0);
@@ -21900,7 +24309,8 @@ mysymbol
         let uri2 = add_document(&mut state, "file:///test2.R", code2);
         let tree2 = parse_r_code(code2);
         let directive_meta2 = parse_directives(code2);
-        let artifacts2 = compute_artifacts_with_metadata(&uri2, &tree2, code2, Some(&directive_meta2));
+        let artifacts2 =
+            compute_artifacts_with_metadata(&uri2, &tree2, code2, Some(&directive_meta2));
 
         // Get scope at line 2 (after both declarations)
         let scope2 = scope_at_position(&artifacts2, 2, 0);
@@ -22614,5 +25024,123 @@ result <- undefined_var
             !result.is_empty(),
             "Default configuration should allow diagnostics to be computed"
         );
+    }
+
+    // ============================================================================
+    // AST Inspection Utility
+    // ============================================================================
+    //
+    // This utility helps developers inspect the tree-sitter AST structure for R code.
+    // It was created after discovering that assumptions about node kinds were incorrect
+    // during symbol kind alignment work.
+    //
+    // Key discoveries that led to this utility:
+    // - Boolean literals (TRUE, FALSE) use "true"/"false" node kinds, NOT "identifier"
+    // - Numeric literals like 42 parse as "float", NOT "integer"
+    // - R constants (NA, Inf, NaN) have dedicated node kinds ("na", "inf", "nan")
+    //
+    // Usage in tests:
+    //   inspect_ast("x <- TRUE");
+    //   inspect_ast("nums <- c(1, 2, 3)");
+    //
+    // This prints the full AST tree with node kinds and text, making it easy to
+    // verify parser behavior without guessing.
+
+    /// Inspect and print the tree-sitter AST structure for R code.
+    ///
+    /// This utility function parses R code and prints the complete AST tree structure,
+    /// showing node kinds and text content. It's useful for:
+    /// - Understanding how tree-sitter-r represents different R constructs
+    /// - Debugging parser behavior when implementing new features
+    /// - Verifying assumptions about node kinds before writing detection logic
+    ///
+    /// # Example Output
+    ///
+    /// ```text
+    /// inspect_ast("x <- TRUE");
+    ///
+    /// Output:
+    /// === AST for: x <- TRUE ===
+    /// program
+    ///   binary_operator
+    ///     identifier "x"
+    ///     <- "<-"
+    ///     true "TRUE"
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The R code to parse and inspect
+    /// * `description` - Optional description printed in the header (defaults to the code itself)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #[test]
+    /// fn explore_parser_behavior() {
+    ///     inspect_ast("x <- 42", Some("numeric assignment"));
+    ///     inspect_ast("flag <- TRUE", Some("boolean assignment"));
+    ///     inspect_ast("data <- list(a=1)", Some("list creation"));
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    pub fn inspect_ast(code: &str, description: Option<&str>) {
+        use tree_sitter::Parser;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .expect("Failed to load R language");
+
+        let tree = parser.parse(code, None).expect("Failed to parse code");
+
+        let desc = description.unwrap_or(code);
+        eprintln!("\n=== AST for: {} ===", desc);
+        eprintln!("Code: {}", code);
+        eprintln!();
+
+        fn print_node(node: tree_sitter::Node, source: &str, depth: usize) {
+            let indent = "  ".repeat(depth);
+            let kind = node.kind();
+            let text = node.utf8_text(source.as_bytes()).unwrap_or("<error>");
+
+            // Format: indent + kind + "text" (if text differs from kind)
+            if text.trim() == kind || text.trim().is_empty() {
+                eprintln!("{}{}", indent, kind);
+            } else {
+                // Escape newlines and quotes for readability
+                let escaped_text = text.replace('\n', "\\n").replace('"', "\\\"");
+                eprintln!("{}{} \"{}\"", indent, kind, escaped_text);
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                print_node(child, source, depth + 1);
+            }
+        }
+
+        print_node(tree.root_node(), code, 0);
+        eprintln!();
+    }
+
+    #[test]
+    fn test_inspect_ast_utility() {
+        // This test demonstrates the inspect_ast utility and verifies it doesn't panic.
+        // Run with: cargo test test_inspect_ast_utility -- --nocapture
+        // to see the actual output.
+
+        inspect_ast("x <- TRUE", Some("boolean literal"));
+        inspect_ast("x <- 42", Some("numeric literal"));
+        inspect_ast("x <- \"hello\"", Some("string literal"));
+        inspect_ast("x <- NULL", Some("null literal"));
+        inspect_ast("x <- NA", Some("NA constant"));
+        inspect_ast("x <- c(1, 2, 3)", Some("array creation"));
+        inspect_ast("x <- list(a=1, b=2)", Some("list creation"));
+        inspect_ast(
+            "my_func <- function(x) { x + 1 }",
+            Some("function definition"),
+        );
+
+        // If we reached here without panicking, the utility works correctly.
     }
 }

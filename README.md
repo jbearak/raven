@@ -86,6 +86,18 @@ For files that aren't explicitly sourced, add a directive:
 - **Workspace indexing** - Background indexing of your entire project
 - **Package awareness** - Recognition of `library()` calls and package exports
 
+## Using with Other R Extensions
+
+If you use Raven alongside [vscode-R](https://github.com/REditorSupport/vscode-R), you may see duplicate entries in the completion menu (e.g., `source` appearing twice). This happens because VS Code does not deduplicate completions across providers — Raven contributes package export completions while vscode-R contributes R snippets for the same functions.
+
+To reduce clutter, add this to your VS Code settings:
+
+```json
+"editor.snippetSuggestions": "bottom"
+```
+
+This pushes snippet completions below LSP completions, so Raven's results (with package attribution like `{base}`) appear first.
+
 ## Documentation
 
 - [Cross-File Awareness](docs/cross-file.md) - Directives, source() detection, symbol resolution

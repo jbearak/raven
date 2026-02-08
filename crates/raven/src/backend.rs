@@ -264,7 +264,10 @@ pub(crate) fn parse_cross_file_config(
             if let Some(v) = cache.get("existenceMaxEntries").and_then(|v| v.as_u64()) {
                 config.cache_existence_max_entries = (v as usize).max(1);
             }
-            if let Some(v) = cache.get("workspaceIndexMaxEntries").and_then(|v| v.as_u64()) {
+            if let Some(v) = cache
+                .get("workspaceIndexMaxEntries")
+                .and_then(|v| v.as_u64())
+            {
                 config.cache_workspace_index_max_entries = (v as usize).max(1);
             }
         }
@@ -466,10 +469,7 @@ pub(crate) fn parse_symbol_config(settings: &serde_json::Value) -> Option<Symbol
     }
 
     log::info!("Symbol configuration loaded from LSP settings:");
-    log::info!(
-        "  workspace_max_results: {}",
-        config.workspace_max_results
-    );
+    log::info!("  workspace_max_results: {}", config.workspace_max_results);
 
     Some(config)
 }
@@ -505,7 +505,10 @@ impl Backend {
                     .cross_file_config
                     .packages_additional_library_paths
                     .clone(),
-                state.workspace_folders.first().and_then(|url| url.to_file_path().ok()),
+                state
+                    .workspace_folders
+                    .first()
+                    .and_then(|url| url.to_file_path().ok()),
             )
         };
 
@@ -629,6 +632,7 @@ impl LanguageServer for Backend {
                         String::from("/"),  // File path navigation
                         String::from("\""), // String literal start for source() calls
                     ]),
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -797,11 +801,11 @@ impl LanguageServer for Backend {
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
-            if let Ok(m) = crate::perf::startup_metrics().lock() { m.log_summary() }
+            if let Ok(m) = crate::perf::startup_metrics().lock() {
+                m.log_summary()
+            }
         }
-        log::info!(
-            "Initialization complete (workspace scan running in background)"
-        );
+        log::info!("Initialization complete (workspace scan running in background)");
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -863,7 +867,10 @@ impl LanguageServer for Backend {
                 .map(|a| a.interface_hash)
                 .or_else(|| {
                     // Also check the new workspace index
-                    state.workspace_index_new.get_artifacts(&uri).map(|a| a.interface_hash)
+                    state
+                        .workspace_index_new
+                        .get_artifacts(&uri)
+                        .map(|a| a.interface_hash)
                 });
 
             // Extract and enrich metadata with inherited working directory
@@ -921,7 +928,10 @@ impl LanguageServer for Backend {
                 for source in &meta.sources {
                     if let Some(ctx) = path_ctx.as_ref() {
                         if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
+                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                &source.path,
+                                ctx,
+                            )
                         {
                             if let Ok(source_uri) = Url::from_file_path(resolved) {
                                 // Check if file needs indexing (not open, not in workspace index)
@@ -958,7 +968,8 @@ impl LanguageServer for Backend {
                                         "Scheduling on-demand indexing for parent file: {}",
                                         parent_uri
                                     );
-                                    files_to_index.push((parent_uri, IndexCategory::BackwardDirective));
+                                    files_to_index
+                                        .push((parent_uri, IndexCategory::BackwardDirective));
                                 }
                             }
                         }
@@ -1027,9 +1038,9 @@ impl LanguageServer for Backend {
             // Only invalidate dependents if the exported interface actually changed
             let interface_changed = match (old_interface_hash, new_interface_hash) {
                 (Some(old), Some(new)) => old != new,
-                (None, Some(_)) => true,  // File wasn't indexed before, now has interface
-                (Some(_), None) => true,  // File lost its interface (parse error?)
-                (None, None) => false,    // No interface before or after
+                (None, Some(_)) => true, // File wasn't indexed before, now has interface
+                (Some(_), None) => true, // File lost its interface (parse error?)
+                (None, None) => false,   // No interface before or after
             };
 
             if interface_changed {
@@ -1138,8 +1149,7 @@ impl LanguageServer for Backend {
                 .collect();
 
             // Collect metadata from sourced files for transitive dependency queuing
-            let mut sourced_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> =
-                Vec::new();
+            let mut sourced_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
 
             if !sourced_files.is_empty() {
                 log::info!(
@@ -1267,8 +1277,7 @@ impl LanguageServer for Backend {
                     .iter()
                     .filter_map(|d| {
                         let ctx = backward_path_ctx.as_ref()?;
-                        let resolved =
-                            crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
                         log::trace!(
                             "did_open re-enrich: backward directive {} -> {}",
                             d.path,
@@ -1293,7 +1302,10 @@ impl LanguageServer for Backend {
                 {
                     for source in &meta.sources {
                         if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, &forward_ctx)
+                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                &source.path,
+                                &forward_ctx,
+                            )
                         {
                             log::trace!(
                                 "did_open re-enrich: source() {} -> {}",
@@ -1326,7 +1338,10 @@ impl LanguageServer for Backend {
                 {
                     for source in &meta.sources {
                         if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, &forward_ctx)
+                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                &source.path,
+                                &forward_ctx,
+                            )
                         {
                             if let Ok(child_uri) = Url::from_file_path(resolved) {
                                 let needs_indexing = {
@@ -1368,7 +1383,10 @@ impl LanguageServer for Backend {
                             .cross_file_config
                             .packages_additional_library_paths
                             .clone(),
-                        state.workspace_folders.first().and_then(|url| url.to_file_path().ok()),
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|url| url.to_file_path().ok()),
                     )
                 };
                 log::trace!("Reinitializing PackageLibrary for did_open prefetch");
@@ -1438,8 +1456,8 @@ impl LanguageServer for Backend {
                 }
                 let has_ddply =
                     package_library.is_symbol_from_loaded_packages("ddply", &scope_packages);
-                let has_row_medians = package_library
-                    .is_symbol_from_loaded_packages("rowMedians", &scope_packages);
+                let has_row_medians =
+                    package_library.is_symbol_from_loaded_packages("rowMedians", &scope_packages);
                 log::trace!(
                     "did_open prefetch: symbol check ddply={} rowMedians={}",
                     has_ddply,
@@ -1708,9 +1726,9 @@ impl LanguageServer for Backend {
             // Only invalidate dependents if the exported interface actually changed
             let interface_changed = match (old_interface_hash, new_interface_hash) {
                 (Some(old), Some(new)) => old != new,
-                (None, Some(_)) => true,  // New file with interface
-                (Some(_), None) => true,  // File lost its interface (parse error?)
-                (None, None) => false,    // No interface before or after
+                (None, Some(_)) => true, // New file with interface
+                (Some(_), None) => true, // File lost its interface (parse error?)
+                (None, None) => false,   // No interface before or after
             };
 
             if interface_changed {
@@ -2045,7 +2063,10 @@ impl LanguageServer for Backend {
                         .packages_additional_library_paths
                         .clone()
                 });
-            let workspace_root = state.workspace_folders.first().and_then(|url| url.to_file_path().ok());
+            let workspace_root = state
+                .workspace_folders
+                .first()
+                .and_then(|url| url.to_file_path().ok());
 
             // Apply new config if parsed
             if let Some(config) = new_config {
@@ -2075,10 +2096,10 @@ impl LanguageServer for Backend {
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
                 packages_enabled,
-            packages_r_path,
-            additional_paths,
-            workspace_root,
-        )
+                packages_r_path,
+                additional_paths,
+                workspace_root,
+            )
         };
 
         // Log diagnostics_enabled change - Requirement 5.2
@@ -2111,7 +2132,10 @@ impl LanguageServer for Backend {
                 lib.add_library_paths(&additional_paths);
                 (std::sync::Arc::new(lib), ready)
             } else {
-                (std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()), false)
+                (
+                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                    false,
+                )
             };
 
             // Replace under brief write lock
@@ -2265,7 +2289,12 @@ impl LanguageServer for Backend {
                             if let Some(tree) = parser.parse(&content, None) {
                                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                                crate::cross_file::scope::compute_artifacts_with_metadata(&uri, &tree, &content, Some(&cross_file_meta))
+                                crate::cross_file::scope::compute_artifacts_with_metadata(
+                                    &uri,
+                                    &tree,
+                                    &content,
+                                    Some(&cross_file_meta),
+                                )
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
                             }
@@ -2544,6 +2573,24 @@ impl LanguageServer for Backend {
         ))
     }
 
+    async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        log::trace!("completion_resolve: label={}", item.label);
+        // Clone the help cache Arc before moving into spawn_blocking
+        let help_cache = self.state.read().await.help_cache.clone();
+        // Run in spawn_blocking since get_help() calls R subprocess (blocking I/O)
+        match tokio::task::spawn_blocking(move || {
+            handlers::completion_item_resolve(item, &help_cache)
+        })
+        .await
+        {
+            Ok(resolved) => Ok(resolved),
+            Err(e) => {
+                log::trace!("completion_resolve: spawn_blocking failed: {e}");
+                Err(tower_lsp::jsonrpc::Error::internal_error())
+            }
+        }
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let state = self.state.read().await;
         Ok(handlers::hover(
@@ -2661,7 +2708,12 @@ impl Backend {
             if let Some(tree) = parser.parse(&content, None) {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                crate::cross_file::scope::compute_artifacts_with_metadata(file_uri, &tree, &content, Some(&cross_file_meta))
+                crate::cross_file::scope::compute_artifacts_with_metadata(
+                    file_uri,
+                    &tree,
+                    &content,
+                    Some(&cross_file_meta),
+                )
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
@@ -2730,13 +2782,13 @@ impl Backend {
                     file_uri
                 );
             } else {
-            log::trace!(
-                "On-demand indexing: prefetching packages for {}: {:?}",
-                file_uri,
-                packages_to_prefetch
-            );
-            let pkg_lib = self.state.read().await.package_library.clone();
-            pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+                log::trace!(
+                    "On-demand indexing: prefetching packages for {}: {:?}",
+                    file_uri,
+                    packages_to_prefetch
+                );
+                let pkg_lib = self.state.read().await.package_library.clone();
+                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
             }
         }
 
@@ -2817,8 +2869,7 @@ impl Backend {
 
         let workspace_root = self.state.read().await.workspace_folders.first().cloned();
         let mut visited: HashSet<Url> = HashSet::new();
-        let mut queue: VecDeque<(Url, usize)> =
-            start_uris.into_iter().map(|u| (u, 0)).collect();
+        let mut queue: VecDeque<(Url, usize)> = start_uris.into_iter().map(|u| (u, 0)).collect();
 
         while let Some((uri, depth)) = queue.pop_front() {
             if depth >= max_backward_depth || visited.contains(&uri) {
@@ -2906,20 +2957,21 @@ impl Backend {
 
             let Some(meta) = meta else { continue };
 
-            let Some(forward_ctx) =
-                crate::cross_file::path_resolve::PathContext::from_metadata(
-                    &uri,
-                    &meta,
-                    workspace_root,
-                )
-            else {
+            let Some(forward_ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
+                &uri,
+                &meta,
+                workspace_root,
+            ) else {
                 continue;
             };
             let parent_effective_wd = forward_ctx.effective_working_directory();
 
             for source in &meta.sources {
                 if let Some(resolved) =
-                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, &forward_ctx)
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        &forward_ctx,
+                    )
                 {
                     log::trace!(
                         "index_forward_chain: {} -> child {}",
@@ -2947,10 +2999,7 @@ impl Backend {
                         };
                         if should_index {
                             let _ = self
-                                .index_file_on_demand_with_inherited_wd(
-                                    &child_uri,
-                                    &inherited_wd,
-                                )
+                                .index_file_on_demand_with_inherited_wd(&child_uri, &inherited_wd)
                                 .await;
                         }
                         queue.push_back((child_uri, depth.saturating_add(1)));
@@ -3007,7 +3056,12 @@ impl Backend {
             if let Some(tree) = parser.parse(&content, None) {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                crate::cross_file::scope::compute_artifacts_with_metadata(file_uri, &tree, &content, Some(&cross_file_meta))
+                crate::cross_file::scope::compute_artifacts_with_metadata(
+                    file_uri,
+                    &tree,
+                    &content,
+                    Some(&cross_file_meta),
+                )
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
@@ -3052,13 +3106,13 @@ impl Backend {
                     file_uri
                 );
             } else {
-            log::trace!(
-                "On-demand indexing (inherited wd): prefetching packages for {}: {:?}",
-                file_uri,
-                packages_to_prefetch
-            );
-            let pkg_lib = self.state.read().await.package_library.clone();
-            pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+                log::trace!(
+                    "On-demand indexing (inherited wd): prefetching packages for {}: {:?}",
+                    file_uri,
+                    packages_to_prefetch
+                );
+                let pkg_lib = self.state.read().await.package_library.clone();
+                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
             }
         }
 
@@ -3696,8 +3750,8 @@ mod tests {
     // **Validates: Requirements 11.1, 11.2, 11.3**
     // ============================================================================
     mod symbol_config_parsing {
-        use serde_json::json;
         use crate::state::SymbolConfig;
+        use serde_json::json;
 
         /// Test that parse_symbol_config returns None when symbols section is absent
         /// **Validates: Requirements 11.1**
@@ -3708,7 +3762,10 @@ mod tests {
             });
 
             let config = crate::backend::parse_symbol_config(&settings);
-            assert!(config.is_none(), "Should return None when symbols section is absent");
+            assert!(
+                config.is_none(),
+                "Should return None when symbols section is absent"
+            );
         }
 
         /// Test that parse_symbol_config returns default when symbols section is empty
@@ -3720,7 +3777,10 @@ mod tests {
             });
 
             let config = crate::backend::parse_symbol_config(&settings);
-            assert!(config.is_some(), "Should return Some when symbols section exists");
+            assert!(
+                config.is_some(),
+                "Should return Some when symbols section exists"
+            );
             let config = config.unwrap();
             assert_eq!(
                 config.workspace_max_results,
@@ -3740,7 +3800,10 @@ mod tests {
             });
 
             let config = crate::backend::parse_symbol_config(&settings);
-            assert!(config.is_some(), "Should return Some when symbols section exists");
+            assert!(
+                config.is_some(),
+                "Should return Some when symbols section exists"
+            );
             let config = config.unwrap();
             assert_eq!(
                 config.workspace_max_results, 500,
@@ -3759,7 +3822,10 @@ mod tests {
             });
 
             let config = crate::backend::parse_symbol_config(&settings);
-            assert!(config.is_some(), "Should return Some when symbols section exists");
+            assert!(
+                config.is_some(),
+                "Should return Some when symbols section exists"
+            );
             let config = config.unwrap();
             assert_eq!(
                 config.workspace_max_results,
@@ -3779,7 +3845,10 @@ mod tests {
             });
 
             let config = crate::backend::parse_symbol_config(&settings);
-            assert!(config.is_some(), "Should return Some when symbols section exists");
+            assert!(
+                config.is_some(),
+                "Should return Some when symbols section exists"
+            );
             let config = config.unwrap();
             assert_eq!(
                 config.workspace_max_results,
@@ -3799,7 +3868,10 @@ mod tests {
                 }
             });
             let config = crate::backend::parse_symbol_config(&settings).unwrap();
-            assert_eq!(config.workspace_max_results, 100, "Minimum boundary should be accepted");
+            assert_eq!(
+                config.workspace_max_results, 100,
+                "Minimum boundary should be accepted"
+            );
 
             // Test maximum boundary
             let settings = json!({
@@ -3808,7 +3880,10 @@ mod tests {
                 }
             });
             let config = crate::backend::parse_symbol_config(&settings).unwrap();
-            assert_eq!(config.workspace_max_results, 10000, "Maximum boundary should be accepted");
+            assert_eq!(
+                config.workspace_max_results, 10000,
+                "Maximum boundary should be accepted"
+            );
         }
 
         /// Test that default value is 1000
