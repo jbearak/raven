@@ -113,6 +113,9 @@ impl HelpCache {
     ///
     /// On cache hit, returns the cached content. On cache miss, calls `get_help()`
     /// to spawn an R subprocess, caches the result (including negative), and returns it.
+    ///
+    /// **Note:** This method blocks on R subprocess I/O. Callers on an async
+    /// runtime should use `tokio::task::spawn_blocking`.
     pub fn get_or_fetch(&self, topic: &str, package: Option<&str>) -> Option<String> {
         if let Some(cached) = self.get(topic, package) {
             return cached;
@@ -162,10 +165,19 @@ const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 /// If the process has already exited, the call is harmless on all platforms.
 #[cfg(unix)]
 fn kill_process_by_pid(pid: u32) {
-    // SAFETY: Sending SIGKILL to a known child PID. If the process already
-    // exited, kill() returns ESRCH harmlessly.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+    match i32::try_from(pid) {
+        Ok(pid_i32) => {
+            // SAFETY: Sending SIGKILL to a known child PID. If the process
+            // already exited, kill() returns ESRCH harmlessly.
+            unsafe {
+                libc::kill(pid_i32, libc::SIGKILL);
+            }
+        }
+        Err(_) => {
+            // PID > i32::MAX would wrap to negative, which kill() interprets
+            // as a process group signal — bail rather than risk that.
+            log::trace!("get_help: pid {} exceeds i32::MAX, cannot kill", pid);
+        }
     }
 }
 
