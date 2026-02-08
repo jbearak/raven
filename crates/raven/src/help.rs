@@ -408,30 +408,6 @@ pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
     extract_signature_from_help(&help_text)
 }
 
-/// Extracts the title and description from R help text for use in completion documentation.
-///
-/// Returns a formatted string with the title (first line) and the "Description:" section content.
-/// Stops at the next section header (e.g., "Usage:", "Arguments:").
-///
-/// # Examples
-///
-/// ```
-/// let help = r#"Arithmetic Mean
-///
-/// Description:
-///
-///      Generic function for the (trimmed) arithmetic mean.
-///
-/// Usage:
-///      mean(x, ...)
-/// "#;
-///
-/// let desc = rlsp::help::extract_description_from_help(help);
-/// assert!(desc.is_some());
-/// let text = desc.unwrap();
-/// assert!(text.contains("Arithmetic Mean"));
-/// assert!(text.contains("arithmetic mean"));
-/// ```
 /// Converts R help text's Unicode curly quotes to markdown inline code.
 ///
 /// R help uses U+2018 (') and U+2019 (') to wrap code references.
@@ -472,6 +448,30 @@ fn r_quotes_to_markdown(text: &str) -> String {
     result
 }
 
+/// Extracts the title and description from R help text for use in completion documentation.
+///
+/// Returns a formatted string with the title (first line) and the "Description:" section content.
+/// Stops at the next section header (e.g., "Usage:", "Arguments:").
+///
+/// # Examples
+///
+/// ```
+/// let help = r#"Arithmetic Mean
+///
+/// Description:
+///
+///      Generic function for the (trimmed) arithmetic mean.
+///
+/// Usage:
+///      mean(x, ...)
+/// "#;
+///
+/// let desc = rlsp::help::extract_description_from_help(help);
+/// assert!(desc.is_some());
+/// let text = desc.unwrap();
+/// assert!(text.contains("Arithmetic Mean"));
+/// assert!(text.contains("arithmetic mean"));
+/// ```
 pub fn extract_description_from_help(help_text: &str) -> Option<String> {
     let lines: Vec<&str> = help_text.lines().collect();
     if lines.is_empty() {

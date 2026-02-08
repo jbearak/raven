@@ -676,6 +676,16 @@ impl<'a> SymbolExtractor<'a> {
             // R constants (tree-sitter-r uses special node kinds)
             "na" | "inf" | "nan" => Some(DocumentSymbolKind::Constant),
 
+            // Typed NA constants (NA_integer_, etc.) are parsed as identifiers
+            "identifier" => {
+                let text = node_text(node, self.text);
+                if R_CONSTANTS.contains(&text) {
+                    Some(DocumentSymbolKind::Constant)
+                } else {
+                    None
+                }
+            }
+
             // Numeric literals
             "integer" | "float" | "complex" => Some(DocumentSymbolKind::Number),
 
