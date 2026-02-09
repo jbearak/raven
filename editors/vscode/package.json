@@ -110,13 +110,15 @@
             "error",
             "warning",
             "information",
-            "hint"
+            "hint",
+            "off"
           ],
           "enumDescriptions": [
             "Report missing sourced files as errors",
             "Report missing sourced files as warnings",
             "Report missing sourced files as information",
-            "Report missing sourced files as hints"
+            "Report missing sourced files as hints",
+            "Disable missing sourced file diagnostics"
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when a sourced file cannot be found. Controls how missing file references in source() calls and LSP directives are reported."
@@ -127,13 +129,15 @@
             "error",
             "warning",
             "information",
-            "hint"
+            "hint",
+            "off"
           ],
           "enumDescriptions": [
             "Report circular dependencies as errors",
             "Report circular dependencies as warnings",
             "Report circular dependencies as information",
-            "Report circular dependencies as hints"
+            "Report circular dependencies as hints",
+            "Disable circular dependency diagnostics"
           ],
           "default": "error",
           "description": "Severity level for diagnostics when circular dependencies are detected between files. Circular dependencies occur when file A sources file B which directly or indirectly sources file A."
@@ -144,13 +148,15 @@
             "error",
             "warning",
             "information",
-            "hint"
+            "hint",
+            "off"
           ],
           "enumDescriptions": [
             "Report out-of-scope symbol usage as errors",
             "Report out-of-scope symbol usage as warnings",
             "Report out-of-scope symbol usage as information",
-            "Report out-of-scope symbol usage as hints"
+            "Report out-of-scope symbol usage as hints",
+            "Disable out-of-scope symbol diagnostics"
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when symbols are used before they are available in scope. This can occur when referencing symbols from a sourced file before the source() call."
@@ -161,13 +167,15 @@
             "error",
             "warning",
             "information",
-            "hint"
+            "hint",
+            "off"
           ],
           "enumDescriptions": [
             "Report ambiguous parent resolution as errors",
             "Report ambiguous parent resolution as warnings",
             "Report ambiguous parent resolution as information",
-            "Report ambiguous parent resolution as hints"
+            "Report ambiguous parent resolution as hints",
+            "Disable ambiguous parent diagnostics"
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when a file's parent cannot be unambiguously determined. This occurs when multiple files source the same child file and the call site cannot be resolved."
@@ -178,16 +186,37 @@
             "error",
             "warning",
             "information",
-            "hint"
+            "hint",
+            "off"
           ],
           "enumDescriptions": [
             "Report max chain depth exceeded as errors",
             "Report max chain depth exceeded as warnings",
             "Report max chain depth exceeded as information",
-            "Report max chain depth exceeded as hints"
+            "Report max chain depth exceeded as hints",
+            "Disable max chain depth diagnostics"
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when the maximum chain depth is exceeded during cross-file dependency resolution. This indicates the dependency chain is deeper than the configured maxChainDepth limit."
+        },
+        "raven.crossFile.redundantDirectiveSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report redundant directives as errors",
+            "Report redundant directives as warnings",
+            "Report redundant directives as information",
+            "Report redundant directives as hints",
+            "Disable redundant directive diagnostics"
+          ],
+          "default": "hint",
+          "description": "Severity level for diagnostics when an @lsp-source directive (without line=) targets the same file as an earlier source() call. The directive is redundant since the source() call already makes the symbols available."
         },
         "raven.crossFile.onDemandIndexing.enabled": {
           "type": "boolean",
@@ -264,13 +293,15 @@
             "error",
             "warning",
             "information",
-            "hint"
+            "hint",
+            "off"
           ],
           "enumDescriptions": [
             "Report missing packages as errors",
             "Report missing packages as warnings",
             "Report missing packages as information",
-            "Report missing packages as hints"
+            "Report missing packages as hints",
+            "Disable missing package diagnostics"
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when a package referenced in library() cannot be found. Controls how missing package references are reported in the editor."

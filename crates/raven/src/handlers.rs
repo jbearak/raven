@@ -2593,26 +2593,28 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     collect_else_newline_errors(tree.root_node(), &text, &mut diagnostics);
 
     // Check for circular dependencies
-    if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
-        let line = cycle_edge.call_site_line.unwrap_or(0);
-        let col = cycle_edge.call_site_column.unwrap_or(0);
-        let target = cycle_edge
-            .to
-            .path_segments()
-            .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-            .unwrap_or_default();
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(line, col),
-                end: Position::new(line, col + 1),
-            },
-            severity: Some(state.cross_file_config.circular_dependency_severity),
-            message: format!(
-                "Circular dependency detected: sourcing '{}' creates a cycle",
-                target
-            ),
-            ..Default::default()
-        });
+    if let Some(severity) = state.cross_file_config.circular_dependency_severity {
+        if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
+            let line = cycle_edge.call_site_line.unwrap_or(0);
+            let col = cycle_edge.call_site_column.unwrap_or(0);
+            let target = cycle_edge
+                .to
+                .path_segments()
+                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+                .unwrap_or_default();
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(line, col),
+                    end: Position::new(line, col + 1),
+                },
+                severity: Some(severity),
+                message: format!(
+                    "Circular dependency detected: sourcing '{}' creates a cycle",
+                    target
+                ),
+                ..Default::default()
+            });
+        }
     }
 
     // Check for max chain depth exceeded (Requirement 5.8)
@@ -2680,7 +2682,7 @@ pub async fn diagnostics_async(
     sync_diagnostics: Vec<Diagnostic>,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     workspace_folders: Option<&Url>,
-    missing_file_severity: DiagnosticSeverity,
+    missing_file_severity: Option<DiagnosticSeverity>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = sync_diagnostics;
 
@@ -2699,16 +2701,18 @@ pub async fn diagnostics_async(
             && !d.message.contains("in @lsp-source directive")
     });
 
-    // Now add async-checked missing file diagnostics
-    let missing_file_diags = collect_missing_file_diagnostics_async(
-        content_provider,
-        uri,
-        directive_meta,
-        workspace_folders,
-        missing_file_severity,
-    )
-    .await;
-    diagnostics.extend(missing_file_diags);
+    // Now add async-checked missing file diagnostics (skip if severity is disabled)
+    if let Some(severity) = missing_file_severity {
+        let missing_file_diags = collect_missing_file_diagnostics_async(
+            content_provider,
+            uri,
+            directive_meta,
+            workspace_folders,
+            severity,
+        )
+        .await;
+        diagnostics.extend(missing_file_diags);
+    }
 
     diagnostics
 }
@@ -2724,7 +2728,7 @@ pub async fn diagnostics_async_standalone(
     sync_diagnostics: Vec<Diagnostic>,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     workspace_folders: Option<&Url>,
-    missing_file_severity: DiagnosticSeverity,
+    missing_file_severity: Option<DiagnosticSeverity>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = sync_diagnostics;
 
@@ -2741,15 +2745,17 @@ pub async fn diagnostics_async_standalone(
             && !d.message.contains("in @lsp-source directive")
     });
 
-    // Collect URIs to check
-    let missing_file_diags = collect_missing_file_diagnostics_standalone(
-        uri,
-        directive_meta,
-        workspace_folders,
-        missing_file_severity,
-    )
-    .await;
-    diagnostics.extend(missing_file_diags);
+    // Collect URIs to check (skip if severity is disabled)
+    if let Some(severity) = missing_file_severity {
+        let missing_file_diags = collect_missing_file_diagnostics_standalone(
+            uri,
+            directive_meta,
+            workspace_folders,
+            severity,
+        )
+        .await;
+        diagnostics.extend(missing_file_diags);
+    }
 
     diagnostics
 }
@@ -2986,6 +2992,12 @@ fn collect_missing_file_diagnostics(
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Skip if missing file diagnostics are disabled
+    let missing_file_severity = match state.cross_file_config.missing_file_severity {
+        Some(sev) => sev,
+        None => return,
+    };
+
     let content_provider = state.content_provider();
 
     // Forward sources use @lsp-cd for path resolution
@@ -3034,7 +3046,7 @@ fn collect_missing_file_diagnostics(
                                     .saturating_add(10),
                             ),
                         },
-                        severity: Some(state.cross_file_config.missing_file_severity),
+                        severity: Some(missing_file_severity),
                         message,
                         ..Default::default()
                     });
@@ -3064,7 +3076,7 @@ fn collect_missing_file_diagnostics(
                                     .saturating_add(10),
                             ),
                         },
-                        severity: Some(state.cross_file_config.missing_file_severity),
+                        severity: Some(missing_file_severity),
                         message,
                         ..Default::default()
                     });
@@ -3091,7 +3103,7 @@ fn collect_missing_file_diagnostics(
                             .saturating_add(10),
                     ),
                 },
-                severity: Some(state.cross_file_config.missing_file_severity),
+                severity: Some(missing_file_severity),
                 message,
                 ..Default::default()
             });
@@ -3112,7 +3124,7 @@ fn collect_missing_file_diagnostics(
                         start: Position::new(directive.directive_line, 0),
                         end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                     },
-                    severity: Some(state.cross_file_config.missing_file_severity),
+                    severity: Some(missing_file_severity),
                     message: format!("Parent file not found: '{}'", directive.path),
                     ..Default::default()
                 });
@@ -3123,7 +3135,7 @@ fn collect_missing_file_diagnostics(
                     start: Position::new(directive.directive_line, 0),
                     end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
                 },
-                severity: Some(state.cross_file_config.missing_file_severity),
+                severity: Some(missing_file_severity),
                 message: format!("Cannot resolve parent path: '{}'", directive.path),
                 ..Default::default()
             });
@@ -3365,20 +3377,22 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
-    for (exceeded_uri, line, col) in &scope.depth_exceeded {
-        if exceeded_uri == uri {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(*line, *col),
-                    end: Position::new(*line, col.saturating_add(1)),
-                },
-                severity: Some(state.cross_file_config.max_chain_depth_severity),
-                message: format!(
-                    "Maximum chain depth ({}) exceeded; some symbols may not be resolved",
-                    max_depth
-                ),
-                ..Default::default()
-            });
+    if let Some(severity) = state.cross_file_config.max_chain_depth_severity {
+        for (exceeded_uri, line, col) in &scope.depth_exceeded {
+            if exceeded_uri == uri {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(*line, *col),
+                        end: Position::new(*line, col.saturating_add(1)),
+                    },
+                    severity: Some(severity),
+                    message: format!(
+                        "Maximum chain depth ({}) exceeded; some symbols may not be resolved",
+                        max_depth
+                    ),
+                    ..Default::default()
+                });
+            }
         }
     }
 }
@@ -3407,6 +3421,12 @@ fn collect_ambiguous_parent_diagnostics(
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Skip if ambiguous parent diagnostics are disabled
+    let severity = match state.cross_file_config.ambiguous_parent_severity {
+        Some(sev) => sev,
+        None => return,
+    };
+
     use crate::cross_file::cache::ParentResolution;
     use crate::cross_file::parent_resolve::resolve_parent_with_content;
 
@@ -3470,7 +3490,7 @@ fn collect_ambiguous_parent_diagnostics(
                 start: Position::new(directive_line, 0),
                 end: Position::new(directive_line, LSP_EOL_CHARACTER),
             },
-            severity: Some(state.cross_file_config.ambiguous_parent_severity),
+            severity: Some(severity),
             message: format!(
                 "Ambiguous parent: using '{}' but also found: {}. Consider adding line= or match= to disambiguate.",
                 selected_name,
@@ -3502,10 +3522,14 @@ fn collect_missing_package_diagnostics(
     meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // Skip if packages feature is disabled
+    // Skip if packages feature is disabled or severity is off
     if !state.cross_file_config.packages_enabled {
         return;
     }
+    let severity = match state.cross_file_config.packages_missing_package_severity {
+        Some(sev) => sev,
+        None => return,
+    };
 
     for lib_call in &meta.library_calls {
         // Skip if the line is ignored via @lsp-ignore or @lsp-ignore-next
@@ -3528,7 +3552,7 @@ fn collect_missing_package_diagnostics(
                     start: Position::new(lib_call.line, 0),
                     end: Position::new(lib_call.line, end_col),
                 },
-                severity: Some(state.cross_file_config.packages_missing_package_severity),
+                severity: Some(severity),
                 message: format!("Package '{}' is not installed", lib_call.package),
                 ..Default::default()
             });
@@ -3717,6 +3741,12 @@ fn collect_out_of_scope_diagnostics(
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Skip if out-of-scope diagnostics are disabled
+    let severity = match state.cross_file_config.out_of_scope_severity {
+        Some(sev) => sev,
+        None => return,
+    };
+
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     // Get all source() calls and @lsp-source directives in this file
@@ -3810,7 +3840,7 @@ fn collect_out_of_scope_diagnostics(
                         start: Position::new(usage_node.start_position().row as u32, start_col),
                         end: Position::new(usage_node.end_position().row as u32, end_col),
                     },
-                    severity: Some(state.cross_file_config.out_of_scope_severity),
+                    severity: Some(severity),
                     message: format!(
                         "Symbol '{}' used before source() call at line {}",
                         name,
@@ -24957,6 +24987,236 @@ result <- helper_with_spaces(42)"#;
             0,
             "Should not emit diagnostic when directive is earlier than source()"
         );
+    }
+
+    // ============================================================================
+    // Tests for severity "off" (None) disabling diagnostics
+    // ============================================================================
+
+    #[test]
+    fn test_missing_package_diagnostic_not_emitted_when_severity_off() {
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls
+            .push(crate::cross_file::source_detect::LibraryCall {
+                package: "__nonexistent_package_xyz__".to_string(),
+                line: 0,
+                column: 30,
+                function_scope: None,
+            });
+
+        let mut state = WorldState::new(Vec::new());
+        state.cross_file_config.packages_missing_package_severity = None;
+        let mut diagnostics = Vec::new();
+
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should not emit diagnostic when missing package severity is off"
+        );
+    }
+
+    #[test]
+    fn test_circular_dependency_diagnostic_not_emitted_when_severity_off() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let a_path = workspace_path.join("a.R");
+        let b_path = workspace_path.join("b.R");
+        std::fs::write(&a_path, "source('b.R')").unwrap();
+        std::fs::write(&b_path, "source('a.R')").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let a_url = Url::from_file_path(&a_path).unwrap();
+        let b_url = Url::from_file_path(&b_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.circular_dependency_severity = None;
+
+        // Set up circular dependency in the graph
+        let meta_a = crate::cross_file::directive::parse_directives("source('b.R')");
+        let meta_b = crate::cross_file::directive::parse_directives("source('a.R')");
+        state
+            .cross_file_graph
+            .update_file(&a_url, &meta_a, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&b_url, &meta_b, Some(&workspace_url), |_| None);
+
+        // Add documents so diagnostics() can run
+        state
+            .documents
+            .insert(a_url.clone(), Document::new("source('b.R')", None));
+
+        let diags = diagnostics(&state, &a_url);
+        let circular_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Circular dependency"))
+            .collect();
+
+        assert_eq!(
+            circular_diags.len(),
+            0,
+            "Should not emit circular dependency diagnostic when severity is off"
+        );
+    }
+
+    #[test]
+    fn test_missing_file_diagnostic_not_emitted_when_severity_off() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        std::fs::write(&main_path, "source('nonexistent.R')").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url);
+        state.cross_file_config.missing_file_severity = None;
+
+        let code = "source('nonexistent.R')";
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let meta = crate::cross_file::directive::parse_directives(code);
+        let mut diagnostics = Vec::new();
+        collect_missing_file_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should not emit missing file diagnostic when severity is off"
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_parent_diagnostic_not_emitted_when_severity_off() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let child_path = workspace_path.join("child.R");
+        let parent1_path = workspace_path.join("parent1.R");
+        let parent2_path = workspace_path.join("parent2.R");
+        std::fs::write(&child_path, "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R")
+            .unwrap();
+        std::fs::write(&parent1_path, "source('child.R')").unwrap();
+        std::fs::write(&parent2_path, "source('child.R')").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let child_url = Url::from_file_path(&child_path).unwrap();
+        let parent1_url = Url::from_file_path(&parent1_path).unwrap();
+        let parent2_url = Url::from_file_path(&parent2_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.ambiguous_parent_severity = None;
+
+        // Set up the graph so both parents source child.R
+        let meta_p1 = crate::cross_file::directive::parse_directives("source('child.R')");
+        let meta_p2 = crate::cross_file::directive::parse_directives("source('child.R')");
+        state
+            .cross_file_graph
+            .update_file(&parent1_url, &meta_p1, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&parent2_url, &meta_p2, Some(&workspace_url), |_| None);
+
+        let child_code = "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R";
+        let meta = crate::cross_file::directive::parse_directives(child_code);
+
+        let mut diagnostics = Vec::new();
+        collect_ambiguous_parent_diagnostics(&state, &child_url, &meta, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should not emit ambiguous parent diagnostic when severity is off"
+        );
+    }
+
+    #[test]
+    fn test_out_of_scope_diagnostic_not_emitted_when_severity_off() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let utils_path = workspace_path.join("utils.R");
+        std::fs::write(&main_path, "x <- helper()\nsource('utils.R')").unwrap();
+        std::fs::write(&utils_path, "helper <- function() 42").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let utils_url = Url::from_file_path(&utils_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url);
+        state.cross_file_config.out_of_scope_severity = None;
+
+        // Add the sourced file so its symbols are discoverable
+        let utils_code = "helper <- function() 42";
+        state
+            .documents
+            .insert(utils_url.clone(), Document::new(utils_code, None));
+
+        let main_code = "x <- helper()\nsource('utils.R')";
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+
+        let meta = crate::cross_file::directive::parse_directives(main_code);
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(main_code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics(
+            &state,
+            &main_url,
+            tree.root_node(),
+            main_code,
+            &meta,
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should not emit out-of-scope diagnostic when severity is off"
+        );
+    }
+
+    #[test]
+    fn test_parse_severity_off_returns_none() {
+        // Verify the parse_severity function handles "off" (case-insensitive)
+        use crate::backend::parse_severity;
+
+        assert_eq!(parse_severity("off"), None);
+        assert_eq!(parse_severity("OFF"), None);
+        assert_eq!(parse_severity("Off"), None);
+        // Unrecognized values default to WARNING, not None
+        assert_eq!(parse_severity("none"), Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            parse_severity("disabled"),
+            Some(DiagnosticSeverity::WARNING)
+        );
+        // Non-off values should return Some
+        assert!(parse_severity("warning").is_some());
+        assert!(parse_severity("error").is_some());
+        assert!(parse_severity("hint").is_some());
+        assert!(parse_severity("information").is_some());
     }
 
     // ============================================================================

@@ -18,11 +18,12 @@ All settings can be configured via VS Code settings or LSP initialization option
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `raven.crossFile.missingFileSeverity` | "warning" | Severity for missing file diagnostics |
-| `raven.crossFile.circularDependencySeverity` | "error" | Severity for circular dependency diagnostics |
-| `raven.crossFile.maxChainDepthSeverity` | "warning" | Severity for max chain depth exceeded diagnostics |
-| `raven.crossFile.outOfScopeSeverity` | "warning" | Severity for out-of-scope symbol diagnostics |
-| `raven.crossFile.ambiguousParentSeverity` | "warning" | Severity for ambiguous parent diagnostics |
+| `raven.crossFile.missingFileSeverity` | "warning" | Severity for missing file diagnostics (`"off"` to disable) |
+| `raven.crossFile.circularDependencySeverity` | "error" | Severity for circular dependency diagnostics (`"off"` to disable) |
+| `raven.crossFile.maxChainDepthSeverity` | "warning" | Severity for max chain depth exceeded diagnostics (`"off"` to disable) |
+| `raven.crossFile.outOfScopeSeverity` | "warning" | Severity for out-of-scope symbol diagnostics (`"off"` to disable) |
+| `raven.crossFile.ambiguousParentSeverity` | "warning" | Severity for ambiguous parent diagnostics (`"off"` to disable) |
+| `raven.crossFile.redundantDirectiveSeverity` | "hint" | Severity for redundant @lsp-source directives (`"off"` to disable) |
 | `raven.diagnostics.undefinedVariables` | true | Enable undefined variable diagnostics |
 
 ## Package Settings
@@ -32,7 +33,7 @@ All settings can be configured via VS Code settings or LSP initialization option
 | `raven.packages.enabled` | true | Enable/disable package function awareness |
 | `raven.packages.additionalLibraryPaths` | [] | Additional R library paths for package discovery |
 | `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls |
-| `raven.packages.missingPackageSeverity` | "warning" | Severity for missing package diagnostics |
+| `raven.packages.missingPackageSeverity` | "warning" | Severity for missing package diagnostics (`"off"` to disable) |
 
 ## Symbol Settings
 

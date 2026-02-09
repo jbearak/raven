@@ -39,16 +39,16 @@ pub struct CrossFileConfig {
     pub revalidation_debounce_ms: u64,
     /// Whether undefined variable diagnostics are enabled
     pub undefined_variables_enabled: bool,
-    /// Severity for missing file diagnostics
-    pub missing_file_severity: DiagnosticSeverity,
-    /// Severity for circular dependency diagnostics
-    pub circular_dependency_severity: DiagnosticSeverity,
-    /// Severity for out-of-scope symbol diagnostics
-    pub out_of_scope_severity: DiagnosticSeverity,
-    /// Severity for ambiguous parent diagnostics
-    pub ambiguous_parent_severity: DiagnosticSeverity,
-    /// Severity for max chain depth exceeded diagnostics
-    pub max_chain_depth_severity: DiagnosticSeverity,
+    /// Severity for missing file diagnostics (None = disabled)
+    pub missing_file_severity: Option<DiagnosticSeverity>,
+    /// Severity for circular dependency diagnostics (None = disabled)
+    pub circular_dependency_severity: Option<DiagnosticSeverity>,
+    /// Severity for out-of-scope symbol diagnostics (None = disabled)
+    pub out_of_scope_severity: Option<DiagnosticSeverity>,
+    /// Severity for ambiguous parent diagnostics (None = disabled)
+    pub ambiguous_parent_severity: Option<DiagnosticSeverity>,
+    /// Severity for max chain depth exceeded diagnostics (None = disabled)
+    pub max_chain_depth_severity: Option<DiagnosticSeverity>,
     /// Whether on-demand indexing is enabled
     pub on_demand_indexing_enabled: bool,
     /// Maximum transitive depth for on-demand indexing
@@ -61,8 +61,8 @@ pub struct CrossFileConfig {
     pub packages_additional_library_paths: Vec<PathBuf>,
     /// Path to R executable for subprocess calls
     pub packages_r_path: Option<PathBuf>,
-    /// Severity for missing package diagnostics
-    pub packages_missing_package_severity: DiagnosticSeverity,
+    /// Severity for missing package diagnostics (None = disabled)
+    pub packages_missing_package_severity: Option<DiagnosticSeverity>,
     /// Severity for redundant directive diagnostics (when @lsp-source without line= targets
     /// same file as earlier source() call)
     /// _Requirements: 6.2_
@@ -106,18 +106,18 @@ impl Default for CrossFileConfig {
             max_revalidations_per_trigger: 10,
             revalidation_debounce_ms: 200,
             undefined_variables_enabled: true,
-            missing_file_severity: DiagnosticSeverity::WARNING,
-            circular_dependency_severity: DiagnosticSeverity::ERROR,
-            out_of_scope_severity: DiagnosticSeverity::WARNING,
-            ambiguous_parent_severity: DiagnosticSeverity::WARNING,
-            max_chain_depth_severity: DiagnosticSeverity::WARNING,
+            missing_file_severity: Some(DiagnosticSeverity::WARNING),
+            circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
+            out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
+            ambiguous_parent_severity: Some(DiagnosticSeverity::WARNING),
+            max_chain_depth_severity: Some(DiagnosticSeverity::WARNING),
             on_demand_indexing_enabled: true,
             on_demand_indexing_max_transitive_depth: 2,
             on_demand_indexing_max_queue_size: 50,
             packages_enabled: true,
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
-            packages_missing_package_severity: DiagnosticSeverity::WARNING,
+            packages_missing_package_severity: Some(DiagnosticSeverity::WARNING),
             redundant_directive_severity: Some(DiagnosticSeverity::HINT),
             cache_metadata_max_entries: 1000,
             cache_file_content_max_entries: 500,
@@ -162,7 +162,7 @@ mod tests {
         assert!(config.packages_r_path.is_none());
         assert_eq!(
             config.packages_missing_package_severity,
-            DiagnosticSeverity::WARNING
+            Some(DiagnosticSeverity::WARNING)
         );
         // Redundant directive severity defaults
         assert_eq!(
