@@ -52,10 +52,12 @@ When a completion request arrives:
 
 1. **File path context** is checked first (existing behavior, unchanged).
 2. **Embedded-R scope gating**: if the document is R Markdown/embedded-R and the cursor is outside an R code block, return standard completions only (no parameter completions).
-3. **Standard completions** are always collected (keywords, constants, document symbols, package exports, cross-file symbols) — this is the existing `completion()` logic.
-4. **Function call context** is checked via AST walk (with bracket-heuristic fallback). If detected, proceed; otherwise return standard completions only.
-5. **Namespace-token suppression**: if the current token being completed is namespace-qualified (`::`/`:::`), skip parameter completions to avoid conflicting with namespace completions.
-6. **Parameter completions** are prepended to the standard list with `"0-"` sort prefix when eligible.
+3. **Token detection**: detect the token at cursor and check for namespace accessor (`::` or `:::`). This happens BEFORE call detection (matching R-LS ordering where `detect_token()` precedes `detect_call()`).
+4. **Special-case context gating**: if the cursor is inside a function call with a special-case handler (e.g., `library()`, `require()` showing installed packages), use that handler and skip parameter completions. The official R-LS skips parameter completions entirely for these functions.
+5. **Standard completions** are always collected (keywords, constants, document symbols, package exports, cross-file symbols) — this is the existing `completion()` logic.
+6. **Namespace-token suppression**: if the token from step 3 has a namespace accessor (`::`/`:::`), skip call detection and parameter completions entirely. Only namespace completions are shown. (This is how R-LS works: `detect_call()` is never invoked when an accessor is present.)
+7. **Function call context** is checked via AST walk (with string-aware bracket-heuristic fallback). If detected, proceed; otherwise return standard completions only.
+8. **Parameter completions** are prepended to the standard list with `"0-"` sort prefix when eligible.
 
 This ordering ensures that inside `filter(df, col > `, the user sees:
 - `filter`'s parameters (`.data`, `.preserve`, etc.) at the top
@@ -104,7 +106,12 @@ fn find_enclosing_function_call(
 5. For nested calls: the innermost `call` ancestor wins
 6. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node. Detect if operator is `::` or `:::` and set `is_internal` accordingly.
 7. Skip if cursor is inside a `string` node (no parameter completions inside string literals)
-8. If the AST walk fails to find a call (e.g., due to incomplete syntax), fall back to a bracket-based heuristic (nearest unmatched `(`, then token lookup before it), matching R-LS robustness
+8. If the AST walk fails to find a call (e.g., due to incomplete syntax), fall back to a **string-aware** bracket-based heuristic:
+   - Scan backward from the cursor position through the document text
+   - Track bracket nesting: `(` pushes, `)` pops; the first unmatched `(` is the target
+   - **String boundary tracking**: Maintain a state machine to detect when the scanner is inside single-quoted (`'...'`), double-quoted (`"..."`), or backtick-quoted (`` `...` ``) strings. Brackets inside strings are ignored. This prevents `f("(", |)` from being confused by the `(` inside the string literal. (The official R language server implements this via a C finite state machine in `fsm.c`/`search.c`.)
+   - Once the unmatched `(` is found, extract the function name token immediately before it (scan backward from the `(` position, collecting identifier characters including `.` and `::` namespace qualifiers)
+   - This matches R-LS robustness for incomplete/malformed syntax
 
 ### 2. Parameter Resolver
 
@@ -415,12 +422,20 @@ fn get_parameter_completions(
                 Some(d) => format!("parameter = {}", d), // optional enhancement
                 None => "parameter".to_string(),
             });
+            // For `...`, insert as-is (no ` = `) since `... = value` is invalid R.
+            // For all other params, append ` = ` for convenience.
+            let insert = if p.is_dots {
+                p.name.clone()
+            } else {
+                format!("{} = ", p.name)
+            };
             // Note: filter_text is intentionally omitted.
             CompletionItem {
                 label: p.name.clone(),
                 kind: Some(CompletionItemKind::VARIABLE),
                 detail,
-                insert_text: Some(format!("{} = ", p.name)),
+                insert_text: Some(insert),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                 // Sort by index (0-001, 0-002) to preserve definition order
                 sort_text: Some(format!("{}{:03}", SORT_PREFIX_PARAM, idx)),
                 data: Some(serde_json::json!({
@@ -435,7 +450,7 @@ fn get_parameter_completions(
 }
 ```
 
-**Matching rule**: Parameter filtering uses case-insensitive substring matching (same semantics as R-LS `match_with`), not strict prefix-only matching.
+**Matching rule**: Parameter filtering uses case-insensitive substring matching (same semantics as R-LS `match_with`), not strict prefix-only matching. The matching MUST treat all characters literally (not as regex patterns). In particular, `.` in R identifiers like `na.rm` must match literally, not as a regex wildcard. Implementation should use a simple `contains`-style check (e.g., `str::contains` with lowercased inputs), NOT regex `grepl`. The R-LS achieves this by escaping `.` before passing to `grepl`.
 **Backend threading model**: The `completion()` async wrapper in `backend.rs` must use `tokio::task::spawn_blocking` to wrap the parameter resolution path, since `resolve()` may block on R subprocess. The pattern is:
 
 1. Acquire WorldState read lock, collect standard completions and detect function call context (fast, non-blocking)
@@ -518,9 +533,9 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 
 ### Property 6: Parameter Completion Formatting
 
-*For any* parameter completion item, the item SHALL have `kind = CompletionItemKind::VARIABLE`, `insert_text` ending with ` = `, and `sort_text` starting with `0-` followed by digits.
+*For any* parameter completion item, the item SHALL have `kind = CompletionItemKind::VARIABLE`, `insert_text_format = InsertTextFormat::PLAIN_TEXT`, `sort_text` starting with `0-` followed by digits, and: for non-dots parameters, `insert_text` ending with ` = `; for the `...` parameter, `insert_text` equal to `"..."` (no ` = ` suffix).
 
-**Validates: Requirements 5.1, 5.3, 5.6**
+**Validates: Requirements 5.1, 5.3, 5.6, 5.7**
 
 ### Property 7: Case-Insensitive Substring Matching
 
@@ -611,6 +626,10 @@ The following are explicitly excluded from this spec and may be addressed in fol
 
 5. **Cross-session cache persistence**: Requirement 9.3 has been deferred (see requirements.md). The signature cache is in-memory only and rebuilt each session.
 
+6. **Workspace-but-not-sourced function resolution**: See requirements.md Out of Scope item 5.
+
+7. **Completion count limiting**: See requirements.md Out of Scope item 6.
+
 ## Testing Strategy
 
 ### Unit Tests
@@ -624,20 +643,23 @@ Unit tests verify specific examples and edge cases:
    - Cursor inside string literals (should not trigger)
    - Cursor outside parentheses (should not trigger)
    - Incomplete syntax / unbalanced parentheses still finds the call
+   - Brackets inside string literals: `f("(", |)` should detect `f`, not be confused by the `(` in the string
    - R Markdown: inside R code block triggers; outside code block does not
+   - `library(|)` and `require(|)`: special-case handler takes precedence (if implemented)
 
 2. **Parameter Extraction**
    - Simple function `function(x, y)`
    - With defaults `function(x = 1, y = "hello")`
-   - With dots `function(...)` — includes `...`
-   - Mixed `function(x, y = 1, ...)` — includes `x`, `y`, and `...`
+   - With dots `function(...)` — includes `...`, insert text is `"..."` (no ` = `)
+   - Mixed `function(x, y = 1, ...)` — includes `x`, `y`, and `...`; `x` and `y` get ` = ` but `...` does not
 
 3. **Mixed Completions**
    - Inside `filter(df, ` — verify both params and local vars present
    - Verify parameter items have `"0-"` sort prefix
    - Verify standard items retain their existing sort prefixes
-   - Case-insensitive substring matching (e.g., `OBJ` matches `object`)
+   - Case-insensitive substring matching (e.g., `OBJ` matches `object`); dots are literal (`.` in `na.rm` matches only `.`)
    - Namespace-qualified token suppression (e.g., `str(stats::o` yields no parameter items)
+   - `insertTextFormat` is `PlainText` on all parameter items
 
 4. **Parameter Documentation Resolve**
    - Package function with Rd `\\arguments` entry

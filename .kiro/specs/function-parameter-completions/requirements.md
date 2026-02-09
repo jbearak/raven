@@ -28,7 +28,7 @@ This feature adds function parameter completions to Raven (an R language server)
 3. WHEN the cursor is positioned inside nested function calls, THE Completion_Handler SHALL detect the innermost function call context
 4. WHEN the cursor is positioned outside any function call parentheses, THE Completion_Handler SHALL NOT provide parameter completions
 5. WHEN the cursor is positioned inside a string literal within function arguments, THE Completion_Handler SHALL NOT provide parameter completions
-6. WHEN the argument list spans multiple lines or contains incomplete syntax (e.g., unbalanced parentheses during typing), THE Completion_Handler SHALL still detect function call context using a fallback heuristic (e.g., nearest unmatched `(`), matching the robustness of the official R language server
+6. WHEN the argument list spans multiple lines or contains incomplete syntax (e.g., unbalanced parentheses during typing), THE Completion_Handler SHALL still detect function call context using a fallback heuristic that scans backward from the cursor for the nearest unmatched `(`, matching the robustness of the official R language server. The bracket scanner SHALL be string-aware: it MUST track string boundaries (single-quoted, double-quoted, backtick-quoted) so that brackets inside string literals are ignored (e.g., `f("(", |)` must detect `f` as the enclosing call, not be confused by the `(` inside the string)
 7. WHEN the document is R Markdown (or another embedded-R format), THE Completion_Handler SHALL only provide parameter completions inside R code blocks, not in markdown/text regions
 
 ### Requirement 2: Base R Function Parameter Completions
@@ -77,10 +77,11 @@ This feature adds function parameter completions to Raven (an R language server)
 
 1. THE Completion_Handler SHALL display parameter completions with `CompletionItemKind::VARIABLE` (matching the official R language server)
 2. THE Completion_Handler SHALL set the detail field to a clear parameter marker (e.g., `parameter`); if default values are available, it MAY append `= <default>` (optional enhancement)
-3. WHEN inserting a parameter completion, THE Completion_Handler SHALL append an equals sign followed by a space (`= `) after the parameter name
+3. WHEN inserting a parameter completion, THE Completion_Handler SHALL append an equals sign followed by a space (`= `) after the parameter name, EXCEPT for the `...` parameter which SHALL be inserted as-is without ` = ` (since `... = value` is not valid R syntax). Note: this intentionally improves on the official R language server, which unconditionally appends ` = ` to all parameters including `...`
 4. THE Completion_Handler SHALL filter parameter completions using case-insensitive substring matching (consistent with the official R language server), not strict prefix-only matching
 5. WHEN a function signature includes `...`, THE Completion_Handler SHALL include `...` in the parameter completion list (matching the official R language server)
 6. THE Completion_Handler SHALL assign parameter completions a sort prefix of `0-{index}-` (e.g., `0-001-`, `0-002-`) corresponding to their definition order, ensuring they appear before all other completion types AND preserve their original order in the function signature
+7. THE Completion_Handler SHALL set `insertTextFormat` to `InsertTextFormat::PLAIN_TEXT` on parameter completion items (matching the official R language server) to prevent clients from interpreting the insert text as a snippet template
 
 ### Requirement 6: Mixed Completions in Function Call Context
 
@@ -92,7 +93,8 @@ This feature adds function parameter completions to Raven (an R language server)
 2. WHEN in function call context, THE Completion_Handler SHALL include standard completions (local variables, package exports, cross-file symbols, keywords) alongside parameter completions
 3. THE Completion_Handler SHALL maintain existing completion behavior when not in function call context
 4. THE Completion_Handler SHALL sort parameter completions (`"0-"`) before all other completion types, and maintain the existing sort precedence for non-parameter items: local definitions (`"1-"`) before package exports (`"4-"`) before keywords (`"5-"`)
-5. WHEN the current token being completed is namespace-qualified (e.g., `stats::` or `stats::o` inside a function call), THE Completion_Handler SHALL NOT add parameter completions, matching the official R language server’s behavior
+5. WHEN the current token being completed is namespace-qualified (e.g., `stats::` or `stats::o` inside a function call), THE Completion_Handler SHALL NOT add parameter completions, matching the official R language server's behavior. Specifically, token detection (checking for `::` or `:::` accessor) SHALL occur BEFORE function call detection: if a namespace accessor is detected at the cursor, the call detection step is skipped entirely
+6. WHEN the cursor is inside a function call that has a special-case completion handler (e.g., `library()` or `require()` showing installed packages), THE Completion_Handler SHALL use the special-case handler instead of (or in addition to) parameter completions, to avoid cluttering the list with both parameter names and the domain-specific completions. The official R language server skips parameter completions entirely for `library()` and `require()`, showing only installed package names
 
 ### Requirement 7: Parameter Documentation on Resolve
 
@@ -161,3 +163,7 @@ The following are explicitly excluded from this spec:
 3. **Dollar-sign completions**: `list$` and `dataframe$` member completions are deferred to a separate follow-up spec.
 
 4. **Filtering out already-specified named arguments**: The official R language server does not exclude previously used parameter names, so this behavior is not required for parity. It may be added later as an enhancement if desired.
+
+5. **Workspace-but-not-sourced function resolution**: The official R language server resolves function parameters by searching ALL open documents (its "global environment") as a distinct step before searching loaded packages. Raven's resolution searches the current file, then cross-file scope (sourced files only), then packages. Functions defined in open-but-not-sourced files are discoverable via workspace symbol search but not via parameter resolution. This difference is intentional — Raven's cross-file model is source-chain-based, and broadening resolution to all open documents would introduce non-deterministic behavior (results depend on which files happen to be open). May revisit if users report missing completions for workspace-visible functions.
+
+6. **Completion count limiting**: The official R language server truncates completion lists to `max_completions` (default: 200), with priority given to items whose labels start with the typed token. This spec does not require a hard completion count limit; VS Code clients already handle large completion lists efficiently. May revisit if performance profiling shows a need.

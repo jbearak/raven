@@ -14,7 +14,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Handle namespace-qualified calls: extract namespace and function name from `namespace_operator` nodes. Check operator text: `::` -> `is_internal = false`, `:::` -> `is_internal = true`
     - Gate on embedded-R scope (R Markdown): return `None` when cursor is outside an R code block
     - Return `None` if cursor is inside a `string` node or outside all function call parentheses
-    - Add a bracket-heuristic fallback (nearest unmatched `(` + token lookup) for incomplete syntax when AST walk fails
+    - Add a **string-aware** bracket-heuristic fallback for incomplete syntax when AST walk fails: scan backward from cursor tracking bracket nesting while maintaining a state machine for string boundaries (single-quoted, double-quoted, backtick-quoted). Brackets inside string literals must be ignored so that e.g. `f("(", |)` correctly identifies `f` as the enclosing call. Then extract the function name token before the unmatched `(`
     - Add `mod completion_context;` to `main.rs`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7_
 
@@ -32,8 +32,10 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Verify parameter completions only appear inside R code blocks, not in markdown text
     - **Validates: Requirements 1.7**
 
-  - [ ]* 1.5 Write unit test for incomplete-syntax fallback
+  - [ ]* 1.5 Write unit tests for incomplete-syntax and string-aware bracket fallback
     - Verify bracket-heuristic detects call context when parentheses are unbalanced during typing
+    - Verify bracket-heuristic handles brackets inside string literals: `f("(", |)` detects `f`, `g(')', |)` detects `g`, `` h(`(`, |) `` detects `h`
+    - Verify bracket-heuristic handles escaped quotes inside strings: `f("a\"(b", |)` detects `f`
     - **Validates: Requirements 1.6**
 
 - [ ] 2. Checkpoint - Ensure context detection tests pass
@@ -45,7 +47,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Define `SignatureCache` with two `RwLock<LruCache>` fields: `package_signatures` (capacity 500) and `user_signatures` (capacity 200)
     - Implement `SignatureCache::new()`, `get_package()`, `get_user()` (use `peek()` for reads), `insert_package()`, `insert_user()` (use `push()` for writes)
     - Implement `SignatureCache::invalidate_file(uri)`: iterate user LRU cache, collect keys matching URI prefix, remove them
-    - Implement `ParameterResolver::extract_from_ast()`: extract params from `formal_parameters` tree-sitter node, detect `...` via `dots` node kind, extract default values from `default_parameter` nodes (do NOT filter out `...`; include it for R-LS parity)
+    - Implement `ParameterResolver::extract_from_ast()`: extract params from `formal_parameters` tree-sitter node, detect `...` via `dots` node kind (set `is_dots = true`), extract default values from `default_parameter` nodes (do NOT filter out `...`; include it for R-LS parity). The `is_dots` flag is used later to suppress ` = ` in insert text
     - Implement `ParameterResolver::resolve(..., is_internal: bool)` with resolution priority: cache → local AST (nearest in-scope definition before cursor; works for untitled docs) → cross-file scope → package (R subprocess with 5s timeout on cache miss)
     - For package resolution: use scope resolver's position-aware `loaded_packages` + `inherited_packages` to determine which package exports the function at cursor position. If `is_internal` is true, pass `exported_only = false` to R query.
     - Add `mod parameter_resolver;` to `main.rs`
@@ -91,20 +93,22 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - If inside function call, call `get_parameter_completions()` and prepend parameter items to the completion list
     - Suppress parameter completions when the current token is namespace-qualified (`::`/`:::`), matching R-LS
     - Respect embedded-R scope gating (R Markdown): no parameter completions outside R code blocks
-    - Implement `get_parameter_completions()`: 
+    - Implement `get_parameter_completions()`:
       - Call `resolver.resolve()`
       - Handle `base::options()` special case: if function is `options` and package is `base` (or inferred as base), add `names(.Options)` to parameter list
-      - Filter params using case-insensitive substring matching against the current token (R-LS behavior)
+      - Filter params using case-insensitive substring matching against the current token (R-LS behavior). Matching must be literal (not regex) — use simple `str::contains` on lowercased strings, NOT regex, to ensure `.` in identifiers like `na.rm` matches literally
       - Include `...` parameters (no exclusion)
-      - Format each as `CompletionItem` with `kind = VARIABLE`, `insert_text = "name = "`, `sort_text = "0-{index}-name"` (preserving definition order), `detail = "parameter"` (optionally `parameter = default`), and `data` JSON with `param_name`, `function_name`, `package`/`uri`+`func_line`
+      - Format each as `CompletionItem` with `kind = VARIABLE`, `insert_text_format = InsertTextFormat::PLAIN_TEXT`, `insert_text = "name = "` for regular params or `insert_text = "..."` for dots (no ` = ` for `...`), `sort_text = "0-{index}-name"` (preserving definition order), `detail = "parameter"` (optionally `parameter = default`), and `data` JSON with `param_name`, `function_name`, `package`/`uri`+`func_line`
+    - Gate parameter completions when inside special-case function calls: if the function is `library` or `require` (and an installed-packages completion handler exists), skip parameter completions to match R-LS behavior
+    - Ensure token detection (checking for `::` or `:::` accessor) happens BEFORE call detection — if accessor is present, skip call detection entirely (R-LS ordering)
     - Update `backend.rs` `completion()` async wrapper: collect standard completions + detect context under WorldState read lock (fast), release lock, then run parameter resolution in `tokio::task::spawn_blocking` with cloned `Arc<SignatureCache>` and `Arc<PackageLibrary>` references
     - Standard completions remain unchanged when not in function call context
-    - _Requirements: 2.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.1, 6.2, 6.3, 6.4, 6.5_
+    - _Requirements: 2.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
 
   - [ ]* 6.3 Write property test for parameter completion formatting
     - **Property 6: Parameter Completion Formatting**
-    - For any parameter completion item, verify `kind = VARIABLE`, `insert_text` ends with ` = `, and `sort_text` starts with `0-` followed by digits
-    - **Validates: Requirements 5.1, 5.3, 5.6**
+    - For any parameter completion item, verify `kind = VARIABLE`, `insert_text_format = PLAIN_TEXT`, `sort_text` starts with `0-` followed by digits; for non-dots params `insert_text` ends with ` = `; for `...` param `insert_text` equals `"..."` (no ` = `)
+    - **Validates: Requirements 5.1, 5.3, 5.6, 5.7**
 
   - [ ]* 6.4 Write property test for case-insensitive substring matching
     - **Property 7: Case-Insensitive Substring Matching**
