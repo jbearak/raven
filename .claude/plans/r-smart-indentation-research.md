@@ -47,12 +47,14 @@ ESS treats indentation as a function of syntactic context. Key findings:
 2. Indent continuation lines by `ess-indent-offset` (2 in RStudio style) from the chain start's column
 3. All continuation lines get the **same** indentation (the `straight` mode, which is the default)
 
-Example:
+**For VS Code implementation:** Use `editor.tabSize` instead of hardcoding 2 spaces. Read from `editor.options.tabSize` and `editor.options.insertSpaces` to respect user configuration.
+
+Example (assuming tabSize=2):
 ```r
 result <- data %>%        # chain start, col 11
-  filter(x > 0) %>%      # +2 from "result" (col 0 + 2 = col 2)
-  mutate(y = x + 1) %>%  # same +2
-  select(y)              # same +2
+  filter(x > 0) %>%      # +tabSize from "result" (col 0 + 2 = col 2)
+  mutate(y = x + 1) %>%  # same +tabSize
+  select(y)              # same +tabSize
 ```
 
 ### Argument alignment (inside parentheses)
@@ -69,7 +71,7 @@ When `(` is followed by a newline, `ess-offset-arguments-newline` applies instea
 
 ```r
 long_function_name(
-  arg1,
+  arg1,  # +tabSize from function line
   arg2
 )
 ```
@@ -78,7 +80,7 @@ long_function_name(
 
 | Variable | RStudio value |
 |----------|--------------|
-| `ess-indent-offset` | 2 |
+| `ess-indent-offset` | 2 (use `editor.tabSize` in VS Code) |
 | `ess-offset-arguments` | `open-delim` |
 | `ess-offset-arguments-newline` | `prev-line` |
 | `ess-offset-block` | `prev-line` |
@@ -196,12 +198,12 @@ On newline, inspect the AST at the cursor position:
 
 1. **Inside unclosed `(`/`[`/`{`**:
    - If opener is followed by content on same line → align to column after opener (open-delim)
-   - If opener is followed by newline → indent +2 from the line containing the opener (prev-line)
-   - Special: `{` always indents +2 (block indent)
+   - If opener is followed by newline → indent +tabSize from the line containing the opener (prev-line)
+   - Special: `{` always indents +tabSize (block indent)
 
 2. **After continuation operator** (`|>`, `%>%`, `+`, `~`, `%infix%`):
    - Walk backward through the AST to find the chain start (first expression not preceded by an operator-terminated line)
-   - Indent +2 from the chain start's column
+   - Indent +tabSize from the chain start's column
    - All continuation lines in the chain get the same indentation (straight mode)
 
 3. **Closing delimiter on its own line** (`)`, `]`, `}`):
@@ -209,6 +211,8 @@ On newline, inspect the AST at the cursor position:
 
 4. **After a complete expression** (no trailing operator, no unclosed delimiters):
    - Return to the indentation of the enclosing block
+
+**Implementation note:** Read `FormattingOptions.tab_size` and `FormattingOptions.insert_spaces` from the LSP request params to respect user configuration. The TextEdit response must replace the full indentation range `(line, 0)` to `(line, existing_whitespace_length)` to override VS Code's declarative rules.
 
 **tree-sitter nodes to use:**
 - `pipe_operator` (for `|>`)
@@ -224,7 +228,7 @@ Expose an indentation style setting:
 ```json
 "raven.indentation.style": {
   "type": "string",
-  "enum": ["rstudio", "rstudio-minus", "tidyverse"],
+  "enum": ["rstudio", "rstudio-minus"],
   "default": "rstudio",
   "description": "Indentation style for R code"
 }
@@ -232,15 +236,18 @@ Expose an indentation style setting:
 
 | Style | Args (same-line) | Args (next-line) | Continuations in calls |
 |-------|-----------------|-------------------|----------------------|
-| `rstudio` | open-delim | prev-line (+2) | Not aligned to paren |
-| `rstudio-minus` | prev-line (+2) | prev-line (+2) | Not aligned to paren |
-| `tidyverse` | open-delim | prev-line (+2) | Not aligned to paren |
+| `rstudio` | open-delim | prev-line (+tabSize) | Not aligned to paren |
+| `rstudio-minus` | prev-line (+tabSize) | prev-line (+tabSize) | Not aligned to paren |
+
+The difference: RStudio aligns arguments to the opening paren when on the same line, while RStudio- indents them relative to the previous line.
+
+Note: `+tabSize` refers to the user's configured `editor.tabSize` setting (typically 2 for R).
 
 ---
 
 ## What Ben Specifically Wants (from the Slack thread)
 
-1. After `|>` or `%>%` at end of line → indent the verb on the next line by +2 from the pipeline object (chain start)
+1. After `|>` or `%>%` at end of line → indent the verb on the next line by +tabSize from the pipeline object (chain start)
 2. Inside unclosed `()` → align or indent continuation arguments properly
 3. Smart de-indentation when a pipe chain ends
 
