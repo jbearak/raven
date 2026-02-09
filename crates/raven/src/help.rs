@@ -3,6 +3,7 @@
 // This module calls R as a subprocess to get help documentation.
 // It's "static" in that it doesn't embed R, but can still access help.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
@@ -38,9 +39,17 @@ struct CachedHelp {
 ///
 /// Uses `peek()` for reads (no LRU promotion, works under read lock) and
 /// `push()` for writes (promotes/evicts under write lock).
+///
+/// Also caches structured argument maps (parameter name → description) parsed
+/// from the "Arguments:" section of rendered help text. This avoids re-parsing
+/// help text on every `completionItem/resolve` request for parameter documentation.
 #[derive(Clone)]
 pub struct HelpCache {
     inner: Arc<RwLock<LruCache<String, CachedHelp>>>,
+    /// Cache for structured argument maps: topic+package → HashMap<param_name, description>.
+    /// Uses the same composite key format as `inner`. `None` values represent
+    /// negative cache entries (no arguments found or no help available).
+    arguments: Arc<RwLock<LruCache<String, Option<HashMap<String, String>>>>>,
     negative_ttl: Duration,
 }
 
@@ -125,6 +134,49 @@ impl HelpCache {
         result
     }
 
+    /// Returns structured argument documentation for a function, using the cache
+    /// to avoid re-parsing help text on every resolve request.
+    ///
+    /// On cache hit, returns the cached argument map. On cache miss, fetches help
+    /// text (via `get_or_fetch`, which itself caches the raw help text), parses
+    /// the "Arguments:" section, caches the result, and returns it.
+    ///
+    /// Returns `Some(HashMap)` when arguments are found, `None` when no help text
+    /// is available or the help text has no "Arguments:" section.
+    ///
+    /// **Note:** This method may block on R subprocess I/O (on help text cache miss).
+    /// Callers on an async runtime should use `tokio::task::spawn_blocking`.
+    pub fn get_arguments(
+        &self,
+        topic: &str,
+        package: Option<&str>,
+    ) -> Option<HashMap<String, String>> {
+        let key = cache_key(topic, package);
+
+        // Check argument cache under read lock (concurrent reads allowed)
+        {
+            if let Ok(guard) = self.arguments.read() {
+                if let Some(cached) = guard.peek(&key) {
+                    return cached.clone();
+                }
+            }
+        }
+
+        // Cache miss — fetch help text and parse arguments
+        let help_text = self.get_or_fetch(topic, package);
+        let args = help_text.and_then(|text| {
+            let map = extract_arguments_from_help(&text);
+            if map.is_empty() { None } else { Some(map) }
+        });
+
+        // Cache the result (including None for negative caching)
+        if let Ok(mut guard) = self.arguments.write() {
+            guard.push(key, args.clone());
+        }
+
+        args
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().map(|c| c.len()).unwrap_or(0)
@@ -134,6 +186,7 @@ impl HelpCache {
         let cap = crate::cross_file::cache::non_zero_or(cap, HELP_CACHE_MAX_ENTRIES);
         Self {
             inner: Arc::new(RwLock::new(LruCache::new(cap))),
+            arguments: Arc::new(RwLock::new(LruCache::new(cap))),
             negative_ttl,
         }
     }
@@ -575,6 +628,185 @@ pub fn extract_description_from_help(help_text: &str) -> Option<String> {
     Some(r_quotes_to_markdown(&format!("{title}\n\n{description}")))
 }
 
+/// Extracts structured argument documentation from the "Arguments:" section
+/// of rendered R help text (produced by `tools::Rd2txt()`).
+///
+/// Returns a `HashMap` mapping parameter names to their descriptions. Multi-line
+/// descriptions are joined with spaces and whitespace is normalized. R's Unicode
+/// curly quotes are converted to markdown backticks.
+///
+/// The parser handles the standard `Rd2txt` output format where each argument
+/// entry looks like:
+///
+/// ```text
+///        x: An R object. Currently there are methods for
+///           numeric/logical vectors.
+///
+///     trim: the fraction (0 to 0.5) of observations to be
+///           trimmed from each end.
+/// ```
+///
+/// The argument name is right-aligned before the colon, and continuation lines
+/// are indented to align with the description start column.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// let help = r#"Arithmetic Mean
+///
+/// Description:
+///
+///      Generic function for the (trimmed) arithmetic mean.
+///
+/// Usage:
+///
+///      mean(x, ...)
+///
+/// Arguments:
+///
+///        x: An R object.
+///
+///     trim: the fraction (0 to 0.5) of observations to be trimmed.
+///
+///    na.rm: a logical value indicating whether NA values should be
+///           stripped.
+///
+///      ...: further arguments passed to or from other methods.
+///
+/// Value:
+///
+///      The mean.
+/// "#;
+///
+/// let args = rlsp::help::extract_arguments_from_help(help);
+/// assert_eq!(args.get("x").unwrap(), "An R object.");
+/// assert!(args.get("trim").unwrap().contains("fraction"));
+/// assert!(args.get("na.rm").unwrap().contains("logical"));
+/// assert!(args.get("...").unwrap().contains("further arguments"));
+/// ```
+pub fn extract_arguments_from_help(help_text: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let lines: Vec<&str> = help_text.lines().collect();
+
+    // Find the "Arguments:" section
+    let args_idx = match lines.iter().position(|line| line.trim() == "Arguments:") {
+        Some(idx) => idx,
+        None => return result,
+    };
+
+    // Track the current argument being parsed
+    let mut current_name: Option<String> = None;
+    let mut current_desc_parts: Vec<String> = Vec::new();
+    // The column where the description text starts (after "name: "),
+    // used to detect continuation lines vs new argument entries.
+    let mut desc_start_col: Option<usize> = None;
+
+    for line in lines.iter().skip(args_idx + 1) {
+        let trimmed = line.trim();
+
+        // Stop at the next section header (non-empty, ends with ':', no parens,
+        // and is NOT an argument entry — argument entries have leading whitespace
+        // before the name and colon)
+        if !trimmed.is_empty()
+            && trimmed.ends_with(':')
+            && !trimmed.contains('(')
+            && !line.starts_with(' ')
+        {
+            break;
+        }
+
+        // Empty line — could be separator between arguments or within section
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Try to match an argument entry: "   name: description"
+        // The pattern is: leading whitespace, then a name (which may contain
+        // dots, letters, digits, or be "..."), then ": ", then description.
+        if let Some(colon_pos) = line.find(": ") {
+            let before_colon = &line[..colon_pos];
+            let name_trimmed = before_colon.trim();
+
+            // Validate this looks like an R parameter name:
+            // - Must not be empty
+            // - Must start with a letter, dot, or be "..."
+            // - The part before the colon must be indented (leading whitespace)
+            if !name_trimmed.is_empty()
+                && before_colon.starts_with(' ')
+                && is_r_param_name(name_trimmed)
+            {
+                // Save previous argument if any
+                if let Some(name) = current_name.take() {
+                    let desc = finalize_description(&current_desc_parts);
+                    if !desc.is_empty() {
+                        result.insert(name, desc);
+                    }
+                    current_desc_parts.clear();
+                }
+
+                // Start new argument
+                current_name = Some(name_trimmed.to_string());
+                let desc_text = &line[colon_pos + 2..];
+                current_desc_parts.push(desc_text.trim().to_string());
+                // Record where the description starts for continuation detection
+                desc_start_col = Some(colon_pos + 2);
+                continue;
+            }
+        }
+
+        // Check for continuation line: must be indented at least as far as
+        // the description start column of the current argument
+        if current_name.is_some() {
+            let line_indent = line.len() - line.trim_start().len();
+            // Continuation lines are indented to align with description start,
+            // or at least significantly indented (>= 6 spaces is a safe heuristic
+            // for Rd2txt output which typically indents 5+ spaces)
+            if let Some(start_col) = desc_start_col {
+                if line_indent >= start_col.saturating_sub(2) {
+                    current_desc_parts.push(trimmed.to_string());
+                    continue;
+                }
+            } else if line_indent >= 6 {
+                current_desc_parts.push(trimmed.to_string());
+                continue;
+            }
+        }
+    }
+
+    // Save the last argument
+    if let Some(name) = current_name {
+        let desc = finalize_description(&current_desc_parts);
+        if !desc.is_empty() {
+            result.insert(name, desc);
+        }
+    }
+
+    result
+}
+
+/// Checks if a string looks like a valid R parameter name.
+///
+/// Valid R parameter names consist of letters, digits, dots, and underscores.
+/// The special `...` (dots) parameter is also valid.
+fn is_r_param_name(s: &str) -> bool {
+    if s == "..." {
+        return true;
+    }
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+}
+
+/// Joins description parts into a single string, normalizing whitespace
+/// and converting R's Unicode curly quotes to markdown backticks.
+fn finalize_description(parts: &[String]) -> String {
+    let joined = parts.join(" ");
+    let normalized = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    r_quotes_to_markdown(&normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,5 +1235,271 @@ Usage:
         let input = "text \u{2018}unmatched";
         let result = r_quotes_to_markdown(input);
         assert_eq!(result, "text \u{2018}unmatched");
+    }
+
+    // --- Tests for extract_arguments_from_help ---
+
+    #[test]
+    fn test_extract_arguments_basic() {
+        let help_text = r#"Arithmetic Mean
+
+Description:
+
+     Generic function for the (trimmed) arithmetic mean.
+
+Usage:
+
+     mean(x, ...)
+
+Arguments:
+
+       x: An R object.
+
+     ...: further arguments passed to or from other methods.
+
+Value:
+
+     The mean.
+"#;
+
+        let args = extract_arguments_from_help(help_text);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args.get("x").unwrap(), "An R object.");
+        assert!(args.get("...").unwrap().contains("further arguments"));
+    }
+
+    #[test]
+    fn test_extract_arguments_multiline_description() {
+        let help_text = r#"Arithmetic Mean
+
+Description:
+
+     Generic function for the (trimmed) arithmetic mean.
+
+Usage:
+
+     mean(x, trim = 0, na.rm = FALSE, ...)
+
+Arguments:
+
+       x: An R object.  Currently there are methods for numeric/logical
+          vectors and date, date-time and time interval objects.
+
+    trim: the fraction (0 to 0.5) of observations to be trimmed from
+          each end of 'x' before the mean is computed.  Values of trim
+          outside that range are taken as the nearest endpoint.
+
+   na.rm: a logical evaluating to TRUE or FALSE indicating whether NA
+          values should be stripped before the computation proceeds.
+
+     ...: further arguments passed to or from other methods.
+
+Value:
+
+     The mean.
+"#;
+
+        let args = extract_arguments_from_help(help_text);
+        assert_eq!(args.len(), 4);
+        assert!(args.get("x").unwrap().contains("An R object."));
+        assert!(args.get("x").unwrap().contains("numeric/logical"));
+        assert!(args.get("trim").unwrap().contains("fraction"));
+        assert!(args.get("trim").unwrap().contains("nearest endpoint"));
+        assert!(args.get("na.rm").unwrap().contains("logical"));
+        assert!(args.get("na.rm").unwrap().contains("stripped"));
+        assert!(args.get("...").unwrap().contains("further arguments"));
+    }
+
+    #[test]
+    fn test_extract_arguments_no_arguments_section() {
+        let help_text = r#"Some Topic
+
+Description:
+
+     Some description.
+
+Usage:
+
+     foo(x)
+
+Value:
+
+     Something.
+"#;
+
+        let args = extract_arguments_from_help(help_text);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_extract_arguments_empty_input() {
+        let args = extract_arguments_from_help("");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_extract_arguments_dotted_param_names() {
+        // R parameter names can contain dots (e.g., na.rm, use.names)
+        let help_text = r#"Test Function
+
+Description:
+
+     A test.
+
+Usage:
+
+     test_fn(na.rm, use.names)
+
+Arguments:
+
+   na.rm: logical. Should missing values be removed?
+
+use.names: logical. Should names be preserved?
+
+Value:
+
+     Result.
+"#;
+
+        let args = extract_arguments_from_help(help_text);
+        assert!(args.contains_key("na.rm"), "Should parse dotted param name na.rm");
+        assert!(args.get("na.rm").unwrap().contains("missing values"));
+    }
+
+    #[test]
+    fn test_extract_arguments_curly_quotes_converted() {
+        // R help uses Unicode curly quotes for code references
+        let help_text = "Test Function\n\
+            \n\
+            Description:\n\
+            \n\
+            \x20\x20\x20\x20\x20A test.\n\
+            \n\
+            Usage:\n\
+            \n\
+            \x20\x20\x20\x20\x20test_fn(x)\n\
+            \n\
+            Arguments:\n\
+            \n\
+            \x20\x20\x20\x20\x20\x20\x20x: An object of class \u{2018}data.frame\u{2019}.\n\
+            \n\
+            Value:\n\
+            \n\
+            \x20\x20\x20\x20\x20Result.\n";
+
+        let args = extract_arguments_from_help(help_text);
+        assert!(args.contains_key("x"));
+        let desc = args.get("x").unwrap();
+        assert!(
+            desc.contains("`data.frame`"),
+            "Curly quotes should be converted to backticks: {desc}"
+        );
+    }
+
+    #[test]
+    fn test_extract_arguments_stops_at_next_section() {
+        // The parser should stop at the next section header (e.g., "Value:")
+        let help_text = r#"Test
+
+Description:
+
+     A test.
+
+Arguments:
+
+       x: first arg.
+
+       y: second arg.
+
+Value:
+
+     z: this is NOT an argument, it's in the Value section.
+"#;
+
+        let args = extract_arguments_from_help(help_text);
+        assert_eq!(args.len(), 2);
+        assert!(args.contains_key("x"));
+        assert!(args.contains_key("y"));
+        assert!(!args.contains_key("z"), "Should not parse entries from Value section");
+    }
+
+    // --- Tests for HelpCache::get_arguments ---
+
+    #[test]
+    fn test_help_cache_get_arguments_caches_result() {
+        let cache = HelpCache::with_max_entries(10);
+
+        // Pre-populate the help text cache with synthetic help text
+        let help_text = r#"Test
+
+Description:
+
+     A test.
+
+Arguments:
+
+       x: first arg.
+
+       y: second arg.
+
+Value:
+
+     Result.
+"#;
+        cache.insert("test_fn", Some("test_pkg"), Some(help_text.to_string()));
+
+        // First call should parse and cache
+        let args1 = cache.get_arguments("test_fn", Some("test_pkg"));
+        assert!(args1.is_some());
+        let args1 = args1.unwrap();
+        assert_eq!(args1.len(), 2);
+        assert_eq!(args1.get("x").unwrap(), "first arg.");
+
+        // Second call should return cached result (same content)
+        let args2 = cache.get_arguments("test_fn", Some("test_pkg"));
+        assert!(args2.is_some());
+        assert_eq!(args2.unwrap(), args1);
+    }
+
+    #[test]
+    fn test_help_cache_get_arguments_negative_caching() {
+        let cache = HelpCache::with_max_entries(10);
+
+        // Pre-populate with help text that has no Arguments section
+        let help_text = "Test\n\nDescription:\n\n     A test.\n\nValue:\n\n     Result.\n";
+        cache.insert("no_args_fn", Some("pkg"), Some(help_text.to_string()));
+
+        // Should return None and cache the negative result
+        let args = cache.get_arguments("no_args_fn", Some("pkg"));
+        assert!(args.is_none());
+
+        // Verify the negative result is cached (check arguments cache directly)
+        {
+            let guard = cache.arguments.read().unwrap();
+            let key = cache_key("no_args_fn", Some("pkg"));
+            let cached = guard.peek(&key);
+            assert!(cached.is_some(), "Negative result should be cached");
+            assert!(cached.unwrap().is_none(), "Cached value should be None");
+        }
+    }
+
+    #[test]
+    fn test_help_cache_get_arguments_clone_shares_state() {
+        // Like the help text cache, the arguments cache must be shared across clones
+        let cache1 = HelpCache::with_max_entries(10);
+        let cache2 = cache1.clone();
+
+        // Pre-populate help text
+        let help_text = "Test\n\nDescription:\n\n     A test.\n\nArguments:\n\n       x: an arg.\n\nValue:\n\n     Result.\n";
+        cache1.insert("fn1", Some("pkg"), Some(help_text.to_string()));
+
+        // Fetch arguments through clone
+        let args = cache2.get_arguments("fn1", Some("pkg"));
+        assert!(args.is_some());
+
+        // Verify it's visible through original
+        let key = cache_key("fn1", Some("pkg"));
+        let guard = cache1.arguments.read().unwrap();
+        assert!(guard.peek(&key).is_some(), "Arguments cached via clone should be visible through original");
     }
 }

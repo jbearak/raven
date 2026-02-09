@@ -6,8 +6,8 @@ This implementation adds function parameter completions to Raven's LSP. When the
 
 ## Tasks
 
-- [ ] 1. Create completion context detection module
-  - [ ] 1.1 Create `crates/raven/src/completion_context.rs` with `FunctionCallContext` struct and `detect_function_call_context()` function
+- [x] 1. Create completion context detection module
+  - [x] 1.1 Create `crates/raven/src/completion_context.rs` with `FunctionCallContext` struct and `detect_function_call_context()` function
     - Define `FunctionCallContext` with `function_name: String`, `namespace: Option<String>`, `is_internal: bool` fields
     - Implement `detect_function_call_context(tree, text, position) -> Option<FunctionCallContext>` using tree-sitter AST walk
     - Implement `find_enclosing_function_call()`: find node at cursor position, walk up ancestors looking for `call` nodes, return innermost match
@@ -26,17 +26,17 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Add `mod completion_context;` to `main.rs`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7_
 
-  - [ ]* 1.2 Write property test for function call context detection
+  - [x] 1.2 Write property test for function call context detection
     - **Property 1: Function Call Context Detection**
     - Generate R code with function calls and random cursor positions; verify context is detected iff cursor is inside argument list, and returns correct function name
     - **Validates: Requirements 1.1, 1.2, 1.4**
 
-  - [ ]* 1.3 Write property test for nested function call resolution
+  - [x] 1.3 Write property test for nested function call resolution
     - **Property 2: Nested Function Call Resolution**
     - Generate nested function calls; verify innermost function name is returned when cursor is inside inner call's parentheses
     - **Validates: Requirements 1.3**
 
-  - [ ]* 1.4 Write unit tests for bracket fallback FSM
+  - [x] 1.4 Write unit tests for bracket fallback FSM
     - Verify bracket-heuristic detects call context when parentheses are unbalanced during typing
     - Verify brackets inside string literals are ignored: `f("(", |)` detects `f`, `g(')', |)` detects `g`, `` h(`(`, |) `` detects `h`
     - Verify escaped quotes inside strings: `f("a\"(b", |)` detects `f`
@@ -47,15 +47,15 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Verify multi-line string bailout: if previous line ends with unmatched quote, stop searching backward
     - _Requirements: 1.6_
 
-  - [ ]* 1.5 Write unit test for embedded-R scope gating (R Markdown)
+  - [x] 1.5 Write unit test for embedded-R scope gating (R Markdown)
     - Verify parameter completions only appear inside R code blocks, not in markdown text
     - _Requirements: 1.7_
 
-- [ ] 2. Checkpoint - Ensure context detection tests pass
+- [x] 2. Checkpoint - Ensure context detection tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 3. Implement parameter resolver module
-  - [ ] 3.1 Create `crates/raven/src/parameter_resolver.rs` with data structures, cache, and AST extraction
+- [x] 3. Implement parameter resolver module
+  - [x] 3.1 Create `crates/raven/src/parameter_resolver.rs` with data structures, cache, and AST extraction
     - Define `FunctionSignature` (name, parameters, source), `ParameterInfo` (name, default_value, is_dots), `SignatureSource` enum (RSubprocess, CurrentFile, CrossFile)
     - Define `SignatureCache` with two `RwLock<LruCache>` fields: `package_signatures` (capacity 500) and `user_signatures` (capacity 200)
     - Implement `SignatureCache::new()`, `get_package()`, `get_user()` (use `peek()` under read lock), `insert_package()`, `insert_user()` (use `push()` under write lock)
@@ -66,18 +66,18 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Add `mod parameter_resolver;` to `main.rs`
     - _Requirements: 2.1, 2.5, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 4.1, 4.2, 4.3, 4.4, 4.5, 9.1, 9.2, 9.4_
 
-  - [ ]* 3.2 Write property test for parameter extraction round-trip
+  - [x] 3.2 Write property test for parameter extraction round-trip
     - **Property 3: Parameter Extraction Round-Trip**
     - Generate R function definitions with varying parameter counts and defaults; verify extracted parameter names match original formal parameter names in declaration order
     - **Validates: Requirements 4.1**
 
-  - [ ]* 3.3 Write property test for dots parameter inclusion
+  - [x] 3.3 Write property test for dots parameter inclusion
     - **Property 5: Dots Parameter Inclusion**
     - Generate R functions with `...` parameter; verify dots is included in parameter completions
     - **Validates: Requirements 5.5**
 
-- [ ] 4. Extend R subprocess for function formals queries
-  - [ ] 4.1 Add `get_function_formals()` method to `RSubprocess` in `crates/raven/src/r_subprocess.rs`
+- [x] 4. Extend R subprocess for function formals queries
+  - [x] 4.1 Add `get_function_formals()` method to `RSubprocess` in `crates/raven/src/r_subprocess.rs`
     - Implement `get_function_formals(function_name, package: Option<&str>, exported_only: bool) -> Result<Vec<ParameterInfo>>`
     - Generate R code that resolves the function object and handles primitives: `fn <- get(...)`; `f <- if (is.primitive(fn)) formals(args(fn)) else formals(fn)`
     - Parse tab-separated output: each line is `name\tdefault\n`; empty string after tab means `default_value = None`
@@ -86,21 +86,21 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Use existing `execute_r_code_with_timeout()` with 5s timeout for completion-path queries
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5_
 
-  - [ ]* 4.2 Write property test for R subprocess input validation
+  - [x] 4.2 Write property test for R subprocess input validation
     - **Property 11: R Subprocess Input Validation**
     - Generate function names with characters outside `[a-zA-Z0-9._]`; verify they are rejected without executing R code
     - **Validates: Requirements 10.2**
 
-- [ ] 5. Checkpoint - Ensure parameter resolver and R subprocess tests pass
+- [x] 5. Checkpoint - Ensure parameter resolver and R subprocess tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 6. Integrate parameter completions into completion handler
-  - [ ] 6.1 Add `SignatureCache` to `WorldState` in `crates/raven/src/state.rs`
+- [x] 6. Integrate parameter completions into completion handler
+  - [x] 6.1 Add `SignatureCache` to `WorldState` in `crates/raven/src/state.rs`
     - Add `pub signature_cache: Arc<SignatureCache>` field to `WorldState`
     - Initialize with default capacities (500 package, 200 user) in `WorldState::new()`
     - _Requirements: 9.1_
 
-  - [ ] 6.2 Modify `completion()` in `crates/raven/src/handlers.rs` to add parameter completions to the completion list
+  - [x] 6.2 Modify `completion()` in `crates/raven/src/handlers.rs` to add parameter completions to the completion list
     - Add `const SORT_PREFIX_PARAM: &str = "0-";` constant alongside existing sort prefix constants
     - After building standard completions, call `detect_function_call_context(tree, &text, position)`
     - If inside function call AND current token is NOT namespace-qualified (`::`/`:::`), call `get_parameter_completions()` and prepend parameter items to the completion list
@@ -115,7 +115,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Standard completions remain unchanged when not in function call context
     - _Requirements: 2.2, 2.3, 2.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
 
-  - [ ] 6.3 Update `backend.rs` completion async wrapper for parameter resolution threading
+  - [x] 6.3 Update `backend.rs` completion async wrapper for parameter resolution threading
     - Collect standard completions + detect function call context under WorldState read lock (fast, non-blocking)
     - Release the read lock
     - If function call context detected, clone `Arc<SignatureCache>` and `Arc<PackageLibrary>` references, then run `get_parameter_completions()` inside `tokio::task::spawn_blocking`
@@ -123,41 +123,41 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - This follows the same pattern already used by `completion_resolve()` in `backend.rs`
     - _Requirements: 9.1_
 
-  - [ ]* 6.4 Write property test for parameter completion formatting
+  - [x] 6.4 Write property test for parameter completion formatting
     - **Property 6: Parameter Completion Formatting**
     - For any parameter completion item: verify `kind = VARIABLE`, `insert_text_format = PLAIN_TEXT`, `sort_text` starts with `0-` followed by digits; for non-dots params `insert_text` ends with ` = `; for `...` param `insert_text` equals `"..."` (no ` = `)
     - **Validates: Requirements 5.1, 5.3, 5.6, 5.7**
 
-  - [ ]* 6.5 Write property test for case-insensitive substring matching
+  - [x] 6.5 Write property test for case-insensitive substring matching
     - **Property 7: Case-Insensitive Substring Matching**
     - Generate tokens with different casing; verify matching is case-insensitive and substring-based (not prefix-only)
     - **Validates: Requirements 5.4**
 
-  - [ ]* 6.6 Write property test for namespace-qualified token suppression
+  - [x] 6.6 Write property test for namespace-qualified token suppression
     - **Property 8: Namespace-Qualified Token Suppression**
     - Verify parameter completions are suppressed when the current token includes `::` or `:::`
     - **Validates: Requirements 6.5**
 
-  - [ ]* 6.7 Write property test for mixed completions
+  - [x] 6.7 Write property test for mixed completions
     - **Property 9: Mixed Completions in Function Call Context**
     - Verify completion list contains both parameter items (with `"0-"` prefix) and standard items (keywords, variables, package exports)
     - **Validates: Requirements 6.1, 6.2**
 
-  - [ ]* 6.8 Write property test for default value preservation
+  - [x] 6.8 Write property test for default value preservation
     - **Property 4: Default Value Preservation**
     - Generate functions with default values; if defaults are included, verify completion item detail field contains the default value string
     - **Validates: Requirements 2.3, 4.3, 5.2**
 
-  - [ ]* 6.9 Write property test for cache consistency
+  - [x] 6.9 Write property test for cache consistency
     - **Property 10: Cache Consistency**
     - Insert a signature into cache, then look it up; verify the cached signature is returned without invoking R subprocess
     - **Validates: Requirements 2.5, 3.5**
 
-- [ ] 7. Checkpoint - Ensure completion integration tests pass
+- [x] 7. Checkpoint - Ensure completion integration tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 8. Create roxygen extraction module
-  - [ ] 8.1 Create `crates/raven/src/roxygen.rs` with shared roxygen/comment extraction logic
+- [x] 8. Create roxygen extraction module
+  - [x] 8.1 Create `crates/raven/src/roxygen.rs` with shared roxygen/comment extraction logic
     - Define `RoxygenBlock` struct with `title: Option<String>`, `description: Option<String>`, `params: HashMap<String, String>`, `fallback: Option<String>`
     - Implement `extract_roxygen_block(text, func_line) -> Option<RoxygenBlock>`: scan backward from function definition line collecting consecutive comment lines (`#'` preferred; plain `#` fallback)
     - Parse title (first non-tag line), description (lines after title before first tag or blank line), and `@param name description` entries (including multi-line continuation per roxygen2 semantics)
@@ -166,24 +166,24 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Add `mod roxygen;` to `main.rs`
     - _Requirements: 7.3, 8.1, 8.2, 8.3, 8.4, 8.5_
 
-  - [ ]* 8.2 Write property test for roxygen function documentation extraction
+  - [x] 8.2 Write property test for roxygen function documentation extraction
     - **Property 14: Roxygen Function Documentation Extraction**
     - Generate roxygen blocks with title, description, and @param tags; verify extraction returns correct title and description
     - **Validates: Requirements 8.1, 8.2, 8.3**
 
-- [ ] 9. Implement documentation on resolve (parameters and functions)
-  - [ ] 9.1 Extend help subsystem to expose structured argument docs from Rd
+- [x] 9. Implement documentation on resolve (parameters and functions)
+  - [x] 9.1 Extend help subsystem to expose structured argument docs from Rd
     - Add helper (e.g., `help::get_arguments(topic, package)`) that parses Rd `\\arguments` into `HashMap<String, String>`
     - Cache argument maps alongside existing help cache to avoid repeated R subprocess calls
     - _Requirements: 7.2_
 
-  - [ ] 9.2 Add `data` field to user-defined function completion items in `crates/raven/src/handlers.rs`
+  - [x] 9.2 Add `data` field to user-defined function completion items in `crates/raven/src/handlers.rs`
     - Extend `collect_document_completions` to include `type = "user_function"`, `uri`, and definition line in `data` JSON for items with `CompletionItemKind::FUNCTION`
     - Extend cross-file function completion items similarly (items from sourced files)
     - This data enables `completionItem/resolve` to locate the roxygen block for documentation
     - _Requirements: 8.1_
 
-  - [ ] 9.3 Extend `completion_item_resolve()` in `crates/raven/src/handlers.rs` for parameter documentation
+  - [x] 9.3 Extend `completion_item_resolve()` in `crates/raven/src/handlers.rs` for parameter documentation
     - Add dispatch logic: check for `type == "parameter"` in completion item's `data` field
     - For package functions (has `package` in data): use structured Rd arguments from help subsystem to resolve parameter docs
     - For user-defined functions (has `uri` + `func_line` in data): read file content, call `extract_roxygen_block()`, then `get_param_doc()`
@@ -191,38 +191,38 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Clear the `data` field from the resolved item before returning (set to `None`/`null`), matching R-LS behavior
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5_
 
-  - [ ] 9.4 Extend `completion_item_resolve()` for user-defined function name documentation
+  - [x] 9.4 Extend `completion_item_resolve()` for user-defined function name documentation
     - Add dispatch: check for `type == "user_function"` in data
     - Use `uri` and `func_line`, call `extract_roxygen_block()`, then `get_function_doc()` to get title/description (or fallback text)
     - Return item unchanged if no roxygen block found
     - _Requirements: 8.1, 8.2, 8.3, 8.4_
 
-  - [ ]* 9.5 Write property test for parameter documentation extraction
+  - [x] 9.5 Write property test for parameter documentation extraction
     - **Property 12: Parameter Documentation Extraction**
     - Generate Rd arguments and roxygen blocks with `@param` entries; verify correct description is extracted for specified parameter name
     - **Validates: Requirements 7.2, 7.3**
 
-- [ ] 10. Checkpoint - Ensure documentation resolve tests pass
+- [x] 10. Checkpoint - Ensure documentation resolve tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 11. Implement cache invalidation and graceful degradation
-  - [ ] 11.1 Hook cache invalidation into `did_change` handler
+- [x] 11. Implement cache invalidation and graceful degradation
+  - [x] 11.1 Hook cache invalidation into `did_change` handler
     - In `did_change` handler in `backend.rs`, call `signature_cache.invalidate_file(uri)` when a file changes
     - This clears all user-defined function signatures keyed to the changed file URI
     - _Requirements: 9.2_
 
-  - [ ]* 11.2 Write property test for cache invalidation
+  - [x] 11.2 Write property test for cache invalidation
     - **Property 13: Cache Invalidation on File Change**
     - Insert user-defined signatures for a file, invalidate that file, verify subsequent lookups return None
     - **Validates: Requirements 9.2**
 
-  - [ ] 11.3 Implement graceful degradation for R subprocess failures
+  - [x] 11.3 Implement graceful degradation for R subprocess failures
     - When R subprocess fails or times out for a package function, fall back to AST-based extraction if the function is user-defined; otherwise return standard completions without parameter suggestions
     - When function signature cannot be determined at all, return standard completions only (no parameter items)
     - Log R subprocess timeouts at warn level; log other errors (parse failures, missing functions) at trace level
     - _Requirements: 11.1, 11.2, 11.3_
 
-- [ ] 12. Final checkpoint - Ensure all tests pass
+- [x] 12. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes

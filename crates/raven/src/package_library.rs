@@ -232,6 +232,14 @@ impl PackageLibrary {
         self.base_packages.contains(package)
     }
 
+    /// Get a reference to the R subprocess interface (if available)
+    ///
+    /// Returns `None` if R is unavailable or the PackageLibrary was created without
+    /// an R subprocess interface.
+    pub fn r_subprocess(&self) -> Option<&RSubprocess> {
+        self.r_subprocess.as_ref()
+    }
+
     /// Get all exports from loaded packages for completions (synchronous, cached-only)
     ///
     /// This method returns a map of symbol name to package name for all exports

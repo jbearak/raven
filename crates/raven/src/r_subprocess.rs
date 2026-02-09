@@ -12,6 +12,8 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use tokio::process::Command;
 
+use crate::parameter_resolver::ParameterInfo;
+
 /// R subprocess interface for package queries
 pub struct RSubprocess {
     /// Path to R executable
@@ -659,6 +661,114 @@ cat("__RAVEN_END__\n")
         parse_multi_exports_output(&output)
     }
 
+    /// Query function parameters using `formals()`.
+    ///
+    /// Resolves the function object and extracts its formal parameters.
+    /// For primitive/special functions, falls back to `formals(args(fn))`.
+    ///
+    /// # Parameters
+    ///
+    /// - `function_name` — Name of the function to query (e.g., `"filter"`, `"na.rm"`)
+    /// - `package` — Optional package name (e.g., `Some("dplyr")` for `dplyr::filter`)
+    /// - `exported_only` — If `true`, uses `getExportedValue()` (for `::`);
+    ///   if `false`, uses `asNamespace()` (for `:::` internal access)
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<ParameterInfo>` with parameter names, default values, and dots detection.
+    /// Returns an empty vec if the function has no formals (e.g., some primitives).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if:
+    /// - Function or package name fails validation (code injection prevention)
+    /// - R subprocess times out (5s timeout for completion-path queries)
+    /// - R subprocess returns an error marker
+    ///
+    /// # Requirements: 10.1, 10.2, 10.3, 10.4, 10.5
+    pub async fn get_function_formals(
+        &self,
+        function_name: &str,
+        package: Option<&str>,
+        exported_only: bool,
+    ) -> Result<Vec<ParameterInfo>> {
+        // Validate function name to prevent R code injection
+        if !is_valid_r_identifier(function_name) {
+            return Err(anyhow!(
+                "Invalid function name '{}': must contain only letters, numbers, dots, and underscores",
+                function_name
+            ));
+        }
+
+        // Validate package name if provided
+        if let Some(pkg) = package {
+            if !is_valid_package_name(pkg) {
+                return Err(anyhow!(
+                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                    pkg
+                ));
+            }
+        }
+
+        // Build R code to resolve the function and extract formals.
+        // The function resolution strategy:
+        // - No package: get(func_name, mode = "function") from the search path
+        // - Exported (::): getExportedValue(pkg, func_name)
+        // - Internal (:::): get(func_name, envir = asNamespace(pkg))
+        //
+        // For primitives, formals() returns NULL, so we fall back to formals(args(fn)).
+        let r_code = match package {
+            Some(pkg) => {
+                if exported_only {
+                    format!(
+                        r#"tryCatch({{ fn <- getExportedValue("{pkg}", "{func}"); f <- if (is.primitive(fn)) formals(args(fn)) else formals(fn); if (is.null(f)) cat("") else for (name in names(f)) {{ default <- if (is.symbol(f[[name]]) && nchar(as.character(f[[name]])) == 0) "" else deparse(f[[name]], width.cutoff = 500)[1]; cat(name, "\t", default, "\n", sep = "") }} }}, error = function(e) cat("__RLSP_ERROR__:", conditionMessage(e), sep = ""))"#,
+                        pkg = pkg,
+                        func = function_name,
+                    )
+                } else {
+                    format!(
+                        r#"tryCatch({{ fn <- get("{func}", envir = asNamespace("{pkg}")); f <- if (is.primitive(fn)) formals(args(fn)) else formals(fn); if (is.null(f)) cat("") else for (name in names(f)) {{ default <- if (is.symbol(f[[name]]) && nchar(as.character(f[[name]])) == 0) "" else deparse(f[[name]], width.cutoff = 500)[1]; cat(name, "\t", default, "\n", sep = "") }} }}, error = function(e) cat("__RLSP_ERROR__:", conditionMessage(e), sep = ""))"#,
+                        pkg = pkg,
+                        func = function_name,
+                    )
+                }
+            }
+            None => {
+                format!(
+                    r#"tryCatch({{ fn <- get("{func}", mode = "function"); f <- if (is.primitive(fn)) formals(args(fn)) else formals(fn); if (is.null(f)) cat("") else for (name in names(f)) {{ default <- if (is.symbol(f[[name]]) && nchar(as.character(f[[name]])) == 0) "" else deparse(f[[name]], width.cutoff = 500)[1]; cat(name, "\t", default, "\n", sep = "") }} }}, error = function(e) cat("__RLSP_ERROR__:", conditionMessage(e), sep = ""))"#,
+                    func = function_name,
+                )
+            }
+        };
+
+        // Use 5s timeout for completion-path queries (shorter than the default 30s)
+        let timeout = std::time::Duration::from_secs(5);
+        let output = self.execute_r_code_with_timeout(&r_code, timeout).await?;
+
+        // Check if R returned an error
+        if output.starts_with("__RLSP_ERROR__:") {
+            let error_msg = output.trim_start_matches("__RLSP_ERROR__:").trim();
+            return Err(anyhow!(
+                "Failed to get formals for function '{}': {}",
+                function_name,
+                error_msg
+            ));
+        }
+
+        // Parse the tab-separated output
+        let params = parse_formals_output(&output);
+
+        log::trace!(
+            "Got {} formals for function '{}' (package: {:?}): {:?}",
+            params.len(),
+            function_name,
+            package,
+            params.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        Ok(params)
+    }
+
     /// Batch initialization: retrieve lib_paths, base_packages, and all base package exports
     /// in a single R subprocess call.
     ///
@@ -1009,6 +1119,83 @@ fn is_valid_package_name(name: &str) -> bool {
     }
 
     true
+}
+
+/// Validate an R identifier (function name) for safe interpolation into R code.
+///
+/// R identifiers can contain ASCII letters, digits, dots, and underscores.
+/// They must not be empty and must only contain characters matching `[a-zA-Z0-9._]`.
+///
+/// This is intentionally more permissive than `is_valid_package_name` (which
+/// enforces R's package naming rules about first characters). Function names
+/// in R can start with a dot followed by a digit (e.g., `.2way.interaction`),
+/// so we only check the character set, not the starting character.
+///
+/// This validation prevents malicious input from being interpolated into R code.
+fn is_valid_r_identifier(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    // All characters must match [a-zA-Z0-9._]
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() && c != '.' && c != '_' {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Parse tab-separated formals output from R subprocess.
+///
+/// Each line is `name\tdefault\n`. An empty string after the tab
+/// (i.e., `name\t\n`) means the parameter has no default value
+/// (`default_value = None`). A non-empty string after the tab is
+/// the deparsed default value.
+///
+/// The `...` parameter is detected by name and sets `is_dots = true`.
+fn parse_formals_output(output: &str) -> Vec<ParameterInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            // Only trim trailing carriage returns, not tabs (tabs are delimiters)
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                return None;
+            }
+
+            // Split on first tab only
+            let (name, default) = match line.split_once('\t') {
+                Some((n, d)) => (n, d),
+                None => {
+                    // Malformed line (no tab separator) — skip
+                    log::trace!("Skipping malformed formals line (no tab): {:?}", line);
+                    return None;
+                }
+            };
+
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+
+            let is_dots = name == "...";
+
+            // Empty string after tab means no default value
+            let default_value = if default.is_empty() {
+                None
+            } else {
+                Some(default.to_string())
+            };
+
+            Some(ParameterInfo {
+                name,
+                default_value,
+                is_dots,
+            })
+        })
+        .collect()
 }
 
 /// Hardcoded list of core R base packages in standard order.
@@ -2025,4 +2212,476 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Tests for is_valid_r_identifier
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_r_identifier_simple() {
+        assert!(is_valid_r_identifier("filter"));
+        assert!(is_valid_r_identifier("print"));
+        assert!(is_valid_r_identifier("mean"));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_with_dots() {
+        assert!(is_valid_r_identifier("na.rm"));
+        assert!(is_valid_r_identifier("is.na"));
+        assert!(is_valid_r_identifier("data.frame"));
+        assert!(is_valid_r_identifier("as.character"));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_with_underscores() {
+        assert!(is_valid_r_identifier("my_func"));
+        assert!(is_valid_r_identifier("process_data"));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_with_numbers() {
+        assert!(is_valid_r_identifier("ggplot2"));
+        assert!(is_valid_r_identifier("utf8"));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_empty() {
+        assert!(!is_valid_r_identifier(""));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_injection_attempts() {
+        // These should all be rejected to prevent R code injection
+        assert!(!is_valid_r_identifier("func; system('rm -rf /')"));
+        assert!(!is_valid_r_identifier("func\"); system('ls')"));
+        assert!(!is_valid_r_identifier("func$(whoami)"));
+        assert!(!is_valid_r_identifier("func`ls`"));
+        assert!(!is_valid_r_identifier("func\ncat('injected')"));
+        assert!(!is_valid_r_identifier("func\rcat('injected')"));
+        assert!(!is_valid_r_identifier("func'"));
+        assert!(!is_valid_r_identifier("func\""));
+        assert!(!is_valid_r_identifier("func("));
+        assert!(!is_valid_r_identifier("func)"));
+        assert!(!is_valid_r_identifier("func{"));
+        assert!(!is_valid_r_identifier("func}"));
+        assert!(!is_valid_r_identifier("func<-"));
+        assert!(!is_valid_r_identifier("func="));
+        assert!(!is_valid_r_identifier("func+"));
+        assert!(!is_valid_r_identifier("func-"));
+        assert!(!is_valid_r_identifier("func*"));
+        assert!(!is_valid_r_identifier("func/"));
+        assert!(!is_valid_r_identifier("func\\"));
+        assert!(!is_valid_r_identifier("func|"));
+        assert!(!is_valid_r_identifier("func&"));
+        assert!(!is_valid_r_identifier("func!"));
+        assert!(!is_valid_r_identifier("func@"));
+        assert!(!is_valid_r_identifier("func#"));
+        assert!(!is_valid_r_identifier("func$"));
+        assert!(!is_valid_r_identifier("func%"));
+        assert!(!is_valid_r_identifier("func^"));
+        assert!(!is_valid_r_identifier("func~"));
+        assert!(!is_valid_r_identifier("func "));
+        assert!(!is_valid_r_identifier(" func"));
+        assert!(!is_valid_r_identifier("func name"));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_unicode() {
+        // Unicode characters should be rejected (only ASCII allowed)
+        assert!(!is_valid_r_identifier("функция")); // Russian
+        assert!(!is_valid_r_identifier("函数")); // Chinese
+        assert!(!is_valid_r_identifier("func日本語"));
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier_dots_only() {
+        // "..." is a valid R identifier (the dots parameter)
+        assert!(is_valid_r_identifier("..."));
+        // Single dot is also valid
+        assert!(is_valid_r_identifier("."));
+        // Dot followed by digit is valid for function names (unlike package names)
+        assert!(is_valid_r_identifier(".1"));
+        assert!(is_valid_r_identifier(".123"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for parse_formals_output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_formals_output_simple() {
+        let output = "x\t\ny\t\n";
+        let params = parse_formals_output(output);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "x");
+        assert!(params[0].default_value.is_none());
+        assert!(!params[0].is_dots);
+        assert_eq!(params[1].name, "y");
+        assert!(params[1].default_value.is_none());
+        assert!(!params[1].is_dots);
+    }
+
+    #[test]
+    fn test_parse_formals_output_with_defaults() {
+        let output = "x\t1\ny\tTRUE\nz\t\"hello\"\n";
+        let params = parse_formals_output(output);
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[0].default_value.as_deref(), Some("1"));
+        assert_eq!(params[1].name, "y");
+        assert_eq!(params[1].default_value.as_deref(), Some("TRUE"));
+        assert_eq!(params[2].name, "z");
+        assert_eq!(params[2].default_value.as_deref(), Some("\"hello\""));
+    }
+
+    #[test]
+    fn test_parse_formals_output_with_dots() {
+        let output = "x\t\n...\t\ny\t1\n";
+        let params = parse_formals_output(output);
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "x");
+        assert!(!params[0].is_dots);
+        assert_eq!(params[1].name, "...");
+        assert!(params[1].is_dots);
+        assert!(params[1].default_value.is_none());
+        assert_eq!(params[2].name, "y");
+        assert_eq!(params[2].default_value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn test_parse_formals_output_empty() {
+        let output = "";
+        let params = parse_formals_output(output);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_formals_output_whitespace_only() {
+        let output = "  \n  \n";
+        let params = parse_formals_output(output);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_formals_output_malformed_no_tab() {
+        // Lines without tab separators should be skipped
+        let output = "x\t\nmalformed_line\ny\t1\n";
+        let params = parse_formals_output(output);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[1].name, "y");
+    }
+
+    #[test]
+    fn test_parse_formals_output_complex_defaults() {
+        let output = "formula\t\ndata\tNULL\nsubset\t\nweights\t\nna.action\t\nmethod\t\"qr\"\n";
+        let params = parse_formals_output(output);
+        assert_eq!(params.len(), 6);
+        assert_eq!(params[0].name, "formula");
+        assert!(params[0].default_value.is_none());
+        assert_eq!(params[1].name, "data");
+        assert_eq!(params[1].default_value.as_deref(), Some("NULL"));
+        assert_eq!(params[5].name, "method");
+        assert_eq!(params[5].default_value.as_deref(), Some("\"qr\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for get_function_formals (integration with R subprocess)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_function_formals_base_print() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let params = subprocess
+            .get_function_formals("print", Some("base"), true)
+            .await
+            .expect("Should get formals for base::print");
+
+        // print.default has x and ... parameters
+        assert!(!params.is_empty(), "print should have parameters");
+        assert_eq!(params[0].name, "x", "First param should be 'x'");
+        // print has a ... parameter
+        assert!(
+            params.iter().any(|p| p.is_dots),
+            "print should have a ... parameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_base_mean() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // mean is a primitive, so formals(args(fn)) should be used
+        let params = subprocess
+            .get_function_formals("mean", None, true)
+            .await
+            .expect("Should get formals for mean");
+
+        assert!(!params.is_empty(), "mean should have parameters");
+        assert_eq!(params[0].name, "x", "First param should be 'x'");
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_stats_lm() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let params = subprocess
+            .get_function_formals("lm", Some("stats"), true)
+            .await
+            .expect("Should get formals for stats::lm");
+
+        // lm has formula, data, subset, weights, na.action, method, etc.
+        assert!(params.len() >= 5, "lm should have at least 5 parameters");
+        assert_eq!(params[0].name, "formula", "First param should be 'formula'");
+
+        // Check that data has a default of NULL (or similar)
+        let data_param = params.iter().find(|p| p.name == "data");
+        assert!(data_param.is_some(), "lm should have a 'data' parameter");
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_unqualified() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Query without package qualification
+        let params = subprocess
+            .get_function_formals("paste", None, true)
+            .await
+            .expect("Should get formals for paste");
+
+        assert!(!params.is_empty(), "paste should have parameters");
+        assert!(
+            params.iter().any(|p| p.is_dots),
+            "paste should have a ... parameter"
+        );
+        // paste has sep and collapse parameters
+        assert!(
+            params.iter().any(|p| p.name == "sep"),
+            "paste should have a 'sep' parameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_nonexistent_function() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let result = subprocess
+            .get_function_formals("nonexistent_func_xyz_12345", None, true)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Nonexistent function should return an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_invalid_function_name() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let result = subprocess
+            .get_function_formals("func; system('ls')", None, true)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Invalid function name should return an error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid function name"),
+            "Error should mention invalid function name: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_invalid_package_name() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let result = subprocess
+            .get_function_formals("print", Some("pkg; system('ls')"), true)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Invalid package name should return an error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid package name"),
+            "Error should mention invalid package name: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_empty_function_name() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let result = subprocess
+            .get_function_formals("", None, true)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Empty function name should return an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_internal_access() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Test with exported_only = false (:::  access)
+        let params = subprocess
+            .get_function_formals("print", Some("base"), false)
+            .await
+            .expect("Should get formals for base:::print");
+
+        assert!(!params.is_empty(), "print should have parameters");
+    }
+
+    #[tokio::test]
+    async fn test_get_function_formals_primitive_sum() {
+        // Skip if R is not available
+        let subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // sum is a primitive function — should fall back to formals(args(fn))
+        let params = subprocess
+            .get_function_formals("sum", None, true)
+            .await
+            .expect("Should get formals for sum (primitive)");
+
+        assert!(!params.is_empty(), "sum should have parameters via args()");
+        assert!(
+            params.iter().any(|p| p.is_dots),
+            "sum should have a ... parameter"
+        );
+    }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Feature: function-parameter-completions, Property 11: R Subprocess Input Validation
+    //
+    // For any function name containing characters outside [a-zA-Z0-9._] or starting
+    // with invalid characters, the R subprocess query methods SHALL reject the input
+    // without executing R code.
+    //
+    // **Validates: Requirements 10.2**
+
+    /// Strategy to generate strings that contain at least one character outside [a-zA-Z0-9._].
+    /// These should always be rejected by is_valid_r_identifier.
+    fn invalid_r_identifier() -> impl Strategy<Value = String> {
+        // Generate a string with at least one invalid character
+        prop_oneof![
+            // Strings containing injection-dangerous characters
+            "[a-zA-Z0-9._]{0,5}[;()\"'`\\\\{}\\[\\]!@#$%^&*<>|/~, \\-+?:][a-zA-Z0-9._]{0,5}",
+            // Strings with spaces
+            "[a-zA-Z]{1,3} [a-zA-Z]{1,3}",
+            // Strings with semicolons (R code injection)
+            "[a-zA-Z]{1,3};[a-zA-Z]{1,3}",
+            // Strings with parentheses (function call injection)
+            "[a-zA-Z]{1,3}\\([a-zA-Z]{0,3}\\)",
+            // Strings with quotes (string injection)
+            "[a-zA-Z]{1,3}\"[a-zA-Z]{0,3}",
+            // Strings with newlines/control characters
+            "[a-zA-Z]{1,3}\n[a-zA-Z]{0,3}",
+            // Unicode characters (non-ASCII)
+            "[a-zA-Z]{1,3}[àéîöü][a-zA-Z]{0,3}",
+        ]
+        .prop_filter("must not be empty", |s| !s.is_empty())
+        .prop_filter("must contain at least one invalid char", |s| {
+            s.chars().any(|c| !c.is_ascii_alphanumeric() && c != '.' && c != '_')
+        })
+    }
+
+    /// Strategy to generate valid R identifiers (only [a-zA-Z0-9._], non-empty).
+    fn valid_r_identifier() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9._]{1,20}".prop_filter("must not be empty", |s| !s.is_empty())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Property 11a: Function names with characters outside [a-zA-Z0-9._] are rejected.
+        ///
+        /// **Validates: Requirements 10.2**
+        #[test]
+        fn invalid_identifiers_are_rejected(name in invalid_r_identifier()) {
+            prop_assert!(
+                !is_valid_r_identifier(&name),
+                "is_valid_r_identifier should reject '{}' which contains characters outside [a-zA-Z0-9._]",
+                name
+            );
+        }
+
+        /// Property 11b: Function names with only [a-zA-Z0-9._] characters are accepted.
+        ///
+        /// **Validates: Requirements 10.2**
+        #[test]
+        fn valid_identifiers_are_accepted(name in valid_r_identifier()) {
+            prop_assert!(
+                is_valid_r_identifier(&name),
+                "is_valid_r_identifier should accept '{}' which contains only [a-zA-Z0-9._]",
+                name
+            );
+        }
+
+        /// Property 11c: Empty strings are always rejected.
+        ///
+        /// **Validates: Requirements 10.2**
+        #[test]
+        fn empty_string_is_rejected(_dummy in 0..1u32) {
+            prop_assert!(
+                !is_valid_r_identifier(""),
+                "is_valid_r_identifier should reject empty strings"
+            );
+        }
+    }
+}
+

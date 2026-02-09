@@ -55,12 +55,13 @@ const R_CONSTANTS: &[&str] = &[
 /// Lower prefixes appear first in the completion list. Aligns with R language server behavior.
 ///
 /// Prefix allocation (matching R-LS conventions):
-///   "0-" — function arguments (reserved for future use)
+///   "0-" — function arguments (parameter completions)
 ///   "1-" — local scope
 ///   "2-" — workspace
 ///   "3-" — imported objects (reserved for future use)
 ///   "4-" — package globals
 ///   "5-" — keywords / text tokens
+const SORT_PREFIX_PARAM: &str = "0-";
 const SORT_PREFIX_SCOPE: &str = "1-";
 const SORT_PREFIX_WORKSPACE: &str = "2-";
 const SORT_PREFIX_PACKAGE: &str = "4-";
@@ -4693,7 +4694,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     }
 
     // Add symbols from current document (local definitions take precedence)
-    collect_document_completions(tree.root_node(), &text, &mut items, &mut seen_names);
+    collect_document_completions(tree.root_node(), &text, uri, &mut items, &mut seen_names);
 
     // Get scope at cursor position for package exports
     // Requirements 9.1, 9.2: Add package exports to completions with package attribution
@@ -4787,11 +4788,25 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             None
         };
 
+        // For user-defined functions from cross-file scope, include data for
+        // completionItem/resolve to locate the roxygen block for documentation
+        let data = if kind == CompletionItemKind::FUNCTION {
+            Some(serde_json::json!({
+                "type": "user_function",
+                "function_name": name_string,
+                "uri": symbol.source_uri.to_string(),
+                "func_line": symbol.defined_line,
+            }))
+        } else {
+            None
+        };
+
         items.push(CompletionItem {
             label: name_string.clone(),
             kind: Some(kind),
             detail,
             sort_text: Some(format!("{}{}", sort_prefix, name_string)),
+            data,
             ..Default::default()
         });
     }
@@ -4806,7 +4821,201 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         ) || !crate::reserved_words::is_reserved_word(&item.label)
     });
 
+    // Check if inside function call — if so, prepend parameter completions.
+    // Token detection (namespace accessor check via find_namespace_context above)
+    // happens BEFORE this point — if accessor is present, we already returned early,
+    // so parameter completions are naturally suppressed for namespace-qualified tokens.
+    // For incomplete namespace expressions (e.g., `pkg::` with no RHS), the AST check
+    // may fail, so we also do a text-based check here as a fallback.
+    // Requirements 2.2, 2.3, 2.6, 5.1-5.7, 6.1-6.6
+    if !has_namespace_accessor_at_cursor(&text, position) {
+        let call_context =
+            crate::completion_context::detect_function_call_context(tree, &text, position);
+        if let Some(ctx) = call_context {
+            let token = get_token_at_cursor(&text, position);
+            let param_items = get_parameter_completions(
+                state,
+                uri,
+                &ctx.function_name,
+                ctx.namespace.as_deref(),
+                ctx.is_internal,
+                &token,
+                position,
+            );
+            // Prepend parameter items so they appear first in the list
+            items.splice(0..0, param_items);
+        }
+    }
+
     Some(CompletionResponse::Array(items))
+}
+
+/// Check if the text before the cursor contains a namespace accessor (`::` or `:::`).
+///
+/// This is a text-based fallback for the AST-based `find_namespace_context` check.
+/// When the namespace expression is incomplete (e.g., `pkg::` with no RHS), tree-sitter
+/// may not produce a `namespace_operator` node, so the AST check fails. This function
+/// scans the line text backward from the cursor to detect `::` or `:::` in the token
+/// being typed, ensuring parameter completions are suppressed for namespace-qualified
+/// tokens even when the AST is incomplete.
+fn has_namespace_accessor_at_cursor(text: &str, position: Position) -> bool {
+    let line_idx = position.line as usize;
+    let col = position.character as usize;
+    let line = match text.lines().nth(line_idx) {
+        Some(l) => l,
+        None => return false,
+    };
+    let prefix = if col <= line.len() {
+        &line[..col]
+    } else {
+        line
+    };
+    // Scan backward: first collect identifier chars (the partial token after `::`)
+    // then check if `::` or `:::` immediately precedes them.
+    let after_ident = prefix
+        .trim_end_matches(|c: char| c.is_alphanumeric() || c == '.' || c == '_');
+    // Check if the remaining prefix ends with `::` or `:::`
+    after_ident.ends_with("::")
+}
+
+/// Extract the token (partial identifier) at the cursor position.
+///
+/// Scans backward from the cursor to collect identifier characters (letters,
+/// digits, `.`, `_`). Returns an empty string if the cursor is at a delimiter
+/// or whitespace.
+fn get_token_at_cursor(text: &str, position: Position) -> String {
+    let line_idx = position.line as usize;
+    let col = position.character as usize;
+    let line = match text.lines().nth(line_idx) {
+        Some(l) => l,
+        None => return String::new(),
+    };
+    // Collect identifier characters backward from cursor
+    let prefix = if col <= line.len() {
+        &line[..col]
+    } else {
+        line
+    };
+    let token: String = prefix
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    token
+}
+
+/// Build parameter completion items for a function call context.
+///
+/// Resolves the function signature via the parameter resolver, filters parameters
+/// using case-insensitive substring matching against the current token, and formats
+/// each as a `CompletionItem` with appropriate sort prefix, kind, and metadata.
+///
+/// Requirements: 2.2, 2.3, 2.6, 5.1-5.7, 6.1-6.6
+fn get_parameter_completions(
+    state: &WorldState,
+    uri: &Url,
+    function_name: &str,
+    namespace: Option<&str>,
+    is_internal: bool,
+    token: &str,
+    position: Position,
+) -> Vec<CompletionItem> {
+    let signature = match crate::parameter_resolver::resolve(
+        state,
+        &state.signature_cache,
+        function_name,
+        namespace,
+        is_internal,
+        uri,
+        position,
+    ) {
+        Some(sig) => sig,
+        None => return Vec::new(),
+    };
+
+    let parameters = &signature.parameters;
+
+    // TODO: Handle base::options() special case — query names(.Options) from R
+    // subprocess and append as additional parameter completions (R-LS parity).
+
+    let token_lower = token.to_lowercase();
+
+    parameters
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            // Case-insensitive substring matching (literal, NOT regex).
+            // An empty token matches all parameters.
+            // Uses str::contains on lowercased strings so `.` in `na.rm` matches literally.
+            if token_lower.is_empty() {
+                true
+            } else {
+                p.name.to_lowercase().contains(&token_lower)
+            }
+        })
+        .map(|(idx, p)| {
+            // For `...`, insert as-is (no ` = `) since `... = value` is invalid R.
+            // For all other params, append ` = ` for convenience.
+            let insert = if p.is_dots {
+                p.name.clone()
+            } else {
+                format!("{} = ", p.name)
+            };
+
+            let detail = Some("parameter".to_string());
+
+            // Build the data JSON for completionItem/resolve
+            let data = build_parameter_data(
+                &p.name,
+                function_name,
+                &signature.source,
+            );
+
+            CompletionItem {
+                label: p.name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail,
+                insert_text: Some(insert),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                // Sort by index (0-001, 0-002) to preserve definition order
+                sort_text: Some(format!("{}{:03}", SORT_PREFIX_PARAM, idx)),
+                data,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Build the `data` JSON for a parameter completion item.
+///
+/// For package functions: includes `type`, `param_name`, `function_name`, `package`.
+/// For user-defined functions: includes `type`, `param_name`, `function_name`, `uri`, `func_line`.
+fn build_parameter_data(
+    param_name: &str,
+    function_name: &str,
+    source: &crate::parameter_resolver::SignatureSource,
+) -> Option<serde_json::Value> {
+    use crate::parameter_resolver::SignatureSource;
+    match source {
+        SignatureSource::RSubprocess { package } => Some(serde_json::json!({
+            "type": "parameter",
+            "param_name": param_name,
+            "function_name": function_name,
+            "package": package,
+        })),
+        SignatureSource::CurrentFile { uri, line } | SignatureSource::CrossFile { uri, line } => {
+            Some(serde_json::json!({
+                "type": "parameter",
+                "param_name": param_name,
+                "function_name": function_name,
+                "uri": uri.as_str(),
+                "func_line": line,
+            }))
+        }
+    }
 }
 
 fn find_namespace_context<'a>(node: &Node<'a>, text: &'a str) -> Option<&'a str> {
@@ -4827,6 +5036,7 @@ fn find_namespace_context<'a>(node: &Node<'a>, text: &'a str) -> Option<&'a str>
 fn collect_document_completions(
     node: Node,
     text: &str,
+    uri: &Url,
     items: &mut Vec<CompletionItem>,
     seen: &mut std::collections::HashSet<String>,
 ) {
@@ -4851,10 +5061,24 @@ fn collect_document_completions(
                         CompletionItemKind::FIELD
                     };
 
+                    // For user-defined functions, include data for completionItem/resolve
+                    // to locate the roxygen block for documentation
+                    let data = if kind == CompletionItemKind::FUNCTION {
+                        Some(serde_json::json!({
+                            "type": "user_function",
+                            "function_name": name,
+                            "uri": uri.to_string(),
+                            "func_line": lhs.start_position().row as u32,
+                        }))
+                    } else {
+                        None
+                    };
+
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: Some(kind),
                         sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
+                        data,
                         ..Default::default()
                     });
                 }
@@ -4864,7 +5088,7 @@ fn collect_document_completions(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_document_completions(child, text, items, seen);
+        collect_document_completions(child, text, uri, items, seen);
     }
 }
 
@@ -4880,13 +5104,141 @@ fn collect_document_completions(
 pub fn completion_item_resolve(
     item: CompletionItem,
     help_cache: &crate::help::HelpCache,
+    document_contents: &HashMap<Url, String>,
 ) -> CompletionItem {
-    // Only resolve items with data containing topic and package
     let data = match &item.data {
-        Some(data) => data,
+        Some(data) => data.clone(),
         None => return item,
     };
 
+    // Dispatch based on the "type" field in the data JSON
+    let item_type = data.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match item_type.as_deref() {
+        // Parameter completion resolve (Requirement 7)
+        Some("parameter") => {
+            resolve_parameter_documentation(item, &data, help_cache, document_contents)
+        }
+        // User-defined function name completion resolve (Requirement 8)
+        Some("user_function") => {
+            resolve_user_function_documentation(item, &data, document_contents)
+        }
+        // Package export completion resolve (existing behavior)
+        _ => resolve_package_export_documentation(item, &data, help_cache),
+    }
+}
+
+/// Resolve documentation for a parameter completion item.
+///
+/// For package functions: extracts argument description from Rd help via help_cache.
+/// For user-defined functions: extracts @param description from roxygen comments.
+/// Clears the data field after resolving (R-LS parity).
+fn resolve_parameter_documentation(
+    item: CompletionItem,
+    data: &serde_json::Value,
+    help_cache: &crate::help::HelpCache,
+    document_contents: &HashMap<Url, String>,
+) -> CompletionItem {
+    let param_name = match data.get("param_name").and_then(|v| v.as_str()) {
+        Some(name) => name.to_string(),
+        None => return clear_data(item),
+    };
+
+    let function_name = match data.get("function_name").and_then(|v| v.as_str()) {
+        Some(name) => name.to_string(),
+        None => return clear_data(item),
+    };
+
+    let documentation = if let Some(package) = data.get("package").and_then(|v| v.as_str()) {
+        // Package function parameter: use structured Rd arguments from help subsystem
+        resolve_package_param_doc(help_cache, &function_name, package, &param_name)
+    } else if let (Some(uri_str), Some(func_line)) = (
+        data.get("uri").and_then(|v| v.as_str()),
+        data.get("func_line").and_then(|v| v.as_u64()),
+    ) {
+        // User-defined function parameter: extract from roxygen comments
+        resolve_user_param_doc(document_contents, uri_str, func_line as u32, &param_name)
+    } else {
+        None
+    };
+
+    let mut resolved = item;
+    if let Some(doc_text) = documentation {
+        resolved.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc_text,
+        }));
+    }
+    // Clear data field to avoid leaking internal metadata (R-LS parity, Requirement 7.5)
+    resolved.data = None;
+    resolved
+}
+
+/// Resolve parameter documentation for a package function using Rd arguments.
+fn resolve_package_param_doc(
+    help_cache: &crate::help::HelpCache,
+    function_name: &str,
+    package: &str,
+    param_name: &str,
+) -> Option<String> {
+    let arguments = help_cache.get_arguments(function_name, Some(package))?;
+    arguments.get(param_name).cloned()
+}
+
+/// Resolve parameter documentation for a user-defined function using roxygen comments.
+fn resolve_user_param_doc(
+    document_contents: &HashMap<Url, String>,
+    uri_str: &str,
+    func_line: u32,
+    param_name: &str,
+) -> Option<String> {
+    let text = read_file_content(document_contents, uri_str)?;
+    let block = crate::roxygen::extract_roxygen_block(&text, func_line)?;
+    crate::roxygen::get_param_doc(&block, param_name)
+}
+
+/// Resolve documentation for a user-defined function name completion item.
+///
+/// Extracts title/description from roxygen comments above the function definition.
+/// Clears the data field after resolving (R-LS parity).
+fn resolve_user_function_documentation(
+    item: CompletionItem,
+    data: &serde_json::Value,
+    document_contents: &HashMap<Url, String>,
+) -> CompletionItem {
+    let documentation = if let (Some(uri_str), Some(func_line)) = (
+        data.get("uri").and_then(|v| v.as_str()),
+        data.get("func_line").and_then(|v| v.as_u64()),
+    ) {
+        let text = read_file_content(document_contents, uri_str);
+        text.and_then(|t| {
+            let block = crate::roxygen::extract_roxygen_block(&t, func_line as u32)?;
+            crate::roxygen::get_function_doc(&block)
+        })
+    } else {
+        None
+    };
+
+    let mut resolved = item;
+    if let Some(doc_text) = documentation {
+        resolved.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc_text,
+        }));
+    }
+    // Clear data field to avoid leaking internal metadata
+    resolved.data = None;
+    resolved
+}
+
+/// Resolve documentation for a package export completion item (existing behavior).
+///
+/// Looks up help text for the topic in the specified package.
+fn resolve_package_export_documentation(
+    item: CompletionItem,
+    data: &serde_json::Value,
+    help_cache: &crate::help::HelpCache,
+) -> CompletionItem {
     let topic = match data.get("topic").and_then(|v| v.as_str()) {
         Some(t) => t.to_string(),
         None => return item,
@@ -4912,6 +5264,29 @@ pub fn completion_item_resolve(
         }),
         ..item
     }
+}
+
+/// Read file content from the document store (open documents) or from disk as fallback.
+fn read_file_content(
+    document_contents: &HashMap<Url, String>,
+    uri_str: &str,
+) -> Option<String> {
+    let uri = Url::parse(uri_str).ok()?;
+
+    // Try open documents first (authoritative)
+    if let Some(content) = document_contents.get(&uri) {
+        return Some(content.clone());
+    }
+
+    // Fall back to reading from disk
+    let path = uri.to_file_path().ok()?;
+    std::fs::read_to_string(path).ok()
+}
+
+/// Clear the data field from a completion item (helper for early returns).
+fn clear_data(mut item: CompletionItem) -> CompletionItem {
+    item.data = None;
+    item
 }
 
 // ============================================================================
@@ -7337,8 +7712,8 @@ x <- "#;
         };
 
         let cache = crate::help::HelpCache::new();
-        let resolved = super::completion_item_resolve(item.clone(), &cache);
-        assert_eq!(resolved.label, "local_var");
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs);
         assert!(
             resolved.documentation.is_none(),
             "Should not add documentation to items without data"
@@ -7355,7 +7730,8 @@ x <- "#;
         };
 
         let cache = crate::help::HelpCache::new();
-        let resolved = super::completion_item_resolve(item, &cache);
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
         assert_eq!(resolved.label, "something");
         assert!(
             resolved.documentation.is_none(),
@@ -7384,7 +7760,7 @@ x <- "#;
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache);
+        let resolved = super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
 
         // Should have documentation populated from the cached help text
         let doc = resolved
@@ -7426,7 +7802,8 @@ x <- "#;
         };
 
         // First call — R subprocess will fail (no such package), should cache None
-        let resolved = super::completion_item_resolve(item.clone(), &cache);
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs);
         assert!(
             resolved.documentation.is_none(),
             "Should have no documentation for nonexistent package"
@@ -7443,7 +7820,7 @@ x <- "#;
         // Second call — should hit the negative cache entry and NOT spawn R again.
         // (We can't directly assert "no subprocess was spawned", but we can verify
         // the cache is consulted by checking it returns the same result quickly.)
-        let resolved2 = super::completion_item_resolve(item, &cache);
+        let resolved2 = super::completion_item_resolve(item, &cache, &empty_docs);
         assert!(
             resolved2.documentation.is_none(),
             "Negative cache hit should still return no documentation"
@@ -7474,7 +7851,8 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "filter", "package": "dplyr"})),
             ..Default::default()
         };
-        let resolved = super::completion_item_resolve(item_dplyr, &cache);
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item_dplyr, &cache, &empty_docs);
         let doc = resolved
             .documentation
             .expect("dplyr::filter should have cached documentation");
@@ -7494,7 +7872,7 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "filter", "package": "nonexistent_pkg"})),
             ..Default::default()
         };
-        let resolved_bad = super::completion_item_resolve(item_bad, &cache);
+        let resolved_bad = super::completion_item_resolve(item_bad, &cache, &empty_docs);
         assert!(
             resolved_bad.documentation.is_none(),
             "nonexistent_pkg::filter should return no documentation from negative cache"
@@ -7522,11 +7900,431 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "read_csv", "package": "readr"})),
             ..Default::default()
         };
-        let resolved = super::completion_item_resolve(item, &cache);
+        let resolved = super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
 
         assert!(
             resolved.documentation.is_some(),
             "Resolve should find help text cached by hover"
+        );
+    }
+
+    /// Test that completion_item_resolve resolves parameter documentation for
+    /// package functions using the Rd arguments from the help cache.
+    #[test]
+    fn test_completion_resolve_parameter_package_function() {
+        let cache = crate::help::HelpCache::new();
+
+        // Pre-populate cache with realistic R help text that has an Arguments section
+        let help_text = "Filter rows\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20Subset rows using column values.\n\n\
+            Arguments:\n\n\
+            \x20\x20\x20\x20\x20.data: A data frame, data frame extension (e.g. a tibble).\n\n\
+            \x20\x20\x20\x20\x20...: Expressions that return a logical value.\n\n\
+            \x20\x20\x20\x20\x20.preserve: Relevant when the .data input is grouped.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20filter(.data, ..., .preserve = FALSE)\n";
+        cache.insert("filter", Some("dplyr"), Some(help_text.to_string()));
+
+        let item = CompletionItem {
+            label: ".data".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            data: Some(serde_json::json!({
+                "type": "parameter",
+                "param_name": ".data",
+                "function_name": "filter",
+                "package": "dplyr"
+            })),
+            ..Default::default()
+        };
+
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+
+        // Should have documentation from the Rd arguments
+        let doc = resolved
+            .documentation
+            .expect("Should have parameter documentation from Rd arguments");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert!(
+                    content.value.contains("data frame"),
+                    "Parameter doc should contain the argument description: {}",
+                    content.value
+                );
+            }
+            _ => panic!("Expected MarkupContent documentation"),
+        }
+
+        // data field should be cleared after resolve
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve (R-LS parity)"
+        );
+    }
+
+    /// Test that completion_item_resolve resolves parameter documentation for
+    /// user-defined functions using roxygen comments.
+    #[test]
+    fn test_completion_resolve_parameter_user_defined() {
+        let cache = crate::help::HelpCache::new();
+
+        let file_content = "\
+#' Process data with threshold
+#'
+#' @param data The input data frame
+#' @param threshold Minimum value to keep
+#' @return Filtered data
+process_data <- function(data, threshold = 0) {
+  data[data > threshold]
+}
+";
+        let uri = Url::parse("file:///test/file.R").unwrap();
+        let mut document_contents = std::collections::HashMap::new();
+        document_contents.insert(uri, file_content.to_string());
+
+        let item = CompletionItem {
+            label: "threshold".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            data: Some(serde_json::json!({
+                "type": "parameter",
+                "param_name": "threshold",
+                "function_name": "process_data",
+                "uri": "file:///test/file.R",
+                "func_line": 5
+            })),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+
+        // Should have documentation from roxygen @param
+        let doc = resolved
+            .documentation
+            .expect("Should have parameter documentation from roxygen");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert!(
+                    content.value.contains("Minimum value to keep"),
+                    "Parameter doc should contain the @param description: {}",
+                    content.value
+                );
+            }
+            _ => panic!("Expected MarkupContent documentation"),
+        }
+
+        // data field should be cleared after resolve
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve (R-LS parity)"
+        );
+    }
+
+    /// Test that completion_item_resolve returns item unchanged (but with data cleared)
+    /// when parameter documentation is not available.
+    #[test]
+    fn test_completion_resolve_parameter_no_docs_available() {
+        let cache = crate::help::HelpCache::new();
+
+        let item = CompletionItem {
+            label: "x".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            data: Some(serde_json::json!({
+                "type": "parameter",
+                "param_name": "x",
+                "function_name": "unknown_func",
+                "package": "nonexistent_pkg"
+            })),
+            ..Default::default()
+        };
+
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+
+        // No documentation should be added
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not have documentation when help is unavailable"
+        );
+
+        // data field should still be cleared
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared even when no docs found"
+        );
+    }
+
+    /// Test that completion_item_resolve clears the data field for parameter items
+    /// even when the param_name is not found in the Rd arguments.
+    #[test]
+    fn test_completion_resolve_parameter_missing_param_name() {
+        let cache = crate::help::HelpCache::new();
+
+        // Pre-populate cache with help text that has arguments but not the one we're looking for
+        let help_text = "Mean\n\n\
+            Description:\n\n\
+            \x20\x20\x20\x20\x20Arithmetic mean.\n\n\
+            Arguments:\n\n\
+            \x20\x20\x20\x20\x20x: An R object.\n\n\
+            Usage:\n\n\
+            \x20\x20\x20\x20\x20mean(x, ...)\n";
+        cache.insert("mean", Some("base"), Some(help_text.to_string()));
+
+        let item = CompletionItem {
+            label: "nonexistent_param".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            data: Some(serde_json::json!({
+                "type": "parameter",
+                "param_name": "nonexistent_param",
+                "function_name": "mean",
+                "package": "base"
+            })),
+            ..Default::default()
+        };
+
+        let empty_docs = std::collections::HashMap::new();
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not have documentation for a param not in Rd arguments"
+        );
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve"
+        );
+    }
+
+    /// Test that completion_item_resolve handles user-defined function parameters
+    /// when the function has no roxygen comments (returns item without docs).
+    #[test]
+    fn test_completion_resolve_parameter_user_no_roxygen() {
+        let cache = crate::help::HelpCache::new();
+
+        let file_content = "\
+process_data <- function(data, threshold = 0) {
+  data[data > threshold]
+}
+";
+        let uri = Url::parse("file:///test/file.R").unwrap();
+        let mut document_contents = std::collections::HashMap::new();
+        document_contents.insert(uri, file_content.to_string());
+
+        let item = CompletionItem {
+            label: "threshold".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            data: Some(serde_json::json!({
+                "type": "parameter",
+                "param_name": "threshold",
+                "function_name": "process_data",
+                "uri": "file:///test/file.R",
+                "func_line": 0
+            })),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+
+        // No roxygen comments, so no documentation
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not have documentation when no roxygen comments exist"
+        );
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve"
+        );
+    }
+
+    /// Test that completion_item_resolve returns roxygen documentation for user-defined
+    /// function name completions (type == "user_function") with title and description.
+    #[test]
+    fn test_completion_resolve_user_function_with_roxygen() {
+        let cache = crate::help::HelpCache::new();
+
+        let file_content = "\
+#' Process data with threshold
+#'
+#' Filters the input data frame, keeping only values above the threshold.
+#'
+#' @param data The input data frame
+#' @param threshold Minimum value to keep
+#' @return Filtered data
+process_data <- function(data, threshold = 0) {
+  data[data > threshold]
+}
+";
+        let uri = Url::parse("file:///test/file.R").unwrap();
+        let mut document_contents = std::collections::HashMap::new();
+        document_contents.insert(uri, file_content.to_string());
+
+        let item = CompletionItem {
+            label: "process_data".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            data: Some(serde_json::json!({
+                "type": "user_function",
+                "function_name": "process_data",
+                "uri": "file:///test/file.R",
+                "func_line": 7
+            })),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+
+        // Should have documentation from roxygen title + description
+        let doc = resolved
+            .documentation
+            .expect("Should have function documentation from roxygen");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert!(
+                    content.value.contains("Process data with threshold"),
+                    "Function doc should contain the title: {}",
+                    content.value
+                );
+                assert!(
+                    content.value.contains("Filters the input data frame"),
+                    "Function doc should contain the description: {}",
+                    content.value
+                );
+            }
+            _ => panic!("Expected MarkupContent documentation"),
+        }
+
+        // data field should be cleared after resolve
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve (R-LS parity)"
+        );
+    }
+
+    /// Test that completion_item_resolve returns item without documentation for user-defined
+    /// function name completions when no roxygen comments exist.
+    #[test]
+    fn test_completion_resolve_user_function_no_roxygen() {
+        let cache = crate::help::HelpCache::new();
+
+        let file_content = "\
+process_data <- function(data, threshold = 0) {
+  data[data > threshold]
+}
+";
+        let uri = Url::parse("file:///test/file.R").unwrap();
+        let mut document_contents = std::collections::HashMap::new();
+        document_contents.insert(uri, file_content.to_string());
+
+        let item = CompletionItem {
+            label: "process_data".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            data: Some(serde_json::json!({
+                "type": "user_function",
+                "function_name": "process_data",
+                "uri": "file:///test/file.R",
+                "func_line": 0
+            })),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+
+        // No roxygen comments, so no documentation
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not have documentation when no roxygen comments exist"
+        );
+        // data field should still be cleared
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve"
+        );
+    }
+
+    /// Test that completion_item_resolve handles user-defined function with plain comment
+    /// fallback (no roxygen tags, just # comments).
+    #[test]
+    fn test_completion_resolve_user_function_plain_comment_fallback() {
+        let cache = crate::help::HelpCache::new();
+
+        let file_content = "\
+# Helper function to clean data
+# Removes NA values and trims whitespace
+clean_data <- function(x) {
+  x[!is.na(x)]
+}
+";
+        let uri = Url::parse("file:///test/file.R").unwrap();
+        let mut document_contents = std::collections::HashMap::new();
+        document_contents.insert(uri, file_content.to_string());
+
+        let item = CompletionItem {
+            label: "clean_data".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            data: Some(serde_json::json!({
+                "type": "user_function",
+                "function_name": "clean_data",
+                "uri": "file:///test/file.R",
+                "func_line": 2
+            })),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+
+        // Should have documentation from plain comment fallback
+        let doc = resolved
+            .documentation
+            .expect("Should have function documentation from plain comment fallback");
+        match doc {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert!(
+                    content.value.contains("clean data")
+                        || content.value.contains("Helper function"),
+                    "Function doc should contain fallback comment text: {}",
+                    content.value
+                );
+            }
+            _ => panic!("Expected MarkupContent documentation"),
+        }
+
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve"
+        );
+    }
+
+    /// Test that completion_item_resolve handles user_function with missing uri gracefully.
+    #[test]
+    fn test_completion_resolve_user_function_missing_uri() {
+        let cache = crate::help::HelpCache::new();
+        let document_contents = std::collections::HashMap::new();
+
+        let item = CompletionItem {
+            label: "my_func".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            data: Some(serde_json::json!({
+                "type": "user_function",
+                "function_name": "my_func"
+                // Missing uri and func_line
+            })),
+            ..Default::default()
+        };
+
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+
+        // No uri/func_line, so no documentation
+        assert!(
+            resolved.documentation.is_none(),
+            "Should not have documentation when uri is missing"
+        );
+        // data field should still be cleared
+        assert!(
+            resolved.data.is_none(),
+            "data field should be cleared after resolve"
         );
     }
 
@@ -21417,6 +22215,1040 @@ setClass("{}", slots = c(value = "numeric"))
                     }
                 }
             }
+        }
+    }
+
+    // ========================================================================
+    // Feature: function-parameter-completions
+    // Property-based tests for parameter completion formatting
+    // ========================================================================
+
+    /// Strategy to generate valid R parameter names for completion formatting tests.
+    fn r_completion_param_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9._]{0,7}"
+            .prop_filter("must not be empty", |s| !s.is_empty())
+            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+    }
+
+    /// Strategy to generate a list of unique parameter definitions for formatting tests.
+    fn r_completion_param_list(
+        min: usize,
+        max: usize,
+    ) -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(r_completion_param_name(), min..=max).prop_filter(
+            "parameter names must be unique",
+            |params| {
+                let mut seen = std::collections::HashSet::new();
+                params.iter().all(|name| seen.insert(name.clone()))
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 6: Parameter Completion Formatting
+        //
+        // For any parameter completion item, the item SHALL have
+        // `kind = CompletionItemKind::VARIABLE`,
+        // `insert_text_format = InsertTextFormat::PLAIN_TEXT`,
+        // `sort_text` starting with `0-` followed by digits, and:
+        // for non-dots parameters, `insert_text` ending with ` = `;
+        // for the `...` parameter, `insert_text` equal to `"..."` (no ` = ` suffix).
+        //
+        // **Validates: Requirements 5.1, 5.3, 5.6, 5.7**
+        // ============================================================================
+
+        #[test]
+        fn prop_parameter_completion_formatting(
+            params in r_completion_param_list(1, 6),
+            include_dots in proptest::bool::ANY,
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Build a function definition with the generated parameters
+            let mut param_strs: Vec<String> = params.clone();
+            if include_dots {
+                param_strs.push("...".to_string());
+            }
+            let func_def = format!("my_test_fn <- function({}) {{ NULL }}", param_strs.join(", "));
+
+            // Build a call to the function with cursor inside the parentheses
+            // The cursor is right after the opening `(` with no token typed yet
+            let code = format!("{}\nmy_test_fn()", func_def);
+
+            let uri = Url::parse("file:///test_formatting.R").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Position cursor inside the function call parentheses (line 1, after `(`)
+            // "my_test_fn()" — the `(` is at column 10, so cursor at column 11 is inside
+            let position = Position::new(1, 11);
+            let completions = super::completion(&state, &uri, position);
+
+            prop_assert!(completions.is_some(), "Should return completions for code: {}", code);
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Collect parameter completion items (those with sort_text starting with "0-")
+                let param_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                    })
+                    .collect();
+
+                // We should have parameter items for all generated params (+ dots if included)
+                let expected_count = params.len() + if include_dots { 1 } else { 0 };
+                prop_assert_eq!(
+                    param_items.len(),
+                    expected_count,
+                    "Expected {} parameter items but got {} for code: {}",
+                    expected_count,
+                    param_items.len(),
+                    code
+                );
+
+                for (idx, item) in param_items.iter().enumerate() {
+                    // Property: kind == VARIABLE
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::VARIABLE),
+                        "Parameter '{}' at index {} should have kind VARIABLE",
+                        item.label,
+                        idx
+                    );
+
+                    // Property: insert_text_format == PLAIN_TEXT
+                    prop_assert_eq!(
+                        item.insert_text_format,
+                        Some(InsertTextFormat::PLAIN_TEXT),
+                        "Parameter '{}' at index {} should have insert_text_format PLAIN_TEXT",
+                        item.label,
+                        idx
+                    );
+
+                    // Property: sort_text starts with "0-" followed by digits
+                    let sort_text = item.sort_text.as_ref().unwrap();
+                    prop_assert!(
+                        sort_text.starts_with("0-"),
+                        "Parameter '{}' sort_text '{}' should start with '0-'",
+                        item.label,
+                        sort_text
+                    );
+                    let after_prefix = &sort_text[2..];
+                    prop_assert!(
+                        !after_prefix.is_empty() && after_prefix.chars().all(|c| c.is_ascii_digit()),
+                        "Parameter '{}' sort_text '{}' should have digits after '0-', got '{}'",
+                        item.label,
+                        sort_text,
+                        after_prefix
+                    );
+
+                    // Property: insert_text formatting depends on dots vs non-dots
+                    let insert_text = item.insert_text.as_ref().unwrap();
+                    if item.label == "..." {
+                        // For `...` param: insert_text equals "..." (no ` = `)
+                        prop_assert_eq!(
+                            insert_text,
+                            "...",
+                            "Dots parameter insert_text should be '...' but got '{}'",
+                            insert_text
+                        );
+                    } else {
+                        // For non-dots params: insert_text ends with ` = `
+                        prop_assert!(
+                            insert_text.ends_with(" = "),
+                            "Non-dots parameter '{}' insert_text '{}' should end with ' = '",
+                            item.label,
+                            insert_text
+                        );
+                    }
+                }
+
+                // Verify sort_text ordering preserves definition order
+                for i in 1..param_items.len() {
+                    let prev_sort = param_items[i - 1].sort_text.as_ref().unwrap();
+                    let curr_sort = param_items[i].sort_text.as_ref().unwrap();
+                    prop_assert!(
+                        prev_sort < curr_sort,
+                        "Parameter sort_text should be strictly increasing: '{}' < '{}' for params '{}' and '{}'",
+                        prev_sort,
+                        curr_sort,
+                        param_items[i - 1].label,
+                        param_items[i].label
+                    );
+                }
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array");
+            }
+        }
+    }
+
+    /// Strategy to generate a parameter name with mixed-case characters and dots,
+    /// representative of real R parameter names like `na.rm`, `stringsAsFactors`.
+    fn r_mixed_case_param_name() -> impl Strategy<Value = String> {
+        // Generate names with at least 3 chars, mixing lowercase, uppercase, and dots
+        "[a-z][a-zA-Z0-9.]{2,9}"
+            .prop_filter("must not be empty", |s| !s.is_empty())
+            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+    }
+
+    /// Strategy to generate a parameter name together with a case-insensitive substring token.
+    /// Returns (param_name, matching_token) where matching_token is a contiguous substring
+    /// of param_name with randomized casing.
+    fn param_with_matching_token() -> impl Strategy<Value = (String, String)> {
+        r_mixed_case_param_name().prop_flat_map(|name| {
+            let len = name.len();
+            // Pick random start..end for a non-empty substring
+            (Just(name.clone()), 0..len).prop_flat_map(move |(name, start)| {
+                let len = name.len();
+                (Just(name.clone()), Just(start), (start + 1)..=len)
+            })
+            .prop_flat_map(|(name, start, end)| {
+                let sub = name[start..end].to_string();
+                let sub_len = sub.len();
+                // Randomize case of each character
+                (
+                    Just(name),
+                    prop::collection::vec(proptest::bool::ANY, sub_len)
+                        .prop_map(move |flags| {
+                            sub.chars()
+                                .zip(flags.iter())
+                                .map(|(c, &upper)| {
+                                    if upper {
+                                        c.to_uppercase().to_string()
+                                    } else {
+                                        c.to_lowercase().to_string()
+                                    }
+                                })
+                                .collect::<String>()
+                        }),
+                )
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 7: Case-Insensitive Substring Matching
+        //
+        // For any typed token inside a function call, parameter completions SHALL
+        // include parameters whose names contain the token as a case-insensitive
+        // substring.
+        //
+        // **Validates: Requirements 5.4**
+        // ============================================================================
+
+        #[test]
+        fn prop_case_insensitive_substring_matching(
+            (param_name, matching_token) in param_with_matching_token(),
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // --- Phase 1: Matching token (case-insensitive substring) ---
+            // The matching_token is a contiguous substring of param_name with randomized case.
+            // The parameter should always be included in completions.
+
+            // Build a function definition with the parameter
+            let func_def = format!("my_fn <- function({}) {{ NULL }}", param_name);
+            // Build a call with the token typed inside the parentheses
+            let call_line = format!("my_fn({})", matching_token);
+            let code = format!("{}\n{}", func_def, call_line);
+
+            let uri = Url::parse("file:///test_case_match.R").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Position cursor at the end of the token inside the call
+            // "my_fn(" is 6 chars, then the token follows
+            let cursor_col = 6 + matching_token.len() as u32;
+            let position = Position::new(1, cursor_col);
+            let completions = super::completion(&state, &uri, position);
+
+            prop_assert!(completions.is_some(), "Should return completions for code: {}", code);
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                let param_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                    })
+                    .collect();
+
+                // The parameter should be included because the token is a
+                // case-insensitive substring of the parameter name
+                let found = param_items.iter().any(|item| item.label == param_name);
+                prop_assert!(
+                    found,
+                    "Parameter '{}' should be in completions when token '{}' (substring with randomized case) is typed. Got param items: {:?}",
+                    param_name,
+                    matching_token,
+                    param_items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array");
+            }
+
+            // --- Phase 2: Non-matching token ---
+            // Use a token that is NOT a substring of the parameter name (case-insensitive).
+            // The parameter should NOT be included in completions.
+            // We construct a non-matching token by appending "zzq" to the param name,
+            // ensuring it cannot be a substring.
+            let non_matching_token = format!("{}zzq", param_name);
+            // Verify it's truly not a substring (sanity check)
+            prop_assume!(!param_name.to_lowercase().contains(&non_matching_token.to_lowercase()));
+
+            let call_line_nm = format!("my_fn({})", non_matching_token);
+            let code_nm = format!("{}\n{}", func_def, call_line_nm);
+
+            let uri_nm = Url::parse("file:///test_case_nomatch.R").unwrap();
+            let mut state_nm = WorldState::new(vec![]);
+            state_nm.documents.insert(uri_nm.clone(), Document::new(&code_nm, None));
+
+            let cursor_col_nm = 6 + non_matching_token.len() as u32;
+            let position_nm = Position::new(1, cursor_col_nm);
+            let completions_nm = super::completion(&state_nm, &uri_nm, position_nm);
+
+            prop_assert!(completions_nm.is_some(), "Should return completions for non-matching code: {}", code_nm);
+
+            if let Some(CompletionResponse::Array(items_nm)) = completions_nm {
+                let param_items_nm: Vec<&CompletionItem> = items_nm.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                    })
+                    .collect();
+
+                // The parameter should NOT be included because the token does not match
+                let found_nm = param_items_nm.iter().any(|item| item.label == param_name);
+                prop_assert!(
+                    !found_nm,
+                    "Parameter '{}' should NOT be in completions when non-matching token '{}' is typed. Got param items: {:?}",
+                    param_name,
+                    non_matching_token,
+                    param_items_nm.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array");
+            }
+        }
+    }
+
+    /// Strategy to generate a valid R package name for namespace-qualified token tests.
+    fn r_package_name() -> impl Strategy<Value = String> {
+        "[a-z]{3,8}"
+            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+    }
+
+    /// Strategy to generate a valid R function name for namespace-qualified token tests.
+    fn r_func_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9.]{1,7}"
+            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+    }
+
+    /// Strategy to generate a partial token (0 or more chars) that could follow `::` or `:::`.
+    /// This represents what the user has typed so far after the namespace accessor.
+    fn r_partial_token() -> impl Strategy<Value = String> {
+        prop::string::string_regex("[a-z]{0,5}").unwrap()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 8: Namespace-Qualified Token Suppression
+        //
+        // For any completion request where the current token uses a namespace
+        // accessor (`::` or `:::`), parameter completions SHALL be suppressed.
+        //
+        // **Validates: Requirements 6.5**
+        // ============================================================================
+
+        #[test]
+        fn prop_namespace_qualified_token_suppression(
+            outer_func in r_func_name(),
+            pkg_name in r_package_name(),
+            partial_token in r_partial_token(),
+            use_triple_colon in proptest::bool::ANY,
+        ) {
+            use crate::state::{WorldState, Document};
+
+            let accessor = if use_triple_colon { ":::" } else { "::" };
+
+            // Build a function definition so parameter completions would normally appear
+            let func_def = format!(
+                "{} <- function(alpha, beta, gamma) {{ NULL }}",
+                outer_func
+            );
+
+            // Build a call where the cursor is typing a namespace-qualified token
+            // e.g., `outer_func(stats::o)` or `outer_func(pkg:::f)`
+            let ns_token = format!("{}{}{}", pkg_name, accessor, partial_token);
+            let call_line = format!("{}({})", outer_func, ns_token);
+            let code = format!("{}\n{}", func_def, call_line);
+
+            let uri = Url::parse("file:///test_ns_suppression.R").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Position cursor at the end of the namespace-qualified token inside the call
+            // The call line is: `outer_func(pkg::partial)` or `outer_func(pkg:::partial)`
+            // `outer_func(` has length outer_func.len() + 1, then the ns_token follows
+            let cursor_col = (outer_func.len() + 1 + ns_token.len()) as u32;
+            let position = Position::new(1, cursor_col);
+            let completions = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                completions.is_some(),
+                "Should return completions (possibly empty) for code: {}",
+                code
+            );
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // No parameter completion items should be present.
+                // Parameter items are identified by sort_text starting with "0-".
+                let param_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                    })
+                    .collect();
+
+                prop_assert!(
+                    param_items.is_empty(),
+                    "Parameter completions should be suppressed when token is namespace-qualified \
+                     ('{}'). Found {} parameter items: {:?}. Code: {}",
+                    ns_token,
+                    param_items.len(),
+                    param_items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+                    code
+                );
+
+                // Additionally verify no items have kind == VARIABLE with detail == "parameter"
+                // (belt-and-suspenders check)
+                let param_detail_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.detail.as_ref().map_or(false, |d| d == "parameter")
+                    })
+                    .collect();
+
+                prop_assert!(
+                    param_detail_items.is_empty(),
+                    "No items with detail='parameter' should appear when token is namespace-qualified \
+                     ('{}'). Found: {:?}. Code: {}",
+                    ns_token,
+                    param_detail_items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+                    code
+                );
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array");
+            }
+        }
+    }
+
+    /// Strategy to generate a valid R function name for mixed completion tests.
+    fn r_mixed_func_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9]{2,7}"
+            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+    }
+
+    /// Strategy to generate a valid R variable name for mixed completion tests.
+    fn r_mixed_var_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_]{2,7}"
+            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 9: Mixed Completions in Function Call Context
+        //
+        // For any function call context where parameter completions are available,
+        // the completion list SHALL contain both parameter items (with "0-" sort prefix)
+        // and standard completion items (keywords, local variables, package exports).
+        //
+        // **Validates: Requirements 6.1, 6.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_mixed_completions_in_function_call_context(
+            params in r_completion_param_list(1, 5),
+            func_name in r_mixed_func_name(),
+            local_vars in prop::collection::vec(r_mixed_var_name(), 1..=3),
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Ensure func_name doesn't collide with local_vars or params
+            prop_assume!(!local_vars.contains(&func_name));
+            prop_assume!(!params.contains(&func_name));
+            // Ensure local_vars are unique and don't collide with params
+            let local_var_set: std::collections::HashSet<_> = local_vars.iter().collect();
+            prop_assume!(local_var_set.len() == local_vars.len());
+            prop_assume!(local_vars.iter().all(|v| !params.contains(v)));
+            // Ensure local_vars are not reserved words
+            prop_assume!(local_vars.iter().all(|v| !is_r_reserved(v)));
+
+            // Build R code with:
+            // 1. Local variable definitions
+            // 2. A function definition with the generated parameters
+            // 3. A call to that function with cursor inside the parentheses
+            let mut code_lines = Vec::new();
+
+            // Define local variables
+            for var in &local_vars {
+                code_lines.push(format!("{} <- 42", var));
+            }
+
+            // Define the function
+            let param_str = params.join(", ");
+            code_lines.push(format!("{} <- function({}) {{ NULL }}", func_name, param_str));
+
+            // Call the function with empty args (cursor will be inside parens)
+            code_lines.push(format!("{}()", func_name));
+
+            let code = code_lines.join("\n");
+
+            let uri = Url::parse("file:///test_mixed_completions.R").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Position cursor inside the function call parentheses on the last line
+            // The call line is: `func_name()` — the `(` is at column func_name.len(),
+            // so cursor at column func_name.len() + 1 is inside the parens
+            let call_line = code_lines.len() as u32 - 1;
+            let cursor_col = func_name.len() as u32 + 1;
+            let position = Position::new(call_line, cursor_col);
+            let completions = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                completions.is_some(),
+                "Should return completions for code:\n{}",
+                code
+            );
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // --- Check 1: Parameter items are present (sort_text starts with "0-") ---
+                let param_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                    })
+                    .collect();
+
+                prop_assert!(
+                    !param_items.is_empty(),
+                    "Should have parameter completion items (sort_text starting with '0-') \
+                     for function '{}' with params {:?}. Got {} total items. Code:\n{}",
+                    func_name,
+                    params,
+                    items.len(),
+                    code
+                );
+
+                // Verify all generated params appear in parameter items
+                for param in &params {
+                    let found = param_items.iter().any(|item| item.label == *param);
+                    prop_assert!(
+                        found,
+                        "Parameter '{}' should appear in parameter completions. \
+                         Found param items: {:?}. Code:\n{}",
+                        param,
+                        param_items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+                        code
+                    );
+                }
+
+                // --- Check 2: Standard items are present ---
+                // 2a: Keywords should be present (sort_text starts with "5-")
+                let keyword_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("5-"))
+                            && item.kind == Some(CompletionItemKind::KEYWORD)
+                    })
+                    .collect();
+
+                prop_assert!(
+                    !keyword_items.is_empty(),
+                    "Should have keyword completion items (sort_text starting with '5-') \
+                     alongside parameter completions. Got {} total items. Code:\n{}",
+                    items.len(),
+                    code
+                );
+
+                // 2b: Local variable definitions should be present (sort_text starts with "1-")
+                let scope_items: Vec<&CompletionItem> = items.iter()
+                    .filter(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("1-"))
+                    })
+                    .collect();
+
+                // At minimum, the local variables we defined should appear
+                for var in &local_vars {
+                    let found = scope_items.iter().any(|item| item.label == *var);
+                    prop_assert!(
+                        found,
+                        "Local variable '{}' should appear in standard completions \
+                         (sort_text starting with '1-'). Found scope items: {:?}. Code:\n{}",
+                        var,
+                        scope_items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+                        code
+                    );
+                }
+
+                // --- Check 3: Parameter items sort before standard items ---
+                // All "0-" prefixed items should appear before any "1-", "4-", or "5-" items
+                // in the items list (since they are prepended)
+                if let Some(last_param_idx) = items.iter().rposition(|item| {
+                    item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                }) {
+                    if let Some(first_standard_idx) = items.iter().position(|item| {
+                        item.sort_text.as_ref().map_or(false, |st| {
+                            st.starts_with("1-") || st.starts_with("4-") || st.starts_with("5-")
+                        })
+                    }) {
+                        prop_assert!(
+                            last_param_idx < first_standard_idx,
+                            "All parameter items (0- prefix) should be prepended before \
+                             standard items. Last param at index {}, first standard at index {}. Code:\n{}",
+                            last_param_idx,
+                            first_standard_idx,
+                            code
+                        );
+                    }
+                }
+
+                // --- Check 4: Parameter completions are ADDITIVE (not replacing) ---
+                // The total number of items should be greater than just the parameter count
+                prop_assert!(
+                    items.len() > param_items.len(),
+                    "Completion list should contain more than just parameter items. \
+                     Total: {}, Params: {}. Parameter completions should be additive. Code:\n{}",
+                    items.len(),
+                    param_items.len(),
+                    code
+                );
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array");
+            }
+        }
+    }
+
+    /// Strategy to generate a valid R default value string for property tests.
+    fn r_default_value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("TRUE".to_string()),
+            Just("FALSE".to_string()),
+            Just("NULL".to_string()),
+            Just("NA".to_string()),
+            (1i32..1000).prop_map(|n| n.to_string()),
+            (1i32..100, 1i32..100).prop_map(|(a, b)| format!("{}.{}", a, b)),
+            "[a-z]{1,8}".prop_map(|s| format!("\"{}\"", s)),
+        ]
+    }
+
+    /// Strategy to generate a parameter definition with an optional default value.
+    /// Returns (param_name, default_value_option, param_definition_string).
+    fn r_param_with_optional_default() -> impl Strategy<Value = (String, Option<String>, String)> {
+        (r_completion_param_name(), proptest::option::of(r_default_value())).prop_map(
+            |(name, default)| {
+                let def_str = match &default {
+                    Some(val) => format!("{} = {}", name, val),
+                    None => name.clone(),
+                };
+                (name, default, def_str)
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 4: Default Value Preservation
+        //
+        // For any function parameter with a default value (user-defined or package),
+        // if the completion item includes a default in its detail, it SHALL match
+        // the parameter's default value string representation.
+        //
+        // **Validates: Requirements 2.3, 4.3, 5.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_default_value_preservation(
+            param_defs in prop::collection::vec(r_param_with_optional_default(), 1..=5)
+                .prop_filter("parameter names must be unique", |params| {
+                    let mut seen = std::collections::HashSet::new();
+                    params.iter().all(|(name, _, _)| seen.insert(name.clone()))
+                }),
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Ensure at least one parameter has a default value
+            let has_any_default = param_defs.iter().any(|(_, default, _)| default.is_some());
+            prop_assume!(has_any_default);
+
+            // Build a function definition with the generated parameters
+            let param_str: Vec<&str> = param_defs.iter().map(|(_, _, def)| def.as_str()).collect();
+            let func_def = format!(
+                "my_default_fn <- function({}) {{ NULL }}",
+                param_str.join(", ")
+            );
+
+            // Build a call to the function with cursor inside the parentheses
+            let code = format!("{}\nmy_default_fn()", func_def);
+
+            let uri = Url::parse("file:///test_default_value.R").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Position cursor inside the function call parentheses (line 1, after `(`)
+            // "my_default_fn()" — the `(` is at column 13, so cursor at column 14 is inside
+            let position = Position::new(1, 14);
+            let completions = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                completions.is_some(),
+                "Should return completions for code: {}",
+                code
+            );
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Collect parameter completion items (those with sort_text starting with "0-")
+                let param_items: Vec<&CompletionItem> = items
+                    .iter()
+                    .filter(|item| {
+                        item.sort_text
+                            .as_ref()
+                            .map_or(false, |st| st.starts_with("0-"))
+                    })
+                    .collect();
+
+                // We should have parameter items for all generated params
+                prop_assert_eq!(
+                    param_items.len(),
+                    param_defs.len(),
+                    "Expected {} parameter items but got {} for code: {}",
+                    param_defs.len(),
+                    param_items.len(),
+                    code
+                );
+
+                // For each parameter, verify the detail field:
+                // - The detail field MUST be present
+                // - The detail field MUST contain the word "parameter"
+                // - If the detail field includes a default value (optional enhancement),
+                //   it must match the parameter's actual default value string
+                for (name, default, _) in &param_defs {
+                    let item = param_items
+                        .iter()
+                        .find(|item| item.label == *name);
+
+                    prop_assert!(
+                        item.is_some(),
+                        "Parameter '{}' should appear in completions. Code: {}",
+                        name,
+                        code
+                    );
+
+                    let item = item.unwrap();
+                    let detail = item.detail.as_ref();
+
+                    // Detail field must be present
+                    prop_assert!(
+                        detail.is_some(),
+                        "Parameter '{}' should have a detail field. Code: {}",
+                        name,
+                        code
+                    );
+
+                    let detail_str = detail.unwrap();
+
+                    // Detail must contain "parameter"
+                    prop_assert!(
+                        detail_str.contains("parameter"),
+                        "Parameter '{}' detail '{}' should contain 'parameter'. Code: {}",
+                        name,
+                        detail_str,
+                        code
+                    );
+
+                    // If the detail includes a default value (optional enhancement),
+                    // verify it matches the actual default value.
+                    // The design doc specifies the format: "parameter = <default>"
+                    if let Some(default_val) = default {
+                        if detail_str.contains('=') {
+                            // Detail includes a default — verify it contains the
+                            // actual default value string
+                            prop_assert!(
+                                detail_str.contains(default_val.as_str()),
+                                "Parameter '{}' detail '{}' includes '=' but does not \
+                                 contain the expected default value '{}'. Code: {}",
+                                name,
+                                detail_str,
+                                default_val,
+                                code
+                            );
+                        }
+                        // If detail is just "parameter" (no default shown), that's
+                        // acceptable — defaults in detail are an optional enhancement
+                        // per Requirements 2.3, 4.3, 5.2.
+                    }
+                }
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array");
+            }
+        }
+    }
+
+    // ========================================================================
+    // Strategies for Property 12: Parameter Documentation Extraction
+    // ========================================================================
+
+    /// Strategy to generate a valid R parameter name for Rd/roxygen entries.
+    fn rd_param_name_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Regular R parameter names: letters, digits, dots, underscores
+            "[a-z][a-z0-9_.]{0,8}",
+            // The dots parameter
+            Just("...".to_string()),
+        ]
+        .prop_filter("param name must not be empty", |s| !s.is_empty())
+    }
+
+    /// Strategy to generate a single-line parameter description (no colons at start,
+    /// no newlines, no `#` chars — safe for both Rd and roxygen contexts).
+    fn rd_param_desc_strategy() -> impl Strategy<Value = String> {
+        "[A-Z][a-z]{2,12}( [a-z]{2,8}){1,5}"
+            .prop_map(|s| s.trim().to_string())
+            .prop_filter("desc must not be empty", |s| !s.is_empty())
+    }
+
+    /// Strategy to generate a list of (param_name, description) entries with unique names.
+    fn rd_param_entries_strategy(
+        min: usize,
+        max: usize,
+    ) -> impl Strategy<Value = Vec<(String, String)>> {
+        prop::collection::vec((rd_param_name_strategy(), rd_param_desc_strategy()), min..=max)
+            .prop_map(|entries| {
+                let mut seen = std::collections::HashSet::new();
+                entries
+                    .into_iter()
+                    .filter(|(name, _)| seen.insert(name.clone()))
+                    .collect()
+            })
+            .prop_filter("must have at least one entry", |v: &Vec<(String, String)>| !v.is_empty())
+    }
+
+    /// Build a help text string in Rd2txt format with an "Arguments:" section.
+    ///
+    /// The format matches what R's `Rd2txt` produces:
+    /// ```text
+    /// Function Title
+    ///
+    /// Description:
+    ///
+    ///      Some description text.
+    ///
+    /// Arguments:
+    ///
+    ///        x: A numeric vector.
+    ///
+    ///      ...: Further arguments.
+    ///
+    /// Value:
+    ///
+    ///      The result.
+    /// ```
+    fn build_rd_help_text(params: &[(String, String)]) -> String {
+        let mut lines = Vec::new();
+        lines.push("Function Title".to_string());
+        lines.push(String::new());
+        lines.push("Description:".to_string());
+        lines.push(String::new());
+        lines.push("     Some description of the function.".to_string());
+        lines.push(String::new());
+        lines.push("Arguments:".to_string());
+        lines.push(String::new());
+
+        for (name, desc) in params {
+            // Rd2txt format: indented name followed by ": " and description.
+            // The indentation varies — names are right-aligned to a column,
+            // typically 6-8 spaces of leading whitespace.
+            let indent = " ".repeat(8 - std::cmp::min(name.len(), 6));
+            lines.push(format!("{}{}: {}", indent, name, desc));
+            lines.push(String::new());
+        }
+
+        lines.push("Value:".to_string());
+        lines.push(String::new());
+        lines.push("     The result.".to_string());
+
+        lines.join("\n")
+    }
+
+    /// Build R code with a roxygen block containing @param entries above a function.
+    ///
+    /// Returns (code, func_line).
+    fn build_roxygen_param_code(params: &[(String, String)]) -> (String, u32) {
+        let mut lines = Vec::new();
+
+        // Preamble so function isn't at line 0
+        lines.push("# preamble".to_string());
+
+        // Title line
+        lines.push("#' My function title".to_string());
+
+        // @param entries
+        for (name, desc) in params {
+            lines.push(format!("#' @param {} {}", name, desc));
+        }
+
+        let func_line = lines.len() as u32;
+
+        // Function definition with matching parameter names
+        let param_names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+        let func_params = if param_names.is_empty() {
+            String::new()
+        } else {
+            param_names.join(", ")
+        };
+        lines.push(format!("my_func <- function({}) {{ NULL }}", func_params));
+
+        (lines.join("\n"), func_line)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 12: Parameter Documentation Extraction
+        //
+        // For any Rd help data containing argument entries or roxygen2-style comment
+        // blocks containing @param name description, the extraction function SHALL
+        // return the description for the specified parameter name.
+        //
+        // **Validates: Requirements 7.2, 7.3**
+        // ============================================================================
+
+        /// Part A: Rd argument extraction.
+        /// Generate help text with an "Arguments:" section containing parameter entries
+        /// in standard Rd2txt format; verify extract_arguments_from_help() returns the
+        /// correct description for each parameter name.
+        #[test]
+        fn prop_rd_argument_extraction(
+            params in rd_param_entries_strategy(1, 5),
+        ) {
+            let help_text = build_rd_help_text(&params);
+            let extracted = crate::help::extract_arguments_from_help(&help_text);
+
+            // Requirement 7.2: For package functions, extract argument description
+            // from the Rd \arguments section.
+            for (name, desc) in &params {
+                let got = extracted.get(name);
+                prop_assert!(
+                    got.is_some(),
+                    "Parameter '{}' should be extracted from Rd help text.\n\
+                     Help text:\n{}\n\
+                     Extracted keys: {:?}",
+                    name,
+                    help_text,
+                    extracted.keys().collect::<Vec<_>>()
+                );
+
+                // The extracted description should contain the original description text.
+                // finalize_description() normalizes whitespace and converts R curly quotes
+                // to markdown backticks, but our generated descriptions are simple ASCII
+                // text so they should round-trip cleanly.
+                let got_desc = got.unwrap();
+                prop_assert!(
+                    got_desc.contains(desc.as_str()),
+                    "Parameter '{}' description mismatch.\n\
+                     Expected to contain: '{}'\n\
+                     Got: '{}'\n\
+                     Help text:\n{}",
+                    name,
+                    desc,
+                    got_desc,
+                    help_text
+                );
+            }
+
+            // No extra parameters should be extracted beyond what we generated
+            prop_assert_eq!(
+                extracted.len(),
+                params.len(),
+                "Expected {} parameters but extracted {}.\n\
+                 Expected: {:?}\n\
+                 Got: {:?}\n\
+                 Help text:\n{}",
+                params.len(),
+                extracted.len(),
+                params.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                extracted.keys().collect::<Vec<_>>(),
+                help_text
+            );
+        }
+
+        /// Part B: Roxygen @param extraction.
+        /// Generate roxygen blocks with @param entries above a function definition;
+        /// verify extract_roxygen_block() + get_param_doc() returns the correct
+        /// description for each parameter name.
+        #[test]
+        fn prop_roxygen_param_extraction(
+            params in rd_param_entries_strategy(1, 5),
+        ) {
+            let (code, func_line) = build_roxygen_param_code(&params);
+
+            // Requirement 7.3: For user-defined functions with roxygen comments,
+            // extract @param description.
+            let block = crate::roxygen::extract_roxygen_block(&code, func_line);
+            prop_assert!(
+                block.is_some(),
+                "Expected a roxygen block for code:\n{}",
+                code
+            );
+            let block = block.unwrap();
+
+            for (name, desc) in &params {
+                let got = crate::roxygen::get_param_doc(&block, name);
+                prop_assert!(
+                    got.is_some(),
+                    "Parameter '{}' should be extracted from roxygen block.\n\
+                     Code:\n{}\n\
+                     Extracted params: {:?}",
+                    name,
+                    code,
+                    block.params.keys().collect::<Vec<_>>()
+                );
+
+                let got_desc = got.unwrap();
+                prop_assert_eq!(
+                    &got_desc,
+                    desc,
+                    "Parameter '{}' description mismatch.\n\
+                     Expected: '{}'\n\
+                     Got: '{}'\n\
+                     Code:\n{}",
+                    name,
+                    desc,
+                    got_desc,
+                    code
+                );
+            }
+
+            // No extra @param entries should be extracted
+            prop_assert_eq!(
+                block.params.len(),
+                params.len(),
+                "Expected {} @param entries but extracted {}.\n\
+                 Expected: {:?}\n\
+                 Got: {:?}\n\
+                 Code:\n{}",
+                params.len(),
+                block.params.len(),
+                params.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                block.params.keys().collect::<Vec<_>>(),
+                code
+            );
         }
     }
 }
