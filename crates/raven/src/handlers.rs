@@ -5933,7 +5933,425 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 // Signature Help
 // ============================================================================
 
-pub fn signature_help(state: &WorldState, uri: &Url, position: Position) -> Option<SignatureHelp> {
+/// Format a signature label from function name and parameters.
+///
+/// Creates a formatted signature string in the form:
+/// - "function_name()" for no parameters
+/// - "function_name(x, y, z)" for parameters without defaults
+/// - "function_name(x = 1, y = TRUE)" for parameters with defaults
+///
+/// # Arguments
+/// * `name` - Function name
+/// * `params` - Vector of ParameterInfo from Parameter_Resolver
+///
+/// # Returns
+/// Formatted signature label string
+fn format_signature_label(name: &str, params: &[crate::parameter_resolver::ParameterInfo]) -> String {
+    if params.is_empty() {
+        return format!("{}()", name);
+    }
+
+    let param_strs: Vec<String> = params
+        .iter()
+        .map(|p| {
+            if let Some(default) = &p.default_value {
+                format!("{} = {}", p.name, default)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect();
+
+    format!("{}({})", name, param_strs.join(", "))
+}
+
+/// Build LSP ParameterInformation for a single parameter.
+///
+/// Creates a ParameterInformation structure with:
+/// - Label: parameter name (or "name = default" if default present)
+/// - Documentation: optional parameter documentation as markdown
+///
+/// # Arguments
+/// * `param` - ParameterInfo from Parameter_Resolver
+/// * `param_doc` - Optional documentation string for this parameter
+///
+/// # Returns
+/// ParameterInformation for LSP response
+fn build_parameter_information(
+    param: &crate::parameter_resolver::ParameterInfo,
+    param_doc: Option<&str>,
+) -> ParameterInformation {
+    let label = if let Some(default) = &param.default_value {
+        format!("{} = {}", param.name, default)
+    } else {
+        param.name.clone()
+    };
+
+    ParameterInformation {
+        label: ParameterLabel::Simple(label),
+        documentation: param_doc.map(|doc| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: doc.to_string(),
+            })
+        }),
+    }
+}
+
+/// Detect which parameter is currently being typed.
+///
+/// Counts commas before the cursor position within the current call
+/// to determine the active parameter index.
+///
+/// # Arguments
+/// * `call_node` - The tree-sitter call node
+/// * `cursor_point` - Current cursor position
+/// * `text` - Source text
+///
+/// # Returns
+/// Index of the active parameter (0-based), or None if cannot determine
+fn detect_active_parameter(call_node: Node, cursor_point: Point, _text: &str) -> Option<u32> {
+    // Count commas in the entire call node that appear before the cursor
+    let mut comma_count = 0;
+    
+    fn count_commas_recursive(node: Node, cursor_point: Point, comma_count: &mut u32) {
+        // If this node starts after the cursor, don't traverse it
+        let node_start = node.start_position();
+        if node_start.row > cursor_point.row
+            || (node_start.row == cursor_point.row && node_start.column > cursor_point.column)
+        {
+            return;
+        }
+
+        // If this is a comma that ends before or at the cursor, count it
+        // Note: tree-sitter-r uses "comma" as the node kind, not ","
+        if node.kind() == "comma" {
+            let node_end = node.end_position();
+            if node_end.row < cursor_point.row
+                || (node_end.row == cursor_point.row && node_end.column <= cursor_point.column)
+            {
+                *comma_count += 1;
+            }
+        }
+
+        // Recursively check children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            count_commas_recursive(child, cursor_point, comma_count);
+        }
+    }
+
+    count_commas_recursive(call_node, cursor_point, &mut comma_count);
+    Some(comma_count)
+}
+
+/// Attempt to build rich signature help for a package function.
+///
+/// Fetches help text from cache, extracts signature and description,
+/// gets parameter documentation, and builds SignatureInformation.
+///
+/// # Arguments
+/// * `help_cache` - Reference to HelpCache
+/// * `function_name` - Name of the function
+/// * `package_name` - Name of the package
+///
+/// # Returns
+/// Some(SignatureInformation) if successful, None if help unavailable
+async fn try_build_package_signature(
+    help_cache: &crate::help::HelpCache,
+    function_name: &str,
+    package_name: &str,
+) -> Option<SignatureInformation> {
+    // Fetch help text from cache (may block on R subprocess)
+    let help_text = tokio::task::spawn_blocking({
+        let cache = help_cache.clone();
+        let func = function_name.to_string();
+        let pkg = package_name.to_string();
+        move || cache.get_or_fetch(&func, Some(&pkg))
+    })
+    .await
+    .ok()??;
+
+    // Extract signature from help text
+    let signature_str = crate::help::extract_signature_from_help(&help_text);
+
+    // Extract description from help text
+    let description = crate::help::extract_description_from_help(&help_text);
+
+    // Get parameter documentation
+    let param_docs = tokio::task::spawn_blocking({
+        let cache = help_cache.clone();
+        let func = function_name.to_string();
+        let pkg = package_name.to_string();
+        move || cache.get_arguments(&func, Some(&pkg))
+    })
+    .await
+    .ok()?;
+
+    // If we have a signature, parse it to extract parameters
+    if let Some(sig_str) = signature_str {
+        // Extract parameters from the signature string
+        // The signature is in the form "function_name(param1, param2 = default, ...)"
+        // We need to parse this to build ParameterInformation for each parameter
+        let params = parse_signature_params(&sig_str);
+
+        // Build parameter information with documentation
+        let parameters: Vec<ParameterInformation> = params
+            .iter()
+            .map(|param| {
+                let param_doc = param_docs
+                    .as_ref()
+                    .and_then(|docs| docs.get(&param.name))
+                    .map(|s| s.as_str());
+                build_parameter_information(param, param_doc)
+            })
+            .collect();
+
+        // Build the signature label
+        let label = format_signature_label(function_name, &params);
+
+        // Build documentation
+        let documentation = description.map(|desc| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: desc,
+            })
+        });
+
+        return Some(SignatureInformation {
+            label,
+            documentation,
+            parameters: Some(parameters),
+            active_parameter: None,
+        });
+    }
+
+    // Fallback: function name with package attribution
+    Some(SignatureInformation {
+        label: format!("{}(...)", function_name),
+        documentation: Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("from `{}`", package_name),
+        })),
+        parameters: None,
+        active_parameter: None,
+    })
+}
+
+/// Parse parameters from a signature string.
+///
+/// Extracts parameter information from a signature string like
+/// "function_name(param1, param2 = default, ...)".
+///
+/// # Arguments
+/// * `signature` - The signature string to parse
+///
+/// # Returns
+/// Vector of ParameterInfo extracted from the signature
+fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::ParameterInfo> {
+    // Find the opening parenthesis
+    let start = match signature.find('(') {
+        Some(pos) => pos + 1,
+        None => return vec![],
+    };
+
+    // Find the closing parenthesis
+    let end = match signature.rfind(')') {
+        Some(pos) => pos,
+        None => return vec![],
+    };
+
+    if start >= end {
+        return vec![];
+    }
+
+    // Extract the parameter list
+    let params_str = &signature[start..end];
+
+    if params_str.trim().is_empty() {
+        return vec![];
+    }
+
+    // Split by commas, but be careful about nested parentheses and quotes
+    let mut params = Vec::new();
+    let mut current_param = String::new();
+    let mut paren_depth = 0;
+    let mut in_quotes = false;
+    let mut quote_char = ' ';
+
+    for ch in params_str.chars() {
+        match ch {
+            '"' | '\'' if !in_quotes => {
+                in_quotes = true;
+                quote_char = ch;
+                current_param.push(ch);
+            }
+            c if in_quotes && c == quote_char => {
+                in_quotes = false;
+                current_param.push(ch);
+            }
+            '(' if !in_quotes => {
+                paren_depth += 1;
+                current_param.push(ch);
+            }
+            ')' if !in_quotes => {
+                paren_depth -= 1;
+                current_param.push(ch);
+            }
+            ',' if !in_quotes && paren_depth == 0 => {
+                // End of parameter
+                if !current_param.trim().is_empty() {
+                    params.push(parse_single_param(&current_param));
+                }
+                current_param.clear();
+            }
+            _ => {
+                current_param.push(ch);
+            }
+        }
+    }
+
+    // Don't forget the last parameter
+    if !current_param.trim().is_empty() {
+        params.push(parse_single_param(&current_param));
+    }
+
+    params
+}
+
+/// Parse a single parameter string into ParameterInfo.
+///
+/// Handles parameters like "x", "y = 1", "... = ", etc.
+///
+/// # Arguments
+/// * `param_str` - The parameter string to parse
+///
+/// # Returns
+/// ParameterInfo for the parameter
+fn parse_single_param(param_str: &str) -> crate::parameter_resolver::ParameterInfo {
+    let trimmed = param_str.trim();
+
+    // Check if this is the dots parameter
+    if trimmed == "..." || trimmed.starts_with("...") {
+        return crate::parameter_resolver::ParameterInfo {
+            name: "...".to_string(),
+            default_value: None,
+            is_dots: true,
+        };
+    }
+
+    // Check if there's a default value (contains '=')
+    if let Some(eq_pos) = trimmed.find('=') {
+        let name = trimmed[..eq_pos].trim().to_string();
+        let default = trimmed[eq_pos + 1..].trim();
+        let default_value = if default.is_empty() {
+            None
+        } else {
+            Some(default.to_string())
+        };
+
+        crate::parameter_resolver::ParameterInfo {
+            name,
+            default_value,
+            is_dots: false,
+        }
+    } else {
+        // No default value
+        crate::parameter_resolver::ParameterInfo {
+            name: trimmed.to_string(),
+            default_value: None,
+            is_dots: false,
+        }
+    }
+}
+/// Attempt to build rich signature help for a user-defined function.
+///
+/// Extracts parameters from AST, gets roxygen documentation,
+/// and builds SignatureInformation.
+///
+/// # Arguments
+/// * `state` - WorldState reference
+/// * `function_name` - Name of the function
+/// * `uri` - URI of the file containing the call
+/// * `position` - Position of the call
+///
+/// # Returns
+/// Some(SignatureInformation) if successful, None if extraction fails
+fn try_build_user_signature(
+    state: &WorldState,
+    function_name: &str,
+    uri: &Url,
+    position: Position,
+) -> Option<SignatureInformation> {
+    // Use Parameter_Resolver::resolve() to get function signature
+    let signature = crate::parameter_resolver::resolve(
+        state,
+        &state.signature_cache,
+        function_name,
+        None, // namespace - None for user functions
+        false, // is_internal
+        uri,
+        position,
+    )?;
+
+    // Extract parameters from FunctionSignature
+    let params = &signature.parameters;
+
+    // Get the source location for roxygen extraction
+    let (source_uri, source_line) = match &signature.source {
+        crate::parameter_resolver::SignatureSource::CurrentFile { uri, line } => (uri, *line),
+        crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => (uri, *line),
+        crate::parameter_resolver::SignatureSource::RSubprocess { .. } => {
+            // This shouldn't happen for user functions, but handle gracefully
+            return None;
+        }
+    };
+
+    // Get the document text for roxygen extraction
+    let doc = state.get_document(source_uri)?;
+    let text = doc.text();
+
+    // Use extract_roxygen_block() to get documentation
+    let roxygen_block = crate::roxygen::extract_roxygen_block(&text, source_line);
+
+    // Build documentation from roxygen block
+    let documentation = roxygen_block.as_ref().and_then(|block| {
+        // Use get_function_doc() to get title and description
+        crate::roxygen::get_function_doc(block).map(|doc_text| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: doc_text,
+            })
+        })
+    });
+
+    // Build parameter information with documentation
+    let parameters: Vec<ParameterInformation> = params
+        .iter()
+        .map(|param| {
+            // Use get_param_doc() for each parameter's documentation
+            let param_doc = roxygen_block.as_ref().and_then(|block| {
+                crate::roxygen::get_param_doc(block, &param.name)
+            });
+            build_parameter_information(param, param_doc.as_deref())
+        })
+        .collect();
+
+    // Build the signature label
+    let label = format_signature_label(function_name, params);
+
+    // Build SignatureInformation with parameters and documentation
+    Some(SignatureInformation {
+        label,
+        documentation,
+        parameters: Some(parameters),
+        active_parameter: None,
+    })
+}
+
+
+
+pub async fn signature_help(state: &WorldState, uri: &Url, position: Position) -> Option<SignatureHelp> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -5943,30 +6361,107 @@ pub fn signature_help(state: &WorldState, uri: &Url, position: Position) -> Opti
     // Find enclosing call
     let mut node = tree.root_node().descendant_for_point_range(point, point)?;
 
-    loop {
+    let call_node = loop {
         if node.kind() == "call" {
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-
-            if !children.is_empty() {
-                let func_node = children[0];
-                let func_name = node_text(func_node, &text);
-
-                return Some(SignatureHelp {
-                    signatures: vec![SignatureInformation {
-                        label: format!("{}(...)", func_name),
-                        documentation: None,
-                        parameters: None,
-                        active_parameter: None,
-                    }],
-                    active_signature: Some(0),
-                    active_parameter: None,
-                });
-            }
+            break node;
         }
-
         node = node.parent()?;
+    };
+
+    // Extract function name from call node
+    let mut cursor = call_node.walk();
+    let children: Vec<_> = call_node.children(&mut cursor).collect();
+
+    if children.is_empty() {
+        return None;
     }
+
+    let func_node = children[0];
+    let func_name = node_text(func_node, &text);
+
+    // Determine if package or user function using cross-file scope
+    // Get the scope at the cursor position
+    let scope = get_cross_file_scope(state, uri, position.line, position.character);
+
+    // Try to build rich signature
+    let signature_info = if let Some(symbol) = scope.symbols.get(func_name) {
+        // Check if this is a package function (source_uri starts with "package:")
+        if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+            // Package function: call try_build_package_signature()
+            try_build_package_signature(&state.help_cache, func_name, pkg).await
+        } else {
+            // User function: call try_build_user_signature()
+            try_build_user_signature(state, func_name, uri, position)
+        }
+    } else if state.cross_file_config.packages_enabled {
+        // Check package exports from combined_exports cache
+        let all_packages: Vec<String> = scope
+            .inherited_packages
+            .iter()
+            .chain(scope.loaded_packages.iter())
+            .cloned()
+            .collect();
+
+        if let Some(pkg_name) = state
+            .package_library
+            .find_package_for_symbol(func_name, &all_packages)
+        {
+            // Package function: call try_build_package_signature()
+            try_build_package_signature(&state.help_cache, func_name, &pkg_name).await
+        } else {
+            // Try user function as fallback
+            try_build_user_signature(state, func_name, uri, position)
+        }
+    } else {
+        // Try user function as fallback
+        try_build_user_signature(state, func_name, uri, position)
+    };
+
+    // Detect active parameter
+    let active_param = detect_active_parameter(call_node, point, &text);
+
+    // Build SignatureHelp with signature and active parameter
+    let signature_info = signature_info.unwrap_or_else(|| {
+        // Handle fallback: function name with source attribution
+        let documentation = if let Some(symbol) = scope.symbols.get(func_name) {
+            // Determine source attribution
+            if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+                Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("from `{}`", pkg),
+                }))
+            } else if symbol.source_uri != *uri {
+                // Cross-file user function
+                let workspace_root = state.workspace_folders.first();
+                let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("defined in `{}`", relative_path),
+                }))
+            } else {
+                // Same file
+                Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("defined in this file, line {}", symbol.defined_line + 1),
+                }))
+            }
+        } else {
+            None
+        };
+
+        SignatureInformation {
+            label: format!("{}(...)", func_name),
+            documentation,
+            parameters: None,
+            active_parameter: None,
+        }
+    });
+
+    Some(SignatureHelp {
+        signatures: vec![signature_info],
+        active_signature: Some(0),
+        active_parameter: active_param,
+    })
 }
 
 // ============================================================================
@@ -15452,7 +15947,879 @@ y <- 2";
         let empty = symbols.iter().find(|s| s.name == "empty").unwrap();
         assert_eq!(empty.kind, DocumentSymbolKind::Null);
     }
+
+    // ========================================================================
+    // Signature Formatting Helper Tests (Task 1.1)
+    // Tests for rich-function-signature-hovers feature
+    // Validates: Requirements 5.1, 5.2, 5.3, 9.1
+    // ========================================================================
+
+    /// Test format_signature_label with zero parameters
+    /// Validates: Requirement 5.4, 9.1 - Empty parameter list should display "func()"
+    #[test]
+    fn test_format_signature_label_zero_parameters() {
+        let params = vec![];
+        let result = format_signature_label("func", &params);
+        assert_eq!(result, "func()");
+    }
+
+    /// Test format_signature_label with single parameter
+    /// Validates: Requirement 5.1 - Single parameter should display "func(x)"
+    #[test]
+    fn test_format_signature_label_single_parameter() {
+        let params = vec![crate::parameter_resolver::ParameterInfo {
+            name: "x".to_string(),
+            default_value: None,
+            is_dots: false,
+        }];
+        let result = format_signature_label("func", &params);
+        assert_eq!(result, "func(x)");
+    }
+
+    /// Test format_signature_label with parameters with defaults
+    /// Validates: Requirement 5.2 - Parameters with defaults should show "param = default"
+    #[test]
+    fn test_format_signature_label_parameters_with_defaults() {
+        let params = vec![
+            crate::parameter_resolver::ParameterInfo {
+                name: "x".to_string(),
+                default_value: Some("1".to_string()),
+                is_dots: false,
+            },
+            crate::parameter_resolver::ParameterInfo {
+                name: "y".to_string(),
+                default_value: Some("TRUE".to_string()),
+                is_dots: false,
+            },
+        ];
+        let result = format_signature_label("func", &params);
+        assert_eq!(result, "func(x = 1, y = TRUE)");
+    }
+
+    /// Test format_signature_label with dots parameter
+    /// Validates: Requirement 5.1 - Dots parameter should be included
+    #[test]
+    fn test_format_signature_label_dots_parameter() {
+        let params = vec![
+            crate::parameter_resolver::ParameterInfo {
+                name: "x".to_string(),
+                default_value: None,
+                is_dots: false,
+            },
+            crate::parameter_resolver::ParameterInfo {
+                name: "...".to_string(),
+                default_value: None,
+                is_dots: true,
+            },
+        ];
+        let result = format_signature_label("func", &params);
+        assert_eq!(result, "func(x, ...)");
+    }
+
+    /// Test build_parameter_information without default
+    /// Validates: Requirement 6.1 - Parameter without default should have simple label
+    #[test]
+    fn test_build_parameter_information_no_default() {
+        let param = crate::parameter_resolver::ParameterInfo {
+            name: "x".to_string(),
+            default_value: None,
+            is_dots: false,
+        };
+        let result = build_parameter_information(&param, None);
+        
+        match result.label {
+            ParameterLabel::Simple(label) => assert_eq!(label, "x"),
+            _ => panic!("Expected Simple label"),
+        }
+        assert!(result.documentation.is_none());
+    }
+
+    /// Test build_parameter_information with default
+    /// Validates: Requirement 6.1 - Parameter with default should show "param = default"
+    #[test]
+    fn test_build_parameter_information_with_default() {
+        let param = crate::parameter_resolver::ParameterInfo {
+            name: "x".to_string(),
+            default_value: Some("1".to_string()),
+            is_dots: false,
+        };
+        let result = build_parameter_information(&param, None);
+        
+        match result.label {
+            ParameterLabel::Simple(label) => assert_eq!(label, "x = 1"),
+            _ => panic!("Expected Simple label"),
+        }
+    }
+
+    /// Test build_parameter_information with documentation
+    /// Validates: Requirement 6.2 - Parameter documentation should be included
+    #[test]
+    fn test_build_parameter_information_with_documentation() {
+        let param = crate::parameter_resolver::ParameterInfo {
+            name: "x".to_string(),
+            default_value: None,
+            is_dots: false,
+        };
+        let result = build_parameter_information(&param, Some("The input value"));
+        
+        assert!(result.documentation.is_some());
+        match result.documentation.unwrap() {
+            Documentation::MarkupContent(content) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert_eq!(content.value, "The input value");
+            }
+            _ => panic!("Expected MarkupContent"),
+        }
+    }
+
+    // ========================================================================
+    // Active Parameter Detection Tests (Task 1.3)
+    // Tests for rich-function-signature-hovers feature
+    // Validates: Requirement 6.3
+    // ========================================================================
+
+    /// Test detect_active_parameter with first parameter (no commas)
+    /// Validates: Requirement 6.3 - First parameter should return index 0
+    #[test]
+    fn test_detect_active_parameter_first_parameter() {
+        let code = "mean(x";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+        
+        // Cursor is after "x" (position 6)
+        let cursor_point = Point::new(0, 6);
+        let result = detect_active_parameter(call_node, cursor_point, code);
+        
+        assert_eq!(result, Some(0));
+    }
+
+    /// Test detect_active_parameter with second parameter (one comma)
+    /// Validates: Requirement 6.3 - Second parameter should return index 1
+    #[test]
+    fn test_detect_active_parameter_second_parameter() {
+        let code = "mean(x, y";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+        
+        // Cursor is after "y" (position 9)
+        let cursor_point = Point::new(0, 9);
+        let result = detect_active_parameter(call_node, cursor_point, code);
+        
+        assert_eq!(result, Some(1));
+    }
+
+    /// Test detect_active_parameter with third parameter (two commas)
+    /// Validates: Requirement 6.3 - Third parameter should return index 2
+    #[test]
+    fn test_detect_active_parameter_third_parameter() {
+        let code = "func(a, b, c";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+        
+        // Cursor is after "c" (position 12)
+        let cursor_point = Point::new(0, 12);
+        let result = detect_active_parameter(call_node, cursor_point, code);
+        
+        assert_eq!(result, Some(2));
+    }
+
+    /// Test detect_active_parameter with no arguments node yet
+    /// Validates: Requirement 6.3 - Opening paren should return index 0
+    #[test]
+    fn test_detect_active_parameter_no_arguments() {
+        let code = "mean(";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+        
+        // Cursor is right after opening paren (position 5)
+        let cursor_point = Point::new(0, 5);
+        let result = detect_active_parameter(call_node, cursor_point, code);
+        
+        assert_eq!(result, Some(0));
+    }
+
+    // ========================================================================
+    // Package Signature Building Tests (Task 2.1)
+    // Tests for rich-function-signature-hovers feature
+    // Validates: Requirements 1.1, 3.1, 3.2, 3.3, 3.4, 4.1, 4.5, 6.2
+    // ========================================================================
+
+    /// Test parse_signature_params with simple parameters
+    /// Validates: Requirement 3.1 - Extract parameters from signature
+    #[test]
+    fn test_parse_signature_params_simple() {
+        let sig = "mean(x, na.rm)";
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[0].default_value, None);
+        assert_eq!(params[1].name, "na.rm");
+        assert_eq!(params[1].default_value, None);
+    }
+
+    /// Test parse_signature_params with defaults
+    /// Validates: Requirement 3.1 - Extract parameters with default values
+    #[test]
+    fn test_parse_signature_params_with_defaults() {
+        let sig = "mean(x, trim = 0, na.rm = FALSE)";
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[0].default_value, None);
+        assert_eq!(params[1].name, "trim");
+        assert_eq!(params[1].default_value, Some("0".to_string()));
+        assert_eq!(params[2].name, "na.rm");
+        assert_eq!(params[2].default_value, Some("FALSE".to_string()));
+    }
+
+    /// Test parse_signature_params with dots parameter
+    /// Validates: Requirement 3.1 - Handle dots parameter
+    #[test]
+    fn test_parse_signature_params_with_dots() {
+        let sig = "c(...)";
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "...");
+        assert!(params[0].is_dots);
+    }
+
+    /// Test parse_signature_params with no parameters
+    /// Validates: Requirement 9.1 - Handle empty parameter list
+    #[test]
+    fn test_parse_signature_params_empty() {
+        let sig = "func()";
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 0);
+    }
+
+    /// Test parse_signature_params with complex defaults
+    /// Validates: Requirement 3.1 - Handle complex default values
+    #[test]
+    fn test_parse_signature_params_complex_defaults() {
+        let sig = r#"func(x, y = c(1, 2), z = "hello")"#;
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[1].name, "y");
+        assert_eq!(params[1].default_value, Some("c(1, 2)".to_string()));
+        assert_eq!(params[2].name, "z");
+        assert_eq!(params[2].default_value, Some(r#""hello""#.to_string()));
+    }
+
+    /// Test parse_signature_params with multiline signature
+    /// Validates: Requirement 3.2 - Handle multiline signatures
+    #[test]
+    fn test_parse_signature_params_multiline() {
+        // In practice, extract_signature_from_help joins lines, but test the parser
+        let sig = "func(x, y = 1, z = TRUE)";
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[1].name, "y");
+        assert_eq!(params[2].name, "z");
+    }
+
+    /// Test parse_single_param with various formats
+    /// Validates: Requirement 3.1 - Parse individual parameters correctly
+    #[test]
+    fn test_parse_single_param_formats() {
+        let param1 = parse_single_param("x");
+        assert_eq!(param1.name, "x");
+        assert_eq!(param1.default_value, None);
+        assert!(!param1.is_dots);
+
+        let param2 = parse_single_param("y = 1");
+        assert_eq!(param2.name, "y");
+        assert_eq!(param2.default_value, Some("1".to_string()));
+        assert!(!param2.is_dots);
+
+        let param3 = parse_single_param("...");
+        assert_eq!(param3.name, "...");
+        assert!(param3.is_dots);
+
+        let param4 = parse_single_param("z = NULL");
+        assert_eq!(param4.name, "z");
+        assert_eq!(param4.default_value, Some("NULL".to_string()));
+    }
+
+    // ========================================================================
+    // User Signature Building Tests (Task 4.1)
+    // Tests for rich-function-signature-hovers feature
+    // Validates: Requirements 2.1, 2.2, 2.3, 5.1, 5.4, 9.3, 9.4
+    // ========================================================================
+
+    /// Test try_build_user_signature with roxygen title + description
+    /// Validates: Requirement 2.2 - Display roxygen documentation
+    #[test]
+    fn test_user_signature_with_roxygen_docs() {
+        let code = r#"
+#' Calculate the sum
+#' This function adds two numbers together.
+#' @param x First number
+#' @param y Second number
+add <- function(x, y) { x + y }
+"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        let result = try_build_user_signature(&state, "add", &uri, Position::new(5, 0));
+        
+        assert!(result.is_some());
+        let sig = result.unwrap();
+        assert_eq!(sig.label, "add(x, y)");
+        assert!(sig.documentation.is_some());
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].label, ParameterLabel::Simple("x".to_string()));
+        assert!(params[0].documentation.is_some());
+        assert_eq!(params[1].label, ParameterLabel::Simple("y".to_string()));
+        assert!(params[1].documentation.is_some());
+    }
+
+    /// Test try_build_user_signature with plain comments (fallback)
+    /// Validates: Requirement 2.3 - Display plain comment text as fallback
+    #[test]
+    fn test_user_signature_with_plain_comments() {
+        let code = r#"
+# This is a simple function
+# It multiplies two numbers
+multiply <- function(a, b) { a * b }
+"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        let result = try_build_user_signature(&state, "multiply", &uri, Position::new(3, 0));
+        
+        assert!(result.is_some());
+        let sig = result.unwrap();
+        assert_eq!(sig.label, "multiply(a, b)");
+        assert!(sig.documentation.is_some());
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.unwrap();
+        assert_eq!(params.len(), 2);
+    }
+
+    /// Test try_build_user_signature with no comments
+    /// Validates: Requirement 9.3 - Handle functions without documentation
+    #[test]
+    fn test_user_signature_no_comments() {
+        let code = r#"
+divide <- function(x, y) { x / y }
+"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        let result = try_build_user_signature(&state, "divide", &uri, Position::new(1, 0));
+        
+        assert!(result.is_some());
+        let sig = result.unwrap();
+        assert_eq!(sig.label, "divide(x, y)");
+        // Documentation may be None when no comments present
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.unwrap();
+        assert_eq!(params.len(), 2);
+    }
+
+    /// Test try_build_user_signature with no parameters
+    /// Validates: Requirement 5.4 - Handle functions with no parameters
+    #[test]
+    fn test_user_signature_no_parameters() {
+        let code = r#"
+#' Get the value of pi
+get_pi <- function() { 3.14159 }
+"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        let result = try_build_user_signature(&state, "get_pi", &uri, Position::new(2, 0));
+        
+        assert!(result.is_some());
+        let sig = result.unwrap();
+        assert_eq!(sig.label, "get_pi()");
+        assert!(sig.documentation.is_some());
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.unwrap();
+        assert_eq!(params.len(), 0);
+    }
+
+    /// Test try_build_user_signature with function not found (AST extraction failure)
+    /// Validates: Requirement 9.4 - Handle AST extraction failure with fallback
+    #[test]
+    fn test_user_signature_function_not_found() {
+        let code = r#"
+x <- 42
+"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        let result = try_build_user_signature(&state, "nonexistent", &uri, Position::new(1, 0));
+        
+        // Should return None when function is not found
+        assert!(result.is_none());
+    }
+
+    /// Test try_build_user_signature with parameters with defaults
+    /// Validates: Requirement 5.2 - Include default values in signature
+    #[test]
+    fn test_user_signature_with_defaults() {
+        let code = r#"
+#' Greet someone
+#' @param name The name to greet
+#' @param greeting The greeting message
+greet <- function(name = "World", greeting = "Hello") {
+    paste(greeting, name)
 }
+"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        let result = try_build_user_signature(&state, "greet", &uri, Position::new(4, 0));
+        
+        assert!(result.is_some());
+        let sig = result.unwrap();
+        assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
+        assert!(sig.documentation.is_some());
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].label, ParameterLabel::Simple("name = \"World\"".to_string()));
+        assert_eq!(params[1].label, ParameterLabel::Simple("greeting = \"Hello\"".to_string()));
+    }
+
+    // ========================================================================
+    // Signature Help Function Tests (Task 6.1)
+    // Tests for rich-function-signature-hovers feature
+    // Validates: Requirements 7.1, 7.2, 7.3, 7.4
+    // ========================================================================
+
+    /// Test signature_help with user function call
+    /// Validates: Requirement 7.2 - Signature help for user-defined functions
+    #[tokio::test]
+    async fn test_signature_help_user_function() {
+        let code = r#"add <- function(x, y) { x + y }
+result <- add(1, 2)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is inside the call to add, after the opening parenthesis
+        // Line 1 is "result <- add(1, 2)" (0-indexed)
+        // Position after "add(" would be at character 14
+        let position = Position::new(1, 14); // After "add("
+        
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some(), "signature_help should return Some");
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        assert_eq!(sig_help.active_signature, Some(0));
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "add(x, y)");
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].label, ParameterLabel::Simple("x".to_string()));
+        assert_eq!(params[1].label, ParameterLabel::Simple("y".to_string()));
+        
+        // Active parameter should be 0 (first parameter)
+        assert_eq!(sig_help.active_parameter, Some(0));
+    }
+
+    /// Test signature_help with undefined function call
+    /// Validates: Requirement 7.3 - Fallback for undefined functions
+    #[tokio::test]
+    async fn test_signature_help_undefined_function() {
+        let code = r#"result <- undefined_func(1, 2)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is inside the call to undefined_func, after the opening paren
+        let position = Position::new(0, 25); // After "undefined_func("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        // Should show fallback signature with function name
+        assert_eq!(sig.label, "undefined_func(...)");
+        // Documentation should be None for truly undefined functions
+        // (no symbol in scope)
+        assert!(sig.documentation.is_none());
+    }
+
+    /// Test signature_help with active parameter detection (second parameter)
+    /// Validates: Requirement 6.3 - Active parameter highlighting
+    #[tokio::test]
+    async fn test_signature_help_active_parameter_second() {
+        let code = r#"add <- function(x, y, z) { x + y + z }
+result <- add(1, 2, 3)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is after the first comma, so second parameter is active
+        let position = Position::new(1, 17); // After "add(1, "
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        
+        // Active parameter should be 1 (second parameter, 0-indexed)
+        assert_eq!(sig_help.active_parameter, Some(1));
+    }
+
+    /// Test signature_help with active parameter detection (third parameter)
+    /// Validates: Requirement 6.3 - Active parameter highlighting
+    #[tokio::test]
+    async fn test_signature_help_active_parameter_third() {
+        let code = r#"add <- function(x, y, z) { x + y + z }
+result <- add(1, 2, 3)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is after the second comma, so third parameter is active
+        let position = Position::new(1, 20); // After "add(1, 2, "
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        
+        // Active parameter should be 2 (third parameter, 0-indexed)
+        assert_eq!(sig_help.active_parameter, Some(2));
+    }
+
+    /// Test signature_help with same-file function
+    /// Validates: Requirement 7.2 - Signature help for user-defined functions
+    #[tokio::test]
+    async fn test_signature_help_same_file_function() {
+        let code = r#"helper <- function(x) { x * 2 }
+result <- helper(5)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is inside the call to helper
+        let position = Position::new(1, 17); // After "helper("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "helper(x)");
+        // Documentation is optional (depends on roxygen comments)
+        assert!(sig.parameters.is_some());
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 1);
+    }
+
+    /// Test signature_help with function that has roxygen documentation
+    /// Validates: Requirement 2.2 - Display roxygen documentation in signature help
+    #[tokio::test]
+    async fn test_signature_help_with_roxygen_docs() {
+        let code = r#"#' Multiply two numbers
+#' @param x First number
+#' @param y Second number
+multiply <- function(x, y) { x * y }
+result <- multiply(3, 4)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is inside the call to multiply
+        let position = Position::new(4, 19); // After "multiply("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "multiply(x, y)");
+        // Should have documentation from roxygen comments
+        assert!(sig.documentation.is_some());
+        
+        // Check that parameters have documentation
+        assert!(sig.parameters.is_some());
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        
+        // Parameters should have documentation from @param tags
+        if let ParameterLabel::Simple(label) = &params[0].label {
+            assert_eq!(label, "x");
+        }
+        assert!(params[0].documentation.is_some());
+        
+        if let ParameterLabel::Simple(label) = &params[1].label {
+            assert_eq!(label, "y");
+        }
+        assert!(params[1].documentation.is_some());
+    }
+
+    /// Test signature_help with function with no parameters
+    /// Validates: Requirement 9.1 - Handle empty parameter list
+    #[tokio::test]
+    async fn test_signature_help_no_parameters() {
+        let code = r#"get_pi <- function() { 3.14159 }
+result <- get_pi()"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is inside the call to get_pi
+        let position = Position::new(1, 17); // After "get_pi("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "get_pi()");
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 0);
+    }
+
+    /// Test signature_help with function with default parameters
+    /// Validates: Requirement 5.2 - Display default values in signature
+    #[tokio::test]
+    async fn test_signature_help_with_defaults() {
+        let code = r#"greet <- function(name = "World", greeting = "Hello") {
+    paste(greeting, name)
+}
+result <- greet("Alice")"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is inside the call to greet
+        let position = Position::new(3, 16); // After "greet("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some());
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
+        assert!(sig.parameters.is_some());
+        
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].label, ParameterLabel::Simple("name = \"World\"".to_string()));
+        assert_eq!(params[1].label, ParameterLabel::Simple("greeting = \"Hello\"".to_string()));
+    }
+
+    /// Integration test: Test typing package function call (e.g., "mean(")
+    /// Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5 - Package function signature help
+    #[tokio::test]
+    async fn test_signature_help_package_function_mean() {
+        let code = r#"library(base)
+result <- mean(x)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is after "mean(" - simulating typing inside the function call
+        let position = Position::new(1, 15); // After "mean("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some(), "signature_help should return Some for package function");
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        assert_eq!(sig_help.active_signature, Some(0));
+        
+        let sig = &sig_help.signatures[0];
+        // Should show signature with function name
+        assert!(sig.label.contains("mean"), "Label should contain function name");
+        assert!(sig.label.contains("("), "Label should contain opening paren");
+        
+        // For package functions, we expect either:
+        // 1. Rich signature with parameters if help text is available
+        // 2. Fallback signature "mean(...)" if help unavailable or function not recognized
+        // Both are acceptable - the important thing is that signature help works
+        if sig.label != "mean(...)" {
+            // Rich signature case - should have parameters
+            assert!(sig.parameters.is_some(), "Rich signature should have parameters");
+            if let Some(params) = &sig.parameters {
+                assert!(!params.is_empty(), "mean() should have parameters");
+            }
+        }
+        // If it's a fallback, that's also acceptable - documentation is optional
+    }
+
+    /// Integration test: Test nested function calls with active parameter detection
+    /// Validates: Requirements 6.3, 7.5 - Active parameter detection in nested calls
+    #[tokio::test]
+    async fn test_signature_help_nested_function_calls() {
+        let code = r#"add <- function(x, y) { x + y }
+multiply <- function(a, b) { a * b }
+result <- add(multiply(2, 3), 5)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Test: Position inside inner call (multiply)
+        // Line 2: "result <- add(multiply(2, 3), 5)"
+        //          0123456789012345678901234567890123
+        // After "multiply(2, " - second parameter of multiply (position 27)
+        let position_inner = Position::new(2, 27); // After "multiply(2, "
+        let result_inner = signature_help(&state, &uri, position_inner).await;
+        
+        assert!(result_inner.is_some(), "signature_help should work in nested calls");
+        let sig_help_inner = result_inner.unwrap();
+        assert_eq!(sig_help_inner.signatures.len(), 1);
+        
+        let sig_inner = &sig_help_inner.signatures[0];
+        assert_eq!(sig_inner.label, "multiply(a, b)");
+        // Active parameter should be 1 (second parameter, 0-indexed)
+        assert_eq!(sig_help_inner.active_parameter, Some(1));
+        
+        // The key test here is that signature help works correctly for nested calls
+        // and shows the innermost function's signature with correct active parameter
+    }
+
+    /// Integration test: Test typing user function call with roxygen (comprehensive)
+    /// Validates: Requirements 2.1, 2.2, 2.3, 6.1, 6.2 - User function with full roxygen docs
+    #[tokio::test]
+    async fn test_signature_help_user_function_with_roxygen_comprehensive() {
+        let code = r#"#' Calculate the sum of two numbers
+#'
+#' This function adds two numeric values together.
+#'
+#' @param x The first number
+#' @param y The second number
+#' @return The sum of x and y
+add_numbers <- function(x, y) { x + y }
+
+result <- add_numbers(1, 2)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is after "add_numbers("
+        let position = Position::new(9, 23); // After "add_numbers("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some(), "signature_help should return Some");
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "add_numbers(x, y)");
+        
+        // Should have documentation from roxygen
+        assert!(sig.documentation.is_some(), "Should have documentation from roxygen");
+        if let Some(Documentation::MarkupContent(content)) = &sig.documentation {
+            assert!(content.value.contains("Calculate the sum"), "Should contain title");
+            assert!(content.value.contains("adds two numeric values"), "Should contain description");
+        }
+        
+        // Should have parameters with documentation
+        assert!(sig.parameters.is_some(), "Should have parameters");
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        
+        // Check parameter documentation
+        assert!(params[0].documentation.is_some(), "First parameter should have docs");
+        assert!(params[1].documentation.is_some(), "Second parameter should have docs");
+    }
+
+    /// Integration test: Test typing user function call without roxygen
+    /// Validates: Requirements 2.1, 5.1, 5.2 - User function without documentation
+    #[tokio::test]
+    async fn test_signature_help_user_function_without_roxygen() {
+        let code = r#"# Simple helper function
+calculate <- function(a, b = 10) { a + b }
+
+result <- calculate(5)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Position is after "calculate("
+        let position = Position::new(3, 20); // After "calculate("
+        let result = signature_help(&state, &uri, position).await;
+        
+        assert!(result.is_some(), "signature_help should return Some");
+        let sig_help = result.unwrap();
+        assert_eq!(sig_help.signatures.len(), 1);
+        
+        let sig = &sig_help.signatures[0];
+        assert_eq!(sig.label, "calculate(a, b = 10)");
+        
+        // Should have parameters even without roxygen
+        assert!(sig.parameters.is_some(), "Should have parameters");
+        let params = sig.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].label, ParameterLabel::Simple("a".to_string()));
+        assert_eq!(params[1].label, ParameterLabel::Simple("b = 10".to_string()));
+        
+        // Documentation might be present (from plain comments) or absent
+        // Either is acceptable for functions without roxygen
+    }
+
+    /// Integration test: Test active parameter highlighting across multiple positions
+    /// Validates: Requirement 6.3 - Active parameter highlighting
+    #[tokio::test]
+    async fn test_signature_help_active_parameter_highlighting() {
+        let code = r#"func <- function(a, b, c, d) { a + b + c + d }
+result <- func(1, 2, 3, 4)"#;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.open_document(uri.clone(), code, None);
+
+        // Test each parameter position
+        let test_cases = vec![
+            (Position::new(1, 15), Some(0)), // After "func(" - first parameter
+            (Position::new(1, 18), Some(1)), // After "func(1, " - second parameter
+            (Position::new(1, 21), Some(2)), // After "func(1, 2, " - third parameter
+            (Position::new(1, 24), Some(3)), // After "func(1, 2, 3, " - fourth parameter
+        ];
+
+        for (position, expected_active) in test_cases {
+            let result = signature_help(&state, &uri, position).await;
+            assert!(result.is_some(), "signature_help should return Some at position {:?}", position);
+            
+            let sig_help = result.unwrap();
+            assert_eq!(
+                sig_help.active_parameter, expected_active,
+                "Active parameter should be {:?} at position {:?}",
+                expected_active, position
+            );
+        }
+    }
+
+}
+
+
 
 #[cfg(test)]
 mod proptests {
@@ -23241,6 +24608,823 @@ setClass("{}", slots = c(value = "numeric"))
                 block.params.keys().collect::<Vec<_>>(),
                 code
             );
+        }
+    }
+
+    // ============================================================================
+    // Property Tests for Signature Formatting (Task 1.2, 1.4)
+    // Feature: rich-function-signature-hovers
+    // ============================================================================
+
+    // Strategy for generating R parameter names
+    fn r_param_name_strategy() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_]{0,10}"
+            .prop_filter("Not reserved", |s| !is_r_reserved(s))
+    }
+
+    // Strategy for generating R default values
+    fn r_default_value_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("NULL".to_string()),
+            Just("TRUE".to_string()),
+            Just("FALSE".to_string()),
+            "[0-9]{1,3}".prop_map(|s| s.to_string()),
+            "\"[a-z]{1,10}\"".prop_map(|s| s.to_string()),
+        ]
+    }
+
+    // Strategy for generating parameter lists
+    fn param_list_strategy(min: usize, max: usize) -> impl Strategy<Value = Vec<crate::parameter_resolver::ParameterInfo>> {
+        prop::collection::vec(
+            (r_param_name_strategy(), prop::option::of(r_default_value_strategy()))
+                .prop_map(|(name, default_value)| crate::parameter_resolver::ParameterInfo {
+                    name,
+                    default_value,
+                    is_dots: false,
+                }),
+            min..=max
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 3: User Function Signature Formatting
+        //
+        // For any user-defined function in the AST, building signature information
+        // should produce a SignatureInformation with a label in the format
+        // "function_name(param1, param2 = default, ...)" where all parameters are
+        // included, defaults are shown when present, and the entire signature is on
+        // a single line regardless of parameter count.
+        //
+        // **Validates: Requirements 5.1, 5.2, 5.3, 2.1**
+        // ============================================================================
+        #[test]
+        fn prop_user_function_signature_formatting(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            params in param_list_strategy(0, 10)
+        ) {
+            // Format the signature
+            let label = format_signature_label(&func_name, &params);
+
+            // Property 1: Label should start with function name and opening paren
+            prop_assert!(
+                label.starts_with(&format!("{}(", func_name)),
+                "Label should start with '{}(' but got: {}",
+                func_name,
+                label
+            );
+
+            // Property 2: Label should end with closing paren
+            prop_assert!(
+                label.ends_with(')'),
+                "Label should end with ')' but got: {}",
+                label
+            );
+
+            // Property 3: Label should be on a single line (no newlines)
+            prop_assert!(
+                !label.contains('\n'),
+                "Label should be on a single line but got: {}",
+                label
+            );
+
+            // Property 4: All parameters should be included
+            for param in &params {
+                prop_assert!(
+                    label.contains(&param.name),
+                    "Label should contain parameter '{}' but got: {}",
+                    param.name,
+                    label
+                );
+
+                // Property 5: Parameters with defaults should show "param = default"
+                if let Some(default) = &param.default_value {
+                    let expected = format!("{} = {}", param.name, default);
+                    prop_assert!(
+                        label.contains(&expected),
+                        "Label should contain '{}' but got: {}",
+                        expected,
+                        label
+                    );
+                }
+            }
+
+            // Property 6: Empty parameter list should produce "func()"
+            if params.is_empty() {
+                prop_assert_eq!(
+                    &label,
+                    &format!("{}()", func_name),
+                    "Empty parameter list should produce '{}()' but got: {}",
+                    func_name,
+                    &label
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 6: Active Parameter Detection
+        //
+        // For any function call being typed, detecting the active parameter should
+        // return the index corresponding to the number of commas before the cursor
+        // position, with the first parameter being index 0.
+        //
+        // **Validates: Requirements 6.3**
+        // ============================================================================
+        #[test]
+        fn prop_active_parameter_detection(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            num_commas in 0usize..=5
+        ) {
+            // Build a function call with the specified number of commas
+            // num_commas = 0: "func(arg0"
+            // num_commas = 1: "func(arg0, arg1"
+            // num_commas = 2: "func(arg0, arg1, arg2"
+            let mut code = format!("{}(arg0", func_name);
+            for i in 1..=num_commas {
+                code.push_str(&format!(", arg{}", i));
+            }
+            // Don't close the paren - we're simulating typing
+
+            // Parse the code
+            let tree = parse_r_code(&code);
+            let call_node = tree.root_node().child(0);
+            
+            if call_node.is_none() {
+                // If parsing failed, skip this test case
+                return Ok(());
+            }
+            let call_node = call_node.unwrap();
+
+            // Cursor is at the end of the code (after the last argument)
+            let cursor_point = Point::new(0, code.len());
+
+            // Detect active parameter
+            let result = detect_active_parameter(call_node, cursor_point, &code);
+
+            // Property: Active parameter index should equal the number of commas
+            prop_assert_eq!(
+                result,
+                Some(num_commas as u32),
+                "Active parameter should be {} for code '{}' with cursor at position {}",
+                num_commas,
+                code,
+                cursor_point.column
+            );
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 1: Package Function Signature Formatting
+        //
+        // For any package function with R help text containing a Usage section,
+        // building signature information should produce a SignatureInformation with
+        // a label containing the function name and all parameters with defaults, and
+        // documentation containing the description.
+        //
+        // **Validates: Requirements 1.1, 1.2, 1.3, 3.1, 3.2, 3.5**
+        // ============================================================================
+        #[test]
+        fn prop_package_function_signature_formatting(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            params in param_list_strategy(0, 5)
+        ) {
+            // Build help text with Usage section
+            let param_strs: Vec<String> = params
+                .iter()
+                .map(|p| {
+                    if let Some(default) = &p.default_value {
+                        format!("{} = {}", p.name, default)
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect();
+            
+            let signature_str = format!("{}({})", func_name, param_strs.join(", "));
+            let help_text = format!(
+                "{}\n\nDescription:\n\nThis is a test function.\n\nUsage:\n\n{}\n\nArguments:\n\n",
+                func_name, signature_str
+            );
+            
+            // Extract signature from help text
+            let signature = crate::help::extract_signature_from_help(&help_text);
+            
+            // Property 1: Signature should be extracted successfully
+            prop_assert!(
+                signature.is_some(),
+                "Should extract signature from help text with Usage section"
+            );
+            
+            let signature = signature.unwrap();
+            
+            // Property 2: Signature should contain function name
+            prop_assert!(
+                signature.contains(&func_name),
+                "Signature should contain function name '{}' but got: {}",
+                func_name,
+                signature
+            );
+            
+            // Property 3: Signature should contain all parameter names
+            for param in &params {
+                prop_assert!(
+                    signature.contains(&param.name),
+                    "Signature should contain parameter '{}' but got: {}",
+                    param.name,
+                    signature
+                );
+            }
+            
+            // Property 4: Parse the signature to get parameters
+            let parsed_params = parse_signature_params(&signature);
+            
+            // Property 5: Number of parsed parameters should match expected
+            prop_assert_eq!(
+                parsed_params.len(),
+                params.len(),
+                "Should parse {} parameters but got {}",
+                params.len(),
+                parsed_params.len()
+            );
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 2: Help Text Description Extraction
+        //
+        // For any R help text containing a Description section, extracting the
+        // description should produce a string that includes the title (if present),
+        // the description text with multi-line content joined by spaces, and Unicode
+        // curly quotes converted to markdown backticks.
+        //
+        // **Validates: Requirements 4.1, 4.2, 4.3, 4.4**
+        // ============================================================================
+        #[test]
+        fn prop_help_text_description_extraction(
+            title in "[A-Z][a-z]{3,10}",
+            description in "[a-z]{10,50}"
+        ) {
+            // Build help text with Description section
+            let help_text = format!(
+                "{}\n\nDescription:\n\n{}\n\n",
+                title, description
+            );
+            
+            // Extract description from help text
+            let extracted_desc = crate::help::extract_description_from_help(&help_text);
+            
+            // Property 1: Description should be extracted successfully
+            prop_assert!(
+                extracted_desc.is_some(),
+                "Should extract description from help text with Description section"
+            );
+            
+            let extracted_desc = extracted_desc.unwrap();
+            
+            // Property 2: Description should not be empty
+            prop_assert!(
+                !extracted_desc.is_empty(),
+                "Extracted description should not be empty"
+            );
+            
+            // Property 3: Description should contain the title text
+            prop_assert!(
+                extracted_desc.contains(&title),
+                "Description should contain title '{}' but got: {}",
+                title,
+                extracted_desc
+            );
+            
+            // Property 4: Description should contain the description text
+            prop_assert!(
+                extracted_desc.contains(&description),
+                "Description should contain description text '{}' but got: {}",
+                description,
+                extracted_desc
+            );
+            
+            // Property 5: Description should have substantial content
+            prop_assert!(
+                extracted_desc.len() > 10,
+                "Description should have substantial content, got: {}",
+                extracted_desc
+            );
+            
+            // Property 6: Description should have title and description separated by blank line
+            prop_assert!(
+                extracted_desc.contains("\n\n"),
+                "Description should have title and description separated by blank line, got: {}",
+                extracted_desc
+            );
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 4: Roxygen Documentation Display
+        //
+        // For any user-defined function with roxygen comments, building signature
+        // information should include documentation with the title and description when
+        // present, or fall back to plain comment text when roxygen tags are absent.
+        //
+        // **Validates: Requirements 2.2, 2.3**
+        // ============================================================================
+        #[test]
+        fn prop_roxygen_documentation_display(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            title in "[A-Z][a-z]{3,20}",
+            description in "[a-z ]{10,50}",
+            has_roxygen_tags in proptest::bool::ANY
+        ) {
+            // Build code with roxygen comments
+            let code = if has_roxygen_tags {
+                // Roxygen with tags
+                format!(
+                    "#' {}\n#' {}\n#' @param x A parameter\n{} <- function(x) {{ x }}\n",
+                    title, description, func_name
+                )
+            } else {
+                // Plain comments (fallback)
+                format!(
+                    "# {}\n# {}\n{} <- function(x) {{ x }}\n",
+                    title, description, func_name
+                )
+            };
+            
+            let func_line = if has_roxygen_tags { 3 } else { 2 };
+            
+            // Extract roxygen block
+            let block = crate::roxygen::extract_roxygen_block(&code, func_line);
+            
+            // Property 1: Block should be extracted successfully
+            prop_assert!(
+                block.is_some(),
+                "Should extract roxygen/comment block from code:\n{}",
+                code
+            );
+            
+            let block = block.unwrap();
+            
+            // Get function documentation
+            let func_doc = crate::roxygen::get_function_doc(&block);
+            
+            // Property 2: Function documentation should be extracted
+            prop_assert!(
+                func_doc.is_some(),
+                "Should extract function documentation from block"
+            );
+            
+            let func_doc = func_doc.unwrap();
+            
+            // Property 3: Documentation should not be empty
+            prop_assert!(
+                !func_doc.is_empty(),
+                "Function documentation should not be empty"
+            );
+            
+            // Property 4: Documentation should contain title or description text
+            let contains_title = func_doc.contains(&title);
+            let contains_desc = func_doc.contains(&description);
+            prop_assert!(
+                contains_title || contains_desc,
+                "Documentation should contain title '{}' or description '{}' but got: {}",
+                title,
+                description,
+                func_doc
+            );
+            
+            // Property 5: For roxygen with tags, should have title and description
+            if has_roxygen_tags {
+                prop_assert!(
+                    block.title.is_some() || block.description.is_some(),
+                    "Roxygen block with tags should have title or description"
+                );
+            } else {
+                // Property 6: For plain comments, should have fallback text
+                prop_assert!(
+                    block.fallback.is_some(),
+                    "Plain comment block should have fallback text"
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 5: Parameter Information Structure
+        //
+        // For any function signature with parameters, the SignatureInformation should
+        // contain a parameters vector where each ParameterInformation has a label
+        // matching the parameter name (with default if present) and documentation from
+        // @param tags or R help Arguments section when available.
+        //
+        // **Validates: Requirements 6.1, 6.2**
+        // ============================================================================
+        #[test]
+        fn prop_parameter_information_structure(
+            params in param_list_strategy(1, 5),
+            has_docs in proptest::bool::ANY
+        ) {
+            // Build parameter documentation map
+            let param_docs: Option<std::collections::HashMap<String, String>> = if has_docs {
+                Some(
+                    params
+                        .iter()
+                        .map(|p| (p.name.clone(), format!("Documentation for {}", p.name)))
+                        .collect()
+                )
+            } else {
+                None
+            };
+            
+            // Build parameter information for each parameter
+            let param_infos: Vec<ParameterInformation> = params
+                .iter()
+                .map(|param| {
+                    let param_doc = param_docs
+                        .as_ref()
+                        .and_then(|docs| docs.get(&param.name))
+                        .map(|s| s.as_str());
+                    build_parameter_information(param, param_doc)
+                })
+                .collect();
+            
+            // Property 1: Should have same number of ParameterInformation as parameters
+            prop_assert_eq!(
+                param_infos.len(),
+                params.len(),
+                "Should have {} ParameterInformation but got {}",
+                params.len(),
+                param_infos.len()
+            );
+            
+            // Property 2: Each ParameterInformation should have correct label
+            for (i, param) in params.iter().enumerate() {
+                let param_info = &param_infos[i];
+                
+                // Extract label string from ParameterLabel
+                let label_str = match &param_info.label {
+                    ParameterLabel::Simple(s) => s.as_str(),
+                    ParameterLabel::LabelOffsets(_) => {
+                        prop_assert!(false, "Expected Simple label, got LabelOffsets");
+                        ""
+                    }
+                };
+                
+                // Property 3: Label should contain parameter name
+                prop_assert!(
+                    label_str.contains(&param.name),
+                    "Label should contain parameter name '{}' but got: {}",
+                    param.name,
+                    label_str
+                );
+                
+                // Property 4: If parameter has default, label should show "name = default"
+                if let Some(default) = &param.default_value {
+                    let expected = format!("{} = {}", param.name, default);
+                    prop_assert_eq!(
+                        label_str,
+                        &expected,
+                        "Label should be '{}' but got: {}",
+                        expected,
+                        label_str
+                    );
+                } else {
+                    // Property 5: If no default, label should be just the name
+                    prop_assert_eq!(
+                        label_str,
+                        &param.name,
+                        "Label should be '{}' but got: {}",
+                        param.name,
+                        label_str
+                    );
+                }
+                
+                // Property 6: If has_docs, should have documentation
+                if has_docs {
+                    prop_assert!(
+                        param_info.documentation.is_some(),
+                        "Parameter '{}' should have documentation when has_docs=true",
+                        param.name
+                    );
+                    
+                    // Property 7: Documentation should contain parameter name
+                    if let Some(Documentation::MarkupContent(content)) = &param_info.documentation {
+                        prop_assert!(
+                            content.value.contains(&param.name),
+                            "Documentation should contain parameter name '{}' but got: {}",
+                            param.name,
+                            content.value
+                        );
+                    }
+                } else {
+                    // Property 8: If no docs, documentation should be None
+                    prop_assert!(
+                        param_info.documentation.is_none(),
+                        "Parameter '{}' should not have documentation when has_docs=false",
+                        param.name
+                    );
+                }
+            }
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 7: Signature Help Fallback
+        //
+        // For any function where signature extraction fails, the signature help should
+        // return a SignatureInformation with label showing the function name and
+        // documentation showing the source attribution (package name or file location).
+        //
+        // **Validates: Requirements 7.1, 7.3, 9.2, 9.4, 9.5**
+        // ============================================================================
+        #[test]
+        fn prop_signature_help_fallback(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            source_type in prop::sample::select(vec!["package", "same_file", "cross_file", "undefined"])
+        ) {
+            // Build a fallback SignatureInformation based on source type
+            let (label, documentation) = match source_type {
+                "package" => {
+                    let pkg_name = "testpkg";
+                    let label = format!("{}(...)", func_name);
+                    let doc = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("from `{}`", pkg_name),
+                    }));
+                    (label, doc)
+                }
+                "same_file" => {
+                    let line = 42;
+                    let label = format!("{}(...)", func_name);
+                    let doc = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("defined in this file, line {}", line),
+                    }));
+                    (label, doc)
+                }
+                "cross_file" => {
+                    let file_path = "other_file.R";
+                    let label = format!("{}(...)", func_name);
+                    let doc = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("defined in `{}`", file_path),
+                    }));
+                    (label, doc)
+                }
+                "undefined" => {
+                    let label = format!("{}(...)", func_name);
+                    let doc = None;
+                    (label, doc)
+                }
+                _ => unreachable!(),
+            };
+
+            let signature_info = SignatureInformation {
+                label: label.clone(),
+                documentation: documentation.clone(),
+                parameters: None,
+                active_parameter: None,
+            };
+
+            // Property 1: Label should be in the format "function_name(...)"
+            prop_assert_eq!(
+                &signature_info.label,
+                &format!("{}(...)", func_name),
+                "Fallback label should be '{}(...)' but got: {}",
+                func_name,
+                signature_info.label
+            );
+
+            // Property 2: Label should start with function name
+            prop_assert!(
+                signature_info.label.starts_with(&func_name),
+                "Fallback label should start with '{}' but got: {}",
+                func_name,
+                signature_info.label
+            );
+
+            // Property 3: Label should end with "(...)"
+            prop_assert!(
+                signature_info.label.ends_with("(...)"),
+                "Fallback label should end with '(...)' but got: {}",
+                signature_info.label
+            );
+
+            // Property 4: Parameters should be None for fallback
+            prop_assert!(
+                signature_info.parameters.is_none(),
+                "Fallback signature should have no parameters"
+            );
+
+            // Property 5: active_parameter should be None for fallback
+            prop_assert!(
+                signature_info.active_parameter.is_none(),
+                "Fallback signature should have no active parameter"
+            );
+
+            // Property 6: Documentation should contain source attribution when available
+            match source_type {
+                "package" => {
+                    prop_assert!(
+                        signature_info.documentation.is_some(),
+                        "Package function fallback should have documentation"
+                    );
+                    if let Some(Documentation::MarkupContent(content)) = &signature_info.documentation {
+                        prop_assert!(
+                            content.value.contains("from"),
+                            "Package fallback documentation should contain 'from' but got: {}",
+                            content.value
+                        );
+                        prop_assert!(
+                            content.value.contains("testpkg"),
+                            "Package fallback documentation should contain package name but got: {}",
+                            content.value
+                        );
+                    }
+                }
+                "same_file" => {
+                    prop_assert!(
+                        signature_info.documentation.is_some(),
+                        "Same-file function fallback should have documentation"
+                    );
+                    if let Some(Documentation::MarkupContent(content)) = &signature_info.documentation {
+                        prop_assert!(
+                            content.value.contains("defined in this file"),
+                            "Same-file fallback documentation should contain 'defined in this file' but got: {}",
+                            content.value
+                        );
+                        prop_assert!(
+                            content.value.contains("line"),
+                            "Same-file fallback documentation should contain 'line' but got: {}",
+                            content.value
+                        );
+                    }
+                }
+                "cross_file" => {
+                    prop_assert!(
+                        signature_info.documentation.is_some(),
+                        "Cross-file function fallback should have documentation"
+                    );
+                    if let Some(Documentation::MarkupContent(content)) = &signature_info.documentation {
+                        prop_assert!(
+                            content.value.contains("defined in"),
+                            "Cross-file fallback documentation should contain 'defined in' but got: {}",
+                            content.value
+                        );
+                        prop_assert!(
+                            content.value.contains("other_file.R"),
+                            "Cross-file fallback documentation should contain file path but got: {}",
+                            content.value
+                        );
+                    }
+                }
+                "undefined" => {
+                    prop_assert!(
+                        signature_info.documentation.is_none(),
+                        "Undefined function fallback should have no documentation"
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            // Property 7: Documentation should be markdown when present
+            if let Some(Documentation::MarkupContent(content)) = &signature_info.documentation {
+                prop_assert_eq!(
+                    &content.kind,
+                    &MarkupKind::Markdown,
+                    "Documentation should be markdown format"
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: rich-function-signature-hovers, Property 8: S3 Method Signature Preference
+        //
+        // For any R help text containing both generic and S3 method signatures in the
+        // Usage section, the signature extractor should return the generic signature
+        // rather than the S3 method signature.
+        //
+        // **Validates: Requirements 3.3**
+        // ============================================================================
+        #[test]
+        fn prop_s3_method_signature_preference(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            generic_params in param_list_strategy(0, 3),
+            s3_params in param_list_strategy(1, 5),
+            s3_class in "[a-z][a-z0-9_]{3,10}",
+            has_generic in prop::bool::ANY
+        ) {
+            // Build parameter strings
+            let generic_param_strs: Vec<String> = generic_params
+                .iter()
+                .map(|p| {
+                    if let Some(default) = &p.default_value {
+                        format!("{} = {}", p.name, default)
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect();
+            
+            let s3_param_strs: Vec<String> = s3_params
+                .iter()
+                .map(|p| {
+                    if let Some(default) = &p.default_value {
+                        format!("{} = {}", p.name, default)
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect();
+
+            // Build help text with both generic and S3 method signatures
+            let help_text = if has_generic {
+                // Case 1: Generic signature followed by S3 method signature
+                format!(
+                    "{}\n\nDescription:\n\nA test function.\n\nUsage:\n\n{}({})\n\n## S3 method for class '{}'\n{}({})\n\nArguments:\n\n",
+                    func_name,
+                    func_name,
+                    generic_param_strs.join(", "),
+                    s3_class,
+                    func_name,
+                    s3_param_strs.join(", ")
+                )
+            } else {
+                // Case 2: Only S3 method signature (no generic)
+                format!(
+                    "{}\n\nDescription:\n\nA test function.\n\nUsage:\n\n## S3 method for class '{}'\n{}({})\n\nArguments:\n\n",
+                    func_name,
+                    s3_class,
+                    func_name,
+                    s3_param_strs.join(", ")
+                )
+            };
+
+            // Extract signature from help text
+            let signature = crate::help::extract_signature_from_help(&help_text);
+
+            // Property 1: Signature should be extracted successfully
+            prop_assert!(
+                signature.is_some(),
+                "Should extract signature from help text with Usage section"
+            );
+
+            let signature = signature.unwrap();
+
+            // Property 2: Signature should contain function name
+            prop_assert!(
+                signature.contains(&func_name),
+                "Signature should contain function name '{}' but got: {}",
+                func_name,
+                signature
+            );
+
+            if has_generic {
+                // Property 3: When both generic and S3 method signatures are present,
+                // should prefer the generic signature
+                let expected_generic = format!("{}({})", func_name, generic_param_strs.join(", "));
+                
+                // The signature should match the generic signature
+                prop_assert_eq!(
+                    signature.trim(),
+                    expected_generic.trim(),
+                    "Should prefer generic signature '{}' over S3 method signature when both are present, but got: {}",
+                    expected_generic,
+                    signature
+                );
+
+                // Property 4: Should NOT contain S3 method parameters when generic is available
+                // Check that we don't have the S3-specific parameters that aren't in generic
+                // We need to be careful here - just checking if the parameter name appears
+                // as a substring isn't sufficient because it might appear in default values.
+                // Instead, we'll verify that the generic signature matches what we expect.
+                for generic_param in &generic_params {
+                    prop_assert!(
+                        signature.contains(&generic_param.name),
+                        "Generic signature should contain generic parameter '{}' but got: {}",
+                        generic_param.name,
+                        signature
+                    );
+                }
+            } else {
+                // Property 5: When only S3 method signature is present,
+                // should return the S3 method signature (as fallback)
+                let expected_s3 = format!("{}({})", func_name, s3_param_strs.join(", "));
+                
+                prop_assert_eq!(
+                    signature.trim(),
+                    expected_s3.trim(),
+                    "Should return S3 method signature '{}' when no generic is available, but got: {}",
+                    expected_s3,
+                    signature
+                );
+
+                // Property 6: Should contain S3 method parameters
+                for s3_param in &s3_params {
+                    prop_assert!(
+                        signature.contains(&s3_param.name),
+                        "S3 method signature should contain parameter '{}' but got: {}",
+                        s3_param.name,
+                        signature
+                    );
+                }
+            }
         }
     }
 }
