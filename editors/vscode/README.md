@@ -25,17 +25,19 @@ Raven settings are available under the `raven.*` prefix in VS Code. Open **Setti
 - **Packages**: Package awareness, library paths, R executable path
 - **Symbols**: Workspace symbol result limits
 
-## Using with Other R Extensions
+## Using with vscode-R
 
-If you use Raven alongside [vscode-R](https://github.com/REditorSupport/vscode-R), you may see duplicate entries in the completion menu (e.g., `source` appearing twice). This happens because VS Code does not deduplicate completions across providers — Raven contributes package export completions while vscode-R contributes R snippets for the same functions.
+The [vscode-R](https://github.com/REditorSupport/vscode-R) extension provides useful features beyond its bundled language server (running R code, viewing plots, etc.). To use Raven instead of the bundled R Language Server, disable its diagnostics so you don't have two LSPs running:
 
-To reduce clutter, add this to your VS Code settings:
+```json
+"r.lsp.diagnostics": false
+```
+
+You may also want to push snippets below LSP completions to reduce duplicate entries:
 
 ```json
 "editor.snippetSuggestions": "bottom"
 ```
-
-This pushes snippet completions below LSP completions, so Raven's results (with package attribution like `{base}`) appear first.
 
 ## More Information
 
