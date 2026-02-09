@@ -2971,7 +2971,8 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
 /// This is the synchronous version that only checks cached sources (no disk I/O).
 /// For async disk checking, use `collect_missing_file_diagnostics_async`.
 ///
-/// Path resolution follows the critical distinction from AGENTS.md:
+/// Path resolution follows the forward-vs-backward invariant documented in
+/// `crates/raven/src/cross_file/path_resolve.rs` (and user-facing `docs/cross-file.md`):
 /// - Forward sources (source() calls): use PathContext::from_metadata (respects @lsp-cd)
 /// - Backward directives (@lsp-sourced-by): use PathContext::new (ignores @lsp-cd)
 ///
@@ -3134,7 +3135,8 @@ fn collect_missing_file_diagnostics(
 /// This version uses `AsyncContentProvider::check_existence_batch` to perform
 /// non-blocking disk I/O for files not found in cache.
 ///
-/// Path resolution follows the critical distinction from AGENTS.md:
+/// Path resolution follows the forward-vs-backward invariant documented in
+/// `crates/raven/src/cross_file/path_resolve.rs` (and user-facing `docs/cross-file.md`):
 /// - Forward sources (source() calls): use PathContext::from_metadata (respects @lsp-cd)
 /// - Backward directives (@lsp-sourced-by): use PathContext::new (ignores @lsp-cd)
 ///
@@ -5473,8 +5475,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
-                    let help_text =
-                        get_help_cached(&state.help_cache, name, Some(pkg)).await;
+                    let help_text = get_help_cached(&state.help_cache, name, Some(pkg)).await;
                     log::trace!(
                         "hover: get_help returned {:?}",
                         help_text.as_ref().map(|s| s.len())
@@ -5532,8 +5533,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            let help_text =
-                get_help_cached(&state.help_cache, name, Some(&pkg_name)).await;
+            let help_text = get_help_cached(&state.help_cache, name, Some(&pkg_name)).await;
             if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
             } else {
@@ -7387,7 +7387,9 @@ x <- "#;
         let resolved = super::completion_item_resolve(item, &cache);
 
         // Should have documentation populated from the cached help text
-        let doc = resolved.documentation.expect("Should have documentation from cache");
+        let doc = resolved
+            .documentation
+            .expect("Should have documentation from cache");
         match doc {
             Documentation::MarkupContent(content) => {
                 assert_eq!(content.kind, MarkupKind::Markdown);

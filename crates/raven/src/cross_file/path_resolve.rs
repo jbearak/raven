@@ -23,7 +23,7 @@
 //      the current working directory at runtime.
 //
 // DO NOT change this behavior without understanding the full implications for cross-file
-// awareness. See AGENTS.md "Path Resolution: Critical Distinction" for detailed documentation.
+// awareness. User-facing explanation lives in `docs/cross-file.md`.
 //
 
 use std::path::{Path, PathBuf};

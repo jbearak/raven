@@ -822,8 +822,7 @@ impl PackageLibrary {
                     let pkg_exports = per_package_exports.entry(package.clone()).or_default();
                     // Preserve depends from DESCRIPTION for transitive dependency resolution
                     if !parse_result.depends.is_empty() {
-                        per_package_depends
-                            .insert(package.clone(), parse_result.depends.clone());
+                        per_package_depends.insert(package.clone(), parse_result.depends.clone());
                     }
                     // Add explicit exports
                     for export in &parse_result.explicit_exports {

@@ -554,7 +554,10 @@ pub fn extract_description_from_help(help_text: &str) -> Option<String> {
     }
 
     // Trim leading/trailing empty lines
-    let start = desc_lines.iter().position(|l| !l.is_empty()).unwrap_or(desc_lines.len());
+    let start = desc_lines
+        .iter()
+        .position(|l| !l.is_empty())
+        .unwrap_or(desc_lines.len());
     let end = desc_lines
         .iter()
         .rposition(|l| !l.is_empty())
@@ -875,14 +878,19 @@ Arguments:
 
         // get() should now treat the expired entry as a cache miss
         assert!(
-            cache.get("some_func", Some("nonexistent_pkg_xyzzy")).is_none(),
+            cache
+                .get("some_func", Some("nonexistent_pkg_xyzzy"))
+                .is_none(),
             "Expired negative entry should be a cache miss"
         );
 
         // get_or_fetch() should re-fetch from R (which will fail again for this
         // fake package) and re-populate the cache with a fresh negative entry
         let result = cache.get_or_fetch("some_func", Some("nonexistent_pkg_xyzzy"));
-        assert!(result.is_none(), "R should still not find this fake package");
+        assert!(
+            result.is_none(),
+            "R should still not find this fake package"
+        );
 
         // The cache should now have a fresh negative entry (not expired)
         assert_eq!(
