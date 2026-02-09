@@ -237,7 +237,7 @@ pub(crate) fn parse_cross_file_config(
             .get("redundantDirectiveSeverity")
             .and_then(|v| v.as_str())
         {
-            config.redundant_directive_severity = parse_optional_severity(sev);
+            config.redundant_directive_severity = parse_severity(sev);
         }
 
         // Parse on-demand indexing settings
@@ -391,26 +391,19 @@ pub(crate) fn parse_cross_file_config(
     Some(config)
 }
 
-fn parse_severity(s: &str) -> DiagnosticSeverity {
-    match s.to_lowercase().as_str() {
-        "error" => DiagnosticSeverity::ERROR,
-        "warning" => DiagnosticSeverity::WARNING,
-        "information" | "info" => DiagnosticSeverity::INFORMATION,
-        "hint" => DiagnosticSeverity::HINT,
-        _ => DiagnosticSeverity::WARNING,
-    }
-}
-
-/// Parse severity with support for "off" to disable the diagnostic entirely
-/// _Requirements: 6.2_
-fn parse_optional_severity(s: &str) -> Option<DiagnosticSeverity> {
+/// Parse a severity string into an optional `DiagnosticSeverity`.
+///
+/// Returns `None` for "off"/"none"/"disabled", which disables the diagnostic entirely.
+/// Returns the corresponding severity for "error", "warning", "information"/"info", "hint".
+/// Unrecognised values default to `Some(WARNING)`.
+pub(crate) fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
     match s.to_lowercase().as_str() {
         "off" | "none" | "disabled" => None,
         "error" => Some(DiagnosticSeverity::ERROR),
         "warning" => Some(DiagnosticSeverity::WARNING),
         "information" | "info" => Some(DiagnosticSeverity::INFORMATION),
         "hint" => Some(DiagnosticSeverity::HINT),
-        _ => Some(DiagnosticSeverity::HINT), // Default to hint for redundant directives
+        _ => Some(DiagnosticSeverity::WARNING),
     }
 }
 

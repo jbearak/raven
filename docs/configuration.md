@@ -23,6 +23,7 @@ All settings can be configured via VS Code settings or LSP initialization option
 | `raven.crossFile.maxChainDepthSeverity` | "warning" | Severity for max chain depth exceeded diagnostics |
 | `raven.crossFile.outOfScopeSeverity` | "warning" | Severity for out-of-scope symbol diagnostics |
 | `raven.crossFile.ambiguousParentSeverity` | "warning" | Severity for ambiguous parent diagnostics |
+| `raven.crossFile.redundantDirectiveSeverity` | "hint" | Severity for redundant @lsp-source directives (where source() already detected) |
 | `raven.diagnostics.undefinedVariables` | true | Enable undefined variable diagnostics |
 
 ## Package Settings

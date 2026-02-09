@@ -14,8 +14,25 @@ cd raven
 ### Download from Releases
 Pre-built binaries are available from the [releases page](../../releases).
 
-### VS Code Extension
-The extension is bundled with the binary. After running `setup.sh`, reload VS Code to activate.
+### Editor Setup
+
+Raven is a standard Language Server Protocol (LSP) server. This repository includes a VS Code extension, but the binary works with any editor that supports LSP.
+
+**VS Code:** The extension is bundled with the binary. After running `setup.sh`, reload VS Code to activate.
+
+**Zed:** Add to your `settings.json`:
+```json
+"lsp": {
+  "r_language_server": {
+    "binary": {
+      "path": "/path/to/raven",
+      "arguments": ["--stdio"]
+    }
+  }
+}
+```
+
+**Other editors:** Run `raven --stdio` and connect via your editor's LSP client.
 
 ## Quick Start
 
@@ -47,30 +64,28 @@ For files that aren't explicitly sourced, add a directive:
 
 ## When to Use Raven
 
+Raven is a static R language server. What sets it apart is cross-file awareness: symbol resolution across `source()` chains, position-aware scope, and "undefined variable" diagnostics that span file boundaries.
+
+Raven can be used **alongside** other R extensions. In VS Code with the [vscode-R](https://github.com/REditorSupport/vscode-R) extension (which includes the [R Language Server](https://github.com/REditorSupport/languageserver)), you may want to adjust two settings:
+
+- **Disable R-LS diagnostics** to avoid overlap with Raven's cross-file diagnostics:
+  ```json
+  "r.lsp.diagnostics": false
+  ```
+- **Push snippets below LSP completions** to reduce duplicate completion entries (VS Code doesn't deduplicate across providers):
+  ```json
+  "editor.snippetSuggestions": "bottom"
+  ```
+
+Neither setting is required — Raven works fine without them.
+
 | Feature | Raven | [Ark](https://github.com/posit-dev/ark) | [R Language Server](https://github.com/REditorSupport/languageserver) |
 |---------|-------|-----|-------------------|
 | Cross-file `source()` tracking | Yes | No | No |
 | Position-aware scope | Yes | No | No |
 | Workspace symbol indexing | Yes | Completions only | Open files only |
-| Works in VS Code | Yes | Positron only | Yes |
+| Editor support | Any LSP-capable editor | Positron only | VS Code |
 | Package export awareness | Yes | Yes | Yes |
-| Embedded R runtime | No | Yes | Yes |
-| Jupyter kernel | No | Yes | No |
-| Debug Adapter (DAP) | No | Yes | No |
-
-**Use Raven when:**
-- Your R project spans multiple files connected by `source()`
-- You want accurate "undefined variable" diagnostics across file boundaries
-- You use VS Code and want cross-file intelligence
-- You want fast startup without loading R
-
-**Use [Ark](https://github.com/posit-dev/ark) when:**
-- You use Positron IDE
-- You need Jupyter notebook or debugging support
-
-**Use [R Language Server](https://github.com/REditorSupport/languageserver) when:**
-- You work primarily with single-file scripts
-- You need runtime introspection
 
 ## Features
 
@@ -85,18 +100,6 @@ For files that aren't explicitly sourced, add a directive:
 - **Workspace symbols** - Fast project-wide symbol search (Ctrl+T) with configurable result limits
 - **Workspace indexing** - Background indexing of your entire project
 - **Package awareness** - Recognition of `library()` calls and package exports
-
-## Using with Other R Extensions
-
-If you use Raven alongside [vscode-R](https://github.com/REditorSupport/vscode-R), you may see duplicate entries in the completion menu (e.g., `source` appearing twice). This happens because VS Code does not deduplicate completions across providers — Raven contributes package export completions while vscode-R contributes R snippets for the same functions.
-
-To reduce clutter, add this to your VS Code settings:
-
-```json
-"editor.snippetSuggestions": "bottom"
-```
-
-This pushes snippet completions below LSP completions, so Raven's results (with package attribution like `{base}`) appear first.
 
 ## Documentation
 
