@@ -21,11 +21,12 @@ Raven settings are available under the `raven.*` prefix in VS Code. Open **Setti
 
 ## Using with vscode-R
 
-The [vscode-R](https://github.com/REditorSupport/vscode-R) extension provides useful features beyond its bundled language server (running R code, viewing plots, etc.). To use Raven instead of the bundled R Language Server, disable its diagnostics so you don't have two LSPs running:
+To run R code, view plots, and access other interactive features, install the [vscode-R](https://github.com/REditorSupport/vscode-R) extension alongside Raven. You can leave both language servers enabled (vscode-R provides formatting diagnostics, Raven provides code diagnostics), or disable vscode-R's language server to avoid duplicate completions:
 
 ```json
-"r.lsp.diagnostics": false
+"r.lsp.enabled": false
 ```
+
 
 You may also want to push snippets below LSP completions to reduce duplicate entries:
 
