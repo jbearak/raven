@@ -53,7 +53,7 @@ When a completion request arrives:
 1. **File path context** is checked first (existing behavior, unchanged).
 2. **Embedded-R scope gating**: if the document is R Markdown/embedded-R and the cursor is outside an R code block, return standard completions only (no parameter completions).
 3. **Token detection**: detect the token at cursor and check for namespace accessor (`::` or `:::`). This happens BEFORE call detection (matching R-LS ordering where `detect_token()` precedes `detect_call()`).
-4. **Special-case context gating**: if the cursor is inside a function call with a special-case handler (e.g., `library()`, `require()` showing installed packages), use that handler and skip parameter completions. The official R-LS skips parameter completions entirely for these functions.
+4. **No special-case suppression for library/require**: the official R-LS does NOT suppress parameter completions for `library()` or `require()`. It shows both parameter completions (from `arg_completion`) and installed package names (from `package_completion`, which runs for all tokens). Raven matches this: parameter completions are always additive when inside a function call, even for library/require.
 5. **Standard completions** are always collected (keywords, constants, document symbols, package exports, cross-file symbols) — this is the existing `completion()` logic.
 6. **Namespace-token suppression**: if the token from step 3 has a namespace accessor (`::`/`:::`), skip call detection and parameter completions entirely. Only namespace completions are shown. (This is how R-LS works: `detect_call()` is never invoked when an accessor is present.)
 7. **Function call context** is checked via AST walk (with string-aware bracket-heuristic fallback). If detected, proceed; otherwise return standard completions only.
@@ -107,11 +107,13 @@ fn find_enclosing_function_call(
 6. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node. Detect if operator is `::` or `:::` and set `is_internal` accordingly.
 7. Skip if cursor is inside a `string` node (no parameter completions inside string literals)
 8. If the AST walk fails to find a call (e.g., due to incomplete syntax), fall back to a bracket-based heuristic with a finite state machine (FSM) modeled on the official R language server's C implementation (`fsm.c`/`search.c`):
-   - Scan backward from the cursor position through the document text, character by character
-   - **Multi-bracket nesting**: Track all three bracket types — `(` / `)`, `[` / `]`, `{` / `}` — using a stack. Opening brackets push, closing brackets pop. Only an unmatched `(` (not `[` or `{`) triggers parameter completions, but all types must be tracked for correct nesting depth. This prevents incorrect matches in `df[func(x, |)]` where the `[` must be counted.
+   - **Line-by-line forward scan (matching R-LS architecture)**: Process lines from the cursor line backward. Within each line, scan **forward** from position 0 (up to the cursor column on the cursor line, or to the end of the line on prior lines). The FSM state is re-initialized at each new line boundary. This forward-within-backward approach is necessary because the FSM tracks string state (raw strings, escape sequences) which requires forward context. The R-LS C implementation (`search.c`) uses exactly this approach: an outer `for (i = row; i >= 0; i--)` loop over lines, with an inner `while (j < n)` forward scan within each line, calling `fsm_initialize()` at the start of each line.
+   - **Multi-line string bailout**: If a previous line (not the cursor line) ends with the FSM in a `single_quoted` or `double_quoted` state, the scanner MUST stop searching further backward (return no match). This indicates a multi-line string, and continuing would produce incorrect bracket matches.
+   - **Multi-bracket nesting**: Track opening and closing brackets — `(` / `)`, `[` / `]`, `{` / `}` — using a stack of positions. The R-LS implementation does NOT match bracket types (any closing bracket pops any opening bracket), which is sufficient for syntactically valid R code. Only an unmatched `(` (identified by the bracket character at the top of the stack) triggers parameter completions. This prevents incorrect matches in `df[func(x, |)]` where the `[` must be counted.
    - **String boundary tracking**: Maintain FSM state to detect when the scanner is inside single-quoted (`'...'`), double-quoted (`"..."`), backtick-quoted (`` `...` ``), or R 4.0+ raw strings (`r"(...)"`, `R"(...)"`, `r'(...)'`, `R'(...)'`, and variants with dash delimiters like `r"-(..)-"`). Brackets inside strings are ignored. This prevents `f("(", |)` from being confused by the `(` inside the string literal.
-   - **Comment handling**: When the scanner encounters `#` outside of any string literal, it must skip backward to the beginning of that line (the `#` starts a comment that extends to end-of-line, so everything from `#` rightward is comment text). This prevents brackets inside comments from affecting nesting, e.g., `f(x, # adjust ( balance\n  |)` must detect `f`.
+   - **Comment handling**: When the forward scanner encounters `#` outside of any string literal, it MUST stop scanning the remainder of that line (break the inner loop). Everything from `#` to end-of-line is comment text. This prevents brackets inside comments from affecting nesting, e.g., `f(x, # adjust ( balance\n  |)` must detect `f`.
    - **Backslash escapes**: Track `\` to handle escaped quotes inside strings (e.g., `f("a\"(b", |)` must detect `f` despite the escaped quote).
+   - **Unbalanced bracket accounting**: After scanning each line, deduct unbalanced closing brackets (those not matched by an opening bracket on the same line) from the bracket stack accumulated from subsequent lines. This handles cases where a closing bracket on line N matches an opening bracket on line N+1.
    - Once the unmatched `(` is found, extract the function name token immediately before it: scan backward from the `(` position, skipping whitespace, then collecting identifier characters including `.` and `::` / `:::` namespace qualifiers. Stop at any character that cannot be part of an R identifier or namespace accessor.
    - This matches R-LS robustness for incomplete/malformed syntax
 
@@ -349,6 +351,8 @@ The resolve handler inspects the `type` field in the completion item's `data` to
 
 4. **No recognized `type`**: Return the item unchanged.
 
+After resolving, the handler SHOULD clear the `data` field from the response (set to `null`/`None`) to avoid leaking internal resolve metadata back to the client. The official R-LS explicitly does `params$data <- NULL` after resolve.
+
 ```rust
 /// Extract parameter description for a specific argument from Rd/structured help
 fn extract_param_description(help_doc: &HelpDoc, param_name: &str) -> Option<String>;
@@ -409,15 +413,14 @@ fn get_parameter_completions(
         None => return Vec::new(),
     };
     
-    // Special handling for base::options()
+    // Special handling for base::options() — merge .Options names
     let mut parameters = signature.parameters;
     if function_name == "options" && (namespace.is_none() || namespace == Some("base")) {
-        // In a real implementation we might query names(.Options) from R
-        // For now, we assume RSubprocess returns them if we requested them special-case
-        // OR we can append them here if we have a list.
-        // Given the spec requirement is to match R-LS, and R-LS appends them in `arg_completion`.
-        // We will leave this implementation detail to the coder but note it in the design.
+        // Query names(.Options) from R subprocess and append as additional
+        // parameter completions, matching R-LS behavior.
     }
+    // Note: No special suppression for library/require — R-LS shows both
+    // parameter completions and package name completions for these functions.
 
     parameters.iter()
         .enumerate() // Capture index for stable sorting
@@ -642,6 +645,12 @@ The following are explicitly excluded from this spec and may be addressed in fol
 
 10. **S4 slot access (`@`) completions**: See requirements.md Out of Scope item 9.
 
+11. **`labelDetails` support**: See requirements.md Out of Scope item 11.
+
+12. **Token completion deduplication**: See requirements.md Out of Scope item 12.
+
+13. **S3/S4 method parameter resolution**: See requirements.md Out of Scope item 13.
+
 ## Testing Strategy
 
 ### Unit Tests
@@ -661,8 +670,9 @@ Unit tests verify specific examples and edge cases:
    - R 4.0+ raw strings: `f(r"(hello(world))", |)` should detect `f`
    - Escaped quotes: `f("a\"(b", |)` should detect `f`
    - Cursor at column 0 (beginning of line): should not crash or trigger false detection
+   - Multi-line string bailout: if previous line ends with unmatched quote, stop searching backward
    - R Markdown: inside R code block triggers; outside code block does not
-   - `library(|)` and `require(|)`: special-case handler takes precedence (if implemented)
+   - `library(|)` and `require(|)`: parameter completions appear alongside package name completions (no suppression)
 
 2. **Parameter Extraction**
    - Simple function `function(x, y)`
@@ -677,6 +687,7 @@ Unit tests verify specific examples and edge cases:
    - Case-insensitive substring matching (e.g., `OBJ` matches `object`); dots are literal (`.` in `na.rm` matches only `.`)
    - Namespace-qualified token suppression (e.g., `str(stats::o` yields no parameter items)
    - `insertTextFormat` is `PlainText` on all parameter items
+   - `library(|)` / `require(|)`: both parameter completions and package names present (no suppression)
 
 4. **Parameter Documentation Resolve**
    - Package function with Rd `\\arguments` entry

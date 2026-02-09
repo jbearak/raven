@@ -15,10 +15,12 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Gate on embedded-R scope (R Markdown): return `None` when cursor is outside an R code block
     - Return `None` if cursor is inside a `string` node or outside all function call parentheses
     - Add a bracket-heuristic fallback with FSM for incomplete syntax when AST walk fails. The scanner must:
-      - Track **all three bracket types** `()`, `[]`, `{}` for correct nesting depth (only unmatched `(` triggers completions)
+      - Use a **line-by-line forward scan** (matching R-LS `search.c`): process lines from cursor line backward; within each line, scan forward from position 0. Re-initialize FSM state at each new line. If a previous line ends with unmatched quote state, bail out (multi-line string detected).
+      - Track brackets — `()`, `[]`, `{}` — using a **stack of positions**. Need not match bracket types (any closing bracket pops any opening bracket, matching R-LS). Only an unmatched `(` triggers completions.
       - Be **string-aware**: maintain FSM state for single-quoted, double-quoted, backtick-quoted, and R 4.0+ raw strings (`r"(...)"`, `R"(...)"`, variants with dash delimiters). Ignore brackets inside strings.
-      - Be **comment-aware**: when `#` is encountered outside string literals, skip backward to the start of that line (comment extends to end-of-line). Ignore brackets inside comments.
+      - Be **comment-aware**: when `#` is encountered outside string literals during the forward scan, stop scanning the remainder of that line (break inner loop). Ignore brackets inside comments.
       - Handle **backslash escapes** inside strings (e.g., `\"` does not end a double-quoted string)
+      - Account for **unbalanced closing brackets** across lines: closing brackets not matched on the current line deduct from the bracket stack accumulated from subsequent lines.
       - After finding the unmatched `(`, extract the function name token before it (skipping whitespace, collecting identifier chars including `.` and `::` / `:::` namespace qualifiers)
     - Add `mod completion_context;` to `main.rs`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7_
@@ -45,6 +47,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Verify bracket-heuristic tracks multi-bracket nesting: `df[func(x, |)]` detects `func`, not confused by `[`
     - Verify bracket-heuristic handles R 4.0+ raw strings: `f(r"(hello(world))", |)` detects `f`
     - Verify bracket-heuristic handles cursor at column 0 (edge case: no crash, no false detection)
+    - Verify bracket-heuristic bails out on multi-line strings: if a previous line ends with unmatched quote, stop searching
     - **Validates: Requirements 1.6**
 
 - [ ] 2. Checkpoint - Ensure context detection tests pass
@@ -108,11 +111,11 @@ This implementation adds function parameter completions to Raven's LSP. When the
       - Filter params using case-insensitive substring matching against the current token (R-LS behavior). Matching must be literal (not regex) — use simple `str::contains` on lowercased strings, NOT regex, to ensure `.` in identifiers like `na.rm` matches literally
       - Include `...` parameters (no exclusion)
       - Format each as `CompletionItem` with `kind = VARIABLE`, `insert_text_format = InsertTextFormat::PLAIN_TEXT`, `insert_text = "name = "` for regular params or `insert_text = "..."` for dots (no ` = ` for `...`), `sort_text = "0-{index}-name"` (preserving definition order), `detail = "parameter"` (optionally `parameter = default`), and `data` JSON with `type = "parameter"`, `param_name`, `function_name`, `package`/`uri`+`func_line`
-    - Gate parameter completions when inside special-case function calls: if the function is `library` or `require` (and an installed-packages completion handler exists), skip parameter completions to match R-LS behavior
+    - Do NOT suppress parameter completions for `library()` or `require()` — R-LS shows both parameter completions and package name completions for these functions (parameter completions are always additive)
     - Ensure token detection (checking for `::` or `:::` accessor) happens BEFORE call detection — if accessor is present, skip call detection entirely (R-LS ordering)
     - Update `backend.rs` `completion()` async wrapper: collect standard completions + detect context under WorldState read lock (fast), release lock, then run parameter resolution in `tokio::task::spawn_blocking` with cloned `Arc<SignatureCache>` and `Arc<PackageLibrary>` references
     - Standard completions remain unchanged when not in function call context
-    - _Requirements: 2.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
+    - _Requirements: 2.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 7.5_
 
   - [ ]* 6.3 Write property test for parameter completion formatting
     - **Property 6: Parameter Completion Formatting**
@@ -180,7 +183,8 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - For package functions (has `package` in data): use structured Rd arguments from the help subsystem to resolve parameter docs (not raw help text)
     - For user-defined functions (has `uri` + `func_line` in data): read file content, call `extract_roxygen_block()`, then `get_param_doc()`
     - Return item unchanged if no documentation found
-    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+    - Clear the `data` field from the resolved item before returning (set to `None`/`null`), matching R-LS behavior of `params$data <- NULL`
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5_
 
   - [ ] 9.4 Extend `completion_item_resolve()` for user-defined function name documentation
     - Add dispatch: check for `type == "user_function"` in data
