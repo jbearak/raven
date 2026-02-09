@@ -7,12 +7,15 @@ This design adds function parameter completions to Raven's LSP completion handle
 Key design decisions informed by research on the official R language server (languageserver package):
 
 - **Mixed completions**: Parameters are ADDED to standard completions, not replacing them. This matches R-LS behavior where `filter(df, ` shows both `filter`'s params AND local variables needed as argument values.
-- **AST-based context detection**: Raven uses tree-sitter for context detection (more robust than R-LS's character-level backward scanning).
-- **Dots exclusion**: `...` is excluded from parameter completions (R-LS includes it, but excluding is better UX).
+- **AST-based context detection with fallback**: Raven uses tree-sitter for context detection and falls back to a bracket heuristic for incomplete syntax, matching R-LS robustness while preserving AST accuracy when available.
+- **Embedded-R scope gating**: In R Markdown or embedded-R documents, parameter completions only appear inside R code blocks (mirrors R-LS behavior).
+- **Case-insensitive substring matching**: Parameter filtering uses case-insensitive substring matches rather than strict prefix-only matches (R-LS parity).
+- **Dots inclusion**: `...` is included in parameter completions to match R-LS (even though it’s not always useful to insert).
 - **Sort prefix `0-` with index**: Parameters sort before all other completion types. Within parameters, they sort by definition order (e.g., `0-001`, `0-002`) rather than alphabetically, to match R-LS behavior and user expectation.
 - **`options()` support**: Special handling for `base::options()` to suggest global option names (e.g., `width`, `digits`) as parameters.
-- **`CompletionItemKind::FIELD`**: Chosen over R-LS's `Variable` kind because FIELD better communicates "named parameter of a function" semantically.
-- **Parameter documentation on resolve**: `completionItem/resolve` lazily loads `@param` descriptions from R help docs or roxygen comments.
+- **`CompletionItemKind::VARIABLE`**: Matches R-LS parameter completion kind; detail is `parameter` (default values are optional enhancements).
+- **Namespace-qualified token suppression**: When the current token uses `::`/`:::`, parameter completions are suppressed to avoid fighting namespace completions (R-LS parity).
+- **Parameter documentation on resolve**: `completionItem/resolve` pulls argument docs from Rd `\\arguments` (package functions) or roxygen2-style comments (user-defined).
 
 The implementation leverages existing infrastructure:
 - Tree-sitter AST for context detection and user-defined function parameter extraction
@@ -48,9 +51,11 @@ graph TD
 When a completion request arrives:
 
 1. **File path context** is checked first (existing behavior, unchanged).
-2. **Standard completions** are always collected (keywords, constants, document symbols, package exports, cross-file symbols) — this is the existing `completion()` logic.
-3. **Function call context** is checked via AST walk. If detected, parameter completions are prepended to the standard list with `"0-"` sort prefix.
-4. If no function call context, return standard completions only.
+2. **Embedded-R scope gating**: if the document is R Markdown/embedded-R and the cursor is outside an R code block, return standard completions only (no parameter completions).
+3. **Standard completions** are always collected (keywords, constants, document symbols, package exports, cross-file symbols) — this is the existing `completion()` logic.
+4. **Function call context** is checked via AST walk (with bracket-heuristic fallback). If detected, proceed; otherwise return standard completions only.
+5. **Namespace-token suppression**: if the current token being completed is namespace-qualified (`::`/`:::`), skip parameter completions to avoid conflicting with namespace completions.
+6. **Parameter completions** are prepended to the standard list with `"0-"` sort prefix when eligible.
 
 This ordering ensures that inside `filter(df, col > `, the user sees:
 - `filter`'s parameters (`.data`, `.preserve`, etc.) at the top
@@ -71,8 +76,6 @@ pub struct FunctionCallContext {
     pub namespace: Option<String>,
     /// Whether the call uses internal access (:::)
     pub is_internal: bool,
-    /// Parameters already specified as named arguments in the call
-    pub existing_params: Vec<String>,
 }
 
 /// Detect if cursor is inside a function call's argument list.
@@ -91,18 +94,17 @@ fn find_enclosing_function_call(
     position: Position,
 ) -> Option<FunctionCallContext>;
 
-/// Extract already-specified named parameter names from function call arguments.
-/// Scans argument nodes for `name = value` patterns.
-fn extract_existing_parameters(call_node: Node, text: &str) -> Vec<String>;
 ```
 
 **Context detection strategy** (tree-sitter AST walk):
-1. Find the node at cursor position
-2. Walk up ancestors looking for `call` nodes
-3. Verify cursor is inside the argument list (between `(` and `)`)
-4. For nested calls: the innermost `call` ancestor wins
-5. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node. Detect if operator is `::` or `:::` and set `is_internal` accordingly.
-6. Skip if cursor is inside a `string` node (no parameter completions inside string literals)
+1. If the document is embedded-R (e.g., R Markdown), ensure the cursor is inside an R code block; otherwise return `None`
+2. Find the node at cursor position
+3. Walk up ancestors looking for `call` nodes
+4. Verify cursor is inside the argument list (between `(` and `)`)
+5. For nested calls: the innermost `call` ancestor wins
+6. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node. Detect if operator is `::` or `:::` and set `is_internal` accordingly.
+7. Skip if cursor is inside a `string` node (no parameter completions inside string literals)
+8. If the AST walk fails to find a call (e.g., due to incomplete syntax), fall back to a bracket-based heuristic (nearest unmatched `(`, then token lookup before it), matching R-LS robustness
 
 ### 2. Parameter Resolver
 
@@ -195,7 +197,7 @@ impl<'a> ParameterResolver<'a> {
 
 **Resolution priority** (matches R-LS two-phase approach):
 1. **Cache**: Check signature cache first
-2. **Local AST**: Search current file for function definition, extract params from `formal_parameters` node
+2. **Local AST**: Search the current file for the nearest in-scope function definition that appears before the cursor, then extract params from its `formal_parameters` node (works for untitled/unsaved documents using in-memory text)
 3. **Cross-file**: Use cross-file scope to find function in sourced files
 4. **Package**: If namespace is provided (`dplyr::filter`), query `formals(dplyr::filter)` directly. Otherwise, use the scope resolver's position-aware package list (the same `loaded_packages` + `inherited_packages` used by the completion handler) to determine which packages are in scope at the cursor position, then check which of those packages exports the function. This ensures that when multiple packages export the same name, the one actually loaded at the cursor's position wins — not a global "most recently loaded" heuristic.
 
@@ -235,11 +237,11 @@ impl RSubprocess {
 R code for querying formals (tab-separated output, one param per line):
 ```r
 tryCatch({
-  # Use ::: if not exported_only, otherwise ::
-  # If package is NULL, use direct name
-  f <- if (is.null(pkg_name)) formals(func_name)
-       else if (exported_only) formals(getExportedValue(pkg_name, func_name))
-       else formals(get(func_name, envir = asNamespace(pkg_name)))
+  # Resolve function object first, then handle primitives via args()
+  fn <- if (is.null(pkg_name)) get(func_name, mode = "function")
+        else if (exported_only) getExportedValue(pkg_name, func_name)
+        else get(func_name, envir = asNamespace(pkg_name))
+  f <- if (is.primitive(fn)) formals(args(fn)) else formals(fn)
   
   if (is.null(f)) cat("")
   else for (name in names(f)) {
@@ -252,14 +254,14 @@ tryCatch({
 
 **Output parsing convention**: Each line is `name\tdefault\n`. An empty string after the tab (i.e., `name\t\n`) means the parameter has no default value — the parser should treat this as `default_value = None`, not as an empty-string default.
 
-### 4. Roxygen Comment Extraction (Shared Utility)
+### 4. Roxygen/Comment Extraction (Shared Utility)
 
 New module: `crates/raven/src/roxygen.rs`
 
-This module provides shared roxygen extraction used by both parameter documentation resolve (Requirement 7) and function documentation resolve (Requirement 8).
+This module provides shared comment extraction used by both parameter documentation resolve (Requirement 7) and function documentation resolve (Requirement 8). It parses roxygen2-style tags when present and falls back to plain comment text when not.
 
 ```rust
-/// Parsed roxygen block from `#'` comment lines above a function definition
+/// Parsed roxygen/comment block from the contiguous comment lines above a function definition
 #[derive(Debug, Clone)]
 pub struct RoxygenBlock {
     /// Title line (first non-tag line)
@@ -268,16 +270,18 @@ pub struct RoxygenBlock {
     pub description: Option<String>,
     /// @param entries: param_name -> description
     pub params: HashMap<String, String>,
+    /// Fallback markdown/text when no roxygen tags are present
+    pub fallback: Option<String>,
 }
 
 /// Extract roxygen comment block by scanning backward from a function definition line.
-/// Collects consecutive `#'` lines immediately above the function.
+/// Collects consecutive comment lines immediately above the function (`#'` preferred, `#` fallback).
 pub fn extract_roxygen_block(text: &str, func_line: u32) -> Option<RoxygenBlock>;
 
 /// Extract @param description for a specific parameter from a roxygen block.
 pub fn get_param_doc(block: &RoxygenBlock, param_name: &str) -> Option<String>;
 
-/// Get the function-level documentation (title + description) from a roxygen block.
+/// Get the function-level documentation (title + description, or fallback text).
 pub fn get_function_doc(block: &RoxygenBlock) -> Option<String>;
 ```
 
@@ -318,8 +322,8 @@ For user-defined function name completions (no `param_name`):
 The resolve handler inspects the `data` field of the completion item to determine which resolution path to use. Dispatch proceeds in this order:
 
 1. **Parameter completion** (has `param_name` in data):
-   - For package functions (has `package`): fetch R help text via `help_cache.get_or_fetch()`, then extract the `@param` description for that parameter name.
-   - For user-defined functions (has `uri` + `func_line`): locate the function definition, call `extract_roxygen_block()`, then `get_param_doc()`.
+   - For package functions (has `package`): fetch structured Rd arguments (or parse Rd `\\arguments`) via `help_cache`/help subsystem, then extract the argument description for that parameter name.
+   - For user-defined functions (has `uri` + `func_line`): locate the function definition, call `extract_roxygen_block()`, then `get_param_doc()` (roxygen2-style tags with fallback to plain comments).
    - If no documentation found, return the item unchanged.
 
 2. **User-defined function name completion** (has `func_line` but no `param_name`):
@@ -334,8 +338,8 @@ The resolve handler inspects the `data` field of the completion item to determin
 Note: The new `package` key in parameter completion data (step 1) has a different semantic from the existing `package` key in package export data (step 3). They are disambiguated by the presence of `param_name`.
 
 ```rust
-/// Extract @param description for a specific parameter from R help text
-fn extract_param_description(help_text: &str, param_name: &str) -> Option<String>;
+/// Extract parameter description for a specific argument from Rd/structured help
+fn extract_param_description(help_doc: &HelpDoc, param_name: &str) -> Option<String>;
 ```
 
 ### 6. Integration with Completion Handler
@@ -361,13 +365,16 @@ pub fn completion(
     let mut items = build_standard_completions(state, uri, position, tree, &text);
 
     // Check if inside function call — if so, prepend parameter completions
+    // Skip param completions if the current token is namespace-qualified (R-LS parity)
     let call_context = detect_function_call_context(tree, &text, position);
     if let Some(ctx) = call_context {
-        let param_items = get_parameter_completions(
-            state, uri, &ctx.function_name, ctx.namespace.as_deref(),
-            ctx.is_internal, &ctx.existing_params, position,
-        );
-        items.splice(0..0, param_items);
+        if token_accessor_is_empty {
+            let param_items = get_parameter_completions(
+                state, uri, &ctx.function_name, ctx.namespace.as_deref(),
+                ctx.is_internal, token, position,
+            );
+            items.splice(0..0, param_items);
+        }
     }
 
     Some(CompletionResponse::Array(items))
@@ -379,7 +386,7 @@ fn get_parameter_completions(
     function_name: &str,
     namespace: Option<&str>,
     is_internal: bool,
-    existing_params: &[String],
+    token: &str,
     position: Position,
 ) -> Vec<CompletionItem> {
     let resolver = ParameterResolver::new(state, &state.signature_cache);
@@ -402,14 +409,16 @@ fn get_parameter_completions(
 
     parameters.iter()
         .enumerate() // Capture index for stable sorting
-        .filter(|(_, p)| !p.is_dots)                          // Exclude ...
-        .filter(|(_, p)| !existing_params.contains(&p.name))  // Exclude already-specified
+        .filter(|(_, p)| match_with_case_insensitive_substring(&p.name, token))
         .map(|(idx, p)| {
-            let detail = p.default_value.as_ref().map(|d| format!("= {}", d));
+            let detail = Some(match p.default_value.as_ref() {
+                Some(d) => format!("parameter = {}", d), // optional enhancement
+                None => "parameter".to_string(),
+            });
             // Note: filter_text is intentionally omitted.
             CompletionItem {
                 label: p.name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
+                kind: Some(CompletionItemKind::VARIABLE),
                 detail,
                 insert_text: Some(format!("{} = ", p.name)),
                 // Sort by index (0-001, 0-002) to preserve definition order
@@ -426,6 +435,7 @@ fn get_parameter_completions(
 }
 ```
 
+**Matching rule**: Parameter filtering uses case-insensitive substring matching (same semantics as R-LS `match_with`), not strict prefix-only matching.
 **Backend threading model**: The `completion()` async wrapper in `backend.rs` must use `tokio::task::spawn_blocking` to wrap the parameter resolution path, since `resolve()` may block on R subprocess. The pattern is:
 
 1. Acquire WorldState read lock, collect standard completions and detect function call context (fast, non-blocking)
@@ -494,61 +504,67 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 
 **Validates: Requirements 4.1**
 
-### Property 4: Default Value Preservation
+### Property 4: Default Value Preservation (Optional Enhancement)
 
-*For any* function parameter with a default value (user-defined or package), the completion item's detail field SHALL contain the string representation of that default value.
+*For any* function parameter with a default value (user-defined or package), if the completion item includes a default in its detail, it SHALL match the parameter’s default value string representation.
 
 **Validates: Requirements 2.3, 4.3, 5.2**
 
-### Property 5: Dots Parameter Exclusion
+### Property 5: Dots Parameter Inclusion
 
-*For any* function with a `...` (dots) parameter, the parameter completions SHALL NOT include `...` as a completion item.
-
-**Validates: Requirements 4.4**
-
-### Property 6: Parameter Completion Formatting
-
-*For any* parameter completion item, the item SHALL have `kind = CompletionItemKind::FIELD`, `insert_text` ending with ` = `, and `sort_text` starting with `0-` followed by digits.
-
-**Validates: Requirements 5.1, 5.3, 5.6**
-
-### Property 7: Already-Specified Parameter Exclusion
-
-*For any* function call with some parameters already specified as named arguments, the parameter completions SHALL NOT include any parameter names that appear in the existing named arguments.
+*For any* function with a `...` (dots) parameter, the parameter completions SHALL include `...` as a completion item.
 
 **Validates: Requirements 5.5**
 
-### Property 8: Mixed Completions in Function Call Context
+### Property 6: Parameter Completion Formatting
+
+*For any* parameter completion item, the item SHALL have `kind = CompletionItemKind::VARIABLE`, `insert_text` ending with ` = `, and `sort_text` starting with `0-` followed by digits.
+
+**Validates: Requirements 5.1, 5.3, 5.6**
+
+### Property 7: Case-Insensitive Substring Matching
+
+*For any* typed token inside a function call, parameter completions SHALL include parameters whose names contain the token as a case-insensitive substring.
+
+**Validates: Requirements 5.4**
+
+### Property 8: Namespace-Qualified Token Suppression
+
+*For any* completion request where the current token uses a namespace accessor (`::` or `:::`), parameter completions SHALL be suppressed.
+
+**Validates: Requirements 6.5**
+
+### Property 9: Mixed Completions in Function Call Context
 
 *For any* function call context where parameter completions are available, the completion list SHALL contain both parameter items (with `"0-"` sort prefix) and standard completion items (keywords, local variables, package exports).
 
 **Validates: Requirements 6.1, 6.2**
 
-### Property 9: Cache Consistency
+### Property 10: Cache Consistency
 
 *For any* function signature inserted into the cache, subsequent lookups with the same key SHALL return the cached signature without invoking R subprocess.
 
 **Validates: Requirements 2.5, 3.4**
 
-### Property 10: R Subprocess Input Validation
+### Property 11: R Subprocess Input Validation
 
 *For any* function name containing characters outside `[a-zA-Z0-9._]` or starting with invalid characters, the R subprocess query methods SHALL reject the input without executing R code.
 
-**Validates: Requirements 9.2**
+**Validates: Requirements 10.2**
 
-### Property 11: Parameter Documentation Extraction
+### Property 12: Parameter Documentation Extraction
 
-*For any* R help text containing argument descriptions or roxygen comment block containing `@param name description`, the extraction function SHALL return the description for the specified parameter name.
+*For any* Rd help data containing `\\arguments` entries or roxygen2-style comment blocks containing `@param name description`, the extraction function SHALL return the description for the specified parameter name.
 
 **Validates: Requirements 7.2, 7.3**
 
-### Property 12: Cache Invalidation on File Change
+### Property 13: Cache Invalidation on File Change
 
 *For any* user-defined function signature in the cache, invalidating the file that defines it SHALL remove the signature from the cache so subsequent lookups return None.
 
 **Validates: Requirements 9.2**
 
-### Property 13: Roxygen Function Documentation Extraction
+### Property 14: Roxygen Function Documentation Extraction
 
 *For any* roxygen comment block containing a title line and/or `@description` tag above a function definition, the extraction function SHALL return the title and description as the function's documentation.
 
@@ -565,7 +581,7 @@ All caches use `RwLock` with `peek()` for reads (no LRU promotion under read loc
 
 ### AST Parsing Failures
 
-1. **Malformed Code**: If tree-sitter cannot parse, fall back to standard completions (no function call context detected).
+1. **Malformed Code**: If tree-sitter cannot parse, fall back to a bracket-based heuristic for call detection; if that fails, return standard completions (no parameter items).
 2. **Missing Nodes**: If expected AST nodes are missing (e.g., no `formal_parameters` child), return empty parameter list.
 3. **Invalid Position**: If cursor position is outside document bounds, return None.
 
@@ -579,8 +595,8 @@ Note: Non-timeout errors in AST parsing and cache operations are logged at trace
 ### Documentation Resolve Failures
 
 1. **No Help Text**: If R help text is unavailable for a package function, return the completion item without documentation.
-2. **No Roxygen**: If user-defined function has no roxygen comments, return the completion item without documentation.
-3. **Param Not Found**: If `@param` for the specific parameter name is not found in the help text, return the completion item without documentation.
+2. **No Comment Block**: If a user-defined function has no contiguous comment block (roxygen or plain), return the completion item without documentation.
+3. **Param Not Found**: If the argument name is not found in Rd `\\arguments` or roxygen tags, return the completion item without documentation.
 
 ## Out of Scope
 
@@ -591,8 +607,9 @@ The following are explicitly excluded from this spec and may be addressed in fol
 2. **Anonymous and lambda function calls**: Parameter completions do not fire for calls to anonymous functions (`(function(x, y) x + y)(1, )`) or R 4.1+ lambda syntax (`(\(x, y) x + y)(1, )`). The context detector only handles identifier and namespace-qualified callees.
 
 3. **Dollar-sign completions**: `list$` and `dataframe$` member completions are deferred to a separate follow-up spec.
+4. **Filtering out already-specified named arguments**: Not required for R-LS parity; may be added later as an enhancement.
 
-4. **Cross-session cache persistence**: Requirement 9.3 has been deferred (see requirements.md). The signature cache is in-memory only and rebuilt each session.
+5. **Cross-session cache persistence**: Requirement 9.3 has been deferred (see requirements.md). The signature cache is in-memory only and rebuilt each session.
 
 ## Testing Strategy
 
@@ -606,21 +623,26 @@ Unit tests verify specific examples and edge cases:
    - Namespace-qualified calls `dplyr::filter(df, )`
    - Cursor inside string literals (should not trigger)
    - Cursor outside parentheses (should not trigger)
+   - Incomplete syntax / unbalanced parentheses still finds the call
+   - R Markdown: inside R code block triggers; outside code block does not
 
 2. **Parameter Extraction**
    - Simple function `function(x, y)`
    - With defaults `function(x = 1, y = "hello")`
-   - With dots `function(...)` — dots excluded
-   - Mixed `function(x, y = 1, ...)` — only x and y appear
+   - With dots `function(...)` — includes `...`
+   - Mixed `function(x, y = 1, ...)` — includes `x`, `y`, and `...`
 
 3. **Mixed Completions**
    - Inside `filter(df, ` — verify both params and local vars present
    - Verify parameter items have `"0-"` sort prefix
    - Verify standard items retain their existing sort prefixes
+   - Case-insensitive substring matching (e.g., `OBJ` matches `object`)
+   - Namespace-qualified token suppression (e.g., `str(stats::o` yields no parameter items)
 
 4. **Parameter Documentation Resolve**
-   - Package function with `@param` in help text
+   - Package function with Rd `\\arguments` entry
    - User-defined function with roxygen `@param`
+   - User-defined function with plain `#` comments (fallback)
    - Missing documentation (graceful fallback)
 
 5. **Cache Behavior**
@@ -636,7 +658,7 @@ Property-based tests verify universal properties across generated inputs. Each t
 - Valid R function definitions with varying parameter counts and default values
 - Function calls with various argument patterns (named, positional, mixed)
 - Cursor positions within generated code
-- R help text and roxygen blocks with `@param` entries
+- Rd argument sections and roxygen blocks with `@param` entries (plus plain-comment fallbacks)
 
 **Tag Format**: Each property test is tagged with:
 `Feature: function-parameter-completions, Property N: [property description]`
@@ -657,3 +679,7 @@ Property-based tests verify universal properties across generated inputs. Each t
 
 4. **completionItem/resolve for Parameters**
    - Select a parameter completion, verify documentation is returned
+
+5. **Embedded-R / Untitled Documents**
+   - R Markdown: parameter completions appear only inside R code blocks
+   - Untitled document URIs: local function parameter completions still work
