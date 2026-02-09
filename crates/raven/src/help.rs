@@ -795,9 +795,22 @@ fn is_r_param_name(s: &str) -> bool {
     if s == "..." {
         return true;
     }
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    // R identifiers must start with a letter or dot (dot not followed by digit)
+    if !(first.is_alphabetic() || first == '.') {
+        return false;
+    }
+    if first == '.' {
+        if let Some(&next) = s.as_bytes().get(1) {
+            if next.is_ascii_digit() {
+                return false;
+            }
+        }
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '.' || c == '_')
 }
 
 /// Joins description parts into a single string, normalizing whitespace

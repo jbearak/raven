@@ -569,7 +569,9 @@ fn parse_function_token(token: &str) -> Option<FunctionCallContext> {
     }
 
     // Simple function name (no namespace)
-    if token.is_empty() || token.starts_with(':') {
+    // Reject empty tokens, tokens starting with ':', and tokens with stray
+    // colons that aren't part of valid ::/:::  (e.g., incomplete "pkg::")
+    if token.is_empty() || token.contains(':') {
         return None;
     }
 

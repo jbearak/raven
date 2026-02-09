@@ -33,7 +33,7 @@ pub fn extract_roxygen_block(text: &str, func_line: u32) -> Option<RoxygenBlock>
     let lines: Vec<&str> = text.lines().collect();
     let func_line = func_line as usize;
 
-    if func_line == 0 || func_line > lines.len() {
+    if func_line == 0 || func_line >= lines.len() {
         return None;
     }
 
