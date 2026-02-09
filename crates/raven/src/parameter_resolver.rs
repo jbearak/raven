@@ -48,8 +48,6 @@ pub enum SignatureSource {
 /// A resolved function signature with its parameters.
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
-    /// Function name
-    pub name: String,
     /// Ordered list of parameters
     pub parameters: Vec<ParameterInfo>,
     /// Where this signature was obtained from
@@ -340,7 +338,6 @@ pub fn resolve(
                 Ok(params) => {
                     // Success: build signature, cache it, and return
                     let signature = FunctionSignature {
-                        name: function_name.to_string(),
                         parameters: params,
                         source: SignatureSource::RSubprocess {
                             package: Some(pkg_name.clone()),
@@ -422,7 +419,6 @@ fn resolve_from_current_file(
     let def_line = func_node.start_position().row as u32;
 
     let sig = FunctionSignature {
-        name: function_name.to_string(),
         parameters,
         source: SignatureSource::CurrentFile {
             uri: uri.clone(),
@@ -488,7 +484,6 @@ fn resolve_from_cross_file(
     let parameters = extract_from_ast(params_node, &source_text);
 
     let sig = FunctionSignature {
-        name: function_name.to_string(),
         parameters,
         source: SignatureSource::CrossFile {
             uri: symbol.source_uri.clone(),
@@ -781,7 +776,6 @@ mod tests {
     fn test_cache_insert_and_get_package() {
         let cache = SignatureCache::new(10, 10);
         let sig = FunctionSignature {
-            name: "filter".to_string(),
             parameters: vec![ParameterInfo {
                 name: ".data".to_string(),
                 default_value: None,
@@ -794,14 +788,13 @@ mod tests {
         cache.insert_package("dplyr::filter".to_string(), sig.clone());
         let cached = cache.get_package("dplyr::filter");
         assert!(cached.is_some());
-        assert_eq!(cached.unwrap().name, "filter");
+        assert_eq!(cached.unwrap().parameters.len(), 1);
     }
 
     #[test]
     fn test_cache_insert_and_get_user() {
         let cache = SignatureCache::new(10, 10);
         let sig = FunctionSignature {
-            name: "my_func".to_string(),
             parameters: vec![],
             source: SignatureSource::CurrentFile {
                 uri: Url::parse("file:///test.R").unwrap(),
@@ -814,7 +807,7 @@ mod tests {
         );
         let cached = cache.get_user("file:///test.R#my_func");
         assert!(cached.is_some());
-        assert_eq!(cached.unwrap().name, "my_func");
+        assert!(cached.unwrap().parameters.is_empty());
     }
 
     #[test]
@@ -824,7 +817,6 @@ mod tests {
 
         // Insert two signatures from the same file
         let sig1 = FunctionSignature {
-            name: "func_a".to_string(),
             parameters: vec![],
             source: SignatureSource::CurrentFile {
                 uri: uri.clone(),
@@ -832,7 +824,6 @@ mod tests {
             },
         };
         let sig2 = FunctionSignature {
-            name: "func_b".to_string(),
             parameters: vec![],
             source: SignatureSource::CurrentFile {
                 uri: uri.clone(),
@@ -845,7 +836,6 @@ mod tests {
         // Insert a signature from a different file
         let other_uri = Url::parse("file:///project/other.R").unwrap();
         let sig3 = FunctionSignature {
-            name: "func_c".to_string(),
             parameters: vec![],
             source: SignatureSource::CurrentFile {
                 uri: other_uri.clone(),
@@ -889,7 +879,6 @@ mod tests {
 
         for i in 0..3 {
             let sig = FunctionSignature {
-                name: format!("func_{}", i),
                 parameters: vec![],
                 source: SignatureSource::RSubprocess { package: None },
             };
@@ -1560,7 +1549,6 @@ mod property_tests {
             // Build the signature to insert
             let signature = if use_package_cache {
                 FunctionSignature {
-                    name: func_name.clone(),
                     parameters: parameters.clone(),
                     source: SignatureSource::RSubprocess {
                         package: Some("testpkg".to_string()),
@@ -1568,7 +1556,6 @@ mod property_tests {
                 }
             } else {
                 FunctionSignature {
-                    name: func_name.clone(),
                     parameters: parameters.clone(),
                     source: SignatureSource::CurrentFile {
                         uri: Url::parse("file:///test/file.R").unwrap(),
@@ -1620,14 +1607,6 @@ mod property_tests {
                 key
             );
             let cached = cached.unwrap();
-
-            // Verify function name is preserved
-            prop_assert_eq!(
-                &cached.name,
-                &func_name,
-                "Cached function name mismatch for key: {}",
-                key
-            );
 
             // Verify parameter count is preserved
             prop_assert_eq!(
@@ -1736,7 +1715,6 @@ mod property_tests {
             for func_name in &func_names {
                 let key = format!("{}#{}", test_uri, func_name);
                 let signature = FunctionSignature {
-                    name: func_name.clone(),
                     parameters: parameters.clone(),
                     source: SignatureSource::CurrentFile {
                         uri: test_uri.clone(),
@@ -1750,7 +1728,6 @@ mod property_tests {
             // Insert a signature for a different file (should not be affected)
             let other_key = format!("{}#other_func", other_uri);
             let other_signature = FunctionSignature {
-                name: "other_func".to_string(),
                 parameters: parameters.clone(),
                 source: SignatureSource::CurrentFile {
                     uri: other_uri.clone(),
@@ -1796,9 +1773,7 @@ mod property_tests {
 
             // Verify re-insertion works after invalidation
             let first_key = &test_keys[0];
-            let first_name = &func_names[0];
             let re_signature = FunctionSignature {
-                name: first_name.clone(),
                 parameters: parameters.clone(),
                 source: SignatureSource::CurrentFile {
                     uri: test_uri.clone(),
