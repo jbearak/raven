@@ -21,7 +21,7 @@ Raven settings are available under the `raven.*` prefix in VS Code. Open **Setti
 
 ## Using with vscode-R
 
-To run R code, view plots, and access other interactive features, install the [vscode-R](https://github.com/REditorSupport/vscode-R) extension alongside Raven. You can leave both language servers enabled (vscode-R provides formatting diagnostics, Raven provides code diagnostics), or disable vscode-R's language server to avoid duplicate completions:
+To run R code, view plots, and access other interactive features, install the [vscode-R](https://github.com/REditorSupport/vscode-R) extension alongside Raven. You can leave the language language server that comes with vscode-R enabled (vscode-R provides formatting diagnostics, Raven provides code diagnostics), or disable vscode-R's language server to avoid duplicate completions:
 
 ```json
 "r.lsp.enabled": false
@@ -33,6 +33,10 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 ```json
 "editor.snippetSuggestions": "bottom"
 ```
+
+## Using with Sight (Stata)
+
+If you work with Stata, see [Sight](https://github.com/jbearak/sight)—a Stata language server with the same cross-file awareness model as Raven. The [Sight](https://marketplace.visualstudio.com/items?itemName=jbearak.sight) extension provides the language server plus syntax highlighting and code execution features.
 
 ## More Information
 
