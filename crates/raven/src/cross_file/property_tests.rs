@@ -21731,6 +21731,13 @@ proptest! {
         use tree_sitter::Parser;
         use tower_lsp::lsp_types::Url;
 
+        // Skip if the symbol name collides with filler variable names
+        let filler_names: Vec<String> = (0..directive_line)
+            .map(|i| format!("x{}", i))
+            .chain((0..3).map(|i| format!("y{}", i)))
+            .collect();
+        prop_assume!(!filler_names.contains(&symbol_name));
+
         // Build content with the directive at the specified line
         let mut lines: Vec<String> = (0..directive_line)
             .map(|i| format!("x{} <- {}", i, i))
@@ -21910,6 +21917,14 @@ proptest! {
         use super::scope::{compute_artifacts_with_metadata, scope_at_position};
         use tree_sitter::Parser;
         use tower_lsp::lsp_types::Url;
+
+        // Skip if the symbol name collides with filler variable names or the code variable
+        let filler_names: Vec<String> = (0..directive_line)
+            .map(|i| format!("x{}", i))
+            .chain((0..3).map(|i| format!("y{}", i)))
+            .collect();
+        prop_assume!(!filler_names.contains(&symbol_name));
+        prop_assume!(symbol_name != code_var_name);
 
         // Build content with code and directive on the same line
         let mut lines: Vec<String> = (0..directive_line)

@@ -5087,7 +5087,7 @@ fn collect_document_completions(
             let rhs = children[2];
 
             let op_text = node_text(op, text);
-            
+
             // Handle left-arrow assignments: name <- value
             if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
                 let name = node_text(lhs, text).to_string();
@@ -5125,7 +5125,7 @@ fn collect_document_completions(
                     });
                 }
             }
-            
+
             // Handle right-arrow assignments: value -> name
             if op_text == "->" && rhs.kind() == "identifier" {
                 let name = node_text(rhs, text).to_string();
@@ -5143,7 +5143,7 @@ fn collect_document_completions(
                             "type": "user_function",
                             "function_name": name,
                             "uri": uri.to_string(),
-                            "func_line": rhs.start_position().row as u32,
+                            "func_line": lhs.start_position().row as u32,
                         }))
                     } else {
                         None
@@ -6017,22 +6017,22 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 // Signature Help
 // ============================================================================
 
-/// Format a signature label from function name and parameters.
+/// Format a plain-text signature label from function name and parameters.
 ///
-/// Creates a formatted signature string in the form:
-/// - "function_name()" for no parameters
-/// - "function_name(x, y, z)" for parameters without defaults
-/// - "function_name(x = 1, y = TRUE)" for parameters with defaults
+/// Returns a plain-text string (no markdown) suitable for `SignatureInformation.label`:
+/// - `"func()"` for no parameters
+/// - `"func(\n  x,\n  y\n)"` for parameters without defaults
+/// - `"func(\n  x = 1,\n  y = TRUE\n)"` for parameters with defaults
 ///
 /// # Arguments
 /// * `name` - Function name
-/// * `params` - Vector of ParameterInfo from Parameter_Resolver
+/// * `params` - Vector of ParameterInfo from parameter resolver
 ///
 /// # Returns
-/// Formatted signature label string
+/// Plain-text signature label string
 fn format_signature_label(name: &str, params: &[crate::parameter_resolver::ParameterInfo]) -> String {
     if params.is_empty() {
-        return format!("```r\n{}()\n```", name);
+        return format!("{}()", name);
     }
 
     let param_strs: Vec<String> = params
@@ -6048,7 +6048,7 @@ fn format_signature_label(name: &str, params: &[crate::parameter_resolver::Param
 
     // Format with line breaks: one parameter per line
     let params_formatted = param_strs.join(",\n  ");
-    format!("```r\n{}(\n  {}\n)\n```", name, params_formatted)
+    format!("{}(\n  {}\n)", name, params_formatted)
 }
 
 /// Build LSP ParameterInformation for a single parameter.
@@ -6638,8 +6638,8 @@ fn build_fallback_signature(
     let (label, documentation) = if let Some(symbol) = scope.symbols.get(func_name) {
         let fallback = format!("{}(...)", func_name);
         let sig = symbol.signature.as_deref().unwrap_or(&fallback);
-        let label = format!("```r\n{}\n```", sig);
-        
+        let label = sig.to_string();
+
         let doc = if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -6658,10 +6658,10 @@ fn build_fallback_signature(
                 value: format!("defined in this file, line {}", symbol.defined_line + 1),
             }))
         };
-        
+
         (label, doc)
     } else {
-        (format!("```r\n{}(...)\n```", func_name), None)
+        (format!("{}(...)", func_name), None)
     };
 
     SignatureInformation {
@@ -16231,7 +16231,7 @@ y <- 2";
     fn test_format_signature_label_zero_parameters() {
         let params = vec![];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "```r\nfunc()\n```");
+        assert_eq!(result, "func()");
     }
 
     /// Test format_signature_label with single parameter
@@ -16244,7 +16244,7 @@ y <- 2";
             is_dots: false,
         }];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "```r\nfunc(\n  x\n)\n```");
+        assert_eq!(result, "func(\n  x\n)");
     }
 
     /// Test format_signature_label with parameters with defaults
@@ -16264,7 +16264,7 @@ y <- 2";
             },
         ];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "```r\nfunc(\n  x = 1,\n  y = TRUE\n)\n```");
+        assert_eq!(result, "func(\n  x = 1,\n  y = TRUE\n)");
     }
 
     /// Test format_signature_label with dots parameter
@@ -16284,7 +16284,7 @@ y <- 2";
             },
         ];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "```r\nfunc(\n  x,\n  ...\n)\n```");
+        assert_eq!(result, "func(\n  x,\n  ...\n)");
     }
 
     /// Test build_parameter_information without default
@@ -16632,10 +16632,10 @@ add <- function(x, y) { x + y }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "```r\nadd(\n  x,\n  y\n)\n```");
+        assert_eq!(sig.label, "add(\n  x,\n  y\n)");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.unwrap();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].label, ParameterLabel::Simple("x".to_string()));
@@ -16661,10 +16661,10 @@ multiply <- function(a, b) { a * b }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "```r\nmultiply(\n  a,\n  b\n)\n```");
+        assert_eq!(sig.label, "multiply(\n  a,\n  b\n)");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.unwrap();
         assert_eq!(params.len(), 2);
     }
@@ -16684,10 +16684,10 @@ divide <- function(x, y) { x / y }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "```r\ndivide(\n  x,\n  y\n)\n```");
+        assert_eq!(sig.label, "divide(\n  x,\n  y\n)");
         // Documentation may be None when no comments present
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.unwrap();
         assert_eq!(params.len(), 2);
     }
@@ -16708,10 +16708,10 @@ get_pi <- function() { 3.14159 }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "```r\nget_pi()\n```");
+        assert_eq!(sig.label, "get_pi()");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.unwrap();
         assert_eq!(params.len(), 0);
     }
@@ -16753,7 +16753,7 @@ greet <- function(name = "World", greeting = "Hello") {
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "```r\ngreet(\n  name = \"World\",\n  greeting = \"Hello\"\n)\n```");
+        assert_eq!(sig.label, "greet(\n  name = \"World\",\n  greeting = \"Hello\"\n)");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
         
@@ -16792,7 +16792,7 @@ result <- add(1, 2)"#;
         assert_eq!(sig_help.active_signature, Some(0));
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\nadd(\n  x,\n  y\n)\n```");
+        assert_eq!(sig.label, "add(\n  x,\n  y\n)");
         assert!(sig.parameters.is_some());
         
         let params = sig.parameters.as_ref().unwrap();
@@ -16823,7 +16823,7 @@ result <- add(1, 2)"#;
         
         let sig = &sig_help.signatures[0];
         // Should show fallback signature with function name
-        assert_eq!(sig.label, "```r\nundefined_func(...)\n```");
+        assert_eq!(sig.label, "undefined_func(...)");
         // Documentation should be None for truly undefined functions
         // (no symbol in scope)
         assert!(sig.documentation.is_none());
@@ -16890,7 +16890,7 @@ result <- helper(5)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\nhelper(\n  x\n)\n```");
+        assert_eq!(sig.label, "helper(\n  x\n)");
         // Documentation is optional (depends on roxygen comments)
         assert!(sig.parameters.is_some());
         let params = sig.parameters.as_ref().unwrap();
@@ -16919,7 +16919,7 @@ result <- multiply(3, 4)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\nmultiply(\n  x,\n  y\n)\n```");
+        assert_eq!(sig.label, "multiply(\n  x,\n  y\n)");
         // Should have documentation from roxygen comments
         assert!(sig.documentation.is_some());
         
@@ -16959,7 +16959,7 @@ result <- get_pi()"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\nget_pi()\n```");
+        assert_eq!(sig.label, "get_pi()");
         assert!(sig.parameters.is_some());
         
         let params = sig.parameters.as_ref().unwrap();
@@ -16987,7 +16987,7 @@ result <- greet("Alice")"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\ngreet(\n  name = \"World\",\n  greeting = \"Hello\"\n)\n```");
+        assert_eq!(sig.label, "greet(\n  name = \"World\",\n  greeting = \"Hello\"\n)");
         assert!(sig.parameters.is_some());
         
         let params = sig.parameters.as_ref().unwrap();
@@ -17057,7 +17057,7 @@ result <- add(multiply(2, 3), 5)"#;
         assert_eq!(sig_help_inner.signatures.len(), 1);
         
         let sig_inner = &sig_help_inner.signatures[0];
-        assert_eq!(sig_inner.label, "```r\nmultiply(\n  a,\n  b\n)\n```");
+        assert_eq!(sig_inner.label, "multiply(\n  a,\n  b\n)");
         // Active parameter should be 1 (second parameter, 0-indexed)
         assert_eq!(sig_help_inner.active_parameter, Some(1));
         
@@ -17092,7 +17092,7 @@ result <- add_numbers(1, 2)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\nadd_numbers(\n  x,\n  y\n)\n```");
+        assert_eq!(sig.label, "add_numbers(\n  x,\n  y\n)");
         
         // Should have documentation from roxygen
         assert!(sig.documentation.is_some(), "Should have documentation from roxygen");
@@ -17132,7 +17132,7 @@ result <- calculate(5)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "```r\ncalculate(\n  a,\n  b = 10\n)\n```");
+        assert_eq!(sig.label, "calculate(\n  a,\n  b = 10\n)");
         
         // Should have parameters even without roxygen
         assert!(sig.parameters.is_some(), "Should have parameters");
@@ -25023,53 +25023,48 @@ setClass("{}", slots = c(value = "numeric"))
             // Format the signature
             let label = format_signature_label(&func_name, &params);
 
-            // Extract the signature from markdown wrapper
-            let sig = label.strip_prefix("```r\n")
-                .and_then(|s| s.strip_suffix("\n```"))
-                .unwrap_or(&label);
-
             // Property 1: Signature should start with function name and opening paren
             prop_assert!(
-                sig.starts_with(&format!("{}(", func_name)),
+                label.starts_with(&format!("{}(", func_name)),
                 "Signature should start with '{}(' but got: {}",
                 func_name,
-                sig
+                label
             );
 
             // Property 2: Signature should end with closing paren
             prop_assert!(
-                sig.trim_end().ends_with(')'),
+                label.trim_end().ends_with(')'),
                 "Signature should end with ')' but got: {}",
-                sig
+                label
             );
 
             // Property 4: All parameters should be included
             for param in &params {
                 prop_assert!(
-                    sig.contains(&param.name),
+                    label.contains(&param.name),
                     "Signature should contain parameter '{}' but got: {}",
                     param.name,
-                    sig
+                    label
                 );
 
                 // Property 5: Parameters with defaults should show "param = default"
                 if let Some(default) = &param.default_value {
                     let expected = format!("{} = {}", param.name, default);
                     prop_assert!(
-                        sig.contains(&expected),
+                        label.contains(&expected),
                         "Signature should contain '{}' but got: {}",
                         expected,
-                        sig
+                        label
                     );
                 }
             }
 
-            // Property 6: Empty parameter list should produce "func()" wrapped in markdown
+            // Property 6: Empty parameter list should produce "func()"
             if params.is_empty() {
                 prop_assert_eq!(
                     &label,
-                    &format!("```r\n{}()\n```", func_name),
-                    "Empty parameter list should produce '{}()' wrapped in markdown but got: {}",
+                    &format!("{}()", func_name),
+                    "Empty parameter list should produce '{}()' but got: {}",
                     func_name,
                     &label
                 );
