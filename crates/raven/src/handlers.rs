@@ -4790,6 +4790,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
 
     // Add cross-file symbols (from scope resolution)
     // Requirement 9.5: Package exports > cross-file symbols
+    // Requirement 9.6: Function signatures SHALL appear in completion detail field
     for (name, symbol) in scope.symbols {
         if seen_names.contains(name.as_ref()) {
             continue; // Local definitions and package exports take precedence
@@ -4811,11 +4812,12 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             SORT_PREFIX_WORKSPACE
         };
 
-        // Add source file info to detail if from another file
-        let detail = if symbol.source_uri != *uri {
-            Some(format!("from {}", symbol.source_uri.path()))
-        } else {
-            None
+        // Use signature if available, otherwise show source file for cross-file symbols
+        let detail = match (&symbol.signature, symbol.source_uri != *uri) {
+            (Some(sig), true) => Some(format!("{} (from {})", sig, symbol.source_uri.path())),
+            (Some(sig), false) => Some(sig.clone()),
+            (None, true) => Some(format!("from {}", symbol.source_uri.path())),
+            (None, false) => None,
         };
 
         // For user-defined functions from cross-file scope, include data for
@@ -5055,6 +5057,19 @@ fn find_namespace_context<'a>(node: &Node<'a>, text: &'a str) -> Option<&'a str>
     }
 }
 
+/// Extract function signature for completion detail field.
+/// Returns a string like "function_name(x, y = 10)".
+fn extract_function_signature_for_completion(func_node: Node, name: &str, text: &str) -> String {
+    let mut cursor = func_node.walk();
+    for child in func_node.children(&mut cursor) {
+        if child.kind() == "parameters" {
+            let params = node_text(child, text);
+            return format!("{}{}", name, params);
+        }
+    }
+    format!("{}()", name)
+}
+
 fn collect_document_completions(
     node: Node,
     text: &str,
@@ -5072,15 +5087,19 @@ fn collect_document_completions(
             let rhs = children[2];
 
             let op_text = node_text(op, text);
+            
+            // Handle left-arrow assignments: name <- value
             if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
                 let name = node_text(lhs, text).to_string();
                 if !seen.contains(&name) {
                     seen.insert(name.clone());
                     // Align with R-LS: use FIELD for variables, FUNCTION for functions
-                    let kind = if rhs.kind() == "function_definition" {
-                        CompletionItemKind::FUNCTION
+                    let (kind, detail) = if rhs.kind() == "function_definition" {
+                        // Extract function signature for detail field
+                        let sig = extract_function_signature_for_completion(rhs, &name, text);
+                        (CompletionItemKind::FUNCTION, Some(sig))
                     } else {
-                        CompletionItemKind::FIELD
+                        (CompletionItemKind::FIELD, None)
                     };
 
                     // For user-defined functions, include data for completionItem/resolve
@@ -5099,6 +5118,41 @@ fn collect_document_completions(
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: Some(kind),
+                        detail,
+                        sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
+                        data,
+                        ..Default::default()
+                    });
+                }
+            }
+            
+            // Handle right-arrow assignments: value -> name
+            if op_text == "->" && rhs.kind() == "identifier" {
+                let name = node_text(rhs, text).to_string();
+                if !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    let (kind, detail) = if lhs.kind() == "function_definition" {
+                        let sig = extract_function_signature_for_completion(lhs, &name, text);
+                        (CompletionItemKind::FUNCTION, Some(sig))
+                    } else {
+                        (CompletionItemKind::FIELD, None)
+                    };
+
+                    let data = if kind == CompletionItemKind::FUNCTION {
+                        Some(serde_json::json!({
+                            "type": "user_function",
+                            "function_name": name,
+                            "uri": uri.to_string(),
+                            "func_line": rhs.start_position().row as u32,
+                        }))
+                    } else {
+                        None
+                    };
+
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(kind),
+                        detail,
                         sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
                         data,
                         ..Default::default()
@@ -5978,7 +6032,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 /// Formatted signature label string
 fn format_signature_label(name: &str, params: &[crate::parameter_resolver::ParameterInfo]) -> String {
     if params.is_empty() {
-        return format!("{}()", name);
+        return format!("```r\n{}()\n```", name);
     }
 
     let param_strs: Vec<String> = params
@@ -5992,7 +6046,9 @@ fn format_signature_label(name: &str, params: &[crate::parameter_resolver::Param
         })
         .collect();
 
-    format!("{}({})", name, param_strs.join(", "))
+    // Format with line breaks: one parameter per line
+    let params_formatted = param_strs.join(",\n  ");
+    format!("```r\n{}(\n  {}\n)\n```", name, params_formatted)
 }
 
 /// Build LSP ParameterInformation for a single parameter.
@@ -6579,8 +6635,12 @@ fn build_fallback_signature(
     uri: &Url,
     state: &WorldState,
 ) -> SignatureInformation {
-    let documentation = if let Some(symbol) = scope.symbols.get(func_name) {
-        if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+    let (label, documentation) = if let Some(symbol) = scope.symbols.get(func_name) {
+        let fallback = format!("{}(...)", func_name);
+        let sig = symbol.signature.as_deref().unwrap_or(&fallback);
+        let label = format!("```r\n{}\n```", sig);
+        
+        let doc = if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: format!("from `{}`", pkg),
@@ -6597,13 +6657,15 @@ fn build_fallback_signature(
                 kind: MarkupKind::Markdown,
                 value: format!("defined in this file, line {}", symbol.defined_line + 1),
             }))
-        }
+        };
+        
+        (label, doc)
     } else {
-        None
+        (format!("```r\n{}(...)\n```", func_name), None)
     };
 
     SignatureInformation {
-        label: format!("{}(...)", func_name),
+        label,
         documentation,
         parameters: None,
         active_parameter: None,
@@ -9920,6 +9982,69 @@ x <- "#;
                     func_items[0].kind,
                     Some(CompletionItemKind::FUNCTION),
                     "Declared function should have FUNCTION kind"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that user-defined functions show their signatures in completion detail.
+    /// Validates: Requirement 9.6 - Function signatures in completion detail
+    #[test]
+    fn test_completion_user_function_signature() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionItemKind, CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Create a document with a user-defined function
+            let code = r#"my_func <- function(x, y = 10) { x + y }
+result <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Get completions at the end of the file (after "result <- ")
+            let position = Position::new(1, 10);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some(), "Should return completions");
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find the user function completion item
+                let func_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "my_func")
+                    .collect();
+
+                assert!(
+                    !func_items.is_empty(),
+                    "User function 'my_func' should appear in completions"
+                );
+
+                let func_item = func_items[0];
+                
+                // Should have FUNCTION kind
+                assert_eq!(
+                    func_item.kind,
+                    Some(CompletionItemKind::FUNCTION),
+                    "User function should have CompletionItemKind::FUNCTION"
+                );
+
+                // Should have signature in detail field
+                assert!(
+                    func_item.detail.is_some(),
+                    "User function should have detail field with signature"
+                );
+                
+                let detail = func_item.detail.as_ref().unwrap();
+                assert!(
+                    detail.contains("my_func") && detail.contains("(x, y = 10)"),
+                    "Detail should contain function signature, got: {}",
+                    detail
                 );
             } else {
                 panic!("Expected CompletionResponse::Array");
@@ -16106,7 +16231,7 @@ y <- 2";
     fn test_format_signature_label_zero_parameters() {
         let params = vec![];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "func()");
+        assert_eq!(result, "```r\nfunc()\n```");
     }
 
     /// Test format_signature_label with single parameter
@@ -16119,7 +16244,7 @@ y <- 2";
             is_dots: false,
         }];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "func(x)");
+        assert_eq!(result, "```r\nfunc(\n  x\n)\n```");
     }
 
     /// Test format_signature_label with parameters with defaults
@@ -16139,7 +16264,7 @@ y <- 2";
             },
         ];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "func(x = 1, y = TRUE)");
+        assert_eq!(result, "```r\nfunc(\n  x = 1,\n  y = TRUE\n)\n```");
     }
 
     /// Test format_signature_label with dots parameter
@@ -16159,7 +16284,7 @@ y <- 2";
             },
         ];
         let result = format_signature_label("func", &params);
-        assert_eq!(result, "func(x, ...)");
+        assert_eq!(result, "```r\nfunc(\n  x,\n  ...\n)\n```");
     }
 
     /// Test build_parameter_information without default
@@ -16507,7 +16632,7 @@ add <- function(x, y) { x + y }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "add(x, y)");
+        assert_eq!(sig.label, "```r\nadd(\n  x,\n  y\n)\n```");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
         
@@ -16536,7 +16661,7 @@ multiply <- function(a, b) { a * b }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "multiply(a, b)");
+        assert_eq!(sig.label, "```r\nmultiply(\n  a,\n  b\n)\n```");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
         
@@ -16559,7 +16684,7 @@ divide <- function(x, y) { x / y }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "divide(x, y)");
+        assert_eq!(sig.label, "```r\ndivide(\n  x,\n  y\n)\n```");
         // Documentation may be None when no comments present
         assert!(sig.parameters.is_some());
         
@@ -16583,7 +16708,7 @@ get_pi <- function() { 3.14159 }
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "get_pi()");
+        assert_eq!(sig.label, "```r\nget_pi()\n```");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
         
@@ -16628,7 +16753,7 @@ greet <- function(name = "World", greeting = "Hello") {
         
         assert!(result.is_some());
         let sig = result.unwrap();
-        assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
+        assert_eq!(sig.label, "```r\ngreet(\n  name = \"World\",\n  greeting = \"Hello\"\n)\n```");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
         
@@ -16667,7 +16792,7 @@ result <- add(1, 2)"#;
         assert_eq!(sig_help.active_signature, Some(0));
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "add(x, y)");
+        assert_eq!(sig.label, "```r\nadd(\n  x,\n  y\n)\n```");
         assert!(sig.parameters.is_some());
         
         let params = sig.parameters.as_ref().unwrap();
@@ -16698,7 +16823,7 @@ result <- add(1, 2)"#;
         
         let sig = &sig_help.signatures[0];
         // Should show fallback signature with function name
-        assert_eq!(sig.label, "undefined_func(...)");
+        assert_eq!(sig.label, "```r\nundefined_func(...)\n```");
         // Documentation should be None for truly undefined functions
         // (no symbol in scope)
         assert!(sig.documentation.is_none());
@@ -16765,7 +16890,7 @@ result <- helper(5)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "helper(x)");
+        assert_eq!(sig.label, "```r\nhelper(\n  x\n)\n```");
         // Documentation is optional (depends on roxygen comments)
         assert!(sig.parameters.is_some());
         let params = sig.parameters.as_ref().unwrap();
@@ -16794,7 +16919,7 @@ result <- multiply(3, 4)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "multiply(x, y)");
+        assert_eq!(sig.label, "```r\nmultiply(\n  x,\n  y\n)\n```");
         // Should have documentation from roxygen comments
         assert!(sig.documentation.is_some());
         
@@ -16834,7 +16959,7 @@ result <- get_pi()"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "get_pi()");
+        assert_eq!(sig.label, "```r\nget_pi()\n```");
         assert!(sig.parameters.is_some());
         
         let params = sig.parameters.as_ref().unwrap();
@@ -16862,7 +16987,7 @@ result <- greet("Alice")"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
+        assert_eq!(sig.label, "```r\ngreet(\n  name = \"World\",\n  greeting = \"Hello\"\n)\n```");
         assert!(sig.parameters.is_some());
         
         let params = sig.parameters.as_ref().unwrap();
@@ -16899,7 +17024,7 @@ result <- mean(x)"#;
         // 1. Rich signature with parameters if help text is available
         // 2. Fallback signature "mean(...)" if help unavailable or function not recognized
         // Both are acceptable - the important thing is that signature help works
-        if sig.label != "mean(...)" {
+        if !sig.label.contains("mean(...)") {
             // Rich signature case - should have parameters
             assert!(sig.parameters.is_some(), "Rich signature should have parameters");
             if let Some(params) = &sig.parameters {
@@ -16932,7 +17057,7 @@ result <- add(multiply(2, 3), 5)"#;
         assert_eq!(sig_help_inner.signatures.len(), 1);
         
         let sig_inner = &sig_help_inner.signatures[0];
-        assert_eq!(sig_inner.label, "multiply(a, b)");
+        assert_eq!(sig_inner.label, "```r\nmultiply(\n  a,\n  b\n)\n```");
         // Active parameter should be 1 (second parameter, 0-indexed)
         assert_eq!(sig_help_inner.active_parameter, Some(1));
         
@@ -16967,7 +17092,7 @@ result <- add_numbers(1, 2)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "add_numbers(x, y)");
+        assert_eq!(sig.label, "```r\nadd_numbers(\n  x,\n  y\n)\n```");
         
         // Should have documentation from roxygen
         assert!(sig.documentation.is_some(), "Should have documentation from roxygen");
@@ -17007,7 +17132,7 @@ result <- calculate(5)"#;
         assert_eq!(sig_help.signatures.len(), 1);
         
         let sig = &sig_help.signatures[0];
-        assert_eq!(sig.label, "calculate(a, b = 10)");
+        assert_eq!(sig.label, "```r\ncalculate(\n  a,\n  b = 10\n)\n```");
         
         // Should have parameters even without roxygen
         assert!(sig.parameters.is_some(), "Should have parameters");
@@ -24898,55 +25023,53 @@ setClass("{}", slots = c(value = "numeric"))
             // Format the signature
             let label = format_signature_label(&func_name, &params);
 
-            // Property 1: Label should start with function name and opening paren
+            // Extract the signature from markdown wrapper
+            let sig = label.strip_prefix("```r\n")
+                .and_then(|s| s.strip_suffix("\n```"))
+                .unwrap_or(&label);
+
+            // Property 1: Signature should start with function name and opening paren
             prop_assert!(
-                label.starts_with(&format!("{}(", func_name)),
-                "Label should start with '{}(' but got: {}",
+                sig.starts_with(&format!("{}(", func_name)),
+                "Signature should start with '{}(' but got: {}",
                 func_name,
-                label
+                sig
             );
 
-            // Property 2: Label should end with closing paren
+            // Property 2: Signature should end with closing paren
             prop_assert!(
-                label.ends_with(')'),
-                "Label should end with ')' but got: {}",
-                label
-            );
-
-            // Property 3: Label should be on a single line (no newlines)
-            prop_assert!(
-                !label.contains('\n'),
-                "Label should be on a single line but got: {}",
-                label
+                sig.trim_end().ends_with(')'),
+                "Signature should end with ')' but got: {}",
+                sig
             );
 
             // Property 4: All parameters should be included
             for param in &params {
                 prop_assert!(
-                    label.contains(&param.name),
-                    "Label should contain parameter '{}' but got: {}",
+                    sig.contains(&param.name),
+                    "Signature should contain parameter '{}' but got: {}",
                     param.name,
-                    label
+                    sig
                 );
 
                 // Property 5: Parameters with defaults should show "param = default"
                 if let Some(default) = &param.default_value {
                     let expected = format!("{} = {}", param.name, default);
                     prop_assert!(
-                        label.contains(&expected),
-                        "Label should contain '{}' but got: {}",
+                        sig.contains(&expected),
+                        "Signature should contain '{}' but got: {}",
                         expected,
-                        label
+                        sig
                     );
                 }
             }
 
-            // Property 6: Empty parameter list should produce "func()"
+            // Property 6: Empty parameter list should produce "func()" wrapped in markdown
             if params.is_empty() {
                 prop_assert_eq!(
                     &label,
-                    &format!("{}()", func_name),
-                    "Empty parameter list should produce '{}()' but got: {}",
+                    &format!("```r\n{}()\n```", func_name),
+                    "Empty parameter list should produce '{}()' wrapped in markdown but got: {}",
                     func_name,
                     &label
                 );
