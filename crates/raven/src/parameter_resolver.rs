@@ -48,7 +48,8 @@ pub enum SignatureSource {
 /// A resolved function signature with its parameters.
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
-    /// Function name
+    /// Function name (read in tests; production code uses the cache key)
+    #[allow(dead_code)]
     pub name: String,
     /// Ordered list of parameters
     pub parameters: Vec<ParameterInfo>,
