@@ -1,7 +1,7 @@
 {
   "name": "raven",
   "displayName": "Raven - R Language Server",
-  "description": "Static R language support with workspace symbol indexing",
+  "description": "Static R language server with cross-file awareness",
   "version": "0.1.0",
   "publisher": "jbearak",
   "license": "GPL-3.0",
