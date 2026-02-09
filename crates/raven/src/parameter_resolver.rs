@@ -496,9 +496,10 @@ fn resolve_from_cross_file(
         },
     };
 
-    // Cache the result under the source file's key (not the caller's URI)
-    // so that invalidation by source file works correctly.
-    let cache_key = format!("{}#{}", symbol.source_uri.as_str(), function_name);
+    // Cache under the caller's URI so the lookup in resolve() (which uses
+    // current_uri) gets a cache hit. Invalidation by source file is handled
+    // by invalidate_file() which checks SignatureSource for source URI matches.
+    let cache_key = format!("{}#{}", uri.as_str(), function_name);
     cache.insert_user(cache_key, sig.clone());
 
     Some(sig)

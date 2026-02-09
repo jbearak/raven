@@ -55,7 +55,7 @@ When a completion request arrives:
 3. **Token detection**: detect the token at cursor and check for namespace accessor (`::` or `:::`). This happens BEFORE call detection (matching R-LS ordering where `detect_token()` precedes `detect_call()`).
 4. **No special-case suppression for library/require**: the official R-LS does NOT suppress parameter completions for `library()` or `require()`. It shows both parameter completions (from `arg_completion`) and installed package names (from `package_completion`, which runs for all tokens). Raven matches this: parameter completions are always additive when inside a function call, even for library/require.
 5. **Standard completions** are always collected (keywords, constants, document symbols, package exports, cross-file symbols) — this is the existing `completion()` logic.
-6. **Namespace-token suppression**: if the token from step 3 has a namespace accessor (`::`/`:::`), skip call detection and parameter completions entirely. Only namespace completions are shown. (This is how R-LS works: `detect_call()` is never invoked when an accessor is present.)
+6. **Namespace-token suppression**: if the token from step 3 has a namespace accessor (`::`/`:::`), skip parameter completions (call detection still runs but its result is not used for parameter retrieval). Only namespace completions are shown alongside standard completions.
 7. **Function call context** is checked via AST walk (with string-aware bracket-heuristic fallback). If detected, proceed; otherwise return standard completions only.
 8. **Parameter completions** are prepended to the standard list with `"0-"` sort prefix when eligible.
 
