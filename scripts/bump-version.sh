@@ -4,11 +4,14 @@ set -e
 # Release script: bumps version, commits, tags, and pushes.
 #
 # Usage:
-#   ./scripts/bump-version.sh <version>
+#   ./scripts/bump-version.sh [patch|minor|major|<version>]
 #
 # Examples:
-#   ./scripts/bump-version.sh 0.2.0
-#   ./scripts/bump-version.sh 1.0.0-beta.1
+#   ./scripts/bump-version.sh           # patch bump (default): 0.1.0 -> 0.1.1
+#   ./scripts/bump-version.sh patch     # same as above
+#   ./scripts/bump-version.sh minor     # 0.1.1 -> 0.2.0
+#   ./scripts/bump-version.sh major     # 0.2.0 -> 1.0.0
+#   ./scripts/bump-version.sh 2.0.0     # explicit version
 #
 # This script will:
 #   1. Validate the working directory is clean
@@ -24,20 +27,57 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
-    echo "Usage: $0 <version>"
+    echo "Usage: $0 [patch|minor|major|<version>]"
     echo ""
-    echo "  version   Semantic version (e.g., 0.2.0 or 1.0.0-beta.1)"
+    echo "  patch     Bump patch version (default): 0.1.0 -> 0.1.1"
+    echo "  minor     Bump minor version: 0.1.1 -> 0.2.0"
+    echo "  major     Bump major version: 0.2.0 -> 1.0.0"
+    echo "  <version> Explicit semver (e.g., 2.0.0 or 1.0.0-beta.1)"
     echo ""
     echo "Examples:"
-    echo "  $0 0.2.0"
+    echo "  $0"
+    echo "  $0 patch"
+    echo "  $0 minor"
     echo "  $0 1.0.0"
     exit 1
 }
 
-VERSION="$1"
-if [ -z "$VERSION" ]; then
+# Read current version from [workspace.package] in Cargo.toml
+VERSION_MATCHES=$(grep -c '^version = ' "$REPO_ROOT/Cargo.toml")
+if [ "$VERSION_MATCHES" -ne 1 ]; then
+    echo "ERROR: Expected exactly 1 top-level 'version = ' line in Cargo.toml, found $VERSION_MATCHES."
+    echo "The Cargo.toml structure may have changed — update this script's version extraction."
+    exit 1
+fi
+CURRENT_VERSION=$(grep '^version = ' "$REPO_ROOT/Cargo.toml" | sed 's/version = "\(.*\)"/\1/')
+if [ -z "$CURRENT_VERSION" ]; then
+    echo "ERROR: Could not read current version from Cargo.toml"
+    exit 1
+fi
+
+BUMP="${1:-patch}"
+
+if [ "$BUMP" = "--help" ] || [ "$BUMP" = "-h" ]; then
     usage
 fi
+
+case "$BUMP" in
+    patch)
+        IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
+        VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+        ;;
+    minor)
+        IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
+        VERSION="$MAJOR.$((MINOR + 1)).0"
+        ;;
+    major)
+        IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
+        VERSION="$((MAJOR + 1)).0.0"
+        ;;
+    *)
+        VERSION="$BUMP"
+        ;;
+esac
 
 # Validate version format
 if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then

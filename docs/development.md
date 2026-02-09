@@ -51,6 +51,38 @@ Typical flow:
 - `cargo build --release -p raven`
 - `python3 scripts/profile_startup.py`
 
+## Releasing
+
+### Version bump and tag
+
+Use the bump script to update versions, commit, tag, and push:
+
+```bash
+./scripts/bump-version.sh           # patch bump (default): 0.1.0 -> 0.1.1
+./scripts/bump-version.sh patch     # same as above
+./scripts/bump-version.sh minor     # 0.1.1 -> 0.2.0
+./scripts/bump-version.sh major     # 0.2.0 -> 1.0.0
+./scripts/bump-version.sh 2.0.0     # explicit version
+```
+
+This updates `Cargo.toml` (workspace version) and `editors/vscode/package.json`, commits the change, creates a git tag, and pushes both.
+
+### CI build
+
+Pushing the tag triggers `release-build.yml`, which:
+1. Cross-compiles the `raven` binary for 6 platforms (linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64, windows-arm64)
+2. Packages a platform-specific `.vsix` for each target (the binary is embedded in `bin/`)
+
+### Publishing
+
+After the build succeeds, manually run `release-publish.yml` from GitHub Actions:
+1. Enter the tag (e.g., `v0.2.0`)
+2. Optionally check "Publish to VS Code Marketplace and Open VSX"
+
+This creates a GitHub Release with all binaries and `.vsix` files. If marketplace publishing is enabled, it uploads each platform `.vsix` to both VS Code Marketplace and Open VSX.
+
+**Required secrets** (for marketplace publishing): `VSCE_PAT`, `OVSX_PAT`.
+
 ## Cross-file internals (high-level)
 
 Cross-file awareness is implemented under `crates/raven/src/cross_file/`.
