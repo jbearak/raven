@@ -6006,11 +6006,10 @@ fn build_parameter_information(
 /// # Arguments
 /// * `call_node` - The tree-sitter call node
 /// * `cursor_point` - Current cursor position
-/// * `text` - Source text
 ///
 /// # Returns
 /// Index of the active parameter (0-based), or None if cannot determine
-fn detect_active_parameter(call_node: Node, cursor_point: Point, _text: &str) -> Option<u32> {
+fn detect_active_parameter(call_node: Node, cursor_point: Point) -> Option<u32> {
     // Count commas in the entire call node that appear before the cursor
     let mut comma_count = 0;
     
@@ -6034,9 +6033,13 @@ fn detect_active_parameter(call_node: Node, cursor_point: Point, _text: &str) ->
             }
         }
 
-        // Recursively check children
+        // Recursively check children, but skip nested comma-bearing nodes
+        // (calls, subset `[`, subset2 `[[`) to avoid counting their commas
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
+            if matches!(child.kind(), "call" | "subset" | "subset2") {
+                continue;
+            }
             count_commas_recursive(child, cursor_point, comma_count);
         }
     }
@@ -6178,9 +6181,19 @@ fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::Par
     let mut paren_depth: usize = 0;
     let mut in_quotes = false;
     let mut quote_char = ' ';
+    let mut skip_next = false;
 
     for ch in params_str.chars() {
+        if skip_next {
+            current_param.push(ch);
+            skip_next = false;
+            continue;
+        }
         match ch {
+            '\\' if in_quotes => {
+                current_param.push(ch);
+                skip_next = true;
+            }
             '"' | '\'' if !in_quotes => {
                 in_quotes = true;
                 quote_char = ch;
@@ -6244,9 +6257,17 @@ fn parse_single_param(param_str: &str) -> crate::parameter_resolver::ParameterIn
     let eq_pos = {
         let mut in_quotes = false;
         let mut quote_char = ' ';
+        let mut skip_next = false;
         let mut pos = None;
         for (i, ch) in trimmed.char_indices() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
             match ch {
+                '\\' if in_quotes => {
+                    skip_next = true;
+                }
                 '"' | '\'' if !in_quotes => {
                     in_quotes = true;
                     quote_char = ch;
@@ -6375,7 +6396,36 @@ fn try_build_user_signature(
 
 
 
-pub async fn signature_help(state: &WorldState, uri: &Url, position: Position) -> Option<SignatureHelp> {
+/// What async work (if any) is needed to complete signature help.
+enum SignatureResolution {
+    /// Package function — needs async help fetch.
+    Package {
+        help_cache: crate::help::HelpCache,
+        func_name: String,
+        package_name: String,
+        /// Pre-built fallback used when async package lookup returns `None`.
+        fallback: SignatureInformation,
+    },
+    /// Already resolved (user function or fallback).
+    Ready(SignatureInformation),
+}
+
+/// Sync-phase result: everything needed to build `SignatureHelp` without `&WorldState`.
+pub struct SignatureHelpContext {
+    active_parameter: Option<u32>,
+    resolution: SignatureResolution,
+}
+
+/// Synchronous phase of signature help: extracts call context, resolves scope,
+/// and determines whether async work is needed.
+///
+/// Call this under a read lock, then release the lock before calling
+/// [`resolve_signature_help`].
+pub fn prepare_signature_help(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<SignatureHelpContext> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -6404,21 +6454,35 @@ pub async fn signature_help(state: &WorldState, uri: &Url, position: Position) -
     let func_name = node_text(func_node, &text);
 
     // Determine if package or user function using cross-file scope
-    // Get the scope at the cursor position
     let scope = get_cross_file_scope(state, uri, position.line, position.character);
 
-    // Try to build rich signature
-    let signature_info = if let Some(symbol) = scope.symbols.get(func_name) {
-        // Check if this is a package function (source_uri starts with "package:")
-        if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
-            // Package function: call try_build_package_signature()
-            try_build_package_signature(&state.help_cache, func_name, pkg).await
-        } else {
-            // User function: call try_build_user_signature()
+    /// Try user signature, falling back to a minimal signature with source attribution.
+    fn resolve_user_or_fallback(
+        state: &WorldState,
+        func_name: &str,
+        uri: &Url,
+        position: Position,
+        scope: &scope::ScopeAtPosition,
+    ) -> SignatureResolution {
+        SignatureResolution::Ready(
             try_build_user_signature(state, func_name, uri, position)
+                .unwrap_or_else(|| build_fallback_signature(func_name, scope, uri, state)),
+        )
+    }
+
+    // Determine resolution strategy
+    let resolution = if let Some(symbol) = scope.symbols.get(func_name) {
+        if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+            SignatureResolution::Package {
+                help_cache: state.help_cache.clone(),
+                func_name: func_name.to_string(),
+                package_name: pkg.to_string(),
+                fallback: build_fallback_signature(func_name, &scope, uri, state),
+            }
+        } else {
+            resolve_user_or_fallback(state, func_name, uri, position, &scope)
         }
     } else if state.cross_file_config.packages_enabled {
-        // Check package exports from combined_exports cache
         let all_packages: Vec<String> = scope
             .inherited_packages
             .iter()
@@ -6430,62 +6494,90 @@ pub async fn signature_help(state: &WorldState, uri: &Url, position: Position) -
             .package_library
             .find_package_for_symbol(func_name, &all_packages)
         {
-            // Package function: call try_build_package_signature()
-            try_build_package_signature(&state.help_cache, func_name, &pkg_name).await
+            SignatureResolution::Package {
+                help_cache: state.help_cache.clone(),
+                func_name: func_name.to_string(),
+                package_name: pkg_name,
+                fallback: build_fallback_signature(func_name, &scope, uri, state),
+            }
         } else {
-            // Try user function as fallback
-            try_build_user_signature(state, func_name, uri, position)
+            resolve_user_or_fallback(state, func_name, uri, position, &scope)
         }
     } else {
-        // Try user function as fallback
-        try_build_user_signature(state, func_name, uri, position)
+        resolve_user_or_fallback(state, func_name, uri, position, &scope)
     };
 
     // Detect active parameter
-    let active_param = detect_active_parameter(call_node, point, &text);
+    let active_param = detect_active_parameter(call_node, point);
 
-    // Build SignatureHelp with signature and active parameter
-    let signature_info = signature_info.unwrap_or_else(|| {
-        // Handle fallback: function name with source attribution
-        let documentation = if let Some(symbol) = scope.symbols.get(func_name) {
-            // Determine source attribution
-            if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
-                Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("from `{}`", pkg),
-                }))
-            } else if symbol.source_uri != *uri {
-                // Cross-file user function
-                let workspace_root = state.workspace_folders.first();
-                let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
-                Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("defined in `{}`", relative_path),
-                }))
-            } else {
-                // Same file
-                Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("defined in this file, line {}", symbol.defined_line + 1),
-                }))
-            }
-        } else {
-            None
-        };
+    Some(SignatureHelpContext {
+        active_parameter: active_param,
+        resolution,
+    })
+}
 
-        SignatureInformation {
-            label: format!("{}(...)", func_name),
-            documentation,
-            parameters: None,
-            active_parameter: None,
+/// Async phase of signature help: performs R subprocess work (if needed)
+/// and assembles the final `SignatureHelp`.
+///
+/// Does **not** require `&WorldState` — call after releasing the read lock.
+pub async fn resolve_signature_help(ctx: SignatureHelpContext) -> Option<SignatureHelp> {
+    let signature_info = match ctx.resolution {
+        SignatureResolution::Package {
+            help_cache,
+            func_name,
+            package_name,
+            fallback,
+        } => {
+            let sig =
+                try_build_package_signature(&help_cache, &func_name, &package_name).await;
+            sig.unwrap_or(fallback)
         }
-    });
+        SignatureResolution::Ready(sig) => sig,
+    };
 
     Some(SignatureHelp {
         signatures: vec![signature_info],
         active_signature: Some(0),
-        active_parameter: active_param,
+        active_parameter: ctx.active_parameter,
     })
+}
+
+/// Build a minimal fallback `SignatureInformation` with source attribution.
+fn build_fallback_signature(
+    func_name: &str,
+    scope: &scope::ScopeAtPosition,
+    uri: &Url,
+    state: &WorldState,
+) -> SignatureInformation {
+    let documentation = if let Some(symbol) = scope.symbols.get(func_name) {
+        if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("from `{}`", pkg),
+            }))
+        } else if symbol.source_uri != *uri {
+            let workspace_root = state.workspace_folders.first();
+            let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("defined in `{}`", relative_path),
+            }))
+        } else {
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("defined in this file, line {}", symbol.defined_line + 1),
+            }))
+        }
+    } else {
+        None
+    };
+
+    SignatureInformation {
+        label: format!("{}(...)", func_name),
+        documentation,
+        parameters: None,
+        active_parameter: None,
+    }
 }
 
 // ============================================================================
@@ -16109,10 +16201,10 @@ y <- 2";
         let code = "mean(x";
         let tree = parse_r_code(code);
         let call_node = tree.root_node().child(0).unwrap();
-        
+
         // Cursor is after "x" (position 6)
         let cursor_point = Point::new(0, 6);
-        let result = detect_active_parameter(call_node, cursor_point, code);
+        let result = detect_active_parameter(call_node, cursor_point);
         
         assert_eq!(result, Some(0));
     }
@@ -16124,10 +16216,10 @@ y <- 2";
         let code = "mean(x, y";
         let tree = parse_r_code(code);
         let call_node = tree.root_node().child(0).unwrap();
-        
+
         // Cursor is after "y" (position 9)
         let cursor_point = Point::new(0, 9);
-        let result = detect_active_parameter(call_node, cursor_point, code);
+        let result = detect_active_parameter(call_node, cursor_point);
         
         assert_eq!(result, Some(1));
     }
@@ -16139,10 +16231,10 @@ y <- 2";
         let code = "func(a, b, c";
         let tree = parse_r_code(code);
         let call_node = tree.root_node().child(0).unwrap();
-        
+
         // Cursor is after "c" (position 12)
         let cursor_point = Point::new(0, 12);
-        let result = detect_active_parameter(call_node, cursor_point, code);
+        let result = detect_active_parameter(call_node, cursor_point);
         
         assert_eq!(result, Some(2));
     }
@@ -16154,12 +16246,74 @@ y <- 2";
         let code = "mean(";
         let tree = parse_r_code(code);
         let call_node = tree.root_node().child(0).unwrap();
-        
+
         // Cursor is right after opening paren (position 5)
         let cursor_point = Point::new(0, 5);
-        let result = detect_active_parameter(call_node, cursor_point, code);
+        let result = detect_active_parameter(call_node, cursor_point);
         
         assert_eq!(result, Some(0));
+    }
+
+    /// Test detect_active_parameter skips commas inside nested calls.
+    /// For `add(multiply(2, 3), 5)` with cursor at `5`, the active
+    /// parameter of the outer call should be 1, not 2.
+    #[test]
+    fn test_detect_active_parameter_nested_call() {
+        let code = "add(multiply(2, 3), 5";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+
+        // Cursor is after "5" (position 21)
+        let cursor_point = Point::new(0, 21);
+        let result = detect_active_parameter(call_node, cursor_point);
+
+        // Only one comma in the outer call separates multiply(...) and 5
+        assert_eq!(result, Some(1));
+    }
+
+    /// Test detect_active_parameter with multiple nested calls.
+    /// `f(g(1, 2), h(3, 4), 5)` — cursor at `5` should give active_parameter=2.
+    #[test]
+    fn test_detect_active_parameter_multiple_nested_calls() {
+        let code = "f(g(1, 2), h(3, 4), 5";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+
+        let cursor_point = Point::new(0, code.len());
+        let result = detect_active_parameter(call_node, cursor_point);
+
+        // Two outer commas: after g(...) and after h(...)
+        assert_eq!(result, Some(2));
+    }
+
+    /// Test detect_active_parameter with deeply nested calls.
+    /// `f(g(h(1, 2), 3), 4)` — cursor at `4` should give active_parameter=1.
+    #[test]
+    fn test_detect_active_parameter_deeply_nested_calls() {
+        let code = "f(g(h(1, 2), 3), 4";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+
+        let cursor_point = Point::new(0, code.len());
+        let result = detect_active_parameter(call_node, cursor_point);
+
+        // One outer comma separates g(...) and 4
+        assert_eq!(result, Some(1));
+    }
+
+    /// Test detect_active_parameter skips commas in bracket subscripts.
+    /// `f(a[1, 2], b)` — the comma inside `[1, 2]` (a "subset" node) must
+    /// not be counted, so cursor at `b` should give active_parameter=1.
+    #[test]
+    fn test_detect_active_parameter_bracket_subscript() {
+        let code = "f(a[1, 2], b";
+        let tree = parse_r_code(code);
+        let call_node = tree.root_node().child(0).unwrap();
+
+        let cursor_point = Point::new(0, code.len());
+        let result = detect_active_parameter(call_node, cursor_point);
+
+        assert_eq!(result, Some(1));
     }
 
     // ========================================================================
@@ -16235,6 +16389,22 @@ y <- 2";
         assert_eq!(params[2].default_value, Some(r#""hello""#.to_string()));
     }
 
+    /// Test parse_signature_params with escaped quotes in defaults.
+    /// Escaped quotes should not prematurely end a quoted string,
+    /// which would cause commas inside the string to be treated as
+    /// parameter separators.
+    #[test]
+    fn test_parse_signature_params_escaped_quotes() {
+        let sig = r#"func(x = "he\"llo", y = 1)"#;
+        let params = parse_signature_params(sig);
+
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[0].default_value, Some(r#""he\"llo""#.to_string()));
+        assert_eq!(params[1].name, "y");
+        assert_eq!(params[1].default_value, Some("1".to_string()));
+    }
+
     /// Test parse_signature_params with multiline signature
     /// Validates: Requirement 3.2 - Handle multiline signatures
     #[test]
@@ -16270,6 +16440,16 @@ y <- 2";
         let param4 = parse_single_param("z = NULL");
         assert_eq!(param4.name, "z");
         assert_eq!(param4.default_value, Some("NULL".to_string()));
+    }
+
+    /// Test parse_single_param with escaped quotes in default value.
+    /// An escaped quote inside a string default should not cause the
+    /// '=' after it to be misidentified as the parameter separator.
+    #[test]
+    fn test_parse_single_param_escaped_quotes() {
+        let param = parse_single_param(r#"x = "val\"=tricky""#);
+        assert_eq!(param.name, "x");
+        assert_eq!(param.default_value, Some(r#""val\"=tricky""#.to_string()));
     }
 
     // ========================================================================
@@ -16449,7 +16629,7 @@ result <- add(1, 2)"#;
         // Position after "add(" would be at character 14
         let position = Position::new(1, 14); // After "add("
         
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
@@ -16480,7 +16660,7 @@ result <- add(1, 2)"#;
 
         // Position is inside the call to undefined_func, after the opening paren
         let position = Position::new(0, 25); // After "undefined_func("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16506,7 +16686,7 @@ result <- add(1, 2, 3)"#;
 
         // Position is after the first comma, so second parameter is active
         let position = Position::new(1, 17); // After "add(1, "
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16527,7 +16707,7 @@ result <- add(1, 2, 3)"#;
 
         // Position is after the second comma, so third parameter is active
         let position = Position::new(1, 20); // After "add(1, 2, "
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16548,7 +16728,7 @@ result <- helper(5)"#;
 
         // Position is inside the call to helper
         let position = Position::new(1, 17); // After "helper("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16577,7 +16757,7 @@ result <- multiply(3, 4)"#;
 
         // Position is inside the call to multiply
         let position = Position::new(4, 19); // After "multiply("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16617,7 +16797,7 @@ result <- get_pi()"#;
 
         // Position is inside the call to get_pi
         let position = Position::new(1, 17); // After "get_pi("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16645,7 +16825,7 @@ result <- greet("Alice")"#;
 
         // Position is inside the call to greet
         let position = Position::new(3, 16); // After "greet("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some());
         let sig_help = result.unwrap();
@@ -16673,7 +16853,7 @@ result <- mean(x)"#;
 
         // Position is after "mean(" - simulating typing inside the function call
         let position = Position::new(1, 15); // After "mean("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some(), "signature_help should return Some for package function");
         let sig_help = result.unwrap();
@@ -16715,7 +16895,7 @@ result <- add(multiply(2, 3), 5)"#;
         //          0123456789012345678901234567890123
         // After "multiply(2, " - second parameter of multiply (position 27)
         let position_inner = Position::new(2, 27); // After "multiply(2, "
-        let result_inner = signature_help(&state, &uri, position_inner).await;
+        let result_inner = resolve_signature_help(prepare_signature_help(&state, &uri, position_inner).unwrap()).await;
         
         assert!(result_inner.is_some(), "signature_help should work in nested calls");
         let sig_help_inner = result_inner.unwrap();
@@ -16750,7 +16930,7 @@ result <- add_numbers(1, 2)"#;
 
         // Position is after "add_numbers("
         let position = Position::new(9, 23); // After "add_numbers("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
@@ -16790,7 +16970,7 @@ result <- calculate(5)"#;
 
         // Position is after "calculate("
         let position = Position::new(3, 20); // After "calculate("
-        let result = signature_help(&state, &uri, position).await;
+        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
         
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
@@ -16829,7 +17009,7 @@ result <- func(1, 2, 3, 4)"#;
         ];
 
         for (position, expected_active) in test_cases {
-            let result = signature_help(&state, &uri, position).await;
+            let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
             assert!(result.is_some(), "signature_help should return Some at position {:?}", position);
             
             let sig_help = result.unwrap();
@@ -24781,7 +24961,7 @@ setClass("{}", slots = c(value = "numeric"))
             let cursor_point = Point::new(0, code.len());
 
             // Detect active parameter
-            let result = detect_active_parameter(call_node, cursor_point, &code);
+            let result = detect_active_parameter(call_node, cursor_point);
 
             // Property: Active parameter index should equal the number of commas
             prop_assert_eq!(

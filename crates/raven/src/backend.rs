@@ -2627,12 +2627,20 @@ impl LanguageServer for Backend {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
-        let state = self.state.read().await;
-        Ok(handlers::signature_help(
-            &state,
-            &params.text_document_position_params.text_document.uri,
-            params.text_document_position_params.position,
-        ).await)
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        // Phase 1: sync work under read lock
+        let ctx = {
+            let state = self.state.read().await;
+            handlers::prepare_signature_help(&state, &uri, position)
+        }; // read lock released
+
+        // Phase 2: async work (package help fetch) without holding the lock
+        Ok(match ctx {
+            Some(ctx) => handlers::resolve_signature_help(ctx).await,
+            None => None,
+        })
     }
 
     async fn goto_definition(

@@ -145,7 +145,6 @@ This plan implements rich signature help for Raven's LSP, enhancing the tooltip 
 
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for faster MVP
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation
 - Property tests validate universal correctness properties
