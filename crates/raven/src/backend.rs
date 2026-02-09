@@ -1141,72 +1141,36 @@ impl LanguageServer for Backend {
                 .map(|(uri, _)| uri.clone())
                 .collect();
 
-            // Collect metadata from sourced files for transitive dependency queuing
-            let mut sourced_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
-
             if !sourced_files.is_empty() {
                 log::info!(
                     "Synchronously indexing {} directly sourced files before diagnostics",
                     sourced_files.len()
                 );
                 for file_uri in sourced_files {
-                    if let Some(meta) = self.index_file_on_demand(&file_uri).await {
-                        sourced_metadata.push((file_uri, meta));
-                    }
+                    self.index_file_on_demand(&file_uri).await;
                 }
             }
 
-            // Queue transitive dependencies from sourced files for background indexing
-            let workspace_root = {
-                let state = self.state.read().await;
-                state.workspace_folders.first().cloned()
-            };
-
-            if !sourced_metadata.is_empty() {
-                for (file_uri, meta) in &sourced_metadata {
-                    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-                        file_uri,
-                        meta,
-                        workspace_root.as_ref(),
-                    );
-
-                    for source in &meta.sources {
-                        if let Some(ctx) = path_ctx.as_ref() {
-                            if let Some(resolved) =
-                                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
-                            {
-                                if let Ok(source_uri) = Url::from_file_path(resolved) {
-                                    let needs_indexing = {
-                                        let state = self.state.read().await;
-                                        !state.documents.contains_key(&source_uri)
-                                            && !state
-                                                .cross_file_workspace_index
-                                                .contains(&source_uri)
-                                    };
-
-                                    if needs_indexing {
-                                        log::trace!(
-                                            "Queuing transitive dependency: {}",
-                                            source_uri
-                                        );
-                                        self.background_indexer.submit(source_uri, 1);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Backward directive targets are indexed synchronously
-            // so parent scopes are available before diagnostics.
-            let (max_backward_depth, max_forward_depth) = {
+            // Synchronously index the forward source chain so transitive
+            // dependencies are available before diagnostics run.
+            // index_forward_chain handles cycle detection, depth limits, and
+            // skips files already in documents or cross_file_workspace_index.
+            let (workspace_root, max_backward_depth, max_forward_depth) = {
                 let state = self.state.read().await;
                 (
+                    state.workspace_folders.first().cloned(),
                     state.cross_file_config.max_backward_depth,
                     state.cross_file_config.max_forward_depth,
                 )
             };
+
+            if max_forward_depth > 0 {
+                self.index_forward_chain(&uri, max_forward_depth, workspace_root.as_ref())
+                    .await;
+            }
+
+            // Backward directive targets are indexed synchronously
+            // so parent scopes are available before diagnostics.
 
             let backward_directive_files: Vec<Url> = files_to_index
                 .iter()
