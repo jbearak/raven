@@ -110,6 +110,7 @@ use crate::cross_file::{
 };
 use crate::document_store::DocumentStore;
 use crate::package_library::PackageLibrary;
+use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::WorkspaceIndex;
 
 /// A parsed document
@@ -499,6 +500,7 @@ pub struct WorldState {
 
     // Caches
     pub help_cache: crate::help::HelpCache,
+    pub signature_cache: Arc<SignatureCache>,
     pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
 
@@ -590,6 +592,7 @@ impl WorldState {
 
             // Caches
             help_cache: crate::help::HelpCache::new(),
+            signature_cache: Arc::new(SignatureCache::new(500, 200)),
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
 

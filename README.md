@@ -104,6 +104,7 @@ This pushes snippet completions below LSP completions, so Raven's results (with 
 - [Declaration Directives](docs/declaration-directives.md) - @lsp-var, @lsp-func for dynamically-created symbols
 - [Package Function Awareness](docs/packages.md) - library() support, meta-packages, base packages
 - [Configuration](docs/configuration.md) - All settings and options
+- [Development Notes](docs/development.md) - Build/test, profiling, and internal architecture notes
 
 ## Provenance
 

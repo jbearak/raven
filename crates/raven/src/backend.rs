@@ -1625,6 +1625,9 @@ impl LanguageServer for Backend {
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
+            // Invalidate signature cache for this file (Requirement 9.2)
+            state.signature_cache.invalidate_file(&uri);
+
             // Capture package settings for background prefetch
             let packages_enabled = state.cross_file_config.packages_enabled;
             let package_library = state.package_library.clone();
@@ -2565,21 +2568,43 @@ impl LanguageServer for Backend {
     /// # }
     /// ```
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let state = self.state.read().await;
-        Ok(handlers::completion(
-            &state,
-            &params.text_document_position.text_document.uri,
-            params.text_document_position.position,
-        ))
+        // Clone Arc<RwLock<WorldState>> and params for the blocking closure.
+        // Run in spawn_blocking since parameter resolution may call R subprocess
+        // (blocking I/O via get_function_formals). This follows the same pattern
+        // used by completion_resolve() to avoid blocking the async runtime.
+        let state = self.state.clone();
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        match tokio::task::spawn_blocking(move || {
+            let handle = tokio::runtime::Handle::current();
+            let state = handle.block_on(state.read());
+            handlers::completion(&state, &uri, position)
+        })
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                log::trace!("completion: spawn_blocking failed: {e}");
+                Err(tower_lsp::jsonrpc::Error::internal_error())
+            }
+        }
     }
 
     async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
         log::trace!("completion_resolve: label={}", item.label);
+        let state = self.state.read().await;
         // Clone the help cache Arc before moving into spawn_blocking
-        let help_cache = self.state.read().await.help_cache.clone();
+        let help_cache = state.help_cache.clone();
+        // Snapshot open document contents for user-defined function resolve
+        let document_contents: std::collections::HashMap<tower_lsp::lsp_types::Url, String> = state
+            .documents
+            .iter()
+            .map(|(uri, doc)| (uri.clone(), doc.text()))
+            .collect();
+        drop(state);
         // Run in spawn_blocking since get_help() calls R subprocess (blocking I/O)
         match tokio::task::spawn_blocking(move || {
-            handlers::completion_item_resolve(item, &help_cache)
+            handlers::completion_item_resolve(item, &help_cache, &document_contents)
         })
         .await
         {

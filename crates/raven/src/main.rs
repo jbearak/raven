@@ -7,6 +7,7 @@
 
 mod backend;
 mod builtins;
+mod completion_context;
 mod content_provider;
 mod cross_file;
 mod document_store;
@@ -15,11 +16,13 @@ mod handlers;
 mod help;
 mod namespace_parser;
 mod package_library;
+mod parameter_resolver;
 mod parser_pool;
 mod perf;
 mod r_env;
 mod r_subprocess;
 mod reserved_words;
+mod roxygen;
 mod state;
 mod workspace_index;
 
