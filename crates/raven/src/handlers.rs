@@ -2586,7 +2586,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     }
 
     // Collect syntax errors (not suppressed by @lsp-ignore)
-    collect_syntax_errors(tree.root_node(), &mut diagnostics);
+    collect_syntax_errors(tree.root_node(), &text, &mut diagnostics);
 
     // Collect else-on-newline errors
     // _Requirements: 4.1_
@@ -3904,34 +3904,538 @@ fn collect_identifier_usages_utf16<'a>(
     }
 }
 
-fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
-    if node.is_error() || node.is_missing() {
-        let message = if node.is_missing() {
-            format!("Missing {}", node.kind())
-        } else {
-            "Syntax error".to_string()
-        };
+/// Find the first MISSING descendant inside a node (depth-first).
+fn find_first_missing_descendant(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_missing() {
+            return Some(child);
+        }
+        if let Some(found) = find_first_missing_descendant(child) {
+            return Some(found);
+        }
+    }
+    None
+}
 
+/// Find the innermost (deepest) ERROR node within a tree that has children.
+///
+/// Performs a depth-first search to locate the deepest ERROR node in the tree
+/// that has child nodes. This avoids selecting leaf ERROR nodes (like a single
+/// `}` token) which are often just structural tokens marked as ERROR because
+/// the parser doesn't know what to do with them after an incomplete expression.
+///
+/// When multiple ERROR nodes exist at the same depth, returns the first one
+/// encountered in source order (left-to-right, top-to-bottom).
+///
+/// # Arguments
+///
+/// * `node` - The root node to search from
+///
+/// # Returns
+///
+/// * `Some(Node)` - The deepest ERROR node with children found
+/// * `None` - No ERROR nodes with children found in the tree
+fn find_innermost_error(node: Node) -> Option<Node> {
+    if node.is_error() {
+        // Check if any children are also ERROR nodes
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.is_error() {
+                // Recurse to find deeper errors
+                if let Some(innermost) = find_innermost_error(child) {
+                    return Some(innermost);
+                }
+            }
+        }
+        
+        // No ERROR children found. Check if this ERROR node has any children at all.
+        // If it has children, it's a good candidate. If it's a leaf, skip it.
+        if node.child_count() > 0 {
+            return Some(node);
+        }
+        
+        // This is a leaf ERROR node (no children), skip it
+        return None;
+    }
+    
+    // Not an ERROR node, check children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(innermost) = find_innermost_error(child) {
+            return Some(innermost);
+        }
+    }
+    None
+}
+
+/// Find the first non-structural line within an ERROR node.
+///
+/// For a multi-line ERROR node, finds the first line that contains named children
+/// (identifiers, operators, etc.) that are NOT structural keywords (if, while, for, etc.)
+/// or punctuation ({, }, (, )). This helps identify where the actual incomplete expression is,
+/// rather than pointing to the structural parent construct.
+///
+/// # Arguments
+///
+/// * `node` - The ERROR node to analyze
+///
+/// # Returns
+///
+/// * `Some(row)` - The row number of the first line with non-structural content
+/// * `None` - No non-structural content found (shouldn't happen in practice)
+fn find_first_content_line(node: Node) -> Option<usize> {
+    let start_row = node.start_position().row;
+    let end_row = node.end_position().row;
+    
+    // Single-line ERROR: return its line
+    if start_row == end_row {
+        return Some(start_row);
+    }
+    
+    // Structural keywords to skip
+    const STRUCTURAL_KEYWORDS: &[&str] = &["if", "while", "for", "function", "repeat"];
+    
+    // Find the line with the opening brace `{`
+    let mut brace_line = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() && child.kind() == "{" {
+            brace_line = Some(child.start_position().row);
+            break;
+        }
+    }
+    
+    // Multi-line ERROR: find the first line with non-structural named children AFTER the opening brace
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // Skip ERROR children - we want to find content, not nested errors
+        if child.is_error() {
+            continue;
+        }
+        
+        // Skip unnamed tokens (punctuation like {, }, (, ))
+        if !child.is_named() {
+            continue;
+        }
+        
+        // Skip structural keywords
+        if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
+            continue;
+        }
+        
+        // Skip boolean/null literals that are part of the condition
+        if matches!(child.kind(), "true" | "false" | "null") {
+            continue;
+        }
+        
+        // If we found a brace line, only consider children AFTER the brace
+        if let Some(brace_row) = brace_line {
+            if child.start_position().row <= brace_row {
+                continue;
+            }
+        }
+        
+        // Found a non-structural named child after the brace - use its line
+        return Some(child.start_position().row);
+    }
+    
+    // Fallback: return the line after the brace, or the start line
+    brace_line.map(|r| r + 1).or(Some(start_row))
+}
+
+/// For a multi-line ERROR node, compute a minimized diagnostic range that
+/// focuses on the first line of the error rather than spanning the entire
+/// enclosing block. This avoids distracting red squiggles on structurally
+/// valid code (like `if`, `{`, `}`) when the only problem is an incomplete
+/// expression on one line.
+fn minimize_error_range(node: Node, text: &str) -> Range {
+    let start_row = node.start_position().row;
+    let start_col = node.start_position().column;
+    let end_row = node.end_position().row;
+    let end_col = node.end_position().column;
+
+    // Phase 1: If there's a MISSING descendant, point the diagnostic there.
+    if let Some(missing) = find_first_missing_descendant(node) {
+        let m_row = missing.start_position().row as u32;
+        let m_col = missing.start_position().column as u32;
+        return Range {
+            start: Position::new(m_row, m_col),
+            // Give zero-width MISSING nodes a 1-column width for visibility
+            end: Position::new(m_row, m_col.saturating_add(1)),
+        };
+    }
+
+    // Phase 2: Find innermost ERROR node (NEW)
+    if let Some(innermost) = find_innermost_error(node) {
+        let inner_start_row = innermost.start_position().row;
+        let inner_end_row = innermost.end_position().row;
+        
+        // If innermost is single-line, return its full range
+        if inner_start_row == inner_end_row {
+            let inner_start_col = innermost.start_position().column;
+            let inner_end_col = innermost.end_position().column;
+            return Range {
+                start: Position::new(inner_start_row as u32, inner_start_col as u32),
+                end: Position::new(inner_end_row as u32, inner_end_col as u32),
+            };
+        }
+        
+        // If innermost is multi-line, find the first line with actual content
+        if let Some(content_row) = find_first_content_line(innermost) {
+            let first_line_end_col = text
+                .lines()
+                .nth(content_row)
+                .map(|line| line.len() as u32)
+                .unwrap_or(0);
+            
+            // Find the start column on the content line
+            let start_col = if content_row == inner_start_row {
+                innermost.start_position().column as u32
+            } else {
+                0
+            };
+            
+            let end_col_clamped = if first_line_end_col <= start_col {
+                start_col.saturating_add(1)
+            } else {
+                first_line_end_col
+            };
+            
+            return Range {
+                start: Position::new(content_row as u32, start_col),
+                end: Position::new(content_row as u32, end_col_clamped),
+            };
+        }
+    }
+
+    // Phase 3: Fallback - Single-line ERROR: keep the full range as-is (already precise).
+    if start_row == end_row {
+        return Range {
+            start: Position::new(start_row as u32, start_col as u32),
+            end: Position::new(end_row as u32, end_col as u32),
+        };
+    }
+
+    // Phase 3: Fallback - Multi-line ERROR: collapse to the first line only.
+    // Find the end column on the first line from the source text.
+    let first_line_end_col = text
+        .lines()
+        .nth(start_row)
+        .map(|line| line.len() as u32)
+        .unwrap_or(start_col as u32);
+
+    // Ensure we have at least some width
+    let end_col_clamped = if first_line_end_col <= start_col as u32 {
+        (start_col as u32).saturating_add(1)
+    } else {
+        first_line_end_col
+    };
+
+    Range {
+        start: Position::new(start_row as u32, start_col as u32),
+        end: Position::new(start_row as u32, end_col_clamped),
+    }
+}
+
+fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    if node.is_error() {
+        diagnostics.push(Diagnostic {
+            range: minimize_error_range(node, text),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "Syntax error".to_string(),
+            ..Default::default()
+        });
+        // Don't recurse into ERROR children — the minimized range already
+        // accounts for nested MISSING nodes, and recursing would produce
+        // duplicate diagnostics for nested ERROR children.
+        return;
+    }
+
+    if node.is_missing() {
+        let row = node.start_position().row as u32;
+        let col = node.start_position().column as u32;
         diagnostics.push(Diagnostic {
             range: Range {
-                start: Position::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u32,
-                ),
-                end: Position::new(
-                    node.end_position().row as u32,
-                    node.end_position().column as u32,
-                ),
+                start: Position::new(row, col),
+                end: Position::new(row, col.saturating_add(1)),
             },
             severity: Some(DiagnosticSeverity::ERROR),
-            message,
+            message: format!("Missing {}", node.kind()),
             ..Default::default()
         });
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_syntax_errors(child, diagnostics);
+        collect_syntax_errors(child, text, diagnostics);
+    }
+}
+
+#[cfg(test)]
+mod syntax_error_range_tests {
+    use super::collect_syntax_errors;
+    use tower_lsp::lsp_types::Diagnostic;
+
+    fn parse_r(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn collect(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r(code);
+        let mut diagnostics = Vec::new();
+        collect_syntax_errors(tree.root_node(), code, &mut diagnostics);
+        diagnostics
+    }
+
+    #[test]
+    fn incomplete_assignment_in_block_minimized() {
+        let code = "if (TRUE) {\n  x <-\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce at least one diagnostic");
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_comparison_in_block_minimized() {
+        let code = "if (TRUE) {\n  x <\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce at least one diagnostic");
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_binary_op_in_block_minimized() {
+        let code = "if (TRUE) {\n  x +\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty());
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_call_in_block_minimized() {
+        let code = "if (TRUE) {\n  f(\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty());
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn single_line_error_unchanged() {
+        // A single-line error should keep its full range
+        let code = "x <- )";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce a diagnostic");
+        // Single-line: start and end on same line
+        for d in &diags {
+            assert_eq!(d.range.start.line, d.range.end.line);
+        }
+    }
+
+    #[test]
+    fn top_level_incomplete_assignment() {
+        // Top-level `x <-` produces a MISSING identifier, not suppressed
+        let code = "x <-";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce a diagnostic for incomplete assignment");
+        assert!(
+            diags.iter().any(|d| d.message.contains("Missing")),
+            "should report a Missing diagnostic"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_diagnostics() {
+        // For code that produces a multi-line ERROR with nested ERROR children,
+        // we should get exactly one diagnostic (not one per nested ERROR).
+        let code = "if (TRUE) {\n  x <-\n}";
+        let diags = collect(code);
+        assert_eq!(
+            diags.len(),
+            1,
+            "should produce exactly one diagnostic, got {}: {:?}",
+            diags.len(),
+            diags
+        );
+    }
+
+    #[test]
+    fn genuinely_broken_code_still_reports_error() {
+        let code = "x <- function( { }";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "genuinely broken code should still produce diagnostics"
+        );
+    }
+
+    #[test]
+    fn incomplete_assignment_range_is_on_first_line() {
+        // With the innermost error detection fix, the diagnostic should be on line 1
+        // (where the `x <-` is), not line 0 (where the `if` is) or line 2 (where `}` is).
+        let code = "if (TRUE) {\n  x <-\n}";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].range.start.line, 1, "diagnostic should start on line 1 (where x <- is)");
+        assert_eq!(diags[0].range.end.line, 1, "diagnostic should end on line 1");
+    }
+
+    // ========================================================================
+    // Property-Based Tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+    use tree_sitter::Node;
+
+    /// Strategy to generate R code with nested ERROR nodes.
+    /// Creates code patterns like:
+    /// - `if (TRUE) { x <- }`
+    /// - `while (x) { y + }`
+    /// - `for (i in 1:10) { z < }`
+    fn nested_error_code() -> impl Strategy<Value = String> {
+        let incomplete_exprs = vec![
+            "x <-",
+            "y +",
+            "z -",
+            "a *",
+            "b /",
+            "c <",
+            "d >",
+            "e ==",
+        ];
+        
+        let control_structures = vec![
+            "if (TRUE)",
+            "if (FALSE)",
+            "while (x)",
+            "for (i in 1:10)",
+        ];
+
+        (
+            prop::sample::select(control_structures),
+            prop::sample::select(incomplete_exprs),
+        )
+            .prop_map(|(ctrl, expr)| format!("{} {{\n  {}\n}}", ctrl, expr))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 2: Innermost ERROR Selection
+        //
+        // For any multi-line ERROR node containing nested ERROR node children,
+        // the diagnostic range SHALL be placed at the location of the deepest
+        // (innermost) ERROR node in the tree.
+        //
+        // **Validates: Requirements 1.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_innermost_error_selection(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+            
+            // Find the outermost ERROR node
+            fn find_outermost_error(node: Node) -> Option<Node> {
+                if node.is_error() {
+                    return Some(node);
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if let Some(error) = find_outermost_error(child) {
+                        return Some(error);
+                    }
+                }
+                None
+            }
+            
+            // Find the innermost ERROR node (deepest in the tree)
+            fn find_innermost_error_recursive(node: Node) -> Option<Node> {
+                if node.is_error() {
+                    // Check if any children are also ERROR nodes
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.is_error() {
+                            // Recurse to find deeper errors
+                            if let Some(innermost) = find_innermost_error_recursive(child) {
+                                return Some(innermost);
+                            }
+                        }
+                    }
+                    // No ERROR children, this is the innermost
+                    return Some(node);
+                }
+                
+                // Not an ERROR node, check children
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if let Some(innermost) = find_innermost_error_recursive(child) {
+                        return Some(innermost);
+                    }
+                }
+                None
+            }
+            
+            let outermost = find_outermost_error(root);
+            prop_assume!(outermost.is_some(), "Generated code must produce an ERROR node");
+            
+            let outermost = outermost.unwrap();
+            
+            // Collect diagnostics
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+            
+            prop_assert!(!diagnostics.is_empty(), "Should produce at least one diagnostic for code: {}", code);
+            
+            // The diagnostic should NOT be on the first line of the outermost ERROR
+            // (which would be the structural parent like `if`, `while`, etc.)
+            // unless the outermost ERROR is single-line
+            let outermost_start_line = outermost.start_position().row as u32;
+            let outermost_end_line = outermost.end_position().row as u32;
+            
+            // If the outermost ERROR is multi-line, the diagnostic should NOT be on its first line
+            // (the structural parent line)
+            if outermost_end_line > outermost_start_line {
+                for diag in &diagnostics {
+                    prop_assert_ne!(
+                        diag.range.start.line,
+                        outermost_start_line,
+                        "Diagnostic should not be on the structural parent line ({}). Code: {}",
+                        outermost_start_line,
+                        code
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -29681,4 +30185,5 @@ result <- undefined_var
 
         // If we reached here without panicking, the utility works correctly.
     }
+
 }

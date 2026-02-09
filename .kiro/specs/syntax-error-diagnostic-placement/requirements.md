@@ -7,13 +7,15 @@ This feature improves the placement of syntax error diagnostics in Raven LSP to 
 ## Glossary
 
 - **ERROR_Node**: A tree-sitter node with `is_error() == true`, indicating a syntax error in the parsed code
+- **Leaf_ERROR_Node**: An ERROR_Node with zero children — typically a single misplaced token (e.g., `}`) that tree-sitter cannot fit into the grammar
 - **MISSING_Node**: A tree-sitter node with `is_missing() == true`, indicating an expected but absent token
 - **Diagnostic_Range**: The LSP Range (start/end Position) where a diagnostic squiggle appears in the editor
 - **Minimization_Logic**: The algorithm that converts a multi-line ERROR node into a focused diagnostic range
 - **Incomplete_Expression**: A syntactically incomplete statement (e.g., `x <-` without a right-hand side)
-- **Structural_Parent**: A syntactically valid construct (e.g., `if`, `{`, `}`) that contains an ERROR node
-- **First_Line_Strategy**: The current approach of collapsing multi-line ERROR ranges to the first line
-- **Innermost_Error_Strategy**: The proposed approach of finding the deepest ERROR or MISSING node within a multi-line ERROR
+- **Structural_Parent**: A syntactically valid construct (e.g., `if`, `while`, `for`, `function`, `repeat`) that contains an ERROR node
+- **Content_Line**: The first line inside a multi-line ERROR node that contains non-structural named tokens (identifiers, operators) after the opening brace
+- **First_Line_Strategy**: The previous approach of collapsing multi-line ERROR ranges to the first line
+- **Content_Line_Strategy**: The new approach of scanning ERROR node children to find the first line with actual content after structural tokens
 
 ## Requirements
 
@@ -23,11 +25,11 @@ This feature improves the placement of syntax error diagnostics in Raven LSP to 
 
 #### Acceptance Criteria
 
-1. WHEN an Incomplete_Expression exists within a multi-line ERROR_Node, THE Minimization_Logic SHALL place the Diagnostic_Range on the line containing the Incomplete_Expression
-2. WHEN a multi-line ERROR_Node contains nested ERROR_Node children, THE Minimization_Logic SHALL identify the innermost (deepest) ERROR_Node and place the Diagnostic_Range there
+1. WHEN an Incomplete_Expression exists within a multi-line ERROR_Node, THE Minimization_Logic SHALL place the Diagnostic_Range on the Content_Line containing the Incomplete_Expression
+2. WHEN a multi-line ERROR_Node contains a non-leaf nested ERROR_Node, THE Minimization_Logic SHALL prefer the nested ERROR_Node's content for placement over the outer ERROR_Node's first line
 3. WHEN a MISSING_Node exists within a multi-line ERROR_Node, THE Minimization_Logic SHALL prioritize the MISSING_Node location for the Diagnostic_Range
 4. WHEN a single-line ERROR_Node is encountered, THE Minimization_Logic SHALL preserve the full range without modification
-5. WHEN a Structural_Parent (such as `if`, `{`, `}`) contains an ERROR_Node, THE Minimization_Logic SHALL NOT place diagnostics on the Structural_Parent line unless the error originates there
+5. WHEN a Structural_Parent (such as `if`, `while`, `for`, `function`, `repeat`) contains an ERROR_Node, THE Minimization_Logic SHALL NOT place diagnostics on the Structural_Parent line unless the error originates there
 
 ### Requirement 2: Diagnostic Deduplication
 
@@ -39,16 +41,16 @@ This feature improves the placement of syntax error diagnostics in Raven LSP to 
 2. WHEN recursing through ERROR_Node children, THE System SHALL stop recursion after identifying the diagnostic location to prevent duplicate diagnostics
 3. WHEN a MISSING_Node is found within an ERROR_Node, THE System SHALL emit a diagnostic for the MISSING_Node and suppress any parent ERROR_Node diagnostic
 
-### Requirement 3: Innermost Error Detection
+### Requirement 3: Content Line Detection
 
 **User Story:** As a developer, I want the system to identify the most specific location of a syntax error within nested structures, so that the diagnostic points to the exact problematic code.
 
 #### Acceptance Criteria
 
-1. WHEN traversing a multi-line ERROR_Node, THE System SHALL perform a depth-first search to find the innermost ERROR_Node or MISSING_Node
-2. WHEN multiple ERROR_Node children exist at the same depth, THE System SHALL select the first one encountered in source order
-3. WHEN an innermost ERROR_Node is single-line, THE System SHALL use its full range for the Diagnostic_Range
-4. WHEN an innermost ERROR_Node is multi-line, THE System SHALL recursively apply the innermost detection strategy until a single-line node or MISSING_Node is found
+1. WHEN traversing a multi-line ERROR_Node, THE System SHALL skip Leaf_ERROR_Nodes (ERROR nodes with zero children) during innermost-error search
+2. WHEN a multi-line ERROR_Node contains an opening brace `{`, THE System SHALL only consider children AFTER the brace line when searching for the Content_Line
+3. WHEN scanning for the Content_Line, THE System SHALL skip structural keywords (`if`, `while`, `for`, `function`, `repeat`), punctuation, boolean/null literals, and ERROR children
+4. WHEN no Content_Line is found after the brace, THE System SHALL fall back to the line immediately after the brace
 
 ### Requirement 4: Backward Compatibility
 
@@ -71,5 +73,5 @@ This feature improves the placement of syntax error diagnostics in Raven LSP to 
 2. THE System SHALL include tests for incomplete binary operations within blocks (e.g., `if (TRUE) { x + }`)
 3. THE System SHALL include tests for incomplete comparisons within blocks (e.g., `if (TRUE) { x < }`)
 4. THE System SHALL include tests for unclosed function calls within blocks (e.g., `if (TRUE) { f( }`)
-5. THE System SHALL include tests verifying that diagnostics appear on the line containing the actual error, not on the Structural_Parent line
+5. THE System SHALL include tests verifying that diagnostics appear on the Content_Line, not on the Structural_Parent line
 6. THE System SHALL include tests verifying exactly one diagnostic is emitted per error structure (no duplicates)
