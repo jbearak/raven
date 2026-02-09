@@ -31,11 +31,11 @@ This plan implements the "content-line detection" strategy to fix syntax error d
     - Ensure single-line ERROR preservation still works
     - _Requirements: 1.3, 1.4_
 
-- [ ]* 2.3 Write property test for content line placement
+- [x] 2.3 Write property test for content line placement
   - **Property 2: Content Line Placement**
   - **Validates: Requirements 1.1, 1.2, 3.2**
 
-- [ ]* 2.4 Write property test for MISSING node priority
+- [x] 2.4 Write property test for MISSING node priority
   - **Property 3: MISSING Node Priority**
   - **Validates: Requirements 1.3**
 
@@ -44,7 +44,7 @@ This plan implements the "content-line detection" strategy to fix syntax error d
     - Changed assertion: diagnostic is now on line 1 (where `x <-` is), not line 0
     - _Requirements: 1.1, 1.5_
 
-  - [ ] 3.2 Verify other existing tests still pass
+  - [x] 3.2 Verify other existing tests still pass
     - Run `incomplete_assignment_in_block_minimized`
     - Run `incomplete_comparison_in_block_minimized`
     - Run `incomplete_binary_op_in_block_minimized`
@@ -55,36 +55,36 @@ This plan implements the "content-line detection" strategy to fix syntax error d
     - Run `genuinely_broken_code_still_reports_error`
     - _Requirements: 4.1, 4.2, 4.3, 4.4_
 
-- [ ]* 3.3 Write property test for single-line range preservation
+- [x] 3.3 Write property test for single-line range preservation
   - **Property 4: Single-Line Range Preservation**
   - **Validates: Requirements 1.4**
 
-- [ ]* 3.4 Write property test for diagnostic deduplication
+- [x] 3.4 Write property test for diagnostic deduplication
   - **Property 5: Diagnostic Deduplication**
   - **Validates: Requirements 2.1**
 
-- [ ] 4. Add new unit tests for edge cases
-  - [ ] 4.1 Add test for multiple errors at same depth
+- [x] 4. Add new unit tests for edge cases
+  - [x] 4.1 Add test for multiple errors at same depth
     - Test that content-line detection picks the first content line
     - _Requirements: 3.2_
 
-  - [ ] 4.2 Add test for deeply nested ERROR nodes
+  - [x] 4.2 Add test for deeply nested ERROR nodes
     - Test that `find_innermost_error` skips leaf ERROR nodes at depth
     - _Requirements: 1.2, 3.1_
 
-- [ ]* 4.3 Write property test for leaf ERROR exclusion
+- [x] 4.3 Write property test for leaf ERROR exclusion
   - **Property 6: Leaf ERROR Exclusion**
   - **Validates: Requirements 3.1**
 
-- [ ]* 4.4 Write property test for MISSING node width
+- [x] 4.4 Write property test for MISSING node width
   - **Property 7: MISSING Node Width**
   - **Validates: Requirements 4.2**
 
-- [ ]* 4.5 Write property test for error detection completeness
+- [x] 4.5 Write property test for error detection completeness
   - **Property 8: Error Detection Completeness**
   - **Validates: Requirements 4.4**
 
-- [ ] 5. Checkpoint — Ensure all tests pass
+- [x] 5. Checkpoint — Ensure all tests pass
   - Run `cargo test -p raven syntax_error_range_tests`
   - Ensure no regressions in other handler tests
   - Ask the user if questions arise

@@ -4174,7 +4174,7 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
 
 #[cfg(test)]
 mod syntax_error_range_tests {
-    use super::collect_syntax_errors;
+    use super::{collect_syntax_errors, find_first_content_line, find_innermost_error};
     use tower_lsp::lsp_types::Diagnostic;
 
     fn parse_r(code: &str) -> tree_sitter::Tree {
@@ -4308,6 +4308,137 @@ mod syntax_error_range_tests {
         assert_eq!(diags[0].range.end.line, 1, "diagnostic should end on line 1");
     }
 
+    #[test]
+    fn multiple_errors_at_same_depth_picks_first_content_line() {
+        // When a block contains multiple incomplete expressions, the content-line
+        // detection should pick the FIRST content line (the first incomplete
+        // expression), not the structural parent or a later error.
+        // Validates: Requirement 3.2
+        let code = "if (TRUE) {\n  x <-\n  y +\n}";
+        // Lines:
+        //   0: "if (TRUE) {"
+        //   1: "  x <-"        ← first content line (first incomplete expr)
+        //   2: "  y +"         ← second incomplete expr
+        //   3: "}"
+        let first_content_line = code.lines()
+            .enumerate()
+            .position(|(_, line)| line.contains("x <-"))
+            .expect("test code should contain 'x <-'") as u32;
+
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for code with syntax errors"
+        );
+        // The diagnostic should appear on the first content line, not on the
+        // structural parent (line 0) or a later error line.
+        assert_eq!(
+            diags[0].range.start.line, first_content_line,
+            "diagnostic should start on the first content line (line {}), got line {}",
+            first_content_line, diags[0].range.start.line
+        );
+        assert_eq!(
+            diags[0].range.end.line, first_content_line,
+            "diagnostic should end on the first content line (line {}), got line {}",
+            first_content_line, diags[0].range.end.line
+        );
+    }
+
+    #[test]
+    fn deeply_nested_error_skips_leaf_errors() {
+        // When tree-sitter produces deeply nested structures with leaf ERROR nodes
+        // (e.g., misplaced `}` tokens), `find_innermost_error` should skip those
+        // leaf ERROR nodes and return a non-leaf ERROR node instead.
+        //
+        // Validates: Requirements 1.2, 3.1
+        //
+        // For nested blocks like:
+        //   if (TRUE) {
+        //     if (TRUE) {
+        //       x <-
+        //     }
+        //   }
+        //
+        // tree-sitter wraps the entire structure in an ERROR node, with leaf ERROR
+        // nodes for the misplaced `}` tokens. `find_innermost_error` must return
+        // the parent ERROR (which has children), not a leaf ERROR.
+        let code = "if (TRUE) {\n  if (TRUE) {\n    x <-\n  }\n}";
+        // Lines:
+        //   0: "if (TRUE) {"
+        //   1: "  if (TRUE) {"
+        //   2: "    x <-"
+        //   3: "  }"
+        //   4: "}"
+
+        let tree = parse_r(code);
+        let root = tree.root_node();
+
+        // Use the production function to find the innermost non-leaf ERROR
+        let innermost = find_innermost_error(root);
+        assert!(
+            innermost.is_some(),
+            "find_innermost_error should find a non-leaf ERROR node"
+        );
+        let innermost = innermost.unwrap();
+
+        // The returned node must NOT be a leaf ERROR (must have children)
+        assert!(
+            innermost.child_count() > 0,
+            "find_innermost_error should skip leaf ERROR nodes (zero children), \
+             but returned a node with {} children",
+            innermost.child_count()
+        );
+
+        // The returned node must be an ERROR node
+        assert!(
+            innermost.is_error(),
+            "find_innermost_error should return an ERROR node"
+        );
+
+        // Collect diagnostics and verify placement
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for deeply nested error"
+        );
+
+        // Find the line containing the incomplete expression dynamically
+        let content_line = code
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("x <-"))
+            .map(|(i, _)| i as u32)
+            .expect("test code should contain 'x <-'");
+
+        // Find the last line (closing brace) — leaf ERROR nodes live here
+        let last_line = (code.lines().count() - 1) as u32;
+
+        // The diagnostic should NOT point to a leaf ERROR's line (the closing braces)
+        for d in &diags {
+            assert_ne!(
+                d.range.start.line, last_line,
+                "diagnostic should not point to the outermost closing brace (leaf ERROR line {})",
+                last_line
+            );
+        }
+
+        // The diagnostic should be on the content line or after it, not on line 0
+        // (the structural parent)
+        assert_eq!(
+            diags.len(),
+            1,
+            "should produce exactly one diagnostic, got {}: {:?}",
+            diags.len(),
+            diags
+        );
+        assert!(
+            diags[0].range.start.line >= content_line,
+            "diagnostic (line {}) should be on or after the content line (line {})",
+            diags[0].range.start.line,
+            content_line
+        );
+    }
+
     // ========================================================================
     // Property-Based Tests
     // ========================================================================
@@ -4344,6 +4475,112 @@ mod syntax_error_range_tests {
             prop::sample::select(incomplete_exprs),
         )
             .prop_map(|(ctrl, expr)| format!("{} {{\n  {}\n}}", ctrl, expr))
+    }
+
+    /// Strategy to generate R code that produces MISSING nodes.
+    ///
+    /// MISSING nodes are produced by tree-sitter for top-level incomplete
+    /// expressions where the parser can infer what token is expected.
+    /// Examples:
+    /// - `x <-` → MISSING identifier (right-hand side)
+    /// - `f(` → MISSING `)` (closing paren)
+    /// - `x <- 1 +` → MISSING identifier (right operand)
+    fn missing_node_code() -> impl Strategy<Value = String> {
+        // Top-level incomplete expressions that reliably produce MISSING nodes.
+        // Expressions inside blocks may NOT produce MISSING nodes (tree-sitter
+        // wraps them in a flat ERROR instead), so we use top-level patterns.
+        let patterns = vec![
+            // Incomplete assignments: MISSING identifier on RHS
+            "x <-",
+            "y <-",
+            "myvar <-",
+            // Unclosed function calls: MISSING )
+            "f(",
+            "g(1,",
+            "h(x, y,",
+            // Incomplete binary after assignment: MISSING identifier
+            "x <- 1 +",
+            "y <- a *",
+        ];
+
+        prop::sample::select(patterns).prop_map(|p| p.to_string())
+    }
+
+    /// Strategy to generate single-line R code that produces single-line ERROR nodes.
+    ///
+    /// These are misplaced tokens or broken expressions that tree-sitter wraps in
+    /// an ERROR node confined to a single line. Examples:
+    /// - `) extra` — stray closing paren
+    /// - `+ y` — leading operator
+    /// - `} stuff` — stray closing brace
+    /// - `x <- ) y` — misplaced token after assignment
+    fn single_line_error_code() -> impl Strategy<Value = String> {
+        // Patterns that reliably produce single-line ERROR nodes.
+        // We combine a valid prefix (possibly empty) with a misplaced token.
+        let stray_tokens = vec![
+            ")",
+            "]",
+            "]]",
+            "}",
+            ",",
+            "} extra",
+            ") extra",
+        ];
+
+        let valid_prefixes = vec![
+            "",
+            "x <- 1; ",
+            "y <- 2\n",
+            "a <- 'hello'\n",
+        ];
+
+        (
+            prop::sample::select(valid_prefixes),
+            prop::sample::select(stray_tokens),
+        )
+            .prop_map(|(prefix, token)| format!("{}{}", prefix, token))
+    }
+
+    /// Strategy to generate a broad variety of syntactically invalid R code.
+    ///
+    /// This combines several error patterns beyond the specific strategies above:
+    /// - Unmatched delimiters (braces, parens, brackets)
+    /// - Incomplete control flow (if/while/for without body)
+    /// - Double operators
+    /// - Trailing commas in unexpected places
+    /// - Incomplete function definitions
+    fn broad_syntax_error_code() -> impl Strategy<Value = String> {
+        let patterns = vec![
+            // Unmatched delimiters
+            "{ x <- 1",
+            "x <- c(1, 2",
+            "x[1",
+            "x[[1",
+            // Incomplete control flow
+            "if (TRUE)",
+            "while (x)",
+            "for (i in 1:10)",
+            // Double/misplaced operators
+            "x <- <- 1",
+            "x ++ y",
+            "x ** y",
+            // Trailing commas / misplaced tokens
+            "c(1, 2,)",
+            "x <- ; y",
+            // Incomplete function definitions
+            "f <- function(",
+            "f <- function(x,",
+            // Broken expressions
+            "x <- function() { y <- }",
+            "if (TRUE) { } else",
+            "x <- 1 + * 2",
+            // Stray keywords / tokens
+            "} x <- 1",
+            ") + 1",
+            "x <- 1 )",
+        ];
+
+        prop::sample::select(patterns).prop_map(|p| p.to_string())
     }
 
     proptest! {
@@ -4434,6 +4671,649 @@ mod syntax_error_range_tests {
                         code
                     );
                 }
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 2: Content line placement
+        //
+        // For any multi-line ERROR node where `find_first_content_line` returns a row,
+        // the diagnostic range SHALL start on that row, not on the structural parent's
+        // line or the leaf ERROR's line.
+        //
+        // **Validates: Requirements 1.1, 1.2, 3.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_content_line_placement(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Find the innermost non-leaf ERROR node using the production function
+            let innermost = find_innermost_error(root);
+            prop_assume!(innermost.is_some(), "Generated code must produce a non-leaf ERROR node");
+            let innermost = innermost.unwrap();
+
+            let inner_start_row = innermost.start_position().row;
+            let inner_end_row = innermost.end_position().row;
+
+            // Only test multi-line ERROR nodes (single-line is a different property)
+            prop_assume!(
+                inner_end_row > inner_start_row,
+                "Innermost ERROR must be multi-line"
+            );
+
+            // Get the content line from the production function
+            let content_row = find_first_content_line(innermost);
+            prop_assume!(content_row.is_some(), "find_first_content_line must return a row");
+            let content_row = content_row.unwrap();
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code: {}",
+                code
+            );
+
+            // Find the diagnostic that corresponds to our ERROR node.
+            // Since collect_syntax_errors doesn't recurse into ERROR children,
+            // there should be exactly one diagnostic for the outermost ERROR.
+            let diag = &diagnostics[0];
+
+            // The diagnostic should start on the content line, not on the
+            // structural parent's line or the leaf ERROR's line.
+            prop_assert_eq!(
+                diag.range.start.line,
+                content_row as u32,
+                "Diagnostic should start on content line {} but started on line {}. Code: {}",
+                content_row,
+                diag.range.start.line,
+                code
+            );
+
+            // The content line should NOT be the leaf ERROR line (closing brace line)
+            // For our generated code, the leaf ERROR is always on the last line
+            prop_assert_ne!(
+                content_row,
+                inner_end_row,
+                "Content line should not be the leaf ERROR line (end of ERROR node). Code: {}",
+                code
+            );
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 3: MISSING node priority
+        //
+        // For any ERROR node containing a MISSING node descendant, the diagnostic
+        // range SHALL be placed at the MISSING node's location, regardless of other
+        // ERROR nodes present.
+        //
+        // **Validates: Requirements 1.3**
+        // ============================================================================
+
+        #[test]
+        fn prop_missing_node_priority(code in missing_node_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Walk the entire tree to find all MISSING nodes
+            fn collect_missing_nodes(node: Node, out: &mut Vec<(u32, u32)>) {
+                if node.is_missing() {
+                    out.push((
+                        node.start_position().row as u32,
+                        node.start_position().column as u32,
+                    ));
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_missing_nodes(child, &mut *out);
+                }
+            }
+
+            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            collect_missing_nodes(root, &mut missing_positions);
+
+            // Our generator should always produce at least one MISSING node
+            prop_assume!(
+                !missing_positions.is_empty(),
+                "Generated code must produce at least one MISSING node"
+            );
+
+            // Collect diagnostics
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code with MISSING nodes: {}",
+                code
+            );
+
+            // For each MISSING node position, there should be a diagnostic placed
+            // at that exact location. The diagnostic may come from:
+            // 1. minimize_error_range Phase 1 (MISSING inside ERROR → "Syntax error")
+            // 2. collect_syntax_errors direct MISSING handling (→ "Missing <kind>")
+            //
+            // In either case, the diagnostic start position must match the MISSING
+            // node's position.
+            for &(m_row, m_col) in &missing_positions {
+                let has_matching_diag = diagnostics.iter().any(|d| {
+                    d.range.start.line == m_row && d.range.start.character == m_col
+                });
+
+                prop_assert!(
+                    has_matching_diag,
+                    "Expected a diagnostic at MISSING node position ({}, {}) but none found. \
+                     Code: {}, Diagnostics: {:?}",
+                    m_row,
+                    m_col,
+                    code,
+                    diagnostics
+                        .iter()
+                        .map(|d| format!(
+                            "({},{})..({},{}) '{}'",
+                            d.range.start.line,
+                            d.range.start.character,
+                            d.range.end.line,
+                            d.range.end.character,
+                            d.message
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 4: Single-line range preservation
+        //
+        // For any single-line ERROR node (where start row equals end row), the
+        // diagnostic range SHALL preserve the full range of the ERROR node without
+        // modification.
+        //
+        // **Validates: Requirements 1.4**
+        // ============================================================================
+
+        #[test]
+        fn prop_single_line_range_preservation(code in single_line_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Walk the tree to find all single-line ERROR nodes
+            fn collect_single_line_errors(node: Node, out: &mut Vec<(u32, u32, u32, u32)>) {
+                if node.is_error() {
+                    let start_row = node.start_position().row as u32;
+                    let start_col = node.start_position().column as u32;
+                    let end_row = node.end_position().row as u32;
+                    let end_col = node.end_position().column as u32;
+                    if start_row == end_row {
+                        out.push((start_row, start_col, end_row, end_col));
+                    }
+                    // Don't recurse into ERROR children — collect_syntax_errors
+                    // doesn't recurse into ERROR nodes either, so nested single-line
+                    // ERROR nodes inside a parent ERROR won't produce separate diagnostics.
+                    return;
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_single_line_errors(child, &mut *out);
+                }
+            }
+
+            let mut single_line_errors: Vec<(u32, u32, u32, u32)> = Vec::new();
+            collect_single_line_errors(root, &mut single_line_errors);
+
+            // Our generator should produce at least one single-line ERROR node
+            prop_assume!(
+                !single_line_errors.is_empty(),
+                "Generated code must produce at least one single-line ERROR node"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code: {}",
+                code
+            );
+
+            // For each top-level single-line ERROR node, there should be a
+            // diagnostic whose range exactly matches the ERROR node's range.
+            // Note: MISSING nodes inside the ERROR may cause the diagnostic
+            // to be placed at the MISSING location instead (Phase 1 priority),
+            // so we check that either:
+            // (a) the diagnostic preserves the full ERROR range, OR
+            // (b) a MISSING node exists inside the ERROR (Phase 1 took priority)
+            for &(s_row, s_col, e_row, e_col) in &single_line_errors {
+                // Check if there's a MISSING descendant that would override placement
+                fn has_missing_descendant(node: Node) -> bool {
+                    if node.is_missing() {
+                        return true;
+                    }
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if has_missing_descendant(child) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+
+                // Re-find the ERROR node to check for MISSING descendants
+                fn find_error_at(node: Node, row: u32, col: u32) -> Option<Node> {
+                    if node.is_error()
+                        && node.start_position().row as u32 == row
+                        && node.start_position().column as u32 == col
+                    {
+                        return Some(node);
+                    }
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if let Some(found) = find_error_at(child, row, col) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+
+                let error_node = find_error_at(root, s_row, s_col);
+                let has_missing = error_node.map_or(false, |n| has_missing_descendant(n));
+
+                if has_missing {
+                    // Phase 1 (MISSING priority) may override the range — that's OK
+                    continue;
+                }
+
+                // The diagnostic for this single-line ERROR should preserve its full range
+                let has_matching_diag = diagnostics.iter().any(|d| {
+                    d.range.start.line == s_row
+                        && d.range.start.character == s_col
+                        && d.range.end.line == e_row
+                        && d.range.end.character == e_col
+                });
+
+                prop_assert!(
+                    has_matching_diag,
+                    "Expected diagnostic with exact range ({},{})..({},{}) for single-line ERROR \
+                     but none found. Code: {}, Diagnostics: {:?}",
+                    s_row,
+                    s_col,
+                    e_row,
+                    e_col,
+                    code,
+                    diagnostics
+                        .iter()
+                        .map(|d| format!(
+                            "({},{})..({},{}) '{}'",
+                            d.range.start.line,
+                            d.range.start.character,
+                            d.range.end.line,
+                            d.range.end.character,
+                            d.message
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 5: Diagnostic deduplication
+        //
+        // For any multi-line ERROR node containing nested ERROR node children,
+        // the system SHALL emit exactly one diagnostic for the entire error structure.
+        //
+        // **Validates: Requirements 2.1**
+        // ============================================================================
+
+        #[test]
+        fn prop_diagnostic_deduplication(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Count top-level ERROR nodes: ERROR nodes that are NOT children of
+            // another ERROR node. Since `collect_syntax_errors` does not recurse
+            // into ERROR children, only top-level ERROR nodes produce diagnostics.
+            fn count_top_level_errors(node: Node) -> usize {
+                if node.is_error() {
+                    // This is a top-level ERROR — don't recurse into its children
+                    // because collect_syntax_errors doesn't either.
+                    return 1;
+                }
+                let mut cursor = node.walk();
+                let mut count = 0;
+                for child in node.children(&mut cursor) {
+                    count += count_top_level_errors(child);
+                }
+                count
+            }
+
+            let top_level_error_count = count_top_level_errors(root);
+            prop_assume!(
+                top_level_error_count > 0,
+                "Generated code must produce at least one ERROR node"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            // Count only "Syntax error" diagnostics (not "Missing ..." diagnostics,
+            // which come from MISSING nodes outside ERROR nodes and are separate).
+            let syntax_error_count = diagnostics
+                .iter()
+                .filter(|d| d.message == "Syntax error")
+                .count();
+
+            // The number of "Syntax error" diagnostics must not exceed the number
+            // of top-level ERROR nodes. This ensures nested ERROR children do not
+            // produce duplicate diagnostics.
+            prop_assert!(
+                syntax_error_count <= top_level_error_count,
+                "Diagnostic count ({}) should not exceed top-level ERROR count ({}). \
+                 Code: {}, Diagnostics: {:?}",
+                syntax_error_count,
+                top_level_error_count,
+                code,
+                diagnostics
+                    .iter()
+                    .map(|d| format!(
+                        "({},{})..({},{}) '{}'",
+                        d.range.start.line,
+                        d.range.start.character,
+                        d.range.end.line,
+                        d.range.end.character,
+                        d.message
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 6: Leaf ERROR exclusion
+        //
+        // For any multi-line ERROR node containing only leaf ERROR children
+        // (zero-child ERROR nodes), `find_innermost_error` SHALL return the parent
+        // ERROR node, not the leaf.
+        //
+        // **Validates: Requirements 3.1**
+        // ============================================================================
+
+        #[test]
+        fn prop_leaf_error_exclusion(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Collect all ERROR nodes in the tree with their child counts
+            fn collect_all_errors(node: Node, out: &mut Vec<(usize, usize)>) {
+                // out entries: (child_count, start_row)
+                if node.is_error() {
+                    out.push((node.child_count(), node.start_position().row));
+                    // Recurse into ERROR children to find nested ERRORs
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        collect_all_errors(child, out);
+                    }
+                    return;
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_all_errors(child, out);
+                }
+            }
+
+            let mut all_errors: Vec<(usize, usize)> = Vec::new();
+            collect_all_errors(root, &mut all_errors);
+
+            // We need at least one ERROR node to test
+            prop_assume!(
+                !all_errors.is_empty(),
+                "Generated code must produce at least one ERROR node"
+            );
+
+            // Use the production function to find the innermost non-leaf ERROR
+            let result = find_innermost_error(root);
+
+            // Check if there are any non-leaf ERROR nodes (child_count > 0)
+            let has_non_leaf_error = all_errors.iter().any(|(cc, _)| *cc > 0);
+
+            if has_non_leaf_error {
+                // If there's at least one non-leaf ERROR, find_innermost_error
+                // MUST return Some and the returned node MUST have children
+                // (i.e., it must NOT be a leaf ERROR).
+                prop_assert!(
+                    result.is_some(),
+                    "find_innermost_error should return Some when non-leaf ERROR nodes exist. \
+                     Code: {}, All errors (child_count, start_row): {:?}",
+                    code,
+                    all_errors
+                );
+
+                let returned = result.unwrap();
+
+                prop_assert!(
+                    returned.is_error(),
+                    "find_innermost_error must return an ERROR node. Code: {}",
+                    code
+                );
+
+                prop_assert!(
+                    returned.child_count() > 0,
+                    "find_innermost_error must NOT return a leaf ERROR node \
+                     (child_count must be > 0), but got child_count={}. \
+                     Code: {}, All errors (child_count, start_row): {:?}",
+                    returned.child_count(),
+                    code,
+                    all_errors
+                );
+
+                // Additionally verify that no leaf ERROR was chosen over a non-leaf
+                // by checking that the returned node is not any of the leaf ERRORs
+                let leaf_error_rows: Vec<usize> = all_errors
+                    .iter()
+                    .filter(|(cc, _)| *cc == 0)
+                    .map(|(_, row)| *row)
+                    .collect();
+
+                // The returned node should not be at a position that only has
+                // leaf ERROR nodes — but since we already checked child_count > 0,
+                // this is guaranteed. We verify the stronger property: if there
+                // are leaf ERRORs, the returned node is distinct from all of them.
+                if !leaf_error_rows.is_empty() {
+                    // The returned node has children, so it's definitionally not
+                    // a leaf. This assertion is redundant but documents the intent.
+                    prop_assert!(
+                        returned.child_count() > 0,
+                        "Returned ERROR must not be a leaf when leaf ERRORs exist"
+                    );
+                }
+            } else {
+                // All ERROR nodes are leaves — find_innermost_error should return None
+                prop_assert!(
+                    result.is_none(),
+                    "find_innermost_error should return None when only leaf ERROR nodes exist. \
+                     Code: {}, All errors (child_count, start_row): {:?}",
+                    code,
+                    all_errors
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 7: MISSING node width
+        //
+        // For any MISSING node, the diagnostic range SHALL have a width of exactly
+        // 1 column to ensure visibility in the editor.
+        //
+        // **Validates: Requirements 4.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_missing_node_width(code in missing_node_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Walk the entire tree to find all MISSING nodes
+            fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32)>) {
+                if node.is_missing() {
+                    out.push((
+                        node.start_position().row as u32,
+                        node.start_position().column as u32,
+                    ));
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_missing_positions(child, &mut *out);
+                }
+            }
+
+            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            collect_missing_positions(root, &mut missing_positions);
+
+            // Our generator should always produce at least one MISSING node
+            prop_assume!(
+                !missing_positions.is_empty(),
+                "Generated code must produce at least one MISSING node"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code with MISSING nodes: {}",
+                code
+            );
+
+            // For each MISSING node position, find the corresponding diagnostic
+            // and verify it has a width of exactly 1 column on a single line.
+            //
+            // MISSING-based diagnostics can appear as:
+            // 1. "Missing <kind>" — from collect_syntax_errors direct MISSING handling
+            // 2. "Syntax error" — from minimize_error_range Phase 1 (MISSING inside ERROR)
+            //
+            // Both paths create a 1-column-wide range at the MISSING node's position.
+            for &(m_row, m_col) in &missing_positions {
+                let matching_diag = diagnostics.iter().find(|d| {
+                    d.range.start.line == m_row && d.range.start.character == m_col
+                });
+
+                // There should be a diagnostic at this MISSING position
+                // (already validated by Property 3, but we need the diagnostic
+                // to check its width)
+                prop_assert!(
+                    matching_diag.is_some(),
+                    "Expected a diagnostic at MISSING node position ({}, {}) but none found. \
+                     Code: {}, Diagnostics: {:?}",
+                    m_row,
+                    m_col,
+                    code,
+                    diagnostics
+                        .iter()
+                        .map(|d| format!(
+                            "({},{})..({},{}) '{}'",
+                            d.range.start.line,
+                            d.range.start.character,
+                            d.range.end.line,
+                            d.range.end.character,
+                            d.message
+                        ))
+                        .collect::<Vec<_>>()
+                );
+
+                let diag = matching_diag.unwrap();
+
+                // The diagnostic must be on a single line
+                prop_assert_eq!(
+                    diag.range.start.line,
+                    diag.range.end.line,
+                    "MISSING node diagnostic must be on a single line, but spans lines {}..{}. \
+                     Code: {}, Position: ({}, {})",
+                    diag.range.start.line,
+                    diag.range.end.line,
+                    code,
+                    m_row,
+                    m_col
+                );
+
+                // The diagnostic must have a width of exactly 1 column
+                let width = diag.range.end.character - diag.range.start.character;
+                prop_assert_eq!(
+                    width,
+                    1,
+                    "MISSING node diagnostic must have width of exactly 1 column, \
+                     but has width {}. Range: ({},{})..({},{}). Code: {}",
+                    width,
+                    diag.range.start.line,
+                    diag.range.start.character,
+                    diag.range.end.line,
+                    diag.range.end.character,
+                    code
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 8: Error detection completeness
+        //
+        // For any R code containing syntax errors, the system SHALL emit at least
+        // one diagnostic.
+        //
+        // **Validates: Requirements 4.4**
+        // ============================================================================
+
+        #[test]
+        fn prop_error_detection_completeness(
+            code in prop_oneof![
+                nested_error_code(),
+                missing_node_code(),
+                single_line_error_code(),
+                broad_syntax_error_code(),
+            ]
+        ) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Only test code that tree-sitter actually considers erroneous.
+            // `has_error()` is true when the tree contains any ERROR or MISSING nodes.
+            prop_assume!(
+                root.has_error(),
+                "Generated code must contain syntax errors (tree-sitter has_error)"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            // The system must emit at least one diagnostic for any code with errors
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Code with syntax errors must produce at least one diagnostic. \
+                 Code: {:?}, has_error: {}",
+                code,
+                root.has_error()
+            );
+
+            // Every emitted diagnostic must have a valid severity
+            for diag in &diagnostics {
+                prop_assert!(
+                    diag.severity.is_some(),
+                    "Every diagnostic must have a severity. Code: {:?}, Message: {}",
+                    code,
+                    diag.message
+                );
+            }
+
+            // Every emitted diagnostic must have a non-empty message
+            for diag in &diagnostics {
+                prop_assert!(
+                    !diag.message.is_empty(),
+                    "Every diagnostic must have a non-empty message. Code: {:?}",
+                    code
+                );
             }
         }
     }
