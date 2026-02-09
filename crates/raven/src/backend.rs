@@ -635,10 +635,6 @@ impl LanguageServer for Backend {
                 }),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
-                document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
-                    first_trigger_character: String::from("\n"),
-                    more_trigger_character: None,
-                }),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
@@ -2657,17 +2653,6 @@ impl LanguageServer for Backend {
         ))
     }
 
-    async fn on_type_formatting(
-        &self,
-        params: DocumentOnTypeFormattingParams,
-    ) -> Result<Option<Vec<TextEdit>>> {
-        let state = self.state.read().await;
-        Ok(handlers::on_type_formatting(
-            &state,
-            &params.text_document_position.text_document.uri,
-            params.text_document_position.position,
-        ))
-    }
 }
 
 impl Backend {

@@ -7021,55 +7021,6 @@ fn find_references_in_tree(
 }
 
 // ============================================================================
-// On Type Formatting (Indentation)
-// ============================================================================
-
-pub fn on_type_formatting(
-    state: &WorldState,
-    uri: &Url,
-    position: Position,
-) -> Option<Vec<TextEdit>> {
-    let doc = state.get_document(uri)?;
-    let text = doc.text();
-
-    // Simple indentation: match previous line's indentation
-    if position.line == 0 {
-        return None;
-    }
-
-    let prev_line_idx = position.line as usize - 1;
-    let lines: Vec<&str> = text.lines().collect();
-
-    if prev_line_idx >= lines.len() {
-        return None;
-    }
-
-    let prev_line = lines[prev_line_idx];
-    let indent: String = prev_line
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .collect();
-
-    // Check if previous line ends with { or ( - add extra indent
-    let trimmed = prev_line.trim_end();
-    let extra_indent = if trimmed.ends_with('{') || trimmed.ends_with('(') {
-        "  "
-    } else {
-        ""
-    };
-
-    let new_indent = format!("{}{}", indent, extra_indent);
-
-    Some(vec![TextEdit {
-        range: Range {
-            start: Position::new(position.line, 0),
-            end: Position::new(position.line, 0),
-        },
-        new_text: new_indent,
-    }])
-}
-
-// ============================================================================
 // Utilities
 // ============================================================================
 
