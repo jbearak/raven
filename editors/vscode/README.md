@@ -1,6 +1,6 @@
 # Raven - R Language Server
 
-A static R language server with cross-file awareness for scientific research workflows. Raven provides LSP features (completions, diagnostics, go-to-definition, hover) without embedding R runtime, using tree-sitter for parsing.
+An R language server with cross-file awareness.
 
 ## Features
 
@@ -17,13 +17,7 @@ A static R language server with cross-file awareness for scientific research wor
 
 ## Settings
 
-Raven settings are available under the `raven.*` prefix in VS Code. Open **Settings** (Ctrl+, / Cmd+,) and search for "raven" to see all available options, including:
-
-- **Server**: Custom binary path
-- **Cross-file**: Traversal depth limits, call-site assumptions, revalidation behavior, cache sizes
-- **Diagnostics**: Enable/disable diagnostics, undefined variable detection
-- **Packages**: Package awareness, library paths, R executable path
-- **Symbols**: Workspace symbol result limits
+Raven settings are available under the `raven.*` prefix in VS Code. Open **Settings** (Ctrl+, / Cmd+,) and search for "raven" to see all available options.
 
 ## Using with vscode-R
 
