@@ -50,7 +50,7 @@ Pre-built binaries are available from the [releases page](https://github.com/jbe
 
 Raven runs over stdio (`raven --stdio`) and works with any LSP-capable editor.
 
-**VS Code:** Install the extension (which bundles the binary) from the [releases page](../../releases).
+**VS Code:** Install the extension (which bundles the binary) from the [releases page](../../releases). Marketplace and OpenVSX publishing is planned but not yet available.
 
 **Zed:** Add to your `settings.json`:
 
@@ -78,14 +78,14 @@ Raven runs over stdio (`raven --stdio`) and works with any LSP-capable editor.
 - **[R Language Server](https://github.com/REditorSupport/languageserver)** is the most established general-purpose R LSP.
 - **[Ark](https://github.com/posit-dev/ark)** is the R LSP used by **Positron**.
 
-Raven replaces these for cross-file scope, diagnostics, and navigation in multi-file R projects.
+Raven is an alternative focused on cross-file scope, diagnostics, and navigation for multi-file R projects.
 
 ### VS Code with the vscode-R extension
 
-The [vscode-R](https://github.com/REditorSupport/vscode-R) extension provides useful features beyond its bundled language server (running R code, viewing plots, etc.). To use Raven instead of the bundled R Language Server, disable its diagnostics so you don’t have two LSPs running:
+The [vscode-R](https://github.com/REditorSupport/vscode-R) extension provides useful features beyond its bundled language server (running R code, viewing plots, etc.). You can leave vscode-R's language server enabled alongside Raven (vscode-R provides formatting diagnostics, Raven provides code diagnostics), or disable it to avoid duplicate completions:
 
 ```json
-"r.lsp.diagnostics": false
+"r.lsp.enabled": false
 ```
 
 You may also want to push snippets below LSP completions to reduce duplicate entries:

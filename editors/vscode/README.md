@@ -17,7 +17,18 @@ An R language server with cross-file awareness.
 
 ## Settings
 
-Raven settings are available under the `raven.*` prefix in VS Code. Open **Settings** (Ctrl+, / Cmd+,) and search for "raven" to see all available options.
+Key settings (all under the `raven.*` prefix):
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
+| `raven.diagnostics.undefinedVariables` | `true` | Enable undefined variable diagnostics |
+| `raven.packages.enabled` | `true` | Enable package function awareness |
+| `raven.packages.rPath` | auto-detect | Path to R executable |
+| `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
+| `raven.server.path` | bundled | Path to `raven` binary (if not using the bundled one) |
+
+Open **Settings** (Ctrl+, / Cmd+,) and search for "raven" to see all options, or see the [full configuration reference](https://github.com/jbearak/raven/blob/main/docs/configuration.md).
 
 ## Using with vscode-R
 
