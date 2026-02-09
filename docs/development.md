@@ -20,6 +20,19 @@ Key code entry points:
 - On-demand background indexing: `crates/raven/src/cross_file/background_indexer.rs`
 - Package loading: `crates/raven/src/package_library.rs`
 
+## Build from source
+
+Prerequisites:
+- Rust toolchain (MSRV: 1.75)
+
+Clone and build:
+```bash
+git clone https://github.com/jbearak/Raven.git
+cd Raven
+cargo build --release -p raven
+# Binary will be at target/release/raven
+```
+
 ## Build, test, run
 
 - Debug build: `cargo build -p raven`
