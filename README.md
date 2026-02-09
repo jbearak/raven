@@ -16,9 +16,9 @@ Pre-built binaries are available from the [releases page](../../releases).
 
 ### Editor Setup
 
-Raven is a standard Language Server Protocol (LSP) server. This repository includes a VS Code extension, but the binary works with any editor that supports LSP.
+Raven provides cross-file symbol resolution, position-aware scope, and diagnostics for R codebases. It works with any editor that supports the Language Server Protocol (LSP).
 
-**VS Code:** The extension is bundled with the binary. After running `setup.sh`, reload VS Code to activate.
+**VS Code:** Install the extension and binary from the [releases page](../../releases).
 
 **Zed:** Add to your `settings.json`:
 ```json
@@ -84,7 +84,7 @@ Neither setting is required — Raven works fine without them.
 | Cross-file `source()` tracking | Yes | No | No |
 | Position-aware scope | Yes | No | No |
 | Workspace symbol indexing | Yes | Completions only | Open files only |
-| Editor support | Any LSP-capable editor | Positron only | VS Code |
+| Editor support | Any LSP-capable editor | Positron only | Any LSP-capable editor |
 | Package export awareness | Yes | Yes | Yes |
 
 ## Features
