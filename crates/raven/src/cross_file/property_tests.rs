@@ -1179,6 +1179,18 @@ fn make_url(name: &str) -> Url {
     Url::parse(&format!("file:///{}.R", name)).unwrap()
 }
 
+/// Build the set of filler variable names used in generated test code.
+///
+/// Tests generate `x0, x1, …` before a directive and `y0, y1, y2` after it.
+/// Use `prop_assume!` with the result to skip cases where a generated symbol
+/// name collides with a filler name.
+fn filler_names(x_count: usize, y_count: usize) -> HashSet<String> {
+    (0..x_count)
+        .map(|i| format!("x{}", i))
+        .chain((0..y_count).map(|i| format!("y{}", i)))
+        .collect()
+}
+
 fn make_meta_with_sources(sources: Vec<(&str, u32)>) -> CrossFileMetadata {
     CrossFileMetadata {
         sources: sources
@@ -10937,8 +10949,7 @@ proptest! {
     ) {
         // Ensure export_name doesn't collide with filler variable names (x0, x1, etc.)
         // which would create local definitions that shadow the package export
-        let filler_names: Vec<String> = (0..lines_before).map(|i| format!("x{}", i)).collect();
-        prop_assume!(!filler_names.contains(&export_name));
+        prop_assume!(!filler_names(lines_before, 0).contains(export_name.as_str()));
 
         let uri = make_url("test_pre_load_all_pos");
 
@@ -21732,11 +21743,7 @@ proptest! {
         use tower_lsp::lsp_types::Url;
 
         // Skip if the symbol name collides with filler variable names
-        let filler_names: Vec<String> = (0..directive_line)
-            .map(|i| format!("x{}", i))
-            .chain((0..3).map(|i| format!("y{}", i)))
-            .collect();
-        prop_assume!(!filler_names.contains(&symbol_name));
+        prop_assume!(!filler_names(directive_line as usize, 3).contains(symbol_name.as_str()));
 
         // Build content with the directive at the specified line
         let mut lines: Vec<String> = (0..directive_line)
@@ -21919,11 +21926,7 @@ proptest! {
         use tower_lsp::lsp_types::Url;
 
         // Skip if the symbol name collides with filler variable names or the code variable
-        let filler_names: Vec<String> = (0..directive_line)
-            .map(|i| format!("x{}", i))
-            .chain((0..3).map(|i| format!("y{}", i)))
-            .collect();
-        prop_assume!(!filler_names.contains(&symbol_name));
+        prop_assume!(!filler_names(directive_line as usize, 3).contains(symbol_name.as_str()));
         prop_assume!(symbol_name != code_var_name);
 
         // Build content with code and directive on the same line
