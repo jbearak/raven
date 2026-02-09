@@ -6175,10 +6175,12 @@ fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::Par
         return vec![];
     }
 
-    // Split by commas, but be careful about nested parentheses and quotes
+    // Split by commas, but be careful about nested parentheses, brackets, braces, and quotes
     let mut params = Vec::new();
     let mut current_param = String::new();
     let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
     let mut in_quotes = false;
     let mut quote_char = ' ';
     let mut skip_next = false;
@@ -6211,7 +6213,23 @@ fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::Par
                 paren_depth = paren_depth.saturating_sub(1);
                 current_param.push(ch);
             }
-            ',' if !in_quotes && paren_depth == 0 => {
+            '[' if !in_quotes => {
+                bracket_depth += 1;
+                current_param.push(ch);
+            }
+            ']' if !in_quotes => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current_param.push(ch);
+            }
+            '{' if !in_quotes => {
+                brace_depth += 1;
+                current_param.push(ch);
+            }
+            '}' if !in_quotes => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current_param.push(ch);
+            }
+            ',' if !in_quotes && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
                 // End of parameter
                 if !current_param.trim().is_empty() {
                     params.push(parse_single_param(&current_param));
@@ -6756,7 +6774,7 @@ pub fn goto_definition(
                         start: Position::new(symbol.defined_line, symbol.defined_column),
                         end: Position::new(
                             symbol.defined_line,
-                            symbol.defined_column + name.len() as u32,
+                            symbol.defined_column + name.chars().map(|c| c.len_utf16() as u32).sum::<u32>(),
                         ),
                     },
                 }));
@@ -6781,7 +6799,7 @@ pub fn goto_definition(
                         start: Position::new(symbol.defined_line, symbol.defined_column),
                         end: Position::new(
                             symbol.defined_line,
-                            symbol.defined_column + name.len() as u32,
+                            symbol.defined_column + name.chars().map(|c| c.len_utf16() as u32).sum::<u32>(),
                         ),
                     },
                 }));
