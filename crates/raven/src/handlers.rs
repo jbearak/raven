@@ -6175,7 +6175,7 @@ fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::Par
     // Split by commas, but be careful about nested parentheses and quotes
     let mut params = Vec::new();
     let mut current_param = String::new();
-    let mut paren_depth = 0;
+    let mut paren_depth: usize = 0;
     let mut in_quotes = false;
     let mut quote_char = ' ';
 
@@ -6195,7 +6195,7 @@ fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::Par
                 current_param.push(ch);
             }
             ')' if !in_quotes => {
-                paren_depth -= 1;
+                paren_depth = paren_depth.saturating_sub(1);
                 current_param.push(ch);
             }
             ',' if !in_quotes && paren_depth == 0 => {
@@ -6240,8 +6240,32 @@ fn parse_single_param(param_str: &str) -> crate::parameter_resolver::ParameterIn
         };
     }
 
-    // Check if there's a default value (contains '=')
-    if let Some(eq_pos) = trimmed.find('=') {
+    // Find '=' that is not inside quotes
+    let eq_pos = {
+        let mut in_quotes = false;
+        let mut quote_char = ' ';
+        let mut pos = None;
+        for (i, ch) in trimmed.char_indices() {
+            match ch {
+                '"' | '\'' if !in_quotes => {
+                    in_quotes = true;
+                    quote_char = ch;
+                }
+                c if in_quotes && c == quote_char => {
+                    in_quotes = false;
+                }
+                '=' if !in_quotes => {
+                    pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        pos
+    };
+
+    // Check if there's a default value (contains '=' outside quotes)
+    if let Some(eq_pos) = eq_pos {
         let name = trimmed[..eq_pos].trim().to_string();
         let default = trimmed[eq_pos + 1..].trim();
         let default_value = if default.is_empty() {
@@ -16839,7 +16863,8 @@ mod proptests {
         parser.parse(code, None).unwrap()
     }
 
-    // Helper to filter out R reserved keywords from generated identifiers
+    // Helper to filter out R reserved keywords from generated lowercase identifiers.
+    // R reserved words are case-sensitive; only lowercase ones can collide with [a-z] generators.
     fn is_r_reserved(s: &str) -> bool {
         matches!(
             s,
@@ -16853,11 +16878,6 @@ mod proptests {
                 | "break"
                 | "function"
                 | "return"
-                | "true"
-                | "false"
-                | "null"
-                | "inf"
-                | "nan"
         )
     }
 
