@@ -4860,16 +4860,12 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
 /// tokens even when the AST is incomplete.
 fn has_namespace_accessor_at_cursor(text: &str, position: Position) -> bool {
     let line_idx = position.line as usize;
-    let col = position.character as usize;
     let line = match text.lines().nth(line_idx) {
         Some(l) => l,
         None => return false,
     };
-    let prefix = if col <= line.len() {
-        &line[..col]
-    } else {
-        line
-    };
+    let byte_offset = utf16_column_to_byte_offset(line, position.character);
+    let prefix = &line[..byte_offset];
     // Scan backward: first collect identifier chars (the partial token after `::`)
     // then check if `::` or `:::` immediately precedes them.
     let after_ident = prefix
@@ -4885,17 +4881,13 @@ fn has_namespace_accessor_at_cursor(text: &str, position: Position) -> bool {
 /// or whitespace.
 fn get_token_at_cursor(text: &str, position: Position) -> String {
     let line_idx = position.line as usize;
-    let col = position.character as usize;
     let line = match text.lines().nth(line_idx) {
         Some(l) => l,
         None => return String::new(),
     };
     // Collect identifier characters backward from cursor
-    let prefix = if col <= line.len() {
-        &line[..col]
-    } else {
-        line
-    };
+    let byte_offset = utf16_column_to_byte_offset(line, position.character);
+    let prefix = &line[..byte_offset];
     let token: String = prefix
         .chars()
         .rev()
