@@ -393,12 +393,12 @@ pub(crate) fn parse_cross_file_config(
 
 /// Parse a severity string into an optional `DiagnosticSeverity`.
 ///
-/// Returns `None` for "off"/"none"/"disabled", which disables the diagnostic entirely.
+/// Returns `None` for "off", which disables the diagnostic entirely.
 /// Returns the corresponding severity for "error", "warning", "information"/"info", "hint".
 /// Unrecognised values default to `Some(WARNING)`.
 pub(crate) fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
     match s.to_lowercase().as_str() {
-        "off" | "none" | "disabled" => None,
+        "off" => None,
         "error" => Some(DiagnosticSeverity::ERROR),
         "warning" => Some(DiagnosticSeverity::WARNING),
         "information" | "info" => Some(DiagnosticSeverity::INFORMATION),

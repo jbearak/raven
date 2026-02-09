@@ -25200,14 +25200,18 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_parse_severity_off_returns_none() {
-        // Verify the parse_severity function itself handles all "off" variants
+        // Verify the parse_severity function handles "off" (case-insensitive)
         use crate::backend::parse_severity;
 
         assert_eq!(parse_severity("off"), None);
         assert_eq!(parse_severity("OFF"), None);
         assert_eq!(parse_severity("Off"), None);
-        assert_eq!(parse_severity("none"), None);
-        assert_eq!(parse_severity("disabled"), None);
+        // Unrecognized values default to WARNING, not None
+        assert_eq!(parse_severity("none"), Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            parse_severity("disabled"),
+            Some(DiagnosticSeverity::WARNING)
+        );
         // Non-off values should return Some
         assert!(parse_severity("warning").is_some());
         assert!(parse_severity("error").is_some());
