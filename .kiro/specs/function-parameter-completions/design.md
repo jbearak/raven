@@ -106,11 +106,13 @@ fn find_enclosing_function_call(
 5. For nested calls: the innermost `call` ancestor wins
 6. For namespace-qualified calls (`pkg::func(`): extract both namespace and function name from the `namespace_operator` node. Detect if operator is `::` or `:::` and set `is_internal` accordingly.
 7. Skip if cursor is inside a `string` node (no parameter completions inside string literals)
-8. If the AST walk fails to find a call (e.g., due to incomplete syntax), fall back to a **string-aware** bracket-based heuristic:
-   - Scan backward from the cursor position through the document text
-   - Track bracket nesting: `(` pushes, `)` pops; the first unmatched `(` is the target
-   - **String boundary tracking**: Maintain a state machine to detect when the scanner is inside single-quoted (`'...'`), double-quoted (`"..."`), or backtick-quoted (`` `...` ``) strings. Brackets inside strings are ignored. This prevents `f("(", |)` from being confused by the `(` inside the string literal. (The official R language server implements this via a C finite state machine in `fsm.c`/`search.c`.)
-   - Once the unmatched `(` is found, extract the function name token immediately before it (scan backward from the `(` position, collecting identifier characters including `.` and `::` namespace qualifiers)
+8. If the AST walk fails to find a call (e.g., due to incomplete syntax), fall back to a bracket-based heuristic with a finite state machine (FSM) modeled on the official R language server's C implementation (`fsm.c`/`search.c`):
+   - Scan backward from the cursor position through the document text, character by character
+   - **Multi-bracket nesting**: Track all three bracket types — `(` / `)`, `[` / `]`, `{` / `}` — using a stack. Opening brackets push, closing brackets pop. Only an unmatched `(` (not `[` or `{`) triggers parameter completions, but all types must be tracked for correct nesting depth. This prevents incorrect matches in `df[func(x, |)]` where the `[` must be counted.
+   - **String boundary tracking**: Maintain FSM state to detect when the scanner is inside single-quoted (`'...'`), double-quoted (`"..."`), backtick-quoted (`` `...` ``), or R 4.0+ raw strings (`r"(...)"`, `R"(...)"`, `r'(...)'`, `R'(...)'`, and variants with dash delimiters like `r"-(..)-"`). Brackets inside strings are ignored. This prevents `f("(", |)` from being confused by the `(` inside the string literal.
+   - **Comment handling**: When the scanner encounters `#` outside of any string literal, it must skip backward to the beginning of that line (the `#` starts a comment that extends to end-of-line, so everything from `#` rightward is comment text). This prevents brackets inside comments from affecting nesting, e.g., `f(x, # adjust ( balance\n  |)` must detect `f`.
+   - **Backslash escapes**: Track `\` to handle escaped quotes inside strings (e.g., `f("a\"(b", |)` must detect `f` despite the escaped quote).
+   - Once the unmatched `(` is found, extract the function name token immediately before it: scan backward from the `(` position, skipping whitespace, then collecting identifier characters including `.` and `::` / `:::` namespace qualifiers. Stop at any character that cannot be part of an R identifier or namespace accessor.
    - This matches R-LS robustness for incomplete/malformed syntax
 
 ### 2. Parameter Resolver
@@ -296,18 +298,22 @@ pub fn get_function_doc(block: &RoxygenBlock) -> Option<String>;
 
 Extension to `crates/raven/src/handlers.rs` `completion_item_resolve()`:
 
-Parameter completion items store resolve data in the `data` field:
+Parameter completion items store resolve data in the `data` field. All parameter completions include `"type": "parameter"` for unambiguous dispatch (matching the official R language server's `token_data` pattern):
+
+For package function parameters:
 ```json
 {
+  "type": "parameter",
   "param_name": "x",
   "function_name": "filter",
   "package": "dplyr"
 }
 ```
 
-For user-defined functions (both parameter and function completions):
+For user-defined function parameters:
 ```json
 {
+  "type": "parameter",
   "param_name": "threshold",
   "function_name": "process_data",
   "uri": "file:///path/to/file.R",
@@ -318,6 +324,7 @@ For user-defined functions (both parameter and function completions):
 For user-defined function name completions (no `param_name`):
 ```json
 {
+  "type": "user_function",
   "function_name": "process_data",
   "uri": "file:///path/to/file.R",
   "func_line": 5
@@ -326,23 +333,21 @@ For user-defined function name completions (no `param_name`):
 
 **Resolve handler dispatch order** (in `completion_item_resolve()`):
 
-The resolve handler inspects the `data` field of the completion item to determine which resolution path to use. Dispatch proceeds in this order:
+The resolve handler inspects the `type` field in the completion item's `data` to determine which resolution path to use. This explicit discriminator avoids fragile heuristics based on which fields happen to be present and matches the R-LS pattern. Dispatch proceeds in this order:
 
-1. **Parameter completion** (has `param_name` in data):
+1. **Parameter completion** (`type == "parameter"`):
    - For package functions (has `package`): fetch structured Rd arguments (or parse Rd `\\arguments`) via `help_cache`/help subsystem, then extract the argument description for that parameter name.
    - For user-defined functions (has `uri` + `func_line`): locate the function definition, call `extract_roxygen_block()`, then `get_param_doc()` (roxygen2-style tags with fallback to plain comments).
    - If no documentation found, return the item unchanged.
 
-2. **User-defined function name completion** (has `func_line` but no `param_name`):
+2. **User-defined function name completion** (`type == "user_function"`):
    - Use `uri` and `func_line`, call `extract_roxygen_block()`, then `get_function_doc()` to get the title/description.
    - If no roxygen block found, return the item unchanged.
 
-3. **Package export completion** (has `topic` and `package`, no `param_name`):
+3. **Package export completion** (has `topic` and `package`, existing behavior):
    - Existing resolve logic (unchanged) — fetches R help via `help_cache`.
 
-4. **No recognized data**: Return the item unchanged.
-
-Note: The new `package` key in parameter completion data (step 1) has a different semantic from the existing `package` key in package export data (step 3). They are disambiguated by the presence of `param_name`.
+4. **No recognized `type`**: Return the item unchanged.
 
 ```rust
 /// Extract parameter description for a specific argument from Rd/structured help
@@ -439,6 +444,7 @@ fn get_parameter_completions(
                 // Sort by index (0-001, 0-002) to preserve definition order
                 sort_text: Some(format!("{}{:03}", SORT_PREFIX_PARAM, idx)),
                 data: Some(serde_json::json!({
+                    "type": "parameter",
                     "param_name": p.name,
                     "function_name": function_name,
                     "package": namespace,
@@ -483,7 +489,7 @@ User functions:    "file:///path/to/file.R#my_func"
 "5-" — keywords / constants (lowest priority)
 ```
 
-Note: `"3-"` is intentionally unused (reserved for future use). This gap is consistent with the existing codebase sort prefix constants in `handlers.rs`.
+Note: `"3-"` is intentionally unused (reserved for future use). The official R language server uses `"3-"` for NAMESPACE-imported objects (`importFrom()` directives). This gap is consistent with the existing codebase sort prefix constants in `handlers.rs` and leaves room for future parity (see requirements.md Out of Scope item 10).
 
 ### Cache Configuration
 
@@ -630,6 +636,12 @@ The following are explicitly excluded from this spec and may be addressed in fol
 
 7. **Completion count limiting**: See requirements.md Out of Scope item 6.
 
+8. **`textDocument/signatureHelp`**: See requirements.md Out of Scope item 7. Infrastructure (parameter resolver, signature cache, roxygen extraction) is designed to be reusable.
+
+9. **`getOption()` special handling**: See requirements.md Out of Scope item 8.
+
+10. **S4 slot access (`@`) completions**: See requirements.md Out of Scope item 9.
+
 ## Testing Strategy
 
 ### Unit Tests
@@ -644,6 +656,11 @@ Unit tests verify specific examples and edge cases:
    - Cursor outside parentheses (should not trigger)
    - Incomplete syntax / unbalanced parentheses still finds the call
    - Brackets inside string literals: `f("(", |)` should detect `f`, not be confused by the `(` in the string
+   - Brackets inside R comments: `f(x, # adjust ( balance\n  |)` should detect `f`
+   - Mixed bracket types: `df[func(x, |)]` should detect `func`, not be confused by the `[`
+   - R 4.0+ raw strings: `f(r"(hello(world))", |)` should detect `f`
+   - Escaped quotes: `f("a\"(b", |)` should detect `f`
+   - Cursor at column 0 (beginning of line): should not crash or trigger false detection
    - R Markdown: inside R code block triggers; outside code block does not
    - `library(|)` and `require(|)`: special-case handler takes precedence (if implemented)
 
