@@ -9,6 +9,21 @@
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Point, Tree};
 
+/// Convert a UTF-16 column offset (from LSP Position.character) to a byte
+/// offset within the given line. Tree-sitter Points expect byte offsets, not
+/// UTF-16 code units.
+fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
+    let target = utf16_col as usize;
+    let mut utf16_count = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_count >= target {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    line.len()
+}
+
 /// Information about a detected function call at cursor position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCallContext {
@@ -87,7 +102,9 @@ fn is_inside_r_code_block(text: &str, position: Position) -> bool {
 
 /// Try to detect function call context using tree-sitter AST walk.
 fn detect_via_ast(tree: &Tree, text: &str, position: Position) -> Option<FunctionCallContext> {
-    let point = Point::new(position.line as usize, position.character as usize);
+    let line_text = text.lines().nth(position.line as usize)?;
+    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
+    let point = Point::new(position.line as usize, byte_col);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
     // If cursor is inside a string node, no parameter completions
@@ -126,7 +143,9 @@ fn find_enclosing_function_call(
     text: &str,
     position: Position,
 ) -> Option<FunctionCallContext> {
-    let cursor_point = Point::new(position.line as usize, position.character as usize);
+    let line_text = text.lines().nth(position.line as usize)?;
+    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
+    let cursor_point = Point::new(position.line as usize, byte_col);
     let mut current = node;
 
     loop {
@@ -223,7 +242,11 @@ enum FsmState {
 fn detect_via_bracket_heuristic(text: &str, position: Position) -> Option<FunctionCallContext> {
     let lines: Vec<&str> = text.lines().collect();
     let cursor_line = position.line as usize;
-    let cursor_col = position.character as usize;
+    let cursor_col = if cursor_line < lines.len() {
+        utf16_column_to_byte_offset(lines[cursor_line], position.character)
+    } else {
+        position.character as usize
+    };
 
     if cursor_line >= lines.len() {
         return None;
@@ -254,14 +277,14 @@ fn detect_via_bracket_heuristic(text: &str, position: Position) -> Option<Functi
 
             match state {
                 FsmState::SingleQuoted => {
-                    if ch == '\\' {
+                    if ch == '\\' && i + 1 < scan_end {
                         i += 1; // skip escaped char
                     } else if ch == '\'' {
                         state = FsmState::Normal;
                     }
                 }
                 FsmState::DoubleQuoted => {
-                    if ch == '\\' {
+                    if ch == '\\' && i + 1 < scan_end {
                         i += 1; // skip escaped char
                     } else if ch == '"' {
                         state = FsmState::Normal;

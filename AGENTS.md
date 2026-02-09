@@ -27,8 +27,8 @@ Reference implementation:
 
 When making significant changes:
 
-1. If user-visible behavior changes, update the relevant user-facing docs under `docs/` (and `README.md` if appropriate).
-2. If internal architecture, caching, performance, or debugging guidance changes, update `docs/development.md`.
+1. Update the relevant user-facing docs under `docs/` (and `README.md` if appropriate) when user-visible behavior changes.
+2. For changes to internal architecture, caching, performance, or debugging guidance, update `docs/development.md`.
 3. If you discover a new non-obvious pitfall (especially something an LLM got wrong), add it to **"Learnings"** in this file.
 4. Prefer documenting invariants next to the code they constrain (module docs / comments) when that is the most durable place.
 5. Keep this file’s pointers, “Key invariants”, and “Learnings” sections accurate over time.

@@ -48,7 +48,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - _Requirements: 1.6_
 
   - [x] 1.5 Write unit test for embedded-R scope gating (R Markdown)
-    - Verify parameter completions only appear inside R code blocks, not in markdown text
+    - Verify parameter completions only appear inside R code blocks, not in Markdown text
     - _Requirements: 1.7_
 
 - [x] 2. Checkpoint - Ensure context detection tests pass
@@ -60,7 +60,7 @@ This implementation adds function parameter completions to Raven's LSP. When the
     - Define `SignatureCache` with two `RwLock<LruCache>` fields: `package_signatures` (capacity 500) and `user_signatures` (capacity 200)
     - Implement `SignatureCache::new()`, `get_package()`, `get_user()` (use `peek()` under read lock), `insert_package()`, `insert_user()` (use `push()` under write lock)
     - Implement `SignatureCache::invalidate_file(uri)`: iterate user LRU cache, collect keys matching URI prefix, remove them
-    - Implement `ParameterResolver::extract_from_ast()`: extract params from `formal_parameters` tree-sitter node; detect `...` via `dots` node kind (set `is_dots = true`); extract default values from `default_parameter` nodes; include `...` in output (R-LS parity)
+    - Implement `ParameterResolver::extract_from_ast()`: extract params from `parameters` tree-sitter node; detect `...` via `dots` node kind (set `is_dots = true`); extract default values from `parameter` nodes with `=`; include `...` in output (R-LS parity)
     - Implement `ParameterResolver::resolve(..., is_internal: bool)` with resolution priority: cache → local AST (nearest in-scope definition before cursor; works for untitled docs) → cross-file scope → package (R subprocess with 5s timeout on cache miss)
     - For package resolution: use scope resolver's position-aware `loaded_packages` + `inherited_packages` to determine which package exports the function at cursor position; if `is_internal` is true, pass `exported_only = false` to R query
     - Add `mod parameter_resolver;` to `main.rs`

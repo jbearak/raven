@@ -164,12 +164,16 @@ impl HelpCache {
 
         // Cache miss — fetch help text and parse arguments
         let help_text = self.get_or_fetch(topic, package);
-        let args = help_text.and_then(|text| {
-            let map = extract_arguments_from_help(&text);
-            if map.is_empty() { None } else { Some(map) }
-        });
+        let args = match help_text {
+            Some(text) => {
+                let map = extract_arguments_from_help(&text);
+                if map.is_empty() { None } else { Some(map) }
+            }
+            // Transient R failure — don't cache so retries can succeed later
+            None => return None,
+        };
 
-        // Cache the result (including None for negative caching)
+        // Cache the parsed result (including None for "no Arguments section" cases)
         if let Ok(mut guard) = self.arguments.write() {
             guard.push(key, args.clone());
         }
@@ -706,14 +710,11 @@ pub fn extract_arguments_from_help(help_text: &str) -> HashMap<String, String> {
     for line in lines.iter().skip(args_idx + 1) {
         let trimmed = line.trim();
 
-        // Stop at the next section header (non-empty, ends with ':', no parens,
-        // and is NOT an argument entry — argument entries have leading whitespace
-        // before the name and colon)
-        if !trimmed.is_empty()
-            && trimmed.ends_with(':')
-            && !trimmed.contains('(')
-            && !line.starts_with(' ')
-        {
+        // Stop at the next section header (non-empty, ends with ':', starts at
+        // column 0). Argument entries have leading whitespace, so checking
+        // !line.starts_with(' ') distinguishes headers from argument lines.
+        // This correctly handles headers like "Author(s):" that contain parens.
+        if !trimmed.is_empty() && trimmed.ends_with(':') && !line.starts_with(' ') {
             break;
         }
 

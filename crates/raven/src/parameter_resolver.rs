@@ -130,11 +130,19 @@ impl SignatureCache {
     pub fn invalidate_file(&self, uri: &Url) {
         let prefix = format!("{}#", uri.as_str());
         if let Ok(mut cache) = self.user_signatures.write() {
-            // Collect keys to remove (can't remove while iterating)
+            // Collect keys to remove: entries keyed by this file's URI prefix,
+            // OR entries whose source URI matches this file (cross-file signatures
+            // cached under the caller's URI).
             let keys_to_remove: Vec<String> = cache
                 .iter()
-                .filter_map(|(k, _)| {
-                    if k.starts_with(&prefix) {
+                .filter_map(|(k, v)| {
+                    let key_match = k.starts_with(&prefix);
+                    let source_match = match &v.source {
+                        SignatureSource::CurrentFile { uri: src, .. }
+                        | SignatureSource::CrossFile { uri: src, .. } => src == uri,
+                        SignatureSource::RSubprocess { .. } => false,
+                    };
+                    if key_match || source_match {
                         Some(k.clone())
                     } else {
                         None
@@ -152,14 +160,6 @@ impl SignatureCache {
 // AST extraction
 // ---------------------------------------------------------------------------
 
-/// Extract parameter information from a `formal_parameters` tree-sitter node.
-///
-/// Walks the node's children to find:
-/// - `identifier` nodes: regular parameters with no default value
-/// - `default_parameter` nodes: parameters with default values (name = value)
-/// - `dots` nodes: the `...` parameter (sets `is_dots = true`)
-///
-/// Returns parameters in declaration order, including `...` (R-LS parity).
 /// Extract parameter information from a `parameters` tree-sitter node.
 ///
 /// Walks the node's children to find:
@@ -264,24 +264,29 @@ pub fn resolve(
         }
     }
 
-    // Check user cache (current file + cross-file)
-    let user_cache_key = format!("{}#{}", current_uri.as_str(), function_name);
-    if let Some(sig) = cache.get_user(&user_cache_key) {
-        return Some(sig);
-    }
+    // --- Phases 1 & 2: Local / cross-file (only for unqualified calls) ---
+    // Namespace-qualified calls (e.g., dplyr::filter) skip user-defined lookup
+    // and go straight to package resolution.
+    if namespace.is_none() {
+        // Check user cache (current file + cross-file)
+        let user_cache_key = format!("{}#{}", current_uri.as_str(), function_name);
+        if let Some(sig) = cache.get_user(&user_cache_key) {
+            return Some(sig);
+        }
 
-    // Also check package cache for unqualified names (may have been resolved before)
-    // We'll check this after local AST search since local definitions take precedence
+        // Phase 1: Local AST search (current file)
+        if let Some(sig) =
+            resolve_from_current_file(state, cache, function_name, current_uri, position)
+        {
+            return Some(sig);
+        }
 
-    // --- Phase 1: Local AST search (current file) ---
-    if let Some(sig) = resolve_from_current_file(state, cache, function_name, current_uri, position)
-    {
-        return Some(sig);
-    }
-
-    // --- Phase 2: Cross-file scope ---
-    if let Some(sig) = resolve_from_cross_file(state, cache, function_name, current_uri, position) {
-        return Some(sig);
+        // Phase 2: Cross-file scope
+        if let Some(sig) =
+            resolve_from_cross_file(state, cache, function_name, current_uri, position)
+        {
+            return Some(sig);
+        }
     }
 
     // --- Phase 3: Package resolution ---
@@ -491,8 +496,9 @@ fn resolve_from_cross_file(
         },
     };
 
-    // Cache the result under the current file's key
-    let cache_key = format!("{}#{}", uri.as_str(), function_name);
+    // Cache the result under the source file's key (not the caller's URI)
+    // so that invalidation by source file works correctly.
+    let cache_key = format!("{}#{}", symbol.source_uri.as_str(), function_name);
     cache.insert_user(cache_key, sig.clone());
 
     Some(sig)

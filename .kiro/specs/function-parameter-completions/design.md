@@ -198,9 +198,9 @@ impl<'a> ParameterResolver<'a> {
         position: Position,
     ) -> Option<FunctionSignature>;
 
-    /// Extract parameters from a function_definition AST node
+    /// Extract parameters from a parameters AST node
     fn extract_from_ast(
-        func_node: Node,
+        params_node: Node,
         text: &str,
     ) -> Vec<ParameterInfo>;
 }
@@ -208,7 +208,7 @@ impl<'a> ParameterResolver<'a> {
 
 **Resolution priority** (matches R-LS two-phase approach):
 1. **Cache**: Check signature cache first
-2. **Local AST**: Search the current file for the nearest in-scope function definition that appears before the cursor, then extract params from its `formal_parameters` node (works for untitled/unsaved documents using in-memory text)
+2. **Local AST**: Search the current file for the nearest in-scope function definition that appears before the cursor, then extract params from its `parameters` node (works for untitled/unsaved documents using in-memory text)
 3. **Cross-file**: Use cross-file scope to find function in sourced files
 4. **Package**: If namespace is provided (`dplyr::filter`), query `formals(dplyr::filter)` directly. Otherwise, use the scope resolver's position-aware package list (the same `loaded_packages` + `inherited_packages` used by the completion handler) to determine which packages are in scope at the cursor position, then check which of those packages exports the function. This ensures that when multiple packages export the same name, the one actually loaded at the cursor's position wins — not a global "most recently loaded" heuristic.
 
