@@ -301,6 +301,10 @@ pub fn print_results(results: &[PhaseResult]) {
 }
 
 /// Print phase results in CSV format.
+///
+/// Note: `detail` is always built from controlled format strings in this
+/// module, so it will never contain commas or newlines. The double-quote
+/// escaping handles the only remaining RFC 4180 concern.
 pub fn print_results_csv(results: &[PhaseResult]) {
     println!("phase,duration_ms,peak_rss_bytes,detail");
     for result in results {

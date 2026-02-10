@@ -105,11 +105,16 @@ jobs:
           fi
           echo "no_baseline=false" >> "$GITHUB_OUTPUT"
           # Compare PR results against main baseline, threshold 5%
-          critcmp main pr --threshold 5 > /tmp/critcmp-output.txt 2>&1 || true
-          if [ -s /tmp/critcmp-output.txt ]; then
-            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          if critcmp main pr --threshold 5 > /tmp/critcmp-output.txt 2>&1; then
+            # critcmp succeeded — check if there's any output (regressions found)
+            if [ -s /tmp/critcmp-output.txt ]; then
+              echo "has_diff=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::critcmp failed; treating as diff to surface in PR comment"
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Post or update PR comment using gh CLI (no third-party actions needed).

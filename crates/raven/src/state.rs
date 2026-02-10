@@ -939,10 +939,8 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 /// so the primary goal is to avoid wasting time on directories that would
 /// never contain R files.
 ///
-/// Note: We intentionally keep this list minimal. Directories like `renv/`,
-/// Directories that are definitively not R-related and should be skipped
-/// during workspace scanning. Keep this conservative — only skip directories
-/// that will never contain user R code.
+/// Comparison is case-insensitive. This list is also used by the
+/// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
     ".git",          // Git internal files
     ".svn",          // Subversion internal files
