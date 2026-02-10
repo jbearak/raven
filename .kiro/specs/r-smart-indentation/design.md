@@ -769,25 +769,6 @@ let style = config
     .unwrap_or(IndentationStyle::RStudio);
 ```
 
-### Malformed FormattingOptions
-
-**Scenario**: LSP client sends invalid tab_size (0, negative, or extremely large) or missing insert_spaces.
-
-**Handling**:
-- Clamp tab_size to reasonable range (1-8, default 2)
-- Default insert_spaces to true if missing
-- Log warning but continue with safe defaults
-
-**Implementation**:
-```rust
-let tab_size = params.options.tab_size.clamp(1, 8);
-let insert_spaces = params.options.insert_spaces.unwrap_or(true);
-
-if params.options.tab_size < 1 || params.options.tab_size > 8 {
-    log::warn!("Invalid tab_size: {}, clamping to {}", params.options.tab_size, tab_size);
-}
-```
-
 ### Chain Start Detection Infinite Loop
 
 **Scenario**: Malformed AST or edge case causes chain start walker to loop indefinitely.

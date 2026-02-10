@@ -24,11 +24,11 @@ This feature implements intelligent indentation for R code in VS Code, addressin
 
 #### Acceptance Criteria
 
-1. WHEN a line ends with `|>` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-2. WHEN a line ends with `%>%` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-3. WHEN a line ends with `+` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-4. WHEN a line ends with `~` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-5. WHEN a line ends with a custom infix operator `%word%` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
+1. WHEN a line ends with `|>` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level (as determined by the file's editor indentation settings)
+2. WHEN a line ends with `%>%` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level
+3. WHEN a line ends with `+` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level
+4. WHEN a line ends with `~` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level
+5. WHEN a line ends with a custom infix operator `%word%` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level
 
 ### Requirement 2: Declarative Bracket Indentation
 
@@ -36,10 +36,10 @@ This feature implements intelligent indentation for R code in VS Code, addressin
 
 #### Acceptance Criteria
 
-1. WHEN a line ends with `{` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-2. WHEN a line ends with `(` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-3. WHEN a line ends with `[` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-4. WHEN a line starts with `}`, `)`, or `]`, THE Language_Configuration SHALL outdent that line
+1. WHEN a line ends with `{` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level (as determined by the file's editor indentation settings)
+2. WHEN a line ends with `(` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level
+3. WHEN a line ends with `[` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line by one indentation level
+4. WHEN a line starts with `}`, `)`, or `]`, THE Language_Configuration SHALL outdent that line by one indentation level
 
 ### Requirement 3: AST-Aware Pipe Chain Indentation
 
