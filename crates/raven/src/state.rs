@@ -98,6 +98,25 @@ impl SymbolConfig {
     }
 }
 
+/// Completion provider configuration
+///
+/// Controls behavior of the completion trigger characters and related UI settings.
+#[derive(Debug, Clone)]
+pub struct CompletionConfig {
+    /// Whether typing `(` triggers parameter completions.
+    /// When true, `(` is registered as a completion trigger character so that
+    /// parameter suggestions appear immediately when opening a function call.
+    pub trigger_on_open_paren: bool,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        Self {
+            trigger_on_open_paren: true,
+        }
+    }
+}
+
 use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
@@ -509,6 +528,8 @@ pub struct WorldState {
     /// Symbol provider configuration
     /// Controls document symbol and workspace symbol behavior
     pub symbol_config: SymbolConfig,
+    /// Completion provider configuration
+    pub completion_config: CompletionConfig,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_revalidation: CrossFileRevalidationState,
@@ -599,6 +620,7 @@ impl WorldState {
             // Cross-file state
             cross_file_config: config,
             symbol_config: SymbolConfig::default(),
+            completion_config: CompletionConfig::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),

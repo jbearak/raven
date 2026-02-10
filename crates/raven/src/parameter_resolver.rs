@@ -251,7 +251,7 @@ pub fn resolve(
     cache: &SignatureCache,
     function_name: &str,
     namespace: Option<&str>,
-    _is_internal: bool,
+    is_internal: bool,
     current_uri: &Url,
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
@@ -334,7 +334,7 @@ pub fn resolve(
             let formals_result = handle.block_on(r_subprocess.get_function_formals(
                 function_name,
                 Some(pkg_name),
-                !_is_internal,
+                !is_internal,
             ));
 
             match formals_result {
@@ -396,26 +396,27 @@ pub fn resolve(
 /// resolution works even when the source file is not open in the editor.
 ///
 /// Priority order (matching the `content_provider` pattern):
-/// 1. Legacy open documents (`state.documents`)
-/// 2. Enriched open documents (`state.document_store`)
+/// 1. Enriched open documents (`state.document_store`)
+/// 2. Legacy open documents (`state.documents`)
 /// 3. New workspace index (`state.workspace_index_new`)
 /// 4. Legacy workspace index (`state.workspace_index`)
+/// 5. File cache (`state.cross_file_file_cache`) — parse on demand
 fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitter::Tree)> {
-    // 1. Legacy open documents (authoritative for open files)
-    if let Some(doc) = state.documents.get(uri) {
-        if let Some(tree) = &doc.tree {
-            return Some((doc.text(), tree.clone()));
-        } else {
-            log::debug!("Document found but has no parsed tree: {}", uri);
-        }
-    }
-
-    // 2. Enriched open documents
+    // 1. Enriched open documents (authoritative for open files)
     if let Some(doc) = state.document_store.get_without_touch(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.contents.to_string(), tree.clone()));
         } else {
             log::debug!("Document in document_store has no parsed tree: {}", uri);
+        }
+    }
+
+    // 2. Legacy open documents
+    if let Some(doc) = state.documents.get(uri) {
+        if let Some(tree) = &doc.tree {
+            return Some((doc.text(), tree.clone()));
+        } else {
+            log::debug!("Document found but has no parsed tree: {}", uri);
         }
     }
 
@@ -434,6 +435,15 @@ fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitt
             return Some((doc.text(), tree.clone()));
         } else {
             log::debug!("Document in workspace_index has no parsed tree: {}", uri);
+        }
+    }
+
+    // 5. File cache — content available but no pre-parsed tree; parse on demand
+    if let Some(content) = state.cross_file_file_cache.get(uri) {
+        if let Some(tree) = crate::parser_pool::with_parser(|p| p.parse(&content, None)) {
+            return Some((content, tree));
+        } else {
+            log::debug!("Failed to parse file cache content for: {}", uri);
         }
     }
 
@@ -586,7 +596,7 @@ fn find_func_def_recursive<'a>(
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
         // Filter extras (e.g., comments) so positional indexing is reliable
-        let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -622,7 +632,7 @@ fn find_func_def_recursive<'a>(
     if node.kind() == "right_assignment" {
         let mut cursor = node.walk();
         // Filter extras (e.g., comments) so positional indexing is reliable
-        let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0]; // value (function_definition)
@@ -682,7 +692,7 @@ fn find_func_def_at_line_recursive<'a>(
 
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -705,7 +715,7 @@ fn find_func_def_at_line_recursive<'a>(
     // Also check right-assignment
     if node.kind() == "right_assignment" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -1242,7 +1252,7 @@ mod tests {
     ) -> Option<Node<'a>> {
         if node.kind() == "binary_operator" {
             let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+            let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
             if children.len() >= 3 {
                 let lhs = children[0];
@@ -1382,7 +1392,7 @@ mod property_tests {
     ) -> Option<Node<'a>> {
         if node.kind() == "binary_operator" {
             let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+            let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
             if children.len() >= 3 {
                 let lhs = children[0];

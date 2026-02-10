@@ -75,10 +75,6 @@ pub struct CrossFileConfig {
     pub cache_existence_max_entries: usize,
     /// Maximum entries in the cross-file workspace index (LRU eviction)
     pub cache_workspace_index_max_entries: usize,
-    /// Whether typing `(` triggers parameter completions
-    /// When true, `(` is registered as a completion trigger character so that
-    /// parameter suggestions appear immediately when opening a function call.
-    pub trigger_on_open_paren: bool,
 }
 
 impl Default for CrossFileConfig {
@@ -127,7 +123,6 @@ impl Default for CrossFileConfig {
             cache_file_content_max_entries: 500,
             cache_existence_max_entries: 2000,
             cache_workspace_index_max_entries: 5000,
-            trigger_on_open_paren: true,
         }
     }
 }
@@ -174,8 +169,6 @@ mod tests {
             config.redundant_directive_severity,
             Some(DiagnosticSeverity::HINT)
         );
-        // Completion trigger defaults
-        assert!(config.trigger_on_open_paren);
     }
 
     #[test]

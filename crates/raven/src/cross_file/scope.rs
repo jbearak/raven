@@ -2133,7 +2133,7 @@ fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option
 fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
     // Check if this is an assignment operator - the operator is a direct child, not a field
     let mut cursor = node.walk();
-    let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
     if children.len() != 3 {
         return None;

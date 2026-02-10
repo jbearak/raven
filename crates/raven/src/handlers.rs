@@ -5079,7 +5079,7 @@ fn collect_document_completions(
 ) {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
