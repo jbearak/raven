@@ -459,6 +459,21 @@ pub(crate) fn parse_completion_config(
     Some(config)
 }
 
+/// Build the list of completion trigger characters, conditionally including `(`.
+fn build_completion_trigger_chars(trigger_on_open_paren: bool) -> Vec<String> {
+    let mut chars = vec![
+        String::from(":"),
+        String::from("$"),
+        String::from("@"),
+        String::from("/"),
+        String::from("\""),
+    ];
+    if trigger_on_open_paren {
+        chars.push(String::from("("));
+    }
+    chars
+}
+
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<WorldState>>,
@@ -609,17 +624,7 @@ impl LanguageServer for Backend {
 
         drop(state);
 
-        // Build completion trigger characters (conditionally include '(' for param completions)
-        let mut completion_trigger_chars = vec![
-            String::from(":"),
-            String::from("$"),
-            String::from("@"),
-            String::from("/"),  // File path navigation
-            String::from("\""), // String literal start for source() calls
-        ];
-        if trigger_on_open_paren {
-            completion_trigger_chars.push(String::from("(")); // Parameter completions on open paren
-        }
+        let completion_trigger_chars = build_completion_trigger_chars(trigger_on_open_paren);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -1982,6 +1987,8 @@ impl LanguageServer for Backend {
             packages_r_path,
             additional_paths,
             workspace_root,
+            trigger_on_open_paren_changed,
+            new_trigger_on_open_paren,
         ) = {
             let mut state = self.state.write().await;
 
@@ -2047,10 +2054,14 @@ impl LanguageServer for Backend {
                 state.symbol_config = config;
             }
 
-            // Apply new completion config if parsed
+            // Apply new completion config if parsed, tracking trigger change
+            let old_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
             if let Some(config) = new_completion_config {
                 state.completion_config = config;
             }
+            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+            let trigger_on_open_paren_changed =
+                old_trigger_on_open_paren != new_trigger_on_open_paren;
 
             // Mark all open documents for force republish
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
@@ -2069,6 +2080,8 @@ impl LanguageServer for Backend {
                 packages_r_path,
                 additional_paths,
                 workspace_root,
+                trigger_on_open_paren_changed,
+                new_trigger_on_open_paren,
             )
         };
 
@@ -2079,6 +2092,57 @@ impl LanguageServer for Backend {
                 old_diagnostics_enabled,
                 new_diagnostics_enabled
             );
+        }
+
+        // Dynamically re-register completion capability if trigger characters changed
+        if trigger_on_open_paren_changed {
+            log::info!(
+                "trigger_on_open_paren changed to {}, re-registering completion capability",
+                new_trigger_on_open_paren
+            );
+
+            let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
+            let registration_options = CompletionRegistrationOptions {
+                text_document_registration_options: TextDocumentRegistrationOptions {
+                    document_selector: Some(vec![DocumentFilter {
+                        language: Some(String::from("r")),
+                        scheme: None,
+                        pattern: None,
+                    }]),
+                },
+                completion_options: CompletionOptions {
+                    trigger_characters: Some(trigger_chars),
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            };
+
+            let registration_id = String::from("completion");
+            let method = String::from("textDocument/completion");
+
+            // Unregister old, then register new
+            if let Err(e) = self
+                .client
+                .unregister_capability(vec![Unregistration {
+                    id: registration_id.clone(),
+                    method: method.clone(),
+                }])
+                .await
+            {
+                log::warn!("Failed to unregister completion capability: {}", e);
+            }
+
+            if let Err(e) = self
+                .client
+                .register_capability(vec![Registration {
+                    id: registration_id,
+                    method,
+                    register_options: serde_json::to_value(registration_options).ok(),
+                }])
+                .await
+            {
+                log::warn!("Failed to re-register completion capability: {}", e);
+            }
         }
 
         // Reinitialize PackageLibrary if package settings changed
