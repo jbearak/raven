@@ -5840,6 +5840,13 @@ fn collect_usages_with_context<'a>(
         return;
     }
 
+    // Skip MISSING nodes — these are synthetic placeholders inserted by
+    // tree-sitter for error recovery (e.g., the absent RHS in `x <-`).
+    // They have no actual text content and should not be treated as usages.
+    if node.is_missing() {
+        return;
+    }
+
     if node.kind() == "identifier" {
         // Skip if we're in a formula or call-like arguments context
         if context.in_formula || context.in_call_like_arguments {
@@ -30694,20 +30701,61 @@ my_func <- function(a = default_value) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| d.message.starts_with("Undefined variable"))
             .collect();
 
         assert!(
-            !undefined_var_diags
-                .iter()
-                .any(|d| d.message == "Undefined variable: x"),
-            "Identifier 'x' inside an ERROR node should not be flagged as undefined. \
-             Got: {:?}",
+            undefined_var_diags.is_empty(),
+            "No undefined variable diagnostics should be emitted for code inside \
+             an ERROR node. Got: {:?}",
             undefined_var_diags
                 .iter()
                 .map(|d| &d.message)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_missing_rhs_not_flagged_as_undefined() {
+        // For top-level `x <-`, tree-sitter produces a binary_operator with a
+        // MISSING identifier child (the absent RHS). The MISSING node has kind
+        // "identifier" but empty text — it should not be collected as a usage.
+        for code in &["x <-", "x <<-"] {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            let undefined_var_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with("Undefined variable"))
+                .collect();
+
+            assert!(
+                undefined_var_diags.is_empty(),
+                "Incomplete assignment {:?} should not produce undefined variable \
+                 diagnostics. Got: {:?}",
+                code,
+                undefined_var_diags
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 
