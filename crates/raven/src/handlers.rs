@@ -6794,23 +6794,40 @@ pub fn completion(
             SORT_PREFIX_WORKSPACE
         };
 
-        // Use signature if available, otherwise show source file for cross-file symbols
-        let detail = match (&symbol.signature, symbol.source_uri != *uri) {
-            (Some(sig), true) => Some(format!("{} (from {})", sig, symbol.source_uri.path())),
-            (Some(sig), false) => Some(sig.clone()),
-            (None, true) => Some(format!("from {}", symbol.source_uri.path())),
+        // Use signature if available, otherwise show source file for cross-file symbols.
+        // For cross-file functions, the file location is shown in the documentation
+        // field (via resolve) since VS Code renders `detail` as a single line.
+        let is_cross_file = symbol.source_uri != *uri;
+        let detail = match (&symbol.signature, is_cross_file) {
+            (Some(sig), _) => Some(sig.clone()),
+            (None, true) => {
+                let rel = compute_relative_path(
+                    &symbol.source_uri,
+                    state.workspace_folders.first(),
+                );
+                Some(format!("from {}", rel))
+            }
             (None, false) => None,
         };
 
         // For user-defined functions from cross-file scope, include data for
-        // completionItem/resolve to locate the roxygen block for documentation
+        // completionItem/resolve to locate the roxygen block for documentation.
+        // Cross-file functions also include the relative path for the documentation panel.
         let data = if kind == CompletionItemKind::FUNCTION {
-            Some(serde_json::json!({
+            let mut json = serde_json::json!({
                 "type": "user_function",
                 "function_name": name_string,
                 "uri": symbol.source_uri.to_string(),
                 "func_line": symbol.defined_line,
-            }))
+            });
+            if is_cross_file {
+                let rel = compute_relative_path(
+                    &symbol.source_uri,
+                    state.workspace_folders.first(),
+                );
+                json["relative_path"] = serde_json::Value::String(rel);
+            }
+            Some(json)
         } else {
             None
         };
@@ -7279,11 +7296,20 @@ fn resolve_user_function_documentation(
         None
     };
 
+    // Build documentation: optional file location header + optional roxygen docs
+    let relative_path = data.get("relative_path").and_then(|v| v.as_str());
+    let doc_value = match (relative_path, documentation) {
+        (Some(path), Some(doc)) => Some(format!("*from {}*\n\n{}", path, doc)),
+        (Some(path), None) => Some(format!("*from {}*", path)),
+        (None, Some(doc)) => Some(doc),
+        (None, None) => None,
+    };
+
     let mut resolved = item;
-    if let Some(doc_text) = documentation {
+    if let Some(text) = doc_value {
         resolved.documentation = Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: doc_text,
+            value: text,
         }));
     }
     // Clear data field to avoid leaking internal metadata
