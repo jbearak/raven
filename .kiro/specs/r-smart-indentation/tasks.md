@@ -240,7 +240,7 @@ This implementation plan breaks down the R smart indentation feature into discre
 
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for faster MVP
+- Tasks marked with `*` are optional property tests that can be skipped for faster MVP; however, core unit tests (3.7, 5.8, 7.5, 9.7) are recommended for MVP as they validate edge cases and error handling critical to an AST-based indentation system
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation at key milestones
 - Property tests validate universal correctness properties with minimum 100 iterations

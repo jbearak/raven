@@ -39,7 +39,7 @@ This feature implements intelligent indentation for R code in VS Code, addressin
 1. WHEN a line ends with `{` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
 2. WHEN a line ends with `(` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
 3. WHEN a line ends with `[` followed by optional whitespace and optional comment, THE Language_Configuration SHALL indent the next line
-4. WHEN a line starts with `}` or `)`, THE Language_Configuration SHALL outdent that line
+4. WHEN a line starts with `}`, `)`, or `]`, THE Language_Configuration SHALL outdent that line
 
 ### Requirement 3: AST-Aware Pipe Chain Indentation
 

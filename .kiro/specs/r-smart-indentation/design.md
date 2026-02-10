@@ -14,7 +14,7 @@ The design respects user preferences for tab size and space/tab usage, and suppo
 
 ### Component Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        VS Code Editor                        │
 │  ┌────────────────────┐         ┌──────────────────────┐   │
@@ -96,7 +96,7 @@ The design respects user preferences for tab size and space/tab usage, and suppo
 {
   "indentationRules": {
     "increaseIndentPattern": "^.*[{(\\[]\\s*(#.*)?$",
-    "decreaseIndentPattern": "^\\s*[})]"
+    "decreaseIndentPattern": "^\\s*[})\\]]"
   }
 }
 ```
@@ -530,8 +530,8 @@ pub struct NodeExt<'a> {
 }
 
 impl<'a> NodeExt<'a> {
-    pub fn text(&self) -> &'a str {
-        self.node.utf8_text(self.source.as_bytes()).unwrap()
+    pub fn text(&self) -> Option<&'a str> {
+        self.node.utf8_text(self.source.as_bytes()).ok()
     }
     
     pub fn kind(&self) -> &'a str {
@@ -729,10 +729,16 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentCo
 
 **Implementation**:
 ```rust
-fn point_from_position(position: Position) -> tree_sitter::Point {
+fn point_from_position(position: Position, source: &str) -> tree_sitter::Point {
+    let row = position.line as usize;
+    let byte_column = source.lines()
+        .nth(row)
+        .map(|line| utf16_offset_to_byte_offset(line, position.character as usize))
+        .unwrap_or(0);
+    // See existing utf16_column_to_byte_offset in completion_context.rs / handlers.rs
     tree_sitter::Point {
-        row: position.line as usize,
-        column: position.character as usize, // Note: May need UTF-16 to byte conversion
+        row,
+        column: byte_column,
     }
 }
 ```
