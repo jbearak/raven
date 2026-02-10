@@ -2555,10 +2555,11 @@ impl LanguageServer for Backend {
         let state = self.state.clone();
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let context = params.context;
         match tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             let state = handle.block_on(state.read());
-            handlers::completion(&state, &uri, position)
+            handlers::completion(&state, &uri, position, context)
         })
         .await
         {
