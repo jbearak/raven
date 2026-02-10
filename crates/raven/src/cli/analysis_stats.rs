@@ -144,9 +144,13 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
         let start = Instant::now();
         for (path, content) in &r_files {
             let tree = parser_pool::with_parser(|parser| parser.parse(content, None));
-            let uri = Url::from_file_path(path).unwrap_or_else(|_| {
-                Url::parse(&format!("file://{}", path.display())).expect("valid URL")
-            });
+            let uri = match Url::from_file_path(path) {
+                Ok(url) => url,
+                Err(_) => {
+                    log::warn!("Skipping file with non-convertible path: {}", path.display());
+                    continue;
+                }
+            };
             parsed_trees.push((uri, content.clone(), tree));
         }
         let duration = start.elapsed();
@@ -163,9 +167,13 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
     if parsed_trees.is_empty() && !should_run("parse") {
         for (path, content) in &r_files {
             let tree = parser_pool::with_parser(|parser| parser.parse(content, None));
-            let uri = Url::from_file_path(path).unwrap_or_else(|_| {
-                Url::parse(&format!("file://{}", path.display())).expect("valid URL")
-            });
+            let uri = match Url::from_file_path(path) {
+                Ok(url) => url,
+                Err(_) => {
+                    log::warn!("Skipping file with non-convertible path: {}", path.display());
+                    continue;
+                }
+            };
             parsed_trees.push((uri, content.clone(), tree));
         }
     }
