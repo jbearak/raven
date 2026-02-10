@@ -817,6 +817,50 @@ fn collect_packages_at_position(state: &WorldState, scope: &ScopeAtPosition) -> 
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Shared test utilities for parameter_resolver test modules.
+#[cfg(test)]
+mod test_utils {
+    use tree_sitter::Node;
+
+    use super::node_text;
+
+    /// Find a function_definition node by name in the tree.
+    pub fn find_function_def_in_tree<'a>(
+        node: Node<'a>,
+        name: &str,
+        text: &str,
+    ) -> Option<Node<'a>> {
+        if node.kind() == "binary_operator" {
+            let mut cursor = node.walk();
+            let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+
+            if children.len() >= 3 {
+                let lhs = children[0];
+                let op = children[1];
+                let rhs = children[2];
+
+                let op_text = node_text(op, text);
+                if matches!(op_text, "<-" | "=" | "<<-")
+                    && lhs.kind() == "identifier"
+                    && node_text(lhs, text) == name
+                    && rhs.kind() == "function_definition"
+                {
+                    return Some(rhs);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(func_node) = find_function_def_in_tree(child, name, text) {
+                return Some(func_node);
+            }
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,43 +1286,7 @@ mod tests {
         assert!(debug_str.contains("SignatureCache"));
     }
 
-    // -- Helper for tests --
-
-    /// Find a function_definition node by name in the tree (for test use).
-    fn find_function_def_in_tree<'a>(
-        node: Node<'a>,
-        name: &str,
-        text: &str,
-    ) -> Option<Node<'a>> {
-        if node.kind() == "binary_operator" {
-            let mut cursor = node.walk();
-            let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-
-            if children.len() >= 3 {
-                let lhs = children[0];
-                let op = children[1];
-                let rhs = children[2];
-
-                let op_text = node_text(op, text);
-                if matches!(op_text, "<-" | "=" | "<<-")
-                    && lhs.kind() == "identifier"
-                    && node_text(lhs, text) == name
-                    && rhs.kind() == "function_definition"
-                {
-                    return Some(rhs);
-                }
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func_node) = find_function_def_in_tree(child, name, text) {
-                return Some(func_node);
-            }
-        }
-
-        None
-    }
+    use super::test_utils::find_function_def_in_tree;
 }
 
 #[cfg(test)]
@@ -1384,41 +1392,7 @@ mod property_tests {
         format!("{} <- function({}) {{ NULL }}", func_name, param_strs.join(", "))
     }
 
-    /// Find the function_definition node in the tree (test helper).
-    fn find_function_def_in_tree<'a>(
-        node: Node<'a>,
-        name: &str,
-        text: &str,
-    ) -> Option<Node<'a>> {
-        if node.kind() == "binary_operator" {
-            let mut cursor = node.walk();
-            let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-
-            if children.len() >= 3 {
-                let lhs = children[0];
-                let op = children[1];
-                let rhs = children[2];
-
-                let op_text = node_text(op, text);
-                if matches!(op_text, "<-" | "=" | "<<-")
-                    && lhs.kind() == "identifier"
-                    && node_text(lhs, text) == name
-                    && rhs.kind() == "function_definition"
-                {
-                    return Some(rhs);
-                }
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func_node) = find_function_def_in_tree(child, name, text) {
-                return Some(func_node);
-            }
-        }
-
-        None
-    }
+    use super::test_utils::find_function_def_in_tree;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
