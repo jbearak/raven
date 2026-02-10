@@ -3906,15 +3906,22 @@ fn collect_identifier_usages_utf16<'a>(
 
 /// Find the first MISSING descendant inside a node (depth-first).
 fn find_first_missing_descendant(node: Node) -> Option<Node> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.is_missing() {
-            return Some(child);
-        }
-        if let Some(found) = find_first_missing_descendant(child) {
-            return Some(found);
+    // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
+    let mut stack = vec![node];
+
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Push in reverse so traversal is left-to-right, depth-first.
+        for child in children.into_iter().rev() {
+            if child.is_missing() {
+                return Some(child);
+            }
+            stack.push(child);
         }
     }
+
     None
 }
 
@@ -3937,70 +3944,70 @@ fn find_first_missing_descendant(node: Node) -> Option<Node> {
 /// * `Some(Node)` - The deepest ERROR node with children found
 /// * `None` - No ERROR nodes with children found in the tree
 fn find_innermost_error(node: Node) -> Option<Node> {
-    if node.is_error() {
-        // Only check direct ERROR children — tree-sitter flattens errors so
-        // nested ERRORs are always direct children of another ERROR, never
-        // hidden under a non-ERROR intermediate node.
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.is_error() {
-                if let Some(innermost) = find_innermost_error(child) {
-                    return Some(innermost);
-                }
+    // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
+    let mut stack: Vec<(Node, usize)> = vec![(node, 0)];
+    let mut best: Option<(Node, usize)> = None;
+
+    while let Some((node, depth)) = stack.pop() {
+        if node.is_error() && node.child_count() > 0 {
+            match best {
+                None => best = Some((node, depth)),
+                Some((_, best_depth)) if depth > best_depth => best = Some((node, depth)),
+                _ => {}
             }
         }
-        
-        // No ERROR children found. Check if this ERROR node has any children at all.
-        // If it has children, it's a good candidate. If it's a leaf, skip it.
-        if node.child_count() > 0 {
-            return Some(node);
-        }
-        
-        // This is a leaf ERROR node (no children), skip it
-        return None;
-    }
-    
-    // Not an ERROR node, check children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(innermost) = find_innermost_error(child) {
-            return Some(innermost);
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Push in reverse so traversal is left-to-right, depth-first.
+        for child in children.into_iter().rev() {
+            stack.push((child, depth + 1));
         }
     }
-    None
+
+    best.map(|(node, _)| node)
 }
 
 /// Recursively descend into a node (including ERROR nodes) to find the row of
 /// the first named token that is not a structural keyword or boolean/null literal.
 fn first_named_token_row(node: Node) -> Option<usize> {
+    // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
     const STRUCTURAL_KEYWORDS: &[&str] = &["if", "else", "while", "for", "function", "repeat"];
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if !child.is_named() {
-            continue;
-        }
-        if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
-            continue;
-        }
-        if matches!(child.kind(), "true" | "false" | "null") {
-            continue;
-        }
-        if child.is_error() {
-            if let Some(row) = first_named_token_row(child) {
-                return Some(row);
+    let mut stack = vec![node];
+
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Push in reverse so traversal is left-to-right, depth-first.
+        for child in children.into_iter().rev() {
+            if !child.is_named() {
+                continue;
             }
-            continue;
-        }
-        // A leaf named node (identifier, operator, etc.)
-        if child.child_count() == 0 {
-            return Some(child.start_position().row);
-        }
-        // Non-leaf named node: recurse
-        if let Some(row) = first_named_token_row(child) {
-            return Some(row);
+            if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
+                continue;
+            }
+            if matches!(child.kind(), "true" | "false" | "null") {
+                continue;
+            }
+
+            if child.is_error() {
+                stack.push(child);
+                continue;
+            }
+
+            // A leaf named node (identifier, operator, etc.)
+            if child.child_count() == 0 {
+                return Some(child.start_position().row);
+            }
+
+            // Non-leaf named node: traverse into it
+            stack.push(child);
         }
     }
+
     None
 }
 
@@ -4022,15 +4029,15 @@ fn first_named_token_row(node: Node) -> Option<usize> {
 fn find_first_content_line(node: Node) -> Option<usize> {
     let start_row = node.start_position().row;
     let end_row = node.end_position().row;
-    
+
     // Single-line ERROR: return its line
     if start_row == end_row {
         return Some(start_row);
     }
-    
+
     // Structural keywords to skip
     const STRUCTURAL_KEYWORDS: &[&str] = &["if", "else", "while", "for", "function", "repeat"];
-    
+
     // Single pass: find the opening brace `{` and the first content line simultaneously.
     // Content before the brace is only used if no brace exists at all.
     let mut brace_row: Option<usize> = None;
@@ -4090,9 +4097,10 @@ fn find_first_content_line(node: Node) -> Option<usize> {
         return content_before_brace;
     }
 
-    // Brace was found but no content after it: fall back to line after brace, clamped to end_row
-    // brace_row is guaranteed Some here (the is_none() case returned above).
-    brace_row.map(|r| (r + 1).min(end_row))
+    // Brace was found but no content after it: fall back to line after brace, clamped to end_row.
+    // Make the invariant explicit (requested in PR review feedback).
+    let brace_row = brace_row.unwrap();
+    Some((brace_row + 1).min(end_row))
 }
 
 /// For a multi-line ERROR node, compute a minimized diagnostic range that
@@ -4103,9 +4111,7 @@ fn find_first_content_line(node: Node) -> Option<usize> {
 fn minimize_error_range(node: Node, text: &str) -> Range {
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    let line_at = |row: usize| -> &str {
-        text.lines().nth(row).unwrap_or("")
-    };
+    let line_at = |row: usize| -> &str { text.lines().nth(row).unwrap_or("") };
 
     let start_row = node.start_position().row;
     let start_col = node.start_position().column;
@@ -4130,18 +4136,19 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
     if let Some(innermost) = find_innermost_error(node) {
         let inner_start_row = innermost.start_position().row;
         let inner_end_row = innermost.end_position().row;
-        
+
         // If innermost is single-line, return its full range
         if inner_start_row == inner_end_row {
             let lt = line_at(inner_start_row);
-            let inner_start_col = byte_offset_to_utf16_column(lt, innermost.start_position().column);
+            let inner_start_col =
+                byte_offset_to_utf16_column(lt, innermost.start_position().column);
             let inner_end_col = byte_offset_to_utf16_column(lt, innermost.end_position().column);
             return Range {
                 start: Position::new(inner_start_row as u32, inner_start_col),
                 end: Position::new(inner_end_row as u32, inner_end_col),
             };
         }
-        
+
         // If innermost is multi-line, find the first line with actual content
         if let Some(content_row) = find_first_content_line(innermost) {
             // Find the last child of the innermost ERROR on the content row.
@@ -4160,8 +4167,10 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 
             if let Some(last_child) = last_child_on_row {
                 let lc_line = line_at(content_row);
-                let lc_start_col = byte_offset_to_utf16_column(lc_line, last_child.start_position().column);
-                let lc_end_col = byte_offset_to_utf16_column(lc_line, last_child.end_position().column);
+                let lc_start_col =
+                    byte_offset_to_utf16_column(lc_line, last_child.start_position().column);
+                let lc_end_col =
+                    byte_offset_to_utf16_column(lc_line, last_child.end_position().column);
                 let end_col = if lc_end_col <= lc_start_col {
                     lc_start_col.saturating_add(1)
                 } else {
@@ -4174,14 +4183,13 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
             }
 
             // Fallback: span the content line (no children found on it)
-            let first_line_end_col = text
-                .lines()
-                .nth(content_row)
-                .map(utf16_len)
-                .unwrap_or(0);
+            let first_line_end_col = text.lines().nth(content_row).map(utf16_len).unwrap_or(0);
 
             let start_col = if content_row == inner_start_row {
-                byte_offset_to_utf16_column(line_at(inner_start_row), innermost.start_position().column)
+                byte_offset_to_utf16_column(
+                    line_at(inner_start_row),
+                    innermost.start_position().column,
+                )
             } else {
                 0
             };
@@ -4361,8 +4369,10 @@ mod syntax_error_range_tests {
             "diagnostic should not cover the identifier 'x' (col 2-3), \
              but starts at col {}. Range: ({},{})..({},{})",
             d.range.start.character,
-            d.range.start.line, d.range.start.character,
-            d.range.end.line, d.range.end.character,
+            d.range.start.line,
+            d.range.start.character,
+            d.range.end.line,
+            d.range.end.character,
         );
     }
 
@@ -4383,7 +4393,10 @@ mod syntax_error_range_tests {
         // Top-level `x <-` produces a MISSING identifier, not suppressed
         let code = "x <-";
         let diags = collect(code);
-        assert!(!diags.is_empty(), "should produce a diagnostic for incomplete assignment");
+        assert!(
+            !diags.is_empty(),
+            "should produce a diagnostic for incomplete assignment"
+        );
         assert!(
             diags.iter().any(|d| d.message.contains("Missing")),
             "should report a Missing diagnostic"
@@ -4422,8 +4435,14 @@ mod syntax_error_range_tests {
         let code = "if (TRUE) {\n  x <-\n}";
         let diags = collect(code);
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].range.start.line, 1, "diagnostic should start on line 1 (where x <- is)");
-        assert_eq!(diags[0].range.end.line, 1, "diagnostic should end on line 1");
+        assert_eq!(
+            diags[0].range.start.line, 1,
+            "diagnostic should start on line 1 (where x <- is)"
+        );
+        assert_eq!(
+            diags[0].range.end.line, 1,
+            "diagnostic should end on line 1"
+        );
     }
 
     #[test]
@@ -4438,7 +4457,8 @@ mod syntax_error_range_tests {
         //   1: "  x <-"        ← first content line (first incomplete expr)
         //   2: "  y +"         ← second incomplete expr
         //   3: "}"
-        let first_content_line = code.lines()
+        let first_content_line = code
+            .lines()
             .enumerate()
             .position(|(_, line)| line.contains("x <-"))
             .expect("test code should contain 'x <-'") as u32;
@@ -4704,7 +4724,10 @@ mod syntax_error_range_tests {
             // don't fail the test.
             eprintln!(
                 "NOTE: tree-sitter-r produces diagnostics for valid `if (x <- 1) y`: {:?}",
-                syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+                syntax_or_missing
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -4722,7 +4745,10 @@ mod syntax_error_range_tests {
             syntax_or_missing.is_empty(),
             "chained assignment `x <- y <- 1` should not produce syntax errors, \
              got: {:?}",
-            syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+            syntax_or_missing
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4738,7 +4764,10 @@ mod syntax_error_range_tests {
         if !syntax_or_missing.is_empty() {
             eprintln!(
                 "NOTE: tree-sitter-r produces diagnostics for valid `switch(x, a =, b = 1)`: {:?}",
-                syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+                syntax_or_missing
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -4756,7 +4785,10 @@ mod syntax_error_range_tests {
         if !syntax_or_missing.is_empty() {
             eprintln!(
                 "NOTE: tree-sitter-r produces diagnostics for valid `c(1, 2, )`: {:?}",
-                syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+                syntax_or_missing
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -4776,7 +4808,9 @@ mod syntax_error_range_tests {
         );
         // Should have a Missing or Syntax error diagnostic
         assert!(
-            diags.iter().any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            diags
+                .iter()
+                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
             "should produce a syntax/missing diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -4893,7 +4927,9 @@ mod syntax_error_range_tests {
             "should produce at least one diagnostic for unclosed library call"
         );
         assert!(
-            diags.iter().any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            diags
+                .iter()
+                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
             "should produce a syntax/missing diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -4927,7 +4963,9 @@ mod syntax_error_range_tests {
         );
         // Should have at least one syntax or missing diagnostic
         assert!(
-            diags.iter().any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            diags
+                .iter()
+                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
             "should produce a syntax/missing diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -5060,23 +5098,9 @@ mod syntax_error_range_tests {
     /// - `while (x) { y + }`
     /// - `for (i in 1:10) { z < }`
     fn nested_error_code() -> impl Strategy<Value = String> {
-        let incomplete_exprs = vec![
-            "x <-",
-            "y +",
-            "z -",
-            "a *",
-            "b /",
-            "c <",
-            "d >",
-            "e ==",
-        ];
+        let incomplete_exprs = vec!["x <-", "y +", "z -", "a *", "b /", "c <", "d >", "e =="];
 
-        let control_structures = vec![
-            "if (TRUE)",
-            "if (FALSE)",
-            "while (x)",
-            "for (i in 1:10)",
-        ];
+        let control_structures = vec!["if (TRUE)", "if (FALSE)", "while (x)", "for (i in 1:10)"];
 
         // Standard pattern: control structure wrapping an incomplete expression
         let block_errors = (
@@ -5110,16 +5134,10 @@ mod syntax_error_range_tests {
         // wraps them in a flat ERROR instead), so we use top-level patterns.
         let patterns = vec![
             // Incomplete assignments: MISSING identifier on RHS
-            "x <-",
-            "y <-",
-            "myvar <-",
-            // Unclosed function calls: MISSING )
-            "f(",
-            "g(1,",
-            "h(x, y,",
+            "x <-", "y <-", "myvar <-", // Unclosed function calls: MISSING )
+            "f(", "g(1,", "h(x, y,",
             // Incomplete binary after assignment: MISSING identifier
-            "x <- 1 +",
-            "y <- a *",
+            "x <- 1 +", "y <- a *",
         ];
 
         prop::sample::select(patterns).prop_map(|p| p.to_string())
@@ -5136,22 +5154,9 @@ mod syntax_error_range_tests {
     fn single_line_error_code() -> impl Strategy<Value = String> {
         // Patterns that reliably produce single-line ERROR nodes.
         // We combine a valid prefix (possibly empty) with a misplaced token.
-        let stray_tokens = vec![
-            ")",
-            "]",
-            "]]",
-            "}",
-            ",",
-            "} extra",
-            ") extra",
-        ];
+        let stray_tokens = vec![")", "]", "]]", "}", ",", "} extra", ") extra"];
 
-        let valid_prefixes = vec![
-            "",
-            "x <- 1; ",
-            "y <- 2\n",
-            "a <- 'hello'\n",
-        ];
+        let valid_prefixes = vec!["", "x <- 1; ", "y <- 2\n", "a <- 'hello'\n"];
 
         (
             prop::sample::select(valid_prefixes),
@@ -5222,21 +5227,21 @@ mod syntax_error_range_tests {
 
             let outermost = find_outermost_error(root);
             prop_assume!(outermost.is_some(), "Generated code must produce an ERROR node");
-            
+
             let outermost = outermost.unwrap();
-            
+
             // Collect diagnostics
             let mut diagnostics = Vec::new();
             collect_syntax_errors(root, &code, &mut diagnostics);
-            
+
             prop_assert!(!diagnostics.is_empty(), "Should produce at least one diagnostic for code: {}", code);
-            
+
             // The diagnostic should NOT be on the first line of the outermost ERROR
             // (which would be the structural parent like `if`, `while`, etc.)
             // unless the outermost ERROR is single-line
             let outermost_start_line = outermost.start_position().row as u32;
             let outermost_end_line = outermost.end_position().row as u32;
-            
+
             // If the outermost ERROR is multi-line, the diagnostic should NOT be on its first line
             // (the structural parent line)
             if outermost_end_line > outermost_start_line {
@@ -6205,6 +6210,7 @@ fn collect_undefined_variables(
     cross_file_symbols: &HashMap<String, ScopedSymbol>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
     use std::collections::HashSet;
 
     let mut defined: HashSet<String> = HashSet::new();
@@ -6224,16 +6230,19 @@ fn collect_undefined_variables(
             && !workspace_imports.contains(&name)
             && !cross_file_symbols.contains_key(&name)
         {
+            let start_pos = node.start_position();
+            let end_pos = node.end_position();
+
+            let start_line_text = text.lines().nth(start_pos.row).unwrap_or("");
+            let end_line_text = text.lines().nth(end_pos.row).unwrap_or("");
+
+            let start_col = byte_offset_to_utf16_column(start_line_text, start_pos.column);
+            let end_col = byte_offset_to_utf16_column(end_line_text, end_pos.column);
+
             diagnostics.push(Diagnostic {
                 range: Range {
-                    start: Position::new(
-                        node.start_position().row as u32,
-                        node.start_position().column as u32,
-                    ),
-                    end: Position::new(
-                        node.end_position().row as u32,
-                        node.end_position().column as u32,
-                    ),
+                    start: Position::new(start_pos.row as u32, start_col),
+                    end: Position::new(end_pos.row as u32, end_col),
                 },
                 severity: Some(DiagnosticSeverity::WARNING),
                 message: format!("Undefined variable: {}", name),
@@ -6316,9 +6325,7 @@ fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'
                 let children: Vec<_> = parent.children(&mut cursor).collect();
                 if children.len() >= 2 {
                     let op_text = node_text(children[1], text);
-                    if children[0].id() == node.id()
-                        && matches!(op_text, "<-" | "=" | "<<-")
-                    {
+                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
                         return;
                     }
                     if children.len() >= 3
@@ -6395,9 +6402,7 @@ fn collect_usages_with_context<'a>(
                 if children.len() >= 2 {
                     let op_text = node_text(children[1], text);
                     // Left-assignment: target is children[0] (e.g., x <- 1)
-                    if children[0].id() == node.id()
-                        && matches!(op_text, "<-" | "=" | "<<-")
-                    {
+                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
                         return;
                     }
                     // Right-assignment: target is children[2] (e.g., 1 -> x)
@@ -6872,8 +6877,8 @@ fn has_namespace_accessor_at_cursor(text: &str, position: Position) -> bool {
     let prefix = &line[..byte_offset];
     // Scan backward: first collect identifier chars (the partial token after `::`)
     // then check if `::` or `:::` immediately precedes them.
-    let after_ident = prefix
-        .trim_end_matches(|c: char| c.is_alphanumeric() || c == '.' || c == '_');
+    let after_ident =
+        prefix.trim_end_matches(|c: char| c.is_alphanumeric() || c == '.' || c == '_');
     // Check if the remaining prefix ends with `::` or `:::`
     after_ident.ends_with("::")
 }
@@ -6964,11 +6969,7 @@ fn get_parameter_completions(
             let detail = Some("parameter".to_string());
 
             // Build the data JSON for completionItem/resolve
-            let data = build_parameter_data(
-                &p.name,
-                function_name,
-                &signature.source,
-            );
+            let data = build_parameter_data(&p.name, function_name, &signature.source);
 
             CompletionItem {
                 label: p.name.clone(),
@@ -7160,7 +7161,10 @@ pub fn completion_item_resolve(
     };
 
     // Dispatch based on the "type" field in the data JSON
-    let item_type = data.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let item_type = data
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     match item_type.as_deref() {
         // Parameter completion resolve (Requirement 7)
@@ -7315,10 +7319,7 @@ fn resolve_package_export_documentation(
 }
 
 /// Read file content from the document store (open documents) or from disk as fallback.
-fn read_file_content(
-    document_contents: &HashMap<Url, String>,
-    uri_str: &str,
-) -> Option<String> {
+fn read_file_content(document_contents: &HashMap<Url, String>, uri_str: &str) -> Option<String> {
     let uri = Url::parse(uri_str).ok()?;
 
     // Try open documents first (authoritative)
@@ -8004,7 +8005,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 ///
 /// # Returns
 /// Single-line plain-text signature label string
-fn format_signature_label(name: &str, params: &[crate::parameter_resolver::ParameterInfo]) -> String {
+fn format_signature_label(
+    name: &str,
+    params: &[crate::parameter_resolver::ParameterInfo],
+) -> String {
     if params.is_empty() {
         return format!("{}()", name);
     }
@@ -8070,7 +8074,7 @@ fn build_parameter_information(
 fn detect_active_parameter(call_node: Node, cursor_point: Point) -> Option<u32> {
     // Count commas in the entire call node that appear before the cursor
     let mut comma_count = 0;
-    
+
     fn count_commas_recursive(node: Node, cursor_point: Point, comma_count: &mut u32) {
         // If this node starts after the cursor, don't traverse it
         let node_start = node.start_position();
@@ -8391,7 +8395,7 @@ fn try_build_user_signature(
         state,
         &state.signature_cache,
         function_name,
-        None, // namespace - None for user functions
+        None,  // namespace - None for user functions
         false, // is_internal
         uri,
         position,
@@ -8433,9 +8437,9 @@ fn try_build_user_signature(
         .iter()
         .map(|param| {
             // Use get_param_doc() for each parameter's documentation
-            let param_doc = roxygen_block.as_ref().and_then(|block| {
-                crate::roxygen::get_param_doc(block, &param.name)
-            });
+            let param_doc = roxygen_block
+                .as_ref()
+                .and_then(|block| crate::roxygen::get_param_doc(block, &param.name));
             build_parameter_information(param, param_doc.as_deref())
         })
         .collect();
@@ -8451,8 +8455,6 @@ fn try_build_user_signature(
         active_parameter: None,
     })
 }
-
-
 
 /// What async work (if any) is needed to complete signature help.
 enum SignatureResolution {
@@ -8586,8 +8588,7 @@ pub async fn resolve_signature_help(ctx: SignatureHelpContext) -> Option<Signatu
             package_name,
             fallback,
         } => {
-            let sig =
-                try_build_package_signature(&help_cache, &func_name, &package_name).await;
+            let sig = try_build_package_signature(&help_cache, &func_name, &package_name).await;
             sig.unwrap_or(fallback)
         }
         SignatureResolution::Ready(sig) => sig,
@@ -10378,7 +10379,8 @@ x <- "#;
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
+        let resolved =
+            super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
 
         // Should have documentation populated from the cached help text
         let doc = resolved
@@ -10518,7 +10520,8 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "read_csv", "package": "readr"})),
             ..Default::default()
         };
-        let resolved = super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
+        let resolved =
+            super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
 
         assert!(
             resolved.documentation.is_some(),
@@ -11949,7 +11952,7 @@ result <- "#;
                 );
 
                 let func_item = func_items[0];
-                
+
                 // Should have FUNCTION kind
                 assert_eq!(
                     func_item.kind,
@@ -11962,7 +11965,7 @@ result <- "#;
                     func_item.detail.is_some(),
                     "User function should have detail field with signature"
                 );
-                
+
                 let detail = func_item.detail.as_ref().unwrap();
                 assert!(
                     detail.contains("my_func") && detail.contains("(x, y = 10)"),
@@ -18220,7 +18223,7 @@ y <- 2";
             is_dots: false,
         };
         let result = build_parameter_information(&param, None);
-        
+
         match result.label {
             ParameterLabel::Simple(label) => assert_eq!(label, "x"),
             _ => panic!("Expected Simple label"),
@@ -18238,7 +18241,7 @@ y <- 2";
             is_dots: false,
         };
         let result = build_parameter_information(&param, None);
-        
+
         match result.label {
             ParameterLabel::Simple(label) => assert_eq!(label, "x = 1"),
             _ => panic!("Expected Simple label"),
@@ -18255,7 +18258,7 @@ y <- 2";
             is_dots: false,
         };
         let result = build_parameter_information(&param, Some("The input value"));
-        
+
         assert!(result.documentation.is_some());
         match result.documentation.unwrap() {
             Documentation::MarkupContent(content) => {
@@ -18283,7 +18286,7 @@ y <- 2";
         // Cursor is after "x" (position 6)
         let cursor_point = Point::new(0, 6);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(0));
     }
 
@@ -18298,7 +18301,7 @@ y <- 2";
         // Cursor is after "y" (position 9)
         let cursor_point = Point::new(0, 9);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(1));
     }
 
@@ -18313,7 +18316,7 @@ y <- 2";
         // Cursor is after "c" (position 12)
         let cursor_point = Point::new(0, 12);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(2));
     }
 
@@ -18328,7 +18331,7 @@ y <- 2";
         // Cursor is right after opening paren (position 5)
         let cursor_point = Point::new(0, 5);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(0));
     }
 
@@ -18552,7 +18555,7 @@ add <- function(x, y) { x + y }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "add", &uri, Position::new(5, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "add(x, y)");
@@ -18581,7 +18584,7 @@ multiply <- function(a, b) { a * b }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "multiply", &uri, Position::new(3, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "multiply(a, b)");
@@ -18604,7 +18607,7 @@ divide <- function(x, y) { x / y }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "divide", &uri, Position::new(1, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "divide(x, y)");
@@ -18628,7 +18631,7 @@ get_pi <- function() { 3.14159 }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "get_pi", &uri, Position::new(2, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "get_pi()");
@@ -18651,7 +18654,7 @@ x <- 42
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "nonexistent", &uri, Position::new(1, 0));
-        
+
         // Should return None when function is not found
         assert!(result.is_none());
     }
@@ -18673,17 +18676,23 @@ greet <- function(name = "World", greeting = "Hello") {
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "greet", &uri, Position::new(4, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.unwrap();
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].label, ParameterLabel::Simple("name = \"World\"".to_string()));
-        assert_eq!(params[1].label, ParameterLabel::Simple("greeting = \"Hello\"".to_string()));
+        assert_eq!(
+            params[0].label,
+            ParameterLabel::Simple("name = \"World\"".to_string())
+        );
+        assert_eq!(
+            params[1].label,
+            ParameterLabel::Simple("greeting = \"Hello\"".to_string())
+        );
     }
 
     // ========================================================================
@@ -18706,23 +18715,24 @@ result <- add(1, 2)"#;
         // Line 1 is "result <- add(1, 2)" (0-indexed)
         // Position after "add(" would be at character 14
         let position = Position::new(1, 14); // After "add("
-        
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
         assert_eq!(sig_help.active_signature, Some(0));
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "add(x, y)");
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].label, ParameterLabel::Simple("x".to_string()));
         assert_eq!(params[1].label, ParameterLabel::Simple("y".to_string()));
-        
+
         // Active parameter should be 0 (first parameter)
         assert_eq!(sig_help.active_parameter, Some(0));
     }
@@ -18738,12 +18748,13 @@ result <- add(1, 2)"#;
 
         // Position is inside the call to undefined_func, after the opening paren
         let position = Position::new(0, 25); // After "undefined_func("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         // Should show fallback signature with function name
         assert_eq!(sig.label, "undefined_func(...)");
@@ -18764,11 +18775,12 @@ result <- add(1, 2, 3)"#;
 
         // Position is after the first comma, so second parameter is active
         let position = Position::new(1, 17); // After "add(1, "
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
-        
+
         // Active parameter should be 1 (second parameter, 0-indexed)
         assert_eq!(sig_help.active_parameter, Some(1));
     }
@@ -18785,11 +18797,12 @@ result <- add(1, 2, 3)"#;
 
         // Position is after the second comma, so third parameter is active
         let position = Position::new(1, 20); // After "add(1, 2, "
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
-        
+
         // Active parameter should be 2 (third parameter, 0-indexed)
         assert_eq!(sig_help.active_parameter, Some(2));
     }
@@ -18806,12 +18819,13 @@ result <- helper(5)"#;
 
         // Position is inside the call to helper
         let position = Position::new(1, 17); // After "helper("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "helper(x)");
         // Documentation is optional (depends on roxygen comments)
@@ -18835,28 +18849,29 @@ result <- multiply(3, 4)"#;
 
         // Position is inside the call to multiply
         let position = Position::new(4, 19); // After "multiply("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "multiply(x, y)");
         // Should have documentation from roxygen comments
         assert!(sig.documentation.is_some());
-        
+
         // Check that parameters have documentation
         assert!(sig.parameters.is_some());
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
-        
+
         // Parameters should have documentation from @param tags
         if let ParameterLabel::Simple(label) = &params[0].label {
             assert_eq!(label, "x");
         }
         assert!(params[0].documentation.is_some());
-        
+
         if let ParameterLabel::Simple(label) = &params[1].label {
             assert_eq!(label, "y");
         }
@@ -18875,16 +18890,17 @@ result <- get_pi()"#;
 
         // Position is inside the call to get_pi
         let position = Position::new(1, 17); // After "get_pi("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "get_pi()");
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 0);
     }
@@ -18903,20 +18919,27 @@ result <- greet("Alice")"#;
 
         // Position is inside the call to greet
         let position = Position::new(3, 16); // After "greet("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].label, ParameterLabel::Simple("name = \"World\"".to_string()));
-        assert_eq!(params[1].label, ParameterLabel::Simple("greeting = \"Hello\"".to_string()));
+        assert_eq!(
+            params[0].label,
+            ParameterLabel::Simple("name = \"World\"".to_string())
+        );
+        assert_eq!(
+            params[1].label,
+            ParameterLabel::Simple("greeting = \"Hello\"".to_string())
+        );
     }
 
     /// Integration test: Test typing package function call (e.g., "mean(")
@@ -18931,25 +18954,38 @@ result <- mean(x)"#;
 
         // Position is after "mean(" - simulating typing inside the function call
         let position = Position::new(1, 15); // After "mean("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
-        assert!(result.is_some(), "signature_help should return Some for package function");
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
+        assert!(
+            result.is_some(),
+            "signature_help should return Some for package function"
+        );
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
         assert_eq!(sig_help.active_signature, Some(0));
-        
+
         let sig = &sig_help.signatures[0];
         // Should show signature with function name
-        assert!(sig.label.contains("mean"), "Label should contain function name");
-        assert!(sig.label.contains("("), "Label should contain opening paren");
-        
+        assert!(
+            sig.label.contains("mean"),
+            "Label should contain function name"
+        );
+        assert!(
+            sig.label.contains("("),
+            "Label should contain opening paren"
+        );
+
         // For package functions, we expect either:
         // 1. Rich signature with parameters if help text is available
         // 2. Fallback signature "mean(...)" if help unavailable or function not recognized
         // Both are acceptable - the important thing is that signature help works
         if !sig.label.contains("mean(...)") {
             // Rich signature case - should have parameters
-            assert!(sig.parameters.is_some(), "Rich signature should have parameters");
+            assert!(
+                sig.parameters.is_some(),
+                "Rich signature should have parameters"
+            );
             if let Some(params) = &sig.parameters {
                 assert!(!params.is_empty(), "mean() should have parameters");
             }
@@ -18973,17 +19009,22 @@ result <- add(multiply(2, 3), 5)"#;
         //          0123456789012345678901234567890123
         // After "multiply(2, " - second parameter of multiply (position 27)
         let position_inner = Position::new(2, 27); // After "multiply(2, "
-        let result_inner = resolve_signature_help(prepare_signature_help(&state, &uri, position_inner).unwrap()).await;
-        
-        assert!(result_inner.is_some(), "signature_help should work in nested calls");
+        let result_inner =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position_inner).unwrap())
+                .await;
+
+        assert!(
+            result_inner.is_some(),
+            "signature_help should work in nested calls"
+        );
         let sig_help_inner = result_inner.unwrap();
         assert_eq!(sig_help_inner.signatures.len(), 1);
-        
+
         let sig_inner = &sig_help_inner.signatures[0];
         assert_eq!(sig_inner.label, "multiply(a, b)");
         // Active parameter should be 1 (second parameter, 0-indexed)
         assert_eq!(sig_help_inner.active_parameter, Some(1));
-        
+
         // The key test here is that signature help works correctly for nested calls
         // and shows the innermost function's signature with correct active parameter
     }
@@ -19008,30 +19049,46 @@ result <- add_numbers(1, 2)"#;
 
         // Position is after "add_numbers("
         let position = Position::new(9, 23); // After "add_numbers("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "add_numbers(x, y)");
-        
+
         // Should have documentation from roxygen
-        assert!(sig.documentation.is_some(), "Should have documentation from roxygen");
+        assert!(
+            sig.documentation.is_some(),
+            "Should have documentation from roxygen"
+        );
         if let Some(Documentation::MarkupContent(content)) = &sig.documentation {
-            assert!(content.value.contains("Calculate the sum"), "Should contain title");
-            assert!(content.value.contains("adds two numeric values"), "Should contain description");
+            assert!(
+                content.value.contains("Calculate the sum"),
+                "Should contain title"
+            );
+            assert!(
+                content.value.contains("adds two numeric values"),
+                "Should contain description"
+            );
         }
-        
+
         // Should have parameters with documentation
         assert!(sig.parameters.is_some(), "Should have parameters");
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
-        
+
         // Check parameter documentation
-        assert!(params[0].documentation.is_some(), "First parameter should have docs");
-        assert!(params[1].documentation.is_some(), "Second parameter should have docs");
+        assert!(
+            params[0].documentation.is_some(),
+            "First parameter should have docs"
+        );
+        assert!(
+            params[1].documentation.is_some(),
+            "Second parameter should have docs"
+        );
     }
 
     /// Integration test: Test typing user function call without roxygen
@@ -19048,22 +19105,26 @@ result <- calculate(5)"#;
 
         // Position is after "calculate("
         let position = Position::new(3, 20); // After "calculate("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "calculate(a, b = 10)");
-        
+
         // Should have parameters even without roxygen
         assert!(sig.parameters.is_some(), "Should have parameters");
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].label, ParameterLabel::Simple("a".to_string()));
-        assert_eq!(params[1].label, ParameterLabel::Simple("b = 10".to_string()));
-        
+        assert_eq!(
+            params[1].label,
+            ParameterLabel::Simple("b = 10".to_string())
+        );
+
         // Documentation might be present (from plain comments) or absent
         // Either is acceptable for functions without roxygen
     }
@@ -19087,9 +19148,15 @@ result <- func(1, 2, 3, 4)"#;
         ];
 
         for (position, expected_active) in test_cases {
-            let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-            assert!(result.is_some(), "signature_help should return Some at position {:?}", position);
-            
+            let result =
+                resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap())
+                    .await;
+            assert!(
+                result.is_some(),
+                "signature_help should return Some at position {:?}",
+                position
+            );
+
             let sig_help = result.unwrap();
             assert_eq!(
                 sig_help.active_parameter, expected_active,
@@ -19098,10 +19165,7 @@ result <- func(1, 2, 3, 4)"#;
             );
         }
     }
-
 }
-
-
 
 #[cfg(test)]
 mod proptests {
@@ -25868,10 +25932,7 @@ setClass("{}", slots = c(value = "numeric"))
     }
 
     /// Strategy to generate a list of unique parameter definitions for formatting tests.
-    fn r_completion_param_list(
-        min: usize,
-        max: usize,
-    ) -> impl Strategy<Value = Vec<String>> {
+    fn r_completion_param_list(min: usize, max: usize) -> impl Strategy<Value = Vec<String>> {
         prop::collection::vec(r_completion_param_name(), min..=max).prop_filter(
             "parameter names must be unique",
             |params| {
@@ -26037,31 +26098,33 @@ setClass("{}", slots = c(value = "numeric"))
         r_mixed_case_param_name().prop_flat_map(|name| {
             let len = name.len();
             // Pick random start..end for a non-empty substring
-            (Just(name.clone()), 0..len).prop_flat_map(move |(name, start)| {
-                let len = name.len();
-                (Just(name.clone()), Just(start), (start + 1)..=len)
-            })
-            .prop_flat_map(|(name, start, end)| {
-                let sub = name[start..end].to_string();
-                let sub_len = sub.len();
-                // Randomize case of each character
-                (
-                    Just(name),
-                    prop::collection::vec(proptest::bool::ANY, sub_len)
-                        .prop_map(move |flags| {
-                            sub.chars()
-                                .zip(flags.iter())
-                                .map(|(c, &upper)| {
-                                    if upper {
-                                        c.to_uppercase().to_string()
-                                    } else {
-                                        c.to_lowercase().to_string()
-                                    }
-                                })
-                                .collect::<String>()
-                        }),
-                )
-            })
+            (Just(name.clone()), 0..len)
+                .prop_flat_map(move |(name, start)| {
+                    let len = name.len();
+                    (Just(name.clone()), Just(start), (start + 1)..=len)
+                })
+                .prop_flat_map(|(name, start, end)| {
+                    let sub = name[start..end].to_string();
+                    let sub_len = sub.len();
+                    // Randomize case of each character
+                    (
+                        Just(name),
+                        prop::collection::vec(proptest::bool::ANY, sub_len).prop_map(
+                            move |flags| {
+                                sub.chars()
+                                    .zip(flags.iter())
+                                    .map(|(c, &upper)| {
+                                        if upper {
+                                            c.to_uppercase().to_string()
+                                        } else {
+                                            c.to_lowercase().to_string()
+                                        }
+                                    })
+                                    .collect::<String>()
+                            },
+                        ),
+                    )
+                })
         })
     }
 
@@ -26173,14 +26236,12 @@ setClass("{}", slots = c(value = "numeric"))
 
     /// Strategy to generate a valid R package name for namespace-qualified token tests.
     fn r_package_name() -> impl Strategy<Value = String> {
-        "[a-z]{3,8}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z]{3,8}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     /// Strategy to generate a valid R function name for namespace-qualified token tests.
     fn r_func_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9.]{1,7}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9.]{1,7}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     /// Strategy to generate a partial token (0 or more chars) that could follow `::` or `:::`.
@@ -26284,14 +26345,12 @@ setClass("{}", slots = c(value = "numeric"))
 
     /// Strategy to generate a valid R function name for mixed completion tests.
     fn r_mixed_func_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9]{2,7}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9]{2,7}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     /// Strategy to generate a valid R variable name for mixed completion tests.
     fn r_mixed_var_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_]{2,7}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9_]{2,7}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     proptest! {
@@ -26485,15 +26544,17 @@ setClass("{}", slots = c(value = "numeric"))
     /// Strategy to generate a parameter definition with an optional default value.
     /// Returns (param_name, default_value_option, param_definition_string).
     fn r_param_with_optional_default() -> impl Strategy<Value = (String, Option<String>, String)> {
-        (r_completion_param_name(), proptest::option::of(r_default_value())).prop_map(
-            |(name, default)| {
+        (
+            r_completion_param_name(),
+            proptest::option::of(r_default_value()),
+        )
+            .prop_map(|(name, default)| {
                 let def_str = match &default {
                     Some(val) => format!("{} = {}", name, val),
                     None => name.clone(),
                 };
                 (name, default, def_str)
-            },
-        )
+            })
     }
 
     proptest! {
@@ -26664,15 +26725,21 @@ setClass("{}", slots = c(value = "numeric"))
         min: usize,
         max: usize,
     ) -> impl Strategy<Value = Vec<(String, String)>> {
-        prop::collection::vec((rd_param_name_strategy(), rd_param_desc_strategy()), min..=max)
-            .prop_map(|entries| {
-                let mut seen = std::collections::HashSet::new();
-                entries
-                    .into_iter()
-                    .filter(|(name, _)| seen.insert(name.clone()))
-                    .collect()
-            })
-            .prop_filter("must have at least one entry", |v: &Vec<(String, String)>| !v.is_empty())
+        prop::collection::vec(
+            (rd_param_name_strategy(), rd_param_desc_strategy()),
+            min..=max,
+        )
+        .prop_map(|entries| {
+            let mut seen = std::collections::HashSet::new();
+            entries
+                .into_iter()
+                .filter(|(name, _)| seen.insert(name.clone()))
+                .collect()
+        })
+        .prop_filter(
+            "must have at least one entry",
+            |v: &Vec<(String, String)>| !v.is_empty(),
+        )
     }
 
     /// Build a help text string in Rd2txt format with an "Arguments:" section.
@@ -26896,8 +26963,7 @@ setClass("{}", slots = c(value = "numeric"))
 
     // Strategy for generating R parameter names
     fn r_param_name_strategy() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_]{0,10}"
-            .prop_filter("Not reserved", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9_]{0,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
     }
 
     // Strategy for generating R default values
@@ -26912,15 +26978,23 @@ setClass("{}", slots = c(value = "numeric"))
     }
 
     // Strategy for generating parameter lists
-    fn param_list_strategy(min: usize, max: usize) -> impl Strategy<Value = Vec<crate::parameter_resolver::ParameterInfo>> {
+    fn param_list_strategy(
+        min: usize,
+        max: usize,
+    ) -> impl Strategy<Value = Vec<crate::parameter_resolver::ParameterInfo>> {
         prop::collection::vec(
-            (r_param_name_strategy(), prop::option::of(r_default_value_strategy()))
-                .prop_map(|(name, default_value)| crate::parameter_resolver::ParameterInfo {
-                    name,
-                    default_value,
-                    is_dots: false,
+            (
+                r_param_name_strategy(),
+                prop::option::of(r_default_value_strategy()),
+            )
+                .prop_map(|(name, default_value)| {
+                    crate::parameter_resolver::ParameterInfo {
+                        name,
+                        default_value,
+                        is_dots: false,
+                    }
                 }),
-            min..=max
+            min..=max,
         )
     }
 
@@ -27020,7 +27094,7 @@ setClass("{}", slots = c(value = "numeric"))
             // Parse the code
             let tree = parse_r_code(&code);
             let call_node = tree.root_node().child(0);
-            
+
             if call_node.is_none() {
                 // If parsing failed, skip this test case
                 return Ok(());
@@ -27070,24 +27144,24 @@ setClass("{}", slots = c(value = "numeric"))
                     }
                 })
                 .collect();
-            
+
             let signature_str = format!("{}({})", func_name, param_strs.join(", "));
             let help_text = format!(
                 "{}\n\nDescription:\n\nThis is a test function.\n\nUsage:\n\n{}\n\nArguments:\n\n",
                 func_name, signature_str
             );
-            
+
             // Extract signature from help text
             let signature = crate::help::extract_signature_from_help(&help_text);
-            
+
             // Property 1: Signature should be extracted successfully
             prop_assert!(
                 signature.is_some(),
                 "Should extract signature from help text with Usage section"
             );
-            
+
             let signature = signature.unwrap();
-            
+
             // Property 2: Signature should contain function name
             prop_assert!(
                 signature.contains(&func_name),
@@ -27095,7 +27169,7 @@ setClass("{}", slots = c(value = "numeric"))
                 func_name,
                 signature
             );
-            
+
             // Property 3: Signature should contain all parameter names
             for param in &params {
                 prop_assert!(
@@ -27105,10 +27179,10 @@ setClass("{}", slots = c(value = "numeric"))
                     signature
                 );
             }
-            
+
             // Property 4: Parse the signature to get parameters
             let parsed_params = parse_signature_params(&signature);
-            
+
             // Property 5: Number of parsed parameters should match expected
             prop_assert_eq!(
                 parsed_params.len(),
@@ -27139,24 +27213,24 @@ setClass("{}", slots = c(value = "numeric"))
                 "{}\n\nDescription:\n\n{}\n\n",
                 title, description
             );
-            
+
             // Extract description from help text
             let extracted_desc = crate::help::extract_description_from_help(&help_text);
-            
+
             // Property 1: Description should be extracted successfully
             prop_assert!(
                 extracted_desc.is_some(),
                 "Should extract description from help text with Description section"
             );
-            
+
             let extracted_desc = extracted_desc.unwrap();
-            
+
             // Property 2: Description should not be empty
             prop_assert!(
                 !extracted_desc.is_empty(),
                 "Extracted description should not be empty"
             );
-            
+
             // Property 3: Description should contain the title text
             prop_assert!(
                 extracted_desc.contains(&title),
@@ -27164,7 +27238,7 @@ setClass("{}", slots = c(value = "numeric"))
                 title,
                 extracted_desc
             );
-            
+
             // Property 4: Description should contain the description text
             prop_assert!(
                 extracted_desc.contains(&description),
@@ -27172,14 +27246,14 @@ setClass("{}", slots = c(value = "numeric"))
                 description,
                 extracted_desc
             );
-            
+
             // Property 5: Description should have substantial content
             prop_assert!(
                 extracted_desc.len() > 10,
                 "Description should have substantial content, got: {}",
                 extracted_desc
             );
-            
+
             // Property 6: Description should have title and description separated by blank line
             prop_assert!(
                 extracted_desc.contains("\n\n"),
@@ -27218,38 +27292,38 @@ setClass("{}", slots = c(value = "numeric"))
                     title, description, func_name
                 )
             };
-            
+
             let func_line = if has_roxygen_tags { 3 } else { 2 };
-            
+
             // Extract roxygen block
             let block = crate::roxygen::extract_roxygen_block(&code, func_line);
-            
+
             // Property 1: Block should be extracted successfully
             prop_assert!(
                 block.is_some(),
                 "Should extract roxygen/comment block from code:\n{}",
                 code
             );
-            
+
             let block = block.unwrap();
-            
+
             // Get function documentation
             let func_doc = crate::roxygen::get_function_doc(&block);
-            
+
             // Property 2: Function documentation should be extracted
             prop_assert!(
                 func_doc.is_some(),
                 "Should extract function documentation from block"
             );
-            
+
             let func_doc = func_doc.unwrap();
-            
+
             // Property 3: Documentation should not be empty
             prop_assert!(
                 !func_doc.is_empty(),
                 "Function documentation should not be empty"
             );
-            
+
             // Property 4: Documentation should contain title or description text
             let contains_title = func_doc.contains(&title);
             let contains_desc = func_doc.contains(&description);
@@ -27260,7 +27334,7 @@ setClass("{}", slots = c(value = "numeric"))
                 description,
                 func_doc
             );
-            
+
             // Property 5: For roxygen with tags, should have title and description
             if has_roxygen_tags {
                 prop_assert!(
@@ -27302,7 +27376,7 @@ setClass("{}", slots = c(value = "numeric"))
             } else {
                 None
             };
-            
+
             // Build parameter information for each parameter
             let param_infos: Vec<ParameterInformation> = params
                 .iter()
@@ -27314,7 +27388,7 @@ setClass("{}", slots = c(value = "numeric"))
                     build_parameter_information(param, param_doc)
                 })
                 .collect();
-            
+
             // Property 1: Should have same number of ParameterInformation as parameters
             prop_assert_eq!(
                 param_infos.len(),
@@ -27323,11 +27397,11 @@ setClass("{}", slots = c(value = "numeric"))
                 params.len(),
                 param_infos.len()
             );
-            
+
             // Property 2: Each ParameterInformation should have correct label
             for (i, param) in params.iter().enumerate() {
                 let param_info = &param_infos[i];
-                
+
                 // Extract label string from ParameterLabel
                 let label_str = match &param_info.label {
                     ParameterLabel::Simple(s) => s.as_str(),
@@ -27336,7 +27410,7 @@ setClass("{}", slots = c(value = "numeric"))
                         ""
                     }
                 };
-                
+
                 // Property 3: Label should contain parameter name
                 prop_assert!(
                     label_str.contains(&param.name),
@@ -27344,7 +27418,7 @@ setClass("{}", slots = c(value = "numeric"))
                     param.name,
                     label_str
                 );
-                
+
                 // Property 4: If parameter has default, label should show "name = default"
                 if let Some(default) = &param.default_value {
                     let expected = format!("{} = {}", param.name, default);
@@ -27365,7 +27439,7 @@ setClass("{}", slots = c(value = "numeric"))
                         label_str
                     );
                 }
-                
+
                 // Property 6: If has_docs, should have documentation
                 if has_docs {
                     prop_assert!(
@@ -27373,7 +27447,7 @@ setClass("{}", slots = c(value = "numeric"))
                         "Parameter '{}' should have documentation when has_docs=true",
                         param.name
                     );
-                    
+
                     // Property 7: Documentation should contain parameter name
                     if let Some(Documentation::MarkupContent(content)) = &param_info.documentation {
                         prop_assert!(
@@ -27591,7 +27665,7 @@ setClass("{}", slots = c(value = "numeric"))
                     }
                 })
                 .collect();
-            
+
             let s3_param_strs: Vec<String> = s3_params
                 .iter()
                 .map(|p| {
@@ -27649,7 +27723,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // Property 3: When both generic and S3 method signatures are present,
                 // should prefer the generic signature
                 let expected_generic = format!("{}({})", func_name, generic_param_strs.join(", "));
-                
+
                 // The signature should match the generic signature
                 prop_assert_eq!(
                     signature.trim(),
@@ -27676,7 +27750,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // Property 5: When only S3 method signature is present,
                 // should return the S3 method signature (as fallback)
                 let expected_s3 = format!("{}({})", func_name, s3_param_strs.join(", "));
-                
+
                 prop_assert_eq!(
                     signature.trim(),
                     expected_s3.trim(),
@@ -29529,8 +29603,11 @@ result <- helper_with_spaces(42)"#;
         let child_path = workspace_path.join("child.R");
         let parent1_path = workspace_path.join("parent1.R");
         let parent2_path = workspace_path.join("parent2.R");
-        std::fs::write(&child_path, "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R")
-            .unwrap();
+        std::fs::write(
+            &child_path,
+            "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R",
+        )
+        .unwrap();
         std::fs::write(&parent1_path, "source('child.R')").unwrap();
         std::fs::write(&parent2_path, "source('child.R')").unwrap();
 
@@ -31364,7 +31441,9 @@ my_func <- function(a = default_value) {
                 .collect();
 
             assert!(
-                !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: x"),
+                !undefined_var_diags
+                    .iter()
+                    .any(|d| d.message == "Undefined variable: x"),
                 "Complete {} ({:?}): target 'x' should not be flagged as undefined. Got: {:?}",
                 label,
                 code,
@@ -31903,5 +31982,4 @@ result <- undefined_var
 
         // If we reached here without panicking, the utility works correctly.
     }
-
 }
