@@ -6,97 +6,97 @@ Build Raven's performance testing in layers: fixture generator → real benchmar
 
 ## Tasks
 
-- [ ] 1. Create the fixture workspace generator
-  - [ ] 1.1 Create `crates/raven/src/test_utils/fixture_workspace.rs` with `FixtureConfig` and `create_fixture_workspace()`
+- [x] 1. Create the fixture workspace generator
+  - [x] 1.1 Create `crates/raven/src/test_utils/fixture_workspace.rs` with `FixtureConfig` and `create_fixture_workspace()`
     - Implement `small()`, `medium()`, `large()` presets
     - Generate valid R files with functions, source() chains, library() calls
     - Ensure deterministic output (no randomness)
     - _Requirements: 3.1, 3.2, 3.3, 3.4_
 
-  - [ ] 1.2 Add unit tests for fixture generator
+  - [x] 1.2 Add unit tests for fixture generator
     - Verify file count matches config
     - Verify source chain depth (file_0 sources file_1, etc.)
     - Verify generated files parse without tree-sitter errors
     - _Requirements: 3.2, 3.3_
 
-- [ ] 2. Rewrite startup benchmarks with real implementations
-  - [ ] 2.1 Replace stub benchmarks in `benches/startup.rs` with actual function calls
+- [x] 2. Rewrite startup benchmarks with real implementations
+  - [x] 2.1 Replace stub benchmarks in `benches/startup.rs` with actual function calls
     - `bench_metadata_extraction`: call real metadata extraction on generated R code
     - `bench_tree_sitter_parsing`: use actual tree-sitter parser
     - `bench_batch_init_parsing`: keep as-is (already exercises real parsing logic)
     - `bench_workspace_scan`: call actual workspace scanning on fixture workspaces
     - _Requirements: 1.1, 1.3_
 
-- [ ] 3. Add LSP operation benchmarks
-  - [ ] 3.1 Create `benches/lsp_operations.rs`
+- [x] 3. Add LSP operation benchmarks
+  - [x] 3.1 Create `benches/lsp_operations.rs`
     - Benchmark completion on small and medium fixture workspaces
     - Benchmark hover on small and medium fixture workspaces
     - Benchmark go-to-definition across source() chains
     - Benchmark diagnostics generation on small and medium workspaces
     - _Requirements: 1.2, 1.3, 1.5_
 
-  - [ ] 3.2 Create `benches/cross_file.rs`
+  - [x] 3.2 Create `benches/cross_file.rs`
     - Benchmark scope resolution with source chain depths 1, 5, 15
     - Benchmark dependency graph traversal on small and medium workspaces
     - _Requirements: 1.4, 1.3_
 
-- [ ] 4. Checkpoint — verify all benchmarks run
+- [x] 4. Checkpoint — verify all benchmarks run
   - Run `cargo bench` and verify Criterion HTML reports are generated. Ask the user if questions arise.
 
-- [ ] 5. Add time-budget regression tests
-  - [ ] 5.1 Create `tests/performance_budgets.rs` with test harness
+- [x] 5. Add time-budget regression tests
+  - [x] 5.1 Create `tests/performance_budgets.rs` with test harness
     - Implement `median_of_3()`, `ci_factor()`, `assert_within_budget()`
     - Gate with `#[cfg(not(debug_assertions))]`
     - _Requirements: 2.2, 2.3, 2.4, 2.5_
 
-  - [ ] 5.2 Add time-budget tests for each operation
+  - [x] 5.2 Add time-budget tests for each operation
     - Tree-sitter parsing: 1KB < 5ms, 10KB < 25ms, 100KB < 250ms
     - Metadata extraction: single file < 2ms
     - Scope resolution: 50-file workspace < 50ms
     - Single-file completion: < 20ms
     - _Requirements: 2.1_
 
-- [ ] 6. Checkpoint — verify time-budget tests pass
+- [x] 6. Checkpoint — verify time-budget tests pass
   - Run `cargo test --release` and verify time-budget tests pass locally. Ask the user if questions arise.
 
-- [ ] 7. Add analysis-stats CLI command
-  - [ ] 7.1 Add `analysis-stats` subcommand to Raven's CLI
+- [x] 7. Add analysis-stats CLI command
+  - [x] 7.1 Add `analysis-stats` subcommand to Raven's CLI
     - Parse workspace, run each phase, collect timing via `perf.rs`
     - Report: file count, parse time, metadata time, scope time, package time
     - Support `--csv` and `--only <phase>` flags
     - _Requirements: 5.1, 5.2, 5.3, 5.4_
 
-  - [ ] 7.2 Add peak RSS measurement to `perf.rs`
+  - [x] 7.2 Add peak RSS measurement to `perf.rs`
     - macOS: `mach_task_info` / `rusage`
     - Linux: `/proc/self/status` VmHWM
     - Fallback: `None` on unsupported platforms
     - _Requirements: 6.1_
 
-  - [ ] 7.3 Document heap profiling in `docs/development.md`
+  - [x] 7.3 Document heap profiling in `docs/development.md`
     - Instructions for `jemalloc` profiling and `dhat`
     - _Requirements: 6.3_
 
-- [ ] 8. Add CI performance workflow
-  - [ ] 8.1 Create `.github/workflows/perf.yml`
+- [x] 8. Add CI performance workflow
+  - [x] 8.1 Create `.github/workflows/perf.yml`
     - Trigger on push to `main` and pull requests
     - Run `cargo test --release` (time-budget tests)
     - Run `cargo bench` with baseline management
     - Record and display release binary size
     - _Requirements: 4.1, 4.4, 4.5_
 
-  - [ ] 8.2 Add PR regression comment via `critcmp`
+  - [x] 8.2 Add PR regression comment via `critcmp`
     - On PRs: compare against cached `main` baseline
     - Post comment summarizing changes > 5%
     - On push to `main`: save new baseline to cache
     - _Requirements: 4.2, 4.3_
 
-- [ ] 9. Add optional allocation tracking
-  - [ ] 9.1 Add global allocator wrapper gated behind `RAVEN_BENCH_ALLOC=1`
+- [x] 9. Add optional allocation tracking
+  - [x] 9.1 Add global allocator wrapper gated behind `RAVEN_BENCH_ALLOC=1`
     - Count allocations during benchmark runs
     - Report in Criterion custom metrics
     - _Requirements: 6.2_
 
-- [ ] 10. Final checkpoint — end-to-end verification
+- [x] 10. Final checkpoint — end-to-end verification
   - Run full benchmark suite, time-budget tests, and analysis-stats on a fixture workspace. Verify CI workflow YAML is valid. Ask the user if questions arise.
 
 ## Notes

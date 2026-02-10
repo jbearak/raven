@@ -7,6 +7,7 @@
 
 mod backend;
 mod builtins;
+mod cli;
 mod completion_context;
 mod content_provider;
 mod cross_file;
@@ -26,6 +27,9 @@ mod roxygen;
 mod state;
 mod workspace_index;
 
+#[cfg(test)]
+mod test_utils;
+
 use std::env;
 
 fn print_usage() {
@@ -36,12 +40,20 @@ fn print_usage() {
     print!(
         r#"
 Usage: raven [OPTIONS]
+       raven analysis-stats <path> [--csv] [--only <phase>]
 
 Available options:
 
 --stdio                      Start the LSP server using stdio transport
 --version                    Print the version
 --help                       Print this help message
+
+Subcommands:
+
+analysis-stats <path>        Profile workspace analysis phases
+  --csv                      Output results in CSV format
+  --only <phase>             Run only the specified phase
+                             (scan, parse, metadata, scope, packages)
 
 "#
     );
@@ -54,7 +66,31 @@ async fn main() -> anyhow::Result<()> {
 
     let mut use_stdio = false;
 
-    for arg in argv {
+    // Collect args to peek at the first one for subcommand detection
+    let args: Vec<String> = argv.collect();
+
+    if let Some(first) = args.first() {
+        if first == "analysis-stats" {
+            env_logger::init();
+            let mut rest = args.into_iter().skip(1);
+            match cli::analysis_stats::parse_args(&mut rest) {
+                Ok(stats_args) => {
+                    let results = cli::analysis_stats::run_analysis_stats(&stats_args);
+                    if stats_args.csv {
+                        cli::analysis_stats::print_results_csv(&results);
+                    } else {
+                        cli::analysis_stats::print_results(&results);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("analysis-stats: {}", e));
+                }
+            }
+        }
+    }
+
+    for arg in &args {
         match arg.as_str() {
             "--stdio" => use_stdio = true,
             "--version" => {

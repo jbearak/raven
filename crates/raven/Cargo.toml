@@ -45,3 +45,11 @@ tokio = { version = "1.26.0", features = ["test-util"] }
 [[bench]]
 name = "startup"
 harness = false
+
+[[bench]]
+name = "lsp_operations"
+harness = false
+
+[[bench]]
+name = "cross_file"
+harness = false

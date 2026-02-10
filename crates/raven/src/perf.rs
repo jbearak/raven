@@ -228,6 +228,58 @@ pub fn get_r_subprocess_calls() -> usize {
     R_SUBPROCESS_CALLS.load(Ordering::Relaxed)
 }
 
+/// Returns the peak resident set size (RSS) of the current process in bytes.
+///
+/// - **macOS**: Uses `libc::getrusage` (`ru_maxrss`, which is in bytes on macOS).
+/// - **Linux**: Reads `/proc/self/status` and parses the `VmHWM` field (reported in kB).
+/// - **Other platforms**: Returns `None`.
+pub fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        peak_rss_macos()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        peak_rss_linux()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn peak_rss_macos() -> Option<u64> {
+    use std::mem::MaybeUninit;
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage writes into the provided pointer; we check the return value.
+    let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if ret == 0 {
+        // SAFETY: getrusage succeeded, so the struct is fully initialized.
+        let usage = unsafe { usage.assume_init() };
+        // On macOS, ru_maxrss is in bytes.
+        Some(usage.ru_maxrss as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn peak_rss_linux() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            // Format: "VmHWM:    12345 kB"
+            let trimmed = rest.trim();
+            let kb_str = trimmed.strip_suffix("kB").unwrap_or(trimmed).trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +306,19 @@ mod tests {
         assert!(metrics.workspace_scan_duration.is_none());
         assert!(metrics.package_init_duration.is_none());
         assert_eq!(metrics.files_scanned, 0);
+    }
+
+    #[test]
+    fn test_peak_rss_bytes_returns_value_on_supported_platforms() {
+        let rss = peak_rss_bytes();
+        // On macOS and Linux, we should get a value; on other platforms, None.
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(rss.is_some(), "peak_rss_bytes() should return Some on macOS/Linux");
+            let bytes = rss.unwrap();
+            // A running process should have at least some RSS (> 0)
+            assert!(bytes > 0, "peak RSS should be > 0, got {}", bytes);
+        } else {
+            assert!(rss.is_none(), "peak_rss_bytes() should return None on unsupported platforms");
+        }
     }
 }
