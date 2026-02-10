@@ -1,11 +1,11 @@
 # Raven - Language Server for R
 
-An open source [Language Server Protocol (LSP)](https://github.com/Microsoft/language-server-protocol) implementation for the R statistical programming language, with a corresponding extension for [VS Code](https://github.com/Microsoft/vscode).
+An open-source [Language Server Protocol (LSP)](https://github.com/Microsoft/language-server-protocol) implementation for the R statistical programming language, with a corresponding extension for [VS Code](https://github.com/Microsoft/vscode).
 
 > **tl;dr**: Raven brings **cross-file intelligence** to R coding. Unlike language servers that treat each file in isolation, Raven follows `source()` chains to provide **workspace-wide completions**, **go-to-definition across files**, **position-aware scope resolution**, and **diagnostics that understand your project structure**.
-
+>
 > **Development Status:** Raven is an early-stage implementation. While functional, it requires substantial testing and code review. Contributions and feedback are welcome!
-
+>
 > **Quick Start:** Download from the [releases page](https://github.com/jbearak/raven/releases), or clone the repo and build from source (`cargo build --release -p raven`). See [Installation](#installation) for details.
 
 Raven works with VS Code, its forks (Antigravity, Cursor, Kiro, Positron, and Windsurf), and any editor with an LSP client. This repository contains the language server and a VS Code extension that activates it. Raven can run alongside existing R extensions like [vscode-R](https://github.com/REditorSupport/vscode-R) — see [Raven vs Ark vs R Language Server](#raven-vs-ark-vs-r-language-server) for how they compare and coexist.

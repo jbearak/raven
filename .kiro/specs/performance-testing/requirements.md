@@ -75,7 +75,7 @@ The goal is a layered system: (1) real Criterion benchmarks that exercise actual
 
 #### Acceptance Criteria
 
-1. THE `raven analysis-stats <path>` command SHALL load the workspace at `<path>` and report: file count, total parse time, total metadata extraction time, scope resolution time, package loading time, and peak memory (via `jemalloc` stats or `/proc/self/status` on Linux / `mach_task_info` on macOS).
+1. THE `raven analysis-stats <path>` command SHALL load the workspace at `<path>` and report: file count, total parse time, total metadata extraction time, scope resolution time, package loading time, and peak memory (via `peak_rss_bytes()` using `getrusage`/`ru_maxrss` on macOS, `/proc/self/status` `VmHWM` on Linux).
 2. THE command SHALL accept a `--csv` flag to output machine-readable results.
 3. THE command SHALL accept a `--only <phase>` flag to run a single phase (e.g., `--only parse`, `--only scope`).
 4. THE command SHALL reuse the existing `perf.rs` `PerfMetrics` infrastructure for timing collection.

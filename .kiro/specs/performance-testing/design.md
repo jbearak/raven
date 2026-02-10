@@ -87,7 +87,7 @@ pub struct FixtureConfig {
 impl FixtureConfig {
     pub fn small() -> Self;   // 10 files, 5 funcs, depth 3
     pub fn medium() -> Self;  // 50 files, 10 funcs, depth 10
-    pub fn large() -> Self;   // 200 files, 20 funcs, depth 15
+    // large() (200 files, 20 funcs, depth 15) — deferred until needed
 }
 
 /// Creates a temp directory with generated R files. Returns TempDir (cleanup on drop).

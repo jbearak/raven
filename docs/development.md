@@ -68,6 +68,8 @@ This reports timing and peak RSS per phase (parse, metadata, scope, packages). U
 
 ### jemalloc heap profiling
 
+> **Note:** These features are not wired up in the repository by default. Follow the steps below to add them locally when you need to profile.
+
 [jemalloc](https://github.com/jemalloc/jemalloc) provides detailed heap profiling with allocation backtraces. This is the best option for finding where memory is allocated in a running Raven process.
 
 **1. Add jemalloc as a feature-gated dependency** in `crates/raven/Cargo.toml`:
