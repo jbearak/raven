@@ -405,6 +405,8 @@ fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitt
     if let Some(doc) = state.documents.get(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.text(), tree.clone()));
+        } else {
+            log::debug!("Document found but has no parsed tree: {}", uri);
         }
     }
 
@@ -412,6 +414,8 @@ fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitt
     if let Some(doc) = state.document_store.get_without_touch(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.contents.to_string(), tree.clone()));
+        } else {
+            log::debug!("Document in document_store has no parsed tree: {}", uri);
         }
     }
 
@@ -419,6 +423,8 @@ fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitt
     if let Some(entry) = state.workspace_index_new.get(uri) {
         if let Some(tree) = &entry.tree {
             return Some((entry.contents.to_string(), tree.clone()));
+        } else {
+            log::debug!("Document in workspace_index_new has no parsed tree: {}", uri);
         }
     }
 
@@ -426,6 +432,8 @@ fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitt
     if let Some(doc) = state.workspace_index.get(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.text(), tree.clone()));
+        } else {
+            log::debug!("Document in workspace_index has no parsed tree: {}", uri);
         }
     }
 
@@ -1234,7 +1242,7 @@ mod tests {
     ) -> Option<Node<'a>> {
         if node.kind() == "binary_operator" {
             let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
+            let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
 
             if children.len() >= 3 {
                 let lhs = children[0];
@@ -1374,7 +1382,7 @@ mod property_tests {
     ) -> Option<Node<'a>> {
         if node.kind() == "binary_operator" {
             let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
+            let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
 
             if children.len() >= 3 {
                 let lhs = children[0];

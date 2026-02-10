@@ -174,6 +174,8 @@ mod tests {
             config.redundant_directive_severity,
             Some(DiagnosticSeverity::HINT)
         );
+        // Completion trigger defaults
+        assert!(config.trigger_on_open_paren);
     }
 
     #[test]

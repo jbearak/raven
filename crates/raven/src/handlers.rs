@@ -8328,7 +8328,7 @@ x <- "#;
                 let param_items: Vec<_> = items
                     .iter()
                     .filter(|item| {
-                        item.detail.as_ref().map_or(false, |d| d.contains("parameter"))
+                        item.detail.as_deref() == Some("parameter")
                     })
                     .collect();
 
@@ -8389,7 +8389,7 @@ x <- "#;
                 let param_items: Vec<_> = items
                     .iter()
                     .filter(|item| {
-                        item.detail.as_ref().map_or(false, |d| d.contains("parameter"))
+                        item.detail.as_deref() == Some("parameter")
                     })
                     .collect();
 
