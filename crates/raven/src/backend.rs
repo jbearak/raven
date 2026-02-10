@@ -30,69 +30,27 @@ enum IndexCategory {
     BackwardDirective,
 }
 
-/// Extract loaded packages from a parsed tree
-///
-/// This is a helper function for on-demand indexing that extracts
-/// library(), require(), and loadNamespace() calls from R code.
-fn extract_loaded_packages_from_tree(tree: &Option<tree_sitter::Tree>, text: &str) -> Vec<String> {
-    let Some(tree) = tree else {
-        return Vec::new();
-    };
-
-    let mut packages = Vec::new();
-
-    fn is_valid_package_name(name: &str) -> bool {
-        if name.is_empty() {
-            return false;
-        }
-        if name.contains("..") || name.contains('/') || name.contains('\\') {
-            return false;
-        }
-        name.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+fn is_valid_package_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
     }
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+}
 
-    let mut stack = Vec::new();
-    stack.push(tree.root_node());
-
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call" {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                let func_text = &text[func_node.byte_range()];
-
-                if func_text == "library" || func_text == "require" || func_text == "loadNamespace"
-                {
-                    if let Some(args_node) = node.child_by_field_name("arguments") {
-                        for i in 0..args_node.child_count() {
-                            if let Some(child) = args_node.child(i) {
-                                if child.kind() == "argument" {
-                                    if let Some(value_node) = child.child_by_field_name("value") {
-                                        let value_text = &text[value_node.byte_range()];
-                                        let pkg_name = value_text
-                                            .trim_matches(|c: char| c == '"' || c == '\'');
-                                        if is_valid_package_name(pkg_name) {
-                                            packages.push(pkg_name.to_string());
-                                        } else {
-                                            log::warn!(
-                                                "Skipping suspicious package name: {}",
-                                                pkg_name
-                                            );
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let child_count = node.child_count();
-        for i in (0..child_count).rev() {
-            if let Some(child) = node.child(i) {
-                stack.push(child);
-            }
+/// Extract loaded packages from metadata-derived library calls.
+fn extract_loaded_packages_from_library_calls(
+    library_calls: &[crate::cross_file::LibraryCall],
+) -> Vec<String> {
+    let mut packages = Vec::new();
+    for lib_call in library_calls {
+        if is_valid_package_name(&lib_call.package) {
+            packages.push(lib_call.package.clone());
+        } else {
+            log::warn!("Skipping suspicious package name: {}", lib_call.package);
         }
     }
     packages
@@ -2756,7 +2714,8 @@ impl Backend {
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let loaded_packages = extract_loaded_packages_from_tree(&tree, &content);
+        let loaded_packages =
+            extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
         } else {
@@ -3076,7 +3035,8 @@ impl Backend {
                 )
             };
 
-        let loaded_packages = extract_loaded_packages_from_tree(&tree, &content);
+        let loaded_packages =
+            extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
         } else {
