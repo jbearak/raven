@@ -6618,7 +6618,7 @@ pub fn completion(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    context: Option<CompletionContext>,
+    _context: Option<CompletionContext>,
 ) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
@@ -6842,19 +6842,7 @@ pub fn completion(
     // For incomplete namespace expressions (e.g., `pkg::` with no RHS), the AST check
     // may fail, so we also do a text-based check here as a fallback.
     //
-    // When trigger_on_open_paren is disabled and the completion was triggered by `(`,
-    // skip parameter completions. Manual invocations (Ctrl+Space) still show them.
-    // Requirements 2.2, 2.3, 2.6, 5.1-5.7, 6.1-6.6
-    let suppress_params = !state.completion_config.trigger_on_open_paren
-        && matches!(
-            &context,
-            Some(CompletionContext {
-                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
-                trigger_character: Some(ch),
-                ..
-            }) if ch == "("
-        );
-    if !suppress_params && !has_namespace_accessor_at_cursor(&text, position) {
+    if !has_namespace_accessor_at_cursor(&text, position) {
         let call_context =
             crate::completion_context::detect_function_call_context(tree, &text, position);
         if let Some(ctx) = call_context {
@@ -7053,7 +7041,10 @@ fn extract_function_signature_for_completion(func_node: Node, name: &str, text: 
     let mut cursor = func_node.walk();
     for child in func_node.children(&mut cursor) {
         if child.kind() == "parameters" {
-            let params = node_text(child, text);
+            let params: String = node_text(child, text)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             return format!("{}{}", name, params);
         }
     }
@@ -9430,6 +9421,26 @@ mod tests {
         let func_node = find_function_definition_node(tree.root_node(), "wrapper", code).unwrap();
         let signature = extract_function_signature(func_node, "wrapper", code);
         assert_eq!(signature, "wrapper(...)");
+    }
+
+    #[test]
+    fn test_signature_multiline_parameters() {
+        let code = "f <- function(a,\n              b,\n              c = 1) { }";
+        let tree = parse_r_code(code);
+
+        let func_node = find_function_definition_node(tree.root_node(), "f", code).unwrap();
+        let signature = extract_function_signature(func_node, "f", code);
+        assert_eq!(signature, "f(a, b, c = 1)");
+    }
+
+    #[test]
+    fn test_completion_signature_multiline_parameters() {
+        let code = "f <- function(a,\n              b,\n              c = 1) { }";
+        let tree = parse_r_code(code);
+
+        let func_node = find_function_definition(tree.root_node()).unwrap();
+        let signature = extract_function_signature_for_completion(func_node, "f", code);
+        assert_eq!(signature, "f(a, b, c = 1)");
     }
 
     #[test]

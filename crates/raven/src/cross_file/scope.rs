@@ -2226,7 +2226,10 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
     let mut cursor = func_node.walk();
     for child in func_node.children(&mut cursor) {
         if child.kind() == "parameters" {
-            let params = node_text(child, content);
+            let params: String = node_text(child, content)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             return format!("{}{}", name, params);
         }
     }
@@ -2937,6 +2940,18 @@ mod tests {
         let symbol = artifacts.exported_interface.get("my_func").unwrap();
         assert_eq!(symbol.kind, SymbolKind::Function);
         assert_eq!(symbol.signature, Some("my_func(x, y)".to_string()));
+    }
+
+    #[test]
+    fn test_function_definition_multiline_params() {
+        let code = "my_func <- function(x,\n                    y,\n                    z = 1) { x + y + z }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        let symbol = artifacts.exported_interface.get("my_func").unwrap();
+        assert_eq!(symbol.kind, SymbolKind::Function);
+        assert_eq!(symbol.signature, Some("my_func(x, y, z = 1)".to_string()));
     }
 
     #[test]
