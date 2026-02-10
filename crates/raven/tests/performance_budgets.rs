@@ -34,25 +34,33 @@ fn median_of_3<F: FnMut()>(mut f: F) -> Duration {
     times[1]
 }
 
-/// Return the CI relaxation factor for time-budget thresholds.
+/// Compute the CI relaxation factor from explicit env var values.
 ///
-/// - When `CI` is set (to any non-empty value), returns the value of
-///   `RAVEN_PERF_CI_FACTOR` (default **3.0**).
+/// - When `ci` is `Some(non-empty)`, returns the parsed `factor` (default **3.0**).
 /// - Otherwise returns **1.0** (no relaxation).
-fn ci_factor() -> f64 {
-    let is_ci = std::env::var("CI")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+fn ci_factor_from(ci: Option<&str>, factor: Option<&str>) -> f64 {
+    let is_ci = ci.map(|v| !v.is_empty()).unwrap_or(false);
 
     if is_ci {
-        std::env::var("RAVEN_PERF_CI_FACTOR")
-            .ok()
+        factor
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|&f| f >= 1.0)
             .unwrap_or(3.0)
     } else {
         1.0
     }
+}
+
+/// Return the CI relaxation factor for time-budget thresholds.
+///
+/// - When `CI` is set (to any non-empty value), returns the value of
+///   `RAVEN_PERF_CI_FACTOR` (default **3.0**).
+/// - Otherwise returns **1.0** (no relaxation).
+fn ci_factor() -> f64 {
+    ci_factor_from(
+        std::env::var("CI").ok().as_deref(),
+        std::env::var("RAVEN_PERF_CI_FACTOR").ok().as_deref(),
+    )
 }
 
 /// Assert that `measured` is within `budget_ms × ci_factor()`.
@@ -109,25 +117,47 @@ fn median_of_3_returns_middle_duration() {
 
 #[test]
 fn ci_factor_is_1_when_ci_unset() {
-    // Save and clear CI env var.
-    let original_ci = std::env::var("CI").ok();
-    let original_factor = std::env::var("RAVEN_PERF_CI_FACTOR").ok();
-    std::env::remove_var("CI");
-    std::env::remove_var("RAVEN_PERF_CI_FACTOR");
-
-    let factor = ci_factor();
+    let factor = ci_factor_from(None, None);
     assert!(
         (factor - 1.0).abs() < f64::EPSILON,
         "ci_factor should be 1.0 when CI is unset, got {factor}"
     );
+}
 
-    // Restore.
-    if let Some(val) = original_ci {
-        std::env::set_var("CI", val);
-    }
-    if let Some(val) = original_factor {
-        std::env::set_var("RAVEN_PERF_CI_FACTOR", val);
-    }
+#[test]
+fn ci_factor_is_3_when_ci_set_without_custom_factor() {
+    let factor = ci_factor_from(Some("true"), None);
+    assert!(
+        (factor - 3.0).abs() < f64::EPSILON,
+        "ci_factor should be 3.0 when CI is set without custom factor, got {factor}"
+    );
+}
+
+#[test]
+fn ci_factor_uses_custom_value() {
+    let factor = ci_factor_from(Some("true"), Some("5.0"));
+    assert!(
+        (factor - 5.0).abs() < f64::EPSILON,
+        "ci_factor should use custom value, got {factor}"
+    );
+}
+
+#[test]
+fn ci_factor_ignores_invalid_custom_value() {
+    let factor = ci_factor_from(Some("true"), Some("not_a_number"));
+    assert!(
+        (factor - 3.0).abs() < f64::EPSILON,
+        "ci_factor should fall back to 3.0 for invalid value, got {factor}"
+    );
+}
+
+#[test]
+fn ci_factor_rejects_factor_below_1() {
+    let factor = ci_factor_from(Some("true"), Some("0.5"));
+    assert!(
+        (factor - 3.0).abs() < f64::EPSILON,
+        "ci_factor should reject factor < 1.0, got {factor}"
+    );
 }
 
 #[test]
