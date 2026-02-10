@@ -21,6 +21,7 @@ use url::Url;
 use crate::cross_file;
 use crate::parser_pool;
 use crate::perf::TimingGuard;
+use crate::state::should_skip_directory;
 
 /// Parsed arguments for the `analysis-stats` subcommand.
 #[derive(Debug)]
@@ -240,8 +241,11 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
     }
 
     // Phase 5: Packages — package loading/resolution
-    // This phase collects unique library() calls and resolves packages via
-    // the static NAMESPACE parser (no R subprocess in CLI mode).
+    // This phase collects unique library() calls and attempts static NAMESPACE
+    // resolution. In CLI mode we use PackageLibrary::new_empty() (no R library
+    // paths), so find_package_directory() will not locate installed packages.
+    // The primary value here is counting unique library() references and
+    // measuring the overhead of the package resolution path itself.
     if should_run("packages") {
         let _guard = TimingGuard::new("analysis-stats:packages");
         let start = Instant::now();
@@ -370,8 +374,6 @@ fn collect_r_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
         }
     }
 }
-
-use crate::state::should_skip_directory;
 
 #[cfg(test)]
 mod tests {
