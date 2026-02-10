@@ -41,6 +41,12 @@ All settings can be configured via VS Code settings or LSP initialization option
 |---------|---------|-------------|
 | `raven.symbols.workspaceMaxResults` | 1000 | Maximum number of symbols returned by workspace symbol search (Ctrl+T). Valid range: 100-10000. Values outside this range are clamped to the nearest boundary. |
 
+## Completion Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `raven.completion.triggerOnOpenParen` | true | Register `(` as a completion trigger character so parameter suggestions appear when opening a function call. Set to `false` to disable. |
+
 ## Severity Values
 
 All severity settings accept one of:

@@ -159,9 +159,11 @@ pub(crate) fn parse_cross_file_config(
     let cross_file = settings.get("crossFile");
     let diagnostics = settings.get("diagnostics");
     let packages = settings.get("packages");
+    let completion = settings.get("completion");
 
     // Return None only if no relevant settings are present at all
-    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
+    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() && completion.is_none()
+    {
         return None;
     }
 
@@ -314,6 +316,16 @@ pub(crate) fn parse_cross_file_config(
         }
     }
 
+    // Parse completion settings
+    if let Some(completion) = completion {
+        if let Some(v) = completion
+            .get("triggerOnOpenParen")
+            .and_then(|v| v.as_bool())
+        {
+            config.trigger_on_open_paren = v;
+        }
+    }
+
     log::info!("Cross-file configuration loaded from LSP settings:");
     log::info!("  max_backward_depth: {}", config.max_backward_depth);
     log::info!("  max_forward_depth: {}", config.max_forward_depth);
@@ -386,6 +398,11 @@ pub(crate) fn parse_cross_file_config(
     log::info!(
         "    workspace_index_max_entries: {}",
         config.cache_workspace_index_max_entries
+    );
+    log::info!("  Completion settings:");
+    log::info!(
+        "    trigger_on_open_paren: {}",
+        config.trigger_on_open_paren
     );
 
     Some(config)
@@ -607,7 +624,22 @@ impl LanguageServer for Backend {
             hierarchical_support
         );
 
+        // Extract completion settings before dropping state lock
+        let trigger_on_open_paren = state.cross_file_config.trigger_on_open_paren;
+
         drop(state);
+
+        // Build completion trigger characters (conditionally include '(' for param completions)
+        let mut completion_trigger_chars = vec![
+            String::from(":"),
+            String::from("$"),
+            String::from("@"),
+            String::from("/"),  // File path navigation
+            String::from("\""), // String literal start for source() calls
+        ];
+        if trigger_on_open_paren {
+            completion_trigger_chars.push(String::from("(")); // Parameter completions on open paren
+        }
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -618,13 +650,7 @@ impl LanguageServer for Backend {
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        String::from(":"),
-                        String::from("$"),
-                        String::from("@"),
-                        String::from("/"),  // File path navigation
-                        String::from("\""), // String literal start for source() calls
-                    ]),
+                    trigger_characters: Some(completion_trigger_chars),
                     resolve_provider: Some(true),
                     ..Default::default()
                 }),
@@ -3421,6 +3447,78 @@ mod tests {
                 "diagnostics_enabled should default to true when diagnostics section is absent"
             );
         }
+
+        /// Test that `completion.triggerOnOpenParen` defaults to true when absent.
+        #[test]
+        fn test_trigger_on_open_paren_defaults_to_true() {
+            let settings = json!({
+                "crossFile": {}
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+            assert!(config.is_some());
+            let config = config.unwrap();
+            assert!(
+                config.trigger_on_open_paren,
+                "trigger_on_open_paren should default to true when completion section is absent"
+            );
+        }
+
+        /// Test that `completion.triggerOnOpenParen` can be set to false.
+        #[test]
+        fn test_trigger_on_open_paren_explicit_false() {
+            let settings = json!({
+                "crossFile": {},
+                "completion": {
+                    "triggerOnOpenParen": false
+                }
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+            assert!(config.is_some());
+            let config = config.unwrap();
+            assert!(
+                !config.trigger_on_open_paren,
+                "trigger_on_open_paren should be false when explicitly set to false"
+            );
+        }
+
+        /// Test that `completion.triggerOnOpenParen` can be set to true explicitly.
+        #[test]
+        fn test_trigger_on_open_paren_explicit_true() {
+            let settings = json!({
+                "crossFile": {},
+                "completion": {
+                    "triggerOnOpenParen": true
+                }
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+            assert!(config.is_some());
+            let config = config.unwrap();
+            assert!(
+                config.trigger_on_open_paren,
+                "trigger_on_open_paren should be true when explicitly set to true"
+            );
+        }
+
+        /// Test that completion section alone triggers config parsing.
+        #[test]
+        fn test_completion_section_alone_triggers_config_parsing() {
+            let settings = json!({
+                "completion": {
+                    "triggerOnOpenParen": false
+                }
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+            assert!(config.is_some(), "Config should parse when only completion section is present");
+            let config = config.unwrap();
+            assert!(
+                !config.trigger_on_open_paren,
+                "trigger_on_open_paren should be false"
+            );
+        }
     }
 
     // ============================================================================
@@ -3433,6 +3531,38 @@ mod tests {
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
+
+            // ============================================================================
+            // Property: completion.triggerOnOpenParen round-trip
+            // For any boolean value `b`, if initialization options JSON contains
+            // `completion.triggerOnOpenParen` set to `b`, parsing SHALL produce a
+            // `CrossFileConfig` with `trigger_on_open_paren` equal to `b`.
+            // ============================================================================
+
+            /// Property: trigger_on_open_paren round-trip parsing
+            #[test]
+            fn prop_config_parsing_trigger_on_open_paren_roundtrip(trigger: bool) {
+                use serde_json::json;
+
+                let settings = json!({
+                    "crossFile": {},
+                    "completion": {
+                        "triggerOnOpenParen": trigger
+                    }
+                });
+
+                let config = crate::backend::parse_cross_file_config(&settings);
+                prop_assert!(config.is_some(), "Configuration parsing should succeed");
+                let config = config.unwrap();
+
+                prop_assert_eq!(
+                    config.trigger_on_open_paren,
+                    trigger,
+                    "trigger_on_open_paren should match input: expected {}, got {}",
+                    trigger,
+                    config.trigger_on_open_paren
+                );
+            }
 
             // ============================================================================
             // Property 3: Configuration parsing round-trip for explicit boolean

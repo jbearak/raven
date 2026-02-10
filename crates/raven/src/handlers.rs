@@ -5079,7 +5079,7 @@ fn collect_document_completions(
 ) {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
+        let children: Vec<_> = node.children(&mut cursor).filter(|c| !c.is_extra()).collect();
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -8290,6 +8290,118 @@ x <- "#;
                     .filter(|item| item.label == "pkg2_only")
                     .collect();
                 assert_eq!(pkg2_only_items.len(), 1, "Should have 'pkg2_only'");
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    // ========================================================================
+    // User-defined function parameter completion tests
+    // ========================================================================
+
+    /// Test that typing inside a call to a user-defined function produces
+    /// parameter completion items with the correct detail and sort prefix.
+    #[test]
+    fn test_completion_user_function_params() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Define a function and call it
+            let code = "my_func <- function(alpha, beta = 10) { alpha + beta }\nmy_func(";
+            let uri = Url::parse("file:///test_params.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Cursor is right after the opening paren: line 1, column 8
+            let position = Position::new(1, 8);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some(), "Should return completions");
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find parameter completion items (those with detail == "parameter")
+                let param_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.detail.as_ref().map_or(false, |d| d.contains("parameter"))
+                    })
+                    .collect();
+
+                assert!(
+                    param_items.len() >= 2,
+                    "Should have at least 2 parameter items (alpha, beta). Got {} param items out of {} total. Param items: {:?}",
+                    param_items.len(),
+                    items.len(),
+                    param_items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                // Check that alpha parameter is present
+                let alpha = param_items.iter().find(|item| item.label == "alpha");
+                assert!(alpha.is_some(), "Should have 'alpha' parameter completion");
+
+                // Check that beta parameter is present
+                let beta = param_items.iter().find(|item| item.label == "beta");
+                assert!(beta.is_some(), "Should have 'beta' parameter completion");
+
+                // Parameter items should have sort_text starting with "0-" (highest priority)
+                for item in &param_items {
+                    assert!(
+                        item.sort_text
+                            .as_ref()
+                            .map_or(false, |s| s.starts_with("0-")),
+                        "Parameter item '{}' should have sort_text starting with '0-', got {:?}",
+                        item.label,
+                        item.sort_text
+                    );
+                }
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that parameter completions include insert_text with `= ` suffix.
+    #[test]
+    fn test_completion_user_function_param_insert_text() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let code = "f <- function(x, y) { x + y }\nf(";
+            let uri = Url::parse("file:///test_insert.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(1, 2);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some());
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                let param_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.detail.as_ref().map_or(false, |d| d.contains("parameter"))
+                    })
+                    .collect();
+
+                // Check insert_text includes " = " suffix for named params
+                let x_item = param_items.iter().find(|item| item.label == "x");
+                assert!(x_item.is_some(), "Should have 'x' parameter");
+                let x_item = x_item.unwrap();
+                assert!(
+                    x_item.insert_text.as_ref().map_or(false, |t| t.contains("= ")),
+                    "Parameter 'x' insert_text should contain '= ', got {:?}",
+                    x_item.insert_text
+                );
             } else {
                 panic!("Expected CompletionResponse::Array");
             }
