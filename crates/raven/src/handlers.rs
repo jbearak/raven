@@ -5737,12 +5737,14 @@ fn collect_definitions(node: Node, text: &str, defined: &mut std::collections::H
         let children: Vec<_> = node.children(&mut cursor).collect();
 
         if children.len() >= 3 {
-            let lhs = children[0];
-            let op = children[1];
-
-            let op_text = node_text(op, text);
-            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
-                defined.insert(node_text(lhs, text).to_string());
+            let op_text = node_text(children[1], text);
+            // Left-assignment: target is children[0]
+            if matches!(op_text, "<-" | "=" | "<<-") && children[0].kind() == "identifier" {
+                defined.insert(node_text(children[0], text).to_string());
+            }
+            // Right-assignment: target is children[2]
+            if matches!(op_text, "->" | "->>") && children[2].kind() == "identifier" {
+                defined.insert(node_text(children[2], text).to_string());
             }
         }
     }
@@ -5790,17 +5792,37 @@ struct UsageContext {
 /// Only used in tests for backward compatibility with existing property tests.
 #[cfg(test)]
 fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'a>)>) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
+
     if node.kind() == "identifier" {
-        // Skip if this is the LHS of an assignment
+        // Skip if this is the target of an assignment
         if let Some(parent) = node.parent() {
             if parent.kind() == "binary_operator" {
                 let mut cursor = parent.walk();
                 let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = node_text(op, text);
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        return; // Skip LHS of assignment
+                if children.len() >= 2 {
+                    let op_text = node_text(children[1], text);
+                    if children[0].id() == node.id()
+                        && matches!(op_text, "<-" | "=" | "<<-")
+                    {
+                        return;
+                    }
+                    if children.len() >= 3
+                        && children[2].id() == node.id()
+                        && matches!(op_text, "->" | "->>")
+                    {
+                        return;
+                    }
+                }
+            }
+
+            if let Some(prev) = node.prev_sibling() {
+                if prev.is_error() {
+                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
+                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                        return;
                     }
                 }
             }
@@ -5853,16 +5875,37 @@ fn collect_usages_with_context<'a>(
             return;
         }
 
-        // Skip if this is the LHS of an assignment
+        // Skip if this is the target of an assignment
         if let Some(parent) = node.parent() {
             if parent.kind() == "binary_operator" {
                 let mut cursor = parent.walk();
                 let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = node_text(op, text);
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        return; // Skip LHS of assignment
+                if children.len() >= 2 {
+                    let op_text = node_text(children[1], text);
+                    // Left-assignment: target is children[0] (e.g., x <- 1)
+                    if children[0].id() == node.id()
+                        && matches!(op_text, "<-" | "=" | "<<-")
+                    {
+                        return;
+                    }
+                    // Right-assignment: target is children[2] (e.g., 1 -> x)
+                    if children.len() >= 3
+                        && children[2].id() == node.id()
+                        && matches!(op_text, "->" | "->>")
+                    {
+                        return;
+                    }
+                }
+            }
+
+            // Skip if this identifier follows an ERROR node containing a
+            // right-assignment operator (e.g., `-> x` or `->> x` where the
+            // parser couldn't find a LHS value for the operator).
+            if let Some(prev) = node.prev_sibling() {
+                if prev.is_error() {
+                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
+                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                        return;
                     }
                 }
             }
@@ -30716,11 +30759,25 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
-    fn test_missing_rhs_not_flagged_as_undefined() {
-        // For top-level `x <-`, tree-sitter produces a binary_operator with a
-        // MISSING identifier child (the absent RHS). The MISSING node has kind
-        // "identifier" but empty text — it should not be collected as a usage.
-        for code in &["x <-", "x <<-"] {
+    fn test_incomplete_assignment_not_flagged_as_undefined() {
+        // All five R assignment operators in incomplete form should not produce
+        // "Undefined variable" diagnostics for either the target or the MISSING
+        // operand.
+        //
+        // Left-assignment (`x <-`, `x <<-`, `x =`): tree-sitter produces a
+        // binary_operator with a MISSING identifier RHS.
+        //
+        // Right-assignment (`-> x`, `->> x`): tree-sitter wraps the operator
+        // in an ERROR node, and the target `x` is a top-level sibling.
+        let cases: &[(&str, &str)] = &[
+            ("x <-", "left-assignment <-"),
+            ("x <<-", "left-assignment <<-"),
+            ("x =", "equals-assignment ="),
+            ("-> x", "right-assignment ->"),
+            ("->> x", "right-assignment ->>"),
+        ];
+
+        for &(code, label) in cases {
             let mut state = create_test_state();
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
@@ -30747,8 +30804,57 @@ my_func <- function(a = default_value) {
 
             assert!(
                 undefined_var_diags.is_empty(),
-                "Incomplete assignment {:?} should not produce undefined variable \
+                "Incomplete {} ({:?}) should not produce undefined variable \
                  diagnostics. Got: {:?}",
+                label,
+                code,
+                undefined_var_diags
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_complete_right_assignment_target_not_flagged() {
+        // For complete right-assignments like `1 -> x` and `1 ->> x`,
+        // the target `x` on the assignment line should not be flagged as
+        // an undefined usage — it's an assignment target.
+        let cases: &[(&str, &str)] = &[
+            ("1 -> x", "right-assignment ->"),
+            ("1 ->> x", "right-assignment ->>"),
+        ];
+
+        for &(code, label) in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            let undefined_var_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with("Undefined variable"))
+                .collect();
+
+            assert!(
+                !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: x"),
+                "Complete {} ({:?}): target 'x' should not be flagged as undefined. Got: {:?}",
+                label,
                 code,
                 undefined_var_diags
                     .iter()
