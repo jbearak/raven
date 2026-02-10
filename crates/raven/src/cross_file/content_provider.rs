@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tower_lsp::lsp_types::Url;
 
-use super::file_cache::{get_file_snapshot, CrossFileFileCache};
+use super::file_cache::CrossFileFileCache;
 use super::scope::ScopeArtifacts;
 use super::types::CrossFileMetadata;
 use super::workspace_index::CrossFileWorkspaceIndex;
@@ -37,7 +37,7 @@ pub trait DocumentContent {
 /// Unified content provider with precedence:
 /// 1. Open document (in-memory)
 /// 2. Workspace index (cached)
-/// 3. Disk file cache (on-demand)
+/// 3. Disk file cache (cached-only; no synchronous disk I/O)
 pub struct CrossFileContentProvider<'a, D: DocumentContent> {
     /// Open documents (authoritative)
     pub open_documents: &'a HashMap<Url, D>,
@@ -77,16 +77,8 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
         // Note: We don't have content in the index, only metadata/artifacts
         // So we fall through to file cache
 
-        // 3. Try file cache or read from disk
-        let path = uri.to_file_path().ok()?;
-        if let Some(snapshot) = get_file_snapshot(&path) {
-            if let Some(content) = self.file_cache.get_if_fresh(uri, &snapshot) {
-                return Some(content);
-            }
-        }
-
-        // Read from disk and cache
-        self.file_cache.read_and_cache(uri)
+        // 3. Try file cache (no synchronous disk I/O)
+        self.file_cache.get(uri)
     }
 
     fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
@@ -140,6 +132,7 @@ pub fn path_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_file::file_cache::FileSnapshot;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -198,19 +191,23 @@ mod tests {
     }
 
     #[test]
-    fn test_reads_from_disk() {
+    fn test_reads_from_cache_only() {
         let open_docs: HashMap<Url, MockDocument> = HashMap::new();
         let index = CrossFileWorkspaceIndex::new();
         let cache = CrossFileFileCache::new();
-
+        // Create a temp file and seed the cache
         // Create a temp file
         let mut temp = NamedTempFile::new().unwrap();
         writeln!(temp, "disk content").unwrap();
         let uri = Url::from_file_path(temp.path()).unwrap();
+        let content = std::fs::read_to_string(temp.path()).unwrap();
+        let metadata = std::fs::metadata(temp.path()).unwrap();
+        let snapshot = FileSnapshot::with_content_hash(&metadata, &content);
+        cache.insert(uri.clone(), snapshot, content.clone());
 
         let provider = CrossFileContentProvider::new(&open_docs, &index, &cache);
 
-        // Should read from disk
+        // Should read from cache (no disk I/O in provider)
         let content = provider.get_content(&uri);
         assert!(content.is_some());
         assert!(content.unwrap().contains("disk content"));
