@@ -344,10 +344,10 @@ my_func <- function(x) { x + 1 }
     group.bench_function("metadata_extraction_small", |b| {
         b.iter(|| {
             alloc_counter::reset();
-            let result = black_box(raven::cross_file::extract_metadata(black_box(small_code)));
-            alloc_counter::print_report("metadata_extraction_small");
-            result
-        })
+            black_box(raven::cross_file::extract_metadata(black_box(small_code)))
+        });
+        // Print one summary report after all iterations complete.
+        alloc_counter::print_report("metadata_extraction_small");
     });
 
     // --- tree-sitter parse (small) ---
@@ -359,9 +359,10 @@ my_func <- function(x) { x + 1 }
             let tree = parser
                 .parse(black_box(&parse_code), None)
                 .expect("parse failed");
-            alloc_counter::print_report("tree_sitter_parse_small");
             black_box(tree)
-        })
+        });
+        // Print one summary report after all iterations complete.
+        alloc_counter::print_report("tree_sitter_parse_small");
     });
 
     group.finish();
