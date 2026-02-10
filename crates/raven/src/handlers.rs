@@ -4089,25 +4089,53 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
         
         // If innermost is multi-line, find the first line with actual content
         if let Some(content_row) = find_first_content_line(innermost) {
+            // Find the last child of the innermost ERROR on the content row.
+            // This is typically the dangling operator (e.g., `<-` in `x <-`)
+            // rather than a valid identifier like `x`. Highlighting just the
+            // trailing incomplete token avoids false overlap with other diagnostics.
+            let mut last_child_on_row: Option<Node> = None;
+            let mut cursor = innermost.walk();
+            for child in innermost.children(&mut cursor) {
+                if child.start_position().row == content_row {
+                    last_child_on_row = Some(child);
+                } else if child.start_position().row > content_row {
+                    break;
+                }
+            }
+
+            if let Some(last_child) = last_child_on_row {
+                let lc_start_col = last_child.start_position().column as u32;
+                let lc_end_col = last_child.end_position().column as u32;
+                let end_col = if lc_end_col <= lc_start_col {
+                    lc_start_col.saturating_add(1)
+                } else {
+                    lc_end_col
+                };
+                return Range {
+                    start: Position::new(content_row as u32, lc_start_col),
+                    end: Position::new(content_row as u32, end_col),
+                };
+            }
+
+            // Fallback: span the content line (no children found on it)
             let first_line_end_col = text
                 .lines()
                 .nth(content_row)
                 .map(utf16_len)
                 .unwrap_or(0);
-            
-            // Find the start column on the content line
+
             let start_col = if content_row == inner_start_row {
                 innermost.start_position().column as u32
             } else {
                 0
             };
-            
+
             let end_col_clamped = if first_line_end_col <= start_col {
                 start_col.saturating_add(1)
             } else {
                 first_line_end_col
             };
-            
+
             return Range {
                 start: Position::new(content_row as u32, start_col),
                 end: Position::new(content_row as u32, end_col_clamped),
@@ -4252,6 +4280,32 @@ mod syntax_error_range_tests {
                 d.range
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_range_excludes_valid_lhs_identifier() {
+        // The diagnostic for `x <-` should highlight just `<-` (the dangling
+        // operator), not `x` which is a valid assignment target.
+        // This prevents false overlap with "Undefined variable" diagnostics
+        // and avoids confusing users by highlighting valid code.
+        let code = "if (1 == 1) {\n  x <-\n}";
+        // Line 1: "  x <-"
+        //           ^^ col 2-3: identifier "x"
+        //              ^^  col 4-6: operator "<-"
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d.range.start.line, 1);
+        assert_eq!(d.range.end.line, 1);
+        // Should start at column 4 (`<-`), not column 0 or 2 (`x`)
+        assert!(
+            d.range.start.character >= 4,
+            "diagnostic should not cover the identifier 'x' (col 2-3), \
+             but starts at col {}. Range: ({},{})..({},{})",
+            d.range.start.character,
+            d.range.start.line, d.range.start.character,
+            d.range.end.line, d.range.end.character,
+        );
     }
 
     #[test]
@@ -5778,6 +5832,14 @@ fn collect_usages_with_context<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
+    // Skip ERROR nodes entirely — identifiers inside them lack reliable
+    // semantic context (e.g., an assignment LHS won't be inside a
+    // binary_operator node), so we'd produce false "Undefined variable"
+    // diagnostics. The syntax error diagnostic already covers these.
+    if node.is_error() {
+        return;
+    }
+
     if node.kind() == "identifier" {
         // Skip if we're in a formula or call-like arguments context
         if context.in_formula || context.in_call_like_arguments {
@@ -30600,6 +30662,51 @@ my_func <- function(a = default_value) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: default_value"),
             "Defined variable 'default_value' should not be flagged as undefined"
+        );
+    }
+
+    #[test]
+    fn test_identifiers_inside_error_nodes_not_flagged_as_undefined() {
+        // When tree-sitter wraps an incomplete expression inside an ERROR node,
+        // identifiers become flat children of the ERROR (not inside a
+        // binary_operator). The LHS assignment check would fail, causing false
+        // "Undefined variable: x" diagnostics. We skip ERROR node subtrees
+        // entirely since the parse tree structure is unreliable there.
+        let mut state = create_test_state();
+        let code = "if (1 == 1) {\n  x <-\n}";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: x"),
+            "Identifier 'x' inside an ERROR node should not be flagged as undefined. \
+             Got: {:?}",
+            undefined_var_diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
         );
     }
 }
