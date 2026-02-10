@@ -31,6 +31,10 @@ pub struct AnalysisStatsArgs {
 }
 
 /// Result of running a single analysis phase.
+///
+/// Note: `peak_rss_bytes` is the process-wide peak RSS at the moment it was
+/// sampled (after the phase completes). Since peak RSS is monotonically
+/// increasing, later phases will always show values >= earlier phases.
 pub struct PhaseResult {
     pub name: String,
     pub duration: Duration,

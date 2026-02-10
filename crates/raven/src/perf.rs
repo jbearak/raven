@@ -7,8 +7,6 @@
 //   RAVEN_PERF=1 raven --stdio      # Enable basic timing logs
 //   RAVEN_PERF=verbose raven --stdio # Enable detailed timing with thresholds
 
-// Allow unused items that are part of the public API for benchmarks/diagnostics
-#![allow(dead_code)]
 
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
@@ -69,6 +67,7 @@ impl TimingGuard {
     /// Create a timing guard with a warning threshold
     ///
     /// If the operation takes longer than `threshold_ms`, a warning will be logged.
+    #[allow(dead_code)] // Part of the public perf API for benchmarks/diagnostics
     pub fn with_threshold(name: &'static str, threshold_ms: u64) -> Self {
         Self {
             start: Instant::now(),
@@ -79,6 +78,7 @@ impl TimingGuard {
     }
 
     /// Get the elapsed time without consuming the guard
+    #[allow(dead_code)] // Part of the public perf API for benchmarks/diagnostics
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
@@ -87,6 +87,7 @@ impl TimingGuard {
     ///
     /// This consumes the guard without logging (useful when you want to handle
     /// the duration yourself).
+    #[allow(dead_code)] // Part of the public perf API for benchmarks/diagnostics
     pub fn finish(self) -> Duration {
         let elapsed = self.start.elapsed();
         std::mem::forget(self); // Prevent Drop from running
@@ -204,6 +205,7 @@ pub fn record_package_init(duration: Duration, r_calls: usize) {
 }
 
 /// Record first diagnostic publish
+#[allow(dead_code)] // Part of the public perf API; will be wired in when diagnostic timing is added
 pub fn record_first_diagnostic(duration: Duration) {
     if !is_enabled() {
         return;
