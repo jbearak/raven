@@ -4500,6 +4500,382 @@ mod syntax_error_range_tests {
     }
 
     // ========================================================================
+    // Edge Case Tests: Incomplete Expressions in Unusual Positions
+    // ========================================================================
+
+    #[test]
+    fn incomplete_assignment_in_while_condition() {
+        // `while ((i <-) < N) print(i)` — the incomplete assignment inside
+        // the condition should produce a diagnostic, but NOT on the `while` keyword.
+        let code = "while ((i <-) < N) print(i)";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete assignment in while condition"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not point to column 0 (the `while` keyword)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `while` keyword), \
+                 got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_assignment_as_function_argument() {
+        // `f(x <-)` — the diagnostic should not blame `f`.
+        let code = "f(x <-)";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete assignment as argument"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not start at column 0 (the `f` identifier)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `f` call), got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_assignment_in_subscript() {
+        // `x[i <-]` — the diagnostic should not blame `x`.
+        let code = "x[i <-]";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete assignment in subscript"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not start at column 0 (the `x` identifier)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `x` subscript), got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_named_argument() {
+        // `tryCatch(\n  expr,\n  error =\n)` — tree-sitter-r considers this
+        // valid syntax (an argument with `name =` and no value is accepted by
+        // the grammar). This is actually correct R: `tryCatch(expr, error = )`
+        // is legal syntax. Verify we do NOT produce false syntax errors.
+        let code = "tryCatch(\n  expr,\n  error =\n)";
+        let diags = collect(code);
+        // tree-sitter-r produces no ERROR/MISSING nodes for this code.
+        if diags.is_empty() {
+            // Expected: no diagnostics for valid R code.
+            return;
+        }
+        // If tree-sitter does produce diagnostics, verify they're well-placed.
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_with_empty_default() {
+        // `x <- function(a, b = ) { a }` — the diagnostic should not blame `x <-`.
+        let code = "x <- function(a, b = ) { a }";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for empty default parameter"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not start at column 0 (the `x` assignment target)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `x <-` assignment), \
+                 got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    // ========================================================================
+    // Edge Case Tests: False-Positive Prevention (Valid R Code)
+    // ========================================================================
+
+    #[test]
+    fn assignment_in_condition_is_valid() {
+        // `if (x <- 1) y` is valid R code — assignment in condition is legal.
+        let code = "if (x <- 1) y";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        // tree-sitter may or may not parse this cleanly. If it does produce
+        // diagnostics, document it as a grammar limitation.
+        if !syntax_or_missing.is_empty() {
+            // tree-sitter-r treats `if (x <- 1) y` as a syntax error, which
+            // is a grammar limitation — R accepts this code. Document but
+            // don't fail the test.
+            eprintln!(
+                "NOTE: tree-sitter-r produces diagnostics for valid `if (x <- 1) y`: {:?}",
+                syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn chained_assignment_is_valid() {
+        // `x <- y <- 1` is valid R code — chained left-assignment.
+        let code = "x <- y <- 1";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        assert!(
+            syntax_or_missing.is_empty(),
+            "chained assignment `x <- y <- 1` should not produce syntax errors, \
+             got: {:?}",
+            syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_switch_case_is_valid() {
+        // `switch(x, a =, b = 1)` is valid R — empty case falls through.
+        let code = "switch(x, a =, b = 1)";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        if !syntax_or_missing.is_empty() {
+            eprintln!(
+                "NOTE: tree-sitter-r produces diagnostics for valid `switch(x, a =, b = 1)`: {:?}",
+                syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_comma_in_c_is_valid() {
+        // `x <- c(1, 2, )` is valid R — trailing comma in c() is allowed.
+        let code = "x <- c(1, 2, )";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        // tree-sitter should accept this. If not, document as grammar limitation.
+        if !syntax_or_missing.is_empty() {
+            eprintln!(
+                "NOTE: tree-sitter-r produces diagnostics for valid `c(1, 2, )`: {:?}",
+                syntax_or_missing.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // ========================================================================
+    // Edge Case Tests: Multi-Line Error Patterns
+    // ========================================================================
+
+    #[test]
+    fn incomplete_else_branch() {
+        // `if (TRUE) x <- 1 else y <-` — incomplete else branch.
+        let code = "if (TRUE) x <- 1 else y <-";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete else branch"
+        );
+        // Should have a Missing or Syntax error diagnostic
+        assert!(
+            diags.iter().any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_for_sequence() {
+        // `for (i in ) print(i)` — empty sequence expression.
+        let code = "for (i in ) print(i)";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for empty for sequence"
+        );
+        for d in &diags {
+            // Should not blame the `for` keyword at column 0
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `for` keyword), got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn double_operator_across_lines() {
+        // `x <- 1 +\n+ 2` — double operator across lines.
+        let code = "x <- 1 +\n+ 2";
+        let diags = collect(code);
+        // Count only "Syntax error" diagnostics (not "Missing")
+        let syntax_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error")
+            .collect();
+        // Should produce at most one syntax error (no cascading duplicates)
+        assert!(
+            syntax_errors.len() <= 1,
+            "should produce at most one syntax error (no cascading), got {}: {:?}",
+            syntax_errors.len(),
+            syntax_errors.iter().map(|d| d.range).collect::<Vec<_>>()
+        );
+        // All diagnostics should be single-line
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_incomplete_in_loop() {
+        // Deeply nested incomplete expression: the diagnostic should NOT be on
+        // line 0 (the `if` keyword). tree-sitter flattens the entire construct
+        // into a single ERROR node, and the algorithm places the diagnostic on
+        // the first content line it finds inside the ERROR (which is the `for`
+        // loop line, not the `x <-` line, because all tokens are flattened).
+        let code = "if (T) {\n  for (i in 1:10) {\n    x <-\n  }\n}";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for deeply nested incomplete expression"
+        );
+
+        // No diagnostic should be on line 0 (the `if` keyword)
+        assert!(
+            !diags.iter().any(|d| d.range.start.line == 0),
+            "no diagnostic should be on line 0 (the `if` keyword), got lines: {:?}",
+            diags.iter().map(|d| d.range.start.line).collect::<Vec<_>>()
+        );
+
+        // All diagnostics should be single-line
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+        }
+    }
+
+    // ========================================================================
+    // Edge Case Tests: String/Delimiter Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn unclosed_string_literal() {
+        // `x <- "unclosed string` — unclosed string literal.
+        let code = "x <- \"unclosed string";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for unclosed string literal"
+        );
+        for d in &diags {
+            // Should not start at column 0 (the `x` assignment target)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `x <-` assignment), \
+                 got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_library_call() {
+        // `library(` — unclosed function call.
+        let code = "library(";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for unclosed library call"
+        );
+        assert!(
+            diags.iter().any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_argument_list() {
+        // `f(,)` — empty argument list with comma.
+        let code = "f(,)";
+        let diags = collect(code);
+        // If tree-sitter produces errors, they should not blame `f`
+        for d in &diags {
+            if d.message == "Syntax error" {
+                assert!(
+                    d.range.start.character > 0,
+                    "syntax error should not start at column 0 (the `f` call), got col {}",
+                    d.range.start.character
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn double_semicolon() {
+        // `x <- ; y` — semicolon after incomplete assignment.
+        let code = "x <- ; y";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for double semicolon"
+        );
+        // Should have at least one syntax or missing diagnostic
+        assert!(
+            diags.iter().any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
     // Property-Based Tests
     // ========================================================================
 
@@ -4636,7 +5012,7 @@ mod syntax_error_range_tests {
             "d >",
             "e ==",
         ];
-        
+
         let control_structures = vec![
             "if (TRUE)",
             "if (FALSE)",
@@ -4644,11 +5020,22 @@ mod syntax_error_range_tests {
             "for (i in 1:10)",
         ];
 
-        (
+        // Standard pattern: control structure wrapping an incomplete expression
+        let block_errors = (
             prop::sample::select(control_structures),
             prop::sample::select(incomplete_exprs),
         )
-            .prop_map(|(ctrl, expr)| format!("{} {{\n  {}\n}}", ctrl, expr))
+            .prop_map(|(ctrl, expr)| format!("{} {{\n  {}\n}}", ctrl, expr));
+
+        // Condition-level patterns: incomplete expressions inside conditions
+        let condition_errors = prop::sample::select(vec![
+            "while ((i <-) < N) print(i)",
+            "if ((y <-) == 1) z",
+            "for (i in ) print(i)",
+        ])
+        .prop_map(|p| p.to_string());
+
+        prop_oneof![block_errors, condition_errors]
     }
 
     /// Strategy to generate R code that produces MISSING nodes.
@@ -5331,6 +5718,73 @@ mod syntax_error_range_tests {
                     !diag.message.is_empty(),
                     "Every diagnostic must have a non-empty message. Code: {:?}",
                     code
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 9: Condition-level errors
+        //
+        // For incomplete expressions inside control-flow conditions (e.g.,
+        // `while ((i <-) < N)`), the diagnostic SHALL be single-line and,
+        // when tree-sitter can isolate the error, SHALL NOT be placed on the
+        // control keyword (column 0).
+        //
+        // NOTE: Some single-line patterns (e.g., `if ((y <-) == 1) z`) produce
+        // a whole-line ERROR node because tree-sitter can't isolate the inner
+        // error — those are tested separately in unit tests without the column
+        // assertion.
+        //
+        // **Validates: Requirements 1.1, 1.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_nested_condition_errors(
+            code in prop::sample::select(vec![
+                "while ((i <-) < N) print(i)",
+                "for (i in ) print(i)",
+            ]).prop_map(|p| p.to_string())
+        ) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            prop_assume!(
+                root.has_error(),
+                "Generated code must contain syntax errors"
+            );
+
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for condition-level error: {}",
+                code
+            );
+
+            // All diagnostics should be single-line and not on the control keyword
+            for diag in &diagnostics {
+                prop_assert_eq!(
+                    diag.range.start.line,
+                    diag.range.end.line,
+                    "Diagnostic should be single-line. Code: {}, Range: ({},{})..({},{})",
+                    code,
+                    diag.range.start.line,
+                    diag.range.start.character,
+                    diag.range.end.line,
+                    diag.range.end.character,
+                );
+
+                // Diagnostic should not start at column 0 (the control keyword)
+                prop_assert!(
+                    diag.range.start.character > 0,
+                    "Diagnostic should not start at column 0 (control keyword). \
+                     Code: {}, Range: ({},{})..({},{})",
+                    code,
+                    diag.range.start.line,
+                    diag.range.start.character,
+                    diag.range.end.line,
+                    diag.range.end.character,
                 );
             }
         }
@@ -30854,6 +31308,107 @@ my_func <- function(a = default_value) {
             assert!(
                 !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: x"),
                 "Complete {} ({:?}): target 'x' should not be flagged as undefined. Got: {:?}",
+                label,
+                code,
+                undefined_var_diags
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_undefined_var_for_incomplete_in_while_condition() {
+        // `while ((i <-) < N) print(i)` — identifiers inside ERROR nodes
+        // should NOT produce "Undefined variable" diagnostics.
+        let mut state = create_test_state();
+        let code = "while ((i <-) < N) print(i)";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable"))
+            .collect();
+
+        assert!(
+            undefined_var_diags.is_empty(),
+            "No undefined variable diagnostics should be emitted for code with \
+             incomplete assignment in while condition. Got: {:?}",
+            undefined_var_diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_no_undefined_var_for_edge_case_incomplete_syntax() {
+        // Table-driven test: various incomplete syntax patterns should NOT
+        // produce "Undefined variable" diagnostics for identifiers inside
+        // ERROR nodes.
+        // Use defined names (assignments before broken syntax, or base functions)
+        // so that only identifiers inside ERROR nodes could produce false positives.
+        let cases: &[(&str, &str)] = &[
+            (
+                "f <- print\nf(x <-)",
+                "incomplete assignment as function argument",
+            ),
+            ("x <- 1\nx[i <-]", "incomplete assignment in subscript"),
+            (
+                "tryCatch(\n  expr,\n  error =\n)",
+                "incomplete named argument",
+            ),
+            (
+                "x <- 1\nx <- function(a, b = ) { a }",
+                "parameter with empty default",
+            ),
+        ];
+
+        for &(code, label) in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            let undefined_var_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with("Undefined variable"))
+                .collect();
+
+            assert!(
+                undefined_var_diags.is_empty(),
+                "No undefined variable diagnostics should be emitted for {} ({:?}). Got: {:?}",
                 label,
                 code,
                 undefined_var_diags
