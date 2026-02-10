@@ -251,7 +251,7 @@ pub fn resolve(
     cache: &SignatureCache,
     function_name: &str,
     namespace: Option<&str>,
-    _is_internal: bool,
+    is_internal: bool,
     current_uri: &Url,
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
@@ -334,7 +334,7 @@ pub fn resolve(
             let formals_result = handle.block_on(r_subprocess.get_function_formals(
                 function_name,
                 Some(pkg_name),
-                !_is_internal,
+                !is_internal,
             ));
 
             match formals_result {
@@ -384,6 +384,66 @@ pub fn resolve(
                 pkg_name,
                 function_name
             );
+        }
+    }
+
+    None
+}
+
+/// Retrieve document text and parsed AST from any available document source.
+///
+/// Searches multiple stores in priority order so that cross-file parameter
+/// resolution works even when the source file is not open in the editor.
+///
+/// Priority order (matching the `content_provider` pattern):
+/// 1. Enriched open documents (`state.document_store`)
+/// 2. Legacy open documents (`state.documents`)
+/// 3. New workspace index (`state.workspace_index_new`)
+/// 4. Legacy workspace index (`state.workspace_index`)
+/// 5. File cache (`state.cross_file_file_cache`) — parse on demand
+fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitter::Tree)> {
+    // 1. Enriched open documents (authoritative for open files)
+    if let Some(doc) = state.document_store.get_without_touch(uri) {
+        if let Some(tree) = &doc.tree {
+            return Some((doc.contents.to_string(), tree.clone()));
+        } else {
+            log::debug!("Document in document_store has no parsed tree: {}", uri);
+        }
+    }
+
+    // 2. Legacy open documents
+    if let Some(doc) = state.documents.get(uri) {
+        if let Some(tree) = &doc.tree {
+            return Some((doc.text(), tree.clone()));
+        } else {
+            log::debug!("Document found but has no parsed tree: {}", uri);
+        }
+    }
+
+    // 3. New workspace index (indexed closed files)
+    if let Some(entry) = state.workspace_index_new.get(uri) {
+        if let Some(tree) = &entry.tree {
+            return Some((entry.contents.to_string(), tree.clone()));
+        } else {
+            log::debug!("Document in workspace_index_new has no parsed tree: {}", uri);
+        }
+    }
+
+    // 4. Legacy workspace index
+    if let Some(doc) = state.workspace_index.get(uri) {
+        if let Some(tree) = &doc.tree {
+            return Some((doc.text(), tree.clone()));
+        } else {
+            log::debug!("Document in workspace_index has no parsed tree: {}", uri);
+        }
+    }
+
+    // 5. File cache — content available but no pre-parsed tree; parse on demand
+    if let Some(content) = state.cross_file_file_cache.get(uri) {
+        if let Some(tree) = crate::parser_pool::with_parser(|p| p.parse(&content, None)) {
+            return Some((content, tree));
+        } else {
+            log::debug!("Failed to parse file cache content for: {}", uri);
         }
     }
 
@@ -470,9 +530,8 @@ fn resolve_from_cross_file(
     }
 
     // Try to get the source file's AST and extract parameters
-    let source_doc = state.get_document(&symbol.source_uri)?;
-    let source_tree = source_doc.tree.as_ref()?;
-    let source_text = source_doc.text();
+    // Use get_text_and_tree to access documents from any source (open, workspace index, etc.)
+    let (source_text, source_tree) = get_text_and_tree(state, &symbol.source_uri)?;
 
     // Find the function definition at the known line
     let func_node = find_function_definition_at_line(
@@ -536,7 +595,8 @@ fn find_func_def_recursive<'a>(
 ) {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
+        // Filter extras (e.g., comments) so positional indexing is reliable
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -571,7 +631,8 @@ fn find_func_def_recursive<'a>(
     // Also check right-assignment: function_definition -> name
     if node.kind() == "right_assignment" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
+        // Filter extras (e.g., comments) so positional indexing is reliable
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0]; // value (function_definition)
@@ -631,7 +692,7 @@ fn find_func_def_at_line_recursive<'a>(
 
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -654,7 +715,7 @@ fn find_func_def_at_line_recursive<'a>(
     // Also check right-assignment
     if node.kind() == "right_assignment" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -755,6 +816,50 @@ fn collect_packages_at_position(state: &WorldState, scope: &ScopeAtPosition) -> 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Shared test utilities for parameter_resolver test modules.
+#[cfg(test)]
+mod test_utils {
+    use tree_sitter::Node;
+
+    use super::node_text;
+
+    /// Find a function_definition node by name in the tree.
+    pub fn find_function_def_in_tree<'a>(
+        node: Node<'a>,
+        name: &str,
+        text: &str,
+    ) -> Option<Node<'a>> {
+        if node.kind() == "binary_operator" {
+            let mut cursor = node.walk();
+            let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+
+            if children.len() >= 3 {
+                let lhs = children[0];
+                let op = children[1];
+                let rhs = children[2];
+
+                let op_text = node_text(op, text);
+                if matches!(op_text, "<-" | "=" | "<<-")
+                    && lhs.kind() == "identifier"
+                    && node_text(lhs, text) == name
+                    && rhs.kind() == "function_definition"
+                {
+                    return Some(rhs);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(func_node) = find_function_def_in_tree(child, name, text) {
+                return Some(func_node);
+            }
+        }
+
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1081,6 +1186,97 @@ mod tests {
         assert_eq!(params.len(), 2); // Second definition has 2 params
     }
 
+    // -- Comment between assignment and function definition --
+
+    #[test]
+    fn test_find_func_def_with_comment_between_arrow_and_function() {
+        // A comment between `<-` and `function(...)` shifts child indices
+        // when extras (comments) are not filtered out.
+        let code = "f <-\n  # documentation comment\n  function(x, y) { x + y }\nf(1)";
+        let tree = parse_r_code(code);
+
+        let pos = tower_lsp::lsp_types::Position::new(3, 0);
+        let func_node = find_function_definition_before_position(
+            tree.root_node(),
+            "f",
+            code,
+            pos,
+        );
+        assert!(
+            func_node.is_some(),
+            "Should find function definition even with comment between <- and function()"
+        );
+
+        // Verify parameters are correctly extracted
+        let func_node = func_node.unwrap();
+        let params_node = func_node
+            .children(&mut func_node.walk())
+            .find(|c| c.kind() == "parameters")
+            .unwrap();
+        let params = extract_from_ast(params_node, code);
+        assert_eq!(params.len(), 2, "Should find both parameters x and y");
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[1].name, "y");
+    }
+
+    #[test]
+    fn test_find_func_def_at_line_with_comment_between_arrow_and_function() {
+        // Same scenario but for the cross-file at-line lookup
+        let code = "f <-\n  # doc\n  function(x) { x }";
+        let tree = parse_r_code(code);
+
+        // The identifier `f` is at line 0
+        let func_node = find_function_definition_at_line(
+            tree.root_node(),
+            "f",
+            code,
+            0,
+        );
+        assert!(
+            func_node.is_some(),
+            "find_function_definition_at_line should handle comments between <- and function()"
+        );
+
+        let func_node = func_node.unwrap();
+        let params_node = func_node
+            .children(&mut func_node.walk())
+            .find(|c| c.kind() == "parameters")
+            .unwrap();
+        let params = extract_from_ast(params_node, code);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "x");
+    }
+
+    #[test]
+    fn test_find_func_def_multiple_comments_between_parts() {
+        // Multiple comments between parts of the assignment
+        let code = "g <-\n  # first comment\n  # second comment\n  function(p, q, r) { p }\ng(1)";
+        let tree = parse_r_code(code);
+
+        let pos = tower_lsp::lsp_types::Position::new(4, 0);
+        let func_node = find_function_definition_before_position(
+            tree.root_node(),
+            "g",
+            code,
+            pos,
+        );
+        assert!(
+            func_node.is_some(),
+            "Should find function definition with multiple comments between <- and function()"
+        );
+
+        let func_node = func_node.unwrap();
+        let params_node = func_node
+            .children(&mut func_node.walk())
+            .find(|c| c.kind() == "parameters")
+            .unwrap();
+        let params = extract_from_ast(params_node, code);
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "p");
+        assert_eq!(params[1].name, "q");
+        assert_eq!(params[2].name, "r");
+    }
+
     // -- SignatureCache Debug --
 
     #[test]
@@ -1090,43 +1286,7 @@ mod tests {
         assert!(debug_str.contains("SignatureCache"));
     }
 
-    // -- Helper for tests --
-
-    /// Find a function_definition node by name in the tree (for test use).
-    fn find_function_def_in_tree<'a>(
-        node: Node<'a>,
-        name: &str,
-        text: &str,
-    ) -> Option<Node<'a>> {
-        if node.kind() == "binary_operator" {
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-
-            if children.len() >= 3 {
-                let lhs = children[0];
-                let op = children[1];
-                let rhs = children[2];
-
-                let op_text = node_text(op, text);
-                if matches!(op_text, "<-" | "=" | "<<-")
-                    && lhs.kind() == "identifier"
-                    && node_text(lhs, text) == name
-                    && rhs.kind() == "function_definition"
-                {
-                    return Some(rhs);
-                }
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func_node) = find_function_def_in_tree(child, name, text) {
-                return Some(func_node);
-            }
-        }
-
-        None
-    }
+    use super::test_utils::find_function_def_in_tree;
 }
 
 #[cfg(test)]
@@ -1232,41 +1392,7 @@ mod property_tests {
         format!("{} <- function({}) {{ NULL }}", func_name, param_strs.join(", "))
     }
 
-    /// Find the function_definition node in the tree (test helper).
-    fn find_function_def_in_tree<'a>(
-        node: Node<'a>,
-        name: &str,
-        text: &str,
-    ) -> Option<Node<'a>> {
-        if node.kind() == "binary_operator" {
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-
-            if children.len() >= 3 {
-                let lhs = children[0];
-                let op = children[1];
-                let rhs = children[2];
-
-                let op_text = node_text(op, text);
-                if matches!(op_text, "<-" | "=" | "<<-")
-                    && lhs.kind() == "identifier"
-                    && node_text(lhs, text) == name
-                    && rhs.kind() == "function_definition"
-                {
-                    return Some(rhs);
-                }
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func_node) = find_function_def_in_tree(child, name, text) {
-                return Some(func_node);
-            }
-        }
-
-        None
-    }
+    use super::test_utils::find_function_def_in_tree;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
@@ -1695,6 +1821,91 @@ mod property_tests {
                 "Second lookup parameter count mismatch for key: {}",
                 key
             );
+        }
+
+        // ============================================================================
+        // Property: Extras (comments) between assignment operator and function()
+        //
+        // For any function definition with optional comments placed between the
+        // assignment operator and the `function(...)` keyword,
+        // `find_function_definition_before_position` SHALL still find the function.
+        // ============================================================================
+
+        /// Generate R code with function definitions that may or may not have
+        /// comments between `<-` and `function(...)`. Verify the function is
+        /// always found regardless of comment placement.
+        #[test]
+        fn prop_extras_filtering_find_func_def(
+            params in r_param_list(1, 4),
+            insert_comment in proptest::bool::ANY,
+            comment_text in "[a-z ]{1,20}",
+        ) {
+            let param_strs: Vec<String> = params
+                .iter()
+                .map(|(name, default)| match default {
+                    Some(val) => format!("{} = {}", name, val),
+                    None => name.clone(),
+                })
+                .collect();
+
+            let func_body = format!("function({}) {{ NULL }}", param_strs.join(", "));
+            let code = if insert_comment {
+                format!("test_fn <-\n  # {}\n  {}\ntest_fn(1)", comment_text, func_body)
+            } else {
+                format!("test_fn <- {}\ntest_fn(1)", func_body)
+            };
+
+            let tree = parse_r_code(&code);
+
+            // Compute call site line
+            let call_line = code.lines().count() as u32 - 1;
+            let pos = tower_lsp::lsp_types::Position::new(call_line, 0);
+
+            let func_node = find_function_definition_before_position(
+                tree.root_node(),
+                "test_fn",
+                &code,
+                pos,
+            );
+
+            prop_assert!(
+                func_node.is_some(),
+                "Should find function definition regardless of comment. insert_comment={}, code:\n{}",
+                insert_comment,
+                code
+            );
+
+            // Verify parameter count matches
+            let func_node = func_node.unwrap();
+            let params_node = func_node
+                .children(&mut func_node.walk())
+                .find(|c| c.kind() == "parameters");
+            prop_assert!(
+                params_node.is_some(),
+                "Should find parameters node. code:\n{}",
+                code
+            );
+
+            let extracted = extract_from_ast(params_node.unwrap(), &code);
+            prop_assert_eq!(
+                extracted.len(),
+                params.len(),
+                "Parameter count mismatch. Expected {}, got {}. code:\n{}",
+                params.len(),
+                extracted.len(),
+                code
+            );
+
+            // Verify parameter names match
+            for (i, (expected_name, _)) in params.iter().enumerate() {
+                prop_assert_eq!(
+                    &extracted[i].name,
+                    expected_name,
+                    "Parameter name mismatch at index {}. code:\n{}",
+                    i,
+                    code
+                );
+            }
         }
 
         // ============================================================================

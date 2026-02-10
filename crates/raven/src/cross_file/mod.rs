@@ -69,6 +69,17 @@ pub use workspace_index::*;
 /// assert!(meta.library_calls.iter().any(|lc| lc.name == "pkg"));
 /// ```
 pub fn extract_metadata(content: &str) -> CrossFileMetadata {
+    let tree = crate::parser_pool::with_parser(|parser| parser.parse(content, None));
+    extract_metadata_with_tree(content, tree.as_ref())
+}
+
+/// Extract cross-file metadata using a pre-parsed tree when available.
+///
+/// This avoids redundant parsing when the caller already has a tree-sitter `Tree`.
+pub fn extract_metadata_with_tree(
+    content: &str,
+    tree: Option<&tree_sitter::Tree>,
+) -> CrossFileMetadata {
     log::trace!(
         "Extracting cross-file metadata from content ({} bytes)",
         content.len()
@@ -77,9 +88,9 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     // Parse directives first
     let mut meta = directive::parse_directives(content);
 
-    // Parse AST for source() calls and library() calls using thread-local parser for efficiency
-    if let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(content, None)) {
-        let detected = source_detect::detect_source_calls(&tree, content);
+    // Parse AST for source() calls and library() calls using provided tree
+    if let Some(tree) = tree {
+        let detected = source_detect::detect_source_calls(tree, content);
 
         // Merge detected source() calls with directive sources
         // Directive sources take precedence (Requirement 6.8)
@@ -98,7 +109,7 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
         meta.sources.sort_by_key(|s| (s.line, s.column));
 
         // Detect library(), require(), loadNamespace() calls (Requirement 1.8)
-        let mut library_calls = source_detect::detect_library_calls(&tree, content);
+        let mut library_calls = source_detect::detect_library_calls(tree, content);
         // Sort by line/column for document order (Requirement 1.8)
         library_calls.sort_by_key(|lc| (lc.line, lc.column));
         meta.library_calls = library_calls;

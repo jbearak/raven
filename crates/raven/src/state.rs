@@ -98,6 +98,25 @@ impl SymbolConfig {
     }
 }
 
+/// Completion provider configuration
+///
+/// Controls behavior of the completion trigger characters and related UI settings.
+#[derive(Debug, Clone)]
+pub struct CompletionConfig {
+    /// Whether typing `(` triggers parameter completions.
+    /// When true, `(` is registered as a completion trigger character so that
+    /// parameter suggestions appear immediately when opening a function call.
+    pub trigger_on_open_paren: bool,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        Self {
+            trigger_on_open_paren: true,
+        }
+    }
+}
+
 use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
@@ -202,9 +221,10 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     };
 
     let mut packages = Vec::new();
-    let root = tree.root_node();
+    let mut stack = Vec::new();
+    stack.push(tree.root_node());
 
-    fn visit_node(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
+    while let Some(node) = stack.pop() {
         if node.kind() == "call" {
             // Check if this is a library/require/loadNamespace call
             if let Some(func_node) = node.child_by_field_name("function") {
@@ -232,15 +252,13 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
             }
         }
 
-        // Recurse into children
-        for i in 0..node.child_count() {
+        let child_count = node.child_count();
+        for i in (0..child_count).rev() {
             if let Some(child) = node.child(i) {
-                visit_node(child, text, packages);
+                stack.push(child);
             }
         }
     }
-
-    visit_node(root, text, &mut packages);
     packages
 }
 
@@ -509,6 +527,8 @@ pub struct WorldState {
     /// Symbol provider configuration
     /// Controls document symbol and workspace symbol behavior
     pub symbol_config: SymbolConfig,
+    /// Completion provider configuration
+    pub completion_config: CompletionConfig,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_revalidation: CrossFileRevalidationState,
@@ -599,6 +619,7 @@ impl WorldState {
             // Cross-file state
             cross_file_config: config,
             symbol_config: SymbolConfig::default(),
+            completion_config: CompletionConfig::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
@@ -918,18 +939,23 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 /// so the primary goal is to avoid wasting time on directories that would
 /// never contain R files.
 ///
-/// Note: We intentionally keep this list minimal. Directories like `renv/`,
-/// `.Rproj.user/`, or `build/` might legitimately contain R code that users
-/// want to navigate to. Only skip directories that are definitively not
-/// R-related.
+/// Comparison is case-insensitive. This list is also used by the
+/// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
-    "node_modules", // JavaScript dependencies (can have 100k+ files)
-    ".git",         // Git internal files
-    "target",       // Rust build artifacts
+    ".git",          // Git internal files
+    ".svn",          // Subversion internal files
+    ".hg",           // Mercurial internal files
+    "node_modules",  // JavaScript dependencies (can have 100k+ files)
+    ".Rproj.user",   // RStudio user-local project state
+    "renv",          // renv package library cache
+    "packrat",       // packrat package library cache
+    ".vscode",       // VS Code settings
+    ".idea",         // JetBrains IDE settings
+    "target",        // Rust build artifacts
 ];
 
-/// Check if a directory should be skipped during scanning
-fn should_skip_directory(dir_name: &str) -> bool {
+/// Check if a directory should be skipped during scanning.
+pub(crate) fn should_skip_directory(dir_name: &str) -> bool {
     SKIP_DIRECTORIES
         .iter()
         .any(|skip| dir_name.eq_ignore_ascii_case(skip))

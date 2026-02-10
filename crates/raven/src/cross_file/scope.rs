@@ -2133,7 +2133,7 @@ fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option
 fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
     // Check if this is an assignment operator - the operator is a direct child, not a field
     let mut cursor = node.walk();
-    let children: Vec<_> = node.children(&mut cursor).collect();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
     if children.len() != 3 {
         return None;
@@ -2146,8 +2146,8 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     // Check operator
     let op_text = node_text(op, content);
 
-    // Handle -> operator: RHS is the name, LHS is the value
-    if op_text == "->" {
+    // Handle -> and ->> operators: RHS is the name, LHS is the value
+    if matches!(op_text, "->" | "->>") {
         if rhs.kind() != "identifier" {
             return None;
         }
@@ -2226,7 +2226,12 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
     let mut cursor = func_node.walk();
     for child in func_node.children(&mut cursor) {
         if child.kind() == "parameters" {
-            let params = node_text(child, content);
+            let params: String = node_text(child, content)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
             return format!("{}{}", name, params);
         }
     }
@@ -2940,6 +2945,18 @@ mod tests {
     }
 
     #[test]
+    fn test_function_definition_multiline_params() {
+        let code = "my_func <- function(x,\n                    y,\n                    z = 1) { x + y + z }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        let symbol = artifacts.exported_interface.get("my_func").unwrap();
+        assert_eq!(symbol.kind, SymbolKind::Function);
+        assert_eq!(symbol.signature, Some("my_func(x, y, z = 1)".to_string()));
+    }
+
+    #[test]
     fn test_variable_definition() {
         let code = "x <- 42";
         let tree = parse_r(code);
@@ -2964,6 +2981,26 @@ mod tests {
     #[test]
     fn test_super_assignment() {
         let code = "x <<- 42";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        assert!(artifacts.exported_interface.contains_key("x"));
+    }
+
+    #[test]
+    fn test_right_assignment() {
+        let code = "42 -> x";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert_eq!(artifacts.exported_interface.len(), 1);
+        assert!(artifacts.exported_interface.contains_key("x"));
+    }
+
+    #[test]
+    fn test_right_super_assignment() {
+        let code = "42 ->> x";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
@@ -9354,7 +9391,7 @@ y <- filter(df)"#;
 
         /// Strategy to generate an assignment operator.
         fn assignment_operator_strategy() -> impl Strategy<Value = &'static str> {
-            prop::sample::select(&["<-", "=", "<<-", "->"])
+            prop::sample::select(&["<-", "=", "<<-", "->", "->>"])
         }
 
         /// Strategy to generate a simple R value (number, string, or function).
@@ -9381,8 +9418,8 @@ y <- filter(df)"#;
                 r_value_strategy(),
             )
                 .prop_map(|(reserved, op, value)| {
-                    let code = if op == "->" {
-                        // Right assignment: value -> name
+                    let code = if matches!(op, "->" | "->>") {
+                        // Right assignment: value -> name or value ->> name
                         format!("{} {} {}", value, op, reserved)
                     } else {
                         // Left assignment: name <- value
@@ -9464,7 +9501,7 @@ y <- filter(df)"#;
                 op in assignment_operator_strategy(),
                 value in r_value_strategy()
             ) {
-                let code = if op == "->" {
+                let code = if matches!(op, "->" | "->>") {
                     format!("{} {} {}", value, op, reserved)
                 } else {
                     format!("{} {} {}", reserved, op, value)
@@ -9506,10 +9543,14 @@ y <- filter(df)"#;
             #[test]
             fn prop_non_reserved_identifiers_are_extracted(
                 ident in "[a-z][a-z0-9_]{0,10}".prop_filter("not reserved", |s| !is_reserved_word(s)),
-                op in prop::sample::select(&["<-", "=", "<<-"]),
+                op in prop::sample::select(&["<-", "=", "<<-", "->", "->>"]),
                 value in (1i32..1000).prop_map(|n| n.to_string())
             ) {
-                let code = format!("{} {} {}", ident, op, value);
+                let code = if matches!(op, "->" | "->>") {
+                    format!("{} {} {}", value, op, ident)
+                } else {
+                    format!("{} {} {}", ident, op, value)
+                };
                 let tree = parse_r(&code);
                 let artifacts = compute_artifacts(&test_uri(), &tree, &code);
 

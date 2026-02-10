@@ -312,6 +312,11 @@
           "minimum": 100,
           "maximum": 10000,
           "description": "Maximum number of symbols returned by workspace symbol search (Ctrl+T / Cmd+T). Higher values show more results but may impact performance. Valid range: 100-10000."
+        },
+        "raven.completion.triggerOnOpenParen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Trigger parameter completions when typing '(' after a function name. When disabled, parameter suggestions require manual invocation (Ctrl+Space)."
         }
       }
     }
