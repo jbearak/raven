@@ -86,7 +86,27 @@ pub fn parse_args(args: &mut impl Iterator<Item = String>) -> Result<AnalysisSta
 }
 
 /// Run the analysis-stats command and return phase results.
+///
+/// The provided path is canonicalized to an absolute path before use, so
+/// that `Url::from_file_path` always receives an absolute path.
 pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
+    // Canonicalize to an absolute path so Url::from_file_path always works.
+    let args = match std::fs::canonicalize(&args.path) {
+        Ok(canonical) => AnalysisStatsArgs {
+            path: canonical,
+            csv: args.csv,
+            only: args.only.clone(),
+        },
+        Err(_) => {
+            // Fall through with original path; Url::from_file_path may fail
+            // but we handle that below.
+            AnalysisStatsArgs {
+                path: args.path.clone(),
+                csv: args.csv,
+                only: args.only.clone(),
+            }
+        }
+    };
     let mut results = Vec::new();
 
     let should_run = |phase: &str| -> bool {
@@ -335,22 +355,7 @@ fn collect_r_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-/// Directories to skip during workspace scanning (mirrors `state::should_skip_directory`).
-fn should_skip_directory(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | ".svn"
-            | ".hg"
-            | "node_modules"
-            | ".Rproj.user"
-            | "renv"
-            | "packrat"
-            | ".vscode"
-            | ".idea"
-            | "target"
-    )
-}
+use crate::state::should_skip_directory;
 
 #[cfg(test)]
 mod tests {
