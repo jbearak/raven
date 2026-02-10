@@ -36,7 +36,7 @@ jobs:
             perf-cargo-${{ runner.os }}-
 
       - name: Run time-budget tests (release mode)
-        run: cargo test --release -p raven --test performance_budgets
+        run: cargo test --release -p raven --features test-support --test performance_budgets
 
   # ── Criterion benchmarks with baseline management ──────────────────────
   benchmarks:
@@ -85,11 +85,11 @@ jobs:
       # On PRs: compare against the main baseline.
       - name: Run benchmarks (push to main — save baseline)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: cargo bench -p raven --features test-support -- --save-baseline main
+        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline main
 
       - name: Run benchmarks (PR — compare against main)
         if: github.event_name == 'pull_request'
-        run: cargo bench -p raven --features test-support -- --save-baseline pr
+        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
 
       # ── PR regression comment via critcmp ────────────────────────────────
       - name: Compare benchmarks against main baseline
