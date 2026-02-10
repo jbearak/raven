@@ -6618,7 +6618,7 @@ pub fn completion(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    _context: Option<CompletionContext>,
+    context: Option<CompletionContext>,
 ) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
@@ -6798,14 +6798,19 @@ pub fn completion(
         // For cross-file functions, the file location is shown in the documentation
         // field (via resolve) since VS Code renders `detail` as a single line.
         let is_cross_file = symbol.source_uri != *uri;
+        let relative_path = if is_cross_file {
+            Some(compute_relative_path(
+                &symbol.source_uri,
+                state.workspace_folders.first(),
+            ))
+        } else {
+            None
+        };
+
         let detail = match (&symbol.signature, is_cross_file) {
             (Some(sig), _) => Some(sig.clone()),
             (None, true) => {
-                let rel = compute_relative_path(
-                    &symbol.source_uri,
-                    state.workspace_folders.first(),
-                );
-                Some(format!("from {}", rel))
+                Some(format!("from {}", relative_path.as_ref().unwrap()))
             }
             (None, false) => None,
         };
@@ -6820,12 +6825,8 @@ pub fn completion(
                 "uri": symbol.source_uri.to_string(),
                 "func_line": symbol.defined_line,
             });
-            if is_cross_file {
-                let rel = compute_relative_path(
-                    &symbol.source_uri,
-                    state.workspace_folders.first(),
-                );
-                json["relative_path"] = serde_json::Value::String(rel);
+            if let Some(rel) = &relative_path {
+                json["relative_path"] = serde_json::Value::String(rel.clone());
             }
             Some(json)
         } else {
@@ -6859,7 +6860,18 @@ pub fn completion(
     // For incomplete namespace expressions (e.g., `pkg::` with no RHS), the AST check
     // may fail, so we also do a text-based check here as a fallback.
     //
-    if !has_namespace_accessor_at_cursor(&text, position) {
+    // When trigger_on_open_paren is false, suppress parameter completions triggered by `(`.
+    // Manual invocation (Ctrl+Space) still shows them regardless of config.
+    let suppress_paren_trigger = !state.completion_config.trigger_on_open_paren
+        && matches!(
+            &context,
+            Some(CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(ch),
+                ..
+            }) if ch == "("
+        );
+    if !suppress_paren_trigger && !has_namespace_accessor_at_cursor(&text, position) {
         let call_context =
             crate::completion_context::detect_function_call_context(tree, &text, position);
         if let Some(ctx) = call_context {
@@ -7059,7 +7071,9 @@ fn extract_function_signature_for_completion(func_node: Node, name: &str, text: 
     for child in func_node.children(&mut cursor) {
         if child.kind() == "parameters" {
             let params: String = node_text(child, text)
-                .split_whitespace()
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
             return format!("{}{}", name, params);

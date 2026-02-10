@@ -2227,7 +2227,9 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
     for child in func_node.children(&mut cursor) {
         if child.kind() == "parameters" {
             let params: String = node_text(child, content)
-                .split_whitespace()
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
             return format!("{}{}", name, params);
