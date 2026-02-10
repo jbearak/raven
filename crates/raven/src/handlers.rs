@@ -3938,11 +3938,12 @@ fn find_first_missing_descendant(node: Node) -> Option<Node> {
 /// * `None` - No ERROR nodes with children found in the tree
 fn find_innermost_error(node: Node) -> Option<Node> {
     if node.is_error() {
-        // Check if any children are also ERROR nodes
+        // Only check direct ERROR children — tree-sitter flattens errors so
+        // nested ERRORs are always direct children of another ERROR, never
+        // hidden under a non-ERROR intermediate node.
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.is_error() {
-                // Recurse to find deeper errors
                 if let Some(innermost) = find_innermost_error(child) {
                     return Some(innermost);
                 }
@@ -3964,6 +3965,40 @@ fn find_innermost_error(node: Node) -> Option<Node> {
     for child in node.children(&mut cursor) {
         if let Some(innermost) = find_innermost_error(child) {
             return Some(innermost);
+        }
+    }
+    None
+}
+
+/// Recursively descend into a node (including ERROR nodes) to find the row of
+/// the first named token that is not a structural keyword or boolean/null literal.
+fn first_named_token_row(node: Node) -> Option<usize> {
+    const STRUCTURAL_KEYWORDS: &[&str] = &["if", "else", "while", "for", "function", "repeat"];
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
+            continue;
+        }
+        if matches!(child.kind(), "true" | "false" | "null") {
+            continue;
+        }
+        if child.is_error() {
+            if let Some(row) = first_named_token_row(child) {
+                return Some(row);
+            }
+            continue;
+        }
+        // A leaf named node (identifier, operator, etc.)
+        if child.child_count() == 0 {
+            return Some(child.start_position().row);
+        }
+        // Non-leaf named node: recurse
+        if let Some(row) = first_named_token_row(child) {
+            return Some(row);
         }
     }
     None
@@ -4010,8 +4045,17 @@ fn find_first_content_line(node: Node) -> Option<usize> {
             continue;
         }
 
-        // Skip ERROR children - we want to find content, not nested errors
+        // Recurse into ERROR children to find content tokens
         if child.is_error() {
+            if let Some(row) = first_named_token_row(child) {
+                if let Some(br) = brace_row {
+                    if row > br {
+                        return Some(row);
+                    }
+                } else if content_before_brace.is_none() {
+                    content_before_brace = Some(row);
+                }
+            }
             continue;
         }
 
@@ -4047,7 +4091,8 @@ fn find_first_content_line(node: Node) -> Option<usize> {
     }
 
     // Brace was found but no content after it: fall back to line after brace, clamped to end_row
-    brace_row.map(|r| (r + 1).min(end_row)).or(Some(start_row))
+    // brace_row is guaranteed Some here (the is_none() case returned above).
+    brace_row.map(|r| (r + 1).min(end_row))
 }
 
 /// For a multi-line ERROR node, compute a minimized diagnostic range that
@@ -4056,6 +4101,12 @@ fn find_first_content_line(node: Node) -> Option<usize> {
 /// valid code (like `if`, `{`, `}`) when the only problem is an incomplete
 /// expression on one line.
 fn minimize_error_range(node: Node, text: &str) -> Range {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let line_at = |row: usize| -> &str {
+        text.lines().nth(row).unwrap_or("")
+    };
+
     let start_row = node.start_position().row;
     let start_col = node.start_position().column;
     let end_row = node.end_position().row;
@@ -4064,7 +4115,10 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
     // Phase 1: If there's a MISSING descendant, point the diagnostic there.
     if let Some(missing) = find_first_missing_descendant(node) {
         let m_row = missing.start_position().row as u32;
-        let m_col = missing.start_position().column as u32;
+        let m_col = byte_offset_to_utf16_column(
+            line_at(missing.start_position().row),
+            missing.start_position().column,
+        );
         return Range {
             start: Position::new(m_row, m_col),
             // Give zero-width MISSING nodes a 1-column width for visibility
@@ -4079,11 +4133,12 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
         
         // If innermost is single-line, return its full range
         if inner_start_row == inner_end_row {
-            let inner_start_col = innermost.start_position().column;
-            let inner_end_col = innermost.end_position().column;
+            let lt = line_at(inner_start_row);
+            let inner_start_col = byte_offset_to_utf16_column(lt, innermost.start_position().column);
+            let inner_end_col = byte_offset_to_utf16_column(lt, innermost.end_position().column);
             return Range {
-                start: Position::new(inner_start_row as u32, inner_start_col as u32),
-                end: Position::new(inner_end_row as u32, inner_end_col as u32),
+                start: Position::new(inner_start_row as u32, inner_start_col),
+                end: Position::new(inner_end_row as u32, inner_end_col),
             };
         }
         
@@ -4104,8 +4159,9 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
             }
 
             if let Some(last_child) = last_child_on_row {
-                let lc_start_col = last_child.start_position().column as u32;
-                let lc_end_col = last_child.end_position().column as u32;
+                let lc_line = line_at(content_row);
+                let lc_start_col = byte_offset_to_utf16_column(lc_line, last_child.start_position().column);
+                let lc_end_col = byte_offset_to_utf16_column(lc_line, last_child.end_position().column);
                 let end_col = if lc_end_col <= lc_start_col {
                     lc_start_col.saturating_add(1)
                 } else {
@@ -4125,7 +4181,7 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
                 .unwrap_or(0);
 
             let start_col = if content_row == inner_start_row {
-                innermost.start_position().column as u32
+                byte_offset_to_utf16_column(line_at(inner_start_row), innermost.start_position().column)
             } else {
                 0
             };
@@ -4145,34 +4201,35 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 
     // Phase 3: Fallback - Single-line ERROR: keep the full range as-is (already precise).
     if start_row == end_row {
+        let lt = line_at(start_row);
         return Range {
-            start: Position::new(start_row as u32, start_col as u32),
-            end: Position::new(end_row as u32, end_col as u32),
+            start: Position::new(start_row as u32, byte_offset_to_utf16_column(lt, start_col)),
+            end: Position::new(end_row as u32, byte_offset_to_utf16_column(lt, end_col)),
         };
     }
 
     // Phase 3: Fallback - Multi-line ERROR: collapse to the first line only.
     // Find the end column on the first line from the source text.
-    let first_line_end_col = text
-        .lines()
-        .nth(start_row)
-        .map(utf16_len)
-        .unwrap_or(start_col as u32);
+    let start_line_text = line_at(start_row);
+    let first_line_end_col = utf16_len(start_line_text);
+    let start_col_utf16 = byte_offset_to_utf16_column(start_line_text, start_col);
 
     // Ensure we have at least some width
-    let end_col_clamped = if first_line_end_col <= start_col as u32 {
-        (start_col as u32).saturating_add(1)
+    let end_col_clamped = if first_line_end_col <= start_col_utf16 {
+        start_col_utf16.saturating_add(1)
     } else {
         first_line_end_col
     };
 
     Range {
-        start: Position::new(start_row as u32, start_col as u32),
+        start: Position::new(start_row as u32, start_col_utf16),
         end: Position::new(start_row as u32, end_col_clamped),
     }
 }
 
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
     if node.is_error() {
         diagnostics.push(Diagnostic {
             range: minimize_error_range(node, text),
@@ -4188,7 +4245,8 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
 
     if node.is_missing() {
         let row = node.start_position().row as u32;
-        let col = node.start_position().column as u32;
+        let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
+        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
         diagnostics.push(Diagnostic {
             range: Range {
                 start: Position::new(row, col),
