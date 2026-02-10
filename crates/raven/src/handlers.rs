@@ -480,8 +480,8 @@ impl<'a> SymbolExtractor<'a> {
 
         let op_text = node_text(op, self.text);
 
-        // Handle -> operator: RHS is the name, LHS is the value
-        if op_text == "->" {
+        // Handle -> and ->> operators: RHS is the name, LHS is the value
+        if matches!(op_text, "->" | "->>") {
             return self.extract_right_assignment(node, lhs, rhs);
         }
 
@@ -5127,7 +5127,7 @@ fn collect_document_completions(
             }
 
             // Handle right-arrow assignments: value -> name
-            if op_text == "->" && rhs.kind() == "identifier" {
+            if matches!(op_text, "->" | "->>") && rhs.kind() == "identifier" {
                 let name = node_text(rhs, text).to_string();
                 if !seen.contains(&name) {
                     seen.insert(name.clone());
@@ -5490,7 +5490,7 @@ fn find_assignment_statement<'a>(
                 let children: Vec<_> = node.children(&mut cursor).collect();
                 if children.len() >= 2 {
                     let op_text = node_text(children[1], content);
-                    if matches!(op_text, "<-" | "=" | "<<-" | "->") {
+                    if matches!(op_text, "<-" | "=" | "<<-" | "->" | "->>") {
                         return Some(StatementMatch {
                             node,
                             header_only: false,
@@ -5563,7 +5563,9 @@ fn find_function_statement<'a>(
                             header_only: false,
                         });
                     }
-                    if op_text == "->" && children[0].kind() == "function_definition" {
+                    if matches!(op_text, "->" | "->>")
+                        && children[0].kind() == "function_definition"
+                    {
                         return Some(StatementMatch {
                             node,
                             header_only: false,
@@ -10097,6 +10099,42 @@ result <- "#;
         // Check selection_range is the RHS identifier
         assert_eq!(symbols[0].selection_range.start.character, 6); // "answer" starts at position 6
         assert_eq!(symbols[0].selection_range.end.character, 12); // "answer" ends at position 12
+    }
+
+    #[test]
+    fn test_symbol_extractor_right_super_assignment() {
+        let code = "42 ->> answer";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "answer");
+        // 42 is detected as Number type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Number);
+
+        // Check selection_range is the RHS identifier
+        assert_eq!(symbols[0].selection_range.start.character, 7); // "answer" starts at position 7
+        assert_eq!(symbols[0].selection_range.end.character, 13); // "answer" ends at position 13
+    }
+
+    #[test]
+    fn test_symbol_extractor_right_super_assignment_function() {
+        let code = "(function(x) x * 2) ->> doubler";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol, got {:?}", symbols);
+        assert_eq!(symbols[0].name, "doubler");
+        assert!(
+            matches!(
+                symbols[0].kind,
+                DocumentSymbolKind::Variable | DocumentSymbolKind::Function
+            ),
+            "Expected Variable or Function, got {:?}",
+            symbols[0].kind
+        );
     }
 
     // ============================================================================
