@@ -51,6 +51,22 @@ Typical flow:
 - `cargo build --release -p raven`
 - `python3 scripts/profile_startup.py`
 
+## Heap profiling
+
+For investigating memory usage, allocation patterns, and leaks, Raven supports two heap profiling approaches.
+
+### Quick RSS profiling with `analysis-stats`
+
+The built-in `analysis-stats` command reports peak RSS after each analysis phase — useful for a quick check without any extra tooling:
+
+```bash
+cargo build --release -p raven
+./target/release/raven analysis-stats /path/to/workspace
+```
+
+This reports timing and peak RSS per phase (parse, metadata, scope, packages). Use `--csv` for machine-readable output or `--only <phase>` to isolate a single phase.
+
+
 ## Releasing
 
 ### Version bump and tag

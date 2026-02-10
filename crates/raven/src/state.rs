@@ -939,18 +939,23 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 /// so the primary goal is to avoid wasting time on directories that would
 /// never contain R files.
 ///
-/// Note: We intentionally keep this list minimal. Directories like `renv/`,
-/// `.Rproj.user/`, or `build/` might legitimately contain R code that users
-/// want to navigate to. Only skip directories that are definitively not
-/// R-related.
+/// Comparison is case-insensitive. This list is also used by the
+/// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
-    "node_modules", // JavaScript dependencies (can have 100k+ files)
-    ".git",         // Git internal files
-    "target",       // Rust build artifacts
+    ".git",          // Git internal files
+    ".svn",          // Subversion internal files
+    ".hg",           // Mercurial internal files
+    "node_modules",  // JavaScript dependencies (can have 100k+ files)
+    ".Rproj.user",   // RStudio user-local project state
+    "renv",          // renv package library cache
+    "packrat",       // packrat package library cache
+    ".vscode",       // VS Code settings
+    ".idea",         // JetBrains IDE settings
+    "target",        // Rust build artifacts
 ];
 
-/// Check if a directory should be skipped during scanning
-fn should_skip_directory(dir_name: &str) -> bool {
+/// Check if a directory should be skipped during scanning.
+pub(crate) fn should_skip_directory(dir_name: &str) -> bool {
     SKIP_DIRECTORIES
         .iter()
         .any(|skip| dir_name.eq_ignore_ascii_case(skip))

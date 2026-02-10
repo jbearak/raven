@@ -1,0 +1,222 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Time-budget regression tests (required check) ──────────────────────
+  time-budgets:
+    name: Time-Budget Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: perf-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            perf-cargo-${{ runner.os }}-
+
+      - name: Run time-budget tests (release mode)
+        run: cargo test --release -p raven --features test-support --test performance_budgets
+
+  # ── Criterion benchmarks with baseline management ──────────────────────
+  benchmarks:
+    name: Criterion Benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: perf-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            perf-cargo-${{ runner.os }}-
+
+      # Criterion baselines are stored under target/criterion/.
+      # We cache them so PR runs can compare against the main baseline.
+      - name: Restore Criterion baseline cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-${{ runner.os }}-
+
+      - name: Install critcmp
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: critcmp-cache
+        with:
+          path: ~/.cargo/bin/critcmp
+          key: critcmp-${{ runner.os }}-v0.1
+      - name: Build critcmp
+        if: steps.critcmp-cache.outputs.cache-hit != 'true'
+        run: cargo install critcmp
+
+      # On push to main: save results as the new baseline.
+      # On PRs: compare against the main baseline.
+      # Only the startup bench is tracked for CI regressions — it's the
+      # fastest and most representative.  cross_file and lsp_operations
+      # can be run locally with `cargo bench`.
+      - name: Run benchmarks (push to main — save baseline)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline main
+
+      - name: Run benchmarks (PR — compare against main)
+        if: github.event_name == 'pull_request'
+        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
+
+      # ── PR regression comment via critcmp ────────────────────────────────
+      - name: Compare benchmarks against main baseline
+        if: github.event_name == 'pull_request'
+        id: critcmp
+        run: |
+          # If the main baseline doesn't exist, skip comparison
+          if ! critcmp --list 2>/dev/null | grep -q '^main$'; then
+            echo "No main baseline found — skipping comparison."
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            echo "no_baseline=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "no_baseline=false" >> "$GITHUB_OUTPUT"
+          # Compare PR results against main baseline, threshold 5%
+          if critcmp main pr --threshold 5 > /tmp/critcmp-output.txt 2>&1; then
+            # critcmp succeeded — check if there's any output (regressions found)
+            if [ -s /tmp/critcmp-output.txt ]; then
+              echo "has_diff=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::critcmp failed; treating as diff to surface in PR comment"
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Post or update PR comment using gh CLI (no third-party actions needed).
+      # We use a hidden marker to find and update existing comments.
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- raven-benchmark-comparison -->"
+
+          # Build the comment body in a temp file to avoid shell-quoting
+          # issues with critcmp output (may contain $, backticks, etc.).
+          BODY_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE"' EXIT
+
+          if [ "${{ steps.critcmp.outputs.no_baseline }}" = "true" ]; then
+            cat > "$BODY_FILE" <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          No `main` baseline found — benchmark comparison skipped.
+
+          A baseline will be created when this branch (or a future PR) is merged to `main`.
+          ENDOFBODY
+          elif [ "${{ steps.critcmp.outputs.has_diff }}" = "true" ]; then
+            {
+              cat <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          Showing benchmarks with **>5% change** vs `main`:
+
+          ```
+          ENDOFBODY
+              cat /tmp/critcmp-output.txt
+              cat <<'ENDOFBODY'
+          ```
+
+          _Generated by `critcmp --threshold 5`. Criterion baselines compared: `main` → `pr`._
+          ENDOFBODY
+            } > "$BODY_FILE"
+          else
+            cat > "$BODY_FILE" <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          No benchmarks changed by more than 5% vs `main`.
+
+          _Generated by `critcmp --threshold 5`._
+          ENDOFBODY
+          fi
+
+          # Find existing comment with our marker
+          EXISTING_COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            | head -1)
+
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            # Update existing comment — use jq to safely encode as JSON
+            jq -Rs '{"body": .}' < "$BODY_FILE" | \
+              gh api \
+                "repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT_ID}" \
+                -X PATCH --input -
+          else
+            # Create new comment
+            gh pr comment "${PR_NUMBER}" --body-file "$BODY_FILE"
+          fi
+
+  # ── Release binary size tracking ───────────────────────────────────────
+  binary-size:
+    name: Binary Size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: perf-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            perf-cargo-${{ runner.os }}-
+
+      - name: Build release binary
+        run: cargo build --release -p raven
+
+      - name: Display binary size
+        run: |
+          echo "## Release Binary Size" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh target/release/raven >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -la target/release/raven
