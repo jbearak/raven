@@ -11,20 +11,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use tower_lsp::lsp_types::Position;
 use url::Url;
 
-// Re-use the fixture workspace generator from the raven crate.
-#[path = "../src/test_utils/fixture_workspace.rs"]
-#[allow(dead_code, unused_imports)]
-mod fixture_workspace;
-
-// Optional allocation counting (active when RAVEN_BENCH_ALLOC=1).
-#[path = "../src/test_utils/alloc_counter.rs"]
-#[allow(dead_code)]
-mod alloc_counter;
-
-#[global_allocator]
-static ALLOC: alloc_counter::CountingAllocator = alloc_counter::CountingAllocator;
-
-use fixture_workspace::{create_fixture_workspace, FixtureConfig};
+use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
 use raven::state::{scan_workspace, Document, WorldState};
 
 // ---------------------------------------------------------------------------

@@ -85,11 +85,11 @@ jobs:
       # On PRs: compare against the main baseline.
       - name: Run benchmarks (push to main — save baseline)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: cargo bench -p raven -- --save-baseline main
+        run: cargo bench -p raven --features test-support -- --save-baseline main
 
       - name: Run benchmarks (PR — compare against main)
         if: github.event_name == 'pull_request'
-        run: cargo bench -p raven -- --save-baseline pr
+        run: cargo bench -p raven --features test-support -- --save-baseline pr
 
       # ── PR regression comment via critcmp ────────────────────────────────
       - name: Compare benchmarks against main baseline

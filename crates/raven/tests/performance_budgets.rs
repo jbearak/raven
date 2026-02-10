@@ -204,9 +204,10 @@ fn assert_within_budget_message_includes_details() {
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use tempfile::TempDir;
 use tree_sitter::Parser;
 use url::Url;
+
+use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
 
 /// Create a tree-sitter parser configured for R.
 fn make_r_parser() -> Parser {
@@ -215,99 +216,6 @@ fn make_r_parser() -> Parser {
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .expect("Failed to set R language for tree-sitter");
     parser
-}
-
-/// Well-known library names used deterministically in generated code.
-const LIBRARIES: &[&str] = &[
-    "stats", "utils", "dplyr", "ggplot2", "tidyr",
-    "stringr", "purrr", "readr", "tibble", "forcats",
-];
-
-/// Configuration for generating a fixture workspace (mirrors test_utils::fixture_workspace).
-struct TestFixtureConfig {
-    file_count: usize,
-    functions_per_file: usize,
-    source_chain_depth: usize,
-    library_calls_per_file: usize,
-    extra_lines_per_file: usize,
-}
-
-impl TestFixtureConfig {
-    /// Small workspace: 10 files, 5 functions each, source chain depth 3.
-    fn small() -> Self {
-        Self {
-            file_count: 10,
-            functions_per_file: 5,
-            source_chain_depth: 3,
-            library_calls_per_file: 1,
-            extra_lines_per_file: 5,
-        }
-    }
-
-    /// Medium workspace: 50 files, 10 functions each, source chain depth 10.
-    fn medium() -> Self {
-        Self {
-            file_count: 50,
-            functions_per_file: 10,
-            source_chain_depth: 10,
-            library_calls_per_file: 2,
-            extra_lines_per_file: 10,
-        }
-    }
-}
-
-/// Generate the content of a single R file deterministically.
-fn generate_fixture_r_file(index: usize, config: &TestFixtureConfig) -> String {
-    let mut content = String::new();
-
-    for lib_i in 0..config.library_calls_per_file {
-        let lib_name = LIBRARIES[(index * config.library_calls_per_file + lib_i) % LIBRARIES.len()];
-        writeln!(content, "library({})", lib_name).unwrap();
-    }
-
-    if config.library_calls_per_file > 0 {
-        content.push('\n');
-    }
-
-    if index < config.source_chain_depth && index + 1 < config.file_count {
-        writeln!(content, "source(\"file_{}.R\")", index + 1).unwrap();
-        content.push('\n');
-    }
-
-    for func_i in 0..config.functions_per_file {
-        writeln!(
-            content,
-            "func_{}_{} <- function(x, y = {}) {{",
-            index, func_i, func_i + 1
-        )
-        .unwrap();
-        writeln!(content, "    result <- x + y * {}", func_i + 1).unwrap();
-        writeln!(content, "    if (is.na(result)) {{").unwrap();
-        writeln!(content, "        return(NULL)").unwrap();
-        writeln!(content, "    }}").unwrap();
-        writeln!(content, "    result").unwrap();
-        writeln!(content, "}}").unwrap();
-        content.push('\n');
-    }
-
-    for line_i in 0..config.extra_lines_per_file {
-        writeln!(content, "var_{}_{} <- {}", index, line_i, line_i + 1).unwrap();
-    }
-
-    content
-}
-
-/// Create a temporary fixture workspace from the given configuration.
-fn create_test_fixture_workspace(config: &TestFixtureConfig) -> TempDir {
-    let temp_dir = TempDir::new().expect("Failed to create temp directory for fixture workspace");
-    for i in 0..config.file_count {
-        let content = generate_fixture_r_file(i, config);
-        let filename = format!("file_{}.R", i);
-        let filepath = temp_dir.path().join(&filename);
-        std::fs::write(&filepath, &content)
-            .unwrap_or_else(|e| panic!("Failed to write fixture file {}: {}", filename, e));
-    }
-    temp_dir
 }
 
 /// Generate a synthetic R file of approximately `target_bytes` size.
@@ -466,8 +374,8 @@ data <- data.frame(x = 1:100, y = rnorm(100))
 #[test]
 fn budget_scope_resolution_50_file_workspace() {
     // Create a 50-file workspace (medium preset)
-    let config = TestFixtureConfig::medium(); // 50 files, 10 funcs, depth 10
-    let workspace = create_test_fixture_workspace(&config);
+    let config = FixtureConfig::medium(); // 50 files, 10 funcs, depth 10
+    let workspace = create_fixture_workspace(&config);
     let workspace_path = workspace.path();
     let folder_url = Url::from_file_path(workspace_path).unwrap();
 
@@ -552,8 +460,8 @@ fn budget_single_file_completion() {
     use tower_lsp::lsp_types::Position;
 
     // Create a small fixture workspace for realistic completion context
-    let config = TestFixtureConfig::small(); // 10 files, 5 funcs, depth 3
-    let workspace = create_test_fixture_workspace(&config);
+    let config = FixtureConfig::small(); // 10 files, 5 funcs, depth 3
+    let workspace = create_fixture_workspace(&config);
     let workspace_path = workspace.path();
 
     // Build a fully-populated WorldState (same pattern as lsp_operations bench)

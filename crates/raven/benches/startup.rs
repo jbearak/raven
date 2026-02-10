@@ -11,10 +11,7 @@ use std::path::PathBuf;
 use tree_sitter::Parser;
 use url::Url;
 
-// Re-use the fixture workspace generator from the raven crate.
-#[path = "../src/test_utils/fixture_workspace.rs"]
-#[allow(dead_code, unused_imports)]
-mod fixture_workspace;
+use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
 
 // Optional allocation counting (active when RAVEN_BENCH_ALLOC=1).
 #[path = "../src/test_utils/alloc_counter.rs"]
@@ -22,8 +19,6 @@ mod alloc_counter;
 
 #[global_allocator]
 static ALLOC: alloc_counter::CountingAllocator = alloc_counter::CountingAllocator;
-
-use fixture_workspace::{create_fixture_workspace, FixtureConfig};
 
 /// Generate a synthetic R file with specified characteristics (for inline use).
 fn generate_r_file(

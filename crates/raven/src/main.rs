@@ -27,7 +27,8 @@ mod roxygen;
 mod state;
 mod workspace_index;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)]
 mod test_utils;
 
 use std::env;

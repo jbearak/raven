@@ -11,9 +11,9 @@ pub mod cross_file;
 pub mod parser_pool;
 pub mod reserved_words;
 pub mod state;
-// test_utils is only available in test builds (uses dev-dependencies like tempfile).
-// Benchmarks access fixture_workspace via #[path] include instead.
-#[cfg(test)]
+// test_utils is available in test builds and when the `test-support` feature is enabled.
+// This allows benchmarks and integration tests to import directly instead of #[path] hacks.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
 
 // Transitive dependencies of the above modules:

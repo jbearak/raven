@@ -31,10 +31,15 @@ indexmap = "2.2"
 regex = "1.10.0"
 ropey = "1.6"
 lru = "0.16"
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 xdg = "2.5.2"
+
+[features]
+# Expose test_utils for integration tests and benchmarks (kept out of production builds)
+test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -45,11 +50,14 @@ tokio = { version = "1.26.0", features = ["test-util"] }
 [[bench]]
 name = "startup"
 harness = false
+required-features = ["test-support"]
 
 [[bench]]
 name = "lsp_operations"
 harness = false
+required-features = ["test-support"]
 
 [[bench]]
 name = "cross_file"
 harness = false
+required-features = ["test-support"]
