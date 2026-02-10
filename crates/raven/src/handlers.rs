@@ -6611,10 +6611,15 @@ fn is_package_export(
 /// let state = /* WorldState instance */;
 /// let uri = /* Url for the document */;
 /// let pos = /* Position { line, character } */;
-/// let resp = completion(&state, &uri, pos);
+/// let resp = completion(&state, &uri, pos, None);
 /// assert!(resp.is_some());
 /// ```
-pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<CompletionResponse> {
+pub fn completion(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    context: Option<CompletionContext>,
+) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -6789,23 +6794,41 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             SORT_PREFIX_WORKSPACE
         };
 
-        // Use signature if available, otherwise show source file for cross-file symbols
-        let detail = match (&symbol.signature, symbol.source_uri != *uri) {
-            (Some(sig), true) => Some(format!("{} (from {})", sig, symbol.source_uri.path())),
-            (Some(sig), false) => Some(sig.clone()),
-            (None, true) => Some(format!("from {}", symbol.source_uri.path())),
+        // Use signature if available, otherwise show source file for cross-file symbols.
+        // For cross-file functions, the file location is shown in the documentation
+        // field (via resolve) since VS Code renders `detail` as a single line.
+        let is_cross_file = symbol.source_uri != *uri;
+        let relative_path = if is_cross_file {
+            Some(compute_relative_path(
+                &symbol.source_uri,
+                state.workspace_folders.first(),
+            ))
+        } else {
+            None
+        };
+
+        let detail = match (&symbol.signature, is_cross_file) {
+            (Some(sig), _) => Some(sig.clone()),
+            (None, true) => {
+                Some(format!("from {}", relative_path.as_ref().unwrap()))
+            }
             (None, false) => None,
         };
 
         // For user-defined functions from cross-file scope, include data for
-        // completionItem/resolve to locate the roxygen block for documentation
+        // completionItem/resolve to locate the roxygen block for documentation.
+        // Cross-file functions also include the relative path for the documentation panel.
         let data = if kind == CompletionItemKind::FUNCTION {
-            Some(serde_json::json!({
+            let mut json = serde_json::json!({
                 "type": "user_function",
                 "function_name": name_string,
                 "uri": symbol.source_uri.to_string(),
                 "func_line": symbol.defined_line,
-            }))
+            });
+            if let Some(rel) = &relative_path {
+                json["relative_path"] = serde_json::Value::String(rel.clone());
+            }
+            Some(json)
         } else {
             None
         };
@@ -6836,8 +6859,19 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     // so parameter completions are naturally suppressed for namespace-qualified tokens.
     // For incomplete namespace expressions (e.g., `pkg::` with no RHS), the AST check
     // may fail, so we also do a text-based check here as a fallback.
-    // Requirements 2.2, 2.3, 2.6, 5.1-5.7, 6.1-6.6
-    if !has_namespace_accessor_at_cursor(&text, position) {
+    //
+    // When trigger_on_open_paren is false, suppress parameter completions triggered by `(`.
+    // Manual invocation (Ctrl+Space) still shows them regardless of config.
+    let suppress_paren_trigger = !state.completion_config.trigger_on_open_paren
+        && matches!(
+            &context,
+            Some(CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(ch),
+                ..
+            }) if ch == "("
+        );
+    if !suppress_paren_trigger && !has_namespace_accessor_at_cursor(&text, position) {
         let call_context =
             crate::completion_context::detect_function_call_context(tree, &text, position);
         if let Some(ctx) = call_context {
@@ -7036,7 +7070,12 @@ fn extract_function_signature_for_completion(func_node: Node, name: &str, text: 
     let mut cursor = func_node.walk();
     for child in func_node.children(&mut cursor) {
         if child.kind() == "parameters" {
-            let params = node_text(child, text);
+            let params: String = node_text(child, text)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
             return format!("{}{}", name, params);
         }
     }
@@ -7052,7 +7091,7 @@ fn collect_document_completions(
 ) {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
+        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
 
         if children.len() >= 3 {
             let lhs = children[0];
@@ -7271,11 +7310,20 @@ fn resolve_user_function_documentation(
         None
     };
 
+    // Build documentation: optional file location header + optional roxygen docs
+    let relative_path = data.get("relative_path").and_then(|v| v.as_str());
+    let doc_value = match (relative_path, documentation) {
+        (Some(path), Some(doc)) => Some(format!("*from {}*\n\n{}", path, doc)),
+        (Some(path), None) => Some(format!("*from {}*", path)),
+        (None, Some(doc)) => Some(doc),
+        (None, None) => None,
+    };
+
     let mut resolved = item;
-    if let Some(doc_text) = documentation {
+    if let Some(text) = doc_value {
         resolved.documentation = Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: doc_text,
+            value: text,
         }));
     }
     // Clear data field to avoid leaking internal metadata
@@ -9416,6 +9464,26 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_multiline_parameters() {
+        let code = "f <- function(a,\n              b,\n              c = 1) { }";
+        let tree = parse_r_code(code);
+
+        let func_node = find_function_definition_node(tree.root_node(), "f", code).unwrap();
+        let signature = extract_function_signature(func_node, "f", code);
+        assert_eq!(signature, "f(a, b, c = 1)");
+    }
+
+    #[test]
+    fn test_completion_signature_multiline_parameters() {
+        let code = "f <- function(a,\n              b,\n              c = 1) { }";
+        let tree = parse_r_code(code);
+
+        let func_node = find_function_definition(tree.root_node()).unwrap();
+        let signature = extract_function_signature_for_completion(func_node, "f", code);
+        assert_eq!(signature, "f(a, b, c = 1)");
+    }
+
+    #[test]
     fn test_compute_relative_path_with_workspace_root() {
         let workspace_root = Url::parse("file:///workspace/").unwrap();
         let target_uri = Url::parse("file:///workspace/src/main.R").unwrap();
@@ -9935,7 +10003,7 @@ result <- "#;
 
             // Get completions at the end of the file (after "result <- ")
             let position = Position::new(2, 10);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -10002,7 +10070,7 @@ result <- "#;
 
             // Get completions at the end of main file
             let position = Position::new(1, 10);
-            let completions = super::completion(&state, &main_uri, position);
+            let completions = super::completion(&state, &main_uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -10062,7 +10130,7 @@ x <- "#;
 
             // Get completions
             let position = Position::new(1, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -10135,7 +10203,7 @@ result <- "#;
 
             // Get completions at the end
             let position = Position::new(3, 10);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -10226,7 +10294,7 @@ x <- "#;
 
             // Get completions
             let position = Position::new(2, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -10272,6 +10340,118 @@ x <- "#;
     }
 
     // ========================================================================
+    // User-defined function parameter completion tests
+    // ========================================================================
+
+    /// Test that typing inside a call to a user-defined function produces
+    /// parameter completion items with the correct detail and sort prefix.
+    #[test]
+    fn test_completion_user_function_params() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Define a function and call it
+            let code = "my_func <- function(alpha, beta = 10) { alpha + beta }\nmy_func(";
+            let uri = Url::parse("file:///test_params.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Cursor is right after the opening paren: line 1, column 8
+            let position = Position::new(1, 8);
+            let completions = super::completion(&state, &uri, position, None);
+
+            assert!(completions.is_some(), "Should return completions");
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find parameter completion items (those with detail == "parameter")
+                let param_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.detail.as_deref() == Some("parameter")
+                    })
+                    .collect();
+
+                assert!(
+                    param_items.len() >= 2,
+                    "Should have at least 2 parameter items (alpha, beta). Got {} param items out of {} total. Param items: {:?}",
+                    param_items.len(),
+                    items.len(),
+                    param_items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                // Check that alpha parameter is present
+                let alpha = param_items.iter().find(|item| item.label == "alpha");
+                assert!(alpha.is_some(), "Should have 'alpha' parameter completion");
+
+                // Check that beta parameter is present
+                let beta = param_items.iter().find(|item| item.label == "beta");
+                assert!(beta.is_some(), "Should have 'beta' parameter completion");
+
+                // Parameter items should have sort_text starting with "0-" (highest priority)
+                for item in &param_items {
+                    assert!(
+                        item.sort_text
+                            .as_ref()
+                            .map_or(false, |s| s.starts_with("0-")),
+                        "Parameter item '{}' should have sort_text starting with '0-', got {:?}",
+                        item.label,
+                        item.sort_text
+                    );
+                }
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that parameter completions include insert_text with `= ` suffix.
+    #[test]
+    fn test_completion_user_function_param_insert_text() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            let code = "f <- function(x, y) { x + y }\nf(";
+            let uri = Url::parse("file:///test_insert.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let position = Position::new(1, 2);
+            let completions = super::completion(&state, &uri, position, None);
+
+            assert!(completions.is_some());
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                let param_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.detail.as_deref() == Some("parameter")
+                    })
+                    .collect();
+
+                // Check insert_text includes " = " suffix for named params
+                let x_item = param_items.iter().find(|item| item.label == "x");
+                assert!(x_item.is_some(), "Should have 'x' parameter");
+                let x_item = x_item.unwrap();
+                assert!(
+                    x_item.insert_text.as_ref().map_or(false, |t| t.contains("= ")),
+                    "Parameter 'x' insert_text should contain '= ', got {:?}",
+                    x_item.insert_text
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    // ========================================================================
     // Package export completion data field and resolve tests
     // ========================================================================
 
@@ -10297,7 +10477,7 @@ x <- "#;
             state.documents.insert(uri.clone(), doc);
 
             let position = Position::new(1, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             if let Some(CompletionResponse::Array(items)) = completions {
                 let my_func = items.iter().find(|i| i.label == "my_func");
@@ -10991,7 +11171,7 @@ clean_data <- function(x) {
             state.documents.insert(uri.clone(), doc);
 
             let position = Position::new(0, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             if let Some(CompletionResponse::Array(items)) = completions {
                 // "source" should appear with {base} attribution
@@ -11723,7 +11903,7 @@ x <- "#;
 
             // Get completions at the end of the file (after "x <- ")
             let position = Position::new(1, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -11773,7 +11953,7 @@ x <- "#;
 
             // Get completions at the end of the file (after "x <- ")
             let position = Position::new(1, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -11824,7 +12004,7 @@ y <- "#;
 
             // Get completions on line 0 (before declaration)
             let position_before = Position::new(0, 5);
-            let completions_before = super::completion(&state, &uri, position_before);
+            let completions_before = super::completion(&state, &uri, position_before, None);
 
             if let Some(CompletionResponse::Array(items)) = completions_before {
                 let declared_items: Vec<_> = items
@@ -11841,7 +12021,7 @@ y <- "#;
 
             // Get completions on line 2 (after declaration)
             let position_after = Position::new(2, 5);
-            let completions_after = super::completion(&state, &uri, position_after);
+            let completions_after = super::completion(&state, &uri, position_after, None);
 
             if let Some(CompletionResponse::Array(items)) = completions_after {
                 let declared_items: Vec<_> = items
@@ -11879,7 +12059,7 @@ x <- "#;
 
             // Get completions at the end of the file
             let position = Position::new(2, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -11937,7 +12117,7 @@ result <- "#;
 
             // Get completions at the end of the file (after "result <- ")
             let position = Position::new(1, 10);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some(), "Should return completions");
 
@@ -12131,7 +12311,7 @@ result <- "#;
             state.documents.insert(uri.clone(), doc);
 
             let position = Position::new(0, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some());
 
@@ -12197,7 +12377,7 @@ result <- "#;
             state.documents.insert(uri.clone(), doc);
 
             let position = Position::new(2, 10);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some());
 
@@ -12251,7 +12431,7 @@ x <- "#;
             state.documents.insert(uri.clone(), doc);
 
             let position = Position::new(1, 5);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             assert!(completions.is_some());
 
@@ -20597,7 +20777,7 @@ mod proptests {
 
             // Request completions at the end of the document
             let position = Position::new(0, code.len() as u32);
-            let response = completion(&state, &uri, position);
+            let response = completion(&state, &uri, position, None);
 
             prop_assert!(response.is_some(), "Completion should return a response");
 
@@ -20666,7 +20846,7 @@ mod proptests {
 
             // Request completions at the end of the document
             let position = Position::new(0, code.len() as u32);
-            let response = completion(&state, &uri, position);
+            let response = completion(&state, &uri, position, None);
 
             prop_assert!(response.is_some(), "Completion should return a response");
 
@@ -20710,7 +20890,7 @@ mod proptests {
 
             // Request completions at the end of the document
             let position = Position::new(0, code.len() as u32);
-            let response = completion(&state, &uri, position);
+            let response = completion(&state, &uri, position, None);
 
             prop_assert!(response.is_some(), "Completion should return a response");
 
@@ -21940,7 +22120,7 @@ mod proptests {
             let completion_line = (1 + lines_between) as u32;
             let position = Position::new(completion_line, 0);
 
-            let response = super::completion(&state, &uri, position);
+            let response = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 response.is_some(),
@@ -22004,7 +22184,7 @@ mod proptests {
             let completion_line = (1 + lines_between) as u32;
             let position = Position::new(completion_line, 0);
 
-            let response = super::completion(&state, &uri, position);
+            let response = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 response.is_some(),
@@ -22066,7 +22246,7 @@ mod proptests {
             // Request completions at line 2 (after both directives)
             let position = Position::new(2, 0);
 
-            let response = super::completion(&state, &uri, position);
+            let response = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 response.is_some(),
@@ -22153,7 +22333,7 @@ mod proptests {
             // Request completions at line 1 (after the directive)
             let position = Position::new(1, 0);
 
-            let response = super::completion(&state, &uri, position);
+            let response = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 response.is_some(),
@@ -22223,7 +22403,7 @@ mod proptests {
             // Request completions at line 0 (ON the directive line)
             let position = Position::new(0, 0);
 
-            let response = super::completion(&state, &uri, position);
+            let response = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 response.is_some(),
@@ -22280,7 +22460,7 @@ mod proptests {
 
             // Request completions at line 1 (after var1, before var2)
             let position_a = Position::new(1, 0);
-            let response_a = super::completion(&state, &uri, position_a);
+            let response_a = super::completion(&state, &uri, position_a, None);
 
             prop_assert!(
                 response_a.is_some(),
@@ -22316,7 +22496,7 @@ mod proptests {
 
             // Request completions at line 3 (after both var1 and var2)
             let position_b = Position::new(3, 0);
-            let response_b = super::completion(&state, &uri, position_b);
+            let response_b = super::completion(&state, &uri, position_b, None);
 
             prop_assert!(
                 response_b.is_some(),
@@ -26020,7 +26200,7 @@ setClass("{}", slots = c(value = "numeric"))
             // Position cursor inside the function call parentheses (line 1, after `(`)
             // "my_test_fn()" — the `(` is at column 10, so cursor at column 11 is inside
             let position = Position::new(1, 11);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             prop_assert!(completions.is_some(), "Should return completions for code: {}", code);
 
@@ -26202,7 +26382,7 @@ setClass("{}", slots = c(value = "numeric"))
             // "my_fn(" is 6 chars, then the token follows
             let cursor_col = 6 + matching_token.len() as u32;
             let position = Position::new(1, cursor_col);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             prop_assert!(completions.is_some(), "Should return completions for code: {}", code);
 
@@ -26245,7 +26425,7 @@ setClass("{}", slots = c(value = "numeric"))
 
             let cursor_col_nm = 6 + non_matching_token.len() as u32;
             let position_nm = Position::new(1, cursor_col_nm);
-            let completions_nm = super::completion(&state_nm, &uri_nm, position_nm);
+            let completions_nm = super::completion(&state_nm, &uri_nm, position_nm, None);
 
             prop_assert!(completions_nm.is_some(), "Should return completions for non-matching code: {}", code_nm);
 
@@ -26331,7 +26511,7 @@ setClass("{}", slots = c(value = "numeric"))
             // `outer_func(` has length outer_func.len() + 1, then the ns_token follows
             let cursor_col = (outer_func.len() + 1 + ns_token.len()) as u32;
             let position = Position::new(1, cursor_col);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 completions.is_some(),
@@ -26451,7 +26631,7 @@ setClass("{}", slots = c(value = "numeric"))
             let call_line = code_lines.len() as u32 - 1;
             let cursor_col = func_name.len() as u32 + 1;
             let position = Position::new(call_line, cursor_col);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 completions.is_some(),
@@ -26638,7 +26818,7 @@ setClass("{}", slots = c(value = "numeric"))
             // Position cursor inside the function call parentheses (line 1, after `(`)
             // "my_default_fn()" — the `(` is at column 13, so cursor at column 14 is inside
             let position = Position::new(1, 14);
-            let completions = super::completion(&state, &uri, position);
+            let completions = super::completion(&state, &uri, position, None);
 
             prop_assert!(
                 completions.is_some(),

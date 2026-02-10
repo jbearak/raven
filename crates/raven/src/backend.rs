@@ -347,7 +347,6 @@ pub(crate) fn parse_cross_file_config(
         "    workspace_index_max_entries: {}",
         config.cache_workspace_index_max_entries
     );
-
     Some(config)
 }
 
@@ -425,6 +424,54 @@ pub(crate) fn parse_symbol_config(settings: &serde_json::Value) -> Option<Symbol
     log::info!("  workspace_max_results: {}", config.workspace_max_results);
 
     Some(config)
+}
+
+/// Parse completion provider configuration from LSP settings.
+///
+/// Reads the `completion` section from a serde_json::Value and constructs a
+/// populated `CompletionConfig`. Only fields present in the provided JSON are
+/// applied; absent fields retain their defaults from `CompletionConfig::default()`.
+///
+/// # Returns
+///
+/// `Some(CompletionConfig)` populated from `settings` when the `completion` section
+/// is present; `None` if the section is missing.
+pub(crate) fn parse_completion_config(
+    settings: &serde_json::Value,
+) -> Option<crate::state::CompletionConfig> {
+    let completion = settings.get("completion")?;
+
+    let mut config = crate::state::CompletionConfig::default();
+
+    if let Some(v) = completion
+        .get("triggerOnOpenParen")
+        .and_then(|v| v.as_bool())
+    {
+        config.trigger_on_open_paren = v;
+    }
+
+    log::info!("Completion configuration loaded from LSP settings:");
+    log::info!(
+        "  trigger_on_open_paren: {}",
+        config.trigger_on_open_paren
+    );
+
+    Some(config)
+}
+
+/// Build the list of completion trigger characters, conditionally including `(`.
+fn build_completion_trigger_chars(trigger_on_open_paren: bool) -> Vec<String> {
+    let mut chars = vec![
+        String::from(":"),
+        String::from("$"),
+        String::from("@"),
+        String::from("/"),
+        String::from("\""),
+    ];
+    if trigger_on_open_paren {
+        chars.push(String::from("("));
+    }
+    chars
 }
 
 pub struct Backend {
@@ -548,6 +595,11 @@ impl LanguageServer for Backend {
             if let Some(config) = parse_symbol_config(init_options) {
                 state.symbol_config = config;
             }
+
+            // Parse completion configuration
+            if let Some(config) = parse_completion_config(init_options) {
+                state.completion_config = config;
+            }
         }
 
         // Detect client capability for hierarchical document symbols
@@ -567,7 +619,12 @@ impl LanguageServer for Backend {
             hierarchical_support
         );
 
+        // Extract completion settings before dropping state lock
+        let trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+
         drop(state);
+
+        let completion_trigger_chars = build_completion_trigger_chars(trigger_on_open_paren);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -578,13 +635,7 @@ impl LanguageServer for Backend {
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        String::from(":"),
-                        String::from("$"),
-                        String::from("@"),
-                        String::from("/"),  // File path navigation
-                        String::from("\""), // String literal start for source() calls
-                    ]),
+                    trigger_characters: Some(completion_trigger_chars),
                     resolve_provider: Some(true),
                     ..Default::default()
                 }),
@@ -1917,6 +1968,9 @@ impl LanguageServer for Backend {
         // Requirement 11.2: Parse symbols.workspaceMaxResults from settings
         let new_symbol_config = parse_symbol_config(&params.settings);
 
+        // Parse completion configuration if provided
+        let new_completion_config = parse_completion_config(&params.settings);
+
         // Log if configuration parsing failed and defaults will be used
         if new_config.is_none() {
             log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
@@ -1933,6 +1987,8 @@ impl LanguageServer for Backend {
             packages_r_path,
             additional_paths,
             workspace_root,
+            trigger_on_open_paren_changed,
+            new_trigger_on_open_paren,
         ) = {
             let mut state = self.state.write().await;
 
@@ -1998,6 +2054,15 @@ impl LanguageServer for Backend {
                 state.symbol_config = config;
             }
 
+            // Apply new completion config if parsed, tracking trigger change
+            let old_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+            if let Some(config) = new_completion_config {
+                state.completion_config = config;
+            }
+            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+            let trigger_on_open_paren_changed =
+                old_trigger_on_open_paren != new_trigger_on_open_paren;
+
             // Mark all open documents for force republish
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
             for uri in &open_uris {
@@ -2015,6 +2080,8 @@ impl LanguageServer for Backend {
                 packages_r_path,
                 additional_paths,
                 workspace_root,
+                trigger_on_open_paren_changed,
+                new_trigger_on_open_paren,
             )
         };
 
@@ -2025,6 +2092,57 @@ impl LanguageServer for Backend {
                 old_diagnostics_enabled,
                 new_diagnostics_enabled
             );
+        }
+
+        // Dynamically re-register completion capability if trigger characters changed
+        if trigger_on_open_paren_changed {
+            log::info!(
+                "trigger_on_open_paren changed to {}, re-registering completion capability",
+                new_trigger_on_open_paren
+            );
+
+            let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
+            let registration_options = CompletionRegistrationOptions {
+                text_document_registration_options: TextDocumentRegistrationOptions {
+                    document_selector: Some(vec![DocumentFilter {
+                        language: Some(String::from("r")),
+                        scheme: None,
+                        pattern: None,
+                    }]),
+                },
+                completion_options: CompletionOptions {
+                    trigger_characters: Some(trigger_chars),
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            };
+
+            let registration_id = String::from("completion");
+            let method = String::from("textDocument/completion");
+
+            // Unregister old, then register new
+            if let Err(e) = self
+                .client
+                .unregister_capability(vec![Unregistration {
+                    id: registration_id.clone(),
+                    method: method.clone(),
+                }])
+                .await
+            {
+                log::warn!("Failed to unregister completion capability: {}", e);
+            }
+
+            if let Err(e) = self
+                .client
+                .register_capability(vec![Registration {
+                    id: registration_id,
+                    method,
+                    register_options: serde_json::to_value(registration_options).ok(),
+                }])
+                .await
+            {
+                log::warn!("Failed to re-register completion capability: {}", e);
+            }
         }
 
         // Reinitialize PackageLibrary if package settings changed
@@ -2501,10 +2619,11 @@ impl LanguageServer for Backend {
         let state = self.state.clone();
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let context = params.context;
         match tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             let state = handle.block_on(state.read());
-            handlers::completion(&state, &uri, position)
+            handlers::completion(&state, &uri, position, context)
         })
         .await
         {
@@ -3383,6 +3502,83 @@ mod tests {
                 "diagnostics_enabled should default to true when diagnostics section is absent"
             );
         }
+
+    }
+
+    // ============================================================================
+    // CompletionConfig Parsing Tests
+    // ============================================================================
+    mod completion_config_parsing {
+        use serde_json::json;
+
+        /// Test that `parse_completion_config` returns None when completion section is absent.
+        #[test]
+        fn test_trigger_on_open_paren_defaults_to_true() {
+            let settings = json!({
+                "crossFile": {}
+            });
+
+            let config = crate::backend::parse_completion_config(&settings);
+            assert!(
+                config.is_none(),
+                "Should return None when completion section is absent"
+            );
+            // When None, caller uses CompletionConfig::default() which has trigger_on_open_paren: true
+            let default = crate::state::CompletionConfig::default();
+            assert!(default.trigger_on_open_paren);
+        }
+
+        /// Test that `completion.triggerOnOpenParen` can be set to false.
+        #[test]
+        fn test_trigger_on_open_paren_explicit_false() {
+            let settings = json!({
+                "completion": {
+                    "triggerOnOpenParen": false
+                }
+            });
+
+            let config = crate::backend::parse_completion_config(&settings);
+            assert!(config.is_some());
+            let config = config.unwrap();
+            assert!(
+                !config.trigger_on_open_paren,
+                "trigger_on_open_paren should be false when explicitly set to false"
+            );
+        }
+
+        /// Test that `completion.triggerOnOpenParen` can be set to true explicitly.
+        #[test]
+        fn test_trigger_on_open_paren_explicit_true() {
+            let settings = json!({
+                "completion": {
+                    "triggerOnOpenParen": true
+                }
+            });
+
+            let config = crate::backend::parse_completion_config(&settings);
+            assert!(config.is_some());
+            let config = config.unwrap();
+            assert!(
+                config.trigger_on_open_paren,
+                "trigger_on_open_paren should be true when explicitly set to true"
+            );
+        }
+
+        /// Test that empty completion section returns default config.
+        #[test]
+        fn test_empty_completion_section_returns_default() {
+            let settings = json!({
+                "completion": {}
+            });
+
+            let config = crate::backend::parse_completion_config(&settings);
+            assert!(config.is_some(), "Should return Some when completion section exists");
+            let config = config.unwrap();
+            assert!(
+                config.trigger_on_open_paren,
+                "trigger_on_open_paren should default to true"
+            );
+        }
     }
 
     // ============================================================================
@@ -3395,6 +3591,37 @@ mod tests {
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
+
+            // ============================================================================
+            // Property: completion.triggerOnOpenParen round-trip
+            // For any boolean value `b`, if initialization options JSON contains
+            // `completion.triggerOnOpenParen` set to `b`, parsing SHALL produce a
+            // `CompletionConfig` with `trigger_on_open_paren` equal to `b`.
+            // ============================================================================
+
+            /// Property: trigger_on_open_paren round-trip parsing
+            #[test]
+            fn prop_config_parsing_trigger_on_open_paren_roundtrip(trigger: bool) {
+                use serde_json::json;
+
+                let settings = json!({
+                    "completion": {
+                        "triggerOnOpenParen": trigger
+                    }
+                });
+
+                let config = crate::backend::parse_completion_config(&settings);
+                prop_assert!(config.is_some(), "Configuration parsing should succeed");
+                let config = config.unwrap();
+
+                prop_assert_eq!(
+                    config.trigger_on_open_paren,
+                    trigger,
+                    "trigger_on_open_paren should match input: expected {}, got {}",
+                    trigger,
+                    config.trigger_on_open_paren
+                );
+            }
 
             // ============================================================================
             // Property 3: Configuration parsing round-trip for explicit boolean

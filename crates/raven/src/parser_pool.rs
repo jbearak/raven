@@ -25,6 +25,17 @@ where
     PARSER.with(|parser| f(&mut parser.borrow_mut()))
 }
 
+/// Collect non-extra (non-comment) children of a tree-sitter node.
+///
+/// Filters out "extra" nodes (comments, whitespace injections) so that
+/// positional indexing into the child list is reliable.
+pub(crate) fn non_extra_children<'a>(
+    node: tree_sitter::Node<'a>,
+    cursor: &mut tree_sitter::TreeCursor<'a>,
+) -> Vec<tree_sitter::Node<'a>> {
+    node.children(cursor).filter(|c| !c.is_extra()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +79,30 @@ mod tests {
         let child1 = root1.child(0).map(|n| n.kind());
         let child2 = root2.child(0).map(|n| n.kind());
         assert_ne!(child1, child2, "Trees should have different structure");
+    }
+
+    #[test]
+    fn test_non_extra_children_filters_comments() {
+        // R code with a comment between assignment children
+        let code = "x <- # a comment\n  1";
+        let tree = with_parser(|p| p.parse(code, None)).expect("parse should succeed");
+        let root = tree.root_node();
+        // The program root's first non-extra child is the binary_operator (assignment)
+        let mut cursor = root.walk();
+        let top_children = non_extra_children(root, &mut cursor);
+        assert_eq!(top_children.len(), 1);
+        let assignment = top_children[0];
+        assert_eq!(assignment.kind(), "binary_operator");
+
+        // The binary_operator has 3 real children (lhs, op, rhs) plus the comment
+        let total = assignment.child_count();
+        let mut cursor2 = assignment.walk();
+        let filtered = non_extra_children(assignment, &mut cursor2);
+        assert_eq!(filtered.len(), 3, "should have lhs, op, rhs");
+        assert!(
+            total > 3,
+            "unfiltered count ({total}) should exceed 3 because of the comment"
+        );
     }
 }
 
