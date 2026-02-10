@@ -1647,7 +1647,6 @@ mod integration_tests {
     use super::*;
     use crate::document_store::DocumentStoreConfig;
     use crate::workspace_index::WorkspaceIndexConfig;
-    use std::sync::Arc;
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///{}", name)).unwrap()

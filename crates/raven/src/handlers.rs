@@ -17003,7 +17003,6 @@ y <- 2";
         assert_eq!(result[0].kind, SymbolKind::FUNCTION);
         assert_eq!(result[0].detail, Some("(x, y)".to_string()));
         assert!(result[0].children.is_none());
-        assert!(result[0].deprecated.is_none());
         assert!(result[0].tags.is_none());
     }
 
