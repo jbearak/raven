@@ -18357,7 +18357,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -18412,7 +18412,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -18465,7 +18465,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
                 .collect();
 
             prop_assert!(
