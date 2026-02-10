@@ -1,13 +1,16 @@
-# Raven
+# Raven - Language Server for R
 
-A static R Language Server (LSP) with cross-file awareness for research workflows.
+An open source [Language Server Protocol (LSP)](https://github.com/Microsoft/language-server-protocol) implementation for the R statistical programming language, with a corresponding extension for [VS Code](https://github.com/Microsoft/vscode).
 
-The stock [R language server](https://github.com/REditorSupport/languageserver) treats each file in isolation. Raven follows `source()` chains across files, which enables:
+> **tl;dr**: Raven brings **cross-file intelligence** to R coding. Unlike language servers that treat each file in isolation, Raven follows `source()` chains to provide **workspace-wide completions**, **go-to-definition across files**, **position-aware scope resolution**, and **diagnostics that understand your project structure**.
 
-- Context-aware completions across file boundaries
-- Go-to-definition and find-references across sourced files
-- Position-aware scope (symbols become available only *after* they’re introduced)
-- Scope-aware “undefined variable” diagnostics that follow those chains
+> **Development Status:** Raven is an early-stage implementation. While functional, it requires substantial testing and code review. Contributions and feedback are welcome!
+
+> **Quick Start:** Download from the [releases page](https://github.com/jbearak/raven/releases), or clone the repo and build from source (`cargo build --release -p raven`). See [Installation](#installation) for details.
+
+Raven works with VS Code, its forks (Antigravity, Cursor, Kiro, Positron, and Windsurf), and any editor with an LSP client. This repository contains the language server and a VS Code extension that activates it. Raven can run alongside existing R extensions like [vscode-R](https://github.com/REditorSupport/vscode-R) — see [Raven vs Ark vs R Language Server](#raven-vs-ark-vs-r-language-server) for how they compare and coexist.
+
+Raven’s sister project [Sight](https://github.com/jbearak/sight) implements a language server, syntax highlighting, and code execution for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
 
 ## Quick Start
 
