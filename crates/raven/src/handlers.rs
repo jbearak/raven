@@ -3994,54 +3994,60 @@ fn find_first_content_line(node: Node) -> Option<usize> {
     }
     
     // Structural keywords to skip
-    const STRUCTURAL_KEYWORDS: &[&str] = &["if", "while", "for", "function", "repeat"];
+    const STRUCTURAL_KEYWORDS: &[&str] = &["if", "else", "while", "for", "function", "repeat"];
     
-    // Find the line with the opening brace `{`
-    let mut brace_line = None;
+    // Single pass: find the opening brace `{` and the first content line simultaneously.
+    // Content before the brace is only used if no brace exists at all.
+    let mut brace_row: Option<usize> = None;
+    let mut content_before_brace: Option<usize> = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if !child.is_named() && child.kind() == "{" {
-            brace_line = Some(child.start_position().row);
-            break;
+        // Track opening brace
+        if !child.is_named() {
+            if child.kind() == "{" && brace_row.is_none() {
+                brace_row = Some(child.start_position().row);
+            }
+            continue;
         }
-    }
-    
-    // Multi-line ERROR: find the first line with non-structural named children AFTER the opening brace
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+
         // Skip ERROR children - we want to find content, not nested errors
         if child.is_error() {
             continue;
         }
-        
-        // Skip unnamed tokens (punctuation like {, }, (, ))
-        if !child.is_named() {
-            continue;
-        }
-        
+
         // Skip structural keywords
         if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
             continue;
         }
-        
+
         // Skip boolean/null literals that are part of the condition
         if matches!(child.kind(), "true" | "false" | "null") {
             continue;
         }
-        
-        // If we found a brace line, only consider children AFTER the brace
-        if let Some(brace_row) = brace_line {
-            if child.start_position().row <= brace_row {
-                continue;
+
+        let row = child.start_position().row;
+
+        if let Some(br) = brace_row {
+            if row > br {
+                // Content after brace — this is the content line
+                return Some(row);
+            }
+            // Content on or before brace row — skip
+        } else {
+            // No brace seen yet — remember as potential content
+            if content_before_brace.is_none() {
+                content_before_brace = Some(row);
             }
         }
-        
-        // Found a non-structural named child after the brace - use its line
-        return Some(child.start_position().row);
     }
-    
-    // Fallback: return the line after the brace, or the start line
-    brace_line.map(|r| r + 1).or(Some(start_row))
+
+    // If no brace was found, use any content we found
+    if brace_row.is_none() {
+        return content_before_brace;
+    }
+
+    // Brace was found but no content after it: fall back to line after brace, clamped to end_row
+    brace_row.map(|r| (r + 1).min(end_row)).or(Some(start_row))
 }
 
 /// For a multi-line ERROR node, compute a minimized diagnostic range that
@@ -4086,7 +4092,7 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
             let first_line_end_col = text
                 .lines()
                 .nth(content_row)
-                .map(|line| line.len() as u32)
+                .map(utf16_len)
                 .unwrap_or(0);
             
             // Find the start column on the content line
@@ -4122,7 +4128,7 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
     let first_line_end_col = text
         .lines()
         .nth(start_row)
-        .map(|line| line.len() as u32)
+        .map(utf16_len)
         .unwrap_or(start_col as u32);
 
     // Ensure we have at least some width
@@ -4446,6 +4452,120 @@ mod syntax_error_range_tests {
     use proptest::prelude::*;
     use tree_sitter::Node;
 
+    // ========================================================================
+    // Shared test helpers for property-based tests
+    // ========================================================================
+
+    /// Find the outermost (first) ERROR node in the tree via depth-first search.
+    fn find_outermost_error(node: Node) -> Option<Node> {
+        if node.is_error() {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(error) = find_outermost_error(child) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    /// Collect all MISSING node positions (row, col) in the tree.
+    fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32)>) {
+        if node.is_missing() {
+            out.push((
+                node.start_position().row as u32,
+                node.start_position().column as u32,
+            ));
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_missing_positions(child, &mut *out);
+        }
+    }
+
+    /// Collect top-level single-line ERROR nodes (start_row, start_col, end_row, end_col).
+    /// Mirrors `collect_syntax_errors` by not recursing into ERROR children.
+    fn collect_single_line_errors(node: Node, out: &mut Vec<(u32, u32, u32, u32)>) {
+        if node.is_error() {
+            let start_row = node.start_position().row as u32;
+            let start_col = node.start_position().column as u32;
+            let end_row = node.end_position().row as u32;
+            let end_col = node.end_position().column as u32;
+            if start_row == end_row {
+                out.push((start_row, start_col, end_row, end_col));
+            }
+            // Don't recurse into ERROR children — collect_syntax_errors
+            // doesn't recurse into ERROR nodes either.
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_single_line_errors(child, &mut *out);
+        }
+    }
+
+    /// Check if a node or any of its descendants is a MISSING node.
+    fn has_missing_descendant(node: Node) -> bool {
+        if node.is_missing() {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if has_missing_descendant(child) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find an ERROR node at a specific (row, col) position.
+    fn find_error_at(node: Node, row: u32, col: u32) -> Option<Node> {
+        if node.is_error()
+            && node.start_position().row as u32 == row
+            && node.start_position().column as u32 == col
+        {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_error_at(child, row, col) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Count top-level ERROR nodes (not recursing into ERROR children).
+    /// Mirrors the behavior of `collect_syntax_errors`.
+    fn count_top_level_errors(node: Node) -> usize {
+        if node.is_error() {
+            return 1;
+        }
+        let mut cursor = node.walk();
+        let mut count = 0;
+        for child in node.children(&mut cursor) {
+            count += count_top_level_errors(child);
+        }
+        count
+    }
+
+    /// Collect all ERROR nodes in the tree with their (child_count, start_row).
+    fn collect_all_errors(node: Node, out: &mut Vec<(usize, usize)>) {
+        if node.is_error() {
+            out.push((node.child_count(), node.start_position().row));
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_all_errors(child, out);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_all_errors(child, out);
+        }
+    }
+
     /// Strategy to generate R code with nested ERROR nodes.
     /// Creates code patterns like:
     /// - `if (TRUE) { x <- }`
@@ -4600,48 +4720,7 @@ mod syntax_error_range_tests {
         fn prop_innermost_error_selection(code in nested_error_code()) {
             let tree = parse_r(&code);
             let root = tree.root_node();
-            
-            // Find the outermost ERROR node
-            fn find_outermost_error(node: Node) -> Option<Node> {
-                if node.is_error() {
-                    return Some(node);
-                }
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if let Some(error) = find_outermost_error(child) {
-                        return Some(error);
-                    }
-                }
-                None
-            }
-            
-            // Find the innermost ERROR node (deepest in the tree)
-            fn find_innermost_error_recursive(node: Node) -> Option<Node> {
-                if node.is_error() {
-                    // Check if any children are also ERROR nodes
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if child.is_error() {
-                            // Recurse to find deeper errors
-                            if let Some(innermost) = find_innermost_error_recursive(child) {
-                                return Some(innermost);
-                            }
-                        }
-                    }
-                    // No ERROR children, this is the innermost
-                    return Some(node);
-                }
-                
-                // Not an ERROR node, check children
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if let Some(innermost) = find_innermost_error_recursive(child) {
-                        return Some(innermost);
-                    }
-                }
-                None
-            }
-            
+
             let outermost = find_outermost_error(root);
             prop_assume!(outermost.is_some(), "Generated code must produce an ERROR node");
             
@@ -4758,22 +4837,8 @@ mod syntax_error_range_tests {
             let tree = parse_r(&code);
             let root = tree.root_node();
 
-            // Walk the entire tree to find all MISSING nodes
-            fn collect_missing_nodes(node: Node, out: &mut Vec<(u32, u32)>) {
-                if node.is_missing() {
-                    out.push((
-                        node.start_position().row as u32,
-                        node.start_position().column as u32,
-                    ));
-                }
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    collect_missing_nodes(child, &mut *out);
-                }
-            }
-
             let mut missing_positions: Vec<(u32, u32)> = Vec::new();
-            collect_missing_nodes(root, &mut missing_positions);
+            collect_missing_positions(root, &mut missing_positions);
 
             // Our generator should always produce at least one MISSING node
             prop_assume!(
@@ -4840,27 +4905,6 @@ mod syntax_error_range_tests {
             let tree = parse_r(&code);
             let root = tree.root_node();
 
-            // Walk the tree to find all single-line ERROR nodes
-            fn collect_single_line_errors(node: Node, out: &mut Vec<(u32, u32, u32, u32)>) {
-                if node.is_error() {
-                    let start_row = node.start_position().row as u32;
-                    let start_col = node.start_position().column as u32;
-                    let end_row = node.end_position().row as u32;
-                    let end_col = node.end_position().column as u32;
-                    if start_row == end_row {
-                        out.push((start_row, start_col, end_row, end_col));
-                    }
-                    // Don't recurse into ERROR children — collect_syntax_errors
-                    // doesn't recurse into ERROR nodes either, so nested single-line
-                    // ERROR nodes inside a parent ERROR won't produce separate diagnostics.
-                    return;
-                }
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    collect_single_line_errors(child, &mut *out);
-                }
-            }
-
             let mut single_line_errors: Vec<(u32, u32, u32, u32)> = Vec::new();
             collect_single_line_errors(root, &mut single_line_errors);
 
@@ -4888,37 +4932,6 @@ mod syntax_error_range_tests {
             // (a) the diagnostic preserves the full ERROR range, OR
             // (b) a MISSING node exists inside the ERROR (Phase 1 took priority)
             for &(s_row, s_col, e_row, e_col) in &single_line_errors {
-                // Check if there's a MISSING descendant that would override placement
-                fn has_missing_descendant(node: Node) -> bool {
-                    if node.is_missing() {
-                        return true;
-                    }
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if has_missing_descendant(child) {
-                            return true;
-                        }
-                    }
-                    false
-                }
-
-                // Re-find the ERROR node to check for MISSING descendants
-                fn find_error_at(node: Node, row: u32, col: u32) -> Option<Node> {
-                    if node.is_error()
-                        && node.start_position().row as u32 == row
-                        && node.start_position().column as u32 == col
-                    {
-                        return Some(node);
-                    }
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if let Some(found) = find_error_at(child, row, col) {
-                            return Some(found);
-                        }
-                    }
-                    None
-                }
-
                 let error_node = find_error_at(root, s_row, s_col);
                 let has_missing = error_node.map_or(false, |n| has_missing_descendant(n));
 
@@ -4972,23 +4985,6 @@ mod syntax_error_range_tests {
         fn prop_diagnostic_deduplication(code in nested_error_code()) {
             let tree = parse_r(&code);
             let root = tree.root_node();
-
-            // Count top-level ERROR nodes: ERROR nodes that are NOT children of
-            // another ERROR node. Since `collect_syntax_errors` does not recurse
-            // into ERROR children, only top-level ERROR nodes produce diagnostics.
-            fn count_top_level_errors(node: Node) -> usize {
-                if node.is_error() {
-                    // This is a top-level ERROR — don't recurse into its children
-                    // because collect_syntax_errors doesn't either.
-                    return 1;
-                }
-                let mut cursor = node.walk();
-                let mut count = 0;
-                for child in node.children(&mut cursor) {
-                    count += count_top_level_errors(child);
-                }
-                count
-            }
 
             let top_level_error_count = count_top_level_errors(root);
             prop_assume!(
@@ -5045,24 +5041,6 @@ mod syntax_error_range_tests {
         fn prop_leaf_error_exclusion(code in nested_error_code()) {
             let tree = parse_r(&code);
             let root = tree.root_node();
-
-            // Collect all ERROR nodes in the tree with their child counts
-            fn collect_all_errors(node: Node, out: &mut Vec<(usize, usize)>) {
-                // out entries: (child_count, start_row)
-                if node.is_error() {
-                    out.push((node.child_count(), node.start_position().row));
-                    // Recurse into ERROR children to find nested ERRORs
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        collect_all_errors(child, out);
-                    }
-                    return;
-                }
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    collect_all_errors(child, out);
-                }
-            }
 
             let mut all_errors: Vec<(usize, usize)> = Vec::new();
             collect_all_errors(root, &mut all_errors);
@@ -5154,20 +5132,6 @@ mod syntax_error_range_tests {
         fn prop_missing_node_width(code in missing_node_code()) {
             let tree = parse_r(&code);
             let root = tree.root_node();
-
-            // Walk the entire tree to find all MISSING nodes
-            fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32)>) {
-                if node.is_missing() {
-                    out.push((
-                        node.start_position().row as u32,
-                        node.start_position().column as u32,
-                    ));
-                }
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    collect_missing_positions(child, &mut *out);
-                }
-            }
 
             let mut missing_positions: Vec<(u32, u32)> = Vec::new();
             collect_missing_positions(root, &mut missing_positions);
