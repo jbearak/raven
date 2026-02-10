@@ -221,9 +221,10 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     };
 
     let mut packages = Vec::new();
-    let root = tree.root_node();
+    let mut stack = Vec::new();
+    stack.push(tree.root_node());
 
-    fn visit_node(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
+    while let Some(node) = stack.pop() {
         if node.kind() == "call" {
             // Check if this is a library/require/loadNamespace call
             if let Some(func_node) = node.child_by_field_name("function") {
@@ -251,15 +252,13 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
             }
         }
 
-        // Recurse into children
-        for i in 0..node.child_count() {
+        let child_count = node.child_count();
+        for i in (0..child_count).rev() {
             if let Some(child) = node.child(i) {
-                visit_node(child, text, packages);
+                stack.push(child);
             }
         }
     }
-
-    visit_node(root, text, &mut packages);
     packages
 }
 

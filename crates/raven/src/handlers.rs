@@ -480,8 +480,8 @@ impl<'a> SymbolExtractor<'a> {
 
         let op_text = node_text(op, self.text);
 
-        // Handle -> operator: RHS is the name, LHS is the value
-        if op_text == "->" {
+        // Handle -> and ->> operators: RHS is the name, LHS is the value
+        if matches!(op_text, "->" | "->>") {
             return self.extract_right_assignment(node, lhs, rhs);
         }
 
@@ -2586,7 +2586,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     }
 
     // Collect syntax errors (not suppressed by @lsp-ignore)
-    collect_syntax_errors(tree.root_node(), &mut diagnostics);
+    collect_syntax_errors(tree.root_node(), &text, &mut diagnostics);
 
     // Collect else-on-newline errors
     // _Requirements: 4.1_
@@ -3904,34 +3904,1953 @@ fn collect_identifier_usages_utf16<'a>(
     }
 }
 
-fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
-    if node.is_error() || node.is_missing() {
-        let message = if node.is_missing() {
-            format!("Missing {}", node.kind())
-        } else {
-            "Syntax error".to_string()
-        };
+/// Find the first MISSING descendant inside a node (depth-first).
+fn find_first_missing_descendant(node: Node) -> Option<Node> {
+    // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
+    let mut stack = vec![node];
 
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Push in reverse so traversal is left-to-right, depth-first.
+        for child in children.into_iter().rev() {
+            if child.is_missing() {
+                return Some(child);
+            }
+            stack.push(child);
+        }
+    }
+
+    None
+}
+
+/// Find the innermost (deepest) ERROR node within a tree that has children.
+///
+/// Performs a depth-first search to locate the deepest ERROR node in the tree
+/// that has child nodes. This avoids selecting leaf ERROR nodes (like a single
+/// `}` token) which are often just structural tokens marked as ERROR because
+/// the parser doesn't know what to do with them after an incomplete expression.
+///
+/// When multiple ERROR nodes exist at the same depth, returns the first one
+/// encountered in source order (left-to-right, top-to-bottom).
+///
+/// # Arguments
+///
+/// * `node` - The root node to search from
+///
+/// # Returns
+///
+/// * `Some(Node)` - The deepest ERROR node with children found
+/// * `None` - No ERROR nodes with children found in the tree
+fn find_innermost_error(node: Node) -> Option<Node> {
+    // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
+    let mut stack: Vec<(Node, usize)> = vec![(node, 0)];
+    let mut best: Option<(Node, usize)> = None;
+
+    while let Some((node, depth)) = stack.pop() {
+        if node.is_error() && node.child_count() > 0 {
+            match best {
+                None => best = Some((node, depth)),
+                Some((_, best_depth)) if depth > best_depth => best = Some((node, depth)),
+                _ => {}
+            }
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Push in reverse so traversal is left-to-right, depth-first.
+        for child in children.into_iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+
+    best.map(|(node, _)| node)
+}
+
+/// Recursively descend into a node (including ERROR nodes) to find the row of
+/// the first named token that is not a structural keyword or boolean/null literal.
+fn first_named_token_row(node: Node) -> Option<usize> {
+    // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
+    const STRUCTURAL_KEYWORDS: &[&str] = &["if", "else", "while", "for", "function", "repeat"];
+
+    let mut stack = vec![node];
+
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        // Push in reverse so traversal is left-to-right, depth-first.
+        for child in children.into_iter().rev() {
+            if !child.is_named() {
+                continue;
+            }
+            if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
+                continue;
+            }
+            if matches!(child.kind(), "true" | "false" | "null") {
+                continue;
+            }
+
+            if child.is_error() {
+                stack.push(child);
+                continue;
+            }
+
+            // A leaf named node (identifier, operator, etc.)
+            if child.child_count() == 0 {
+                return Some(child.start_position().row);
+            }
+
+            // Non-leaf named node: traverse into it
+            stack.push(child);
+        }
+    }
+
+    None
+}
+
+/// Find the first non-structural line within an ERROR node.
+///
+/// For a multi-line ERROR node, finds the first line that contains named children
+/// (identifiers, operators, etc.) that are NOT structural keywords (if, while, for, etc.)
+/// or punctuation ({, }, (, )). This helps identify where the actual incomplete expression is,
+/// rather than pointing to the structural parent construct.
+///
+/// # Arguments
+///
+/// * `node` - The ERROR node to analyze
+///
+/// # Returns
+///
+/// * `Some(row)` - The row number of the first line with non-structural content
+/// * `None` - No non-structural content found (shouldn't happen in practice)
+fn find_first_content_line(node: Node) -> Option<usize> {
+    let start_row = node.start_position().row;
+    let end_row = node.end_position().row;
+
+    // Single-line ERROR: return its line
+    if start_row == end_row {
+        return Some(start_row);
+    }
+
+    // Structural keywords to skip
+    const STRUCTURAL_KEYWORDS: &[&str] = &["if", "else", "while", "for", "function", "repeat"];
+
+    // Single pass: find the opening brace `{` and the first content line simultaneously.
+    // Content before the brace is only used if no brace exists at all.
+    let mut brace_row: Option<usize> = None;
+    let mut content_before_brace: Option<usize> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // Track opening brace
+        if !child.is_named() {
+            if child.kind() == "{" && brace_row.is_none() {
+                brace_row = Some(child.start_position().row);
+            }
+            continue;
+        }
+
+        // Recurse into ERROR children to find content tokens
+        if child.is_error() {
+            if let Some(row) = first_named_token_row(child) {
+                if let Some(br) = brace_row {
+                    if row > br {
+                        return Some(row);
+                    }
+                } else if content_before_brace.is_none() {
+                    content_before_brace = Some(row);
+                }
+            }
+            continue;
+        }
+
+        // Skip structural keywords
+        if STRUCTURAL_KEYWORDS.contains(&child.kind()) {
+            continue;
+        }
+
+        // Skip boolean/null literals that are part of the condition
+        if matches!(child.kind(), "true" | "false" | "null") {
+            continue;
+        }
+
+        let row = child.start_position().row;
+
+        if let Some(br) = brace_row {
+            if row > br {
+                // Content after brace — this is the content line
+                return Some(row);
+            }
+            // Content on or before brace row — skip
+        } else {
+            // No brace seen yet — remember as potential content
+            if content_before_brace.is_none() {
+                content_before_brace = Some(row);
+            }
+        }
+    }
+
+    // If no brace was found, use any content we found
+    if brace_row.is_none() {
+        return content_before_brace;
+    }
+
+    // Brace was found but no content after it: fall back to line after brace, clamped to end_row.
+    // Make the invariant explicit (requested in PR review feedback).
+    let brace_row = brace_row.unwrap();
+    Some((brace_row + 1).min(end_row))
+}
+
+/// For a multi-line ERROR node, compute a minimized diagnostic range that
+/// focuses on the first line of the error rather than spanning the entire
+/// enclosing block. This avoids distracting red squiggles on structurally
+/// valid code (like `if`, `{`, `}`) when the only problem is an incomplete
+/// expression on one line.
+fn minimize_error_range(node: Node, text: &str) -> Range {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let line_at = |row: usize| -> &str { text.lines().nth(row).unwrap_or("") };
+
+    let start_row = node.start_position().row;
+    let start_col = node.start_position().column;
+    let end_row = node.end_position().row;
+    let end_col = node.end_position().column;
+
+    // Phase 1: If there's a MISSING descendant, point the diagnostic there.
+    if let Some(missing) = find_first_missing_descendant(node) {
+        let m_row = missing.start_position().row as u32;
+        let m_col = byte_offset_to_utf16_column(
+            line_at(missing.start_position().row),
+            missing.start_position().column,
+        );
+        return Range {
+            start: Position::new(m_row, m_col),
+            // Give zero-width MISSING nodes a 1-column width for visibility
+            end: Position::new(m_row, m_col.saturating_add(1)),
+        };
+    }
+
+    // Phase 2: Find innermost ERROR node (NEW)
+    if let Some(innermost) = find_innermost_error(node) {
+        let inner_start_row = innermost.start_position().row;
+        let inner_end_row = innermost.end_position().row;
+
+        // If innermost is single-line, return its full range
+        if inner_start_row == inner_end_row {
+            let lt = line_at(inner_start_row);
+            let inner_start_col =
+                byte_offset_to_utf16_column(lt, innermost.start_position().column);
+            let inner_end_col = byte_offset_to_utf16_column(lt, innermost.end_position().column);
+            return Range {
+                start: Position::new(inner_start_row as u32, inner_start_col),
+                end: Position::new(inner_end_row as u32, inner_end_col),
+            };
+        }
+
+        // If innermost is multi-line, find the first line with actual content
+        if let Some(content_row) = find_first_content_line(innermost) {
+            // Find the last child of the innermost ERROR on the content row.
+            // This is typically the dangling operator (e.g., `<-` in `x <-`)
+            // rather than a valid identifier like `x`. Highlighting just the
+            // trailing incomplete token avoids false overlap with other diagnostics.
+            let mut last_child_on_row: Option<Node> = None;
+            let mut cursor = innermost.walk();
+            for child in innermost.children(&mut cursor) {
+                if child.start_position().row == content_row {
+                    last_child_on_row = Some(child);
+                } else if child.start_position().row > content_row {
+                    break;
+                }
+            }
+
+            if let Some(last_child) = last_child_on_row {
+                let lc_line = line_at(content_row);
+                let lc_start_col =
+                    byte_offset_to_utf16_column(lc_line, last_child.start_position().column);
+                let lc_end_col =
+                    byte_offset_to_utf16_column(lc_line, last_child.end_position().column);
+                let end_col = if lc_end_col <= lc_start_col {
+                    lc_start_col.saturating_add(1)
+                } else {
+                    lc_end_col
+                };
+                return Range {
+                    start: Position::new(content_row as u32, lc_start_col),
+                    end: Position::new(content_row as u32, end_col),
+                };
+            }
+
+            // Fallback: span the content line (no children found on it)
+            let first_line_end_col = text.lines().nth(content_row).map(utf16_len).unwrap_or(0);
+
+            let start_col = if content_row == inner_start_row {
+                byte_offset_to_utf16_column(
+                    line_at(inner_start_row),
+                    innermost.start_position().column,
+                )
+            } else {
+                0
+            };
+
+            let end_col_clamped = if first_line_end_col <= start_col {
+                start_col.saturating_add(1)
+            } else {
+                first_line_end_col
+            };
+
+            return Range {
+                start: Position::new(content_row as u32, start_col),
+                end: Position::new(content_row as u32, end_col_clamped),
+            };
+        }
+    }
+
+    // Phase 3: Fallback - Single-line ERROR: keep the full range as-is (already precise).
+    if start_row == end_row {
+        let lt = line_at(start_row);
+        return Range {
+            start: Position::new(start_row as u32, byte_offset_to_utf16_column(lt, start_col)),
+            end: Position::new(end_row as u32, byte_offset_to_utf16_column(lt, end_col)),
+        };
+    }
+
+    // Phase 3: Fallback - Multi-line ERROR: collapse to the first line only.
+    // Find the end column on the first line from the source text.
+    let start_line_text = line_at(start_row);
+    let first_line_end_col = utf16_len(start_line_text);
+    let start_col_utf16 = byte_offset_to_utf16_column(start_line_text, start_col);
+
+    // Ensure we have at least some width
+    let end_col_clamped = if first_line_end_col <= start_col_utf16 {
+        start_col_utf16.saturating_add(1)
+    } else {
+        first_line_end_col
+    };
+
+    Range {
+        start: Position::new(start_row as u32, start_col_utf16),
+        end: Position::new(start_row as u32, end_col_clamped),
+    }
+}
+
+fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    if node.is_error() {
+        diagnostics.push(Diagnostic {
+            range: minimize_error_range(node, text),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "Syntax error".to_string(),
+            ..Default::default()
+        });
+        // Don't recurse into ERROR children — the minimized range already
+        // accounts for nested MISSING nodes, and recursing would produce
+        // duplicate diagnostics for nested ERROR children.
+        return;
+    }
+
+    if node.is_missing() {
+        let row = node.start_position().row as u32;
+        let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
+        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
         diagnostics.push(Diagnostic {
             range: Range {
-                start: Position::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u32,
-                ),
-                end: Position::new(
-                    node.end_position().row as u32,
-                    node.end_position().column as u32,
-                ),
+                start: Position::new(row, col),
+                end: Position::new(row, col.saturating_add(1)),
             },
             severity: Some(DiagnosticSeverity::ERROR),
-            message,
+            message: format!("Missing {}", node.kind()),
             ..Default::default()
         });
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_syntax_errors(child, diagnostics);
+        collect_syntax_errors(child, text, diagnostics);
+    }
+}
+
+#[cfg(test)]
+mod syntax_error_range_tests {
+    use super::{collect_syntax_errors, find_first_content_line, find_innermost_error};
+    use tower_lsp::lsp_types::Diagnostic;
+
+    fn parse_r(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn collect(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r(code);
+        let mut diagnostics = Vec::new();
+        collect_syntax_errors(tree.root_node(), code, &mut diagnostics);
+        diagnostics
+    }
+
+    #[test]
+    fn incomplete_assignment_in_block_minimized() {
+        let code = "if (TRUE) {\n  x <-\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce at least one diagnostic");
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_comparison_in_block_minimized() {
+        let code = "if (TRUE) {\n  x <\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce at least one diagnostic");
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_binary_op_in_block_minimized() {
+        let code = "if (TRUE) {\n  x +\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty());
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_call_in_block_minimized() {
+        let code = "if (TRUE) {\n  f(\n}";
+        let diags = collect(code);
+        assert!(!diags.is_empty());
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should not span multiple lines: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_range_excludes_valid_lhs_identifier() {
+        // The diagnostic for `x <-` should highlight just `<-` (the dangling
+        // operator), not `x` which is a valid assignment target.
+        // This prevents false overlap with "Undefined variable" diagnostics
+        // and avoids confusing users by highlighting valid code.
+        let code = "if (1 == 1) {\n  x <-\n}";
+        // Line 1: "  x <-"
+        //           ^^ col 2-3: identifier "x"
+        //              ^^  col 4-6: operator "<-"
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d.range.start.line, 1);
+        assert_eq!(d.range.end.line, 1);
+        // Should start at column 4 (`<-`), not column 0 or 2 (`x`)
+        assert!(
+            d.range.start.character >= 4,
+            "diagnostic should not cover the identifier 'x' (col 2-3), \
+             but starts at col {}. Range: ({},{})..({},{})",
+            d.range.start.character,
+            d.range.start.line,
+            d.range.start.character,
+            d.range.end.line,
+            d.range.end.character,
+        );
+    }
+
+    #[test]
+    fn single_line_error_unchanged() {
+        // A single-line error should keep its full range
+        let code = "x <- )";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce a diagnostic");
+        // Single-line: start and end on same line
+        for d in &diags {
+            assert_eq!(d.range.start.line, d.range.end.line);
+        }
+    }
+
+    #[test]
+    fn top_level_incomplete_assignment() {
+        // Top-level `x <-` produces a MISSING identifier, not suppressed
+        let code = "x <-";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce a diagnostic for incomplete assignment"
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("Missing")),
+            "should report a Missing diagnostic"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_diagnostics() {
+        // For code that produces a multi-line ERROR with nested ERROR children,
+        // we should get exactly one diagnostic (not one per nested ERROR).
+        let code = "if (TRUE) {\n  x <-\n}";
+        let diags = collect(code);
+        assert_eq!(
+            diags.len(),
+            1,
+            "should produce exactly one diagnostic, got {}: {:?}",
+            diags.len(),
+            diags
+        );
+    }
+
+    #[test]
+    fn genuinely_broken_code_still_reports_error() {
+        let code = "x <- function( { }";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "genuinely broken code should still produce diagnostics"
+        );
+    }
+
+    #[test]
+    fn incomplete_assignment_range_is_on_first_line() {
+        // With the innermost error detection fix, the diagnostic should be on line 1
+        // (where the `x <-` is), not line 0 (where the `if` is) or line 2 (where `}` is).
+        let code = "if (TRUE) {\n  x <-\n}";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].range.start.line, 1,
+            "diagnostic should start on line 1 (where x <- is)"
+        );
+        assert_eq!(
+            diags[0].range.end.line, 1,
+            "diagnostic should end on line 1"
+        );
+    }
+
+    #[test]
+    fn multiple_errors_at_same_depth_picks_first_content_line() {
+        // When a block contains multiple incomplete expressions, the content-line
+        // detection should pick the FIRST content line (the first incomplete
+        // expression), not the structural parent or a later error.
+        // Validates: Requirement 3.2
+        let code = "if (TRUE) {\n  x <-\n  y +\n}";
+        // Lines:
+        //   0: "if (TRUE) {"
+        //   1: "  x <-"        ← first content line (first incomplete expr)
+        //   2: "  y +"         ← second incomplete expr
+        //   3: "}"
+        let first_content_line = code
+            .lines()
+            .enumerate()
+            .position(|(_, line)| line.contains("x <-"))
+            .expect("test code should contain 'x <-'") as u32;
+
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for code with syntax errors"
+        );
+        // The diagnostic should appear on the first content line, not on the
+        // structural parent (line 0) or a later error line.
+        assert_eq!(
+            diags[0].range.start.line, first_content_line,
+            "diagnostic should start on the first content line (line {}), got line {}",
+            first_content_line, diags[0].range.start.line
+        );
+        assert_eq!(
+            diags[0].range.end.line, first_content_line,
+            "diagnostic should end on the first content line (line {}), got line {}",
+            first_content_line, diags[0].range.end.line
+        );
+    }
+
+    #[test]
+    fn deeply_nested_error_skips_leaf_errors() {
+        // When tree-sitter produces deeply nested structures with leaf ERROR nodes
+        // (e.g., misplaced `}` tokens), `find_innermost_error` should skip those
+        // leaf ERROR nodes and return a non-leaf ERROR node instead.
+        //
+        // Validates: Requirements 1.2, 3.1
+        //
+        // For nested blocks like:
+        //   if (TRUE) {
+        //     if (TRUE) {
+        //       x <-
+        //     }
+        //   }
+        //
+        // tree-sitter wraps the entire structure in an ERROR node, with leaf ERROR
+        // nodes for the misplaced `}` tokens. `find_innermost_error` must return
+        // the parent ERROR (which has children), not a leaf ERROR.
+        let code = "if (TRUE) {\n  if (TRUE) {\n    x <-\n  }\n}";
+        // Lines:
+        //   0: "if (TRUE) {"
+        //   1: "  if (TRUE) {"
+        //   2: "    x <-"
+        //   3: "  }"
+        //   4: "}"
+
+        let tree = parse_r(code);
+        let root = tree.root_node();
+
+        // Use the production function to find the innermost non-leaf ERROR
+        let innermost = find_innermost_error(root);
+        assert!(
+            innermost.is_some(),
+            "find_innermost_error should find a non-leaf ERROR node"
+        );
+        let innermost = innermost.unwrap();
+
+        // The returned node must NOT be a leaf ERROR (must have children)
+        assert!(
+            innermost.child_count() > 0,
+            "find_innermost_error should skip leaf ERROR nodes (zero children), \
+             but returned a node with {} children",
+            innermost.child_count()
+        );
+
+        // The returned node must be an ERROR node
+        assert!(
+            innermost.is_error(),
+            "find_innermost_error should return an ERROR node"
+        );
+
+        // Collect diagnostics and verify placement
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for deeply nested error"
+        );
+
+        // Find the line containing the incomplete expression dynamically
+        let content_line = code
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("x <-"))
+            .map(|(i, _)| i as u32)
+            .expect("test code should contain 'x <-'");
+
+        // Find the last line (closing brace) — leaf ERROR nodes live here
+        let last_line = (code.lines().count() - 1) as u32;
+
+        // The diagnostic should NOT point to a leaf ERROR's line (the closing braces)
+        for d in &diags {
+            assert_ne!(
+                d.range.start.line, last_line,
+                "diagnostic should not point to the outermost closing brace (leaf ERROR line {})",
+                last_line
+            );
+        }
+
+        // The diagnostic should be on the content line or after it, not on line 0
+        // (the structural parent)
+        assert_eq!(
+            diags.len(),
+            1,
+            "should produce exactly one diagnostic, got {}: {:?}",
+            diags.len(),
+            diags
+        );
+        assert!(
+            diags[0].range.start.line >= content_line,
+            "diagnostic (line {}) should be on or after the content line (line {})",
+            diags[0].range.start.line,
+            content_line
+        );
+    }
+
+    // ========================================================================
+    // Edge Case Tests: Incomplete Expressions in Unusual Positions
+    // ========================================================================
+
+    #[test]
+    fn incomplete_assignment_in_while_condition() {
+        // `while ((i <-) < N) print(i)` — the incomplete assignment inside
+        // the condition should produce a diagnostic, but NOT on the `while` keyword.
+        let code = "while ((i <-) < N) print(i)";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete assignment in while condition"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not point to column 0 (the `while` keyword)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `while` keyword), \
+                 got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_assignment_as_function_argument() {
+        // `f(x <-)` — the diagnostic should not blame `f`.
+        let code = "f(x <-)";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete assignment as argument"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not start at column 0 (the `f` identifier)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `f` call), got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_assignment_in_subscript() {
+        // `x[i <-]` — the diagnostic should not blame `x`.
+        let code = "x[i <-]";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete assignment in subscript"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not start at column 0 (the `x` identifier)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `x` subscript), got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_named_argument() {
+        // `tryCatch(\n  expr,\n  error =\n)` — tree-sitter-r considers this
+        // valid syntax (an argument with `name =` and no value is accepted by
+        // the grammar). This is actually correct R: `tryCatch(expr, error = )`
+        // is legal syntax. Verify we do NOT produce false syntax errors.
+        let code = "tryCatch(\n  expr,\n  error =\n)";
+        let diags = collect(code);
+        // tree-sitter-r produces no ERROR/MISSING nodes for this code.
+        if diags.is_empty() {
+            // Expected: no diagnostics for valid R code.
+            return;
+        }
+        // If tree-sitter does produce diagnostics, verify they're well-placed.
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_with_empty_default() {
+        // `x <- function(a, b = ) { a }` — the diagnostic should not blame `x <-`.
+        let code = "x <- function(a, b = ) { a }";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for empty default parameter"
+        );
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+            // Should not start at column 0 (the `x` assignment target)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `x <-` assignment), \
+                 got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    // ========================================================================
+    // Edge Case Tests: False-Positive Prevention (Valid R Code)
+    // ========================================================================
+
+    #[test]
+    fn assignment_in_condition_is_valid() {
+        // `if (x <- 1) y` is valid R code — assignment in condition is legal.
+        let code = "if (x <- 1) y";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        // tree-sitter may or may not parse this cleanly. If it does produce
+        // diagnostics, document it as a grammar limitation.
+        if !syntax_or_missing.is_empty() {
+            // tree-sitter-r treats `if (x <- 1) y` as a syntax error, which
+            // is a grammar limitation — R accepts this code. Document but
+            // don't fail the test.
+            eprintln!(
+                "NOTE: tree-sitter-r produces diagnostics for valid `if (x <- 1) y`: {:?}",
+                syntax_or_missing
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn chained_assignment_is_valid() {
+        // `x <- y <- 1` is valid R code — chained left-assignment.
+        let code = "x <- y <- 1";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        assert!(
+            syntax_or_missing.is_empty(),
+            "chained assignment `x <- y <- 1` should not produce syntax errors, \
+             got: {:?}",
+            syntax_or_missing
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_switch_case_is_valid() {
+        // `switch(x, a =, b = 1)` is valid R — empty case falls through.
+        let code = "switch(x, a =, b = 1)";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        if !syntax_or_missing.is_empty() {
+            eprintln!(
+                "NOTE: tree-sitter-r produces diagnostics for valid `switch(x, a =, b = 1)`: {:?}",
+                syntax_or_missing
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_comma_in_c_is_valid() {
+        // `x <- c(1, 2, )` is valid R — trailing comma in c() is allowed.
+        let code = "x <- c(1, 2, )";
+        let diags = collect(code);
+        let syntax_or_missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .collect();
+        // tree-sitter should accept this. If not, document as grammar limitation.
+        if !syntax_or_missing.is_empty() {
+            eprintln!(
+                "NOTE: tree-sitter-r produces diagnostics for valid `c(1, 2, )`: {:?}",
+                syntax_or_missing
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // ========================================================================
+    // Edge Case Tests: Multi-Line Error Patterns
+    // ========================================================================
+
+    #[test]
+    fn incomplete_else_branch() {
+        // `if (TRUE) x <- 1 else y <-` — incomplete else branch.
+        let code = "if (TRUE) x <- 1 else y <-";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for incomplete else branch"
+        );
+        // Should have a Missing or Syntax error diagnostic
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_for_sequence() {
+        // `for (i in ) print(i)` — empty sequence expression.
+        let code = "for (i in ) print(i)";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for empty for sequence"
+        );
+        for d in &diags {
+            // Should not blame the `for` keyword at column 0
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `for` keyword), got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn double_operator_across_lines() {
+        // `x <- 1 +\n+ 2` — double operator across lines.
+        let code = "x <- 1 +\n+ 2";
+        let diags = collect(code);
+        // Count only "Syntax error" diagnostics (not "Missing")
+        let syntax_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message == "Syntax error")
+            .collect();
+        // Should produce at most one syntax error (no cascading duplicates)
+        assert!(
+            syntax_errors.len() <= 1,
+            "should produce at most one syntax error (no cascading), got {}: {:?}",
+            syntax_errors.len(),
+            syntax_errors.iter().map(|d| d.range).collect::<Vec<_>>()
+        );
+        // All diagnostics should be single-line
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_incomplete_in_loop() {
+        // Deeply nested incomplete expression: the diagnostic should NOT be on
+        // line 0 (the `if` keyword). tree-sitter flattens the entire construct
+        // into a single ERROR node, and the algorithm places the diagnostic on
+        // the first content line it finds inside the ERROR (which is the `for`
+        // loop line, not the `x <-` line, because all tokens are flattened).
+        let code = "if (T) {\n  for (i in 1:10) {\n    x <-\n  }\n}";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for deeply nested incomplete expression"
+        );
+
+        // No diagnostic should be on line 0 (the `if` keyword)
+        assert!(
+            !diags.iter().any(|d| d.range.start.line == 0),
+            "no diagnostic should be on line 0 (the `if` keyword), got lines: {:?}",
+            diags.iter().map(|d| d.range.start.line).collect::<Vec<_>>()
+        );
+
+        // All diagnostics should be single-line
+        for d in &diags {
+            assert_eq!(
+                d.range.start.line, d.range.end.line,
+                "diagnostic should be single-line: {:?}",
+                d.range
+            );
+        }
+    }
+
+    // ========================================================================
+    // Edge Case Tests: String/Delimiter Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn unclosed_string_literal() {
+        // `x <- "unclosed string` — unclosed string literal.
+        let code = "x <- \"unclosed string";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for unclosed string literal"
+        );
+        for d in &diags {
+            // Should not start at column 0 (the `x` assignment target)
+            assert!(
+                d.range.start.character > 0,
+                "diagnostic should not start at column 0 (the `x <-` assignment), \
+                 got col {}",
+                d.range.start.character
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_library_call() {
+        // `library(` — unclosed function call.
+        let code = "library(";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for unclosed library call"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_argument_list() {
+        // `f(,)` — empty argument list with comma.
+        let code = "f(,)";
+        let diags = collect(code);
+        // If tree-sitter produces errors, they should not blame `f`
+        for d in &diags {
+            if d.message == "Syntax error" {
+                assert!(
+                    d.range.start.character > 0,
+                    "syntax error should not start at column 0 (the `f` call), got col {}",
+                    d.range.start.character
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn double_semicolon() {
+        // `x <- ; y` — semicolon after incomplete assignment.
+        let code = "x <- ; y";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "should produce at least one diagnostic for double semicolon"
+        );
+        // Should have at least one syntax or missing diagnostic
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
+    // Property-Based Tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+    use tree_sitter::Node;
+
+    // ========================================================================
+    // Shared test helpers for property-based tests
+    // ========================================================================
+
+    /// Find the outermost (first) ERROR node in the tree via depth-first search.
+    fn find_outermost_error(node: Node) -> Option<Node> {
+        if node.is_error() {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(error) = find_outermost_error(child) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    /// Collect all MISSING node positions (row, col) in the tree.
+    fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32)>) {
+        if node.is_missing() {
+            out.push((
+                node.start_position().row as u32,
+                node.start_position().column as u32,
+            ));
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_missing_positions(child, &mut *out);
+        }
+    }
+
+    /// Collect top-level single-line ERROR nodes (start_row, start_col, end_row, end_col).
+    /// Mirrors `collect_syntax_errors` by not recursing into ERROR children.
+    fn collect_single_line_errors(node: Node, out: &mut Vec<(u32, u32, u32, u32)>) {
+        if node.is_error() {
+            let start_row = node.start_position().row as u32;
+            let start_col = node.start_position().column as u32;
+            let end_row = node.end_position().row as u32;
+            let end_col = node.end_position().column as u32;
+            if start_row == end_row {
+                out.push((start_row, start_col, end_row, end_col));
+            }
+            // Don't recurse into ERROR children — collect_syntax_errors
+            // doesn't recurse into ERROR nodes either.
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_single_line_errors(child, &mut *out);
+        }
+    }
+
+    /// Check if a node or any of its descendants is a MISSING node.
+    fn has_missing_descendant(node: Node) -> bool {
+        if node.is_missing() {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if has_missing_descendant(child) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find an ERROR node at a specific (row, col) position.
+    fn find_error_at(node: Node, row: u32, col: u32) -> Option<Node> {
+        if node.is_error()
+            && node.start_position().row as u32 == row
+            && node.start_position().column as u32 == col
+        {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_error_at(child, row, col) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Count top-level ERROR nodes (not recursing into ERROR children).
+    /// Mirrors the behavior of `collect_syntax_errors`.
+    fn count_top_level_errors(node: Node) -> usize {
+        if node.is_error() {
+            return 1;
+        }
+        let mut cursor = node.walk();
+        let mut count = 0;
+        for child in node.children(&mut cursor) {
+            count += count_top_level_errors(child);
+        }
+        count
+    }
+
+    /// Collect all ERROR nodes in the tree with their (child_count, start_row).
+    fn collect_all_errors(node: Node, out: &mut Vec<(usize, usize)>) {
+        if node.is_error() {
+            out.push((node.child_count(), node.start_position().row));
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_all_errors(child, out);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_all_errors(child, out);
+        }
+    }
+
+    /// Strategy to generate R code with nested ERROR nodes.
+    /// Creates code patterns like:
+    /// - `if (TRUE) { x <- }`
+    /// - `while (x) { y + }`
+    /// - `for (i in 1:10) { z < }`
+    fn nested_error_code() -> impl Strategy<Value = String> {
+        let incomplete_exprs = vec!["x <-", "y +", "z -", "a *", "b /", "c <", "d >", "e =="];
+
+        let control_structures = vec!["if (TRUE)", "if (FALSE)", "while (x)", "for (i in 1:10)"];
+
+        // Standard pattern: control structure wrapping an incomplete expression
+        let block_errors = (
+            prop::sample::select(control_structures),
+            prop::sample::select(incomplete_exprs),
+        )
+            .prop_map(|(ctrl, expr)| format!("{} {{\n  {}\n}}", ctrl, expr));
+
+        // Condition-level patterns: incomplete expressions inside conditions
+        let condition_errors = prop::sample::select(vec![
+            "while ((i <-) < N) print(i)",
+            "if ((y <-) == 1) z",
+            "for (i in ) print(i)",
+        ])
+        .prop_map(|p| p.to_string());
+
+        prop_oneof![block_errors, condition_errors]
+    }
+
+    /// Strategy to generate R code that produces MISSING nodes.
+    ///
+    /// MISSING nodes are produced by tree-sitter for top-level incomplete
+    /// expressions where the parser can infer what token is expected.
+    /// Examples:
+    /// - `x <-` → MISSING identifier (right-hand side)
+    /// - `f(` → MISSING `)` (closing paren)
+    /// - `x <- 1 +` → MISSING identifier (right operand)
+    fn missing_node_code() -> impl Strategy<Value = String> {
+        // Top-level incomplete expressions that reliably produce MISSING nodes.
+        // Expressions inside blocks may NOT produce MISSING nodes (tree-sitter
+        // wraps them in a flat ERROR instead), so we use top-level patterns.
+        let patterns = vec![
+            // Incomplete assignments: MISSING identifier on RHS
+            "x <-", "y <-", "myvar <-", // Unclosed function calls: MISSING )
+            "f(", "g(1,", "h(x, y,",
+            // Incomplete binary after assignment: MISSING identifier
+            "x <- 1 +", "y <- a *",
+        ];
+
+        prop::sample::select(patterns).prop_map(|p| p.to_string())
+    }
+
+    /// Strategy to generate single-line R code that produces single-line ERROR nodes.
+    ///
+    /// These are misplaced tokens or broken expressions that tree-sitter wraps in
+    /// an ERROR node confined to a single line. Examples:
+    /// - `) extra` — stray closing paren
+    /// - `+ y` — leading operator
+    /// - `} stuff` — stray closing brace
+    /// - `x <- ) y` — misplaced token after assignment
+    fn single_line_error_code() -> impl Strategy<Value = String> {
+        // Patterns that reliably produce single-line ERROR nodes.
+        // We combine a valid prefix (possibly empty) with a misplaced token.
+        let stray_tokens = vec![")", "]", "]]", "}", ",", "} extra", ") extra"];
+
+        let valid_prefixes = vec!["", "x <- 1; ", "y <- 2\n", "a <- 'hello'\n"];
+
+        (
+            prop::sample::select(valid_prefixes),
+            prop::sample::select(stray_tokens),
+        )
+            .prop_map(|(prefix, token)| format!("{}{}", prefix, token))
+    }
+
+    /// Strategy to generate a broad variety of syntactically invalid R code.
+    ///
+    /// This combines several error patterns beyond the specific strategies above:
+    /// - Unmatched delimiters (braces, parens, brackets)
+    /// - Incomplete control flow (if/while/for without body)
+    /// - Double operators
+    /// - Trailing commas in unexpected places
+    /// - Incomplete function definitions
+    fn broad_syntax_error_code() -> impl Strategy<Value = String> {
+        let patterns = vec![
+            // Unmatched delimiters
+            "{ x <- 1",
+            "x <- c(1, 2",
+            "x[1",
+            "x[[1",
+            // Incomplete control flow
+            "if (TRUE)",
+            "while (x)",
+            "for (i in 1:10)",
+            // Double/misplaced operators
+            "x <- <- 1",
+            "x ++ y",
+            "x ** y",
+            // Trailing commas / misplaced tokens
+            "c(1, 2,)",
+            "x <- ; y",
+            // Incomplete function definitions
+            "f <- function(",
+            "f <- function(x,",
+            // Broken expressions
+            "x <- function() { y <- }",
+            "if (TRUE) { } else",
+            "x <- 1 + * 2",
+            // Stray keywords / tokens
+            "} x <- 1",
+            ") + 1",
+            "x <- 1 )",
+        ];
+
+        prop::sample::select(patterns).prop_map(|p| p.to_string())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 2: Innermost ERROR Selection
+        //
+        // For any multi-line ERROR node containing nested ERROR node children,
+        // the diagnostic range SHALL be placed at the location of the deepest
+        // (innermost) ERROR node in the tree.
+        //
+        // **Validates: Requirements 1.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_innermost_error_selection(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let outermost = find_outermost_error(root);
+            prop_assume!(outermost.is_some(), "Generated code must produce an ERROR node");
+
+            let outermost = outermost.unwrap();
+
+            // Collect diagnostics
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(!diagnostics.is_empty(), "Should produce at least one diagnostic for code: {}", code);
+
+            // The diagnostic should NOT be on the first line of the outermost ERROR
+            // (which would be the structural parent like `if`, `while`, etc.)
+            // unless the outermost ERROR is single-line
+            let outermost_start_line = outermost.start_position().row as u32;
+            let outermost_end_line = outermost.end_position().row as u32;
+
+            // If the outermost ERROR is multi-line, the diagnostic should NOT be on its first line
+            // (the structural parent line)
+            if outermost_end_line > outermost_start_line {
+                for diag in &diagnostics {
+                    prop_assert_ne!(
+                        diag.range.start.line,
+                        outermost_start_line,
+                        "Diagnostic should not be on the structural parent line ({}). Code: {}",
+                        outermost_start_line,
+                        code
+                    );
+                }
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 2: Content line placement
+        //
+        // For any multi-line ERROR node where `find_first_content_line` returns a row,
+        // the diagnostic range SHALL start on that row, not on the structural parent's
+        // line or the leaf ERROR's line.
+        //
+        // **Validates: Requirements 1.1, 1.2, 3.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_content_line_placement(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Find the innermost non-leaf ERROR node using the production function
+            let innermost = find_innermost_error(root);
+            prop_assume!(innermost.is_some(), "Generated code must produce a non-leaf ERROR node");
+            let innermost = innermost.unwrap();
+
+            let inner_start_row = innermost.start_position().row;
+            let inner_end_row = innermost.end_position().row;
+
+            // Only test multi-line ERROR nodes (single-line is a different property)
+            prop_assume!(
+                inner_end_row > inner_start_row,
+                "Innermost ERROR must be multi-line"
+            );
+
+            // Get the content line from the production function
+            let content_row = find_first_content_line(innermost);
+            prop_assume!(content_row.is_some(), "find_first_content_line must return a row");
+            let content_row = content_row.unwrap();
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code: {}",
+                code
+            );
+
+            // Find the diagnostic that corresponds to our ERROR node.
+            // Since collect_syntax_errors doesn't recurse into ERROR children,
+            // there should be exactly one diagnostic for the outermost ERROR.
+            let diag = &diagnostics[0];
+
+            // The diagnostic should start on the content line, not on the
+            // structural parent's line or the leaf ERROR's line.
+            prop_assert_eq!(
+                diag.range.start.line,
+                content_row as u32,
+                "Diagnostic should start on content line {} but started on line {}. Code: {}",
+                content_row,
+                diag.range.start.line,
+                code
+            );
+
+            // The content line should NOT be the leaf ERROR line (closing brace line)
+            // For our generated code, the leaf ERROR is always on the last line
+            prop_assert_ne!(
+                content_row,
+                inner_end_row,
+                "Content line should not be the leaf ERROR line (end of ERROR node). Code: {}",
+                code
+            );
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 3: MISSING node priority
+        //
+        // For any ERROR node containing a MISSING node descendant, the diagnostic
+        // range SHALL be placed at the MISSING node's location, regardless of other
+        // ERROR nodes present.
+        //
+        // **Validates: Requirements 1.3**
+        // ============================================================================
+
+        #[test]
+        fn prop_missing_node_priority(code in missing_node_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            collect_missing_positions(root, &mut missing_positions);
+
+            // Our generator should always produce at least one MISSING node
+            prop_assume!(
+                !missing_positions.is_empty(),
+                "Generated code must produce at least one MISSING node"
+            );
+
+            // Collect diagnostics
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code with MISSING nodes: {}",
+                code
+            );
+
+            // For each MISSING node position, there should be a diagnostic placed
+            // at that exact location. The diagnostic may come from:
+            // 1. minimize_error_range Phase 1 (MISSING inside ERROR → "Syntax error")
+            // 2. collect_syntax_errors direct MISSING handling (→ "Missing <kind>")
+            //
+            // In either case, the diagnostic start position must match the MISSING
+            // node's position.
+            for &(m_row, m_col) in &missing_positions {
+                let has_matching_diag = diagnostics.iter().any(|d| {
+                    d.range.start.line == m_row && d.range.start.character == m_col
+                });
+
+                prop_assert!(
+                    has_matching_diag,
+                    "Expected a diagnostic at MISSING node position ({}, {}) but none found. \
+                     Code: {}, Diagnostics: {:?}",
+                    m_row,
+                    m_col,
+                    code,
+                    diagnostics
+                        .iter()
+                        .map(|d| format!(
+                            "({},{})..({},{}) '{}'",
+                            d.range.start.line,
+                            d.range.start.character,
+                            d.range.end.line,
+                            d.range.end.character,
+                            d.message
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 4: Single-line range preservation
+        //
+        // For any single-line ERROR node (where start row equals end row), the
+        // diagnostic range SHALL preserve the full range of the ERROR node without
+        // modification.
+        //
+        // **Validates: Requirements 1.4**
+        // ============================================================================
+
+        #[test]
+        fn prop_single_line_range_preservation(code in single_line_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let mut single_line_errors: Vec<(u32, u32, u32, u32)> = Vec::new();
+            collect_single_line_errors(root, &mut single_line_errors);
+
+            // Our generator should produce at least one single-line ERROR node
+            prop_assume!(
+                !single_line_errors.is_empty(),
+                "Generated code must produce at least one single-line ERROR node"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code: {}",
+                code
+            );
+
+            // For each top-level single-line ERROR node, there should be a
+            // diagnostic whose range exactly matches the ERROR node's range.
+            // Note: MISSING nodes inside the ERROR may cause the diagnostic
+            // to be placed at the MISSING location instead (Phase 1 priority),
+            // so we check that either:
+            // (a) the diagnostic preserves the full ERROR range, OR
+            // (b) a MISSING node exists inside the ERROR (Phase 1 took priority)
+            for &(s_row, s_col, e_row, e_col) in &single_line_errors {
+                let error_node = find_error_at(root, s_row, s_col);
+                let has_missing = error_node.map_or(false, |n| has_missing_descendant(n));
+
+                if has_missing {
+                    // Phase 1 (MISSING priority) may override the range — that's OK
+                    continue;
+                }
+
+                // The diagnostic for this single-line ERROR should preserve its full range
+                let has_matching_diag = diagnostics.iter().any(|d| {
+                    d.range.start.line == s_row
+                        && d.range.start.character == s_col
+                        && d.range.end.line == e_row
+                        && d.range.end.character == e_col
+                });
+
+                prop_assert!(
+                    has_matching_diag,
+                    "Expected diagnostic with exact range ({},{})..({},{}) for single-line ERROR \
+                     but none found. Code: {}, Diagnostics: {:?}",
+                    s_row,
+                    s_col,
+                    e_row,
+                    e_col,
+                    code,
+                    diagnostics
+                        .iter()
+                        .map(|d| format!(
+                            "({},{})..({},{}) '{}'",
+                            d.range.start.line,
+                            d.range.start.character,
+                            d.range.end.line,
+                            d.range.end.character,
+                            d.message
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 5: Diagnostic deduplication
+        //
+        // For any multi-line ERROR node containing nested ERROR node children,
+        // the system SHALL emit exactly one diagnostic for the entire error structure.
+        //
+        // **Validates: Requirements 2.1**
+        // ============================================================================
+
+        #[test]
+        fn prop_diagnostic_deduplication(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let top_level_error_count = count_top_level_errors(root);
+            prop_assume!(
+                top_level_error_count > 0,
+                "Generated code must produce at least one ERROR node"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            // Count only "Syntax error" diagnostics (not "Missing ..." diagnostics,
+            // which come from MISSING nodes outside ERROR nodes and are separate).
+            let syntax_error_count = diagnostics
+                .iter()
+                .filter(|d| d.message == "Syntax error")
+                .count();
+
+            // The number of "Syntax error" diagnostics must not exceed the number
+            // of top-level ERROR nodes. This ensures nested ERROR children do not
+            // produce duplicate diagnostics.
+            prop_assert!(
+                syntax_error_count <= top_level_error_count,
+                "Diagnostic count ({}) should not exceed top-level ERROR count ({}). \
+                 Code: {}, Diagnostics: {:?}",
+                syntax_error_count,
+                top_level_error_count,
+                code,
+                diagnostics
+                    .iter()
+                    .map(|d| format!(
+                        "({},{})..({},{}) '{}'",
+                        d.range.start.line,
+                        d.range.start.character,
+                        d.range.end.line,
+                        d.range.end.character,
+                        d.message
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 6: Leaf ERROR exclusion
+        //
+        // For any multi-line ERROR node containing only leaf ERROR children
+        // (zero-child ERROR nodes), `find_innermost_error` SHALL return the parent
+        // ERROR node, not the leaf.
+        //
+        // **Validates: Requirements 3.1**
+        // ============================================================================
+
+        #[test]
+        fn prop_leaf_error_exclusion(code in nested_error_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let mut all_errors: Vec<(usize, usize)> = Vec::new();
+            collect_all_errors(root, &mut all_errors);
+
+            // We need at least one ERROR node to test
+            prop_assume!(
+                !all_errors.is_empty(),
+                "Generated code must produce at least one ERROR node"
+            );
+
+            // Use the production function to find the innermost non-leaf ERROR
+            let result = find_innermost_error(root);
+
+            // Check if there are any non-leaf ERROR nodes (child_count > 0)
+            let has_non_leaf_error = all_errors.iter().any(|(cc, _)| *cc > 0);
+
+            if has_non_leaf_error {
+                // If there's at least one non-leaf ERROR, find_innermost_error
+                // MUST return Some and the returned node MUST have children
+                // (i.e., it must NOT be a leaf ERROR).
+                prop_assert!(
+                    result.is_some(),
+                    "find_innermost_error should return Some when non-leaf ERROR nodes exist. \
+                     Code: {}, All errors (child_count, start_row): {:?}",
+                    code,
+                    all_errors
+                );
+
+                let returned = result.unwrap();
+
+                prop_assert!(
+                    returned.is_error(),
+                    "find_innermost_error must return an ERROR node. Code: {}",
+                    code
+                );
+
+                prop_assert!(
+                    returned.child_count() > 0,
+                    "find_innermost_error must NOT return a leaf ERROR node \
+                     (child_count must be > 0), but got child_count={}. \
+                     Code: {}, All errors (child_count, start_row): {:?}",
+                    returned.child_count(),
+                    code,
+                    all_errors
+                );
+
+                // Additionally verify that no leaf ERROR was chosen over a non-leaf
+                // by checking that the returned node is not any of the leaf ERRORs
+                let leaf_error_rows: Vec<usize> = all_errors
+                    .iter()
+                    .filter(|(cc, _)| *cc == 0)
+                    .map(|(_, row)| *row)
+                    .collect();
+
+                // The returned node should not be at a position that only has
+                // leaf ERROR nodes — but since we already checked child_count > 0,
+                // this is guaranteed. We verify the stronger property: if there
+                // are leaf ERRORs, the returned node is distinct from all of them.
+                if !leaf_error_rows.is_empty() {
+                    // The returned node has children, so it's definitionally not
+                    // a leaf. This assertion is redundant but documents the intent.
+                    prop_assert!(
+                        returned.child_count() > 0,
+                        "Returned ERROR must not be a leaf when leaf ERRORs exist"
+                    );
+                }
+            } else {
+                // All ERROR nodes are leaves — find_innermost_error should return None
+                prop_assert!(
+                    result.is_none(),
+                    "find_innermost_error should return None when only leaf ERROR nodes exist. \
+                     Code: {}, All errors (child_count, start_row): {:?}",
+                    code,
+                    all_errors
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 7: MISSING node width
+        //
+        // For any MISSING node, the diagnostic range SHALL have a width of exactly
+        // 1 column to ensure visibility in the editor.
+        //
+        // **Validates: Requirements 4.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_missing_node_width(code in missing_node_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            collect_missing_positions(root, &mut missing_positions);
+
+            // Our generator should always produce at least one MISSING node
+            prop_assume!(
+                !missing_positions.is_empty(),
+                "Generated code must produce at least one MISSING node"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for code with MISSING nodes: {}",
+                code
+            );
+
+            // For each MISSING node position, find the corresponding diagnostic
+            // and verify it has a width of exactly 1 column on a single line.
+            //
+            // MISSING-based diagnostics can appear as:
+            // 1. "Missing <kind>" — from collect_syntax_errors direct MISSING handling
+            // 2. "Syntax error" — from minimize_error_range Phase 1 (MISSING inside ERROR)
+            //
+            // Both paths create a 1-column-wide range at the MISSING node's position.
+            for &(m_row, m_col) in &missing_positions {
+                let matching_diag = diagnostics.iter().find(|d| {
+                    d.range.start.line == m_row && d.range.start.character == m_col
+                });
+
+                // There should be a diagnostic at this MISSING position
+                // (already validated by Property 3, but we need the diagnostic
+                // to check its width)
+                prop_assert!(
+                    matching_diag.is_some(),
+                    "Expected a diagnostic at MISSING node position ({}, {}) but none found. \
+                     Code: {}, Diagnostics: {:?}",
+                    m_row,
+                    m_col,
+                    code,
+                    diagnostics
+                        .iter()
+                        .map(|d| format!(
+                            "({},{})..({},{}) '{}'",
+                            d.range.start.line,
+                            d.range.start.character,
+                            d.range.end.line,
+                            d.range.end.character,
+                            d.message
+                        ))
+                        .collect::<Vec<_>>()
+                );
+
+                let diag = matching_diag.unwrap();
+
+                // The diagnostic must be on a single line
+                prop_assert_eq!(
+                    diag.range.start.line,
+                    diag.range.end.line,
+                    "MISSING node diagnostic must be on a single line, but spans lines {}..{}. \
+                     Code: {}, Position: ({}, {})",
+                    diag.range.start.line,
+                    diag.range.end.line,
+                    code,
+                    m_row,
+                    m_col
+                );
+
+                // The diagnostic must have a width of exactly 1 column
+                let width = diag.range.end.character - diag.range.start.character;
+                prop_assert_eq!(
+                    width,
+                    1,
+                    "MISSING node diagnostic must have width of exactly 1 column, \
+                     but has width {}. Range: ({},{})..({},{}). Code: {}",
+                    width,
+                    diag.range.start.line,
+                    diag.range.start.character,
+                    diag.range.end.line,
+                    diag.range.end.character,
+                    code
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 8: Error detection completeness
+        //
+        // For any R code containing syntax errors, the system SHALL emit at least
+        // one diagnostic.
+        //
+        // **Validates: Requirements 4.4**
+        // ============================================================================
+
+        #[test]
+        fn prop_error_detection_completeness(
+            code in prop_oneof![
+                nested_error_code(),
+                missing_node_code(),
+                single_line_error_code(),
+                broad_syntax_error_code(),
+            ]
+        ) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            // Only test code that tree-sitter actually considers erroneous.
+            // `has_error()` is true when the tree contains any ERROR or MISSING nodes.
+            prop_assume!(
+                root.has_error(),
+                "Generated code must contain syntax errors (tree-sitter has_error)"
+            );
+
+            // Collect diagnostics using the production code path
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            // The system must emit at least one diagnostic for any code with errors
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Code with syntax errors must produce at least one diagnostic. \
+                 Code: {:?}, has_error: {}",
+                code,
+                root.has_error()
+            );
+
+            // Every emitted diagnostic must have a valid severity
+            for diag in &diagnostics {
+                prop_assert!(
+                    diag.severity.is_some(),
+                    "Every diagnostic must have a severity. Code: {:?}, Message: {}",
+                    code,
+                    diag.message
+                );
+            }
+
+            // Every emitted diagnostic must have a non-empty message
+            for diag in &diagnostics {
+                prop_assert!(
+                    !diag.message.is_empty(),
+                    "Every diagnostic must have a non-empty message. Code: {:?}",
+                    code
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: syntax-error-diagnostic-placement, Property 9: Condition-level errors
+        //
+        // For incomplete expressions inside control-flow conditions (e.g.,
+        // `while ((i <-) < N)`), the diagnostic SHALL be single-line and,
+        // when tree-sitter can isolate the error, SHALL NOT be placed on the
+        // control keyword (column 0).
+        //
+        // NOTE: Some single-line patterns (e.g., `if ((y <-) == 1) z`) produce
+        // a whole-line ERROR node because tree-sitter can't isolate the inner
+        // error — those are tested separately in unit tests without the column
+        // assertion.
+        //
+        // **Validates: Requirements 1.1, 1.2**
+        // ============================================================================
+
+        #[test]
+        fn prop_nested_condition_errors(
+            code in prop::sample::select(vec![
+                "while ((i <-) < N) print(i)",
+                "for (i in ) print(i)",
+            ]).prop_map(|p| p.to_string())
+        ) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            prop_assume!(
+                root.has_error(),
+                "Generated code must contain syntax errors"
+            );
+
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            prop_assert!(
+                !diagnostics.is_empty(),
+                "Should produce at least one diagnostic for condition-level error: {}",
+                code
+            );
+
+            // All diagnostics should be single-line and not on the control keyword
+            for diag in &diagnostics {
+                prop_assert_eq!(
+                    diag.range.start.line,
+                    diag.range.end.line,
+                    "Diagnostic should be single-line. Code: {}, Range: ({},{})..({},{})",
+                    code,
+                    diag.range.start.line,
+                    diag.range.start.character,
+                    diag.range.end.line,
+                    diag.range.end.character,
+                );
+
+                // Diagnostic should not start at column 0 (the control keyword)
+                prop_assert!(
+                    diag.range.start.character > 0,
+                    "Diagnostic should not start at column 0 (control keyword). \
+                     Code: {}, Range: ({},{})..({},{})",
+                    code,
+                    diag.range.start.line,
+                    diag.range.start.character,
+                    diag.range.end.line,
+                    diag.range.end.character,
+                );
+            }
+        }
     }
 }
 
@@ -4291,6 +6210,7 @@ fn collect_undefined_variables(
     cross_file_symbols: &HashMap<String, ScopedSymbol>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
     use std::collections::HashSet;
 
     let mut defined: HashSet<String> = HashSet::new();
@@ -4310,16 +6230,19 @@ fn collect_undefined_variables(
             && !workspace_imports.contains(&name)
             && !cross_file_symbols.contains_key(&name)
         {
+            let start_pos = node.start_position();
+            let end_pos = node.end_position();
+
+            let start_line_text = text.lines().nth(start_pos.row).unwrap_or("");
+            let end_line_text = text.lines().nth(end_pos.row).unwrap_or("");
+
+            let start_col = byte_offset_to_utf16_column(start_line_text, start_pos.column);
+            let end_col = byte_offset_to_utf16_column(end_line_text, end_pos.column);
+
             diagnostics.push(Diagnostic {
                 range: Range {
-                    start: Position::new(
-                        node.start_position().row as u32,
-                        node.start_position().column as u32,
-                    ),
-                    end: Position::new(
-                        node.end_position().row as u32,
-                        node.end_position().column as u32,
-                    ),
+                    start: Position::new(start_pos.row as u32, start_col),
+                    end: Position::new(end_pos.row as u32, end_col),
                 },
                 severity: Some(DiagnosticSeverity::WARNING),
                 message: format!("Undefined variable: {}", name),
@@ -4335,12 +6258,14 @@ fn collect_definitions(node: Node, text: &str, defined: &mut std::collections::H
         let children: Vec<_> = node.children(&mut cursor).collect();
 
         if children.len() >= 3 {
-            let lhs = children[0];
-            let op = children[1];
-
-            let op_text = node_text(op, text);
-            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
-                defined.insert(node_text(lhs, text).to_string());
+            let op_text = node_text(children[1], text);
+            // Left-assignment: target is children[0]
+            if matches!(op_text, "<-" | "=" | "<<-") && children[0].kind() == "identifier" {
+                defined.insert(node_text(children[0], text).to_string());
+            }
+            // Right-assignment: target is children[2]
+            if matches!(op_text, "->" | "->>") && children[2].kind() == "identifier" {
+                defined.insert(node_text(children[2], text).to_string());
             }
         }
     }
@@ -4388,17 +6313,35 @@ struct UsageContext {
 /// Only used in tests for backward compatibility with existing property tests.
 #[cfg(test)]
 fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'a>)>) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
+
     if node.kind() == "identifier" {
-        // Skip if this is the LHS of an assignment
+        // Skip if this is the target of an assignment
         if let Some(parent) = node.parent() {
             if parent.kind() == "binary_operator" {
                 let mut cursor = parent.walk();
                 let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = node_text(op, text);
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        return; // Skip LHS of assignment
+                if children.len() >= 2 {
+                    let op_text = node_text(children[1], text);
+                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
+                        return;
+                    }
+                    if children.len() >= 3
+                        && children[2].id() == node.id()
+                        && matches!(op_text, "->" | "->>")
+                    {
+                        return;
+                    }
+                }
+            }
+
+            if let Some(prev) = node.prev_sibling() {
+                if prev.is_error() {
+                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
+                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                        return;
                     }
                 }
             }
@@ -4430,22 +6373,56 @@ fn collect_usages_with_context<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
+    // Skip ERROR nodes entirely — identifiers inside them lack reliable
+    // semantic context (e.g., an assignment LHS won't be inside a
+    // binary_operator node), so we'd produce false "Undefined variable"
+    // diagnostics. The syntax error diagnostic already covers these.
+    if node.is_error() {
+        return;
+    }
+
+    // Skip MISSING nodes — these are synthetic placeholders inserted by
+    // tree-sitter for error recovery (e.g., the absent RHS in `x <-`).
+    // They have no actual text content and should not be treated as usages.
+    if node.is_missing() {
+        return;
+    }
+
     if node.kind() == "identifier" {
         // Skip if we're in a formula or call-like arguments context
         if context.in_formula || context.in_call_like_arguments {
             return;
         }
 
-        // Skip if this is the LHS of an assignment
+        // Skip if this is the target of an assignment
         if let Some(parent) = node.parent() {
             if parent.kind() == "binary_operator" {
                 let mut cursor = parent.walk();
                 let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = node_text(op, text);
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        return; // Skip LHS of assignment
+                if children.len() >= 2 {
+                    let op_text = node_text(children[1], text);
+                    // Left-assignment: target is children[0] (e.g., x <- 1)
+                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
+                        return;
+                    }
+                    // Right-assignment: target is children[2] (e.g., 1 -> x)
+                    if children.len() >= 3
+                        && children[2].id() == node.id()
+                        && matches!(op_text, "->" | "->>")
+                    {
+                        return;
+                    }
+                }
+            }
+
+            // Skip if this identifier follows an ERROR node containing a
+            // right-assignment operator (e.g., `-> x` or `->> x` where the
+            // parser couldn't find a LHS value for the operator).
+            if let Some(prev) = node.prev_sibling() {
+                if prev.is_error() {
+                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
+                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                        return;
                     }
                 }
             }
@@ -4900,8 +6877,8 @@ fn has_namespace_accessor_at_cursor(text: &str, position: Position) -> bool {
     let prefix = &line[..byte_offset];
     // Scan backward: first collect identifier chars (the partial token after `::`)
     // then check if `::` or `:::` immediately precedes them.
-    let after_ident = prefix
-        .trim_end_matches(|c: char| c.is_alphanumeric() || c == '.' || c == '_');
+    let after_ident =
+        prefix.trim_end_matches(|c: char| c.is_alphanumeric() || c == '.' || c == '_');
     // Check if the remaining prefix ends with `::` or `:::`
     after_ident.ends_with("::")
 }
@@ -4992,11 +6969,7 @@ fn get_parameter_completions(
             let detail = Some("parameter".to_string());
 
             // Build the data JSON for completionItem/resolve
-            let data = build_parameter_data(
-                &p.name,
-                function_name,
-                &signature.source,
-            );
+            let data = build_parameter_data(&p.name, function_name, &signature.source);
 
             CompletionItem {
                 label: p.name.clone(),
@@ -5127,7 +7100,7 @@ fn collect_document_completions(
             }
 
             // Handle right-arrow assignments: value -> name
-            if op_text == "->" && rhs.kind() == "identifier" {
+            if matches!(op_text, "->" | "->>") && rhs.kind() == "identifier" {
                 let name = node_text(rhs, text).to_string();
                 if !seen.contains(&name) {
                     seen.insert(name.clone());
@@ -5188,7 +7161,10 @@ pub fn completion_item_resolve(
     };
 
     // Dispatch based on the "type" field in the data JSON
-    let item_type = data.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let item_type = data
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     match item_type.as_deref() {
         // Parameter completion resolve (Requirement 7)
@@ -5343,10 +7319,7 @@ fn resolve_package_export_documentation(
 }
 
 /// Read file content from the document store (open documents) or from disk as fallback.
-fn read_file_content(
-    document_contents: &HashMap<Url, String>,
-    uri_str: &str,
-) -> Option<String> {
+fn read_file_content(document_contents: &HashMap<Url, String>, uri_str: &str) -> Option<String> {
     let uri = Url::parse(uri_str).ok()?;
 
     // Try open documents first (authoritative)
@@ -5490,7 +7463,7 @@ fn find_assignment_statement<'a>(
                 let children: Vec<_> = node.children(&mut cursor).collect();
                 if children.len() >= 2 {
                     let op_text = node_text(children[1], content);
-                    if matches!(op_text, "<-" | "=" | "<<-" | "->") {
+                    if matches!(op_text, "<-" | "=" | "<<-" | "->" | "->>") {
                         return Some(StatementMatch {
                             node,
                             header_only: false,
@@ -5563,7 +7536,9 @@ fn find_function_statement<'a>(
                             header_only: false,
                         });
                     }
-                    if op_text == "->" && children[0].kind() == "function_definition" {
+                    if matches!(op_text, "->" | "->>")
+                        && children[0].kind() == "function_definition"
+                    {
                         return Some(StatementMatch {
                             node,
                             header_only: false,
@@ -6032,7 +8007,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 ///
 /// # Returns
 /// Single-line plain-text signature label string
-fn format_signature_label(name: &str, params: &[crate::parameter_resolver::ParameterInfo]) -> String {
+fn format_signature_label(
+    name: &str,
+    params: &[crate::parameter_resolver::ParameterInfo],
+) -> String {
     if params.is_empty() {
         return format!("{}()", name);
     }
@@ -6098,7 +8076,7 @@ fn build_parameter_information(
 fn detect_active_parameter(call_node: Node, cursor_point: Point) -> Option<u32> {
     // Count commas in the entire call node that appear before the cursor
     let mut comma_count = 0;
-    
+
     fn count_commas_recursive(node: Node, cursor_point: Point, comma_count: &mut u32) {
         // If this node starts after the cursor, don't traverse it
         let node_start = node.start_position();
@@ -6419,7 +8397,7 @@ fn try_build_user_signature(
         state,
         &state.signature_cache,
         function_name,
-        None, // namespace - None for user functions
+        None,  // namespace - None for user functions
         false, // is_internal
         uri,
         position,
@@ -6461,9 +8439,9 @@ fn try_build_user_signature(
         .iter()
         .map(|param| {
             // Use get_param_doc() for each parameter's documentation
-            let param_doc = roxygen_block.as_ref().and_then(|block| {
-                crate::roxygen::get_param_doc(block, &param.name)
-            });
+            let param_doc = roxygen_block
+                .as_ref()
+                .and_then(|block| crate::roxygen::get_param_doc(block, &param.name));
             build_parameter_information(param, param_doc.as_deref())
         })
         .collect();
@@ -6479,8 +8457,6 @@ fn try_build_user_signature(
         active_parameter: None,
     })
 }
-
-
 
 /// What async work (if any) is needed to complete signature help.
 enum SignatureResolution {
@@ -6614,8 +8590,7 @@ pub async fn resolve_signature_help(ctx: SignatureHelpContext) -> Option<Signatu
             package_name,
             fallback,
         } => {
-            let sig =
-                try_build_package_signature(&help_cache, &func_name, &package_name).await;
+            let sig = try_build_package_signature(&help_cache, &func_name, &package_name).await;
             sig.unwrap_or(fallback)
         }
         SignatureResolution::Ready(sig) => sig,
@@ -8518,7 +10493,8 @@ x <- "#;
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
+        let resolved =
+            super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
 
         // Should have documentation populated from the cached help text
         let doc = resolved
@@ -8658,7 +10634,8 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "read_csv", "package": "readr"})),
             ..Default::default()
         };
-        let resolved = super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
+        let resolved =
+            super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
 
         assert!(
             resolved.documentation.is_some(),
@@ -10089,7 +12066,7 @@ result <- "#;
                 );
 
                 let func_item = func_items[0];
-                
+
                 // Should have FUNCTION kind
                 assert_eq!(
                     func_item.kind,
@@ -10102,7 +12079,7 @@ result <- "#;
                     func_item.detail.is_some(),
                     "User function should have detail field with signature"
                 );
-                
+
                 let detail = func_item.detail.as_ref().unwrap();
                 assert!(
                     detail.contains("my_func") && detail.contains("(x, y = 10)"),
@@ -10209,6 +12186,42 @@ result <- "#;
         // Check selection_range is the RHS identifier
         assert_eq!(symbols[0].selection_range.start.character, 6); // "answer" starts at position 6
         assert_eq!(symbols[0].selection_range.end.character, 12); // "answer" ends at position 12
+    }
+
+    #[test]
+    fn test_symbol_extractor_right_super_assignment() {
+        let code = "42 ->> answer";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "answer");
+        // 42 is detected as Number type
+        assert_eq!(symbols[0].kind, DocumentSymbolKind::Number);
+
+        // Check selection_range is the RHS identifier
+        assert_eq!(symbols[0].selection_range.start.character, 7); // "answer" starts at position 7
+        assert_eq!(symbols[0].selection_range.end.character, 13); // "answer" ends at position 13
+    }
+
+    #[test]
+    fn test_symbol_extractor_right_super_assignment_function() {
+        let code = "(function(x) x * 2) ->> doubler";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol, got {:?}", symbols);
+        assert_eq!(symbols[0].name, "doubler");
+        assert!(
+            matches!(
+                symbols[0].kind,
+                DocumentSymbolKind::Variable | DocumentSymbolKind::Function
+            ),
+            "Expected Variable or Function, got {:?}",
+            symbols[0].kind
+        );
     }
 
     // ============================================================================
@@ -15102,7 +17115,6 @@ y <- 2";
         assert_eq!(result[0].kind, SymbolKind::FUNCTION);
         assert_eq!(result[0].detail, Some("(x, y)".to_string()));
         assert!(result[0].children.is_none());
-        assert!(result[0].deprecated.is_none());
         assert!(result[0].tags.is_none());
     }
 
@@ -16360,7 +18372,7 @@ y <- 2";
             is_dots: false,
         };
         let result = build_parameter_information(&param, None);
-        
+
         match result.label {
             ParameterLabel::Simple(label) => assert_eq!(label, "x"),
             _ => panic!("Expected Simple label"),
@@ -16378,7 +18390,7 @@ y <- 2";
             is_dots: false,
         };
         let result = build_parameter_information(&param, None);
-        
+
         match result.label {
             ParameterLabel::Simple(label) => assert_eq!(label, "x = 1"),
             _ => panic!("Expected Simple label"),
@@ -16395,7 +18407,7 @@ y <- 2";
             is_dots: false,
         };
         let result = build_parameter_information(&param, Some("The input value"));
-        
+
         assert!(result.documentation.is_some());
         match result.documentation.unwrap() {
             Documentation::MarkupContent(content) => {
@@ -16423,7 +18435,7 @@ y <- 2";
         // Cursor is after "x" (position 6)
         let cursor_point = Point::new(0, 6);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(0));
     }
 
@@ -16438,7 +18450,7 @@ y <- 2";
         // Cursor is after "y" (position 9)
         let cursor_point = Point::new(0, 9);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(1));
     }
 
@@ -16453,7 +18465,7 @@ y <- 2";
         // Cursor is after "c" (position 12)
         let cursor_point = Point::new(0, 12);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(2));
     }
 
@@ -16468,7 +18480,7 @@ y <- 2";
         // Cursor is right after opening paren (position 5)
         let cursor_point = Point::new(0, 5);
         let result = detect_active_parameter(call_node, cursor_point);
-        
+
         assert_eq!(result, Some(0));
     }
 
@@ -16692,7 +18704,7 @@ add <- function(x, y) { x + y }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "add", &uri, Position::new(5, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "add(x, y)");
@@ -16721,7 +18733,7 @@ multiply <- function(a, b) { a * b }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "multiply", &uri, Position::new(3, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "multiply(a, b)");
@@ -16744,7 +18756,7 @@ divide <- function(x, y) { x / y }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "divide", &uri, Position::new(1, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "divide(x, y)");
@@ -16768,7 +18780,7 @@ get_pi <- function() { 3.14159 }
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "get_pi", &uri, Position::new(2, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "get_pi()");
@@ -16791,7 +18803,7 @@ x <- 42
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "nonexistent", &uri, Position::new(1, 0));
-        
+
         // Should return None when function is not found
         assert!(result.is_none());
     }
@@ -16813,17 +18825,23 @@ greet <- function(name = "World", greeting = "Hello") {
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "greet", &uri, Position::new(4, 0));
-        
+
         assert!(result.is_some());
         let sig = result.unwrap();
         assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
         assert!(sig.documentation.is_some());
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.unwrap();
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].label, ParameterLabel::Simple("name = \"World\"".to_string()));
-        assert_eq!(params[1].label, ParameterLabel::Simple("greeting = \"Hello\"".to_string()));
+        assert_eq!(
+            params[0].label,
+            ParameterLabel::Simple("name = \"World\"".to_string())
+        );
+        assert_eq!(
+            params[1].label,
+            ParameterLabel::Simple("greeting = \"Hello\"".to_string())
+        );
     }
 
     // ========================================================================
@@ -16846,23 +18864,24 @@ result <- add(1, 2)"#;
         // Line 1 is "result <- add(1, 2)" (0-indexed)
         // Position after "add(" would be at character 14
         let position = Position::new(1, 14); // After "add("
-        
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
         assert_eq!(sig_help.active_signature, Some(0));
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "add(x, y)");
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].label, ParameterLabel::Simple("x".to_string()));
         assert_eq!(params[1].label, ParameterLabel::Simple("y".to_string()));
-        
+
         // Active parameter should be 0 (first parameter)
         assert_eq!(sig_help.active_parameter, Some(0));
     }
@@ -16878,12 +18897,13 @@ result <- add(1, 2)"#;
 
         // Position is inside the call to undefined_func, after the opening paren
         let position = Position::new(0, 25); // After "undefined_func("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         // Should show fallback signature with function name
         assert_eq!(sig.label, "undefined_func(...)");
@@ -16904,11 +18924,12 @@ result <- add(1, 2, 3)"#;
 
         // Position is after the first comma, so second parameter is active
         let position = Position::new(1, 17); // After "add(1, "
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
-        
+
         // Active parameter should be 1 (second parameter, 0-indexed)
         assert_eq!(sig_help.active_parameter, Some(1));
     }
@@ -16925,11 +18946,12 @@ result <- add(1, 2, 3)"#;
 
         // Position is after the second comma, so third parameter is active
         let position = Position::new(1, 20); // After "add(1, 2, "
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
-        
+
         // Active parameter should be 2 (third parameter, 0-indexed)
         assert_eq!(sig_help.active_parameter, Some(2));
     }
@@ -16946,12 +18968,13 @@ result <- helper(5)"#;
 
         // Position is inside the call to helper
         let position = Position::new(1, 17); // After "helper("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "helper(x)");
         // Documentation is optional (depends on roxygen comments)
@@ -16975,28 +18998,29 @@ result <- multiply(3, 4)"#;
 
         // Position is inside the call to multiply
         let position = Position::new(4, 19); // After "multiply("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "multiply(x, y)");
         // Should have documentation from roxygen comments
         assert!(sig.documentation.is_some());
-        
+
         // Check that parameters have documentation
         assert!(sig.parameters.is_some());
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
-        
+
         // Parameters should have documentation from @param tags
         if let ParameterLabel::Simple(label) = &params[0].label {
             assert_eq!(label, "x");
         }
         assert!(params[0].documentation.is_some());
-        
+
         if let ParameterLabel::Simple(label) = &params[1].label {
             assert_eq!(label, "y");
         }
@@ -17015,16 +19039,17 @@ result <- get_pi()"#;
 
         // Position is inside the call to get_pi
         let position = Position::new(1, 17); // After "get_pi("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "get_pi()");
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 0);
     }
@@ -17043,20 +19068,27 @@ result <- greet("Alice")"#;
 
         // Position is inside the call to greet
         let position = Position::new(3, 16); // After "greet("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some());
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "greet(name = \"World\", greeting = \"Hello\")");
         assert!(sig.parameters.is_some());
-        
+
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].label, ParameterLabel::Simple("name = \"World\"".to_string()));
-        assert_eq!(params[1].label, ParameterLabel::Simple("greeting = \"Hello\"".to_string()));
+        assert_eq!(
+            params[0].label,
+            ParameterLabel::Simple("name = \"World\"".to_string())
+        );
+        assert_eq!(
+            params[1].label,
+            ParameterLabel::Simple("greeting = \"Hello\"".to_string())
+        );
     }
 
     /// Integration test: Test typing package function call (e.g., "mean(")
@@ -17071,25 +19103,38 @@ result <- mean(x)"#;
 
         // Position is after "mean(" - simulating typing inside the function call
         let position = Position::new(1, 15); // After "mean("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
-        assert!(result.is_some(), "signature_help should return Some for package function");
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
+        assert!(
+            result.is_some(),
+            "signature_help should return Some for package function"
+        );
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
         assert_eq!(sig_help.active_signature, Some(0));
-        
+
         let sig = &sig_help.signatures[0];
         // Should show signature with function name
-        assert!(sig.label.contains("mean"), "Label should contain function name");
-        assert!(sig.label.contains("("), "Label should contain opening paren");
-        
+        assert!(
+            sig.label.contains("mean"),
+            "Label should contain function name"
+        );
+        assert!(
+            sig.label.contains("("),
+            "Label should contain opening paren"
+        );
+
         // For package functions, we expect either:
         // 1. Rich signature with parameters if help text is available
         // 2. Fallback signature "mean(...)" if help unavailable or function not recognized
         // Both are acceptable - the important thing is that signature help works
         if !sig.label.contains("mean(...)") {
             // Rich signature case - should have parameters
-            assert!(sig.parameters.is_some(), "Rich signature should have parameters");
+            assert!(
+                sig.parameters.is_some(),
+                "Rich signature should have parameters"
+            );
             if let Some(params) = &sig.parameters {
                 assert!(!params.is_empty(), "mean() should have parameters");
             }
@@ -17113,17 +19158,22 @@ result <- add(multiply(2, 3), 5)"#;
         //          0123456789012345678901234567890123
         // After "multiply(2, " - second parameter of multiply (position 27)
         let position_inner = Position::new(2, 27); // After "multiply(2, "
-        let result_inner = resolve_signature_help(prepare_signature_help(&state, &uri, position_inner).unwrap()).await;
-        
-        assert!(result_inner.is_some(), "signature_help should work in nested calls");
+        let result_inner =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position_inner).unwrap())
+                .await;
+
+        assert!(
+            result_inner.is_some(),
+            "signature_help should work in nested calls"
+        );
         let sig_help_inner = result_inner.unwrap();
         assert_eq!(sig_help_inner.signatures.len(), 1);
-        
+
         let sig_inner = &sig_help_inner.signatures[0];
         assert_eq!(sig_inner.label, "multiply(a, b)");
         // Active parameter should be 1 (second parameter, 0-indexed)
         assert_eq!(sig_help_inner.active_parameter, Some(1));
-        
+
         // The key test here is that signature help works correctly for nested calls
         // and shows the innermost function's signature with correct active parameter
     }
@@ -17148,30 +19198,46 @@ result <- add_numbers(1, 2)"#;
 
         // Position is after "add_numbers("
         let position = Position::new(9, 23); // After "add_numbers("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "add_numbers(x, y)");
-        
+
         // Should have documentation from roxygen
-        assert!(sig.documentation.is_some(), "Should have documentation from roxygen");
+        assert!(
+            sig.documentation.is_some(),
+            "Should have documentation from roxygen"
+        );
         if let Some(Documentation::MarkupContent(content)) = &sig.documentation {
-            assert!(content.value.contains("Calculate the sum"), "Should contain title");
-            assert!(content.value.contains("adds two numeric values"), "Should contain description");
+            assert!(
+                content.value.contains("Calculate the sum"),
+                "Should contain title"
+            );
+            assert!(
+                content.value.contains("adds two numeric values"),
+                "Should contain description"
+            );
         }
-        
+
         // Should have parameters with documentation
         assert!(sig.parameters.is_some(), "Should have parameters");
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
-        
+
         // Check parameter documentation
-        assert!(params[0].documentation.is_some(), "First parameter should have docs");
-        assert!(params[1].documentation.is_some(), "Second parameter should have docs");
+        assert!(
+            params[0].documentation.is_some(),
+            "First parameter should have docs"
+        );
+        assert!(
+            params[1].documentation.is_some(),
+            "Second parameter should have docs"
+        );
     }
 
     /// Integration test: Test typing user function call without roxygen
@@ -17188,22 +19254,26 @@ result <- calculate(5)"#;
 
         // Position is after "calculate("
         let position = Position::new(3, 20); // After "calculate("
-        let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-        
+        let result =
+            resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
+
         assert!(result.is_some(), "signature_help should return Some");
         let sig_help = result.unwrap();
         assert_eq!(sig_help.signatures.len(), 1);
-        
+
         let sig = &sig_help.signatures[0];
         assert_eq!(sig.label, "calculate(a, b = 10)");
-        
+
         // Should have parameters even without roxygen
         assert!(sig.parameters.is_some(), "Should have parameters");
         let params = sig.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].label, ParameterLabel::Simple("a".to_string()));
-        assert_eq!(params[1].label, ParameterLabel::Simple("b = 10".to_string()));
-        
+        assert_eq!(
+            params[1].label,
+            ParameterLabel::Simple("b = 10".to_string())
+        );
+
         // Documentation might be present (from plain comments) or absent
         // Either is acceptable for functions without roxygen
     }
@@ -17227,9 +19297,15 @@ result <- func(1, 2, 3, 4)"#;
         ];
 
         for (position, expected_active) in test_cases {
-            let result = resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap()).await;
-            assert!(result.is_some(), "signature_help should return Some at position {:?}", position);
-            
+            let result =
+                resolve_signature_help(prepare_signature_help(&state, &uri, position).unwrap())
+                    .await;
+            assert!(
+                result.is_some(),
+                "signature_help should return Some at position {:?}",
+                position
+            );
+
             let sig_help = result.unwrap();
             assert_eq!(
                 sig_help.active_parameter, expected_active,
@@ -17238,10 +19314,7 @@ result <- func(1, 2, 3, 4)"#;
             );
         }
     }
-
 }
-
-
 
 #[cfg(test)]
 mod proptests {
@@ -18431,7 +20504,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -18486,7 +20559,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -18539,7 +20612,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -24008,10 +26081,7 @@ setClass("{}", slots = c(value = "numeric"))
     }
 
     /// Strategy to generate a list of unique parameter definitions for formatting tests.
-    fn r_completion_param_list(
-        min: usize,
-        max: usize,
-    ) -> impl Strategy<Value = Vec<String>> {
+    fn r_completion_param_list(min: usize, max: usize) -> impl Strategy<Value = Vec<String>> {
         prop::collection::vec(r_completion_param_name(), min..=max).prop_filter(
             "parameter names must be unique",
             |params| {
@@ -24177,31 +26247,33 @@ setClass("{}", slots = c(value = "numeric"))
         r_mixed_case_param_name().prop_flat_map(|name| {
             let len = name.len();
             // Pick random start..end for a non-empty substring
-            (Just(name.clone()), 0..len).prop_flat_map(move |(name, start)| {
-                let len = name.len();
-                (Just(name.clone()), Just(start), (start + 1)..=len)
-            })
-            .prop_flat_map(|(name, start, end)| {
-                let sub = name[start..end].to_string();
-                let sub_len = sub.len();
-                // Randomize case of each character
-                (
-                    Just(name),
-                    prop::collection::vec(proptest::bool::ANY, sub_len)
-                        .prop_map(move |flags| {
-                            sub.chars()
-                                .zip(flags.iter())
-                                .map(|(c, &upper)| {
-                                    if upper {
-                                        c.to_uppercase().to_string()
-                                    } else {
-                                        c.to_lowercase().to_string()
-                                    }
-                                })
-                                .collect::<String>()
-                        }),
-                )
-            })
+            (Just(name.clone()), 0..len)
+                .prop_flat_map(move |(name, start)| {
+                    let len = name.len();
+                    (Just(name.clone()), Just(start), (start + 1)..=len)
+                })
+                .prop_flat_map(|(name, start, end)| {
+                    let sub = name[start..end].to_string();
+                    let sub_len = sub.len();
+                    // Randomize case of each character
+                    (
+                        Just(name),
+                        prop::collection::vec(proptest::bool::ANY, sub_len).prop_map(
+                            move |flags| {
+                                sub.chars()
+                                    .zip(flags.iter())
+                                    .map(|(c, &upper)| {
+                                        if upper {
+                                            c.to_uppercase().to_string()
+                                        } else {
+                                            c.to_lowercase().to_string()
+                                        }
+                                    })
+                                    .collect::<String>()
+                            },
+                        ),
+                    )
+                })
         })
     }
 
@@ -24313,14 +26385,12 @@ setClass("{}", slots = c(value = "numeric"))
 
     /// Strategy to generate a valid R package name for namespace-qualified token tests.
     fn r_package_name() -> impl Strategy<Value = String> {
-        "[a-z]{3,8}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z]{3,8}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     /// Strategy to generate a valid R function name for namespace-qualified token tests.
     fn r_func_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9.]{1,7}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9.]{1,7}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     /// Strategy to generate a partial token (0 or more chars) that could follow `::` or `:::`.
@@ -24424,14 +26494,12 @@ setClass("{}", slots = c(value = "numeric"))
 
     /// Strategy to generate a valid R function name for mixed completion tests.
     fn r_mixed_func_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9]{2,7}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9]{2,7}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     /// Strategy to generate a valid R variable name for mixed completion tests.
     fn r_mixed_var_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_]{2,7}"
-            .prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9_]{2,7}".prop_filter("must not be a reserved word", |s| !is_r_reserved(s))
     }
 
     proptest! {
@@ -24625,15 +26693,17 @@ setClass("{}", slots = c(value = "numeric"))
     /// Strategy to generate a parameter definition with an optional default value.
     /// Returns (param_name, default_value_option, param_definition_string).
     fn r_param_with_optional_default() -> impl Strategy<Value = (String, Option<String>, String)> {
-        (r_completion_param_name(), proptest::option::of(r_default_value())).prop_map(
-            |(name, default)| {
+        (
+            r_completion_param_name(),
+            proptest::option::of(r_default_value()),
+        )
+            .prop_map(|(name, default)| {
                 let def_str = match &default {
                     Some(val) => format!("{} = {}", name, val),
                     None => name.clone(),
                 };
                 (name, default, def_str)
-            },
-        )
+            })
     }
 
     proptest! {
@@ -24804,15 +26874,21 @@ setClass("{}", slots = c(value = "numeric"))
         min: usize,
         max: usize,
     ) -> impl Strategy<Value = Vec<(String, String)>> {
-        prop::collection::vec((rd_param_name_strategy(), rd_param_desc_strategy()), min..=max)
-            .prop_map(|entries| {
-                let mut seen = std::collections::HashSet::new();
-                entries
-                    .into_iter()
-                    .filter(|(name, _)| seen.insert(name.clone()))
-                    .collect()
-            })
-            .prop_filter("must have at least one entry", |v: &Vec<(String, String)>| !v.is_empty())
+        prop::collection::vec(
+            (rd_param_name_strategy(), rd_param_desc_strategy()),
+            min..=max,
+        )
+        .prop_map(|entries| {
+            let mut seen = std::collections::HashSet::new();
+            entries
+                .into_iter()
+                .filter(|(name, _)| seen.insert(name.clone()))
+                .collect()
+        })
+        .prop_filter(
+            "must have at least one entry",
+            |v: &Vec<(String, String)>| !v.is_empty(),
+        )
     }
 
     /// Build a help text string in Rd2txt format with an "Arguments:" section.
@@ -25036,8 +27112,7 @@ setClass("{}", slots = c(value = "numeric"))
 
     // Strategy for generating R parameter names
     fn r_param_name_strategy() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_]{0,10}"
-            .prop_filter("Not reserved", |s| !is_r_reserved(s))
+        "[a-z][a-z0-9_]{0,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
     }
 
     // Strategy for generating R default values
@@ -25052,15 +27127,23 @@ setClass("{}", slots = c(value = "numeric"))
     }
 
     // Strategy for generating parameter lists
-    fn param_list_strategy(min: usize, max: usize) -> impl Strategy<Value = Vec<crate::parameter_resolver::ParameterInfo>> {
+    fn param_list_strategy(
+        min: usize,
+        max: usize,
+    ) -> impl Strategy<Value = Vec<crate::parameter_resolver::ParameterInfo>> {
         prop::collection::vec(
-            (r_param_name_strategy(), prop::option::of(r_default_value_strategy()))
-                .prop_map(|(name, default_value)| crate::parameter_resolver::ParameterInfo {
-                    name,
-                    default_value,
-                    is_dots: false,
+            (
+                r_param_name_strategy(),
+                prop::option::of(r_default_value_strategy()),
+            )
+                .prop_map(|(name, default_value)| {
+                    crate::parameter_resolver::ParameterInfo {
+                        name,
+                        default_value,
+                        is_dots: false,
+                    }
                 }),
-            min..=max
+            min..=max,
         )
     }
 
@@ -25160,7 +27243,7 @@ setClass("{}", slots = c(value = "numeric"))
             // Parse the code
             let tree = parse_r_code(&code);
             let call_node = tree.root_node().child(0);
-            
+
             if call_node.is_none() {
                 // If parsing failed, skip this test case
                 return Ok(());
@@ -25210,24 +27293,24 @@ setClass("{}", slots = c(value = "numeric"))
                     }
                 })
                 .collect();
-            
+
             let signature_str = format!("{}({})", func_name, param_strs.join(", "));
             let help_text = format!(
                 "{}\n\nDescription:\n\nThis is a test function.\n\nUsage:\n\n{}\n\nArguments:\n\n",
                 func_name, signature_str
             );
-            
+
             // Extract signature from help text
             let signature = crate::help::extract_signature_from_help(&help_text);
-            
+
             // Property 1: Signature should be extracted successfully
             prop_assert!(
                 signature.is_some(),
                 "Should extract signature from help text with Usage section"
             );
-            
+
             let signature = signature.unwrap();
-            
+
             // Property 2: Signature should contain function name
             prop_assert!(
                 signature.contains(&func_name),
@@ -25235,7 +27318,7 @@ setClass("{}", slots = c(value = "numeric"))
                 func_name,
                 signature
             );
-            
+
             // Property 3: Signature should contain all parameter names
             for param in &params {
                 prop_assert!(
@@ -25245,10 +27328,10 @@ setClass("{}", slots = c(value = "numeric"))
                     signature
                 );
             }
-            
+
             // Property 4: Parse the signature to get parameters
             let parsed_params = parse_signature_params(&signature);
-            
+
             // Property 5: Number of parsed parameters should match expected
             prop_assert_eq!(
                 parsed_params.len(),
@@ -25279,24 +27362,24 @@ setClass("{}", slots = c(value = "numeric"))
                 "{}\n\nDescription:\n\n{}\n\n",
                 title, description
             );
-            
+
             // Extract description from help text
             let extracted_desc = crate::help::extract_description_from_help(&help_text);
-            
+
             // Property 1: Description should be extracted successfully
             prop_assert!(
                 extracted_desc.is_some(),
                 "Should extract description from help text with Description section"
             );
-            
+
             let extracted_desc = extracted_desc.unwrap();
-            
+
             // Property 2: Description should not be empty
             prop_assert!(
                 !extracted_desc.is_empty(),
                 "Extracted description should not be empty"
             );
-            
+
             // Property 3: Description should contain the title text
             prop_assert!(
                 extracted_desc.contains(&title),
@@ -25304,7 +27387,7 @@ setClass("{}", slots = c(value = "numeric"))
                 title,
                 extracted_desc
             );
-            
+
             // Property 4: Description should contain the description text
             prop_assert!(
                 extracted_desc.contains(&description),
@@ -25312,14 +27395,14 @@ setClass("{}", slots = c(value = "numeric"))
                 description,
                 extracted_desc
             );
-            
+
             // Property 5: Description should have substantial content
             prop_assert!(
                 extracted_desc.len() > 10,
                 "Description should have substantial content, got: {}",
                 extracted_desc
             );
-            
+
             // Property 6: Description should have title and description separated by blank line
             prop_assert!(
                 extracted_desc.contains("\n\n"),
@@ -25358,38 +27441,38 @@ setClass("{}", slots = c(value = "numeric"))
                     title, description, func_name
                 )
             };
-            
+
             let func_line = if has_roxygen_tags { 3 } else { 2 };
-            
+
             // Extract roxygen block
             let block = crate::roxygen::extract_roxygen_block(&code, func_line);
-            
+
             // Property 1: Block should be extracted successfully
             prop_assert!(
                 block.is_some(),
                 "Should extract roxygen/comment block from code:\n{}",
                 code
             );
-            
+
             let block = block.unwrap();
-            
+
             // Get function documentation
             let func_doc = crate::roxygen::get_function_doc(&block);
-            
+
             // Property 2: Function documentation should be extracted
             prop_assert!(
                 func_doc.is_some(),
                 "Should extract function documentation from block"
             );
-            
+
             let func_doc = func_doc.unwrap();
-            
+
             // Property 3: Documentation should not be empty
             prop_assert!(
                 !func_doc.is_empty(),
                 "Function documentation should not be empty"
             );
-            
+
             // Property 4: Documentation should contain title or description text
             let contains_title = func_doc.contains(&title);
             let contains_desc = func_doc.contains(&description);
@@ -25400,7 +27483,7 @@ setClass("{}", slots = c(value = "numeric"))
                 description,
                 func_doc
             );
-            
+
             // Property 5: For roxygen with tags, should have title and description
             if has_roxygen_tags {
                 prop_assert!(
@@ -25442,7 +27525,7 @@ setClass("{}", slots = c(value = "numeric"))
             } else {
                 None
             };
-            
+
             // Build parameter information for each parameter
             let param_infos: Vec<ParameterInformation> = params
                 .iter()
@@ -25454,7 +27537,7 @@ setClass("{}", slots = c(value = "numeric"))
                     build_parameter_information(param, param_doc)
                 })
                 .collect();
-            
+
             // Property 1: Should have same number of ParameterInformation as parameters
             prop_assert_eq!(
                 param_infos.len(),
@@ -25463,11 +27546,11 @@ setClass("{}", slots = c(value = "numeric"))
                 params.len(),
                 param_infos.len()
             );
-            
+
             // Property 2: Each ParameterInformation should have correct label
             for (i, param) in params.iter().enumerate() {
                 let param_info = &param_infos[i];
-                
+
                 // Extract label string from ParameterLabel
                 let label_str = match &param_info.label {
                     ParameterLabel::Simple(s) => s.as_str(),
@@ -25476,7 +27559,7 @@ setClass("{}", slots = c(value = "numeric"))
                         ""
                     }
                 };
-                
+
                 // Property 3: Label should contain parameter name
                 prop_assert!(
                     label_str.contains(&param.name),
@@ -25484,7 +27567,7 @@ setClass("{}", slots = c(value = "numeric"))
                     param.name,
                     label_str
                 );
-                
+
                 // Property 4: If parameter has default, label should show "name = default"
                 if let Some(default) = &param.default_value {
                     let expected = format!("{} = {}", param.name, default);
@@ -25505,7 +27588,7 @@ setClass("{}", slots = c(value = "numeric"))
                         label_str
                     );
                 }
-                
+
                 // Property 6: If has_docs, should have documentation
                 if has_docs {
                     prop_assert!(
@@ -25513,7 +27596,7 @@ setClass("{}", slots = c(value = "numeric"))
                         "Parameter '{}' should have documentation when has_docs=true",
                         param.name
                     );
-                    
+
                     // Property 7: Documentation should contain parameter name
                     if let Some(Documentation::MarkupContent(content)) = &param_info.documentation {
                         prop_assert!(
@@ -25731,7 +27814,7 @@ setClass("{}", slots = c(value = "numeric"))
                     }
                 })
                 .collect();
-            
+
             let s3_param_strs: Vec<String> = s3_params
                 .iter()
                 .map(|p| {
@@ -25789,7 +27872,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // Property 3: When both generic and S3 method signatures are present,
                 // should prefer the generic signature
                 let expected_generic = format!("{}({})", func_name, generic_param_strs.join(", "));
-                
+
                 // The signature should match the generic signature
                 prop_assert_eq!(
                     signature.trim(),
@@ -25816,7 +27899,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // Property 5: When only S3 method signature is present,
                 // should return the S3 method signature (as fallback)
                 let expected_s3 = format!("{}({})", func_name, s3_param_strs.join(", "));
-                
+
                 prop_assert_eq!(
                     signature.trim(),
                     expected_s3.trim(),
@@ -27669,8 +29752,11 @@ result <- helper_with_spaces(42)"#;
         let child_path = workspace_path.join("child.R");
         let parent1_path = workspace_path.join("parent1.R");
         let parent2_path = workspace_path.join("parent2.R");
-        std::fs::write(&child_path, "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R")
-            .unwrap();
+        std::fs::write(
+            &child_path,
+            "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R",
+        )
+        .unwrap();
         std::fs::write(&parent1_path, "source('child.R')").unwrap();
         std::fs::write(&parent2_path, "source('child.R')").unwrap();
 
@@ -29365,6 +31451,258 @@ my_func <- function(a = default_value) {
                 .any(|d| d.message == "Undefined variable: default_value"),
             "Defined variable 'default_value' should not be flagged as undefined"
         );
+    }
+
+    #[test]
+    fn test_identifiers_inside_error_nodes_not_flagged_as_undefined() {
+        // When tree-sitter wraps an incomplete expression inside an ERROR node,
+        // identifiers become flat children of the ERROR (not inside a
+        // binary_operator). The LHS assignment check would fail, causing false
+        // "Undefined variable: x" diagnostics. We skip ERROR node subtrees
+        // entirely since the parse tree structure is unreliable there.
+        let mut state = create_test_state();
+        let code = "if (1 == 1) {\n  x <-\n}";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable"))
+            .collect();
+
+        assert!(
+            undefined_var_diags.is_empty(),
+            "No undefined variable diagnostics should be emitted for code inside \
+             an ERROR node. Got: {:?}",
+            undefined_var_diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_incomplete_assignment_not_flagged_as_undefined() {
+        // All five R assignment operators in incomplete form should not produce
+        // "Undefined variable" diagnostics for either the target or the MISSING
+        // operand.
+        //
+        // Left-assignment (`x <-`, `x <<-`, `x =`): tree-sitter produces a
+        // binary_operator with a MISSING identifier RHS.
+        //
+        // Right-assignment (`-> x`, `->> x`): tree-sitter wraps the operator
+        // in an ERROR node, and the target `x` is a top-level sibling.
+        let cases: &[(&str, &str)] = &[
+            ("x <-", "left-assignment <-"),
+            ("x <<-", "left-assignment <<-"),
+            ("x =", "equals-assignment ="),
+            ("-> x", "right-assignment ->"),
+            ("->> x", "right-assignment ->>"),
+        ];
+
+        for &(code, label) in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            let undefined_var_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with("Undefined variable"))
+                .collect();
+
+            assert!(
+                undefined_var_diags.is_empty(),
+                "Incomplete {} ({:?}) should not produce undefined variable \
+                 diagnostics. Got: {:?}",
+                label,
+                code,
+                undefined_var_diags
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_complete_right_assignment_target_not_flagged() {
+        // For complete right-assignments like `1 -> x` and `1 ->> x`,
+        // the target `x` on the assignment line should not be flagged as
+        // an undefined usage — it's an assignment target.
+        let cases: &[(&str, &str)] = &[
+            ("1 -> x", "right-assignment ->"),
+            ("1 ->> x", "right-assignment ->>"),
+        ];
+
+        for &(code, label) in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            let undefined_var_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with("Undefined variable"))
+                .collect();
+
+            assert!(
+                !undefined_var_diags
+                    .iter()
+                    .any(|d| d.message == "Undefined variable: x"),
+                "Complete {} ({:?}): target 'x' should not be flagged as undefined. Got: {:?}",
+                label,
+                code,
+                undefined_var_diags
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_undefined_var_for_incomplete_in_while_condition() {
+        // `while ((i <-) < N) print(i)` — identifiers inside ERROR nodes
+        // should NOT produce "Undefined variable" diagnostics.
+        let mut state = create_test_state();
+        let code = "while ((i <-) < N) print(i)";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable"))
+            .collect();
+
+        assert!(
+            undefined_var_diags.is_empty(),
+            "No undefined variable diagnostics should be emitted for code with \
+             incomplete assignment in while condition. Got: {:?}",
+            undefined_var_diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_no_undefined_var_for_edge_case_incomplete_syntax() {
+        // Table-driven test: various incomplete syntax patterns should NOT
+        // produce "Undefined variable" diagnostics for identifiers inside
+        // ERROR nodes.
+        // Use defined names (assignments before broken syntax, or base functions)
+        // so that only identifiers inside ERROR nodes could produce false positives.
+        let cases: &[(&str, &str)] = &[
+            (
+                "f <- print\nf(x <-)",
+                "incomplete assignment as function argument",
+            ),
+            ("x <- 1\nx[i <-]", "incomplete assignment in subscript"),
+            (
+                "tryCatch(\n  expr,\n  error =\n)",
+                "incomplete named argument",
+            ),
+            (
+                "x <- 1\nx <- function(a, b = ) { a }",
+                "parameter with empty default",
+            ),
+        ];
+
+        for &(code, label) in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            let undefined_var_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with("Undefined variable"))
+                .collect();
+
+            assert!(
+                undefined_var_diags.is_empty(),
+                "No undefined variable diagnostics should be emitted for {} ({:?}). Got: {:?}",
+                label,
+                code,
+                undefined_var_diags
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 

@@ -22,7 +22,7 @@ use crate::cross_file::file_cache::FileSnapshot;
 use crate::cross_file::path_resolve::{
     resolve_path, resolve_path_with_workspace_fallback, PathContext,
 };
-use crate::cross_file::{extract_metadata, CrossFileMetadata};
+use crate::cross_file::{extract_metadata_with_tree, CrossFileMetadata};
 use crate::state::WorldState;
 
 /// Task for background indexing
@@ -284,8 +284,10 @@ impl BackgroundIndexer {
         let content = tokio::fs::read_to_string(&path).await?;
         let metadata_fs = tokio::fs::metadata(&path).await?;
 
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
+
         // Extract cross-file metadata
-        let mut cross_file_meta = extract_metadata(&content);
+        let mut cross_file_meta = extract_metadata_with_tree(&content, tree.as_ref());
 
         // Enrich metadata with inherited working directory
         // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
@@ -307,18 +309,15 @@ impl BackgroundIndexer {
         // Use compute_artifacts_with_metadata to include declared symbols from directives
         // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
         // **Validates: Requirements 12.1** (Workspace index declaration extraction)
-        let artifacts = crate::parser_pool::with_parser(|parser| {
-            if let Some(tree) = parser.parse(&content, None) {
-                crate::cross_file::scope::compute_artifacts_with_metadata(
-                    uri,
-                    &tree,
-                    &content,
-                    Some(&cross_file_meta),
-                )
-            } else {
-                crate::cross_file::scope::ScopeArtifacts::default()
-            }
-        });
+        let artifacts = match tree.as_ref() {
+            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                &content,
+                Some(&cross_file_meta),
+            ),
+            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        };
 
         let snapshot = FileSnapshot::with_content_hash(&metadata_fs, &content);
 

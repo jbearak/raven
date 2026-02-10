@@ -10,3 +10,4 @@ cc 753f8957dde0ae658593179be5ae64ef0c8768a360bfa26dfff8a80b643b8844 # shrinks to
 cc f95ee9c31758748cf4113c2a8e4c8e7cc2b557e139677d2e0edd653b8d33187f # shrinks to var1 = "sin", var2 = "a__"
 cc 2dedd5b15f894237256947bc7c1391c87277bd9351679cedb9c8e946685c5834 # shrinks to outer_func = "a0", pkg_name = "aaa", partial_token = "", use_triple_colon = false
 cc 2250c8f29bc61283775c429485d811bc470b61dc653492a4f3296a3aab75251d # shrinks to func_name = "a_a", params = []
+cc 983b057cd15b41227acf67a33b60f8aad42d25970dfa29401494b609f8d246fe # shrinks to reserved_word = "if", var_name = "ifa"
