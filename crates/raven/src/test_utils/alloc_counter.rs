@@ -54,8 +54,9 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Check (once) whether `RAVEN_BENCH_ALLOC=1` is set.
 #[inline]
 fn is_enabled() -> bool {
-    // Fast path: already initialised.
-    if INITIALIZED.load(Ordering::Relaxed) {
+    // Fast path: already initialised. Use Acquire to pair with the Release
+    // store below, ensuring visibility of the ENABLED store.
+    if INITIALIZED.load(Ordering::Acquire) {
         return ENABLED.load(Ordering::Relaxed);
     }
     // Slow path (runs at most once per process).
