@@ -47,6 +47,25 @@ All settings can be configured via VS Code settings or LSP initialization option
 |---------|---------|-------------|
 | `raven.completion.triggerOnOpenParen` | true | Register `(` as a completion trigger character so parameter suggestions appear when opening a function call. Set to `false` to disable. |
 
+## Indentation Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `raven.indentation.style` | "rstudio" | Indentation style for R code. Controls AST-aware (Tier 2) indentation behavior. See [Smart Indentation](indentation.md) for details. |
+
+`raven.indentation.style` accepts one of:
+- `"rstudio"` — Same-line arguments align to opening paren; next-line arguments indent from function line (matches the RStudio IDE default)
+- `"rstudio-minus"` — All arguments indent relative to previous line, regardless of paren position
+- `"off"` — Disables AST-aware indentation (Tier 2); only basic declarative rules (Tier 1) remain active
+
+Raven also sets `editor.formatOnType` to `true` for R files by default (lowest-priority VS Code default — your explicit settings take precedence). This is required for Tier 2 indentation to function. You can disable it per-language:
+
+```json
+"[r]": {
+  "editor.formatOnType": false
+}
+```
+
 ## Severity Values
 
 All severity settings accept one of:
