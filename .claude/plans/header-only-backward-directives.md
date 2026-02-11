@@ -72,4 +72,4 @@ New tests to add:
 ### Documentation updates
 
 1. `docs/cross-file.md`: Document that backward and working-dir directives must appear in the file header (before any code). Define "header" as consecutive blank/comment lines from start of file.
-2. `CLAUDE.md` learnings: Add note about header-only constraint for backward/wd directives.
+2. `AGENTS.md` learnings: Add note about header-only constraint for backward/wd directives.

@@ -1473,10 +1473,10 @@ fn is_within_workspace(resolved_path: &Path, workspace_root: &Path) -> bool {
 /// allowing us to determine where the path portion begins.
 struct DirectivePathPatterns {
     /// Pattern for backward directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
-    /// Matches: # @lsp-sourced-by:  or # lsp-run-by  etc.
+    /// Matches: `# @lsp-sourced-by:` or `# @lsp-run-by` etc. (with optional leading whitespace)
     backward: Regex,
     /// Pattern for forward directive (@lsp-source)
-    /// Matches: # @lsp-source:  or # lsp-source  etc.
+    /// Matches: `# @lsp-source:` or `# @lsp-source` etc. (with optional leading whitespace)
     forward: Regex,
 }
 
@@ -1489,11 +1489,11 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
     PATTERNS.get_or_init(|| {
         // Patterns match the directive keyword and trailing whitespace/colon
         // Consistent with cross_file/directive.rs patterns
-        // The @ is required, colon is optional, whitespace after is required or end of match
+        // The @ is required, colon is optional, leading whitespace is allowed
         DirectivePathPatterns {
-            backward: Regex::new(r#"^#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?(?:\s+|$)"#)
+            backward: Regex::new(r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*"#)
                 .unwrap(),
-            forward: Regex::new(r#"^#\s*@lsp-source\s*:?(?:\s+|$)"#).unwrap(),
+            forward: Regex::new(r#"^\s*#\s*@lsp-source\s*:?\s*"#).unwrap(),
         }
     })
 }

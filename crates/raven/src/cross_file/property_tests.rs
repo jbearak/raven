@@ -21967,7 +21967,9 @@ proptest! {
         );
 
         // The code variable (from the assignment) SHOULD still be in scope
-        let scope_after_assignment = scope_at_position(&artifacts, directive_line, 10);
+        // Position past the assignment: `{code_var_name} <- 42 ...`
+        let assignment_col = (code_var_name.len() + " <- 42".len()) as u32;
+        let scope_after_assignment = scope_at_position(&artifacts, directive_line, assignment_col);
         prop_assert!(
             scope_after_assignment.symbols.contains_key(code_var_name.as_str()),
             "Code variable '{}' SHOULD be in scope on line {} after assignment. Content:\n{}",

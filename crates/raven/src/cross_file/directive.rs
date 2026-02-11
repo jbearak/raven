@@ -69,7 +69,7 @@ fn patterns() -> &'static DirectivePatterns {
                 r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
             ).unwrap(),
             forward: Regex::new(
-                r#"^\s*#\s*@lsp-(?:source|run|include)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
+                r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
             ).unwrap(),
             working_dir: Regex::new(
                 r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
@@ -926,6 +926,7 @@ x <- undefined"#;
         let content = "x <- 1\n# @lsp-sourced-by ../main.R";
         let meta = parse_directives(content);
         assert_eq!(meta.sourced_by.len(), 0);
+        assert_eq!(meta.sources.len(), 0, "backward directive must not be misinterpreted as forward");
     }
 
     #[test]
