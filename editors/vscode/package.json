@@ -342,16 +342,16 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run bundle && npm run copy-binary",
-    "bundle": "npx esbuild src/extension.ts --bundle --platform=node --outfile=dist/extension.js --external:vscode --minify",
-    "copy-binary": "node scripts/bundle.js",
-    "compile": "npm run bundle",
+    "vscode:prepublish": "bun run bundle && bun run copy-binary",
+    "bundle": "bunx esbuild src/extension.ts --bundle --platform=node --outfile=dist/extension.js --external:vscode --minify",
+    "copy-binary": "bun scripts/bundle.js",
+    "compile": "bun run bundle",
     "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile:test",
+    "pretest": "bun run compile:test",
     "test": "vscode-test",
-    "package": "npm run bundle && npm run copy-binary && vsce package --allow-missing-repository",
-    "package:target": "npm run bundle && npm run copy-binary && vsce package --target",
+    "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
+    "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
