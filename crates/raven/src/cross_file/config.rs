@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
+use crate::indentation::IndentationStyle;
+
 /// Default call site assumption when not specified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CallSiteDefault {
@@ -75,6 +77,9 @@ pub struct CrossFileConfig {
     pub cache_existence_max_entries: usize,
     /// Maximum entries in the cross-file workspace index (LRU eviction)
     pub cache_workspace_index_max_entries: usize,
+    /// Indentation style for R code formatting
+    /// _Requirements: 7.1, 7.2, 7.3, 7.4_
+    pub indentation_style: IndentationStyle,
 }
 
 impl Default for CrossFileConfig {
@@ -123,6 +128,7 @@ impl Default for CrossFileConfig {
             cache_file_content_max_entries: 500,
             cache_existence_max_entries: 2000,
             cache_workspace_index_max_entries: 5000,
+            indentation_style: IndentationStyle::default(),
         }
     }
 }
@@ -169,6 +175,8 @@ mod tests {
             config.redundant_directive_severity,
             Some(DiagnosticSeverity::HINT)
         );
+        // Indentation style defaults (Requirement 7.4)
+        assert_eq!(config.indentation_style, IndentationStyle::RStudio);
     }
 
     #[test]
@@ -211,6 +219,18 @@ mod tests {
         assert!(
             config.diagnostics_enabled,
             "diagnostics_enabled should default to true"
+        );
+    }
+
+    #[test]
+    fn test_indentation_style_default_is_rstudio() {
+        // Validates: Requirements 7.4
+        // The indentation_style field should default to RStudio style
+        let config = CrossFileConfig::default();
+        assert_eq!(
+            config.indentation_style,
+            IndentationStyle::RStudio,
+            "indentation_style should default to RStudio"
         );
     }
 }

@@ -15,6 +15,7 @@ mod document_store;
 mod file_path_intellisense;
 mod handlers;
 mod help;
+mod indentation;
 mod namespace_parser;
 mod package_library;
 mod parameter_resolver;

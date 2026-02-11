@@ -25,6 +25,7 @@ pub mod document_store;
 pub mod file_path_intellisense;
 pub mod handlers;
 pub mod help;
+pub mod indentation;
 pub mod namespace_parser;
 pub mod package_library;
 pub mod parameter_resolver;

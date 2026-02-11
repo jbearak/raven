@@ -317,6 +317,12 @@
           "type": "boolean",
           "default": true,
           "description": "Trigger parameter completions when typing '(' after a function name. When disabled, parameter suggestions require manual invocation (Ctrl+Space)."
+        },
+        "raven.indentation.style": {
+          "type": "string",
+          "enum": ["rstudio", "rstudio-minus"],
+          "default": "rstudio",
+          "description": "Indentation style for R code. 'rstudio' aligns same-line arguments to opening paren; 'rstudio-minus' indents all arguments relative to previous line."
         }
       }
     }

@@ -29,7 +29,25 @@
     }
   },
   "indentationRules": {
-    "increaseIndentPattern": "^.*\\{[^}]*$|^.*\\([^)]*$",
-    "decreaseIndentPattern": "^\\s*[})]"
-  }
+    "increaseIndentPattern": "^.*[{(\\[]\\s*(#.*)?$",
+    "decreaseIndentPattern": "^\\s*[})\\]]"
+  },
+  "onEnterRules": [
+    {
+      "beforeText": ".*(\\|>|%>%)\\s*(#.*)?$",
+      "action": { "indent": "indent" }
+    },
+    {
+      "beforeText": ".*\\+\\s*(#.*)?$",
+      "action": { "indent": "indent" }
+    },
+    {
+      "beforeText": ".*~\\s*(#.*)?$",
+      "action": { "indent": "indent" }
+    },
+    {
+      "beforeText": ".*(%\\w+%)\\s*(#.*)?$",
+      "action": { "indent": "indent" }
+    }
+  ]
 }
