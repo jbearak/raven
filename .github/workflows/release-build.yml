@@ -50,8 +50,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry & build artifacts
@@ -67,7 +68,7 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.use-zigbuild
-        run: pip install cargo-zigbuild
+        run: pip install cargo-zigbuild==0.21.6
 
       - name: Build LSP
         run: |
@@ -91,7 +92,7 @@ jobs:
           fi
 
       - name: Upload LSP artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lsp-${{ matrix.platform }}
           path: raven-${{ matrix.platform }}.zip
@@ -108,7 +109,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '18'
 
@@ -116,7 +117,7 @@ jobs:
         run: npm install -g @vscode/vsce
 
       - name: Download LSP artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: lsp-*
           path: lsp-binaries
@@ -160,7 +161,7 @@ jobs:
           vsce package --target ${{ matrix.target }}
 
       - name: Upload extension artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vscode-${{ matrix.target }}
           path: editors/vscode/*.vsix
