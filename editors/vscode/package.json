@@ -2,7 +2,7 @@
   "name": "raven",
   "displayName": "Raven - R Language Server",
   "description": "Static R language server with cross-file awareness",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "jbearak",
   "license": "GPL-3.0",
   "repository": {
