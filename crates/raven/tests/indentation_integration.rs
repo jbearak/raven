@@ -488,12 +488,10 @@ fn test_insert_spaces_false() {
 
 #[test]
 fn test_insert_spaces_false_with_alignment() {
-    // When target column is not a multiple of tab_size, use tabs + spaces
+    // func( has opener at column 4; next-line indent = 4 columns = 1 tab
     let code = "func(\n";
     let config = tabs_config(4, IndentationStyle::RStudio);
-    // For column 6: 1 tab (4 cols) + 2 spaces
     let indent = simulate_on_type_formatting(code, 1, config);
-    // Column 4 = 1 tab exactly
     assert_eq!(indent, "\t", "4 columns should be 1 tab");
 }
 

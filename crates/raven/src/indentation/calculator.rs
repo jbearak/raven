@@ -69,7 +69,7 @@ pub fn calculate_indentation(
             // Align to chain start column (RHS of assignment if present)
             // but ensure at least one tab_size indent from the line start.
             let line_indent = get_line_indent(source, chain_start_line, config.tab_size);
-            std::cmp::max(chain_start_col, line_indent + config.tab_size)
+            std::cmp::max(chain_start_col, line_indent.saturating_add(config.tab_size))
         }
         IndentContext::InsideParens {
             opener_line,
@@ -80,26 +80,26 @@ pub fn calculate_indentation(
                 IndentationStyle::RStudio => {
                     if has_content_on_opener_line {
                         // Align to column after opening paren
-                        opener_col + 1
+                        opener_col.saturating_add(1)
                     } else {
                         // Indent from function line
-                        get_line_indent(source, opener_line, config.tab_size) + config.tab_size
+                        get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
                     }
                 }
                 IndentationStyle::RStudioMinus => {
                     // Always indent from opener line + tab_size
-                    get_line_indent(source, opener_line, config.tab_size) + config.tab_size
+                    get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
                 }
                 IndentationStyle::Off => {
                     // Off should be handled before reaching calculate_indentation
                     // (the handler returns None early). Fallback to basic indent.
-                    get_line_indent(source, opener_line, config.tab_size) + config.tab_size
+                    get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
                 }
             }
         }
         IndentContext::InsideBraces { opener_line, .. } => {
             // Brace block: indent from brace line
-            get_line_indent(source, opener_line, config.tab_size) + config.tab_size
+            get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
         }
         IndentContext::ClosingDelimiter { opener_line, .. } => {
             // Closing delimiter: align to opener line indentation

@@ -2798,14 +2798,16 @@ impl LanguageServer for Backend {
         // sits inside an ERROR node (unmatched bracket), we delete the duplicate.
         if matches!(params.ch.as_str(), ")" | "]" | "}") {
             if let Some(line_text) = source.lines().nth(position.line as usize) {
-                let col = position.character as usize;
-                if col < line_text.len() {
-                    let next_byte = line_text.as_bytes()[col];
+                // Convert UTF-16 column to byte offset for indexing and tree-sitter
+                let byte_col = utf16_column_to_byte_offset(line_text, position.character);
+                if byte_col < line_text.len() {
+                    let next_byte = line_text.as_bytes()[byte_col];
                     let typed_byte = params.ch.as_bytes()[0];
                     if next_byte == typed_byte {
                         // Potential duplicate — check if the next delimiter is
                         // inside an ERROR node (unmatched bracket).
-                        let point = tree_sitter::Point::new(position.line as usize, col);
+                        let point =
+                            tree_sitter::Point::new(position.line as usize, byte_col);
                         if let Some(node) =
                             tree.root_node().descendant_for_point_range(point, point)
                         {
@@ -2816,17 +2818,18 @@ impl LanguageServer for Backend {
                                     "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
                                     params.ch,
                                     position.line,
-                                    col
+                                    byte_col
                                 );
+                                // TextEdit range uses UTF-16 offsets (LSP protocol)
                                 return Ok(Some(vec![TextEdit {
                                     range: tower_lsp::lsp_types::Range {
                                         start: Position {
                                             line: position.line,
-                                            character: col as u32,
+                                            character: position.character,
                                         },
                                         end: Position {
                                             line: position.line,
-                                            character: (col + 1) as u32,
+                                            character: position.character + 1,
                                         },
                                     },
                                     new_text: String::new(),
@@ -3542,6 +3545,18 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())
+}
+
+/// Convert a UTF-16 column offset to a byte offset within a line.
+fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
+    let mut utf16_count = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_count == utf16_col as usize {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    line.len()
 }
 
 #[cfg(test)]

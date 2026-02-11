@@ -284,6 +284,7 @@ pub struct IndentationConfig {
 pub enum IndentationStyle {
     RStudio,
     RStudioMinus,
+    Off,
 }
 
 pub fn calculate_indentation(
@@ -401,6 +402,7 @@ impl Config {
             .and_then(|s| match s {
                 "rstudio" => Some(IndentationStyle::RStudio),
                 "rstudio-minus" => Some(IndentationStyle::RStudioMinus),
+                "off" => Some(IndentationStyle::Off),
                 _ => None,
             })
             .unwrap_or(IndentationStyle::RStudio);
