@@ -53,12 +53,13 @@ pub struct LibraryCall {
 /// # Examples
 ///
 /// ```
-/// use tree_sitter::Parser;
-/// // Parse R source text and detect source calls
-/// let mut parser = Parser::new();
-/// parser.set_language(tree_sitter_r::language()).unwrap();
-/// let tree = parser.parse("source('utils.R', local = TRUE)\n", None).unwrap();
-/// let sources = crates::rlsp::cross_file::source_detect::detect_source_calls(&tree, "source('utils.R', local = TRUE)\n");
+/// use raven::cross_file::source_detect::detect_source_calls;
+///
+/// let mut parser = tree_sitter::Parser::new();
+/// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+/// let source = "source('utils.R', local = TRUE)\n";
+/// let tree = parser.parse(source, None).unwrap();
+/// let sources = detect_source_calls(&tree, source);
 /// assert_eq!(sources.len(), 1);
 /// assert_eq!(sources[0].path, "utils.R");
 /// assert!(sources[0].local);
@@ -474,10 +475,10 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// # Examples
 ///
 /// ```
-/// use tree_sitter::Parser;
+/// use raven::cross_file::source_detect::detect_library_calls;
 ///
-/// let mut parser = Parser::new();
-/// parser.set_language(tree_sitter_r::language()).unwrap();
+/// let mut parser = tree_sitter::Parser::new();
+/// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
 /// let source = r#"library(dplyr)"#;
 /// let tree = parser.parse(source, None).unwrap();
 /// let calls = detect_library_calls(&tree, source);
@@ -518,8 +519,9 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// // Traverse the whole tree and collect library-like calls.
+/// Traverse the whole tree and collect library-like calls:
+///
+/// ```text
 /// let mut library_calls = Vec::new();
 /// let root = tree.root_node();
 /// visit_node_for_library(root, source_text, &mut library_calls);
@@ -555,16 +557,9 @@ fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<Lib
 ///
 /// # Examples
 ///
-/// ```no_run
-/// // Given a tree-sitter `Node` for a call and the source `content`,
-/// // `try_parse_library_call` returns a `LibraryCall` when the package is statically known.
-/// // (Constructing a Node requires a tree-sitter parse; this example is illustrative.)
-/// # use crates::rlsp::cross_file::source_detect::try_parse_library_call;
-/// # use crates::rlsp::cross_file::source_detect::LibraryCall;
-/// # let node = panic!("node from tree-sitter required");
-/// # let content = "library(dplyr)";
-/// # let _ = try_parse_library_call(node, content);
-/// ```
+/// Given a tree-sitter `Node` for a call and the source `content`,
+/// `try_parse_library_call` returns a `LibraryCall` when the package is statically known.
+/// (Constructing a Node requires a tree-sitter parse; this example is illustrative.)
 fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
     let func_node = node.child_by_field_name("function")?;
     let func_text = node_text(func_node, content);
@@ -614,14 +609,9 @@ fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
 ///
 /// # Examples
 ///
-/// ```
-/// // `args_node` is the Tree-sitter `arguments` node for a call like:
-/// //   library(foo, character.only = TRUE)
-/// // `content` is the source text containing that call.
-/// // The function will return `true` for that node.
-/// let res = has_character_only_true(&args_node, content);
-/// assert!(res);
-/// ```
+/// `args_node` is the Tree-sitter `arguments` node for a call like
+/// `library(foo, character.only = TRUE)` and `content` is the source text
+/// containing that call. The function will return `true` for that node.
 fn has_character_only_true(args_node: &Node, content: &str) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {

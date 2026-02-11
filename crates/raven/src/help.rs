@@ -264,7 +264,7 @@ fn kill_process_by_pid(_pid: u32) {
 ///
 /// ```no_run
 /// // Attempt to get help for `mean` from the base package
-/// if let Some(text) = rlsp::help::get_help("mean", Some("base")) {
+/// if let Some(text) = raven::help::get_help("mean", Some("base")) {
 ///     assert!(text.contains("Usage:"));
 /// }
 /// ```
@@ -408,6 +408,8 @@ cat(paste(txt, collapse = "\n"))
 /// # Examples
 ///
 /// ```
+/// use raven::help::extract_signature_from_help;
+///
 /// let help = r#"
 /// Arithmetic Mean
 ///
@@ -507,7 +509,9 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
+/// use raven::help::get_function_signature;
+///
 /// let sig = get_function_signature("mean", "base");
 /// if let Some(s) = sig {
 ///     println!("{}", s);
@@ -567,6 +571,8 @@ fn r_quotes_to_markdown(text: &str) -> String {
 /// # Examples
 ///
 /// ```
+/// use raven::help::extract_description_from_help;
+///
 /// let help = r#"Arithmetic Mean
 ///
 /// Description:
@@ -577,7 +583,7 @@ fn r_quotes_to_markdown(text: &str) -> String {
 ///      mean(x, ...)
 /// "#;
 ///
-/// let desc = rlsp::help::extract_description_from_help(help);
+/// let desc = extract_description_from_help(help);
 /// assert!(desc.is_some());
 /// let text = desc.unwrap();
 /// assert!(text.contains("Arithmetic Mean"));
@@ -657,6 +663,7 @@ pub fn extract_description_from_help(help_text: &str) -> Option<String> {
 ///
 /// ```
 /// use std::collections::HashMap;
+/// use raven::help::extract_arguments_from_help;
 ///
 /// let help = r#"Arithmetic Mean
 ///
@@ -684,7 +691,7 @@ pub fn extract_description_from_help(help_text: &str) -> Option<String> {
 ///      The mean.
 /// "#;
 ///
-/// let args = rlsp::help::extract_arguments_from_help(help);
+/// let args = extract_arguments_from_help(help);
 /// assert_eq!(args.get("x").unwrap(), "An R object.");
 /// assert!(args.get("trim").unwrap().contains("fraction"));
 /// assert!(args.get("na.rm").unwrap().contains("logical"));

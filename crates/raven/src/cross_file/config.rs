@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
+
 /// Default call site assumption when not specified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CallSiteDefault {
@@ -87,6 +88,8 @@ impl Default for CrossFileConfig {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::CrossFileConfig;
+    ///
     /// let cfg = CrossFileConfig::default();
     /// assert!(cfg.index_workspace);
     /// assert_eq!(cfg.max_chain_depth, 20);
@@ -213,4 +216,5 @@ mod tests {
             "diagnostics_enabled should default to true"
         );
     }
+
 }

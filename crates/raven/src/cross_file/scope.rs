@@ -34,6 +34,7 @@ impl Position {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::Position;
     /// let p = Position::new(3, 5);
     /// assert_eq!(p.line, 3);
     /// assert_eq!(p.column, 5);
@@ -50,6 +51,7 @@ impl Position {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::Position;
     /// let p = Position::eof();
     /// assert!(p.is_eof());
     /// ```
@@ -71,6 +73,7 @@ impl Position {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::Position;
     /// let p = Position::eof();
     /// assert!(p.is_eof());
     ///
@@ -102,6 +105,7 @@ impl FunctionScopeInterval {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::{Position, FunctionScopeInterval};
     /// let start = Position::new(1, 0);
     /// let end = Position::new(10, 0);
     /// let interval = FunctionScopeInterval::new(start, end);
@@ -118,6 +122,7 @@ impl FunctionScopeInterval {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::{Position, FunctionScopeInterval};
     /// let interval = FunctionScopeInterval::new(Position::new(1, 0), Position::new(3, 5));
     /// assert!(interval.contains(Position::new(1, 0)));
     /// assert!(interval.contains(Position::new(2, 10)));
@@ -134,6 +139,7 @@ impl FunctionScopeInterval {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::FunctionScopeInterval;
     /// let iv = FunctionScopeInterval::from_tuple((1, 2, 3, 4));
     /// assert_eq!(iv.as_tuple(), (1, 2, 3, 4));
     /// ```
@@ -153,6 +159,7 @@ impl FunctionScopeInterval {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::{Position, FunctionScopeInterval};
     /// let interval = FunctionScopeInterval::new(Position::new(1, 2), Position::new(3, 4));
     /// assert_eq!(interval.as_tuple(), (1, 2, 3, 4));
     /// ```
@@ -209,6 +216,7 @@ impl FunctionScopeTree {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::FunctionScopeTree;
     /// let empty = FunctionScopeTree::new();
     /// assert!(empty.is_empty());
     ///
@@ -224,6 +232,7 @@ impl FunctionScopeTree {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::FunctionScopeTree;
     /// let tree = FunctionScopeTree::new();
     /// assert_eq!(tree.len(), 0);
     /// ```
@@ -241,13 +250,14 @@ impl FunctionScopeTree {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::{FunctionScopeTree, FunctionScopeInterval, Position};
     /// let scopes = &[ (0, 0, 10, 0), (2, 0, 5, 0), (6, 0, 9, 0) ];
     /// let tree = FunctionScopeTree::from_scopes(scopes);
     /// assert_eq!(tree.len(), 3);
     /// // Query a point inside the second interval
     /// let pos = Position::new(3, 0);
     /// let matches = tree.query_point(pos);
-    /// assert!(matches.iter().any(|iv| iv.contains(pos)));
+    /// assert!(matches.iter().any(|iv: &FunctionScopeInterval| iv.contains(pos)));
     /// ```
     ///
     /// A balanced FunctionScopeTree containing the valid intervals from `scopes`.
@@ -294,14 +304,7 @@ impl FunctionScopeTree {
     ///
     /// Returns the root `IntervalNode` for the slice, or `None` when the slice is empty.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// // Construct a tree from sorted scope tuples via the public constructor.
-    /// let tree = FunctionScopeTree::from_scopes(&[(0, 0, 1, 0), (2, 0, 3, 0)]);
-    /// assert!(!tree.is_empty());
-    /// assert_eq!(tree.len(), 2);
-    /// ```
+    /// Builds a balanced subtree from a sorted slice of intervals via median splitting.
     fn build_balanced_tree(intervals: &[FunctionScopeInterval]) -> Option<Box<IntervalNode>> {
         if intervals.is_empty() {
             return None;
@@ -348,6 +351,7 @@ impl FunctionScopeTree {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::{FunctionScopeTree, Position};
     /// let tree = FunctionScopeTree::from_scopes(&[(0, 0, 2, 0), (1, 0, 3, 0)]);
     /// let pos = Position::new(1, 5);
     /// let mut intervals = tree.query_point(pos);
@@ -368,16 +372,7 @@ impl FunctionScopeTree {
     /// and start-ordering invariants, prunes subtrees that cannot contain the query position
     /// to avoid unnecessary work.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// // Build a tree from scope tuples and query for intervals containing a position.
-    /// let scopes = vec![(1, 0, 10, 0), (2, 0, 5, 0), (6, 0, 9, 0)];
-    /// let tree = FunctionScopeTree::from_scopes(&scopes);
-    /// let pos = Position::new(3, 0);
-    /// let intervals = tree.query_point(pos);
-    /// assert!(intervals.iter().any(|i| i.contains(pos)));
-    /// ```
+    /// Recursively traverses the interval tree, collecting all intervals containing `pos`.
     fn query_point_recursive(
         node: &IntervalNode,
         pos: Position,
@@ -421,6 +416,7 @@ impl FunctionScopeTree {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::{FunctionScopeTree, Position};
     /// let tree = FunctionScopeTree::from_scopes(&[
     ///     (0, 0, 10, 0), // outer scope
     ///     (2, 0, 5, 0),  // inner scope
@@ -481,6 +477,7 @@ impl Default for FunctionScopeTree {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::FunctionScopeTree;
     /// let tree = FunctionScopeTree::default();
     /// assert!(tree.is_empty());
     /// ```
@@ -601,6 +598,7 @@ impl Default for ScopeArtifacts {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::ScopeArtifacts;
     /// let artifacts = ScopeArtifacts::default();
     /// assert!(artifacts.exported_interface.is_empty());
     /// assert!(artifacts.timeline.is_empty());
@@ -639,45 +637,12 @@ pub struct ScopeAtPosition {
 /// scoping (`local = true`) or when it represents a `sys.source` call that does
 /// not target the global environment (`is_sys_source = true` and
 /// `sys_source_global_env = false`).
-///
-/// # Examples
-///
-/// ```
-/// let s = ForwardSource {
-///     local: true,
-///     is_sys_source: false,
-///     sys_source_global_env: false, ..Default::default()
-/// };
-/// assert!(should_apply_local_scoping(&s));
-///
-/// let t = ForwardSource {
-///     local: false,
-///     is_sys_source: true,
-///     sys_source_global_env: false, ..Default::default()
-/// };
-/// assert!(should_apply_local_scoping(&t));
-///
-/// let u = ForwardSource {
-///     local: false,
-///     is_sys_source: true,
-///     sys_source_global_env: true,
-/// };
-/// assert!(!should_apply_local_scoping(&u));
-/// ```
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
 }
 /// Finds the innermost function-scope interval that contains the given position.
 ///
 /// Given a 0-based (line, column) position, returns the containing function scope whose start is the latest (innermost) among all intervals that include the position.
-///
-/// # Examples
-///
-/// ```
-/// let tree = FunctionScopeTree::from_scopes(&[(0, 0, 10, 0), (2, 0, 5, 0)]);
-/// let tuple = find_containing_function_scope(&tree, 3, 1);
-/// assert_eq!(tuple, Some((2, 0, 5, 0)));
-/// ```
 fn find_containing_function_scope(
     tree: &FunctionScopeTree,
     line: u32,
@@ -1166,6 +1131,7 @@ pub fn compute_artifacts_with_metadata(
 /// # Examples
 ///
 /// ```
+/// use raven::cross_file::{ScopeArtifacts, scope_at_position};
 /// let artifacts = ScopeArtifacts::default();
 /// let scope = scope_at_position(&artifacts, 0, 0);
 /// assert!(scope.symbols.is_empty());
@@ -1325,10 +1291,11 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
 ///
 /// ```
 /// use std::collections::HashSet;
-/// let artifacts = crate::cross_file::scope::ScopeArtifacts::default();
+/// use raven::cross_file::{ScopeArtifacts, scope_at_position_with_packages};
+/// let artifacts = ScopeArtifacts::default();
 /// let get_exports = |_pkg: &str| -> HashSet<String> { HashSet::new() };
 /// let base_exports = HashSet::new();
-/// let scope = crate::cross_file::scope::scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+/// let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
 /// assert!(scope.symbols.is_empty());
 /// ```
 pub fn scope_at_position_with_packages<F>(
@@ -2262,21 +2229,6 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// # Returns
 ///
 /// `u64` hash of the provided `interface`, `packages`, and `declared_symbols`.
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::HashMap;
-/// use std::sync::Arc;
-/// use crate::cross_file::types::DeclaredSymbol;
-/// // Use an empty interface, no packages, and no declared symbols as the simplest example.
-/// let interface: HashMap<Arc<str>, crate::ScopedSymbol> = HashMap::new();
-/// let packages: Vec<String> = Vec::new();
-/// let declared: Vec<DeclaredSymbol> = Vec::new();
-/// let h1 = crate::compute_interface_hash(&interface, &packages, &declared);
-/// let h2 = crate::compute_interface_hash(&interface, &packages, &declared);
-/// assert_eq!(h1, h2);
-/// ```
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
@@ -2379,38 +2331,6 @@ where
 ///
 /// A `ScopeAtPosition` containing the merged symbols, provenance chain, recorded depth-exceeded
 /// entries, and package information applicable at the queried position.
-///
-/// # Examples
-///
-/// ```
-/// use url::Url;
-/// use std::collections::HashSet;
-///
-/// // Minimal stubs: no artifacts, no metadata, and an empty graph.
-/// let uri = Url::parse("file:///example.R").unwrap();
-/// let get_artifacts = |_u: &Url| -> Option<super::ScopeArtifacts> { None };
-/// let get_metadata = |_u: &Url| -> Option<super::types::CrossFileMetadata> { None };
-/// let graph: super::dependency::DependencyGraph = Default::default();
-/// let mut visited: HashSet<Url> = HashSet::new();
-///
-/// let scope = super::scope_at_position_with_graph_recursive(
-///     &uri,
-///     1,
-///     1,
-///     &get_artifacts,
-///     &get_metadata,
-///     &graph,
-///     None,
-///     None,
-///     10,
-///     0,
-///     &mut visited,
-///     &[], // no inherited packages
-///     &std::collections::HashSet::new(), // no base exports
-/// );
-///
-/// assert!(scope.symbols.is_empty());
-/// ```
 #[allow(clippy::too_many_arguments)]
 fn scope_at_position_with_graph_recursive<F, G>(
     uri: &Url,

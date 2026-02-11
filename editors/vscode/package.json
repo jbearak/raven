@@ -37,6 +37,11 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "configurationDefaults": {
+      "[r]": {
+        "editor.formatOnType": true
+      }
+    },
     "configuration": {
       "type": "object",
       "title": "Raven",
@@ -317,6 +322,17 @@
           "type": "boolean",
           "default": true,
           "description": "Trigger parameter completions when typing '(' after a function name. When disabled, parameter suggestions require manual invocation (Ctrl+Space)."
+        },
+        "raven.indentation.style": {
+          "type": "string",
+          "enum": ["rstudio", "rstudio-minus", "off"],
+          "enumDescriptions": [
+            "Aligns same-line arguments to opening paren (RStudio convention)",
+            "Indents all arguments relative to previous line",
+            "Disables AST-aware indentation (Tier 2), keeping only basic declarative rules (Tier 1)"
+          ],
+          "default": "rstudio",
+          "description": "Indentation style for R code. Controls the AST-aware (Tier 2) indentation behavior. Set to 'off' to disable Tier 2 while keeping basic indentation rules active."
         }
       }
     }

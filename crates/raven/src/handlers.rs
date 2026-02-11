@@ -17,6 +17,7 @@ use crate::content_provider::ContentProvider;
 use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::cross_file::{scope, ScopedSymbol};
 use crate::state::WorldState;
+use crate::utf16::utf16_column_to_byte_offset;
 
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
@@ -500,12 +501,17 @@ impl<'a> SymbolExtractor<'a> {
         lhs: tree_sitter::Node<'a>,
         rhs: tree_sitter::Node<'a>,
     ) -> Option<RawSymbol> {
-        // LHS must be an identifier
-        if lhs.kind() != "identifier" {
+        // LHS must be an identifier (and not a MISSING node with empty text)
+        if lhs.kind() != "identifier" || lhs.is_missing() {
             return None;
         }
 
         let name = node_text(lhs, self.text).to_string();
+
+        // Skip empty names (defensive: MISSING nodes may slip through)
+        if name.is_empty() {
+            return None;
+        }
 
         // Skip reserved words
         if crate::reserved_words::is_reserved_word(&name) {
@@ -546,12 +552,17 @@ impl<'a> SymbolExtractor<'a> {
         lhs: tree_sitter::Node<'a>,
         rhs: tree_sitter::Node<'a>,
     ) -> Option<RawSymbol> {
-        // RHS must be an identifier (the name being assigned)
-        if rhs.kind() != "identifier" {
+        // RHS must be an identifier (and not a MISSING node with empty text)
+        if rhs.kind() != "identifier" || rhs.is_missing() {
             return None;
         }
 
         let name = node_text(rhs, self.text).to_string();
+
+        // Skip empty names (defensive: MISSING nodes may slip through)
+        if name.is_empty() {
+            return None;
+        }
 
         // Skip reserved words
         if crate::reserved_words::is_reserved_word(&name) {
@@ -1265,7 +1276,7 @@ impl<'a> SymbolExtractor<'a> {
 /// # Example
 ///
 /// ```no_run
-/// use crate::handlers::{HierarchyBuilder, RawSymbol};
+/// use raven::handlers::{HierarchyBuilder, RawSymbol};
 ///
 /// let symbols: Vec<RawSymbol> = vec![/* extracted symbols */];
 /// let line_count = 100;
@@ -1854,17 +1865,6 @@ impl HierarchyBuilder {
 /// and parent-file backward directives; it uses the state's ContentProvider to
 /// resolve referenced files and artifacts.
 ///
-/// # Examples
-///
-/// ```no_run
-/// use url::Url;
-/// // `state` is a prepared WorldState; obtain or mock as appropriate in tests.
-/// let state = /* WorldState */ todo!();
-/// let uri = Url::parse("file:///path/to/script.R").unwrap();
-/// let symbols = crate::get_cross_file_symbols(&state, &uri, 12, 4);
-/// // `symbols` maps symbol names to their scoped metadata.
-/// ```
-///
 /// # Returns
 ///
 /// A `HashMap` mapping symbol names to their corresponding `ScopedSymbol` entries.
@@ -1885,15 +1885,6 @@ fn get_cross_file_symbols(
 ///
 /// A `scope::ScopeAtPosition` containing the resolved symbols, `loaded_packages`, `inherited_packages`, and scope depth metadata for the specified location.
 ///
-/// # Examples
-///
-/// ```no_run
-/// use url::Url;
-/// // `state` is your WorldState and `uri` is the file URL you want to query.
-/// let uri = Url::parse("file:///path/to/script.R").unwrap();
-/// let scope = get_cross_file_scope(&state, &uri, 10, 5);
-/// // inspect scope.symbols, scope.loaded_packages, etc.
-/// ```
 fn get_cross_file_scope(
     state: &WorldState,
     uri: &Url,
@@ -2255,12 +2246,6 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 ///
 /// The filename without extension, or `None` if the URI has no path segments.
 ///
-/// # Examples
-///
-/// ```
-/// let uri = Url::parse("file:///path/to/utils.R").unwrap();
-/// assert_eq!(extract_container_name(&uri), Some("utils".to_string()));
-/// ```
 fn extract_container_name(uri: &Url) -> Option<String> {
     uri.path_segments()?.next_back().map(|filename| {
         // Remove extension if present
@@ -2297,7 +2282,11 @@ fn extract_container_name(uri: &Url) -> Option<String> {
 /// # Examples
 ///
 /// ```no_run
+/// use raven::handlers::workspace_symbol;
+/// use raven::state::WorldState;
+///
 /// // Given a populated `state: WorldState`
+/// # let state: WorldState = todo!();
 /// let symbols = workspace_symbol(&state, "plot");
 /// // `symbols` is `Some(Vec<SymbolInformation>)` containing matching symbols (up to the configured limit)
 /// ```
@@ -2441,18 +2430,6 @@ fn collect_legacy_ast_symbols(
 /// - `lower_query`: a lowercased query string used for substring matching against symbol names.
 /// - `symbols`: output vector to which matching `SymbolInformation` entries will be appended.
 ///
-/// # Examples
-///
-/// ```no_run
-/// # use lsp_types::{Location, Range, Position, SymbolInformation, SymbolKind};
-/// # use url::Url;
-/// # // Assume `artifacts` is a prepared ScopeArtifacts instance and `symbols` is an empty Vec.
-/// # let file_uri = Url::parse("file:///path/to/file.R").unwrap();
-/// # let lower_query = "foo";
-/// # let mut symbols: Vec<SymbolInformation> = Vec::new();
-/// # // collect_workspace_symbols_from_artifacts(&file_uri, &artifacts, lower_query, &mut symbols);
-/// // After calling, `symbols` will contain any exported symbols whose names contain "foo".
-/// ```
 #[allow(deprecated)] // SymbolInformation::deprecated is deprecated in favor of tags
 fn collect_workspace_symbols_from_artifacts(
     file_uri: &Url,
@@ -2517,8 +2494,14 @@ fn collect_workspace_symbols_from_artifacts(
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
+/// use raven::handlers::diagnostics;
+/// use raven::state::WorldState;
+/// use url::Url;
+///
 /// // Given a prepared `WorldState` and a `Url` referring to an open document:
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
 /// let diags = diagnostics(&state, &uri);
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
@@ -3404,17 +3387,6 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
 /// points at the first backward directive line and suggests adding `line=` or `match=`
 /// to disambiguate. The diagnostic's severity is taken from the cross-file config.
 ///
-/// # Examples
-///
-/// ```no_run
-/// # use url::Url;
-/// # use lsp_types::Diagnostic;
-/// # use crate::WorldState;
-/// # use crate::cross_file::CrossFileMetadata;
-/// # fn example(state: &WorldState, uri: &Url, meta: &CrossFileMetadata, diagnostics: &mut Vec<Diagnostic>) {
-/// collect_ambiguous_parent_diagnostics(state, uri, meta, diagnostics);
-/// # }
-/// ```
 fn collect_ambiguous_parent_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -3725,14 +3697,6 @@ fn collect_invalid_line_param_diagnostics(
 /// - `directive_meta`: Cross-file directive metadata (contains `@lsp-source` / `source()` locations).
 /// - `diagnostics`: Mutable vector to receive emitted diagnostics.
 ///
-/// # Examples
-///
-/// ```no_run
-/// // Collect diagnostics into `diags` for a parsed document:
-/// let mut diags = Vec::new();
-/// collect_out_of_scope_diagnostics(&state, &uri, root_node, &text, &directive_meta, &mut diags);
-/// // `diags` now contains diagnostics for symbols used before their `source()` calls.
-/// ```
 fn collect_out_of_scope_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -6543,14 +6507,6 @@ fn collect_usages_with_context<'a>(
 ///
 /// Checks common R constants (e.g., `TRUE`, `FALSE`, `NULL`, `NA`, `Inf`, `NaN`, `T`, `F`) first and then consults the comprehensive builtin registry.
 ///
-/// # Examples
-///
-/// ```
-/// assert!(is_builtin("TRUE"));
-/// assert!(is_builtin("sum"));
-/// assert!(!is_builtin("my_custom_fn"));
-/// ```
-///
 /// # Returns
 /// `true` if `name` is a recognized R builtin constant or function, `false` otherwise.
 fn is_builtin(name: &str) -> bool {
@@ -6574,14 +6530,6 @@ fn is_builtin(name: &str) -> bool {
 ///
 /// `true` if the symbol is exported by a loaded package, `false` otherwise.
 ///
-/// # Examples
-///
-/// ```rust,no_run
-/// # use crate::package_library::PackageLibrary;
-/// # let package_library: PackageLibrary = unimplemented!();
-/// let loaded = vec!["stats".to_string(), "base".to_string()];
-/// let is_export = is_package_export("lm", &loaded, &package_library);
-/// ```
 fn is_package_export(
     name: &str,
     loaded_packages: &[String],
@@ -6606,11 +6554,16 @@ fn is_package_export(
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
+/// use raven::handlers::completion;
+/// use raven::state::WorldState;
+/// use tower_lsp::lsp_types::Position;
+/// use url::Url;
+///
 /// // Obtain a `WorldState`, `Url`, and `Position` from your environment.
-/// let state = /* WorldState instance */;
-/// let uri = /* Url for the document */;
-/// let pos = /* Position { line, character } */;
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
+/// let pos = Position::new(0, 0);
 /// let resp = completion(&state, &uri, pos, None);
 /// assert!(resp.is_some());
 /// ```
@@ -7426,16 +7379,6 @@ pub fn extract_definition_statement(
     extract_statement_from_tree(tree, symbol, &content)
 }
 
-fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
-    let mut utf16_count = 0;
-    for (byte_idx, ch) in line.char_indices() {
-        if utf16_count == utf16_col as usize {
-            return byte_idx;
-        }
-        utf16_count += ch.len_utf16();
-    }
-    line.len()
-}
 
 fn next_utf8_char_boundary(line: &str, byte_offset: usize) -> usize {
     if byte_offset >= line.len() {
@@ -7820,12 +7763,17 @@ async fn get_help_cached(
 /// # Examples
 ///
 /// ```no_run
-/// # use lsp_types::Position;
+/// # use tower_lsp::lsp_types::Position;
 /// # use url::Url;
-/// # use crate::state::WorldState;
+/// # use raven::state::WorldState;
+/// # use raven::handlers::hover;
+/// # async fn example() {
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
 /// // Assuming `state` is available and `uri` refers to an open R document:
 /// let pos = Position::new(10, 4);
-/// let _ = hover(&state, &uri, pos);
+/// let _ = hover(&state, &uri, pos).await;
+/// # }
 /// ```
 ///
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
@@ -8714,8 +8662,16 @@ fn build_fallback_signature(
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
+/// use raven::handlers::goto_definition;
+/// use raven::state::WorldState;
+/// use tower_lsp::lsp_types::Position;
+/// use url::Url;
+///
 /// // Assume `state`, `uri`, and `pos` are available in the test harness.
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
+/// let pos = Position::new(0, 0);
 /// let result = goto_definition(&state, &uri, pos);
 /// // `result` will be `Some(...)` when a navigable definition exists, otherwise `None`.
 /// ```
@@ -9533,6 +9489,24 @@ mod tests {
 
         let result = escape_markdown(input);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_extract_container_name() {
+        let uri = Url::parse("file:///path/to/utils.R").unwrap();
+        assert_eq!(extract_container_name(&uri), Some("utils".to_string()));
+
+        let uri_no_ext = Url::parse("file:///path/to/Makefile").unwrap();
+        assert_eq!(
+            extract_container_name(&uri_no_ext),
+            Some("Makefile".to_string())
+        );
+
+        let uri_nested = Url::parse("file:///project/src/analysis.r").unwrap();
+        assert_eq!(
+            extract_container_name(&uri_nested),
+            Some("analysis".to_string())
+        );
     }
 
     fn find_function_definition(node: Node) -> Option<Node> {

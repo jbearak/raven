@@ -40,6 +40,8 @@ pub fn is_verbose() -> bool {
 ///
 /// Use this to measure the duration of a scope:
 /// ```
+/// use raven::perf::TimingGuard;
+///
 /// let _guard = TimingGuard::new("operation_name");
 /// // ... do work ...
 /// // Duration logged when _guard goes out of scope

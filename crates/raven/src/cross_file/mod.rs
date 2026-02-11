@@ -58,7 +58,9 @@ pub use workspace_index::*;
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
+/// use raven::cross_file;
+///
 /// let content = r#"
 /// #> sourceline: helper.R
 /// source('other.R')
@@ -66,7 +68,7 @@ pub use workspace_index::*;
 /// "#;
 /// let meta = cross_file::extract_metadata(content);
 /// assert!(meta.sources.len() >= 1);
-/// assert!(meta.library_calls.iter().any(|lc| lc.name == "pkg"));
+/// assert!(meta.library_calls.iter().any(|lc| lc.package == "pkg"));
 /// ```
 pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(content, None));

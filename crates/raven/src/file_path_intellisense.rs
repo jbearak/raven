@@ -18,6 +18,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::cross_file::path_resolve::PathContext;
 use crate::cross_file::types::{byte_offset_to_utf16_column, CrossFileMetadata};
+use crate::utf16::utf16_column_to_byte_offset;
 
 // ============================================================================
 // Types
@@ -341,17 +342,6 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
 }
 
-/// Convert UTF-16 column to byte offset for a given line
-fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
-    let mut utf16_count = 0;
-    for (byte_idx, ch) in line.char_indices() {
-        if utf16_count == utf16_col as usize {
-            return byte_idx;
-        }
-        utf16_count += ch.len_utf16();
-    }
-    line.len()
-}
 
 /// Check if cursor is after an LSP directive where a path is expected
 ///

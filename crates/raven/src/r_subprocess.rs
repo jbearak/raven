@@ -32,10 +32,11 @@ impl RSubprocess {
     ///
     /// ```
     /// use std::path::PathBuf;
+    /// use raven::r_subprocess::RSubprocess;
     /// // If an explicit invalid path is given, `new` returns `None`.
-    /// assert!(crate::r_subprocess::RSubprocess::new(Some(PathBuf::from("/no/such/path"))).is_none());
+    /// assert!(RSubprocess::new(Some(PathBuf::from("/no/such/path"))).is_none());
     /// // When no path is provided, `new` attempts discovery and may return `Some` or `None` depending on the environment.
-    /// let _ = crate::r_subprocess::RSubprocess::new(None);
+    /// let _ = RSubprocess::new(None);
     /// ```
     pub fn new(r_path: Option<PathBuf>) -> Option<Self> {
         let path = match r_path {
@@ -78,16 +79,6 @@ impl RSubprocess {
     /// # Returns
     ///
     /// `Some(PathBuf)` containing the path to an R executable if found, `None` if no candidate was discovered.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// if let Some(r_path) = discover_r_path() {
-    ///     println!("Found R at {:?}", r_path);
-    /// } else {
-    ///     println!("R not found on this system");
-    /// }
-    /// ```
     fn discover_r_path() -> Option<PathBuf> {
         // First, try to find R in PATH using `which` on Unix or `where` on Windows
         if let Some(path) = Self::find_r_in_path() {
@@ -102,15 +93,6 @@ impl RSubprocess {
     ///
     /// Returns `Some(PathBuf)` with the first valid R executable found in PATH, or `None` if no valid executable is discovered.
     /// The function validates any candidate before returning it.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// // Returns `Some` when an R executable is available on PATH, otherwise `None`.
-    /// if let Some(path) = find_r_in_path() {
-    ///     println!("Found R at: {}", path.display());
-    /// }
-    /// ```
     fn find_r_in_path() -> Option<PathBuf> {
         #[cfg(unix)]
         {
@@ -145,13 +127,6 @@ impl RSubprocess {
     }
 
     /// Searches common installation locations for an R executable and returns the first valid candidate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// // Usage: returns Some(path) if a known R installation is found, or None otherwise.
-    /// let _ = find_r_in_common_locations();
-    /// ```
     fn find_r_in_common_locations() -> Option<PathBuf> {
         let common_paths = Self::get_common_r_paths();
         common_paths.into_iter().find(Self::is_valid_r_executable)
@@ -161,14 +136,6 @@ impl RSubprocess {
     ///
     /// The returned list contains platform-specific candidate paths (macOS, Linux, Windows) in a preferred order.
     /// Entries are suggestions and may point to non-existent files; callers should validate existence before use.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let paths = get_common_r_paths();
-    /// // Paths are returned as absolute filesystem locations (may or may not exist)
-    /// assert!(paths.iter().all(|p| p.is_absolute()));
-    /// ```
     fn get_common_r_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
@@ -220,15 +187,6 @@ impl RSubprocess {
     /// Checks that the file exists and that invoking it with `--version` either
     /// returns a successful exit status or prints an R version string to stderr.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    /// let candidate = PathBuf::from("/usr/bin/R");
-    /// // May be `true` on systems with R installed, `false` otherwise.
-    /// let _ok = is_valid_r_executable(&candidate);
-    /// ```
-    ///
     /// # Returns
     ///
     /// `true` if the path exists and appears to be an R executable, `false` otherwise.
@@ -259,16 +217,6 @@ impl RSubprocess {
     /// Returns an error if the R subprocess cannot be spawned or if R exits with a non-zero status,
     /// in which case the error contains the process status and stderr content.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    /// // Construct an RSubprocess pointing to an `R` executable on PATH or a full path.
-    /// let r = RSubprocess::new(Some(PathBuf::from("R"))).unwrap();
-    /// let rt = tokio::runtime::Runtime::new().unwrap();
-    /// let out = rt.block_on(r.execute_r_code(r#"cat("ok")"#)).unwrap();
-    /// assert_eq!(out.trim(), "ok");
-    /// ```
     /// Default timeout for R subprocess calls (30 seconds).
     const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -347,7 +295,7 @@ impl RSubprocess {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use rlsp::r_subprocess::RSubprocess;
+    /// # use raven::r_subprocess::RSubprocess;
     /// # async fn doc_example() {
     /// let rsub = RSubprocess::new(None).expect("R executable not found");
     /// let lib_paths = rsub.get_lib_paths().await.unwrap();
@@ -388,16 +336,14 @@ impl RSubprocess {
     ///
     /// # Examples
     ///
-    /// ```
-    /// // Run the async method using a small runtime for demonstration.
-    /// // Replace the constructor below with the actual path-discovery call used in your project.
+    /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use tokio::runtime::Runtime;
-    /// # use crates::rlsp::r_subprocess::RSubprocess;
+    /// # use raven::r_subprocess::RSubprocess;
+    /// # async fn doc_example() {
     /// let r = RSubprocess::new(None).expect("R executable not found");
-    /// let rt = Runtime::new().unwrap();
-    /// let pkgs = rt.block_on(async { r.get_base_packages().await.unwrap() });
+    /// let pkgs = r.get_base_packages().await.unwrap();
     /// assert!(pkgs.contains(&"base".to_string()));
+    /// # }
     /// ```
     pub async fn get_base_packages(&self) -> Result<Vec<String>> {
         // Use cat() with sep="\n" to output each package name on its own line
@@ -443,13 +389,12 @@ impl RSubprocess {
     /// # Examples
     ///
     /// ```no_run
-    /// // Runs the async call on the current thread
+    /// # use raven::r_subprocess::RSubprocess;
+    /// # async fn doc_example() {
     /// let rp = RSubprocess::new(None).expect("R executable not found");
-    /// let exports = tokio::runtime::Runtime::new()
-    ///     .unwrap()
-    ///     .block_on(rp.get_package_exports("stats"))
-    ///     .expect("failed to get exports");
+    /// let exports = rp.get_package_exports("stats").await.expect("failed to get exports");
     /// assert!(exports.iter().any(|s| s == "lm"));
+    /// # }
     /// ```
     pub async fn get_package_exports(&self, package: &str) -> Result<Vec<String>> {
         // Validate package name to prevent injection attacks
@@ -536,14 +481,14 @@ impl RSubprocess {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rlsp::r_subprocess::RSubprocess;
-    /// # tokio_test::block_on(async {
+    /// # use raven::r_subprocess::RSubprocess;
+    /// # async fn doc_example() {
     /// if let Some(r) = RSubprocess::new(None) {
     ///     // Retrieves dependencies declared in the DESCRIPTION of the "stats" package.
     ///     let deps = r.get_package_depends("stats").await.unwrap();
     ///     assert!(deps.iter().all(|name| !name.is_empty()));
     /// }
-    /// # });
+    /// # }
     /// ```
     pub async fn get_package_depends(&self, package: &str) -> Result<Vec<String>> {
         // Validate package name to prevent injection attacks
@@ -1000,12 +945,6 @@ fn parse_multi_exports_output(
 /// A `Vec<String>` containing valid package names extracted from `depends_str`, or an empty
 /// vector if there are no valid package names.
 ///
-/// # Examples
-///
-/// ```
-/// let v = parse_depends_field("R (>= 3.5), dplyr, ggplot2");
-/// assert_eq!(v, vec!["dplyr".to_string(), "ggplot2".to_string()]);
-/// ```
 fn parse_depends_field(depends_str: &str) -> Vec<String> {
     let trimmed = depends_str.trim();
     if trimmed.is_empty() {
@@ -1037,19 +976,6 @@ fn parse_depends_field(depends_str: &str) -> Vec<String> {
 /// Trims each line, ignores empty lines, converts each remaining line into a `PathBuf`,
 /// and retains only paths that exist on the filesystem.
 ///
-/// # Examples
-///
-/// ```
-/// use std::fs;
-/// use std::path::PathBuf;
-/// let dir = std::env::temp_dir().join("r_libs_example");
-/// let dir2 = dir.join("sub");
-/// let _ = fs::create_dir_all(&dir2);
-/// let input = format!("{}\n{}\n\n", dir.display(), dir2.display());
-/// let paths = crate::parse_lib_paths_output(&input);
-/// assert!(paths.contains(&PathBuf::from(dir)));
-/// assert!(paths.contains(&PathBuf::from(dir2)));
-/// ```
 fn parse_lib_paths_output(output: &str) -> Vec<PathBuf> {
     output
         .lines()
@@ -1062,13 +988,6 @@ fn parse_lib_paths_output(output: &str) -> Vec<PathBuf> {
 
 /// Parse the output of R's `.packages()` (one package name per line) into a list of package names.
 ///
-/// # Examples
-///
-/// ```
-/// let out = "base\nmethods\nutils\n";
-/// let pkgs = parse_packages_output(out);
-/// assert_eq!(pkgs, vec!["base".to_string(), "methods".to_string(), "utils".to_string()]);
-/// ```
 fn parse_packages_output(output: &str) -> Vec<String> {
     output
         .lines()
@@ -1209,6 +1128,7 @@ fn parse_formals_output(output: &str) -> Vec<ParameterInfo> {
 /// # Examples
 ///
 /// ```
+/// use raven::r_subprocess::get_fallback_base_packages;
 /// let pkgs = get_fallback_base_packages();
 /// assert_eq!(pkgs, vec![
 ///     "base".to_string(),
@@ -1237,9 +1157,14 @@ pub fn get_fallback_base_packages() -> Vec<String> {
 /// This returns a curated list of common system, user, and package-manager library locations for macOS, Linux, and Windows,
 /// filtered to only include paths that exist on the filesystem.
 ///
+/// Note: this function performs synchronous filesystem checks (`Path::exists()`).
+/// That is acceptable for the current fallback usage when the R subprocess is unavailable,
+/// but avoid calling it on LSP request threads (do I/O off-thread and revalidate via cache updates).
+///
 /// # Examples
 ///
 /// ```
+/// use raven::r_subprocess::get_fallback_lib_paths;
 /// let paths = get_fallback_lib_paths();
 /// for p in &paths {
 ///     // returned paths are absolute filesystem paths

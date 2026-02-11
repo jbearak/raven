@@ -18,8 +18,10 @@ use tower_lsp::Server;
 
 use crate::content_provider::ContentProvider;
 use crate::handlers;
+use crate::indentation;
 use crate::r_env;
-use crate::state::{scan_workspace, SymbolConfig, WorldState};
+use crate::state::{scan_workspace, IndentationSettings, SymbolConfig, WorldState};
+use crate::utf16::utf16_column_to_byte_offset;
 
 /// Category of files for on-demand indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +86,7 @@ struct ActiveDocumentsChangedParams {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use serde_json::json;
 /// let settings = json!({
 ///     "crossFile": {
@@ -102,7 +104,7 @@ struct ActiveDocumentsChangedParams {
 ///     "diagnostics": { "enabled": true, "undefinedVariables": false }
 /// });
 ///
-/// let cfg = crate::backend::parse_cross_file_config(&settings);
+/// let cfg = raven::backend::parse_cross_file_config(&settings);
 /// assert!(cfg.is_some());
 /// let cfg = cfg.unwrap();
 /// assert_eq!(cfg.max_backward_depth, 5);
@@ -119,7 +121,6 @@ pub(crate) fn parse_cross_file_config(
     let cross_file = settings.get("crossFile");
     let diagnostics = settings.get("diagnostics");
     let packages = settings.get("packages");
-
     // Return None only if no relevant settings are present at all
     if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
         return None;
@@ -274,6 +275,7 @@ pub(crate) fn parse_cross_file_config(
         }
     }
 
+
     log::info!("Cross-file configuration loaded from LSP settings:");
     log::info!("  max_backward_depth: {}", config.max_backward_depth);
     log::info!("  max_forward_depth: {}", config.max_forward_depth);
@@ -347,6 +349,36 @@ pub(crate) fn parse_cross_file_config(
         "    workspace_index_max_entries: {}",
         config.cache_workspace_index_max_entries
     );
+    Some(config)
+}
+
+/// Parse indentation configuration from LSP settings.
+///
+/// Reads the `indentation` section from a serde_json::Value and constructs a
+/// populated `IndentationSettings`. Only fields present in the provided JSON
+/// are applied; absent fields retain their defaults.
+pub(crate) fn parse_indentation_config(
+    settings: &serde_json::Value,
+) -> Option<IndentationSettings> {
+    let indentation = settings.get("indentation")?;
+
+    let mut config = IndentationSettings::default();
+
+    if let Some(style_str) = indentation.get("style").and_then(|v| v.as_str()) {
+        config.style = match style_str.to_lowercase().as_str() {
+            "rstudio" => crate::indentation::IndentationStyle::RStudio,
+            "rstudio-minus" => crate::indentation::IndentationStyle::RStudioMinus,
+            "off" => crate::indentation::IndentationStyle::Off,
+            _ => {
+                log::warn!(
+                    "Invalid indentation.style: {}, defaulting to rstudio",
+                    style_str
+                );
+                crate::indentation::IndentationStyle::RStudio
+            }
+        };
+    }
+
     Some(config)
 }
 
@@ -559,12 +591,13 @@ impl LanguageServer for Backend {
     /// # Examples
     ///
     /// ```no_run
-    /// # use lsp_types::InitializeParams;
-    /// # async fn example(backend: &crate::backend::Backend) -> lsp_types::InitializeResult {
+    /// # use tower_lsp::lsp_types::InitializeParams;
+    /// # use tower_lsp::LanguageServer;
+    /// # async fn example(backend: &raven::backend::Backend) -> tower_lsp::lsp_types::InitializeResult {
     /// let params = InitializeParams::default();
     /// // run inside an async context (tokio/runtime)
     /// backend.initialize(params).await.unwrap()
-    /// }
+    /// # }
     /// ```
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         log::info!("Initializing ark-lsp");
@@ -599,6 +632,11 @@ impl LanguageServer for Backend {
             // Parse completion configuration
             if let Some(config) = parse_completion_config(init_options) {
                 state.completion_config = config;
+            }
+
+            // Parse indentation configuration
+            if let Some(config) = parse_indentation_config(init_options) {
+                state.indentation_config = config;
             }
         }
 
@@ -647,6 +685,9 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                document_on_type_formatting_provider: Some(
+                    indentation::on_type_formatting_capability(),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1953,7 +1994,8 @@ impl LanguageServer for Backend {
     ///
     /// ```no_run
     /// // Called from an async context when the client sends updated configuration.
-    /// # async fn example(backend: &crate::backend::Backend, params: lsp_types::DidChangeConfigurationParams) {
+    /// # use tower_lsp::LanguageServer;
+    /// # async fn example(backend: &raven::backend::Backend, params: tower_lsp::lsp_types::DidChangeConfigurationParams) {
     /// backend.did_change_configuration(params).await;
     /// # }
     /// ```
@@ -1971,8 +2013,14 @@ impl LanguageServer for Backend {
         // Parse completion configuration if provided
         let new_completion_config = parse_completion_config(&params.settings);
 
+        // Parse indentation configuration if provided
+        let new_indentation_config = parse_indentation_config(&params.settings);
+
         // Log if configuration parsing failed and defaults will be used
-        if new_config.is_none() {
+        let has_cross_file_settings = params.settings.get("crossFile").is_some()
+            || params.settings.get("diagnostics").is_some()
+            || params.settings.get("packages").is_some();
+        if has_cross_file_settings && new_config.is_none() {
             log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
         }
 
@@ -2052,6 +2100,11 @@ impl LanguageServer for Backend {
                 config.hierarchical_document_symbol_support =
                     state.symbol_config.hierarchical_document_symbol_support;
                 state.symbol_config = config;
+            }
+
+            // Apply new indentation config if parsed
+            if let Some(config) = new_indentation_config {
+                state.indentation_config = config;
             }
 
             // Apply new completion config if parsed, tracking trigger change
@@ -2539,9 +2592,10 @@ impl LanguageServer for Backend {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # use lsp_types::DocumentSymbolParams;
-    /// # async fn example(backend: &crate::backend::Backend, params: DocumentSymbolParams) {
+    /// ```no_run
+    /// # use tower_lsp::lsp_types::DocumentSymbolParams;
+    /// # use tower_lsp::LanguageServer;
+    /// # async fn example(backend: &raven::backend::Backend, params: DocumentSymbolParams) {
     /// let result = backend.document_symbol(params).await.unwrap();
     /// if let Some(symbols) = result {
     ///     // process symbols
@@ -2600,11 +2654,12 @@ impl LanguageServer for Backend {
     /// # Examples
     ///
     /// ```no_run
-    /// use lsp_types::CompletionParams;
+    /// use tower_lsp::lsp_types::CompletionParams;
+    /// # use tower_lsp::LanguageServer;
     ///
     /// // `backend` is an initialized `Backend` instance and `params` is a prepared `CompletionParams`.
     /// // This example shows the call site; actual construction of `Backend` and `params` is omitted.
-    /// # async fn example(backend: &crate::backend::Backend, params: CompletionParams) {
+    /// # async fn example(backend: &raven::backend::Backend, params: CompletionParams) {
     /// let result = backend.completion(params).await.unwrap();
     /// if let Some(response) = result {
     ///     // Inspect completion items in `response`
@@ -2709,6 +2764,180 @@ impl LanguageServer for Backend {
         ))
     }
 
+    /// Handles on-type formatting requests triggered by newline characters.
+    ///
+    /// This provides AST-aware indentation for R code, computing the correct
+    /// indentation based on syntactic context (pipe chains, function arguments,
+    /// brace blocks, etc.).
+    ///
+    /// # Requirements
+    ///
+    /// Validates: Requirements 3.1, 6.1, 6.2, 8.3, 8.4
+    /// - 3.1: Chain start detection with iteration limit
+    /// - 6.1: Read FormattingOptions.tab_size from LSP request parameters
+    /// - 6.2: Read FormattingOptions.insert_spaces from LSP request parameters
+    /// - 8.3: Compute indentation using tree-sitter AST
+    /// - 8.4: Return TextEdit array that overrides VS Code's declarative indentation
+    ///
+    /// # Error Handling
+    ///
+    /// - Invalid AST states: Falls back to regex-based detection
+    /// - UTF-16 position validation: Validates position is within document bounds
+    /// - Malformed FormattingOptions: Clamps tab_size to 1-8, defaults insert_spaces to true
+    /// - Chain start infinite loop: Iteration limit of 1000 lines
+    /// - Missing/unmatched delimiters: Handled gracefully with heuristics
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        // Only handle registered trigger characters
+        if params.ch != "\n" && !matches!(params.ch.as_str(), ")" | "]" | "}") {
+            return Ok(None);
+        }
+
+        let state = self.state.read().await;
+
+        // Get document from state
+        let uri = &params.text_document_position.text_document.uri;
+        let doc = match state.get_document(uri) {
+            Some(d) => d,
+            None => {
+                log::trace!("on_type_formatting: document not found: {}", uri);
+                return Ok(None);
+            }
+        };
+
+        // Get tree-sitter AST
+        let tree = match doc.tree.as_ref() {
+            Some(t) => t,
+            None => {
+                log::trace!("on_type_formatting: no parse tree for: {}", uri);
+                return Ok(None);
+            }
+        };
+
+        let source = doc.text();
+        let position = params.text_document_position.position;
+
+        // Get indentation style from server configuration
+        let style = state.indentation_config.style;
+
+        // If style is Off, disable all formatting — return no edits
+        // so only Tier 1 declarative rules apply
+        if style == indentation::IndentationStyle::Off {
+            log::trace!("on_type_formatting: style is Off, returning no edits");
+            return Ok(None);
+        }
+
+        // Handle closing delimiter triggers: detect and remove auto-close duplicates.
+        // When VS Code auto-closes `(` → `()` and the user later types `)` after
+        // Enter pushed the auto-closed `)` to a new line, the over-type mechanism
+        // fails and a duplicate `)` is inserted. We detect this via tree-sitter:
+        // if the character at the cursor position is the same delimiter and it
+        // sits inside an ERROR node (unmatched bracket), we delete the duplicate.
+        if matches!(params.ch.as_str(), ")" | "]" | "}") {
+            if let Some(line_text) = source.lines().nth(position.line as usize) {
+                // Convert UTF-16 column to byte offset for indexing and tree-sitter
+                let byte_col = utf16_column_to_byte_offset(line_text, position.character);
+                if byte_col < line_text.len() {
+                    let next_byte = line_text.as_bytes()[byte_col];
+                    let typed_byte = params.ch.as_bytes()[0];
+                    if next_byte == typed_byte {
+                        // Potential duplicate — check if the next delimiter is
+                        // inside an ERROR node (unmatched bracket).
+                        let point =
+                            tree_sitter::Point::new(position.line as usize, byte_col);
+                        if let Some(node) =
+                            tree.root_node().descendant_for_point_range(point, point)
+                        {
+                            let is_error = node.is_error()
+                                || node.parent().map_or(false, |p| p.is_error());
+                            if is_error {
+                                log::trace!(
+                                    "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
+                                    params.ch,
+                                    position.line,
+                                    byte_col
+                                );
+                                // TextEdit range uses UTF-16 offsets (LSP protocol)
+                                return Ok(Some(vec![TextEdit {
+                                    range: tower_lsp::lsp_types::Range {
+                                        start: Position {
+                                            line: position.line,
+                                            character: position.character,
+                                        },
+                                        end: Position {
+                                            line: position.line,
+                                            character: position.character.saturating_add(1),
+                                        },
+                                    },
+                                    new_text: String::new(),
+                                }]));
+                            }
+                        }
+                    }
+                }
+            }
+            // No duplicate detected — no edits needed for delimiter triggers
+            return Ok(None);
+        }
+
+        // Extract FormattingOptions (Requirements 6.1, 6.2)
+        let raw_tab_size = params.options.tab_size;
+        let tab_size = raw_tab_size.max(1).min(8);
+        if raw_tab_size == 0 {
+            log::warn!("on_type_formatting: tab_size 0 is invalid, clamped to 1");
+        } else if raw_tab_size > 8 {
+            log::warn!(
+                "on_type_formatting: tab_size {} is out of range, clamped to 8",
+                raw_tab_size
+            );
+        }
+        let insert_spaces = params.options.insert_spaces;
+
+        // Build IndentationConfig
+        let config = indentation::IndentationConfig {
+            tab_size,
+            insert_spaces,
+            style,
+        };
+
+        // Detect syntactic context using AST (Requirement 8.3)
+        // This handles invalid AST states with fallback to regex-based detection
+        let context = indentation::detect_context(tree, &source, position, tab_size);
+
+        if log::log_enabled!(log::Level::Trace) {
+            let source_lines = source.lines().count();
+            log::trace!(
+                "on_type_formatting: pos=({},{}), context={:?}, style={:?}, tab_size={}, source_lines={}",
+                position.line,
+                position.character,
+                context,
+                style,
+                tab_size,
+                source_lines
+            );
+        }
+
+        // Calculate target indentation
+        let target_column = indentation::calculate_indentation(context, config.clone(), &source);
+
+        // Generate TextEdit (Requirement 8.4)
+        let edit = indentation::format_indentation(position.line, target_column, config, &source);
+
+        log::trace!(
+            "on_type_formatting: line={}, target_column={}, edit=({},{})-({},{}) new_text={:?}",
+            position.line,
+            target_column,
+            edit.range.start.line,
+            edit.range.start.character,
+            edit.range.end.line,
+            edit.range.end.character,
+            edit.new_text
+        );
+
+        Ok(Some(vec![edit]))
+    }
 }
 
 impl Backend {
@@ -3352,6 +3581,7 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Ok(())
 }
 
+
 #[cfg(test)]
 mod tests {
     /// Tests for saturating arithmetic used in priority scoring
@@ -3454,7 +3684,6 @@ mod tests {
         fn test_diagnostics_section_without_enabled_defaults_to_true() {
             // JSON with diagnostics section but no enabled key
             let settings = json!({
-                "crossFile": {},
                 "diagnostics": {
                     "undefinedVariables": false
                 }
@@ -4063,6 +4292,142 @@ mod tests {
                 SymbolConfig::default().workspace_max_results,
                 1000,
                 "Default config should have workspace_max_results = 1000"
+            );
+        }
+    }
+
+    // ============================================================================
+    // Unit Tests for Indentation Style Configuration Parsing
+    // **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    // ============================================================================
+    mod indentation_config_parsing {
+        use crate::indentation::IndentationStyle;
+        use crate::state::IndentationSettings;
+        use serde_json::json;
+
+        /// Test that missing indentation section defaults to RStudio style
+        /// **Validates: Requirements 7.4**
+        #[test]
+        fn test_missing_indentation_section_defaults_to_rstudio() {
+            let settings = json!({
+                "crossFile": {}
+            });
+            let config = crate::backend::parse_indentation_config(&settings);
+            assert!(
+                config.is_none(),
+                "Should return None when indentation section is absent"
+            );
+            assert_eq!(
+                IndentationSettings::default().style,
+                IndentationStyle::RStudio,
+                "Should default to RStudio style when indentation section is absent"
+            );
+        }
+
+        /// Test that empty indentation section defaults to RStudio style
+        /// **Validates: Requirements 7.4**
+        #[test]
+        fn test_empty_indentation_section_defaults_to_rstudio() {
+            let settings = json!({
+                "indentation": {}
+            });
+            let config = crate::backend::parse_indentation_config(&settings);
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+            assert_eq!(
+                config.style,
+                IndentationStyle::RStudio,
+                "Should default to RStudio style when style key is absent"
+            );
+        }
+
+        /// Test that "rstudio" value is parsed correctly
+        /// **Validates: Requirements 7.1, 7.2**
+        #[test]
+        fn test_parse_rstudio_style() {
+            let settings = json!({
+                "indentation": {
+                    "style": "rstudio"
+                }
+            });
+            let config = crate::backend::parse_indentation_config(&settings);
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+            assert_eq!(
+                config.style,
+                IndentationStyle::RStudio,
+                "Should parse 'rstudio' as RStudio style"
+            );
+        }
+
+        /// Test that "rstudio-minus" value is parsed correctly
+        /// **Validates: Requirements 7.1, 7.3**
+        #[test]
+        fn test_parse_rstudio_minus_style() {
+            let settings = json!({
+                "indentation": {
+                    "style": "rstudio-minus"
+                }
+            });
+            let config = crate::backend::parse_indentation_config(&settings);
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+            assert_eq!(
+                config.style,
+                IndentationStyle::RStudioMinus,
+                "Should parse 'rstudio-minus' as RStudioMinus style"
+            );
+        }
+
+        /// Test that invalid style value defaults to RStudio
+        /// **Validates: Requirements 7.4**
+        #[test]
+        fn test_invalid_style_defaults_to_rstudio() {
+            let settings = json!({
+                "indentation": {
+                    "style": "invalid-style"
+                }
+            });
+            let config = crate::backend::parse_indentation_config(&settings);
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+            assert_eq!(
+                config.style,
+                IndentationStyle::RStudio,
+                "Should default to RStudio style for invalid values"
+            );
+        }
+
+        /// Test that style parsing is case-insensitive
+        /// **Validates: Requirements 7.1**
+        #[test]
+        fn test_style_parsing_case_insensitive() {
+            // Test uppercase
+            let settings = json!({
+                "crossFile": {},
+                "indentation": {
+                    "style": "RSTUDIO"
+                }
+            });
+            let config = crate::backend::parse_indentation_config(&settings).unwrap();
+            assert_eq!(
+                config.style,
+                IndentationStyle::RStudio,
+                "Should parse 'RSTUDIO' as RStudio style"
+            );
+
+            // Test mixed case
+            let settings = json!({
+                "crossFile": {},
+                "indentation": {
+                    "style": "RStudio-Minus"
+                }
+            });
+            let config = crate::backend::parse_indentation_config(&settings).unwrap();
+            assert_eq!(
+                config.style,
+                IndentationStyle::RStudioMinus,
+                "Should parse 'RStudio-Minus' as RStudioMinus style"
             );
         }
     }
