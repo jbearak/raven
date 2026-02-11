@@ -79,6 +79,18 @@ The design respects user preferences for tab size and space/tab usage, and suppo
 - TextEdit range: `(line, 0)` to `(line, existing_whitespace_length)`
 - This prevents double-indentation bugs (e.g., 6 spaces instead of 4)
 
+**Auto-Closing Pairs and Closing Delimiter Detection**
+
+VS Code's auto-closing pairs feature (e.g., typing `(` inserts `()`) interacts with `onTypeFormatting` in a critical way. When the user presses Enter between auto-inserted delimiters:
+
+1. User types `func(` → VS Code auto-inserts `)` → cursor is between: `func(|)`
+2. User presses Enter → document becomes `func(\n)` with cursor on the new line
+3. `onTypeFormatting` fires for the new line, which now starts with `)`
+
+The closing delimiter detection must NOT treat this as a "closing delimiter line" — the user wants content indentation, not closing delimiter alignment. The heuristic: if a line contains ONLY a closing delimiter (with optional whitespace), skip closing delimiter detection and let the normal `InsideParens`/`InsideBraces` detection handle it. This ensures the line gets content-level indentation (including paren-alignment in RStudio style).
+
+This applies to all auto-closed delimiters: `)`, `]`, `}`.
+
 **Why Tree-Sitter?**
 - Provides accurate syntactic context (not just regex matching)
 - Already integrated into Raven for other features
@@ -405,14 +417,19 @@ impl Config {
     "properties": {
       "raven.indentation.style": {
         "type": "string",
-        "enum": ["rstudio", "rstudio-minus"],
+        "enum": ["rstudio", "rstudio-minus", "off"],
         "default": "rstudio",
-        "description": "Indentation style for R code. 'rstudio' aligns same-line arguments to opening paren; 'rstudio-minus' indents all arguments relative to previous line."
+        "description": "Indentation style for R code. 'rstudio' aligns same-line arguments to opening paren; 'rstudio-minus' indents all arguments relative to previous line; 'off' disables AST-aware indentation (Tier 2) while keeping basic declarative rules (Tier 1) active."
       }
     }
   }
 }
 ```
+
+**Tier 2 Disable Behavior**: When `raven.indentation.style` is set to `"off"`, the `onTypeFormatting` handler returns `None` (no edits). This effectively disables Tier 2 while:
+- Tier 1 declarative rules remain active (they are in `language-configuration.json`, independent of LSP)
+- `editor.formatOnType` can remain `true` for other languages without affecting R
+- The LSP capability is still registered (no restart needed to re-enable)
 
 ### Documentation
 

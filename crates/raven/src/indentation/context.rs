@@ -923,6 +923,12 @@ fn find_unclosed_delimiter_heuristic(
 /// Checks if the first non-whitespace character on the current line is
 /// `)`, `]`, or `}`.
 ///
+/// When the cursor is at position 0 on a line that contains only a closing
+/// delimiter (with optional whitespace), this is likely an auto-close scenario:
+/// the user pressed Enter between `(` and `)`, and VS Code pushed the auto-inserted
+/// `)` to the new line. In this case, we skip closing delimiter detection so the
+/// line gets indented as "inside parens" content instead.
+///
 /// # Arguments
 ///
 /// * `source` - The source code text
@@ -930,8 +936,9 @@ fn find_unclosed_delimiter_heuristic(
 ///
 /// # Returns
 ///
-/// `Some(IndentContext::ClosingDelimiter)` if a closing delimiter is found,
-/// with placeholder opener position (to be filled by AST lookup).
+/// `Some(IndentContext::ClosingDelimiter)` if a closing delimiter is found
+/// and the cursor is NOT at the start of the line (i.e., the user intentionally
+/// placed the delimiter), with placeholder opener position (to be filled by AST lookup).
 fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentContext> {
     let line_text = source.lines().nth(position.line as usize)?;
     let trimmed = line_text.trim_start();
@@ -942,6 +949,20 @@ fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentCo
 
     let first_char = trimmed.chars().next()?;
     if matches!(first_char, ')' | ']' | '}') {
+        // If the line contains only the closing delimiter (with optional whitespace),
+        // this is an auto-close push-down scenario: the user pressed Enter and
+        // VS Code's auto-inserted closing delimiter got pushed to this line.
+        // Skip closing delimiter detection so the line gets indented as content
+        // inside the enclosing parens/braces.
+        //
+        // The onTypeFormatting position.character may be 0 or may reflect
+        // the previous line's indentation — either way, a delimiter-only line
+        // after Enter means we're inserting content, not aligning the delimiter.
+        let after_delimiter = trimmed[first_char.len_utf8()..].trim();
+        if after_delimiter.is_empty() {
+            return None;
+        }
+
         // Return with placeholder opener position - will be updated by AST lookup
         Some(IndentContext::ClosingDelimiter {
             opener_line: 0,
@@ -3684,7 +3705,9 @@ mod tests {
         let code = "func(\n  arg1,\n  arg2\n)";
         let tree = parse_r_code(code);
 
-        // Cursor on line 3 (the closing paren line)
+        // Cursor on line 3 (the closing paren line).
+        // The line contains only ")" — the auto-close heuristic skips closing
+        // delimiter detection so the line gets indented as inside-parens content.
         let position = Position {
             line: 3,
             character: 0,
@@ -3692,10 +3715,10 @@ mod tests {
         let ctx = detect_context(&tree, code, position);
 
         match ctx {
-            IndentContext::ClosingDelimiter { delimiter, .. } => {
-                assert_eq!(delimiter, ')');
+            IndentContext::InsideParens { opener_col, .. } => {
+                assert_eq!(opener_col, 4); // column of the opening paren
             }
-            _ => panic!("Expected ClosingDelimiter context, got {:?}", ctx),
+            _ => panic!("Expected InsideParens context (auto-close heuristic), got {:?}", ctx),
         }
     }
 
@@ -3704,7 +3727,8 @@ mod tests {
         let code = "{\n  x <- 1\n}";
         let tree = parse_r_code(code);
 
-        // Cursor on line 2 (the closing brace line)
+        // Cursor on line 2 (the closing brace line).
+        // The line contains only "}" — auto-close heuristic treats as inside-braces.
         let position = Position {
             line: 2,
             character: 0,
@@ -3712,10 +3736,10 @@ mod tests {
         let ctx = detect_context(&tree, code, position);
 
         match ctx {
-            IndentContext::ClosingDelimiter { delimiter, .. } => {
-                assert_eq!(delimiter, '}');
+            IndentContext::InsideBraces { opener_line, .. } => {
+                assert_eq!(opener_line, 0);
             }
-            _ => panic!("Expected ClosingDelimiter context, got {:?}", ctx),
+            _ => panic!("Expected InsideBraces context (auto-close heuristic), got {:?}", ctx),
         }
     }
 
@@ -3938,7 +3962,9 @@ mod tests {
 
     #[test]
     fn test_detect_context_priority_closing_over_continuation() {
-        // Closing delimiter should take priority even if previous line has operator
+        // When a line contains only a closing delimiter, the auto-close heuristic
+        // treats it as inside-parens (the delimiter was pushed down by Enter).
+        // This is correct for onTypeFormatting: the user wants content indentation.
         let code = "data %>%\n  filter(x\n  )";
         let tree = parse_r_code(code);
 
@@ -3949,12 +3975,12 @@ mod tests {
         };
         let ctx = detect_context(&tree, code, position);
 
-        // Should detect closing delimiter, not continuation
+        // Delimiter-only line → treated as inside-parens
         match ctx {
-            IndentContext::ClosingDelimiter { delimiter, .. } => {
-                assert_eq!(delimiter, ')');
+            IndentContext::InsideParens { .. } => {
+                // Expected: auto-close heuristic kicks in
             }
-            _ => panic!("Expected ClosingDelimiter context, got {:?}", ctx),
+            _ => panic!("Expected InsideParens context (auto-close heuristic), got {:?}", ctx),
         }
     }
 
@@ -5645,5 +5671,115 @@ mod tests {
             | IndentContext::AfterCompleteExpression { .. } => {}
             _ => {}
         }
+    }
+}
+
+
+#[cfg(test)]
+mod auto_close_tests {
+    use super::*;
+    use crate::indentation::calculator::{IndentationConfig, IndentationStyle, calculate_indentation};
+    use tower_lsp::lsp_types::Position;
+
+    fn parse_r(code: &str) -> Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn rstudio_config(tab_size: u32) -> IndentationConfig {
+        IndentationConfig {
+            tab_size,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        }
+    }
+
+    #[test]
+    fn auto_closed_paren_gets_inside_parens_context() {
+        // VS Code auto-inserts `)`, user presses Enter → `func(\n)`
+        let code = "x <- some_func(\n)";
+        let tree = parse_r(code);
+        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 });
+        assert!(matches!(ctx, IndentContext::InsideParens { .. }),
+            "Auto-closed paren should be treated as InsideParens, got {:?}", ctx);
+    }
+
+    #[test]
+    fn unclosed_paren_gets_inside_parens_context() {
+        let code = "x <- some_func(\n";
+        let tree = parse_r(code);
+        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 });
+        assert!(matches!(ctx, IndentContext::InsideParens { .. }),
+            "Unclosed paren should be InsideParens, got {:?}", ctx);
+    }
+
+    #[test]
+    fn auto_closed_and_unclosed_produce_same_indent() {
+        let config = rstudio_config(2);
+
+        let code_auto = "x <- some_func(\n)";
+        let tree_auto = parse_r(code_auto);
+        let ctx_auto = detect_context(&tree_auto, code_auto, Position { line: 1, character: 0 });
+        let indent_auto = calculate_indentation(ctx_auto, config.clone(), code_auto);
+
+        let code_open = "x <- some_func(\n";
+        let tree_open = parse_r(code_open);
+        let ctx_open = detect_context(&tree_open, code_open, Position { line: 1, character: 0 });
+        let indent_open = calculate_indentation(ctx_open, config, code_open);
+
+        assert_eq!(indent_auto, indent_open,
+            "Auto-closed and unclosed parens should produce identical indentation");
+    }
+
+    #[test]
+    fn auto_closed_paren_in_braces_with_content_aligns_to_paren() {
+        // The key user-reported scenario: content after opener should align
+        let code = "if (TRUE) {\n  x <- some_func(\"file\",\n  )\n}";
+        let tree = parse_r(code);
+        let ctx = detect_context(&tree, code, Position { line: 2, character: 0 });
+
+        match &ctx {
+            IndentContext::InsideParens { opener_col, has_content_on_opener_line, .. } => {
+                assert_eq!(*opener_col, 16);
+                assert!(*has_content_on_opener_line);
+            }
+            _ => panic!("Expected InsideParens, got {:?}", ctx),
+        }
+
+        let indent = calculate_indentation(ctx, rstudio_config(2), code);
+        // RStudio style with content after opener → align to column after `(`
+        assert_eq!(indent, 17, "Should align to column after opening paren");
+    }
+
+    #[test]
+    fn auto_closed_brace_gets_inside_braces_context() {
+        let code = "if (TRUE) {\n}";
+        let tree = parse_r(code);
+        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 });
+        assert!(matches!(ctx, IndentContext::InsideBraces { .. }),
+            "Auto-closed brace should be treated as InsideBraces, got {:?}", ctx);
+    }
+
+    #[test]
+    fn second_enter_inside_auto_closed_parens() {
+        // Simulates: user typed `x <- some_function(x,`, Enter (got alignment),
+        // typed `y`, then pressed Enter again. Document state:
+        //   x <- some_function(x,
+        //                      y
+        //                      )
+        // Cursor is on line 2, the `)` is also on line 2.
+        // onTypeFormatting position character may be nonzero (matching prev indent).
+        let code = "x <- some_function(x,\n                   y\n                   )";
+        let tree = parse_r(code);
+
+        // Cursor at line 2 with nonzero character (matching previous line's indent)
+        let ctx = detect_context(&tree, code, Position { line: 2, character: 19 });
+        assert!(matches!(ctx, IndentContext::InsideParens { .. }),
+            "Second Enter with auto-closed paren should be InsideParens, got {:?}", ctx);
+
+        let indent = calculate_indentation(ctx, rstudio_config(2), code);
+        // Should align to column after `(` since there's content after opener
+        assert_eq!(indent, 19, "Should maintain paren alignment on second Enter");
     }
 }

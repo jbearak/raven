@@ -90,10 +90,11 @@ This feature implements intelligent indentation for R code in VS Code, addressin
 
 #### Acceptance Criteria
 
-1. THE system SHALL provide a configuration setting `raven.indentation.style` with enum values `rstudio` and `rstudio-minus`
+1. THE system SHALL provide a configuration setting `raven.indentation.style` with enum values `rstudio`, `rstudio-minus`, and `off`
 2. WHEN `raven.indentation.style` is set to `rstudio`, THE Indentation_Handler SHALL align same-line arguments to the opening paren and indent next-line arguments by tab_size from the function line
 3. WHEN `raven.indentation.style` is set to `rstudio-minus`, THE Indentation_Handler SHALL indent all arguments by tab_size from the previous line regardless of paren position
 4. WHEN `raven.indentation.style` is not configured, THE system SHALL default to `rstudio`
+5. WHEN `raven.indentation.style` is set to `off`, THE Indentation_Handler SHALL return no edits (None), disabling Tier 2 AST-aware indentation while leaving Tier 1 declarative rules active
 
 ### Requirement 8: LSP On-Type Formatting Registration
 

@@ -307,12 +307,16 @@ fn test_brace_block_tab_size_4() {
 
 #[test]
 fn test_closing_paren_alignment() {
+    // When cursor is at character 0 on a line with only ")", the auto-close
+    // heuristic treats this as "inside parens" (the paren was pushed down by Enter).
+    // This matches the real onTypeFormatting scenario.
     let code = r#"func(
   arg1,
   arg2
 )"#;
     let column = get_indentation_column(code, 3, rstudio_config(2));
-    assert_eq!(column, 0, "Closing paren should align to opener line indent");
+    // Inside parens with no content after opener → line_indent + tab_size = 0 + 2
+    assert_eq!(column, 2, "Auto-close heuristic: indent as inside-parens content");
 }
 
 #[test]
@@ -321,7 +325,8 @@ fn test_closing_paren_indented_opener() {
     arg1
   )"#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(column, 2, "Closing paren should align to indented opener line");
+    // Inside parens with no content after opener → line_indent + tab_size = 2 + 2
+    assert_eq!(column, 4, "Auto-close heuristic: indent as inside-parens content");
 }
 
 #[test]
@@ -330,7 +335,8 @@ fn test_closing_brace_alignment() {
   x <- 1
 }"#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(column, 0, "Closing brace should align to opener line indent");
+    // Inside braces → opener_indent + tab_size = 0 + 2
+    assert_eq!(column, 2, "Auto-close heuristic: indent as inside-braces content");
 }
 
 #[test]
@@ -340,7 +346,8 @@ fn test_closing_bracket_alignment() {
   2
 ]"#;
     let column = get_indentation_column(code, 3, rstudio_config(2));
-    assert_eq!(column, 0, "Closing bracket should align to opener line indent");
+    // Inside parens (brackets) with no content after opener → line_indent + tab_size = 0 + 2
+    assert_eq!(column, 2, "Auto-close heuristic: indent as inside-parens content");
 }
 
 // ============================================================================
@@ -754,18 +761,20 @@ fn test_full_cycle_closing_delimiter() {
     let position = Position { line: 2, character: 0 };
     let context = detect_context(&tree, code, position);
     
+    // With cursor at character 0, auto-close heuristic kicks in:
+    // the line has only ")" so we treat it as inside-parens
     match &context {
-        IndentContext::ClosingDelimiter { delimiter, .. } => {
-            assert_eq!(*delimiter, ')', "Should detect closing paren");
+        IndentContext::InsideParens { opener_col, .. } => {
+            assert_eq!(*opener_col, 4, "Should detect opening paren column");
         }
-        _ => panic!("Should detect ClosingDelimiter context"),
+        _ => panic!("Expected InsideParens context (auto-close heuristic), got {:?}", context),
     }
     
     let target_column = calculate_indentation(context, config.clone(), code);
-    assert_eq!(target_column, 0, "Closing paren should align to opener line");
+    assert_eq!(target_column, 2, "Inside parens, no content after opener → line_indent + tab_size");
     
     let edit = format_indentation(2, target_column, config, code);
-    assert_eq!(edit.new_text, "", "Should generate empty string for column 0");
+    assert_eq!(edit.new_text, "  ", "Should generate 2 spaces");
 }
 
 #[test]

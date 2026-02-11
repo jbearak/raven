@@ -38,6 +38,10 @@ pub enum IndentationStyle {
     /// RStudio-minus style: all arguments indent +tab_size from
     /// previous line regardless of paren position.
     RStudioMinus,
+    /// Off: disable Tier 2 AST-aware indentation entirely.
+    /// The onTypeFormatting handler returns None (no edits),
+    /// leaving only Tier 1 declarative rules active.
+    Off,
 }
 
 /// Calculates the target indentation column based on context and configuration.
@@ -81,6 +85,11 @@ pub fn calculate_indentation(
                 }
                 IndentationStyle::RStudioMinus => {
                     // Always indent from opener line + tab_size
+                    get_line_indent(source, opener_line) + config.tab_size
+                }
+                IndentationStyle::Off => {
+                    // Off should be handled before reaching calculate_indentation
+                    // (the handler returns None early). Fallback to basic indent.
                     get_line_indent(source, opener_line) + config.tab_size
                 }
             }

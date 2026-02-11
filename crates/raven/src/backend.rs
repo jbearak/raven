@@ -120,9 +120,11 @@ pub(crate) fn parse_cross_file_config(
     let cross_file = settings.get("crossFile");
     let diagnostics = settings.get("diagnostics");
     let packages = settings.get("packages");
+    let indentation = settings.get("indentation");
 
     // Return None only if no relevant settings are present at all
-    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
+    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() && indentation.is_none()
+    {
         return None;
     }
 
@@ -281,6 +283,7 @@ pub(crate) fn parse_cross_file_config(
             config.indentation_style = match style_str.to_lowercase().as_str() {
                 "rstudio" => crate::indentation::IndentationStyle::RStudio,
                 "rstudio-minus" => crate::indentation::IndentationStyle::RStudioMinus,
+                "off" => crate::indentation::IndentationStyle::Off,
                 _ => {
                     log::warn!(
                         "Invalid indentation.style: {}, defaulting to rstudio",
@@ -2803,6 +2806,13 @@ impl LanguageServer for Backend {
         // Get indentation style from server configuration
         let style = state.cross_file_config.indentation_style;
 
+        // If style is Off, disable Tier 2 entirely — return no edits
+        // so only Tier 1 declarative rules apply (Requirement 7.5)
+        if style == indentation::IndentationStyle::Off {
+            log::trace!("on_type_formatting: style is Off, returning no edits");
+            return Ok(None);
+        }
+
         // Build IndentationConfig
         let config = indentation::IndentationConfig {
             tab_size,
@@ -2814,20 +2824,31 @@ impl LanguageServer for Backend {
         // This handles invalid AST states with fallback to regex-based detection
         let context = indentation::detect_context(tree, &source, position);
 
+        log::info!(
+            "on_type_formatting: pos=({},{}), context={:?}, style={:?}, tab_size={}, source_lines={}",
+            position.line,
+            position.character,
+            context,
+            style,
+            tab_size,
+            source.lines().count()
+        );
+
         // Calculate target indentation
         let target_column = indentation::calculate_indentation(context, config.clone(), &source);
 
         // Generate TextEdit (Requirement 8.4)
         let edit = indentation::format_indentation(position.line, target_column, config, &source);
 
-        log::trace!(
-            "on_type_formatting: line={}, target_column={}, edit_range=({},{})-({},{})",
+        log::info!(
+            "on_type_formatting: line={}, target_column={}, edit=({},{})-({},{}) new_text={:?}",
             position.line,
             target_column,
             edit.range.start.line,
             edit.range.start.character,
             edit.range.end.line,
-            edit.range.end.character
+            edit.range.end.character,
+            edit.new_text
         );
 
         Ok(Some(vec![edit]))
