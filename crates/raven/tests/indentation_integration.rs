@@ -1392,3 +1392,13 @@ fn test_nested_parens_in_pipe_chain_with_autoclose() {
     let column = get_indentation_column(code, 2, rstudio_config(4));
     assert_eq!(column, 13, "Should align inside f() to where '1' is, even with auto-closed parens");
 }
+
+#[test]
+fn test_nested_call_autoclose_no_pipe() {
+    // Non-pipe: x <- f(x = f(1,)) with )) pushed down by Enter
+    // The )) should be treated as closing delimiters, aligning to
+    // the opener line's indentation (col 0 for unindented code)
+    let code = "x <- f(x = f(1,\n))\n";
+    let col = get_indentation_column(code, 1, rstudio_config(2));
+    assert_eq!(col, 0, "Closing )) should align to opener line indent");
+}

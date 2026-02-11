@@ -462,11 +462,14 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u
         if let Some(ctx) = find_matching_opener_context(tree, source, &ctx, position) {
             return ctx;
         }
-        // If no matching opener found, use the fallback context with heuristic
+        // find_matching_opener_context returns None when:
+        // - No matching opener found in the AST, OR
+        // - The closer is inside a pipe chain (auto-close push-down scenario)
+        // In both cases, fall through to arguments/braces detection below,
+        // which will find the correct enclosing context.
         log::trace!(
-            "detect_context: no matching opener found for closing delimiter, using heuristic"
+            "detect_context: no matching opener from AST, falling through to content detection"
         );
-        return ctx;
     }
 
     // 2. Check if previous line ends with continuation operator
@@ -975,9 +978,7 @@ fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentCo
         // the previous line's indentation — either way, a delimiter-only line
         // after Enter means we're inserting content, not aligning the delimiter.
         let after_delimiter = trimmed[first_char.len_utf8()..].trim();
-        if after_delimiter.is_empty()
-            || after_delimiter.chars().all(|c| matches!(c, ')' | ']' | '}'))
-        {
+        if after_delimiter.is_empty() {
             return None;
         }
 
@@ -1036,6 +1037,15 @@ fn find_matching_opener_context(
     let node = tree.root_node().descendant_for_point_range(point, point)?;
     let (opener_line, opener_col) = find_opener_position(node, *delimiter, source)?;
 
+    // When the cursor line contains only closing delimiters (auto-close push-down)
+    // and the expression is inside a pipe chain, skip ClosingDelimiter so we fall
+    // through to InsideParens content-level detection. Inside a pipe chain, the
+    // auto-closed delimiters need content alignment, not delimiter alignment.
+    let is_all_closers = trimmed.chars().all(|c| matches!(c, ')' | ']' | '}'));
+    if is_all_closers && is_inside_pipe_chain(node, source) {
+        return None;
+    }
+
     Some(IndentContext::ClosingDelimiter {
         opener_line,
         opener_col,
@@ -1045,6 +1055,35 @@ fn find_matching_opener_context(
 
 /// Finds the position of the opening delimiter that matches a closing delimiter.
 ///
+/// Checks if a node is inside a pipe chain (has a `|>` or `%>%` ancestor).
+fn is_inside_pipe_chain(node: Node, source: &str) -> bool {
+    let source_bytes = source.as_bytes();
+    let mut current = node;
+    loop {
+        if current.kind() == "binary_operator" {
+            let mut cursor = current.walk();
+            for child in current.children(&mut cursor) {
+                let kind = child.kind();
+                if kind == "|>" {
+                    return true;
+                }
+                if kind == "special" {
+                    if let Ok(text) = child.utf8_text(source_bytes) {
+                        if text == "%>%" {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    false
+}
+
 /// # Arguments
 ///
 /// * `node` - The tree-sitter node at or near the closing delimiter
