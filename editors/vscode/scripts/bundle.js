@@ -10,8 +10,10 @@ if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
 }
 
-// In CI mode, the binary is pre-placed by the workflow
-if (fs.existsSync(destBinary)) {
+// In CI mode, the binary is pre-placed by the workflow.
+// Check for both names since cross-platform CI (e.g. packaging win32 on Linux)
+// means process.platform won't match the target platform.
+if (fs.existsSync(destBinary) || fs.existsSync(path.join(binDir, 'raven')) || fs.existsSync(path.join(binDir, 'raven.exe'))) {
     console.log('raven binary already present (CI mode)');
     process.exit(0);
 }
