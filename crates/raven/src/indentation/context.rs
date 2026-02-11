@@ -978,7 +978,9 @@ fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentCo
         // the previous line's indentation — either way, a delimiter-only line
         // after Enter means we're inserting content, not aligning the delimiter.
         let after_delimiter = trimmed[first_char.len_utf8()..].trim();
-        if after_delimiter.is_empty() {
+        if after_delimiter.is_empty()
+            || after_delimiter.chars().all(|c| matches!(c, ')' | ']' | '}'))
+        {
             return None;
         }
 
