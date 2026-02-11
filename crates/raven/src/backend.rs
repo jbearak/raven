@@ -2868,7 +2868,7 @@ impl LanguageServer for Backend {
                                         },
                                         end: Position {
                                             line: position.line,
-                                            character: position.character + 1,
+                                            character: position.character.saturating_add(1),
                                         },
                                     },
                                     new_text: String::new(),

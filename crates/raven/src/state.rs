@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
 use crate::indentation::IndentationStyle;
+
 /// Symbol provider configuration
 ///
 /// Controls behavior of document symbol and workspace symbol providers.

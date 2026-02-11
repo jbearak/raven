@@ -11,12 +11,10 @@
 //! - Missing delimiters: Handles unclosed delimiters gracefully with heuristics
 //! - Iteration limits: Prevents infinite loops in chain start detection
 
-// Many helper functions are pub for use by property-based tests within this module
-// but are not re-exported from the indentation module.
-#![allow(dead_code)]
-
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
+
+use crate::utf16::utf16_column_to_byte_offset;
 
 // ============================================================================
 // AST Node Detection Functions
@@ -34,6 +32,7 @@ use tree_sitter::{Node, Tree};
 /// # Returns
 ///
 /// `true` if the node is a `|>` node (native pipe operator).
+#[allow(dead_code)] // pub for property-based tests
 pub fn is_pipe_operator(node: Node) -> bool {
     node.kind() == "|>"
 }
@@ -50,6 +49,7 @@ pub fn is_pipe_operator(node: Node) -> bool {
 /// # Returns
 ///
 /// `true` if the node is a `special` node (magrittr pipe or custom infix).
+#[allow(dead_code)] // pub for property-based tests
 pub fn is_special_operator(node: Node) -> bool {
     node.kind() == "special"
 }
@@ -70,6 +70,7 @@ pub fn is_special_operator(node: Node) -> bool {
 /// # Returns
 ///
 /// `true` if the node is a `+` or `~` operator node.
+#[allow(dead_code)] // pub for property-based tests
 pub fn is_continuation_binary_operator(node: Node, _source: &str) -> bool {
     let kind = node.kind();
     kind == "+" || kind == "~"
@@ -84,6 +85,7 @@ pub fn is_continuation_binary_operator(node: Node, _source: &str) -> bool {
 /// # Returns
 ///
 /// `true` if the node is a `call` node.
+#[allow(dead_code)] // pub for property-based tests
 pub fn is_call_node(node: Node) -> bool {
     node.kind() == "call"
 }
@@ -97,6 +99,7 @@ pub fn is_call_node(node: Node) -> bool {
 /// # Returns
 ///
 /// `true` if the node is an `arguments` node.
+#[allow(dead_code)] // pub for property-based tests
 pub fn is_arguments_node(node: Node) -> bool {
     node.kind() == "arguments"
 }
@@ -130,6 +133,7 @@ pub fn is_brace_list_node(node: Node) -> bool {
 ///
 /// `Some(OperatorType)` if the node is a recognized continuation operator,
 /// `None` otherwise.
+#[allow(dead_code)] // pub for property-based tests
 pub fn get_operator_type(node: Node, source: &str) -> Option<OperatorType> {
     match node.kind() {
         "|>" => Some(OperatorType::Pipe),
@@ -161,6 +165,7 @@ pub fn get_operator_type(node: Node, source: &str) -> Option<OperatorType> {
 /// # Returns
 ///
 /// `true` if the node is a continuation operator.
+#[allow(dead_code)] // pub for property-based tests
 pub fn is_continuation_operator(node: Node, source: &str) -> bool {
     is_pipe_operator(node)
         || is_special_operator(node)
@@ -204,6 +209,7 @@ where
 /// # Returns
 ///
 /// The nearest `arguments` ancestor, or `None` if not inside arguments.
+#[allow(dead_code)] // pub for property-based tests
 pub fn find_enclosing_arguments(node: Node) -> Option<Node> {
     find_parent(node, is_arguments_node)
 }
@@ -230,6 +236,7 @@ pub fn find_enclosing_brace_list(node: Node) -> Option<Node> {
 /// # Returns
 ///
 /// The nearest `call` ancestor, or `None` if not inside a call.
+#[allow(dead_code)] // pub for property-based tests
 pub fn find_enclosing_call(node: Node) -> Option<Node> {
     find_parent(node, is_call_node)
 }
@@ -247,6 +254,7 @@ pub fn find_enclosing_call(node: Node) -> Option<Node> {
 /// # Returns
 ///
 /// The innermost relevant ancestor node, or `None` if none found.
+#[allow(dead_code)] // pub for property-based tests
 pub fn find_innermost_context_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
     let mut current = node;
     loop {
@@ -285,6 +293,7 @@ pub fn find_innermost_context_node<'a>(node: Node<'a>, source: &str) -> Option<N
 /// // If node is at the closing ')', this returns the 'arguments' node
 /// // which starts at the opening '('
 /// ```
+#[allow(dead_code)] // pub for property-based tests
 pub fn find_matching_opener<'a>(node: Node<'a>, delimiter: char) -> Option<Node<'a>> {
     let target_kind = match delimiter {
         ')' => "arguments",
@@ -332,8 +341,16 @@ pub fn find_matching_opener<'a>(node: Node<'a>, delimiter: char) -> Option<Node<
 /// # Returns
 ///
 /// The substring of source corresponding to the node's byte range.
+#[allow(dead_code)] // used in tests and by test-only pub fns
 fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
+    source.get(node.byte_range()).unwrap_or_else(|| {
+        log::warn!(
+            "node_text: byte range {:?} out of bounds for source len {}",
+            node.byte_range(),
+            source.len()
+        );
+        ""
+    })
 }
 
 // ============================================================================
@@ -473,7 +490,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u
     }
 
     // 2. Check if previous line ends with continuation operator
-    if let Some(ctx) = detect_continuation_operator(tree, source, position) {
+    if let Some(ctx) = detect_continuation_operator(tree, source, position, tab_size) {
         return ctx;
     }
 
@@ -571,9 +588,9 @@ fn is_position_valid(source: &str, position: Position) -> bool {
 
     // Check character is within line bounds (allowing for end of line)
     let line_text = lines.get(position.line as usize).unwrap_or(&"");
-    // UTF-16 character position can be at most line length + 1 (for end of line)
-    // We're lenient here since the actual character position may be approximate
-    position.character as usize <= line_text.len() + 1
+    // LSP position.character is in UTF-16 code units, so compare against UTF-16 length.
+    // Allow +1 for end-of-line position.
+    position.character as usize <= line_text.encode_utf16().count() + 1
 }
 
 /// Determines if we should use fallback regex-based detection.
@@ -608,10 +625,12 @@ fn should_use_fallback(root: Node, source: &str, position: Position) -> bool {
         false
     };
 
-    // Check cursor position
+    // Check cursor position (convert UTF-16 column to byte offset for tree-sitter)
+    let line_text = source.lines().nth(position.line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     let point = tree_sitter::Point {
         row: position.line as usize,
-        column: position.character as usize,
+        column: byte_col,
     };
     if has_error_at(point) {
         return true;
@@ -713,7 +732,7 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
             if let Some(op_type) = operator_type {
                 // Find chain start using simple backward walk
                 let (chain_start_line, chain_start_col) =
-                    find_chain_start_heuristic(source, position.line - 1);
+                    find_chain_start_heuristic(source, position.line - 1, tab_size);
                 return IndentContext::AfterContinuationOperator {
                     chain_start_line,
                     chain_start_col,
@@ -843,7 +862,7 @@ fn find_matching_opener_heuristic(
 /// # Returns
 ///
 /// `(line, col)` of the chain start.
-fn find_chain_start_heuristic(source: &str, start_line: u32) -> (u32, u32) {
+fn find_chain_start_heuristic(source: &str, start_line: u32, tab_size: u32) -> (u32, u32) {
     let mut current_line = start_line;
     let max_iterations = 1000;
     let mut iterations = 0;
@@ -874,12 +893,8 @@ fn find_chain_start_heuristic(source: &str, start_line: u32) -> (u32, u32) {
         log::warn!("find_chain_start_heuristic: exceeded max iterations");
     }
 
-    // Get the column of first non-whitespace on chain start line
-    let col = source
-        .lines()
-        .nth(current_line as usize)
-        .map(|l| l.chars().take_while(|c| c.is_whitespace()).count() as u32)
-        .unwrap_or(0);
+    // Get the visual column of first non-whitespace on chain start line
+    let col = get_line_indent(source, current_line, tab_size);
 
     (current_line, col)
 }
@@ -908,27 +923,46 @@ fn find_unclosed_delimiter_heuristic(
         let line_text = lines.get(line_idx)?;
         let stripped = strip_trailing_comment(line_text);
 
+        let mut in_string = false;
+        let mut string_char = '"';
+        let mut escape_next = false;
+
         for (col, ch) in stripped.char_indices() {
-            match ch {
-                '(' | '[' | '{' => {
-                    stack.push((line_idx as u32, col as u32, ch));
-                }
-                ')' => {
-                    if let Some((_, _, '(')) = stack.last() {
-                        stack.pop();
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if ch == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+            if !in_string && (ch == '"' || ch == '\'') {
+                in_string = true;
+                string_char = ch;
+            } else if in_string && ch == string_char {
+                in_string = false;
+            } else if !in_string {
+                match ch {
+                    '(' | '[' | '{' => {
+                        stack.push((line_idx as u32, col as u32, ch));
                     }
-                }
-                ']' => {
-                    if let Some((_, _, '[')) = stack.last() {
-                        stack.pop();
+                    ')' => {
+                        if let Some((_, _, '(')) = stack.last() {
+                            stack.pop();
+                        }
                     }
-                }
-                '}' => {
-                    if let Some((_, _, '{')) = stack.last() {
-                        stack.pop();
+                    ']' => {
+                        if let Some((_, _, '[')) = stack.last() {
+                            stack.pop();
+                        }
                     }
+                    '}' => {
+                        if let Some((_, _, '{')) = stack.last() {
+                            stack.pop();
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -1286,6 +1320,7 @@ fn detect_continuation_operator(
     tree: &Tree,
     source: &str,
     position: Position,
+    tab_size: u32,
 ) -> Option<IndentContext> {
     // Need to check the previous line
     if position.line == 0 {
@@ -1321,7 +1356,7 @@ fn detect_continuation_operator(
     // Try AST-based chain start detection first, fall back to text-based heuristic
     let (chain_start_line, chain_start_col) =
         find_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
-            let walker = ChainWalker::new(tree, source);
+            let walker = ChainWalker::new(tree, source, tab_size);
             walker.find_chain_start(position)
         });
 
@@ -1372,46 +1407,6 @@ fn is_custom_infix_ending(trimmed: &str) -> bool {
     }
 
     false
-}
-
-/// Detects if the cursor is inside unclosed parentheses.
-///
-/// Walks up the AST from the cursor position to find an enclosing
-/// `arguments` node that hasn't been closed yet.
-///
-/// # Arguments
-///
-/// * `tree` - The tree-sitter parse tree
-/// * `source` - The source code text
-/// * `position` - The cursor position
-///
-/// # Returns
-///
-/// `Some(IndentContext::InsideParens)` if inside unclosed parentheses,
-/// with the opener position and content check.
-#[allow(dead_code)] // Used in tests and may be useful for future refactoring
-fn detect_inside_parens(tree: &Tree, source: &str, position: Position) -> Option<IndentContext> {
-    // Strategy: Look for an arguments node that:
-    // 1. Starts before the cursor position
-    // 2. Either ends after the cursor OR has a MISSING closing paren
-
-    let root = tree.root_node();
-
-    // Find all arguments nodes and check if cursor is inside any of them
-    let args_node = find_unclosed_arguments_at_position(root, position, source)?;
-
-    let opener_pos = args_node.start_position();
-    let opener_line = opener_pos.row as u32;
-    let opener_col = opener_pos.column as u32;
-
-    // Check if there's content after the opening paren on the same line
-    let has_content = check_content_after_opener(source, opener_line, opener_col);
-
-    Some(IndentContext::InsideParens {
-        opener_line,
-        opener_col,
-        has_content_on_opener_line: has_content,
-    })
 }
 
 /// Finds an unclosed arguments node that contains the given position.
@@ -1513,44 +1508,6 @@ fn check_content_after_opener(source: &str, opener_line: u32, opener_col: u32) -
     !stripped.trim().is_empty()
 }
 
-/// Detects if the cursor is inside unclosed braces.
-///
-/// Walks up the AST from the cursor position to find an enclosing
-/// `braced_expression` node that hasn't been closed yet.
-///
-/// # Arguments
-///
-/// * `tree` - The tree-sitter parse tree
-/// * `source` - The source code text
-/// * `position` - The cursor position
-///
-/// # Returns
-///
-/// `Some(IndentContext::InsideBraces)` if inside unclosed braces,
-/// with the opener position.
-#[allow(dead_code)] // Used in tests and may be useful for future refactoring
-fn detect_inside_braces(tree: &Tree, source: &str, position: Position, tab_size: u32) -> Option<IndentContext> {
-    // Strategy: Look for a braced_expression node that:
-    // 1. Starts before the cursor position
-    // 2. Either ends after the cursor OR has a MISSING closing brace
-
-    let root = tree.root_node();
-
-    // Find all braced_expression nodes and check if cursor is inside any of them
-    let brace_node = find_unclosed_braces_at_position(root, position, source)?;
-
-    let opener_pos = brace_node.start_position();
-
-    // Get the indentation of the line containing the opening brace
-    let opener_line = opener_pos.row as u32;
-    let opener_col = get_line_indent(source, opener_line, tab_size);
-
-    Some(IndentContext::InsideBraces {
-        opener_line,
-        opener_col,
-    })
-}
-
 /// Finds an unclosed braced_expression node that contains the given position.
 ///
 /// This handles the case where tree-sitter marks the closing brace as MISSING.
@@ -1644,9 +1601,12 @@ fn get_line_indent(source: &str, line: u32, tab_size: u32) -> u32 {
 ///
 /// The indentation level of the enclosing block, or 0 if at top level.
 fn get_enclosing_block_indent(tree: &Tree, source: &str, position: Position, tab_size: u32) -> u32 {
+    // Convert UTF-16 column to byte offset for tree-sitter
+    let line_text = source.lines().nth(position.line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     let point = tree_sitter::Point {
         row: position.line as usize,
-        column: position.character as usize,
+        column: byte_col,
     };
 
     // Get node at cursor position
@@ -1684,6 +1644,8 @@ pub struct ChainWalker<'a> {
     tree: &'a Tree,
     /// The source code text
     source: &'a str,
+    /// Tab size for visual column calculation
+    tab_size: u32,
 }
 
 impl<'a> ChainWalker<'a> {
@@ -1693,8 +1655,9 @@ impl<'a> ChainWalker<'a> {
     ///
     /// * `tree` - The tree-sitter parse tree
     /// * `source` - The source code text
-    pub fn new(tree: &'a Tree, source: &'a str) -> Self {
-        Self { tree, source }
+    /// * `tab_size` - Tab size for visual column calculation
+    pub fn new(tree: &'a Tree, source: &'a str, tab_size: u32) -> Self {
+        Self { tree, source, tab_size }
     }
 
     /// Finds the chain start by walking backward through operator-terminated lines.
@@ -1763,33 +1726,8 @@ impl<'a> ChainWalker<'a> {
         }
 
         // Check for magrittr pipe %>% and custom infix %word%
-        // Pattern: ends with %something%
-        // The last character must be '%' and there must be another '%' before it
-        if trimmed.ends_with('%') {
-            let bytes = trimmed.as_bytes();
-            let len = bytes.len();
-            // Find the opening % by scanning backward from the second-to-last character
-            if len >= 3 {
-                // Start from len-2 (skip the closing %)
-                for i in (0..len - 1).rev() {
-                    if bytes[i] == b'%' {
-                        // Found opening %, check content between
-                        let between = &trimmed[i + 1..len - 1];
-                        // Valid infix operators: %>%, %in%, %*%, %/%, %o%, %x%, %||%, etc.
-                        // Allow alphanumeric, '.', '>', '<', '*', '/', '|', '&', '!', '='
-                        if !between.is_empty()
-                            && between.chars().all(|c| {
-                                c.is_alphanumeric()
-                                    || matches!(c, '.' | '>' | '<' | '*' | '/' | '|' | '&' | '!' | '=')
-                            })
-                        {
-                            return true;
-                        }
-                        // Found a %, but content is invalid, stop looking
-                        break;
-                    }
-                }
-            }
+        if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
+            return true;
         }
 
         // Check for + operator at end
@@ -1816,14 +1754,7 @@ impl<'a> ChainWalker<'a> {
     /// The column (0-indexed) of the first non-whitespace character,
     /// or 0 if the line is empty or all whitespace.
     fn get_line_start_column(&self, line: u32) -> u32 {
-        let Some(line_text) = self.get_line_text(line) else {
-            return 0;
-        };
-
-        line_text
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .count() as u32
+        get_line_indent(self.source, line, self.tab_size)
     }
 
     /// Gets the text content of a specific line.
@@ -1856,6 +1787,11 @@ fn strip_trailing_comment(line: &str) -> &str {
     let mut in_string = false;
     let mut string_char = '"';
     let mut escape_next = false;
+    let mut in_raw_string = false;
+    let mut raw_close_delim: char = ')';
+    let mut skip_raw_close_quote = false;
+
+    let bytes = line.as_bytes();
 
     for (i, c) in line.char_indices() {
         if escape_next {
@@ -1863,9 +1799,46 @@ fn strip_trailing_comment(line: &str) -> &str {
             continue;
         }
 
+        // Skip the closing '"' of a raw string (already consumed at close_delim)
+        if skip_raw_close_quote {
+            skip_raw_close_quote = false;
+            continue;
+        }
+
+        // Inside raw string: look for close_delim followed by '"'
+        if in_raw_string {
+            if c == raw_close_delim {
+                let next_byte = i + c.len_utf8();
+                if next_byte < bytes.len() && bytes[next_byte] == b'"' {
+                    in_raw_string = false;
+                    skip_raw_close_quote = true;
+                }
+            }
+            continue;
+        }
+
         if c == '\\' && in_string {
             escape_next = true;
             continue;
+        }
+
+        if !in_string && (c == 'r' || c == 'R') {
+            // Check for raw string: r"(...)", R"[...]", r"{...}"
+            let next_byte = i + 1;
+            if next_byte + 1 < bytes.len() && bytes[next_byte] == b'"' {
+                let open_delim = bytes[next_byte + 1];
+                let close = match open_delim {
+                    b'(' => Some(')'),
+                    b'[' => Some(']'),
+                    b'{' => Some('}'),
+                    _ => None,
+                };
+                if let Some(cd) = close {
+                    in_raw_string = true;
+                    raw_close_delim = cd;
+                    continue;
+                }
+            }
         }
 
         if !in_string && (c == '"' || c == '\'') {
@@ -1988,6 +1961,31 @@ mod tests {
     }
 
     #[test]
+    fn test_should_use_fallback_multibyte_utf16() {
+        // CJK character (U+4E16) is 1 UTF-16 code unit but 3 bytes.
+        // Verify the UTF-16→byte conversion doesn't cause a panic or wrong lookup.
+        let code = "\u{4E16} <- 1 + 2";
+        let tree = parse_r_code(code);
+        // character=2 in UTF-16 is after the CJK char + space
+        let position = Position { line: 0, character: 2 };
+        // Should not panic regardless of fallback result
+        let _ = should_use_fallback(tree.root_node(), code, position);
+    }
+
+    #[test]
+    fn test_is_position_valid_multibyte() {
+        // CJK character: 3 bytes, 1 UTF-16 code unit
+        let source = "\u{4E16}\u{754C}"; // 世界 — 2 chars, 2 UTF-16 code units, 6 bytes
+        // character=2 (UTF-16 count) should be valid (end of line)
+        assert!(is_position_valid(source, Position { line: 0, character: 2 }));
+        // character=3 is one past end → still valid (end-of-line sentinel)
+        assert!(is_position_valid(source, Position { line: 0, character: 3 }));
+        // character=7 is way past → would fail with byte comparison but might pass with UTF-16
+        // 6 bytes, 2 UTF-16 units, so character=7 is well beyond
+        assert!(!is_position_valid(source, Position { line: 0, character: 7 }));
+    }
+
+    #[test]
     fn test_fallback_detect_context_closing_delimiter() {
         let source = "func(\n  arg1\n)";
         let position = Position { line: 2, character: 0 };
@@ -2105,7 +2103,7 @@ mod tests {
     #[test]
     fn test_find_chain_start_heuristic_simple() {
         let source = "data %>%\n  step1()";
-        let (line, col) = find_chain_start_heuristic(source, 0);
+        let (line, col) = find_chain_start_heuristic(source, 0, 2);
         assert_eq!(line, 0);
         assert_eq!(col, 0);
     }
@@ -2113,7 +2111,7 @@ mod tests {
     #[test]
     fn test_find_chain_start_heuristic_multi_line() {
         let source = "data %>%\n  step1() %>%\n  step2()";
-        let (line, col) = find_chain_start_heuristic(source, 1);
+        let (line, col) = find_chain_start_heuristic(source, 1, 2);
         assert_eq!(line, 0);
         assert_eq!(col, 0);
     }
@@ -2121,7 +2119,7 @@ mod tests {
     #[test]
     fn test_find_chain_start_heuristic_indented() {
         let source = "  data %>%\n    step1()";
-        let (line, col) = find_chain_start_heuristic(source, 0);
+        let (line, col) = find_chain_start_heuristic(source, 0, 2);
         assert_eq!(line, 0);
         assert_eq!(col, 2); // First non-whitespace at column 2
     }
@@ -2144,6 +2142,23 @@ mod tests {
     #[test]
     fn test_find_unclosed_delimiter_heuristic_closed() {
         let source = "func(arg)\n";
+        let result = find_unclosed_delimiter_heuristic(source, 1);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_unclosed_delimiter_heuristic_brackets_in_string() {
+        // Brackets inside string literals should NOT be counted
+        let source = "x <- \"has a ( in it\"\nfunc(\n";
+        let result = find_unclosed_delimiter_heuristic(source, 2);
+        // Should find the `(` on line 1 (func() call), not the `(` inside the string
+        assert_eq!(result, Some((1, 4, '(')));
+    }
+
+    #[test]
+    fn test_find_unclosed_delimiter_heuristic_only_string_brackets() {
+        // Only brackets inside strings — no real unclosed delimiters
+        let source = "x <- \"has ( and ) in it\"\n";
         let result = find_unclosed_delimiter_heuristic(source, 1);
         assert_eq!(result, None);
     }
@@ -2760,7 +2775,7 @@ mod tests {
             };
 
             // Detect chain start using ChainWalker
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(end_position);
 
             // Verify: chain start should be line 0 (first line of chain)
@@ -2797,7 +2812,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2822,7 +2837,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2847,7 +2862,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2872,7 +2887,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2897,7 +2912,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2926,7 +2941,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code);
+            let walker = ChainWalker::new(&tree, &code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             // Chain start should always be line 0 regardless of cursor position
@@ -3645,7 +3660,7 @@ mod tests {
     fn test_chain_walker_simple_pipe() {
         let code = "result <- data %>%\n  filter(x > 0) %>%\n  select(y)";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         // Cursor on line 2 (select line)
         let position = Position {
@@ -3663,7 +3678,7 @@ mod tests {
     fn test_chain_walker_native_pipe() {
         let code = "data |>\n  filter(x) |>\n  select(y)";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3679,7 +3694,7 @@ mod tests {
     fn test_chain_walker_plus_operator() {
         let code = "ggplot(data) +\n  geom_point() +\n  theme_minimal()";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3695,7 +3710,7 @@ mod tests {
     fn test_chain_walker_tilde_operator() {
         let code = "y ~\n  x1 +\n  x2";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3711,7 +3726,7 @@ mod tests {
     fn test_chain_walker_custom_infix() {
         let code = "x %myop%\n  y %myop%\n  z";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3727,7 +3742,7 @@ mod tests {
     fn test_chain_walker_with_comments() {
         let code = "data %>%  # comment\n  filter(x) %>%  # another comment\n  select(y)";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3743,7 +3758,7 @@ mod tests {
     fn test_chain_walker_indented_start() {
         let code = "  result <- data %>%\n    filter(x) %>%\n    select(y)";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3759,7 +3774,7 @@ mod tests {
     fn test_chain_walker_no_chain() {
         let code = "x <- 1\ny <- 2\nz <- 3";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         // Cursor on line 2
         let position = Position {
@@ -3777,7 +3792,7 @@ mod tests {
     fn test_chain_walker_single_line() {
         let code = "data %>% filter(x)";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 0,
@@ -3794,7 +3809,7 @@ mod tests {
     fn test_chain_walker_middle_of_chain() {
         let code = "data %>%\n  step1() %>%\n  step2() %>%\n  step3()";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         // Cursor on line 1 (step1 line)
         let position = Position {
@@ -3813,7 +3828,7 @@ mod tests {
         // Test %in% operator
         let code = "x %in%\n  y";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 1,
@@ -3830,7 +3845,7 @@ mod tests {
         // Mix of different continuation operators
         let code = "data %>%\n  filter(x) |>\n  mutate(y = y + 1)";
         let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code);
+        let walker = ChainWalker::new(&tree, code, 2);
 
         let position = Position {
             line: 2,
@@ -3840,6 +3855,24 @@ mod tests {
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
+    }
+
+    #[test]
+    fn test_chain_walker_tab_indented() {
+        // Tab-indented chain start should report visual column, not char count
+        let code = "\tresult <- data %>%\n\t\tfilter(x)";
+        let tree = parse_r_code(code);
+        let walker = ChainWalker::new(&tree, code, 4);
+
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
+        let (start_line, start_col) = walker.find_chain_start(position);
+
+        assert_eq!(start_line, 0);
+        // One tab with tab_size=4 → visual column 4
+        assert_eq!(start_col, 4);
     }
 
     // ========================================================================
@@ -3891,6 +3924,24 @@ mod tests {
     #[test]
     fn test_strip_trailing_comment_only_comment() {
         assert_eq!(strip_trailing_comment("# just a comment"), "");
+    }
+
+    #[test]
+    fn test_strip_trailing_comment_raw_string() {
+        // R raw string r"(...)" — hash inside should NOT be treated as comment
+        assert_eq!(
+            strip_trailing_comment(r#"x <- r"(# not a comment)" # real comment"#),
+            r#"x <- r"(# not a comment)" "#
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_comment_raw_string_brackets() {
+        // R raw string R"[...]"
+        assert_eq!(
+            strip_trailing_comment(r#"x <- R"[# not a comment]" # real comment"#),
+            r#"x <- R"[# not a comment]" "#
+        );
     }
 
     // ========================================================================
