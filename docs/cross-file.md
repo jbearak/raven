@@ -16,6 +16,8 @@ All directives must appear on their own comment line (starting with `#`, optiona
 
 All directives support optional colon and quotes: `# @lsp-sourced-by: "../main.R"` is equivalent to `# @lsp-sourced-by ../main.R`.
 
+**Header-only directives:** Backward directives (`@lsp-sourced-by` and synonyms) and working directory directives (`@lsp-cd` and synonyms) must appear in the **file header** — the region of consecutive blank and comment lines at the top of the file, before any code. They are ignored if they appear after the first line of code. This matches the Sight reference implementation. Forward directives, declaration directives, and ignore directives can appear anywhere in the file.
+
 ### Backward Directives
 
 Declare that this file is sourced by another file:

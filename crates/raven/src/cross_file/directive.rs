@@ -100,13 +100,33 @@ fn patterns() -> &'static DirectivePatterns {
 
 /// Parse directives from file content.
 /// Extracts @lsp-* directives including sourced-by, source, working-directory, and ignore directives.
+///
+/// Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) and working
+/// directory directives (`@lsp-cd`, etc.) are **header-only**: they must appear before any code.
+/// The header is the region of consecutive blank and comment lines from the start of the file;
+/// it ends at the first non-blank, non-comment line.
+///
+/// Forward, declaration, and ignore directives are recognized anywhere in the file.
 pub fn parse_directives(content: &str) -> CrossFileMetadata {
     log::trace!("Starting directive parsing");
     let patterns = patterns();
     let mut meta = CrossFileMetadata::default();
 
+    // Header tracking: backward and working-dir directives are only recognized
+    // in the file header (consecutive blank/comment lines from the start).
+    let mut in_header = true;
+
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num as u32;
+
+        // Track header boundary before the @lsp- pre-filter so that code lines
+        // without directives still end the header region.
+        if in_header {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                in_header = false;
+            }
+        }
 
         // Fast pre-filter: skip lines that can't contain any directive.
         // All directives require "@lsp-" so a cheap contains() check avoids
@@ -115,33 +135,49 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             continue;
         }
 
-        // Check backward directives
-        if let Some(caps) = patterns.backward.captures(line) {
-            let path = capture_path(&caps, 1).unwrap_or_default();
-            let call_site = if let Some(line_match) = caps.get(4) {
-                // Convert 1-based user input to 0-based internal
-                let user_line: u32 = line_match.as_str().parse().unwrap_or(1);
-                CallSiteSpec::Line(user_line.saturating_sub(1))
-            } else if let Some(match_pattern) = caps.get(5) {
-                CallSiteSpec::Match(match_pattern.as_str().to_string())
-            } else {
-                CallSiteSpec::Default
-            };
-            log::trace!(
-                "  Parsed backward directive at line {}: path='{}' call_site={:?}",
-                line_num,
-                path,
-                call_site
-            );
-            meta.sourced_by.push(BackwardDirective {
-                path,
-                call_site,
-                directive_line: line_num,
-            });
-            continue;
+        // Header-only: backward directives
+        if in_header {
+            if let Some(caps) = patterns.backward.captures(line) {
+                let path = capture_path(&caps, 1).unwrap_or_default();
+                let call_site = if let Some(line_match) = caps.get(4) {
+                    // Convert 1-based user input to 0-based internal
+                    let user_line: u32 = line_match.as_str().parse().unwrap_or(1);
+                    CallSiteSpec::Line(user_line.saturating_sub(1))
+                } else if let Some(match_pattern) = caps.get(5) {
+                    CallSiteSpec::Match(match_pattern.as_str().to_string())
+                } else {
+                    CallSiteSpec::Default
+                };
+                log::trace!(
+                    "  Parsed backward directive at line {}: path='{}' call_site={:?}",
+                    line_num,
+                    path,
+                    call_site
+                );
+                meta.sourced_by.push(BackwardDirective {
+                    path,
+                    call_site,
+                    directive_line: line_num,
+                });
+                continue;
+            }
         }
 
-        // Check forward directive
+        // Header-only: working directory directive
+        if in_header {
+            if let Some(caps) = patterns.working_dir.captures(line) {
+                let path = capture_path(&caps, 1).unwrap_or_default();
+                log::trace!(
+                    "  Parsed working directory directive at line {}: path='{}'",
+                    line_num,
+                    path
+                );
+                meta.working_directory = Some(path);
+                continue;
+            }
+        }
+
+        // Full-file: forward directive
         if let Some(caps) = patterns.forward.captures(line) {
             let path = capture_path(&caps, 1).unwrap_or_default();
             // Parse line=N parameter from capture group 4 if present
@@ -185,19 +221,7 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             continue;
         }
 
-        // Check working directory directive
-        if let Some(caps) = patterns.working_dir.captures(line) {
-            let path = capture_path(&caps, 1).unwrap_or_default();
-            log::trace!(
-                "  Parsed working directory directive at line {}: path='{}'",
-                line_num,
-                path
-            );
-            meta.working_directory = Some(path);
-            continue;
-        }
-
-        // Check ignore directives
+        // Full-file: ignore directives
         if patterns.ignore.is_match(line) {
             log::trace!("  Parsed @lsp-ignore directive at line {}", line_num);
             meta.ignored_lines.insert(line_num);
@@ -889,6 +913,82 @@ x <- undefined"#;
         let meta = parse_directives(content);
         assert_eq!(meta.sources.len(), 1);
         assert_eq!(meta.sources[0].path, "utils.R");
+    }
+
+    // ============================================================================
+    // Tests for header-only constraint
+    // Backward directives and @lsp-cd must appear in the file header (before
+    // any code). Forward, declaration, and ignore directives work anywhere.
+    // ============================================================================
+
+    #[test]
+    fn test_backward_after_code_not_recognized() {
+        let content = "x <- 1\n# @lsp-sourced-by ../main.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 0);
+    }
+
+    #[test]
+    fn test_working_dir_after_code_not_recognized() {
+        let content = "x <- 1\n# @lsp-cd /data";
+        let meta = parse_directives(content);
+        assert_eq!(meta.working_directory, None);
+    }
+
+    #[test]
+    fn test_backward_in_header_with_blanks_and_comments() {
+        // Header can contain blank lines and comments before the directive
+        let content = "\n# some comment\n\n# @lsp-sourced-by ../main.R\nx <- 1";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].path, "../main.R");
+    }
+
+    #[test]
+    fn test_working_dir_in_header_recognized() {
+        let content = "# @lsp-cd /data\nx <- 1";
+        let meta = parse_directives(content);
+        assert_eq!(meta.working_directory, Some("/data".to_string()));
+    }
+
+    #[test]
+    fn test_forward_after_code_still_recognized() {
+        let content = "x <- 1\n# @lsp-source utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+    }
+
+    #[test]
+    fn test_declaration_after_code_still_recognized() {
+        let content = "x <- 1\n# @lsp-var myvar";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "myvar");
+    }
+
+    #[test]
+    fn test_ignore_after_code_still_recognized() {
+        let content = "x <- 1\n# @lsp-ignore\ny <- undefined";
+        let meta = parse_directives(content);
+        assert!(meta.ignored_lines.contains(&1));
+    }
+
+    #[test]
+    fn test_backward_and_forward_mixed_header() {
+        // Backward in header, forward after code — both recognized appropriately
+        let content = "# @lsp-sourced-by ../main.R\nx <- 1\n# @lsp-source helpers.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_backward_after_blank_line_before_code_recognized() {
+        // Blank lines don't end the header
+        let content = "\n\n# @lsp-sourced-by ../main.R\n\nx <- 1";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
     }
 
     // ============================================================================
