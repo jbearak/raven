@@ -21898,14 +21898,15 @@ proptest! {
         }
     }
 
-    /// Feature: lsp-declaration-directives, Property 4 extended: Same-line code and directive
+    /// Feature: lsp-declaration-directives, Property 4 extended: Trailing-comment directive not recognized
     ///
-    /// When a directive appears on a line with code (e.g., `x <- 1 # @lsp-var foo`),
-    /// the declared symbol SHALL be available starting from line N+1, not on line N.
+    /// Declaration directives must be on their own comment line. When a directive appears
+    /// as a trailing comment (e.g., `x <- 1 # @lsp-var foo`), it is NOT recognized and
+    /// the symbol is not declared.
     ///
-    /// **Validates: Requirements 4.6**
+    /// **Validates: Start-of-line anchoring for declaration directives**
     #[test]
-    fn prop_declaration_same_line_code_and_directive(
+    fn prop_declaration_trailing_comment_not_recognized(
         symbol_name in r_symbol_name(),
         code_var_name in r_symbol_name(),
         directive_line in 0..5u32,
@@ -21920,7 +21921,7 @@ proptest! {
         prop_assume!(!filler_names(directive_line as usize, 3).contains(symbol_name.as_str()));
         prop_assume!(symbol_name != code_var_name);
 
-        // Build content with code and directive on the same line
+        // Build content with code and directive on the same line (trailing comment)
         let mut lines: Vec<String> = (0..directive_line)
             .map(|i| format!("x{} <- {}", i, i))
             .collect();
@@ -21930,7 +21931,7 @@ proptest! {
         } else {
             format!("# @lsp-var {}", symbol_name)
         };
-        // Code with trailing comment directive
+        // Code with trailing comment directive — NOT recognized
         lines.push(format!("{} <- 42 {}", code_var_name, directive));
 
         // Add some lines after
@@ -21950,24 +21951,22 @@ proptest! {
         let metadata = parse_directives(&content);
         let artifacts = compute_artifacts_with_metadata(&uri, &tree, &content, Some(&metadata));
 
-        // The declared symbol should NOT be in scope on the same line as the directive
+        // The declared symbol should NOT be in scope anywhere — directive was not recognized
         let scope_on_directive_line = scope_at_position(&artifacts, directive_line, 0);
         prop_assert!(
             !scope_on_directive_line.symbols.contains_key(symbol_name.as_str()),
-            "Declared symbol '{}' should NOT be in scope on directive line {} (same line as code). Content:\n{}",
+            "Trailing-comment directive should not be recognized: '{}' should NOT be in scope on line {}. Content:\n{}",
             symbol_name, directive_line, content
         );
 
-        // The declared symbol SHOULD be in scope on the next line
         let scope_after_directive = scope_at_position(&artifacts, directive_line + 1, 0);
         prop_assert!(
-            scope_after_directive.symbols.contains_key(symbol_name.as_str()),
-            "Declared symbol '{}' SHOULD be in scope on line {} (after directive on line {}). Content:\n{}",
-            symbol_name, directive_line + 1, directive_line, content
+            !scope_after_directive.symbols.contains_key(symbol_name.as_str()),
+            "Trailing-comment directive should not be recognized: '{}' should NOT be in scope on line {}. Content:\n{}",
+            symbol_name, directive_line + 1, content
         );
 
-        // The code variable (from the assignment) SHOULD be in scope on the same line
-        // (at a position after the assignment)
+        // The code variable (from the assignment) SHOULD still be in scope
         let scope_after_assignment = scope_at_position(&artifacts, directive_line, 10);
         prop_assert!(
             scope_after_assignment.symbols.contains_key(code_var_name.as_str()),

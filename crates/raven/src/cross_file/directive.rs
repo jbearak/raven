@@ -62,35 +62,37 @@ fn patterns() -> &'static DirectivePatterns {
     PATTERNS.get_or_init(|| {
         // Path pattern: "quoted with spaces" or 'single quoted' or unquoted
         // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
+        // All directive regexes are anchored to start of line (^\s*) except
+        // @lsp-ignore, which can appear as a trailing comment (e.g., x <- foo # @lsp-ignore).
         DirectivePatterns {
             backward: Regex::new(
-                r#"#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
+                r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
             ).unwrap(),
             forward: Regex::new(
-                r#"#\s*@lsp-(?:source|run|include)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
+                r#"^\s*#\s*@lsp-(?:source|run|include)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
             ).unwrap(),
             working_dir: Regex::new(
-                r#"#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             ignore: Regex::new(
                 r"#\s*@lsp-ignore\s*:?\s*$"
             ).unwrap(),
             ignore_next: Regex::new(
-                r"#\s*@lsp-ignore-next\s*:?\s*$"
+                r"^\s*#\s*@lsp-ignore-next\s*:?\s*$"
             ).unwrap(),
             // Declaration directives for variables
             // Synonyms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
             // Requirements: 1.1, 1.2, 1.3
             declare_var: Regex::new(
-                r#"#\s*@lsp-(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"^\s*#\s*@lsp-(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             // Declaration directives for functions
             // Synonyms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
             // Requirements: 2.1, 2.2, 2.3
             declare_func: Regex::new(
-                r#"#\s*@lsp-(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"^\s*#\s*@lsp-(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
         }
     })
@@ -105,6 +107,13 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
 
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num as u32;
+
+        // Fast pre-filter: skip lines that can't contain any directive.
+        // All directives require "@lsp-" so a cheap contains() check avoids
+        // running 7 regex matches on the vast majority of lines.
+        if !line.contains("@lsp-") {
+            continue;
+        }
 
         // Check backward directives
         if let Some(caps) = patterns.backward.captures(line) {
@@ -814,6 +823,72 @@ x <- undefined"#;
         let content = "# lsp-ignore-next\ny <- undefined";
         let meta = parse_directives(content);
         assert!(!meta.ignored_next_lines.contains(&1));
+    }
+
+    // ============================================================================
+    // Tests for start-of-line anchoring
+    // Directives (except @lsp-ignore) must appear at the start of a line,
+    // not as trailing comments.
+    // ============================================================================
+
+    #[test]
+    fn test_trailing_comment_backward_not_recognized() {
+        let content = r#"x <- 1 # @lsp-sourced-by ../main.R"#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 0);
+    }
+
+    #[test]
+    fn test_trailing_comment_forward_not_recognized() {
+        let content = "x <- 1 # @lsp-source utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 0);
+    }
+
+    #[test]
+    fn test_trailing_comment_working_dir_not_recognized() {
+        let content = "x <- 1 # @lsp-cd /data";
+        let meta = parse_directives(content);
+        assert_eq!(meta.working_directory, None);
+    }
+
+    #[test]
+    fn test_trailing_comment_ignore_next_not_recognized() {
+        let content = "x <- 1 # @lsp-ignore-next\ny <- undefined";
+        let meta = parse_directives(content);
+        assert!(!meta.ignored_next_lines.contains(&1));
+    }
+
+    #[test]
+    fn test_trailing_comment_declare_var_not_recognized() {
+        let content = "x <- 1 # @lsp-var myvar";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 0);
+    }
+
+    #[test]
+    fn test_trailing_comment_declare_func_not_recognized() {
+        let content = "x <- 1 # @lsp-func myfunc";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 0);
+    }
+
+    #[test]
+    fn test_trailing_comment_ignore_is_recognized() {
+        // @lsp-ignore is the exception: it works as a trailing comment
+        // so you can write `x <- foo # @lsp-ignore` to suppress diagnostics on that line
+        let content = "x <- foo # @lsp-ignore";
+        let meta = parse_directives(content);
+        assert!(meta.ignored_lines.contains(&0));
+    }
+
+    #[test]
+    fn test_indented_directive_recognized() {
+        // Directives with leading whitespace (indented code) should still work
+        let content = "    # @lsp-source utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
     }
 
     // ============================================================================
