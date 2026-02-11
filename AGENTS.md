@@ -18,6 +18,7 @@ Maintainer/internal:
 
 Code (authoritative for behavior):
 - Cross-file: `crates/raven/src/cross_file/`
+- Indentation: `crates/raven/src/indentation/`
 - Packages: `crates/raven/src/package_library.rs`, `crates/raven/src/r_subprocess.rs`
 
 Reference implementation:

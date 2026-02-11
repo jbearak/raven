@@ -32,7 +32,7 @@ The AST-based chain start detection (`find_chain_start_from_ast`) encounters a m
 
 ### AST Structure
 
-```
+```text
 (program 
   (binary_operator                    ; x <- ...
     lhs: (identifier)                 ; x

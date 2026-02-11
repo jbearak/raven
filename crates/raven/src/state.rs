@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
+use crate::indentation::IndentationStyle;
 /// Symbol provider configuration
 ///
 /// Controls behavior of document symbol and workspace symbol providers.
@@ -113,6 +114,22 @@ impl Default for CompletionConfig {
     fn default() -> Self {
         Self {
             trigger_on_open_paren: true,
+        }
+    }
+}
+
+/// Indentation configuration settings.
+#[derive(Debug, Clone)]
+pub struct IndentationSettings {
+    /// Indentation style for R code formatting.
+    /// _Requirements: 7.1, 7.2, 7.3, 7.4_
+    pub style: IndentationStyle,
+}
+
+impl Default for IndentationSettings {
+    fn default() -> Self {
+        Self {
+            style: IndentationStyle::default(),
         }
     }
 }
@@ -529,6 +546,8 @@ pub struct WorldState {
     pub symbol_config: SymbolConfig,
     /// Completion provider configuration
     pub completion_config: CompletionConfig,
+    /// Indentation configuration
+    pub indentation_config: IndentationSettings,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_revalidation: CrossFileRevalidationState,
@@ -622,6 +641,7 @@ impl WorldState {
             cross_file_config: config,
             symbol_config: SymbolConfig::default(),
             completion_config: CompletionConfig::default(),
+            indentation_config: IndentationSettings::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),

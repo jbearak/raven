@@ -20,7 +20,8 @@ use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::r_env;
-use crate::state::{scan_workspace, SymbolConfig, WorldState};
+use crate::state::{scan_workspace, IndentationSettings, SymbolConfig, WorldState};
+use crate::utf16::utf16_column_to_byte_offset;
 
 /// Category of files for on-demand indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,11 +121,8 @@ pub(crate) fn parse_cross_file_config(
     let cross_file = settings.get("crossFile");
     let diagnostics = settings.get("diagnostics");
     let packages = settings.get("packages");
-    let indentation = settings.get("indentation");
-
     // Return None only if no relevant settings are present at all
-    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() && indentation.is_none()
-    {
+    if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
         return None;
     }
 
@@ -277,23 +275,6 @@ pub(crate) fn parse_cross_file_config(
         }
     }
 
-    // Parse indentation settings (Requirement 7.1, 7.2, 7.3, 7.4)
-    if let Some(indentation) = settings.get("indentation") {
-        if let Some(style_str) = indentation.get("style").and_then(|v| v.as_str()) {
-            config.indentation_style = match style_str.to_lowercase().as_str() {
-                "rstudio" => crate::indentation::IndentationStyle::RStudio,
-                "rstudio-minus" => crate::indentation::IndentationStyle::RStudioMinus,
-                "off" => crate::indentation::IndentationStyle::Off,
-                _ => {
-                    log::warn!(
-                        "Invalid indentation.style: {}, defaulting to rstudio",
-                        style_str
-                    );
-                    crate::indentation::IndentationStyle::RStudio
-                }
-            };
-        }
-    }
 
     log::info!("Cross-file configuration loaded from LSP settings:");
     log::info!("  max_backward_depth: {}", config.max_backward_depth);
@@ -368,8 +349,36 @@ pub(crate) fn parse_cross_file_config(
         "    workspace_index_max_entries: {}",
         config.cache_workspace_index_max_entries
     );
-    log::info!("  Indentation settings:");
-    log::info!("    style: {:?}", config.indentation_style);
+    Some(config)
+}
+
+/// Parse indentation configuration from LSP settings.
+///
+/// Reads the `indentation` section from a serde_json::Value and constructs a
+/// populated `IndentationSettings`. Only fields present in the provided JSON
+/// are applied; absent fields retain their defaults.
+pub(crate) fn parse_indentation_config(
+    settings: &serde_json::Value,
+) -> Option<IndentationSettings> {
+    let indentation = settings.get("indentation")?;
+
+    let mut config = IndentationSettings::default();
+
+    if let Some(style_str) = indentation.get("style").and_then(|v| v.as_str()) {
+        config.style = match style_str.to_lowercase().as_str() {
+            "rstudio" => crate::indentation::IndentationStyle::RStudio,
+            "rstudio-minus" => crate::indentation::IndentationStyle::RStudioMinus,
+            "off" => crate::indentation::IndentationStyle::Off,
+            _ => {
+                log::warn!(
+                    "Invalid indentation.style: {}, defaulting to rstudio",
+                    style_str
+                );
+                crate::indentation::IndentationStyle::RStudio
+            }
+        };
+    }
+
     Some(config)
 }
 
@@ -623,6 +632,11 @@ impl LanguageServer for Backend {
             // Parse completion configuration
             if let Some(config) = parse_completion_config(init_options) {
                 state.completion_config = config;
+            }
+
+            // Parse indentation configuration
+            if let Some(config) = parse_indentation_config(init_options) {
+                state.indentation_config = config;
             }
         }
 
@@ -1999,8 +2013,14 @@ impl LanguageServer for Backend {
         // Parse completion configuration if provided
         let new_completion_config = parse_completion_config(&params.settings);
 
+        // Parse indentation configuration if provided
+        let new_indentation_config = parse_indentation_config(&params.settings);
+
         // Log if configuration parsing failed and defaults will be used
-        if new_config.is_none() {
+        let has_cross_file_settings = params.settings.get("crossFile").is_some()
+            || params.settings.get("diagnostics").is_some()
+            || params.settings.get("packages").is_some();
+        if has_cross_file_settings && new_config.is_none() {
             log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
         }
 
@@ -2080,6 +2100,11 @@ impl LanguageServer for Backend {
                 config.hierarchical_document_symbol_support =
                     state.symbol_config.hierarchical_document_symbol_support;
                 state.symbol_config = config;
+            }
+
+            // Apply new indentation config if parsed
+            if let Some(config) = new_indentation_config {
+                state.indentation_config = config;
             }
 
             // Apply new completion config if parsed, tracking trigger change
@@ -2794,6 +2819,16 @@ impl LanguageServer for Backend {
         let source = doc.text();
         let position = params.text_document_position.position;
 
+        // Get indentation style from server configuration
+        let style = state.indentation_config.style;
+
+        // If style is Off, disable all formatting — return no edits
+        // so only Tier 1 declarative rules apply
+        if style == indentation::IndentationStyle::Off {
+            log::trace!("on_type_formatting: style is Off, returning no edits");
+            return Ok(None);
+        }
+
         // Handle closing delimiter triggers: detect and remove auto-close duplicates.
         // When VS Code auto-closes `(` → `()` and the user later types `)` after
         // Enter pushed the auto-closed `)` to a new line, the over-type mechanism
@@ -2848,25 +2883,17 @@ impl LanguageServer for Backend {
         }
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
-        // Guard against tab_size of 0 (use 1 as minimum)
         let raw_tab_size = params.options.tab_size;
-        let tab_size = raw_tab_size.max(1);
+        let tab_size = raw_tab_size.max(1).min(8);
         if raw_tab_size == 0 {
+            log::warn!("on_type_formatting: tab_size 0 is invalid, clamped to 1");
+        } else if raw_tab_size > 8 {
             log::warn!(
-                "on_type_formatting: tab_size 0 is invalid, using 1"
+                "on_type_formatting: tab_size {} is out of range, clamped to 8",
+                raw_tab_size
             );
         }
         let insert_spaces = params.options.insert_spaces;
-
-        // Get indentation style from server configuration
-        let style = state.cross_file_config.indentation_style;
-
-        // If style is Off, disable Tier 2 entirely — return no edits
-        // so only Tier 1 declarative rules apply (Requirement 7.5)
-        if style == indentation::IndentationStyle::Off {
-            log::trace!("on_type_formatting: style is Off, returning no edits");
-            return Ok(None);
-        }
 
         // Build IndentationConfig
         let config = indentation::IndentationConfig {
@@ -2879,15 +2906,18 @@ impl LanguageServer for Backend {
         // This handles invalid AST states with fallback to regex-based detection
         let context = indentation::detect_context(tree, &source, position, tab_size);
 
-        log::info!(
-            "on_type_formatting: pos=({},{}), context={:?}, style={:?}, tab_size={}, source_lines={}",
-            position.line,
-            position.character,
-            context,
-            style,
-            tab_size,
-            source.lines().count()
-        );
+        if log::log_enabled!(log::Level::Trace) {
+            let source_lines = source.lines().count();
+            log::trace!(
+                "on_type_formatting: pos=({},{}), context={:?}, style={:?}, tab_size={}, source_lines={}",
+                position.line,
+                position.character,
+                context,
+                style,
+                tab_size,
+                source_lines
+            );
+        }
 
         // Calculate target indentation
         let target_column = indentation::calculate_indentation(context, config.clone(), &source);
@@ -2895,7 +2925,7 @@ impl LanguageServer for Backend {
         // Generate TextEdit (Requirement 8.4)
         let edit = indentation::format_indentation(position.line, target_column, config, &source);
 
-        log::info!(
+        log::trace!(
             "on_type_formatting: line={}, target_column={}, edit=({},{})-({},{}) new_text={:?}",
             position.line,
             target_column,
@@ -3551,17 +3581,6 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Convert a UTF-16 column offset to a byte offset within a line.
-fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
-    let mut utf16_count = 0;
-    for (byte_idx, ch) in line.char_indices() {
-        if utf16_count == utf16_col as usize {
-            return byte_idx;
-        }
-        utf16_count += ch.len_utf16();
-    }
-    line.len()
-}
 
 #[cfg(test)]
 mod tests {
@@ -3665,7 +3684,6 @@ mod tests {
         fn test_diagnostics_section_without_enabled_defaults_to_true() {
             // JSON with diagnostics section but no enabled key
             let settings = json!({
-                "crossFile": {},
                 "diagnostics": {
                     "undefinedVariables": false
                 }
@@ -4284,6 +4302,7 @@ mod tests {
     // ============================================================================
     mod indentation_config_parsing {
         use crate::indentation::IndentationStyle;
+        use crate::state::IndentationSettings;
         use serde_json::json;
 
         /// Test that missing indentation section defaults to RStudio style
@@ -4293,12 +4312,13 @@ mod tests {
             let settings = json!({
                 "crossFile": {}
             });
-
-            let config = crate::backend::parse_cross_file_config(&settings);
-            assert!(config.is_some(), "Configuration parsing should succeed");
-            let config = config.unwrap();
+            let config = crate::backend::parse_indentation_config(&settings);
+            assert!(
+                config.is_none(),
+                "Should return None when indentation section is absent"
+            );
             assert_eq!(
-                config.indentation_style,
+                IndentationSettings::default().style,
                 IndentationStyle::RStudio,
                 "Should default to RStudio style when indentation section is absent"
             );
@@ -4309,15 +4329,13 @@ mod tests {
         #[test]
         fn test_empty_indentation_section_defaults_to_rstudio() {
             let settings = json!({
-                "crossFile": {},
                 "indentation": {}
             });
-
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_indentation_config(&settings);
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.indentation_style,
+                config.style,
                 IndentationStyle::RStudio,
                 "Should default to RStudio style when style key is absent"
             );
@@ -4328,17 +4346,15 @@ mod tests {
         #[test]
         fn test_parse_rstudio_style() {
             let settings = json!({
-                "crossFile": {},
                 "indentation": {
                     "style": "rstudio"
                 }
             });
-
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_indentation_config(&settings);
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.indentation_style,
+                config.style,
                 IndentationStyle::RStudio,
                 "Should parse 'rstudio' as RStudio style"
             );
@@ -4349,17 +4365,15 @@ mod tests {
         #[test]
         fn test_parse_rstudio_minus_style() {
             let settings = json!({
-                "crossFile": {},
                 "indentation": {
                     "style": "rstudio-minus"
                 }
             });
-
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_indentation_config(&settings);
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.indentation_style,
+                config.style,
                 IndentationStyle::RStudioMinus,
                 "Should parse 'rstudio-minus' as RStudioMinus style"
             );
@@ -4370,17 +4384,15 @@ mod tests {
         #[test]
         fn test_invalid_style_defaults_to_rstudio() {
             let settings = json!({
-                "crossFile": {},
                 "indentation": {
                     "style": "invalid-style"
                 }
             });
-
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_indentation_config(&settings);
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.indentation_style,
+                config.style,
                 IndentationStyle::RStudio,
                 "Should default to RStudio style for invalid values"
             );
@@ -4397,9 +4409,9 @@ mod tests {
                     "style": "RSTUDIO"
                 }
             });
-            let config = crate::backend::parse_cross_file_config(&settings).unwrap();
+            let config = crate::backend::parse_indentation_config(&settings).unwrap();
             assert_eq!(
-                config.indentation_style,
+                config.style,
                 IndentationStyle::RStudio,
                 "Should parse 'RSTUDIO' as RStudio style"
             );
@@ -4411,9 +4423,9 @@ mod tests {
                     "style": "RStudio-Minus"
                 }
             });
-            let config = crate::backend::parse_cross_file_config(&settings).unwrap();
+            let config = crate::backend::parse_indentation_config(&settings).unwrap();
             assert_eq!(
-                config.indentation_style,
+                config.style,
                 IndentationStyle::RStudioMinus,
                 "Should parse 'RStudio-Minus' as RStudioMinus style"
             );

@@ -8,21 +8,7 @@
 
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Point, Tree};
-
-/// Convert a UTF-16 column offset (from LSP Position.character) to a byte
-/// offset within the given line. Tree-sitter Points expect byte offsets, not
-/// UTF-16 code units.
-fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
-    let target = utf16_col as usize;
-    let mut utf16_count = 0;
-    for (byte_idx, ch) in line.char_indices() {
-        if utf16_count >= target {
-            return byte_idx;
-        }
-        utf16_count += ch.len_utf16();
-    }
-    line.len()
-}
+use crate::utf16::utf16_column_to_byte_offset;
 
 /// Information about a detected function call at cursor position.
 #[derive(Debug, Clone, PartialEq, Eq)]

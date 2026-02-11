@@ -120,6 +120,7 @@ pub fn calculate_indentation(
 ///
 /// * `source` - The source code text
 /// * `line` - The line number (0-indexed)
+/// * `tab_size` - The number of columns a tab character represents
 ///
 /// # Returns
 ///

@@ -1157,6 +1157,10 @@ pub fn get_fallback_base_packages() -> Vec<String> {
 /// This returns a curated list of common system, user, and package-manager library locations for macOS, Linux, and Windows,
 /// filtered to only include paths that exist on the filesystem.
 ///
+/// Note: this function performs synchronous filesystem checks (`Path::exists()`).
+/// That is acceptable for the current fallback usage when the R subprocess is unavailable,
+/// but avoid calling it on LSP request threads (do I/O off-thread and revalidate via cache updates).
+///
 /// # Examples
 ///
 /// ```

@@ -213,8 +213,11 @@ fn test_nested_function_call_incomplete() {
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // The fallback heuristic should find the unclosed delimiter
     // This documents the current behavior for incomplete code
-    // The test passes as long as we don't panic
-    let _ = column; // Acknowledge the value is computed without error
+    // The test passes as long as we don't panic, but keep a sanity bound
+    assert!(
+        column <= 120,
+        "Fallback indentation should remain within a reasonable bound"
+    );
 }
 
 // ============================================================================

@@ -26,6 +26,7 @@ mod r_subprocess;
 mod reserved_words;
 mod roxygen;
 mod state;
+mod utf16;
 mod workspace_index;
 
 #[cfg(any(test, feature = "test-support"))]

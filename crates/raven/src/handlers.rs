@@ -17,6 +17,7 @@ use crate::content_provider::ContentProvider;
 use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::cross_file::{scope, ScopedSymbol};
 use crate::state::WorldState;
+use crate::utf16::utf16_column_to_byte_offset;
 
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
@@ -7378,16 +7379,6 @@ pub fn extract_definition_statement(
     extract_statement_from_tree(tree, symbol, &content)
 }
 
-fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
-    let mut utf16_count = 0;
-    for (byte_idx, ch) in line.char_indices() {
-        if utf16_count == utf16_col as usize {
-            return byte_idx;
-        }
-        utf16_count += ch.len_utf16();
-    }
-    line.len()
-}
 
 fn next_utf8_char_boundary(line: &str, byte_offset: usize) -> usize {
     if byte_offset >= line.len() {

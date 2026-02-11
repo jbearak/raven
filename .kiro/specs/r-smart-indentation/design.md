@@ -357,6 +357,9 @@ pub fn format_indentation(
        .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
        .unwrap_or(0);
    ```
+   Note: `source.lines().nth(...)` is O(n) per call; consider precomputing a
+   `Vec<usize>` of line start byte offsets (as used elsewhere in Raven) and using
+   that index for repeated per-line lookups during a formatting request.
 
 2. Generate new whitespace string:
    ```rust
@@ -780,6 +783,7 @@ let style = config
     .and_then(|s| match s {
         "rstudio" => Some(IndentationStyle::RStudio),
         "rstudio-minus" => Some(IndentationStyle::RStudioMinus),
+        "off" => Some(IndentationStyle::Off),
         _ => {
             log::warn!("Invalid indentation.style: {}, defaulting to rstudio", s);
             None

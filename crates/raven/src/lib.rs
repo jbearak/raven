@@ -33,4 +33,5 @@ pub mod perf;
 pub mod r_env;
 pub mod r_subprocess;
 pub mod roxygen;
+pub mod utf16;
 pub mod workspace_index;
