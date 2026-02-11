@@ -16430,9 +16430,9 @@ fn forward_directive_synonym() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just("lsp-source"), Just("lsp-run"), Just("lsp-include"),]
 }
 
-/// Generate optional @ prefix
-fn optional_at_prefix() -> impl Strategy<Value = &'static str> {
-    prop_oneof![Just("@"), Just(""),]
+/// Generate @ prefix (required for all directives)
+fn at_prefix() -> impl Strategy<Value = &'static str> {
+    Just("@")
 }
 
 /// Generate optional colon separator
@@ -16482,7 +16482,7 @@ proptest! {
     /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9**
     #[test]
     fn prop_forward_directive_parsing_completeness(
-        at_prefix in optional_at_prefix(),
+        at_prefix in at_prefix(),
         synonym in forward_directive_synonym(),
         colon in optional_colon(),
         path in relative_path(),  // Use simple path for unquoted case
@@ -16566,7 +16566,7 @@ proptest! {
     /// **Validates: Requirements 1.6, 1.7, 1.8**
     #[test]
     fn prop_forward_directive_paths_with_spaces(
-        at_prefix in optional_at_prefix(),
+        at_prefix in at_prefix(),
         synonym in forward_directive_synonym(),
         colon in optional_colon(),
         dir in path_component(),
@@ -16607,7 +16607,7 @@ proptest! {
     fn prop_forward_directive_all_syntax_combinations(
         path in relative_path(),
     ) {
-        let at_prefixes = ["@", ""];
+        let at_prefixes = ["@"];
         let synonyms = ["lsp-source", "lsp-run", "lsp-include"];
         let colons = [":", ""];
         let quote_styles = [QuoteStyle::None, QuoteStyle::Double, QuoteStyle::Single];
@@ -16782,11 +16782,11 @@ proptest! {
 
     /// Feature: lsp-source-directive, Property 2 Extended: Synonym equivalence without @ prefix
     ///
-    /// Synonyms without @ prefix should also produce identical ForwardSource entries.
+    /// Synonyms without @ prefix should NOT be recognized as directives.
     ///
-    /// **Validates: Requirements 1.2, 1.3, 1.4**
+    /// **Validates: All directives require @ prefix**
     #[test]
-    fn prop_forward_directive_synonym_equivalence_no_at_prefix(
+    fn prop_forward_directive_synonym_no_at_prefix_not_recognized(
         path in relative_path_with_parents(),
     ) {
         let source_content = format!("# lsp-source {}", path);
@@ -16797,19 +16797,10 @@ proptest! {
         let meta_run = parse_directives(&run_content);
         let meta_include = parse_directives(&include_content);
 
-        // All should produce exactly one ForwardSource
-        prop_assert_eq!(meta_source.sources.len(), 1);
-        prop_assert_eq!(meta_run.sources.len(), 1);
-        prop_assert_eq!(meta_include.sources.len(), 1);
-
-        // All should have the same path
-        prop_assert_eq!(&meta_source.sources[0].path, &path);
-        prop_assert_eq!(&meta_run.sources[0].path, &path);
-        prop_assert_eq!(&meta_include.sources[0].path, &path);
-
-        // All should have identical ForwardSource structures
-        prop_assert_eq!(&meta_source.sources[0], &meta_run.sources[0], "lsp-source and lsp-run (no @) should produce identical ForwardSource");
-        prop_assert_eq!(&meta_source.sources[0], &meta_include.sources[0], "lsp-source and lsp-include (no @) should produce identical ForwardSource");
+        // None should produce any ForwardSource entries
+        prop_assert_eq!(meta_source.sources.len(), 0, "lsp-source without @ should not be recognized");
+        prop_assert_eq!(meta_run.sources.len(), 0, "lsp-run without @ should not be recognized");
+        prop_assert_eq!(meta_include.sources.len(), 0, "lsp-include without @ should not be recognized");
     }
 }
 
@@ -16908,7 +16899,7 @@ proptest! {
     fn prop_forward_directive_call_site_line_conversion_syntax_variations(
         path in relative_path(),
         user_line in 1..500u32,
-        at_prefix in optional_at_prefix(),
+        at_prefix in at_prefix(),
         colon in optional_colon(),
         quotes in quote_style(),
     ) {
@@ -17081,7 +17072,7 @@ proptest! {
     fn prop_forward_directive_default_call_site_syntax_variations(
         path in relative_path(),
         prefix_lines in 0..15u32,
-        at_prefix in optional_at_prefix(),
+        at_prefix in at_prefix(),
         colon in optional_colon(),
         quotes in quote_style(),
     ) {

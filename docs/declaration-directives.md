@@ -28,8 +28,6 @@ All syntax variations are supported:
 - With or without colon: `@lsp-var: myvar` or `@lsp-var myvar`
 - With quotes for special characters: `@lsp-var "my.var"` or `@lsp-var 'my.var'`
 
-**Important:** Unlike source directives, declaration directives require the `@` prefix. `# lsp-var myvar` (without `@`) is NOT recognized.
-
 ## Position-Aware Behavior
 
 Declared symbols are available starting from the beginning of the next line (line N+1), matching `source()` semantics:

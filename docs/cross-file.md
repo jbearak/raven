@@ -52,7 +52,6 @@ Explicitly declare that this file sources another file (useful for dynamic or co
 ```
 
 All syntax variations are supported:
-- With or without `@` prefix: `@lsp-source` or `lsp-source`
 - With or without colon: `@lsp-source: path` or `@lsp-source path`
 - With quotes: `@lsp-source "path/with spaces.R"` or `@lsp-source 'path.R'`
 - Without quotes: `@lsp-source path.R`

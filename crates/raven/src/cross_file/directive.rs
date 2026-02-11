@@ -64,19 +64,19 @@ fn patterns() -> &'static DirectivePatterns {
         // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
         DirectivePatterns {
             backward: Regex::new(
-                r#"#\s*@?lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
+                r#"#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
             ).unwrap(),
             forward: Regex::new(
-                r#"#\s*@?lsp-(?:source|run|include)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
+                r#"#\s*@lsp-(?:source|run|include)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
             ).unwrap(),
             working_dir: Regex::new(
-                r#"#\s*@?lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                r#"#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             ignore: Regex::new(
-                r"#\s*@?lsp-ignore\s*:?\s*$"
+                r"#\s*@lsp-ignore\s*:?\s*$"
             ).unwrap(),
             ignore_next: Regex::new(
-                r"#\s*@?lsp-ignore-next\s*:?\s*$"
+                r"#\s*@lsp-ignore-next\s*:?\s*$"
             ).unwrap(),
             // Declaration directives for variables
             // Synonyms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
@@ -487,12 +487,11 @@ x <- undefined"#;
     }
 
     #[test]
-    fn test_forward_directive_synonyms_no_at_prefix() {
+    fn test_forward_directive_synonyms_no_at_prefix_not_recognized() {
         for directive in ["lsp-source", "lsp-run", "lsp-include"] {
             let content = format!("# {} utils.R", directive);
             let meta = parse_directives(&content);
-            assert_eq!(meta.sources.len(), 1, "Failed for {}", directive);
-            assert_eq!(meta.sources[0].path, "utils.R", "Failed for {}", directive);
+            assert_eq!(meta.sources.len(), 0, "Should not recognize {} without @ prefix", directive);
         }
     }
 
@@ -748,49 +747,44 @@ x <- undefined"#;
         assert_eq!(meta.working_directory, Some("/data/my project".to_string()));
     }
 
-    // Tests for directives without '@' prefix
+    // Tests that directives without '@' prefix are NOT recognized
     #[test]
-    fn test_backward_directive_no_at_prefix() {
+    fn test_backward_directive_no_at_prefix_not_recognized() {
         let content = "# lsp-sourced-by ../main.R";
         let meta = parse_directives(content);
-        assert_eq!(meta.sourced_by.len(), 1);
-        assert_eq!(meta.sourced_by[0].path, "../main.R");
+        assert_eq!(meta.sourced_by.len(), 0);
     }
 
     #[test]
-    fn test_backward_directive_no_at_prefix_with_colon() {
+    fn test_backward_directive_no_at_prefix_with_colon_not_recognized() {
         let content = "# lsp-sourced-by: ../main.R";
         let meta = parse_directives(content);
-        assert_eq!(meta.sourced_by.len(), 1);
-        assert_eq!(meta.sourced_by[0].path, "../main.R");
+        assert_eq!(meta.sourced_by.len(), 0);
     }
 
     #[test]
-    fn test_backward_directive_no_at_prefix_synonyms() {
+    fn test_backward_directive_no_at_prefix_synonyms_not_recognized() {
         let content = "# lsp-run-by ../main.R\n# lsp-included-by ../other.R";
         let meta = parse_directives(content);
-        assert_eq!(meta.sourced_by.len(), 2);
-        assert_eq!(meta.sourced_by[0].path, "../main.R");
-        assert_eq!(meta.sourced_by[1].path, "../other.R");
+        assert_eq!(meta.sourced_by.len(), 0);
     }
 
     #[test]
-    fn test_forward_directive_no_at_prefix() {
+    fn test_forward_directive_no_at_prefix_not_recognized() {
         let content = "# lsp-source utils.R";
         let meta = parse_directives(content);
-        assert_eq!(meta.sources.len(), 1);
-        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources.len(), 0);
     }
 
     #[test]
-    fn test_working_dir_no_at_prefix() {
+    fn test_working_dir_no_at_prefix_not_recognized() {
         let content = "# lsp-wd /data/scripts";
         let meta = parse_directives(content);
-        assert_eq!(meta.working_directory, Some("/data/scripts".to_string()));
+        assert_eq!(meta.working_directory, None);
     }
 
     #[test]
-    fn test_working_dir_no_at_prefix_synonyms() {
+    fn test_working_dir_no_at_prefix_synonyms_not_recognized() {
         for directive in [
             "lsp-cd",
             "lsp-working-directory",
@@ -801,26 +795,25 @@ x <- undefined"#;
             let content = format!("# {} /data", directive);
             let meta = parse_directives(&content);
             assert_eq!(
-                meta.working_directory,
-                Some("/data".to_string()),
-                "Failed for {}",
+                meta.working_directory, None,
+                "Should not recognize {} without @ prefix",
                 directive
             );
         }
     }
 
     #[test]
-    fn test_ignore_directive_no_at_prefix() {
+    fn test_ignore_directive_no_at_prefix_not_recognized() {
         let content = "x <- 1\n# lsp-ignore\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(meta.ignored_lines.contains(&1));
+        assert!(!meta.ignored_lines.contains(&1));
     }
 
     #[test]
-    fn test_ignore_next_directive_no_at_prefix() {
+    fn test_ignore_next_directive_no_at_prefix_not_recognized() {
         let content = "# lsp-ignore-next\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(meta.ignored_next_lines.contains(&1));
+        assert!(!meta.ignored_next_lines.contains(&1));
     }
 
     // ============================================================================
