@@ -37,8 +37,8 @@ jobs:
             target: x86_64-apple-darwin
             platform: macos-x64
             use-zigbuild: false
-          - os: ubuntu-latest
-            target: x86_64-pc-windows-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
             platform: windows-x64
             use-zigbuild: false
           - os: windows-latest
@@ -58,16 +58,10 @@ jobs:
         if: matrix.use-zigbuild
         run: pip install cargo-zigbuild
 
-      - name: Install cross
-        if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
       - name: Build LSP
         run: |
           if [ "${{ matrix.use-zigbuild }}" = "true" ]; then
             cargo zigbuild --release --target ${{ matrix.target }} --bin raven
-          elif [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
-            cross build --release --target ${{ matrix.target }} --bin raven
           else
             cargo build --release --target ${{ matrix.target }} --bin raven
           fi
@@ -78,7 +72,7 @@ jobs:
           if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
             cp target/${{ matrix.target }}/release/raven.exe dist/
             cp LICENSE dist/
-            cd dist && zip -r ../raven-${{ matrix.platform }}.zip .
+            cd dist && 7z a -tzip ../raven-${{ matrix.platform }}.zip .
           else
             cp target/${{ matrix.target }}/release/raven dist/
             cp LICENSE dist/
