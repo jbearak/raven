@@ -5,6 +5,7 @@ import {
     LanguageClientOptions,
     ServerOptions,
 } from 'vscode-languageclient/node';
+import { registerAutoCloseFix } from './autoCloseFix';
 
 /**
  * Severity level for diagnostic messages.
@@ -347,6 +348,9 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     client.start();
+
+    // Register auto-close pair overtype fix
+    context.subscriptions.push(registerAutoCloseFix());
 
     // Register activity signal listeners for cross-file revalidation prioritization
     context.subscriptions.push(
