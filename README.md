@@ -110,6 +110,7 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 - **Document symbols** - Hierarchical outline view with R code section support (`# Section ----`), S4/R6 class detection, and nested function display
 - **Workspace symbols** - Fast project-wide symbol search (Ctrl+T) with configurable result limits
 - **Workspace indexing** - Background indexing of your entire project
+- **Smart indentation** - AST-aware auto-indentation with RStudio-style alignment on Enter
 - **Package awareness** - Recognition of `library()` calls and package exports
 
 ## Documentation
@@ -117,6 +118,7 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 - [Cross-File Awareness](docs/cross-file.md) - Directives, `source()` detection, symbol resolution
 - [Declaration Directives](docs/declaration-directives.md) - `@lsp-var`, `@lsp-func` for dynamically-created symbols
 - [Package Function Awareness](docs/packages.md) - `library()` support, meta-packages, base packages
+- [Smart Indentation](docs/indentation.md) - AST-aware auto-indentation styles and configuration
 - [Configuration](docs/configuration.md) - All settings and options
 
 ## Development
