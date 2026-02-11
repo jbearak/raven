@@ -116,6 +116,7 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 ## Documentation
 
 - [Cross-File Awareness](docs/cross-file.md) - Directives, `source()` detection, symbol resolution
+- [Document Outline](docs/document-outline.md) - Hierarchical outline view, R code sections, symbol types
 - [Declaration Directives](docs/declaration-directives.md) - `@lsp-var`, `@lsp-func` for dynamically-created symbols
 - [Package Function Awareness](docs/packages.md) - `library()` support, meta-packages, base packages
 - [Smart Indentation](docs/indentation.md) - AST-aware auto-indentation styles and configuration
