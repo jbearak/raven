@@ -2870,7 +2870,7 @@ impl LanguageServer for Backend {
 
         // Detect syntactic context using AST (Requirement 8.3)
         // This handles invalid AST states with fallback to regex-based detection
-        let context = indentation::detect_context(tree, &source, position);
+        let context = indentation::detect_context(tree, &source, position, tab_size);
 
         log::info!(
             "on_type_formatting: pos=({},{}), context={:?}, style={:?}, tab_size={}, source_lines={}",

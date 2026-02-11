@@ -68,7 +68,7 @@ pub fn calculate_indentation(
         } => {
             // Align to chain start column (RHS of assignment if present)
             // but ensure at least one tab_size indent from the line start.
-            let line_indent = get_line_indent(source, chain_start_line);
+            let line_indent = get_line_indent(source, chain_start_line, config.tab_size);
             std::cmp::max(chain_start_col, line_indent + config.tab_size)
         }
         IndentContext::InsideParens {
@@ -83,27 +83,27 @@ pub fn calculate_indentation(
                         opener_col + 1
                     } else {
                         // Indent from function line
-                        get_line_indent(source, opener_line) + config.tab_size
+                        get_line_indent(source, opener_line, config.tab_size) + config.tab_size
                     }
                 }
                 IndentationStyle::RStudioMinus => {
                     // Always indent from opener line + tab_size
-                    get_line_indent(source, opener_line) + config.tab_size
+                    get_line_indent(source, opener_line, config.tab_size) + config.tab_size
                 }
                 IndentationStyle::Off => {
                     // Off should be handled before reaching calculate_indentation
                     // (the handler returns None early). Fallback to basic indent.
-                    get_line_indent(source, opener_line) + config.tab_size
+                    get_line_indent(source, opener_line, config.tab_size) + config.tab_size
                 }
             }
         }
         IndentContext::InsideBraces { opener_line, .. } => {
             // Brace block: indent from brace line
-            get_line_indent(source, opener_line) + config.tab_size
+            get_line_indent(source, opener_line, config.tab_size) + config.tab_size
         }
         IndentContext::ClosingDelimiter { opener_line, .. } => {
             // Closing delimiter: align to opener line indentation
-            get_line_indent(source, opener_line)
+            get_line_indent(source, opener_line, config.tab_size)
         }
         IndentContext::AfterCompleteExpression {
             enclosing_block_indent,
@@ -124,14 +124,14 @@ pub fn calculate_indentation(
 /// # Returns
 ///
 /// The column of the first non-whitespace character on the line.
-pub fn get_line_indent(source: &str, line: u32) -> u32 {
+pub fn get_line_indent(source: &str, line: u32, tab_size: u32) -> u32 {
     source
         .lines()
         .nth(line as usize)
         .map(|l| {
             l.chars()
                 .take_while(|c| c.is_whitespace())
-                .map(|c| if c == '\t' { 1 } else { 1 }) // Simplified: count chars
+                .map(|c| if c == '\t' { tab_size } else { 1 })
                 .sum()
         })
         .unwrap_or(0)
@@ -158,59 +158,75 @@ mod tests {
     #[test]
     fn test_get_line_indent() {
         let source = "no indent\n  two spaces\n    four spaces";
-        assert_eq!(get_line_indent(source, 0), 0);
-        assert_eq!(get_line_indent(source, 1), 2);
-        assert_eq!(get_line_indent(source, 2), 4);
+        assert_eq!(get_line_indent(source, 0, 1), 0);
+        assert_eq!(get_line_indent(source, 1, 1), 2);
+        assert_eq!(get_line_indent(source, 2, 1), 4);
     }
 
     #[test]
     fn test_get_line_indent_empty_line() {
         let source = "first\n\nthird";
-        assert_eq!(get_line_indent(source, 1), 0);
+        assert_eq!(get_line_indent(source, 1, 1), 0);
     }
 
     #[test]
     fn test_get_line_indent_out_of_bounds() {
         let source = "only one line";
-        assert_eq!(get_line_indent(source, 10), 0);
+        assert_eq!(get_line_indent(source, 10, 1), 0);
     }
 
     #[test]
     fn test_get_line_indent_whitespace_only_line() {
         // Lines with only whitespace should return the whitespace count
         let source = "first\n    \nthird";
-        assert_eq!(get_line_indent(source, 1), 4);
+        assert_eq!(get_line_indent(source, 1, 1), 4);
     }
 
     #[test]
     fn test_get_line_indent_with_tabs() {
-        // Tab characters should be counted as 1 character each (simplified behavior)
+        // Tab characters counted with tab_size=1 (each tab = 1 column)
         let source = "\tfirst\n\t\tsecond\n\t  mixed";
-        assert_eq!(get_line_indent(source, 0), 1); // 1 tab
-        assert_eq!(get_line_indent(source, 1), 2); // 2 tabs
-        assert_eq!(get_line_indent(source, 2), 3); // 1 tab + 2 spaces
+        assert_eq!(get_line_indent(source, 0, 1), 1); // 1 tab
+        assert_eq!(get_line_indent(source, 1, 1), 2); // 2 tabs
+        assert_eq!(get_line_indent(source, 2, 1), 3); // 1 tab + 2 spaces
+    }
+
+    #[test]
+    fn test_get_line_indent_with_tabs_tab_size_4() {
+        // Tab characters expand to tab_size columns each
+        let source = "\tx\n\t\tx\n\t  x\n";
+        assert_eq!(get_line_indent(source, 0, 4), 4); // 1 tab * 4
+        assert_eq!(get_line_indent(source, 1, 4), 8); // 2 tabs * 4
+        assert_eq!(get_line_indent(source, 2, 4), 6); // 1 tab * 4 + 2 spaces
     }
 
     #[test]
     fn test_get_line_indent_mixed_whitespace() {
-        // Mixed tabs and spaces
+        // Mixed tabs and spaces with tab_size=1
         let source = "  \t  code";
-        assert_eq!(get_line_indent(source, 0), 5); // 2 spaces + 1 tab + 2 spaces
+        assert_eq!(get_line_indent(source, 0, 1), 5); // 2 spaces + 1 tab(=1) + 2 spaces
+    }
+
+    #[test]
+    fn test_get_line_indent_mixed_whitespace_tab_size_4() {
+        // Mixed tabs and spaces with tab_size=4
+        let source = "  \t  code";
+        assert_eq!(get_line_indent(source, 0, 4), 8); // 2 spaces + 1 tab(=4) + 2 spaces
     }
 
     #[test]
     fn test_get_line_indent_empty_source() {
         // Empty source string
         let source = "";
-        assert_eq!(get_line_indent(source, 0), 0);
+        assert_eq!(get_line_indent(source, 0, 1), 0);
     }
 
     #[test]
     fn test_get_line_indent_single_newline() {
         // Source with just a newline
         let source = "\n";
-        assert_eq!(get_line_indent(source, 0), 0);
-        assert_eq!(get_line_indent(source, 1), 0);
+        assert_eq!(get_line_indent(source, 0, 1), 0);
+        assert_eq!(get_line_indent(source, 1, 1), 0);
     }
 
     // ========================================================================
@@ -1096,17 +1112,17 @@ mod tests {
     fn test_edge_case_out_of_bounds_line_number() {
         // get_line_indent should handle out-of-bounds line numbers gracefully
         let source = "only one line";
-        assert_eq!(get_line_indent(source, 0), 0);
-        assert_eq!(get_line_indent(source, 1), 0); // out of bounds
-        assert_eq!(get_line_indent(source, 100), 0); // way out of bounds
-        assert_eq!(get_line_indent(source, u32::MAX), 0); // maximum value
+        assert_eq!(get_line_indent(source, 0, 1), 0);
+        assert_eq!(get_line_indent(source, 1, 1), 0); // out of bounds
+        assert_eq!(get_line_indent(source, 100, 1), 0); // way out of bounds
+        assert_eq!(get_line_indent(source, u32::MAX, 1), 0); // maximum value
     }
 
     #[test]
     fn test_edge_case_empty_source_string() {
         // Empty source string should be handled gracefully
         let source = "";
-        assert_eq!(get_line_indent(source, 0), 0);
+        assert_eq!(get_line_indent(source, 0, 1), 0);
 
         // Calculation with empty source should still work
         let config = IndentationConfig::default();

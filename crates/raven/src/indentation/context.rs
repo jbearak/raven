@@ -431,7 +431,7 @@ pub enum OperatorType {
 /// # Returns
 ///
 /// The detected `IndentContext` that should be used for indentation calculation.
-pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentContext {
+pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u32) -> IndentContext {
     // Validate position is within document bounds
     if !is_position_valid(source, position) {
         log::warn!(
@@ -453,7 +453,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentCo
             position.line,
             position.character
         );
-        return fallback_detect_context(source, position);
+        return fallback_detect_context(source, position, tab_size);
     }
 
     // 1. Check if current line starts with closing delimiter
@@ -491,7 +491,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentCo
             {
                 // Braces are innermost
                 let opener_line = braces_start.row as u32;
-                let opener_col = get_line_indent(source, opener_line);
+                let opener_col = get_line_indent(source, opener_line, tab_size);
                 IndentContext::InsideBraces {
                     opener_line,
                     opener_col,
@@ -522,7 +522,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentCo
         (None, Some(b)) => {
             let opener_pos = b.start_position();
             let opener_line = opener_pos.row as u32;
-            let opener_col = get_line_indent(source, opener_line);
+            let opener_col = get_line_indent(source, opener_line, tab_size);
             IndentContext::InsideBraces {
                 opener_line,
                 opener_col,
@@ -531,7 +531,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentCo
         (None, None) => {
             // 4. Default to complete expression
             IndentContext::AfterCompleteExpression {
-                enclosing_block_indent: get_enclosing_block_indent(tree, source, position),
+                enclosing_block_indent: get_enclosing_block_indent(tree, source, position, tab_size),
             }
         }
     }
@@ -658,7 +658,7 @@ fn should_use_fallback(root: Node, source: &str, position: Position) -> bool {
 /// # Returns
 ///
 /// The detected `IndentContext` based on regex heuristics.
-fn fallback_detect_context(source: &str, position: Position) -> IndentContext {
+fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> IndentContext {
     // 1. Check if current line starts with closing delimiter
     if let Some(line_text) = source.lines().nth(position.line as usize) {
         let trimmed = line_text.trim_start();
@@ -676,7 +676,7 @@ fn fallback_detect_context(source: &str, position: Position) -> IndentContext {
                 }
                 // No matching opener found - use previous line indent
                 let prev_indent = if position.line > 0 {
-                    get_line_indent(source, position.line - 1)
+                    get_line_indent(source, position.line - 1, tab_size)
                 } else {
                     0
                 };
@@ -734,7 +734,7 @@ fn fallback_detect_context(source: &str, position: Position) -> IndentContext {
                 };
             }
             '{' => {
-                let opener_indent = get_line_indent(source, opener_line);
+                let opener_indent = get_line_indent(source, opener_line, tab_size);
                 return IndentContext::InsideBraces {
                     opener_line,
                     opener_col: opener_indent,
@@ -746,7 +746,7 @@ fn fallback_detect_context(source: &str, position: Position) -> IndentContext {
 
     // 4. Default to complete expression with previous line indent
     let enclosing_indent = if position.line > 0 {
-        get_line_indent(source, position.line - 1)
+        get_line_indent(source, position.line - 1, tab_size)
     } else {
         0
     };
@@ -1496,7 +1496,7 @@ fn check_content_after_opener(source: &str, opener_line: u32, opener_col: u32) -
 /// `Some(IndentContext::InsideBraces)` if inside unclosed braces,
 /// with the opener position.
 #[allow(dead_code)] // Used in tests and may be useful for future refactoring
-fn detect_inside_braces(tree: &Tree, source: &str, position: Position) -> Option<IndentContext> {
+fn detect_inside_braces(tree: &Tree, source: &str, position: Position, tab_size: u32) -> Option<IndentContext> {
     // Strategy: Look for a braced_expression node that:
     // 1. Starts before the cursor position
     // 2. Either ends after the cursor OR has a MISSING closing brace
@@ -1510,7 +1510,7 @@ fn detect_inside_braces(tree: &Tree, source: &str, position: Position) -> Option
 
     // Get the indentation of the line containing the opening brace
     let opener_line = opener_pos.row as u32;
-    let opener_col = get_line_indent(source, opener_line);
+    let opener_col = get_line_indent(source, opener_line, tab_size);
 
     Some(IndentContext::InsideBraces {
         opener_line,
@@ -1583,11 +1583,16 @@ fn find_unclosed_braces_at_position<'a>(
 /// # Returns
 ///
 /// The number of leading whitespace characters on the line.
-fn get_line_indent(source: &str, line: u32) -> u32 {
+fn get_line_indent(source: &str, line: u32, tab_size: u32) -> u32 {
     source
         .lines()
         .nth(line as usize)
-        .map(|l| l.chars().take_while(|c| c.is_whitespace()).count() as u32)
+        .map(|l| {
+            l.chars()
+                .take_while(|c| c.is_whitespace())
+                .map(|c| if c == '\t' { tab_size } else { 1 })
+                .sum()
+        })
         .unwrap_or(0)
 }
 
@@ -1605,7 +1610,7 @@ fn get_line_indent(source: &str, line: u32) -> u32 {
 /// # Returns
 ///
 /// The indentation level of the enclosing block, or 0 if at top level.
-fn get_enclosing_block_indent(tree: &Tree, source: &str, position: Position) -> u32 {
+fn get_enclosing_block_indent(tree: &Tree, source: &str, position: Position, tab_size: u32) -> u32 {
     let point = tree_sitter::Point {
         row: position.line as usize,
         column: position.character as usize,
@@ -1619,7 +1624,7 @@ fn get_enclosing_block_indent(tree: &Tree, source: &str, position: Position) -> 
     // Walk up to find enclosing block
     if let Some(brace_node) = find_enclosing_brace_list(node) {
         let opener_line = brace_node.start_position().row as u32;
-        return get_line_indent(source, opener_line);
+        return get_line_indent(source, opener_line, tab_size);
     }
 
     // No enclosing block, return 0 (top level)
@@ -1953,7 +1958,7 @@ mod tests {
     fn test_fallback_detect_context_closing_delimiter() {
         let source = "func(\n  arg1\n)";
         let position = Position { line: 2, character: 0 };
-        let ctx = fallback_detect_context(source, position);
+        let ctx = fallback_detect_context(source, position, 2);
         
         match ctx {
             IndentContext::ClosingDelimiter { delimiter, .. } => {
@@ -1967,7 +1972,7 @@ mod tests {
     fn test_fallback_detect_context_continuation_operator() {
         let source = "data %>%\n";
         let position = Position { line: 1, character: 0 };
-        let ctx = fallback_detect_context(source, position);
+        let ctx = fallback_detect_context(source, position, 2);
         
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -1981,7 +1986,7 @@ mod tests {
     fn test_fallback_detect_context_native_pipe() {
         let source = "data |>\n";
         let position = Position { line: 1, character: 0 };
-        let ctx = fallback_detect_context(source, position);
+        let ctx = fallback_detect_context(source, position, 2);
         
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -1995,7 +2000,7 @@ mod tests {
     fn test_fallback_detect_context_unclosed_paren() {
         let source = "func(\n";
         let position = Position { line: 1, character: 0 };
-        let ctx = fallback_detect_context(source, position);
+        let ctx = fallback_detect_context(source, position, 2);
         
         match ctx {
             IndentContext::InsideParens { opener_line, opener_col, .. } => {
@@ -2010,7 +2015,7 @@ mod tests {
     fn test_fallback_detect_context_unclosed_brace() {
         let source = "if (TRUE) {\n";
         let position = Position { line: 1, character: 0 };
-        let ctx = fallback_detect_context(source, position);
+        let ctx = fallback_detect_context(source, position, 2);
         
         match ctx {
             IndentContext::InsideBraces { opener_line, .. } => {
@@ -2024,7 +2029,7 @@ mod tests {
     fn test_fallback_detect_context_complete_expression() {
         let source = "x <- 1\n";
         let position = Position { line: 1, character: 0 };
-        let ctx = fallback_detect_context(source, position);
+        let ctx = fallback_detect_context(source, position, 2);
         
         match ctx {
             IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
@@ -2116,7 +2121,7 @@ mod tests {
         let tree = parse_r_code(code);
         // Position way out of bounds
         let position = Position { line: 100, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
         
         // Should return AfterCompleteExpression with indent 0
         match ctx {
@@ -2134,7 +2139,7 @@ mod tests {
         let position = Position { line: 1, character: 0 };
         
         // Should not panic, should return a valid context
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
         
         // The fallback should detect this as a complete expression
         match ctx {
@@ -3871,7 +3876,7 @@ mod tests {
             line: 3,
             character: 0,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens { opener_col, .. } => {
@@ -3892,7 +3897,7 @@ mod tests {
             line: 2,
             character: 0,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideBraces { opener_line, .. } => {
@@ -3912,7 +3917,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator {
@@ -3939,7 +3944,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator {
@@ -3963,7 +3968,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator {
@@ -3987,7 +3992,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator {
@@ -4012,7 +4017,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens {
@@ -4037,7 +4042,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens {
@@ -4062,7 +4067,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideBraces { opener_line, .. } => {
@@ -4081,7 +4086,7 @@ mod tests {
             line: 1,
             character: 0,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterCompleteExpression { .. } => {
@@ -4101,7 +4106,7 @@ mod tests {
             line: 2,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator {
@@ -4132,7 +4137,7 @@ mod tests {
             line: 2,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Delimiter-only line → treated as inside-parens
         match ctx {
@@ -4156,7 +4161,7 @@ mod tests {
             line: 2,
             character: 5,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // With more complete code, should detect InsideParens
         match ctx {
@@ -4182,7 +4187,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should still detect continuation operator despite comment
         match ctx {
@@ -4207,7 +4212,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator {
@@ -4231,7 +4236,7 @@ mod tests {
             line: 1,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideBraces { opener_line, .. } => {
@@ -4251,7 +4256,7 @@ mod tests {
             line: 3,
             character: 2,
         };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterCompleteExpression {
@@ -4417,7 +4422,7 @@ mod tests {
             let tree = parse_r_code(&code);
 
             // Detect context at cursor position
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Verify the innermost context is detected
             prop_assert!(
@@ -4446,7 +4451,7 @@ mod tests {
 
             // Cursor on line 1 (after pipe)
             let position = Position { line: 1, character: 2 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect pipe context, not parens context
             match ctx {
@@ -4483,7 +4488,7 @@ mod tests {
 
             // Cursor on line 2 (inside function call)
             let position = Position { line: 2, character: 4 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect parens context (innermost), not pipe context
             match ctx {
@@ -4520,7 +4525,7 @@ mod tests {
 
             // Cursor on line 1 (inside braces)
             let position = Position { line: 1, character: 2 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect brace context (innermost), not parens context
             match ctx {
@@ -4559,7 +4564,7 @@ mod tests {
 
             // Cursor on line 2 (after inner pipe)
             let position = Position { line: 2, character: 4 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect the innermost pipe context
             match ctx {
@@ -4592,7 +4597,7 @@ mod tests {
 
             // Cursor on line 1 (inside inner call)
             let position = Position { line: 1, character: 2 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect innermost parens context
             match ctx {
@@ -4625,7 +4630,7 @@ mod tests {
 
             // Cursor on line 2 (after pipe)
             let position = Position { line: 2, character: 4 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect pipe context, not brace context
             match ctx {
@@ -4659,7 +4664,7 @@ mod tests {
 
             // Cursor on line 2 (inside function call)
             let position = Position { line: 2, character: 4 };
-            let ctx = detect_context(&tree, &code, position);
+            let ctx = detect_context(&tree, &code, position, 2);
 
             // Should detect parens context, not brace context
             match ctx {
@@ -4688,7 +4693,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -4707,7 +4712,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 2, character: 4 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens { .. } => {
@@ -4726,7 +4731,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideBraces { .. } => {
@@ -4746,7 +4751,7 @@ mod tests {
 
         // Cursor after inner pipe
         let position = Position { line: 2, character: 4 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { .. } => {
@@ -4764,7 +4769,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -4784,7 +4789,7 @@ mod tests {
 
         // Cursor inside aes() call
         let position = Position { line: 2, character: 4 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens { .. } => {
@@ -4811,7 +4816,7 @@ mod tests {
 
         // Cursor on line 1 (empty line)
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator from line 0
         match ctx {
@@ -4830,7 +4835,7 @@ mod tests {
 
         // Cursor on line 1 (empty line)
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens
         match ctx {
@@ -4849,7 +4854,7 @@ mod tests {
 
         // Cursor on line 1 (empty line)
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces
         match ctx {
@@ -4872,7 +4877,7 @@ mod tests {
 
         // Cursor on line 1 (first empty line after pipe) - should detect continuation
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
@@ -4883,7 +4888,7 @@ mod tests {
 
         // Cursor on line 2 (second empty line) - previous line is empty, so no continuation detected
         let position2 = Position { line: 2, character: 0 };
-        let ctx2 = detect_context(&tree, code, position2);
+        let ctx2 = detect_context(&tree, code, position2, 2);
 
         // This is expected to be AfterCompleteExpression since line 1 is empty
         match ctx2 {
@@ -4906,7 +4911,7 @@ mod tests {
 
         // Cursor on line 1 (after the pipe with comment)
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator despite comment
         match ctx {
@@ -4925,7 +4930,7 @@ mod tests {
 
         // Cursor on line 1 (comment-only line)
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator from line 0
         match ctx {
@@ -4947,7 +4952,7 @@ mod tests {
 
         // Cursor on line 1 (comment line) - previous line has pipe
         let position1 = Position { line: 1, character: 2 };
-        let ctx1 = detect_context(&tree, code, position1);
+        let ctx1 = detect_context(&tree, code, position1, 2);
 
         match ctx1 {
             IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
@@ -4958,7 +4963,7 @@ mod tests {
 
         // Cursor on line 2 (after comment line) - previous line is comment, no operator
         let position2 = Position { line: 2, character: 2 };
-        let ctx2 = detect_context(&tree, code, position2);
+        let ctx2 = detect_context(&tree, code, position2, 2);
 
         // This is expected to be AfterCompleteExpression since line 1 is a comment
         match ctx2 {
@@ -4977,7 +4982,7 @@ mod tests {
 
         // Cursor on line 1
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator (hash in string is not a comment)
         match ctx {
@@ -4995,7 +5000,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5017,7 +5022,7 @@ mod tests {
 
         // Cursor on line 1 (EOF)
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator
         match ctx {
@@ -5036,7 +5041,7 @@ mod tests {
 
         // Cursor on line 1 (EOF)
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens
         match ctx {
@@ -5055,7 +5060,7 @@ mod tests {
 
         // Cursor on line 2 (EOF)
         let position = Position { line: 2, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces
         match ctx {
@@ -5073,7 +5078,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5090,7 +5095,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5112,7 +5117,7 @@ mod tests {
 
         // Cursor at end of line 0
         let position = Position { line: 0, character: 8 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully - either detect pipe context or complete expression
         // The important thing is it doesn't panic
@@ -5136,7 +5141,7 @@ mod tests {
 
         // Cursor at end of line 0
         let position = Position { line: 0, character: 7 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens (unclosed)
         match ctx {
@@ -5155,7 +5160,7 @@ mod tests {
 
         // Cursor at end of line 0
         let position = Position { line: 0, character: 8 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces (unclosed)
         match ctx {
@@ -5175,7 +5180,7 @@ mod tests {
 
         // Cursor at end of line 0
         let position = Position { line: 0, character: 7 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully without panicking
         // The exact context depends on how tree-sitter parses the error
@@ -5198,7 +5203,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully - detect some context without panicking
         match ctx {
@@ -5221,7 +5226,7 @@ mod tests {
 
         // Cursor on line 2 (inside inner call)
         let position = Position { line: 2, character: 4 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect innermost unclosed context (parens)
         match ctx {
@@ -5250,7 +5255,7 @@ mod tests {
 
         // Cursor inside empty parens
         let position = Position { line: 0, character: 5 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression (parens are closed)
         match ctx {
@@ -5272,7 +5277,7 @@ mod tests {
 
         // Cursor inside empty braces
         let position = Position { line: 0, character: 1 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression or inside braces
         match ctx {
@@ -5294,7 +5299,7 @@ mod tests {
 
         // Cursor at end of line
         let position = Position { line: 0, character: 15 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression (pipe chain is complete)
         match ctx {
@@ -5313,7 +5318,7 @@ mod tests {
 
         // Cursor on line 0 (empty line)
         let position = Position { line: 0, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression (nothing before cursor)
         match ctx {
@@ -5332,7 +5337,7 @@ mod tests {
 
         // Cursor on line 1 (whitespace-only line)
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator from line 0
         match ctx {
@@ -5351,7 +5356,7 @@ mod tests {
 
         // Cursor at column 0 on line 1
         let position = Position { line: 1, character: 0 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens { .. } => {
@@ -5372,7 +5377,7 @@ mod tests {
 
         // Cursor on last line
         let position = Position { line: 50, character: 2 };
-        let ctx = detect_context(&tree, &code, position);
+        let ctx = detect_context(&tree, &code, position, 2);
 
         // Should detect continuation operator with chain start at line 0
         match ctx {
@@ -5391,7 +5396,7 @@ mod tests {
 
         // Cursor on line 3 (after +)
         let position = Position { line: 3, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator with chain start at line 0
         match ctx {
@@ -5411,7 +5416,7 @@ mod tests {
 
         // Cursor at end of line 0
         let position = Position { line: 0, character: 4 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully - may detect as complete expression or inside parens
         // depending on how tree-sitter handles subset syntax
@@ -5434,7 +5439,7 @@ mod tests {
 
         // Cursor on line 3 (deepest level)
         let position = Position { line: 3, character: 6 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect some context without panicking
         match ctx {
@@ -5456,7 +5461,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5474,7 +5479,7 @@ mod tests {
 
         // Cursor on line 3 (after pipe)
         let position = Position { line: 3, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5491,7 +5496,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5508,7 +5513,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let position = Position { line: 1, character: 2 };
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
@@ -5531,7 +5536,7 @@ mod tests {
         let position = Position { line: 1, character: 0 };
 
         // Should not panic, should return a valid context using fallback
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // The fallback should detect the continuation operator on the previous line
         match ctx {
@@ -5553,7 +5558,7 @@ mod tests {
         let position = Position { line: 1, character: 0 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Any context is acceptable for incomplete code
         match ctx {
@@ -5571,7 +5576,7 @@ mod tests {
         let tree = parse_r_code(code);
         let position = Position { line: 1000, character: 0 };
 
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression with indent 0
         match ctx {
@@ -5591,7 +5596,7 @@ mod tests {
         let position = Position { line: 0, character: 100 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully
         match ctx {
@@ -5608,7 +5613,7 @@ mod tests {
         let position = Position { line: u32::MAX, character: u32::MAX };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression with indent 0
         match ctx {
@@ -5626,7 +5631,7 @@ mod tests {
         let tree = parse_r_code(code);
         let position = Position { line: 3, character: 0 };
 
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens
         match ctx {
@@ -5647,7 +5652,7 @@ mod tests {
         let tree = parse_r_code(code);
         let position = Position { line: 3, character: 0 };
 
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces
         match ctx {
@@ -5669,7 +5674,7 @@ mod tests {
         let position = Position { line: 0, character: 7 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Any context is acceptable for mismatched delimiters
         match ctx {
@@ -5688,7 +5693,7 @@ mod tests {
         let position = Position { line: 0, character: 10 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Any context is acceptable for mismatched delimiters
         match ctx {
@@ -5707,7 +5712,7 @@ mod tests {
         let position = Position { line: 2, character: 4 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Any context is acceptable for syntax error in nested structure
         match ctx {
@@ -5726,7 +5731,7 @@ mod tests {
         let tree = parse_r_code(code);
         let position = Position { line: 0, character: 0 };
 
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression with indent 0
         match ctx {
@@ -5745,7 +5750,7 @@ mod tests {
         let position = Position { line: 1, character: 0 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression
         match ctx {
@@ -5762,7 +5767,7 @@ mod tests {
         let position = Position { line: 2, character: 0 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression
         match ctx {
@@ -5779,7 +5784,7 @@ mod tests {
         let position = Position { line: 1, character: 2 };
 
         // Should not panic
-        let ctx = detect_context(&tree, code, position);
+        let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator context
         match ctx {
@@ -5798,7 +5803,7 @@ mod tests {
         let position = Position { line: 1, character: 2 };
 
         // Should not panic
-        let ctx = detect_context(&tree, &code, position);
+        let ctx = detect_context(&tree, &code, position, 2);
 
         // Should detect continuation operator context
         match ctx {
@@ -5822,7 +5827,7 @@ mod tests {
         let position = Position { line: 0, character: code.len() as u32 };
 
         // Should not panic
-        let ctx = detect_context(&tree, &code, position);
+        let ctx = detect_context(&tree, &code, position, 2);
 
         // Should detect inside parens or complete expression
         match ctx {
@@ -5859,7 +5864,7 @@ mod auto_close_tests {
         // VS Code auto-inserts `)`, user presses Enter → `func(\n)`
         let code = "x <- some_func(\n)";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 });
+        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 }, 2);
         assert!(matches!(ctx, IndentContext::InsideParens { .. }),
             "Auto-closed paren should be treated as InsideParens, got {:?}", ctx);
     }
@@ -5868,7 +5873,7 @@ mod auto_close_tests {
     fn unclosed_paren_gets_inside_parens_context() {
         let code = "x <- some_func(\n";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 });
+        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 }, 2);
         assert!(matches!(ctx, IndentContext::InsideParens { .. }),
             "Unclosed paren should be InsideParens, got {:?}", ctx);
     }
@@ -5879,12 +5884,12 @@ mod auto_close_tests {
 
         let code_auto = "x <- some_func(\n)";
         let tree_auto = parse_r(code_auto);
-        let ctx_auto = detect_context(&tree_auto, code_auto, Position { line: 1, character: 0 });
+        let ctx_auto = detect_context(&tree_auto, code_auto, Position { line: 1, character: 0 }, 2);
         let indent_auto = calculate_indentation(ctx_auto, config.clone(), code_auto);
 
         let code_open = "x <- some_func(\n";
         let tree_open = parse_r(code_open);
-        let ctx_open = detect_context(&tree_open, code_open, Position { line: 1, character: 0 });
+        let ctx_open = detect_context(&tree_open, code_open, Position { line: 1, character: 0 }, 2);
         let indent_open = calculate_indentation(ctx_open, config, code_open);
 
         assert_eq!(indent_auto, indent_open,
@@ -5896,7 +5901,7 @@ mod auto_close_tests {
         // The key user-reported scenario: content after opener should align
         let code = "if (TRUE) {\n  x <- some_func(\"file\",\n  )\n}";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 2, character: 0 });
+        let ctx = detect_context(&tree, code, Position { line: 2, character: 0 }, 2);
 
         match &ctx {
             IndentContext::InsideParens { opener_col, has_content_on_opener_line, .. } => {
@@ -5915,7 +5920,7 @@ mod auto_close_tests {
     fn auto_closed_brace_gets_inside_braces_context() {
         let code = "if (TRUE) {\n}";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 });
+        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 }, 2);
         assert!(matches!(ctx, IndentContext::InsideBraces { .. }),
             "Auto-closed brace should be treated as InsideBraces, got {:?}", ctx);
     }
@@ -5933,7 +5938,7 @@ mod auto_close_tests {
         let tree = parse_r(code);
 
         // Cursor at line 2 with nonzero character (matching previous line's indent)
-        let ctx = detect_context(&tree, code, Position { line: 2, character: 19 });
+        let ctx = detect_context(&tree, code, Position { line: 2, character: 19 }, 2);
         assert!(matches!(ctx, IndentContext::InsideParens { .. }),
             "Second Enter with auto-closed paren should be InsideParens, got {:?}", ctx);
 

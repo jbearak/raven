@@ -42,7 +42,7 @@ fn simulate_on_type_formatting(
 ) -> String {
     let tree = parse_r_code(code);
     let position = Position { line, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, config.tab_size);
     let target_column = calculate_indentation(context, config.clone(), code);
     let edit = format_indentation(line, target_column, config, code);
     edit.new_text
@@ -52,7 +52,7 @@ fn simulate_on_type_formatting(
 fn get_indentation_column(code: &str, line: u32, config: IndentationConfig) -> u32 {
     let tree = parse_r_code(code);
     let position = Position { line, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, config.tab_size);
     calculate_indentation(context, config, code)
 }
 
@@ -614,7 +614,7 @@ fn test_empty_file() {
     let code = "";
     let tree = parse_r_code(code);
     let position = Position { line: 0, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, 2);
     
     // Should return AfterCompleteExpression with indent 0
     match context {
@@ -659,7 +659,7 @@ fn test_textedit_replaces_existing_whitespace() {
     let code = "    existing_indent\n";
     let tree = parse_r_code(code);
     let position = Position { line: 0, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, 2);
     let target_column = calculate_indentation(context, rstudio_config(2), code);
     let edit = format_indentation(0, target_column, rstudio_config(2), code);
     
@@ -731,8 +731,8 @@ fn test_full_cycle_pipe_chain() {
     
     // Step 2: Detect context at line 1 (after the pipe)
     let position = Position { line: 1, character: 0 };
-    let context = detect_context(&tree, code, position);
-    
+    let context = detect_context(&tree, code, position, config.tab_size);
+
     // Step 3: Calculate indentation
     // "result <- data" — "data" at col 10, max(10, 0+2) = 10
     let target_column = calculate_indentation(context, config.clone(), code);
@@ -749,10 +749,10 @@ fn test_full_cycle_pipe_chain() {
 fn test_full_cycle_function_args_rstudio() {
     let code = "mutate(data,\n";
     let config = rstudio_config(2);
-    
+
     let tree = parse_r_code(code);
     let position = Position { line: 1, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, config.tab_size);
     
     match &context {
         IndentContext::InsideParens { has_content_on_opener_line, .. } => {
@@ -773,10 +773,10 @@ fn test_full_cycle_function_args_rstudio() {
 fn test_full_cycle_function_args_rstudio_minus() {
     let code = "mutate(data,\n";
     let config = rstudio_minus_config(2);
-    
+
     let tree = parse_r_code(code);
     let position = Position { line: 1, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, config.tab_size);
     
     let target_column = calculate_indentation(context, config.clone(), code);
     // RStudio-minus: line indent (0) + tab_size (2) = 2
@@ -792,10 +792,10 @@ fn test_full_cycle_closing_delimiter() {
   arg1
 )"#;
     let config = rstudio_config(2);
-    
+
     let tree = parse_r_code(code);
     let position = Position { line: 2, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, config.tab_size);
     
     // With cursor at character 0, auto-close heuristic kicks in:
     // the line has only ")" so we treat it as inside-parens
@@ -817,10 +817,10 @@ fn test_full_cycle_closing_delimiter() {
 fn test_full_cycle_brace_block() {
     let code = "if (TRUE) {\n";
     let config = rstudio_config(4);
-    
+
     let tree = parse_r_code(code);
     let position = Position { line: 1, character: 0 };
-    let context = detect_context(&tree, code, position);
+    let context = detect_context(&tree, code, position, config.tab_size);
     
     match &context {
         IndentContext::InsideBraces { .. } => {}
