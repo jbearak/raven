@@ -459,7 +459,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position) -> IndentCo
     // 1. Check if current line starts with closing delimiter
     if let Some(ctx) = detect_closing_delimiter(source, position) {
         // Find the matching opener using AST
-        if let Some(ctx) = find_matching_opener_context(tree, source, &ctx) {
+        if let Some(ctx) = find_matching_opener_context(tree, source, &ctx, position) {
             return ctx;
         }
         // If no matching opener found, use the fallback context with heuristic
@@ -1003,6 +1003,7 @@ fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentCo
 /// * `tree` - The tree-sitter parse tree
 /// * `source` - The source code text
 /// * `ctx` - The closing delimiter context with placeholder opener position
+/// * `position` - The cursor position (used to identify the closing delimiter line)
 ///
 /// # Returns
 ///
@@ -1012,43 +1013,34 @@ fn find_matching_opener_context(
     tree: &Tree,
     source: &str,
     ctx: &IndentContext,
+    position: Position,
 ) -> Option<IndentContext> {
     let IndentContext::ClosingDelimiter { delimiter, .. } = ctx else {
         return None;
     };
 
-    // Find the position of the closing delimiter on the current line
-    let lines: Vec<&str> = source.lines().collect();
-
-    // We need to find which line has the closing delimiter
-    // Since we're called from detect_context, we need to search for it
-    for (line_idx, line_text) in lines.iter().enumerate() {
-        let trimmed = line_text.trim_start();
-        if trimmed.starts_with(*delimiter) {
-            let col = line_text.len() - trimmed.len();
-            let point = tree_sitter::Point {
-                row: line_idx,
-                column: col,
-            };
-
-            // Get the node at the closing delimiter position
-            if let Some(node) = tree.root_node().descendant_for_point_range(point, point) {
-                // Walk up to find the enclosing structure
-                if let Some((opener_line, opener_col)) =
-                    find_opener_position(node, *delimiter, source)
-                {
-                    return Some(IndentContext::ClosingDelimiter {
-                        opener_line,
-                        opener_col,
-                        delimiter: *delimiter,
-                    });
-                }
-            }
-            break;
-        }
+    // Use the cursor line directly — we already know it starts with a closing delimiter
+    let line_text = source.lines().nth(position.line as usize)?;
+    let trimmed = line_text.trim_start();
+    if !trimmed.starts_with(*delimiter) {
+        return None;
     }
 
-    None
+    let col = line_text.len() - trimmed.len();
+    let point = tree_sitter::Point {
+        row: position.line as usize,
+        column: col,
+    };
+
+    // Get the node at the closing delimiter position and walk up to find the opener
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    let (opener_line, opener_col) = find_opener_position(node, *delimiter, source)?;
+
+    Some(IndentContext::ClosingDelimiter {
+        opener_line,
+        opener_col,
+        delimiter: *delimiter,
+    })
 }
 
 /// Finds the position of the opening delimiter that matches a closing delimiter.
