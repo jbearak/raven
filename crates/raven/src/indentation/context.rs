@@ -587,35 +587,10 @@ fn is_position_valid(source: &str, position: Position) -> bool {
 /// # Returns
 ///
 /// `true` if fallback detection should be used, `false` otherwise.
-fn should_use_fallback(root: Node, _source: &str, position: Position) -> bool {
-    // Check if there's an error node at or near the cursor position
-    let point = tree_sitter::Point {
-        row: position.line as usize,
-        column: position.character as usize,
-    };
-
-    // Get the node at cursor position
-    if let Some(node) = root.descendant_for_point_range(point, point) {
-        // Check if this node or any ancestor is an error
-        let mut current = node;
-        loop {
-            if current.is_error() {
-                return true;
-            }
-            match current.parent() {
-                Some(parent) => current = parent,
-                None => break,
-            }
-        }
-    }
-
-    // Also check the previous line for errors (since we often indent based on it)
-    if position.line > 0 {
-        let prev_point = tree_sitter::Point {
-            row: (position.line - 1) as usize,
-            column: 0,
-        };
-        if let Some(node) = root.descendant_for_point_range(prev_point, prev_point) {
+fn should_use_fallback(root: Node, source: &str, position: Position) -> bool {
+    // Helper: check if any ancestor of the node at `point` is an ERROR node
+    let has_error_at = |point: tree_sitter::Point| -> bool {
+        if let Some(node) = root.descendant_for_point_range(point, point) {
             let mut current = node;
             loop {
                 if current.is_error() {
@@ -624,6 +599,43 @@ fn should_use_fallback(root: Node, _source: &str, position: Position) -> bool {
                 match current.parent() {
                     Some(parent) => current = parent,
                     None => break,
+                }
+            }
+        }
+        false
+    };
+
+    // Check cursor position
+    let point = tree_sitter::Point {
+        row: position.line as usize,
+        column: position.character as usize,
+    };
+    if has_error_at(point) {
+        return true;
+    }
+
+    // Check the previous line for errors (since we often indent based on it).
+    // Check both the start AND end of the line — an ERROR node may begin
+    // mid-line (e.g., `z(x = f(1,` where `z` is valid but `(x = f(1,` is ERROR).
+    if position.line > 0 {
+        let prev_row = (position.line - 1) as usize;
+        let prev_start = tree_sitter::Point {
+            row: prev_row,
+            column: 0,
+        };
+        if has_error_at(prev_start) {
+            return true;
+        }
+
+        if let Some(prev_line_text) = source.lines().nth(prev_row) {
+            if !prev_line_text.is_empty() {
+                let end_col = prev_line_text.len().saturating_sub(1);
+                let prev_end = tree_sitter::Point {
+                    row: prev_row,
+                    column: end_col,
+                };
+                if has_error_at(prev_end) {
+                    return true;
                 }
             }
         }
@@ -963,7 +975,9 @@ fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentCo
         // the previous line's indentation — either way, a delimiter-only line
         // after Enter means we're inserting content, not aligning the delimiter.
         let after_delimiter = trimmed[first_char.len_utf8()..].trim();
-        if after_delimiter.is_empty() {
+        if after_delimiter.is_empty()
+            || after_delimiter.chars().all(|c| matches!(c, ')' | ']' | '}'))
+        {
             return None;
         }
 
@@ -1383,6 +1397,8 @@ fn find_unclosed_arguments_at_position<'a>(
     position: Position,
     source: &str,
 ) -> Option<Node<'a>> {
+    let mut result: Option<Node<'a>> = None;
+
     // Check if this node is an arguments node
     if node.kind() == "arguments" {
         let start = node.start_position();
@@ -1403,13 +1419,13 @@ fn find_unclosed_arguments_at_position<'a>(
             let has_missing_close = has_missing_child(node);
 
             if cursor_before_end || has_missing_close {
-                return Some(node);
+                // Store as candidate but keep recursing to find innermost
+                result = Some(node);
             }
         }
     }
 
     // Recursively check children, looking for the innermost match
-    let mut result: Option<Node<'a>> = None;
     let mut cursor = node.walk();
 
     if cursor.goto_first_child() {
@@ -1518,6 +1534,8 @@ fn find_unclosed_braces_at_position<'a>(
     position: Position,
     _source: &str,
 ) -> Option<Node<'a>> {
+    let mut result: Option<Node<'a>> = None;
+
     // Check if this node is a braced_expression node
     if node.kind() == "braced_expression" {
         let start = node.start_position();
@@ -1538,13 +1556,13 @@ fn find_unclosed_braces_at_position<'a>(
             let has_missing_close = has_missing_child(node);
 
             if cursor_before_end || has_missing_close {
-                return Some(node);
+                // Store as candidate but keep recursing to find innermost
+                result = Some(node);
             }
         }
     }
 
     // Recursively check children, looking for the innermost match
-    let mut result: Option<Node<'a>> = None;
     let mut cursor = node.walk();
 
     if cursor.goto_first_child() {

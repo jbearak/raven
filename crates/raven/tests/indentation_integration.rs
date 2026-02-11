@@ -1146,10 +1146,10 @@ fn test_nested_anonymous_functions() {
   })
 })
 "#;
-    // Line 2 is inside the inner function body - the sapply call
+    // Line 2 is inside the inner function body (function(y) { ... })
+    // The inner { is on line 1 which has indent 2, so body indent = 2 + tab_size = 4
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
-    // Inside the outer function body, so should be at indent 2
-    assert_eq!(col_2, 2, "Inner function call should be at outer function body indent");
+    assert_eq!(col_2, 4, "Inner function body should indent from inner brace line");
 }
 
 // ----------------------------------------------------------------------------
@@ -1367,4 +1367,28 @@ fn test_native_and_magrittr_pipe_mixed() {
 
     assert_eq!(col_2, 10, "Magrittr pipe after native should align to RHS");
     assert_eq!(col_3, 10, "Native pipe after magrittr should align to RHS");
+}
+
+#[test]
+fn test_nested_parens_in_pipe_chain() {
+    // When typing inside nested parens within a pipe chain,
+    // align with the first argument of the inner function call
+    let code = "x <- f() |>\n     z(x = f(1,\n";
+    let column = get_indentation_column(code, 2, rstudio_config(4));
+    // f( is at col 12 on line 1, with content "1," after it
+    // RStudio style: align to col 13 (opener_col + 1)
+    assert_eq!(column, 13);
+}
+
+#[test]
+fn test_nested_parens_in_pipe_chain_with_autoclose() {
+    // VS Code auto-closing pairs push )) to the next line when Enter is pressed
+    // The document looks like:
+    //   x <- f() |>
+    //        z(x = f(1,
+    //   ))
+    // We want line 2 to get col 13 (align with "1"), not col 0
+    let code = "x <- f() |>\n     z(x = f(1,\n))\n";
+    let column = get_indentation_column(code, 2, rstudio_config(4));
+    assert_eq!(column, 13, "Should align inside f() to where '1' is, even with auto-closed parens");
 }
