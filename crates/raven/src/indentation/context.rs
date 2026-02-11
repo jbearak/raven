@@ -1085,22 +1085,69 @@ fn find_opener_position(node: Node, delimiter: char, _source: &str) -> Option<(u
     }
 }
 
-/// Finds the pipe chain start position using AST analysis.
+/// Returns the continuation operator class for a `binary_operator` node.
 ///
-/// For pipe operators (`|>`, `%>%`), walks up through parent `binary_operator`
-/// nodes to find the outermost pipe expression, then determines the start
-/// column of the pipe expression (RHS of assignment if present).
+/// Classes:
+/// - 0: Pipe (`|>`, `%>%`)
+/// - 1: Plus (`+`)
+/// - 2: Tilde (`~`)
+/// - 3: Infix (other `%word%` operators)
+/// - None: no continuation operator found (e.g., `*`, `/`, `>`)
+fn continuation_class_of_binop(binop: &tree_sitter::Node, source: &str) -> Option<u8> {
+    for i in 0..binop.child_count() {
+        if let Some(child) = binop.child(i) {
+            match child.kind() {
+                "|>" => return Some(0),
+                "+" => return Some(1),
+                "~" => return Some(2),
+                "special" => {
+                    let text = &source[child.byte_range()];
+                    if text == "%>%" {
+                        return Some(0);
+                    } else {
+                        return Some(3);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Checks if a chain has mixed operator classes by drilling down through the LHS.
 ///
-/// # Arguments
+/// For example, `(data %>% ggplot()) + geom_point()` is mixed because the `+`
+/// chain's LHS contains a `%>%` chain (different operator class).
+fn is_mixed_chain(binop: tree_sitter::Node, our_class: u8, source: &str) -> bool {
+    let mut current = binop;
+    loop {
+        let lhs = match current.child(0) {
+            Some(lhs) if lhs.kind() == "binary_operator" => lhs,
+            _ => return false, // LHS is not a binary_operator — not mixed
+        };
+
+        match continuation_class_of_binop(&lhs, source) {
+            Some(class) if class == our_class => {
+                // Same class, keep drilling down
+                current = lhs;
+            }
+            Some(_) => return true, // Different continuation class → mixed
+            None => return false,   // Non-continuation operator (*, /, etc.) → not mixed
+        }
+    }
+}
+
+/// Finds the continuation chain start position using AST analysis.
 ///
-/// * `tree` - The tree-sitter parse tree
-/// * `source` - The source code text
-/// * `prev_line` - The line containing the pipe operator
+/// For continuation operators (`|>`, `%>%`, `+`, `~`, `%word%`), walks up
+/// through parent `binary_operator` nodes of the same operator class to find
+/// the outermost chained expression, then determines the start column
+/// (RHS of assignment if present).
 ///
-/// # Returns
-///
-/// `Some((line, col))` of the pipe chain start, or `None` if AST lookup fails.
-fn find_pipe_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Option<(u32, u32)> {
+/// Returns `None` for mixed-operator chains (e.g., `%>%` feeding into `+`),
+/// falling back to text-based heuristics.
+fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Option<(u32, u32)> {
     let root = tree.root_node();
 
     // Find the end of the actual code on prev_line (before comments/whitespace)
@@ -1117,8 +1164,8 @@ fn find_pipe_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> 
     // Get the node at the operator position
     let node = root.descendant_for_point_range(point, point)?;
 
-    // Verify this is actually a pipe operator or its parent is a binary_operator
-    let pipe_binop = if node.kind() == "|>" || node.kind() == "special" {
+    // Verify this is a continuation operator or its parent is a binary_operator
+    let chain_binop = if matches!(node.kind(), "|>" | "+" | "~" | "special") {
         // Direct hit on operator node - parent should be binary_operator
         node.parent()
             .filter(|p| p.kind() == "binary_operator")?
@@ -1134,51 +1181,48 @@ fn find_pipe_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> 
         }
     };
 
-    // Walk up through parent binary_operator nodes that contain pipe operators
-    let mut outermost = pipe_binop;
-    let mut current = pipe_binop;
+    // Determine our operator class
+    let our_class = continuation_class_of_binop(&chain_binop, source)?;
+
+    // Check for mixed chain (e.g., %>% piping into + layers).
+    // If the LHS ultimately contains a different-class continuation operator,
+    // fall back to text-based heuristics which handle mixed chains better.
+    if is_mixed_chain(chain_binop, our_class, source) {
+        return None;
+    }
+
+    // Walk up through parent binary_operators with the SAME operator class.
+    // Stop at different-class operators or non-binary-operator parents.
+    let mut outermost = chain_binop;
+    let mut current = chain_binop;
     while let Some(parent) = current.parent() {
         if parent.kind() == "binary_operator" {
-            // Check if this parent contains a pipe operator child
-            let has_pipe = (0..parent.child_count()).any(|i| {
-                parent.child(i).map_or(false, |child| {
-                    if child.kind() == "|>" {
-                        true
-                    } else if child.kind() == "special" {
-                        let text = &source[child.byte_range()];
-                        text == "%>%"
-                    } else {
-                        false
-                    }
-                })
-            });
-            if has_pipe {
-                outermost = parent;
-                current = parent;
-            } else {
-                break;
+            match continuation_class_of_binop(&parent, source) {
+                Some(class) if class == our_class => {
+                    outermost = parent;
+                    current = parent;
+                }
+                _ => break,
             }
         } else {
             break;
         }
     }
 
-    // Now check if the outermost pipe binary_operator's parent is an assignment
-    // If so, the chain start is the RHS of the assignment (= start of the pipe expression)
+    // Now check if the outermost binary_operator's parent is an assignment
+    // If so, the chain start is the RHS of the assignment (= start of the expression)
     if let Some(parent) = outermost.parent() {
         let parent_kind = parent.kind();
         if parent_kind == "left_assignment"
             || parent_kind == "equals_assignment"
             || parent_kind == "right_assignment"
         {
-            // The outermost pipe expr IS the RHS of the assignment.
-            // Return its start position as chain start.
             let start = outermost.start_position();
             return Some((start.row as u32, start.column as u32));
         }
     }
 
-    // No assignment parent — standalone pipe chain. Return outermost start.
+    // No assignment parent — standalone chain. Return outermost start.
     let start = outermost.start_position();
     Some((start.row as u32, start.column as u32))
 }
@@ -1235,19 +1279,12 @@ fn detect_continuation_operator(
         None
     }?;
 
-    // For pipe operators, try AST-based chain start detection first
+    // Try AST-based chain start detection first, fall back to text-based heuristic
     let (chain_start_line, chain_start_col) =
-        if matches!(operator_type, OperatorType::Pipe | OperatorType::MagrittrPipe) {
-            find_pipe_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
-                // Fallback to text-based heuristic
-                let walker = ChainWalker::new(tree, source);
-                walker.find_chain_start(position)
-            })
-        } else {
-            // Non-pipe operators: use existing ChainWalker
+        find_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
             let walker = ChainWalker::new(tree, source);
             walker.find_chain_start(position)
-        };
+        });
 
     Some(IndentContext::AfterContinuationOperator {
         chain_start_line,

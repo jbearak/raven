@@ -3,7 +3,7 @@
 //! This module computes the correct indentation amount based on the
 //! detected context and user configuration (tab size, style preference).
 
-use super::context::{IndentContext, OperatorType};
+use super::context::IndentContext;
 
 /// Configuration for indentation calculation.
 #[derive(Debug, Clone, PartialEq)]
@@ -64,18 +64,12 @@ pub fn calculate_indentation(
         IndentContext::AfterContinuationOperator {
             chain_start_line,
             chain_start_col,
-            operator_type,
+            operator_type: _,
         } => {
-            // Pipe/magrittr pipe: align to RHS of assignment (chain_start_col)
+            // Align to chain start column (RHS of assignment if present)
             // but ensure at least one tab_size indent from the line start.
-            // Non-pipe operators (+, ~, %word%): indent from chain start + tab_size.
-            match operator_type {
-                OperatorType::Pipe | OperatorType::MagrittrPipe => {
-                    let line_indent = get_line_indent(source, chain_start_line);
-                    std::cmp::max(chain_start_col, line_indent + config.tab_size)
-                }
-                _ => chain_start_col + config.tab_size,
-            }
+            let line_indent = get_line_indent(source, chain_start_line);
+            std::cmp::max(chain_start_col, line_indent + config.tab_size)
         }
         IndentContext::InsideParens {
             opener_line,
@@ -276,7 +270,7 @@ mod tests {
             style: IndentationStyle::RStudio,
         };
 
-        // Non-pipe (+) chain start at col 4: chain_start_col + tab_size = 8
+        // Plus chain start at col 4, no line indent: max(4, 0+4) = 4
         let context = IndentContext::AfterContinuationOperator {
             chain_start_line: 0,
             chain_start_col: 4,
@@ -284,7 +278,7 @@ mod tests {
         };
 
         let indent = calculate_indentation(context, config, "");
-        assert_eq!(indent, 8);
+        assert_eq!(indent, 4);
     }
 
     #[test]
@@ -326,30 +320,35 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_vs_non_pipe_different_indent_with_offset() {
+    fn test_all_operators_same_indent_with_offset() {
         use super::super::context::OperatorType;
 
-        // Pipe at col 5 (RHS of assignment): max(5, 0+2) = 5
+        // All operators at col 5 (RHS of assignment): max(5, 0+2) = 5
         let config = IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
             style: IndentationStyle::RStudio,
         };
 
-        let pipe_ctx = IndentContext::AfterContinuationOperator {
-            chain_start_line: 0,
-            chain_start_col: 5,
-            operator_type: OperatorType::Pipe,
-        };
-        assert_eq!(calculate_indentation(pipe_ctx, config.clone(), ""), 5);
-
-        // Plus at col 5: 5 + 2 = 7
-        let plus_ctx = IndentContext::AfterContinuationOperator {
-            chain_start_line: 0,
-            chain_start_col: 5,
-            operator_type: OperatorType::Plus,
-        };
-        assert_eq!(calculate_indentation(plus_ctx, config, ""), 7);
+        for op in [
+            OperatorType::Pipe,
+            OperatorType::MagrittrPipe,
+            OperatorType::Plus,
+            OperatorType::Tilde,
+            OperatorType::CustomInfix,
+        ] {
+            let ctx = IndentContext::AfterContinuationOperator {
+                chain_start_line: 0,
+                chain_start_col: 5,
+                operator_type: op,
+            };
+            assert_eq!(
+                calculate_indentation(ctx, config.clone(), ""),
+                5,
+                "Operator {:?} at col 5 should produce indent 5",
+                op
+            );
+        }
     }
 
     #[test]
@@ -985,7 +984,7 @@ mod tests {
     fn test_edge_case_chain_start_at_column_100_plus() {
         use super::super::context::OperatorType;
 
-        // Non-pipe chain start at column 100+: 100 + 2 = 102
+        // Plus chain start at column 100, no line indent: max(100, 0+2) = 100
         let config = IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
@@ -999,7 +998,7 @@ mod tests {
         };
 
         let indent = calculate_indentation(context, config, "");
-        assert_eq!(indent, 102); // 100 + 2 = 102
+        assert_eq!(indent, 100); // max(100, 0+2) = 100
     }
 
     #[test]
@@ -1388,7 +1387,8 @@ mod tests {
         }
 
         // Feature: r-smart-indentation, Property 2b: Non-Pipe Chain Indentation Calculation
-        // For non-pipe operators (+, ~, %word%), indentation = chain_start_col + tab_size.
+        // For non-pipe operators (+, ~, %word%), indentation = max(chain_start_col, line_indent + tab_size).
+        // With source="" and chain_start_line=0, line_indent=0, so indent = max(C, T).
         // **Validates: Requirements 3.2**
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
@@ -1427,13 +1427,15 @@ mod tests {
 
                 let indent = calculate_indentation(context, config, "");
 
+                // Property: indent = max(chain_start_col, 0 + tab_size)
+                let expected = std::cmp::max(chain_start_col, tab_size);
                 prop_assert_eq!(
                     indent,
-                    chain_start_col + tab_size,
+                    expected,
                     "For non-pipe chain_start_col={}, tab_size={}, expected indent={}, got={}",
                     chain_start_col,
                     tab_size,
-                    chain_start_col + tab_size,
+                    expected,
                     indent
                 );
             }
@@ -1533,7 +1535,7 @@ mod tests {
                     indentations.push((i, indent));
                 }
 
-                let expected_indent = chain_start_col + tab_size;
+                let expected_indent = std::cmp::max(chain_start_col, tab_size);
                 for (line_idx, indent) in &indentations {
                     prop_assert_eq!(
                         *indent,

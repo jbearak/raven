@@ -24,17 +24,17 @@ pub use formatter::format_indentation;
 
 /// Returns the LSP capability options for on-type formatting.
 ///
-/// This registers the newline character (`\n`) as the trigger for on-type formatting,
-/// enabling AST-aware indentation when the user presses Enter.
-///
-/// # Requirements
-///
-/// Validates: Requirement 8.1 - Register `textDocument/onTypeFormatting` capability
-/// with trigger character `"\n"`.
+/// Registers trigger characters:
+/// - `\n` — AST-aware indentation when the user presses Enter
+/// - `)`, `]`, `}` — auto-close duplicate delimiter removal
 pub fn on_type_formatting_capability() -> DocumentOnTypeFormattingOptions {
     DocumentOnTypeFormattingOptions {
         first_trigger_character: "\n".to_string(),
-        more_trigger_character: None,
+        more_trigger_character: Some(vec![
+            ")".to_string(),
+            "]".to_string(),
+            "}".to_string(),
+        ]),
     }
 }
 
@@ -43,25 +43,19 @@ pub fn on_type_formatting_capability() -> DocumentOnTypeFormattingOptions {
 mod tests {
     use super::on_type_formatting_capability;
 
-    /// Test that server capabilities include onTypeFormatting with trigger "\n".
-    ///
-    /// **Validates: Requirement 8.1** - Register `textDocument/onTypeFormatting`
-    /// capability with trigger character `"\n"`.
     #[test]
     fn test_on_type_formatting_capability_registration() {
         let capability = on_type_formatting_capability();
 
-        // Verify first_trigger_character is "\n"
         assert_eq!(
             capability.first_trigger_character, "\n",
             "first_trigger_character should be newline"
         );
 
-        // Verify more_trigger_character is None
-        assert_eq!(
-            capability.more_trigger_character, None,
-            "more_trigger_character should be None"
-        );
+        let more = capability.more_trigger_character.expect("should have more triggers");
+        assert!(more.contains(&")".to_string()), "should trigger on )");
+        assert!(more.contains(&"]".to_string()), "should trigger on ]");
+        assert!(more.contains(&"}".to_string()), "should trigger on }}");
     }
 }
 

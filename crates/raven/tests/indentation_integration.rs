@@ -166,10 +166,10 @@ fn test_ggplot_plus_operator_chain() {
 
 #[test]
 fn test_formula_tilde_operator() {
-    // Formula with ~ operator
+    // Formula with ~ operator: `y` starts at col 9, align continuation there
     let code = "model <- y ~\n";
-    let indent = simulate_on_type_formatting(code, 1, rstudio_config(2));
-    assert_eq!(indent, "  ", "Formula ~ operator should indent continuation");
+    let column = get_indentation_column(code, 1, rstudio_config(2));
+    assert_eq!(column, 9, "Formula ~ operator after assignment should align to RHS");
 }
 
 // ============================================================================

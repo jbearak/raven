@@ -2761,8 +2761,8 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentOnTypeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
-        // Only handle newline triggers
-        if params.ch != "\n" {
+        // Only handle registered trigger characters
+        if params.ch != "\n" && !matches!(params.ch.as_str(), ")" | "]" | "}") {
             return Ok(None);
         }
 
@@ -2789,6 +2789,56 @@ impl LanguageServer for Backend {
 
         let source = doc.text();
         let position = params.text_document_position.position;
+
+        // Handle closing delimiter triggers: detect and remove auto-close duplicates.
+        // When VS Code auto-closes `(` → `()` and the user later types `)` after
+        // Enter pushed the auto-closed `)` to a new line, the over-type mechanism
+        // fails and a duplicate `)` is inserted. We detect this via tree-sitter:
+        // if the character at the cursor position is the same delimiter and it
+        // sits inside an ERROR node (unmatched bracket), we delete the duplicate.
+        if matches!(params.ch.as_str(), ")" | "]" | "}") {
+            if let Some(line_text) = source.lines().nth(position.line as usize) {
+                let col = position.character as usize;
+                if col < line_text.len() {
+                    let next_byte = line_text.as_bytes()[col];
+                    let typed_byte = params.ch.as_bytes()[0];
+                    if next_byte == typed_byte {
+                        // Potential duplicate — check if the next delimiter is
+                        // inside an ERROR node (unmatched bracket).
+                        let point = tree_sitter::Point::new(position.line as usize, col);
+                        if let Some(node) =
+                            tree.root_node().descendant_for_point_range(point, point)
+                        {
+                            let is_error = node.is_error()
+                                || node.parent().map_or(false, |p| p.is_error());
+                            if is_error {
+                                log::info!(
+                                    "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
+                                    params.ch,
+                                    position.line,
+                                    col
+                                );
+                                return Ok(Some(vec![TextEdit {
+                                    range: tower_lsp::lsp_types::Range {
+                                        start: Position {
+                                            line: position.line,
+                                            character: col as u32,
+                                        },
+                                        end: Position {
+                                            line: position.line,
+                                            character: (col + 1) as u32,
+                                        },
+                                    },
+                                    new_text: String::new(),
+                                }]));
+                            }
+                        }
+                    }
+                }
+            }
+            // No duplicate detected — no edits needed for delimiter triggers
+            return Ok(None);
+        }
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
         // Guard against tab_size of 0 (use 1 as minimum)

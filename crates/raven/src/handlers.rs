@@ -500,12 +500,17 @@ impl<'a> SymbolExtractor<'a> {
         lhs: tree_sitter::Node<'a>,
         rhs: tree_sitter::Node<'a>,
     ) -> Option<RawSymbol> {
-        // LHS must be an identifier
-        if lhs.kind() != "identifier" {
+        // LHS must be an identifier (and not a MISSING node with empty text)
+        if lhs.kind() != "identifier" || lhs.is_missing() {
             return None;
         }
 
         let name = node_text(lhs, self.text).to_string();
+
+        // Skip empty names (defensive: MISSING nodes may slip through)
+        if name.is_empty() {
+            return None;
+        }
 
         // Skip reserved words
         if crate::reserved_words::is_reserved_word(&name) {
@@ -546,12 +551,17 @@ impl<'a> SymbolExtractor<'a> {
         lhs: tree_sitter::Node<'a>,
         rhs: tree_sitter::Node<'a>,
     ) -> Option<RawSymbol> {
-        // RHS must be an identifier (the name being assigned)
-        if rhs.kind() != "identifier" {
+        // RHS must be an identifier (and not a MISSING node with empty text)
+        if rhs.kind() != "identifier" || rhs.is_missing() {
             return None;
         }
 
         let name = node_text(rhs, self.text).to_string();
+
+        // Skip empty names (defensive: MISSING nodes may slip through)
+        if name.is_empty() {
+            return None;
+        }
 
         // Skip reserved words
         if crate::reserved_words::is_reserved_word(&name) {
