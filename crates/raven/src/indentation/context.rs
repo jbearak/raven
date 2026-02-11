@@ -1162,25 +1162,30 @@ fn continuation_class_of_binop(binop: &tree_sitter::Node, source: &str) -> Optio
     None
 }
 
-/// Checks if a chain has mixed operator classes by drilling down through the LHS.
+/// Finds the start position of the current operator sub-chain within a mixed chain.
 ///
-/// For example, `(data %>% ggplot()) + geom_point()` is mixed because the `+`
-/// chain's LHS contains a `%>%` chain (different operator class).
-fn is_mixed_chain(binop: tree_sitter::Node, our_class: u8, source: &str) -> bool {
-    let mut current = binop;
+/// Drills into the LHS spine of `outermost` (the outermost same-class binary_operator).
+/// When it hits a different operator class, returns the RHS of that boundary node —
+/// the first operand of the current sub-chain. Returns `Some(col)` when a
+/// cross-class boundary is found, `None` for single-class chains.
+fn find_subchain_start(
+    outermost: tree_sitter::Node,
+    target_class: u8,
+    source: &str,
+) -> Option<u32> {
+    let mut current = outermost;
     loop {
-        let lhs = match current.child(0) {
-            Some(lhs) if lhs.kind() == "binary_operator" => lhs,
-            _ => return false, // LHS is not a binary_operator — not mixed
-        };
-
+        let lhs = current.child(0)?;
+        if lhs.kind() != "binary_operator" {
+            return None;
+        }
         match continuation_class_of_binop(&lhs, source) {
-            Some(class) if class == our_class => {
-                // Same class, keep drilling down
-                current = lhs;
+            Some(class) if class == target_class => current = lhs,
+            _ => {
+                // Cross-class boundary: sub-chain starts at RHS of this node.
+                let rhs = lhs.child(2)?;
+                return Some(rhs.start_position().column as u32);
             }
-            Some(_) => return true, // Different continuation class → mixed
-            None => return false,   // Non-continuation operator (*, /, etc.) → not mixed
         }
     }
 }
@@ -1189,11 +1194,9 @@ fn is_mixed_chain(binop: tree_sitter::Node, our_class: u8, source: &str) -> bool
 ///
 /// For continuation operators (`|>`, `%>%`, `+`, `~`, `%word%`), walks up
 /// through parent `binary_operator` nodes of the same operator class to find
-/// the outermost chained expression, then determines the start column
-/// (RHS of assignment if present).
-///
-/// Returns `None` for mixed-operator chains (e.g., `%>%` feeding into `+`),
-/// falling back to text-based heuristics.
+/// the outermost chained expression, then uses `find_subchain_start` to locate
+/// the first operand of the current operator sub-chain (handling mixed chains
+/// where different operator classes meet).
 fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Option<(u32, u32)> {
     let root = tree.root_node();
 
@@ -1205,7 +1208,10 @@ fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Optio
         return None;
     }
 
-    let trimmed_end_col = trimmed.len().saturating_sub(1);
+    // Account for leading whitespace when computing the column
+    let leading_ws = line_text.len() - line_text.trim_start().len();
+    let content_len = trimmed.trim_start().len();
+    let trimmed_end_col = leading_ws + content_len.saturating_sub(1);
     let point = tree_sitter::Point::new(prev_line as usize, trimmed_end_col);
 
     // Get the node at the operator position
@@ -1231,13 +1237,6 @@ fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Optio
     // Determine our operator class
     let our_class = continuation_class_of_binop(&chain_binop, source)?;
 
-    // Check for mixed chain (e.g., %>% piping into + layers).
-    // If the LHS ultimately contains a different-class continuation operator,
-    // fall back to text-based heuristics which handle mixed chains better.
-    if is_mixed_chain(chain_binop, our_class, source) {
-        return None;
-    }
-
     // Walk up through parent binary_operators with the SAME operator class.
     // Stop at different-class operators or non-binary-operator parents.
     let mut outermost = chain_binop;
@@ -1256,22 +1255,15 @@ fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Optio
         }
     }
 
-    // Now check if the outermost binary_operator's parent is an assignment
-    // If so, the chain start is the RHS of the assignment (= start of the expression)
-    if let Some(parent) = outermost.parent() {
-        let parent_kind = parent.kind();
-        if parent_kind == "left_assignment"
-            || parent_kind == "equals_assignment"
-            || parent_kind == "right_assignment"
-        {
-            let start = outermost.start_position();
-            return Some((start.row as u32, start.column as u32));
-        }
-    }
-
-    // No assignment parent — standalone chain. Return outermost start.
+    // For mixed chains, find_subchain_start returns the sub-chain's first
+    // operand column. Use outermost's start line (which has the expression
+    // root's indent level) so the calculator formula produces correct results.
+    // For single-class chains, use outermost's start position directly.
     let start = outermost.start_position();
-    Some((start.row as u32, start.column as u32))
+    match find_subchain_start(outermost, our_class, source) {
+        Some(sub_col) => Some((start.row as u32, sub_col)),
+        None => Some((start.row as u32, start.column as u32)),
+    }
 }
 
 /// Detects if the previous line ends with a continuation operator.
@@ -5439,13 +5431,38 @@ mod tests {
         let position = Position { line: 3, character: 2 };
         let ctx = detect_context(&tree, code, position, 2);
 
-        // Should detect continuation operator with chain start at line 0
+        // Should detect continuation operator with sub-chain start column at 2
+        // (the RHS of the |> boundary, where `mutate(y)` starts) but line 0
+        // (outermost expression start, for correct indent calculation)
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, operator_type, .. } => {
+            IndentContext::AfterContinuationOperator { chain_start_line, chain_start_col, operator_type, .. } => {
                 assert_eq!(chain_start_line, 0);
+                assert_eq!(chain_start_col, 2);
                 assert_eq!(operator_type, OperatorType::Plus);
             }
             _ => panic!("Expected AfterContinuationOperator for mixed operators, got {:?}", ctx),
+        }
+    }
+
+    #[test]
+    fn test_mixed_chain_pipe_then_arithmetic() {
+        // Mixed chain: pipe followed by arithmetic operators with nested calls
+        let code = "x <- f(a,\n       b,\n       c(a,\n         b = f(a,\n               b))) |>\n     x + y +\n";
+        let tree = parse_r_code(code);
+
+        // Cursor on line 6 (after `x + y +`)
+        let position = Position { line: 6, character: 0 };
+        let ctx = detect_context(&tree, code, position, 4);
+
+        // Sub-chain start col should be 5 (RHS of |>, where `x` is).
+        // Line should be 0 (outermost expression start) for correct indent calc.
+        match ctx {
+            IndentContext::AfterContinuationOperator { chain_start_line, chain_start_col, operator_type, .. } => {
+                assert_eq!(chain_start_col, 5, "Should align with sub-chain start after pipe");
+                assert_eq!(chain_start_line, 0);
+                assert_eq!(operator_type, OperatorType::Plus);
+            }
+            _ => panic!("Expected AfterContinuationOperator, got {:?}", ctx),
         }
     }
 
