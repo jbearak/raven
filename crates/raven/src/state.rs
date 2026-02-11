@@ -551,6 +551,8 @@ impl WorldState {
     ///
     /// ```
     /// use std::path::PathBuf;
+    /// use raven::state::WorldState;
+    ///
     /// let ws = WorldState::new(vec![PathBuf::from("/usr/lib/R/library")]);
     /// // newly created state has no opened documents or workspace folders by default
     /// assert!(ws.documents.is_empty());

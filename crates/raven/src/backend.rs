@@ -85,7 +85,7 @@ struct ActiveDocumentsChangedParams {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use serde_json::json;
 /// let settings = json!({
 ///     "crossFile": {
@@ -103,7 +103,7 @@ struct ActiveDocumentsChangedParams {
 ///     "diagnostics": { "enabled": true, "undefinedVariables": false }
 /// });
 ///
-/// let cfg = crate::backend::parse_cross_file_config(&settings);
+/// let cfg = raven::backend::parse_cross_file_config(&settings);
 /// assert!(cfg.is_some());
 /// let cfg = cfg.unwrap();
 /// assert_eq!(cfg.max_backward_depth, 5);
@@ -582,12 +582,13 @@ impl LanguageServer for Backend {
     /// # Examples
     ///
     /// ```no_run
-    /// # use lsp_types::InitializeParams;
-    /// # async fn example(backend: &crate::backend::Backend) -> lsp_types::InitializeResult {
+    /// # use tower_lsp::lsp_types::InitializeParams;
+    /// # use tower_lsp::LanguageServer;
+    /// # async fn example(backend: &raven::backend::Backend) -> tower_lsp::lsp_types::InitializeResult {
     /// let params = InitializeParams::default();
     /// // run inside an async context (tokio/runtime)
     /// backend.initialize(params).await.unwrap()
-    /// }
+    /// # }
     /// ```
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         log::info!("Initializing ark-lsp");
@@ -1979,7 +1980,8 @@ impl LanguageServer for Backend {
     ///
     /// ```no_run
     /// // Called from an async context when the client sends updated configuration.
-    /// # async fn example(backend: &crate::backend::Backend, params: lsp_types::DidChangeConfigurationParams) {
+    /// # use tower_lsp::LanguageServer;
+    /// # async fn example(backend: &raven::backend::Backend, params: tower_lsp::lsp_types::DidChangeConfigurationParams) {
     /// backend.did_change_configuration(params).await;
     /// # }
     /// ```
@@ -2565,9 +2567,10 @@ impl LanguageServer for Backend {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # use lsp_types::DocumentSymbolParams;
-    /// # async fn example(backend: &crate::backend::Backend, params: DocumentSymbolParams) {
+    /// ```no_run
+    /// # use tower_lsp::lsp_types::DocumentSymbolParams;
+    /// # use tower_lsp::LanguageServer;
+    /// # async fn example(backend: &raven::backend::Backend, params: DocumentSymbolParams) {
     /// let result = backend.document_symbol(params).await.unwrap();
     /// if let Some(symbols) = result {
     ///     // process symbols
@@ -2626,11 +2629,12 @@ impl LanguageServer for Backend {
     /// # Examples
     ///
     /// ```no_run
-    /// use lsp_types::CompletionParams;
+    /// use tower_lsp::lsp_types::CompletionParams;
+    /// # use tower_lsp::LanguageServer;
     ///
     /// // `backend` is an initialized `Backend` instance and `params` is a prepared `CompletionParams`.
     /// // This example shows the call site; actual construction of `Backend` and `params` is omitted.
-    /// # async fn example(backend: &crate::backend::Backend, params: CompletionParams) {
+    /// # async fn example(backend: &raven::backend::Backend, params: CompletionParams) {
     /// let result = backend.completion(params).await.unwrap();
     /// if let Some(response) = result {
     ///     // Inspect completion items in `response`

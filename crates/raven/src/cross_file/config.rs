@@ -92,6 +92,8 @@ impl Default for CrossFileConfig {
     /// # Examples
     ///
     /// ```
+    /// use raven::cross_file::CrossFileConfig;
+    ///
     /// let cfg = CrossFileConfig::default();
     /// assert!(cfg.index_workspace);
     /// assert_eq!(cfg.max_chain_depth, 20);

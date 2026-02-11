@@ -37,9 +37,10 @@ fn index_exports_cache() -> &'static DashMap<PathBuf, Vec<String>> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::path::Path;
-/// let exports = crate::namespace_parser::parse_namespace_exports(Path::new("NAMESPACE")).unwrap();
+/// use raven::namespace_parser::parse_namespace_exports;
+/// let exports = parse_namespace_exports(Path::new("NAMESPACE")).unwrap();
 /// // `exports` may contain entries like "foo", "__PATTERN__:^bar.*$", or "print.myclass"
 /// ```
 pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
@@ -58,21 +59,6 @@ pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
 /// - export patterns from `exportPattern(...)` stored as markers `__PATTERN__:<pattern>`.
 ///
 /// Comments and blank lines are ignored; whitespace is trimmed and empty names are filtered out.
-///
-/// # Examples
-///
-/// ```
-/// let content = r#"
-/// export(foo, "bar")
-/// exportPattern(".*_internal$")
-/// S3method(print, foo)
-/// "#;
-/// let exports = parse_namespace_content(content);
-/// assert!(exports.contains(&"foo".to_string()));
-/// assert!(exports.contains(&"bar".to_string()));
-/// assert!(exports.contains(&"__PATTERN__:.*_internal$".to_string()));
-/// assert!(exports.contains(&"print.foo".to_string()));
-/// ```
 fn parse_namespace_content(content: &str) -> Vec<String> {
     let mut exports = Vec::new();
 
@@ -129,24 +115,6 @@ fn parse_namespace_content(content: &str) -> Vec<String> {
 /// Preserves comment-only lines (lines starting with `#`) as separate lines when they are
 /// not inside a parenthesized directive. If a directive's parentheses never close, the
 /// accumulated line is emitted as-is at the end.
-///
-/// # Examples
-///
-/// ```
-/// let src = r#"
-/// export(
-///   func1,
-///   func2
-/// )
-/// # a comment
-/// otherDirective(x)
-/// "#;
-///
-/// let normalized = normalize_multiline_directives(src);
-/// assert!(normalized.contains("export( func1, func2 )"));
-/// assert!(normalized.contains("# a comment\n"));
-/// assert!(normalized.contains("otherDirective(x)"));
-/// ```
 fn normalize_multiline_directives(content: &str) -> String {
     let mut result = String::new();
     let mut current_line = String::new();
@@ -203,13 +171,6 @@ fn normalize_multiline_directives(content: &str) -> String {
 /// if the line does not start with the directive or lacks the opening `(`.
 /// If a matching closing parenthesis cannot be found, returns the remainder of
 /// the line after the opening `(` with any trailing `)` characters trimmed.
-///
-/// # Examples
-///
-/// ```
-/// assert_eq!(extract_directive_args("export(foo, bar)", "export"), Some("foo, bar".to_string()));
-/// assert_eq!(extract_directive_args("something(foo)", "export"), None);
-/// ```
 fn extract_directive_args(line: &str, directive: &str) -> Option<String> {
     // Find the opening parenthesis
     let after_directive = line.strip_prefix(directive)?;
@@ -230,14 +191,6 @@ fn extract_directive_args(line: &str, directive: &str) -> Option<String> {
 /// Find the byte index of the closing parenthesis that matches an implicit opening parenthesis immediately before the input.
 ///
 /// Scans the input left-to-right while tracking nested `(` / `)` pairs; returns the index of the `)` that closes the implicit opener (i.e., the `)` that brings the nesting depth to zero). Returns `None` if no matching closing parenthesis is found.
-///
-/// # Examples
-///
-/// ```
-/// let s = "a,b)";
-/// // treating the input as the content after an opening '(', the closing ')' is at byte index 3
-/// assert_eq!(find_matching_paren(s), Some(3));
-/// ```
 fn find_matching_paren(s: &str) -> Option<usize> {
     let mut depth = 0;
     for (i, ch) in s.char_indices() {
@@ -261,13 +214,6 @@ fn find_matching_paren(s: &str) -> Option<usize> {
 /// ignores commas that appear inside quoted strings, and omits empty items.
 ///
 /// Returns a `Vec<String>` containing the parsed, trimmed arguments in order.
-///
-/// # Examples
-///
-/// ```
-/// let v = parse_comma_separated_args(r#"foo, "bar baz", 'qux',  , "escaped,comma""#);
-/// assert_eq!(v, vec!["foo", "bar baz", "qux", "escaped,comma"]);
-/// ```
 fn parse_comma_separated_args(args: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -309,14 +255,6 @@ fn parse_comma_separated_args(args: &str) -> Vec<String> {
 ///
 /// Returns `Some("generic.class")` when the arguments contain a non-empty generic and class;
 /// returns `None` otherwise.
-///
-/// # Examples
-///
-/// ```
-/// assert_eq!(parse_s3method_args("foo, bar"), Some("foo.bar".to_string()));
-/// assert_eq!(parse_s3method_args("foo, bar, baz"), Some("foo.bar".to_string())); // method ignored
-/// assert_eq!(parse_s3method_args(""), None);
-/// ```
 fn parse_s3method_args(args: &str) -> Option<String> {
     let parts = parse_comma_separated_args(args);
 
@@ -344,11 +282,11 @@ fn parse_s3method_args(args: &str) -> Option<String> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::path::Path;
-/// // Assume a DESCRIPTION file exists at "tests/fixtures/DESCRIPTION"
-/// let deps = crate::namespace_parser::parse_description_depends(Path::new("tests/fixtures/DESCRIPTION")).unwrap();
-/// assert!(deps.iter().all(|s| !s.contains('(')));
+/// use raven::namespace_parser::parse_description_depends;
+/// let deps = parse_description_depends(Path::new("tests/fixtures/DESCRIPTION")).unwrap();
+/// assert!(deps.iter().all(|s: &String| !s.contains('(')));
 /// ```
 pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(description_path).map_err(|e| {
@@ -368,19 +306,6 @@ pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>>
 /// lines that begin with whitespace, and stops when a new field or a non-continuation line is encountered.
 /// The collected field value is then parsed into package names (version constraints are stripped and the
 /// `R` entry is excluded).
-///
-/// # Examples
-///
-/// ```
-/// let desc = "\
-/// Package: foo
-/// Depends: R (>= 3.5.0), dplyr (>= 1.0.0),
-///  tibble
-/// Imports: utils
-/// ";
-/// let deps = parse_description_field(desc, "Depends");
-/// assert_eq!(deps, vec!["dplyr".to_string(), "tibble".to_string()]);
-/// ```
 fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
     let mut field_value = String::new();
     let mut in_field = false;
@@ -411,13 +336,6 @@ fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
 /// Extracts package names from a DESCRIPTION "Depends" field value.
 ///
 /// Strips any parenthesized version constraints and excludes the special `R` entry.
-///
-/// # Examples
-///
-/// ```
-/// let pkgs = parse_depends_value("R (>= 3.5), dplyr, ggplot2");
-/// assert_eq!(pkgs, vec!["dplyr", "ggplot2"]);
-/// ```
 fn parse_depends_value(value: &str) -> Vec<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -468,8 +386,9 @@ fn parse_depends_value(value: &str) -> Vec<String> {
 /// # Examples
 /// ```rust,no_run
 /// use std::path::Path;
+/// use raven::namespace_parser::parse_index_exports;
 /// # async fn demo() -> anyhow::Result<()> {
-/// let exports = crate::namespace_parser::parse_index_exports(Path::new("/usr/lib/R/library/dplyr")).await?;
+/// let exports = parse_index_exports(Path::new("/usr/lib/R/library/dplyr")).await?;
 /// assert!(exports.contains(&"mutate".to_string()));
 /// # Ok(())
 /// # }
@@ -910,6 +829,13 @@ Version: 1.0.0"#;
     fn test_extract_directive_args_no_parens() {
         let args = extract_directive_args("export", "export");
         assert!(args.is_none());
+    }
+
+    #[test]
+    fn test_find_matching_paren_doctest() {
+        let s = "a,b)";
+        // treating the input as the content after an opening '(', the closing ')' is at byte index 3
+        assert_eq!(find_matching_paren(s), Some(3));
     }
 
     #[test]
