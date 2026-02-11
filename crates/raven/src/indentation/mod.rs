@@ -17,13 +17,9 @@ mod calculator;
 mod context;
 mod formatter;
 
-pub use calculator::{calculate_indentation, get_line_indent, IndentationConfig, IndentationStyle};
-pub use context::{
-    detect_context, find_enclosing_arguments, find_enclosing_brace_list, find_enclosing_call,
-    find_innermost_context_node, find_matching_opener, find_parent, get_operator_type,
-    is_arguments_node, is_brace_list_node, is_call_node, is_continuation_binary_operator,
-    is_continuation_operator, is_pipe_operator, is_special_operator, IndentContext, OperatorType,
-};
+pub use calculator::{calculate_indentation, IndentationConfig, IndentationStyle};
+#[allow(unused_imports)] // Used by integration tests
+pub use context::{detect_context, IndentContext, OperatorType};
 pub use formatter::format_indentation;
 
 /// Returns the LSP capability options for on-type formatting.
@@ -45,7 +41,7 @@ pub fn on_type_formatting_capability() -> DocumentOnTypeFormattingOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::on_type_formatting_capability;
 
     /// Test that server capabilities include onTypeFormatting with trigger "\n".
     ///

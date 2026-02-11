@@ -11,6 +11,10 @@
 //! - Missing delimiters: Handles unclosed delimiters gracefully with heuristics
 //! - Iteration limits: Prevents infinite loops in chain start detection
 
+// Many helper functions are pub for use by property-based tests within this module
+// but are not re-exported from the indentation module.
+#![allow(dead_code)]
+
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
