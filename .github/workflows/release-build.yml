@@ -78,7 +78,7 @@ jobs:
           if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
             cp target/${{ matrix.target }}/release/raven.exe dist/
             cp LICENSE dist/
-            cd dist && zip -r ../raven-${{ matrix.platform }}.zip .
+            cd dist && 7z a -tzip ../raven-${{ matrix.platform }}.zip .
           else
             cp target/${{ matrix.target }}/release/raven dist/
             cp LICENSE dist/
