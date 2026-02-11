@@ -2,7 +2,7 @@
   "name": "raven",
   "displayName": "Raven - R Language Server",
   "description": "Static R language server with cross-file awareness",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "jbearak",
   "license": "GPL-3.0",
   "repository": {
@@ -325,7 +325,11 @@
         },
         "raven.indentation.style": {
           "type": "string",
-          "enum": ["rstudio", "rstudio-minus", "off"],
+          "enum": [
+            "rstudio",
+            "rstudio-minus",
+            "off"
+          ],
           "enumDescriptions": [
             "Aligns same-line arguments to opening paren (RStudio convention)",
             "Indents all arguments relative to previous line",
