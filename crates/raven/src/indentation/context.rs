@@ -934,11 +934,11 @@ fn find_unclosed_delimiter_heuristic(
                 escape_next = false;
                 continue;
             }
-            if ch == '\\' && in_string {
+            if ch == '\\' && in_string && string_char != '`' {
                 escape_next = true;
                 continue;
             }
-            if !in_string && (ch == '"' || ch == '\'') {
+            if !in_string && (ch == '"' || ch == '\'' || ch == '`') {
                 in_string = true;
                 string_char = ch;
             } else if in_string && ch == string_char {
@@ -1796,7 +1796,7 @@ fn strip_trailing_comment(line: &str) -> &str {
             continue;
         }
 
-        if c == '\\' && in_string {
+        if c == '\\' && in_string && string_char != '`' {
             escape_next = true;
             continue;
         }
@@ -1820,7 +1820,7 @@ fn strip_trailing_comment(line: &str) -> &str {
             }
         }
 
-        if !in_string && (c == '"' || c == '\'') {
+        if !in_string && (c == '"' || c == '\'' || c == '`') {
             in_string = true;
             string_char = c;
         } else if in_string && c == string_char {
