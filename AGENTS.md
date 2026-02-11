@@ -11,6 +11,7 @@ User-facing:
 - `docs/cross-file.md`
 - `docs/declaration-directives.md`
 - `docs/packages.md`
+- `docs/indentation.md`
 - `docs/configuration.md`
 
 Maintainer/internal:
