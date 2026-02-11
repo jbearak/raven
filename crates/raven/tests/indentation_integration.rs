@@ -603,7 +603,7 @@ fn test_tidyverse_across_function_incomplete() {
     // The fallback heuristic handles incomplete code
     // This documents the current behavior for incomplete code
     // The test passes as long as we don't panic
-    let _ = column; // Acknowledge the value is computed without error
+    assert!(column <= 120, "Fallback indentation should remain within a reasonable bound");
 }
 
 // ============================================================================

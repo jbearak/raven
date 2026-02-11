@@ -14,6 +14,8 @@
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
+use super::calculator::get_line_indent;
+
 use crate::utf16::utf16_column_to_byte_offset;
 
 // ============================================================================
@@ -1561,29 +1563,6 @@ fn find_unclosed_braces_at_position<'a>(
     }
 
     result
-}
-
-/// Gets the indentation (leading whitespace count) of a line.
-///
-/// # Arguments
-///
-/// * `source` - The source code text
-/// * `line` - The line number (0-indexed)
-///
-/// # Returns
-///
-/// The number of leading whitespace characters on the line.
-fn get_line_indent(source: &str, line: u32, tab_size: u32) -> u32 {
-    source
-        .lines()
-        .nth(line as usize)
-        .map(|l| {
-            l.chars()
-                .take_while(|c| c.is_whitespace())
-                .map(|c| if c == '\t' { tab_size } else { 1 })
-                .sum()
-        })
-        .unwrap_or(0)
 }
 
 /// Gets the indentation of the enclosing block.

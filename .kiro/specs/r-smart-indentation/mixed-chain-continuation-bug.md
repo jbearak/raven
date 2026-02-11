@@ -159,5 +159,5 @@ ESS (Emacs Speaks Statistics) handles this correctly by:
 
 - **Discovered:** 2026-02-11
 - **Severity:** Medium (affects mixed chain indentation)
-- **Workaround:** None (requires code fix)
-- **Fix Status:** Investigated, solution identified, not yet implemented
+- **Workaround:** None
+- **Fix Status:** Implemented and verified (commits 29e5549, 041b3fa)

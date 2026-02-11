@@ -2853,7 +2853,7 @@ impl LanguageServer for Backend {
                             let is_error = node.is_error()
                                 || node.parent().map_or(false, |p| p.is_error());
                             if is_error {
-                                log::info!(
+                                log::trace!(
                                     "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
                                     params.ch,
                                     position.line,

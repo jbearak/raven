@@ -237,6 +237,7 @@ pub fn detect_context(
     tree: &Tree,
     source: &str,
     position: Position,
+    tab_size: u32,
 ) -> IndentContext {
     // Implementation
 }
