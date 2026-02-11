@@ -1085,6 +1085,104 @@ fn find_opener_position(node: Node, delimiter: char, _source: &str) -> Option<(u
     }
 }
 
+/// Finds the pipe chain start position using AST analysis.
+///
+/// For pipe operators (`|>`, `%>%`), walks up through parent `binary_operator`
+/// nodes to find the outermost pipe expression, then determines the start
+/// column of the pipe expression (RHS of assignment if present).
+///
+/// # Arguments
+///
+/// * `tree` - The tree-sitter parse tree
+/// * `source` - The source code text
+/// * `prev_line` - The line containing the pipe operator
+///
+/// # Returns
+///
+/// `Some((line, col))` of the pipe chain start, or `None` if AST lookup fails.
+fn find_pipe_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Option<(u32, u32)> {
+    let root = tree.root_node();
+
+    // Find the end of the actual code on prev_line (before comments/whitespace)
+    let line_text = source.lines().nth(prev_line as usize)?;
+    let trimmed = strip_trailing_comment(line_text);
+    let trimmed = trimmed.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let trimmed_end_col = trimmed.len().saturating_sub(1);
+    let point = tree_sitter::Point::new(prev_line as usize, trimmed_end_col);
+
+    // Get the node at the operator position
+    let node = root.descendant_for_point_range(point, point)?;
+
+    // Verify this is actually a pipe operator or its parent is a binary_operator
+    let pipe_binop = if node.kind() == "|>" || node.kind() == "special" {
+        // Direct hit on operator node - parent should be binary_operator
+        node.parent()
+            .filter(|p| p.kind() == "binary_operator")?
+    } else if node.kind() == "binary_operator" {
+        node
+    } else {
+        // Try parent
+        let parent = node.parent()?;
+        if parent.kind() == "binary_operator" {
+            parent
+        } else {
+            return None;
+        }
+    };
+
+    // Walk up through parent binary_operator nodes that contain pipe operators
+    let mut outermost = pipe_binop;
+    let mut current = pipe_binop;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "binary_operator" {
+            // Check if this parent contains a pipe operator child
+            let has_pipe = (0..parent.child_count()).any(|i| {
+                parent.child(i).map_or(false, |child| {
+                    if child.kind() == "|>" {
+                        true
+                    } else if child.kind() == "special" {
+                        let text = &source[child.byte_range()];
+                        text == "%>%"
+                    } else {
+                        false
+                    }
+                })
+            });
+            if has_pipe {
+                outermost = parent;
+                current = parent;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Now check if the outermost pipe binary_operator's parent is an assignment
+    // If so, the chain start is the RHS of the assignment (= start of the pipe expression)
+    if let Some(parent) = outermost.parent() {
+        let parent_kind = parent.kind();
+        if parent_kind == "left_assignment"
+            || parent_kind == "equals_assignment"
+            || parent_kind == "right_assignment"
+        {
+            // The outermost pipe expr IS the RHS of the assignment.
+            // Return its start position as chain start.
+            let start = outermost.start_position();
+            return Some((start.row as u32, start.column as u32));
+        }
+    }
+
+    // No assignment parent — standalone pipe chain. Return outermost start.
+    let start = outermost.start_position();
+    Some((start.row as u32, start.column as u32))
+}
+
 /// Detects if the previous line ends with a continuation operator.
 ///
 /// Checks if the line before the cursor position ends with a continuation
@@ -1137,9 +1235,19 @@ fn detect_continuation_operator(
         None
     }?;
 
-    // Find chain start using ChainWalker
-    let walker = ChainWalker::new(tree, source);
-    let (chain_start_line, chain_start_col) = walker.find_chain_start(position);
+    // For pipe operators, try AST-based chain start detection first
+    let (chain_start_line, chain_start_col) =
+        if matches!(operator_type, OperatorType::Pipe | OperatorType::MagrittrPipe) {
+            find_pipe_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
+                // Fallback to text-based heuristic
+                let walker = ChainWalker::new(tree, source);
+                walker.find_chain_start(position)
+            })
+        } else {
+            // Non-pipe operators: use existing ChainWalker
+            let walker = ChainWalker::new(tree, source);
+            walker.find_chain_start(position)
+        };
 
     Some(IndentContext::AfterContinuationOperator {
         chain_start_line,

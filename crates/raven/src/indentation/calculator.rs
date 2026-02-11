@@ -3,7 +3,7 @@
 //! This module computes the correct indentation amount based on the
 //! detected context and user configuration (tab size, style preference).
 
-use super::context::IndentContext;
+use super::context::{IndentContext, OperatorType};
 
 /// Configuration for indentation calculation.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,11 +62,20 @@ pub fn calculate_indentation(
 ) -> u32 {
     match context {
         IndentContext::AfterContinuationOperator {
-            chain_start_col, ..
+            chain_start_line,
+            chain_start_col,
+            operator_type,
         } => {
-            // Pipe chain continuation: indent from chain start
-            // All continuation lines in a chain get the same indentation (straight mode)
-            chain_start_col + config.tab_size
+            // Pipe/magrittr pipe: align to RHS of assignment (chain_start_col)
+            // but ensure at least one tab_size indent from the line start.
+            // Non-pipe operators (+, ~, %word%): indent from chain start + tab_size.
+            match operator_type {
+                OperatorType::Pipe | OperatorType::MagrittrPipe => {
+                    let line_indent = get_line_indent(source, chain_start_line);
+                    std::cmp::max(chain_start_col, line_indent + config.tab_size)
+                }
+                _ => chain_start_col + config.tab_size,
+            }
         }
         IndentContext::InsideParens {
             opener_line,
@@ -245,7 +254,8 @@ mod tests {
             style: IndentationStyle::RStudio,
         };
 
-        // Chain starts at column 4, so continuation should be at column 8
+        // Pipe chain start at col 4 (RHS of assignment), line 0 has no indent.
+        // Formula: max(4, 0+4) = 4
         let context = IndentContext::AfterContinuationOperator {
             chain_start_line: 0,
             chain_start_col: 4,
@@ -253,11 +263,32 @@ mod tests {
         };
 
         let indent = calculate_indentation(context, config, "");
+        assert_eq!(indent, 4);
+    }
+
+    #[test]
+    fn test_non_pipe_chain_continuation_with_offset() {
+        use super::super::context::OperatorType;
+
+        let config = IndentationConfig {
+            tab_size: 4,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+
+        // Non-pipe (+) chain start at col 4: chain_start_col + tab_size = 8
+        let context = IndentContext::AfterContinuationOperator {
+            chain_start_line: 0,
+            chain_start_col: 4,
+            operator_type: OperatorType::Plus,
+        };
+
+        let indent = calculate_indentation(context, config, "");
         assert_eq!(indent, 8);
     }
 
     #[test]
-    fn test_pipe_chain_continuation_all_operators_same_indent() {
+    fn test_pipe_chain_continuation_all_operators_at_col_zero() {
         use super::super::context::OperatorType;
 
         let config = IndentationConfig {
@@ -266,10 +297,10 @@ mod tests {
             style: IndentationStyle::RStudio,
         };
 
-        let chain_start_col = 0;
-        let expected_indent = chain_start_col + config.tab_size;
-
-        // All operator types should produce the same indentation (straight mode)
+        // When chain starts at column 0 with no line indent, all operators
+        // produce the same result (tab_size = 2):
+        // - Pipe/MagrittrPipe: max(0, 0+2) = 2
+        // - Others: 0 + 2 = 2
         let operators = [
             OperatorType::Pipe,
             OperatorType::MagrittrPipe,
@@ -281,17 +312,44 @@ mod tests {
         for op in operators {
             let context = IndentContext::AfterContinuationOperator {
                 chain_start_line: 0,
-                chain_start_col,
+                chain_start_col: 0,
                 operator_type: op,
             };
 
             let indent = calculate_indentation(context.clone(), config.clone(), "");
             assert_eq!(
-                indent, expected_indent,
-                "Operator {:?} should produce indent {}",
-                op, expected_indent
+                indent, 2,
+                "Operator {:?} at col 0 should produce indent 2",
+                op
             );
         }
+    }
+
+    #[test]
+    fn test_pipe_vs_non_pipe_different_indent_with_offset() {
+        use super::super::context::OperatorType;
+
+        // Pipe at col 5 (RHS of assignment): max(5, 0+2) = 5
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+
+        let pipe_ctx = IndentContext::AfterContinuationOperator {
+            chain_start_line: 0,
+            chain_start_col: 5,
+            operator_type: OperatorType::Pipe,
+        };
+        assert_eq!(calculate_indentation(pipe_ctx, config.clone(), ""), 5);
+
+        // Plus at col 5: 5 + 2 = 7
+        let plus_ctx = IndentContext::AfterContinuationOperator {
+            chain_start_line: 0,
+            chain_start_col: 5,
+            operator_type: OperatorType::Plus,
+        };
+        assert_eq!(calculate_indentation(plus_ctx, config, ""), 7);
     }
 
     #[test]
@@ -361,9 +419,10 @@ mod tests {
 
         // Pipe chain indentation should be the same regardless of style setting
         // (style only affects function argument alignment)
+        // chain_start_col=4, line_indent=0, tab_size=2 → max(4, 0+2) = 4
         let chain_start_col = 4;
         let tab_size = 2;
-        let expected_indent = chain_start_col + tab_size;
+        let expected_indent = 4; // max(4, 0+2) = 4
 
         for style in [IndentationStyle::RStudio, IndentationStyle::RStudioMinus] {
             let config = IndentationConfig {
@@ -902,10 +961,10 @@ mod tests {
     // --- Very Large Indentation Edge Cases ---
 
     #[test]
-    fn test_edge_case_chain_start_at_column_100() {
+    fn test_edge_case_chain_start_at_column_100_pipe() {
         use super::super::context::OperatorType;
 
-        // Chain start at column 100+ should work correctly
+        // Pipe chain start at column 100 with no line indent: max(100, 0+2) = 100
         let config = IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
@@ -916,6 +975,27 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 100,
             operator_type: OperatorType::Pipe,
+        };
+
+        let indent = calculate_indentation(context, config, "");
+        assert_eq!(indent, 100); // max(100, 0+2) = 100
+    }
+
+    #[test]
+    fn test_edge_case_chain_start_at_column_100_plus() {
+        use super::super::context::OperatorType;
+
+        // Non-pipe chain start at column 100+: 100 + 2 = 102
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+
+        let context = IndentContext::AfterContinuationOperator {
+            chain_start_line: 0,
+            chain_start_col: 100,
+            operator_type: OperatorType::Plus,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1252,32 +1332,28 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        // Feature: r-smart-indentation, Property 2: Pipe Chain Indentation Calculation
-        // *For any* pipe chain with a detected chain start at column C and any tab_size
-        // value T, the computed indentation for continuation lines should equal C + T.
+        // Feature: r-smart-indentation, Property 2a: Pipe Chain Indentation Calculation
+        // For pipe/magrittr operators, indentation = max(chain_start_col, line_indent + tab_size).
+        // With source="" and chain_start_line=0, line_indent=0, so indent = max(C, T).
         // **Validates: Requirements 3.2**
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
 
             #[test]
-            fn property_pipe_chain_indentation_calculation(
+            fn property_pipe_indentation_calculation(
                 chain_start_col in 0u32..100,
                 tab_size in 1u32..9,
-                operator_type_idx in 0usize..5,
+                is_magrittr in proptest::bool::ANY,
                 style_idx in 0usize..2,
             ) {
                 use super::super::super::context::OperatorType;
 
-                // Map index to operator type
-                let operator_type = match operator_type_idx {
-                    0 => OperatorType::Pipe,
-                    1 => OperatorType::MagrittrPipe,
-                    2 => OperatorType::Plus,
-                    3 => OperatorType::Tilde,
-                    _ => OperatorType::CustomInfix,
+                let operator_type = if is_magrittr {
+                    OperatorType::MagrittrPipe
+                } else {
+                    OperatorType::Pipe
                 };
 
-                // Map index to style
                 let style = match style_idx {
                     0 => IndentationStyle::RStudio,
                     _ => IndentationStyle::RStudioMinus,
@@ -1297,11 +1373,64 @@ mod tests {
 
                 let indent = calculate_indentation(context, config, "");
 
-                // Property: indentation should equal chain_start_col + tab_size
+                // Property: indent = max(chain_start_col, 0 + tab_size)
+                let expected = std::cmp::max(chain_start_col, tab_size);
+                prop_assert_eq!(
+                    indent,
+                    expected,
+                    "For pipe chain_start_col={}, tab_size={}, expected indent={}, got={}",
+                    chain_start_col,
+                    tab_size,
+                    expected,
+                    indent
+                );
+            }
+        }
+
+        // Feature: r-smart-indentation, Property 2b: Non-Pipe Chain Indentation Calculation
+        // For non-pipe operators (+, ~, %word%), indentation = chain_start_col + tab_size.
+        // **Validates: Requirements 3.2**
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            #[test]
+            fn property_non_pipe_indentation_calculation(
+                chain_start_col in 0u32..100,
+                tab_size in 1u32..9,
+                operator_type_idx in 0usize..3,
+                style_idx in 0usize..2,
+            ) {
+                use super::super::super::context::OperatorType;
+
+                let operator_type = match operator_type_idx {
+                    0 => OperatorType::Plus,
+                    1 => OperatorType::Tilde,
+                    _ => OperatorType::CustomInfix,
+                };
+
+                let style = match style_idx {
+                    0 => IndentationStyle::RStudio,
+                    _ => IndentationStyle::RStudioMinus,
+                };
+
+                let config = IndentationConfig {
+                    tab_size,
+                    insert_spaces: true,
+                    style,
+                };
+
+                let context = IndentContext::AfterContinuationOperator {
+                    chain_start_line: 0,
+                    chain_start_col,
+                    operator_type,
+                };
+
+                let indent = calculate_indentation(context, config, "");
+
                 prop_assert_eq!(
                     indent,
                     chain_start_col + tab_size,
-                    "For chain_start_col={}, tab_size={}, expected indent={}, got={}",
+                    "For non-pipe chain_start_col={}, tab_size={}, expected indent={}, got={}",
                     chain_start_col,
                     tab_size,
                     chain_start_col + tab_size,
@@ -1311,28 +1440,77 @@ mod tests {
         }
 
         // Feature: r-smart-indentation, Property 3: Uniform Continuation Indentation
-        // *For any* pipe chain with multiple continuation lines, all continuation lines
-        // should receive identical indentation values (straight mode).
+        // *For any* chain with multiple continuation lines of the same operator class
+        // (pipe vs non-pipe), all continuation lines should receive identical indentation.
         // **Validates: Requirements 3.3**
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
 
             #[test]
-            fn property_uniform_continuation_indentation(
+            fn property_uniform_pipe_continuation_indentation(
                 chain_start_col in 0u32..100,
                 chain_start_line in 0u32..1000,
                 tab_size in 1u32..9,
                 num_continuation_lines in 2usize..20,
-                operator_types in prop::collection::vec(0usize..5, 2..20),
+                use_magrittr in prop::collection::vec(proptest::bool::ANY, 2..20),
             ) {
                 use super::super::super::context::OperatorType;
 
-                // Helper to map index to operator type
-                let map_operator = |idx: usize| match idx % 5 {
-                    0 => OperatorType::Pipe,
-                    1 => OperatorType::MagrittrPipe,
-                    2 => OperatorType::Plus,
-                    3 => OperatorType::Tilde,
+                let config = IndentationConfig {
+                    tab_size,
+                    insert_spaces: true,
+                    style: IndentationStyle::RStudio,
+                };
+
+                let mut indentations = Vec::new();
+
+                for (i, &is_mag) in use_magrittr.iter().take(num_continuation_lines).enumerate() {
+                    let operator_type = if is_mag {
+                        OperatorType::MagrittrPipe
+                    } else {
+                        OperatorType::Pipe
+                    };
+                    let context = IndentContext::AfterContinuationOperator {
+                        chain_start_line,
+                        chain_start_col,
+                        operator_type,
+                    };
+
+                    let indent = calculate_indentation(context, config.clone(), "");
+                    indentations.push((i, indent));
+                }
+
+                // With source="" and chain_start_line pointing to empty: line_indent=0
+                let expected_indent = std::cmp::max(chain_start_col, tab_size);
+                for (line_idx, indent) in &indentations {
+                    prop_assert_eq!(
+                        *indent,
+                        expected_indent,
+                        "Pipe continuation line {} should have indent {}, got {}",
+                        line_idx,
+                        expected_indent,
+                        indent
+                    );
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            #[test]
+            fn property_uniform_non_pipe_continuation_indentation(
+                chain_start_col in 0u32..100,
+                chain_start_line in 0u32..1000,
+                tab_size in 1u32..9,
+                num_continuation_lines in 2usize..20,
+                operator_types in prop::collection::vec(0usize..3, 2..20),
+            ) {
+                use super::super::super::context::OperatorType;
+
+                let map_operator = |idx: usize| match idx % 3 {
+                    0 => OperatorType::Plus,
+                    1 => OperatorType::Tilde,
                     _ => OperatorType::CustomInfix,
                 };
 
@@ -1342,10 +1520,6 @@ mod tests {
                     style: IndentationStyle::RStudio,
                 };
 
-                // Calculate indentation for each continuation line in the chain
-                // All should get the same indentation regardless of:
-                // - Which line number they're on
-                // - Which operator type precedes them
                 let mut indentations = Vec::new();
 
                 for (i, &op_idx) in operator_types.iter().take(num_continuation_lines).enumerate() {
@@ -1359,31 +1533,16 @@ mod tests {
                     indentations.push((i, indent));
                 }
 
-                // Property: all continuation lines should have identical indentation
                 let expected_indent = chain_start_col + tab_size;
                 for (line_idx, indent) in &indentations {
                     prop_assert_eq!(
                         *indent,
                         expected_indent,
-                        "Continuation line {} should have indent {}, got {}",
+                        "Non-pipe continuation line {} should have indent {}, got {}",
                         line_idx,
                         expected_indent,
                         indent
                     );
-                }
-
-                // Also verify all indentations are equal to each other
-                if let Some((_, first_indent)) = indentations.first() {
-                    for (line_idx, indent) in &indentations {
-                        prop_assert_eq!(
-                            indent,
-                            first_indent,
-                            "All continuation lines should have same indent. Line {} has {}, but line 0 has {}",
-                            line_idx,
-                            indent,
-                            first_indent
-                        );
-                    }
                 }
             }
         }

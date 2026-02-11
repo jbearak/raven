@@ -90,35 +90,69 @@ fn tabs_config(tab_size: u32, style: IndentationStyle) -> IndentationConfig {
 
 #[test]
 fn test_simple_pipe_chain_native_pipe() {
-    // Native R pipe |>
+    // Native R pipe |> after assignment: align to RHS ("data" at col 10)
     let code = "result <- data |>\n";
-    let indent = simulate_on_type_formatting(code, 1, rstudio_config(2));
-    assert_eq!(indent, "  ", "Native pipe continuation should indent by tab_size");
+    let column = get_indentation_column(code, 1, rstudio_config(2));
+    // "result <- data" - "data" starts at column 10
+    assert_eq!(column, 10, "Native pipe should align to RHS of assignment");
 }
 
 #[test]
 fn test_simple_pipe_chain_magrittr_pipe() {
-    // Magrittr pipe %>%
+    // Magrittr pipe %>% after assignment: align to RHS ("data" at col 10)
     let code = "result <- data %>%\n";
-    let indent = simulate_on_type_formatting(code, 1, rstudio_config(2));
-    assert_eq!(indent, "  ", "Magrittr pipe continuation should indent by tab_size");
+    let column = get_indentation_column(code, 1, rstudio_config(2));
+    assert_eq!(column, 10, "Magrittr pipe should align to RHS of assignment");
 }
 
 #[test]
 fn test_pipe_chain_multiple_lines() {
     // Multi-line pipe chain - all continuation lines should have same indentation
-    let code = r#"result <- data %>%
-  filter(x > 0) %>%
-"#;
-    let indent = simulate_on_type_formatting(code, 2, rstudio_config(2));
-    assert_eq!(indent, "  ", "All pipe chain continuations should have uniform indentation");
+    // "result <- data %>%" — RHS "data" at col 10
+    let code = "result <- data %>%\n          filter(x > 0) %>%\n";
+    let column = get_indentation_column(code, 2, rstudio_config(2));
+    assert_eq!(column, 10, "All pipe chain continuations should have uniform indentation");
 }
 
 #[test]
 fn test_pipe_chain_with_tab_size_4() {
+    // "result <- data" - "data" at col 10; max(10, 0+4) = 10
     let code = "result <- data %>%\n";
-    let indent = simulate_on_type_formatting(code, 1, rstudio_config(4));
-    assert_eq!(indent, "    ", "Pipe chain should respect tab_size=4");
+    let column = get_indentation_column(code, 1, rstudio_config(4));
+    assert_eq!(column, 10, "Pipe chain should align to RHS of assignment");
+}
+
+#[test]
+fn test_pipe_after_assignment_aligns_to_rhs() {
+    // x <- merp() |> with tab_size=4: "merp" at col 5, max(5, 0+4) = 5
+    let code = "x <- merp() |>\n";
+    let column = get_indentation_column(code, 1, rstudio_config(4));
+    assert_eq!(column, 5, "Pipe after assignment should align to RHS");
+}
+
+#[test]
+fn test_pipe_after_multiline_call_aligns_to_rhs() {
+    // x <- merp(x,\n          y) |> with tab_size=4
+    // The outermost pipe binary_operator starts at "merp" (col 5)
+    let code = "x <- merp(x,\n          y) |>\n";
+    let column = get_indentation_column(code, 2, rstudio_config(4));
+    assert_eq!(column, 5, "Pipe after multiline call should align to RHS of assignment");
+}
+
+#[test]
+fn test_pipe_standalone_no_assignment() {
+    // data |> with tab_size=2: chain starts at "data" col 0, max(0, 0+2) = 2
+    let code = "data |>\n";
+    let column = get_indentation_column(code, 1, rstudio_config(2));
+    assert_eq!(column, 2, "Standalone pipe should indent by tab_size");
+}
+
+#[test]
+fn test_pipe_indented_with_assignment() {
+    // "  x <- data |>" with tab_size=2: "data" at col 7, line_indent=2, max(7, 2+2) = 7
+    let code = "  x <- data |>\n";
+    let column = get_indentation_column(code, 1, rstudio_config(2));
+    assert_eq!(column, 7, "Indented pipe after assignment should align to RHS");
 }
 
 #[test]
@@ -496,19 +530,20 @@ fn test_insert_spaces_false_multiple_tabs() {
 #[test]
 fn test_tidyverse_dplyr_pipe_chain() {
     // Real dplyr example
+    // "result <- mtcars" — "mtcars" at col 10
     let code = r#"result <- mtcars %>%
-  filter(mpg > 20) %>%
-  select(mpg, cyl, hp) %>%
-  mutate(efficiency = mpg / hp) %>%
+          filter(mpg > 20) %>%
+          select(mpg, cyl, hp) %>%
+          mutate(efficiency = mpg / hp) %>%
 "#;
-    // All continuation lines should have same indentation
+    // All continuation lines should align to RHS (col 10)
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
     let col_3 = get_indentation_column(code, 3, rstudio_config(2));
     let col_4 = get_indentation_column(code, 4, rstudio_config(2));
-    
-    assert_eq!(col_2, 2, "Line 2 should have uniform pipe indent");
-    assert_eq!(col_3, 2, "Line 3 should have uniform pipe indent");
-    assert_eq!(col_4, 2, "Line 4 should have uniform pipe indent");
+
+    assert_eq!(col_2, 10, "Line 2 should align to RHS of assignment");
+    assert_eq!(col_3, 10, "Line 3 should align to RHS of assignment");
+    assert_eq!(col_4, 10, "Line 4 should align to RHS of assignment");
 }
 
 #[test]
@@ -699,12 +734,13 @@ fn test_full_cycle_pipe_chain() {
     let context = detect_context(&tree, code, position);
     
     // Step 3: Calculate indentation
+    // "result <- data" — "data" at col 10, max(10, 0+2) = 10
     let target_column = calculate_indentation(context, config.clone(), code);
-    assert_eq!(target_column, 2, "Should calculate correct indentation");
-    
+    assert_eq!(target_column, 10, "Should align pipe to RHS of assignment");
+
     // Step 4: Format TextEdit
     let edit = format_indentation(1, target_column, config, code);
-    assert_eq!(edit.new_text, "  ", "Should generate correct whitespace");
+    assert_eq!(edit.new_text, "          ", "Should generate correct whitespace");
     assert_eq!(edit.range.start.line, 1);
     assert_eq!(edit.range.end.line, 1);
 }
@@ -875,29 +911,31 @@ fn test_style_does_not_affect_closing_delimiters() {
 #[test]
 fn test_pipe_chain_with_nested_function_calls() {
     // Complex dplyr chain with nested functions inside pipe steps
+    // "result <- data" — "data" at col 10
     let code = r#"result <- data %>%
-  filter(category %in% c("A", "B", "C")) %>%
-  mutate(score = ifelse(value > mean(value), "high", "low")) %>%
-  group_by(category, score) %>%
+          filter(category %in% c("A", "B", "C")) %>%
+          mutate(score = ifelse(value > mean(value), "high", "low")) %>%
+          group_by(category, score) %>%
 "#;
-    // All continuation lines should have uniform indentation
+    // All continuation lines should align to RHS (col 10)
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
     let col_3 = get_indentation_column(code, 3, rstudio_config(2));
     let col_4 = get_indentation_column(code, 4, rstudio_config(2));
 
-    assert_eq!(col_2, 2, "Nested function in pipe should maintain uniform indent");
-    assert_eq!(col_3, 2, "Nested ifelse in pipe should maintain uniform indent");
-    assert_eq!(col_4, 2, "Multiple args in pipe should maintain uniform indent");
+    assert_eq!(col_2, 10, "Nested function in pipe should align to RHS");
+    assert_eq!(col_3, 10, "Nested ifelse in pipe should align to RHS");
+    assert_eq!(col_4, 10, "Multiple args in pipe should align to RHS");
 }
 
 #[test]
 fn test_pipe_chain_with_deeply_nested_functions() {
     // Pipe with deeply nested function calls (3+ levels)
+    // "result <- data" — "data" at col 10
     let code = r#"result <- data %>%
-  mutate(x = outer(middle(inner(value)))) %>%
+          mutate(x = outer(middle(inner(value)))) %>%
 "#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(column, 2, "Deeply nested functions in pipe should maintain uniform indent");
+    assert_eq!(column, 10, "Deeply nested functions in pipe should align to RHS");
 }
 
 #[test]
@@ -934,17 +972,18 @@ fn test_pipe_inside_function_argument() {
 #[test]
 fn test_pipe_inside_function_argument_complete() {
     // Complete pipe chain inside function argument
+    // "  new_col = x %>%" on line 2 — "x" at col 12 (RHS of `=`)
     let code = r#"result <- mutate(
   data,
   new_col = x %>%
-    filter(y > 0) %>%
-    summarise(mean(z))
+            filter(y > 0) %>%
+            summarise(mean(z))
 )
 "#;
     // Line 4 is a pipe continuation inside the function argument
     let col_4 = get_indentation_column(code, 4, rstudio_config(2));
-    // Should maintain pipe chain indentation
-    assert_eq!(col_4, 4, "Pipe continuation inside function arg should maintain indent");
+    // Should align to RHS of assignment (col 12)
+    assert_eq!(col_4, 12, "Pipe continuation inside function arg should align to RHS");
 }
 
 #[test]
@@ -1121,23 +1160,24 @@ fn test_nested_anonymous_functions() {
 #[test]
 fn test_tidyverse_data_wrangling_pipeline() {
     // Realistic data wrangling pipeline
+    // "clean_data <- raw_data" — "raw_data" at col 14
     let code = r#"clean_data <- raw_data %>%
-  janitor::clean_names() %>%
-  filter(!is.na(important_column)) %>%
-  mutate(
-    date = lubridate::ymd(date_string),
-    category = factor(category, levels = c("A", "B", "C"))
-  ) %>%
-  select(id, date, category, value)
+              janitor::clean_names() %>%
+              filter(!is.na(important_column)) %>%
+              mutate(
+                date = lubridate::ymd(date_string),
+                category = factor(category, levels = c("A", "B", "C"))
+              ) %>%
+              select(id, date, category, value)
 "#;
-    // Check various continuation lines
+    // Check various continuation lines — align to RHS col 14
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
     let col_3 = get_indentation_column(code, 3, rstudio_config(2));
     // Line 8 is after the complete expression
     let col_8 = get_indentation_column(code, 8, rstudio_config(2));
 
-    assert_eq!(col_2, 2, "janitor call should have chain indent");
-    assert_eq!(col_3, 2, "filter call should have chain indent");
+    assert_eq!(col_2, 14, "janitor call should align to RHS");
+    assert_eq!(col_3, 14, "filter call should align to RHS");
     assert_eq!(col_8, 0, "After complete pipeline should return to base indent");
 }
 
@@ -1290,10 +1330,11 @@ fn test_pipe_after_closing_brace() {
 #[test]
 fn test_multiple_pipes_same_line() {
     // Multiple pipe operations on same line (less common but valid)
+    // "result <- data %>% filter(x > 0) %>%" — RHS "data" at col 10
     let code = r#"result <- data %>% filter(x > 0) %>%
 "#;
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 2, "Continuation after multiple pipes should indent");
+    assert_eq!(column, 10, "Continuation after multiple pipes should align to RHS");
 }
 
 #[test]
@@ -1316,13 +1357,14 @@ fn test_pipe_with_comment_between_lines() {
 #[test]
 fn test_native_and_magrittr_pipe_mixed() {
     // Mixing native |> and magrittr %>% pipes (unusual but valid)
+    // "result <- data |>" — RHS "data" at col 10
     let code = r#"result <- data |>
-  filter(x > 0) %>%
-  select(y) |>
+          filter(x > 0) %>%
+          select(y) |>
 "#;
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
     let col_3 = get_indentation_column(code, 3, rstudio_config(2));
 
-    assert_eq!(col_2, 2, "Magrittr pipe after native should maintain indent");
-    assert_eq!(col_3, 2, "Native pipe after magrittr should maintain indent");
+    assert_eq!(col_2, 10, "Magrittr pipe after native should align to RHS");
+    assert_eq!(col_3, 10, "Native pipe after magrittr should align to RHS");
 }

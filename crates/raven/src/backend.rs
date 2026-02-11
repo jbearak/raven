@@ -2791,14 +2791,12 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
-        // Clamp tab_size to reasonable range (1-8) to handle malformed requests
+        // Guard against tab_size of 0 (use 1 as minimum)
         let raw_tab_size = params.options.tab_size;
-        let tab_size = raw_tab_size.clamp(1, 8);
-        if raw_tab_size != tab_size {
+        let tab_size = raw_tab_size.max(1);
+        if raw_tab_size == 0 {
             log::warn!(
-                "on_type_formatting: tab_size {} out of range, clamped to {}",
-                raw_tab_size,
-                tab_size
+                "on_type_formatting: tab_size 0 is invalid, using 1"
             );
         }
         let insert_spaces = params.options.insert_spaces;
