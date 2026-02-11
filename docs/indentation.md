@@ -37,6 +37,8 @@ When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces t
 | `"rstudio-minus"` | All arguments indent from previous line, regardless of paren position |
 | `"off"` | Disables Tier 2; only Tier 1 declarative rules remain active |
 
+Style names follow the [ESS (Emacs Speaks Statistics)](https://ess.r-project.org/) conventions: `rstudio` matches the RStudio IDE's default alignment; `rstudio-minus` (`RStudio-` in ESS) drops same-line paren alignment.
+
 ### Disabling Tier 2
 
 Two ways to disable AST-aware indentation:
