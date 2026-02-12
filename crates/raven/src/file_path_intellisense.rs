@@ -1491,7 +1491,7 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         // Consistent with cross_file/directive.rs patterns
         // The @ is required, colon is optional, leading whitespace is allowed
         DirectivePathPatterns {
-            backward: Regex::new(r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*"#)
+            backward: Regex::new(r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#)
                 .unwrap(),
             forward: Regex::new(r#"^\s*#\s*@lsp-source(?:\s+:?\s*|:\s*)"#).unwrap(),
         }
