@@ -12,6 +12,7 @@ User-facing:
 - `docs/declaration-directives.md`
 - `docs/packages.md`
 - `docs/indentation.md`
+- `docs/document-outline.md`
 - `docs/configuration.md`
 
 Maintainer/internal:
