@@ -133,3 +133,4 @@ When making significant changes:
 - "Ambiguous parent" diagnostics are misleading: a file being sourced by multiple parents is a valid use case, not an error. The diagnostic was removed entirely (previously controlled by `ambiguous_parent_severity` config).
 - Backward and forward directives support `line=eof` and `line=end` as synonyms for "use scope at end of file" — useful when a parent file sources multiple helpers and child functions need access to all of them.
 - `detect_cycle` returns the closing edge (from a different file), not an edge from the queried file. Diagnostic positions from the closing edge are invalid for the queried file. Always use an outgoing edge from the diagnosed file for positioning.
+- Dependency graph edge changes (adding/removing `source()` calls) must trigger revalidation of dependent files, not just interface hash changes. Otherwise cycle diagnostics on parent files become stale when a child's `source()` is commented out.

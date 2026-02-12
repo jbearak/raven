@@ -1108,9 +1108,10 @@ impl LanguageServer for Backend {
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
 
-            // Only invalidate dependents if interface changed (optimization)
-            // This avoids cascading revalidation when file content hasn't changed
-            if interface_changed {
+            // Invalidate dependents if interface changed OR dependency edges changed.
+            // Interface changes affect symbol resolution in dependent files.
+            // Edge changes affect cycle detection diagnostics in dependent files.
+            if interface_changed || result.edges_changed {
                 let dependents = state
                     .cross_file_graph
                     .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
@@ -1651,7 +1652,7 @@ impl LanguageServer for Backend {
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // Extract and enrich metadata with inherited working directory
-            let (packages_to_prefetch, enriched_meta, wd_affected) = if let Some(doc) =
+            let (packages_to_prefetch, enriched_meta, wd_affected, edges_changed) = if let Some(doc) =
                 state.documents.get(&uri)
             {
                 let text = doc.text();
@@ -1702,7 +1703,7 @@ impl LanguageServer for Backend {
                     })
                     .collect();
 
-                let _result = state.cross_file_graph.update_file(
+                let graph_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
                     workspace_root.as_ref(),
@@ -1719,9 +1720,9 @@ impl LanguageServer for Backend {
                         &state.cross_file_meta,
                     );
 
-                (pkgs, Some(meta), wd_children)
+                (pkgs, Some(meta), wd_children, graph_result.edges_changed)
             } else {
-                (Vec::new(), None, Vec::new())
+                (Vec::new(), None, Vec::new(), false)
             };
 
             // Update new DocumentStore with enriched metadata (Requirement 1.4)
@@ -1764,9 +1765,11 @@ impl LanguageServer for Backend {
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
 
-            // Only invalidate dependents if interface changed (optimization)
-            // This avoids cascading revalidation when only comments/local variables change
-            if interface_changed {
+            // Invalidate dependents if interface changed OR dependency edges changed.
+            // Interface changes affect symbol resolution in dependent files.
+            // Edge changes affect cycle detection diagnostics in dependent files
+            // (e.g., commenting out a source() call breaks a cycle).
+            if interface_changed || edges_changed {
                 let dependents = state
                     .cross_file_graph
                     .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);

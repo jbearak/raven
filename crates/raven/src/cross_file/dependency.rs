@@ -611,6 +611,10 @@ pub struct UpdateResult {
     /// These are stored for diagnostic emission with configurable severity.
     /// _Requirements: 6.2_
     pub redundant_directives: Vec<RedundantDirective>,
+    /// True if forward edges from this file changed (added/removed targets).
+    /// Used to trigger revalidation of dependents even when interface hash
+    /// doesn't change (e.g., commenting out a source() call breaks a cycle).
+    pub edges_changed: bool,
 }
 
 /// Dependency graph tracking source relationships between files
@@ -696,6 +700,13 @@ impl DependencyGraph {
             let resolved = resolve_path(path, &backward_path_ctx)?;
             path_to_uri(&resolved)
         };
+
+        // Snapshot forward edge targets before removal for change detection
+        let old_targets: HashSet<Url> = self
+            .forward
+            .get(uri)
+            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .unwrap_or_default();
 
         // Remove existing edges where this file is the parent
         // BUT: only remove edges that were created by THIS file's forward sources/directives
@@ -924,6 +935,14 @@ impl DependencyGraph {
                 self.add_edge(edge);
             }
         }
+
+        // Detect whether forward edges changed (for revalidation of dependents)
+        let new_targets: HashSet<Url> = self
+            .forward
+            .get(uri)
+            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .unwrap_or_default();
+        result.edges_changed = old_targets != new_targets;
 
         // Log total edge count after update
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
