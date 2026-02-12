@@ -2606,8 +2606,8 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Check for missing files in source() calls and directives (Requirement 10.2)
     collect_missing_file_diagnostics(state, uri, &directive_meta, &mut diagnostics);
 
-    // Check for ambiguous parents (Requirement 5.10 / 10.6)
-    collect_ambiguous_parent_diagnostics(state, uri, &directive_meta, &mut diagnostics);
+    // Note: "Ambiguous parent" diagnostics removed - multiple parents is a valid use case
+    // A file can legitimately be sourced by multiple scripts
 
     // Check for out-of-scope symbol usage (Requirement 10.3)
     collect_out_of_scope_diagnostics(
@@ -3380,98 +3380,6 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
     }
 }
 
-/// Emit a diagnostic when a file's parent resolution is ambiguous.
-///
-/// This inspects the cross-file metadata and graph to resolve the file's parent(s).
-/// If resolution returns an ambiguous result, a single `Diagnostic` is pushed that
-/// points at the first backward directive line and suggests adding `line=` or `match=`
-/// to disambiguate. The diagnostic's severity is taken from the cross-file config.
-///
-fn collect_ambiguous_parent_diagnostics(
-    state: &WorldState,
-    uri: &Url,
-    meta: &crate::cross_file::CrossFileMetadata,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    // Skip if ambiguous parent diagnostics are disabled
-    let severity = match state.cross_file_config.ambiguous_parent_severity {
-        Some(sev) => sev,
-        None => return,
-    };
-
-    use crate::cross_file::cache::ParentResolution;
-    use crate::cross_file::parent_resolve::resolve_parent_with_content;
-
-    // Build PathContext for proper path resolution
-    // Use PathContext::new (not from_metadata) because backward directives should
-    // resolve relative to the file's directory, ignoring @lsp-cd
-    let path_ctx =
-        crate::cross_file::path_resolve::PathContext::new(uri, state.workspace_folders.first());
-
-    let resolve_path = |path: &str| -> Option<Url> {
-        let ctx = path_ctx.as_ref()?;
-        let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
-        crate::cross_file::path_resolve::path_to_uri(&resolved)
-    };
-
-    let get_content = |parent_uri: &Url| -> Option<String> {
-        // Open docs first, then file cache
-        if let Some(doc) = state.documents.get(parent_uri) {
-            return Some(doc.text());
-        }
-        state.cross_file_file_cache.get(parent_uri)
-    };
-
-    let resolution = resolve_parent_with_content(
-        meta,
-        &state.cross_file_graph,
-        uri,
-        &state.cross_file_config,
-        resolve_path,
-        get_content,
-    );
-
-    if let ParentResolution::Ambiguous {
-        selected_uri,
-        alternatives,
-        ..
-    } = resolution
-    {
-        // Find the first backward directive line to attach the diagnostic
-        let directive_line = meta
-            .sourced_by
-            .first()
-            .map(|d| d.directive_line)
-            .unwrap_or(0);
-
-        let alt_list: Vec<String> = alternatives
-            .iter()
-            .filter_map(|u| {
-                u.path_segments()
-                    .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-            })
-            .collect();
-
-        let selected_name = selected_uri
-            .path_segments()
-            .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-            .unwrap_or_else(|| selected_uri.to_string());
-
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(directive_line, 0),
-                end: Position::new(directive_line, LSP_EOL_CHARACTER),
-            },
-            severity: Some(severity),
-            message: format!(
-                "Ambiguous parent: using '{}' but also found: {}. Consider adding line= or match= to disambiguate.",
-                selected_name,
-                alt_list.join(", ")
-            ),
-            ..Default::default()
-        });
-    }
-}
 
 /// Emit diagnostics for `library()` calls that reference packages not present in the package library.
 ///
@@ -29785,54 +29693,6 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
-    #[test]
-    fn test_ambiguous_parent_diagnostic_not_emitted_when_severity_off() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let workspace_path = temp_dir.path();
-        let child_path = workspace_path.join("child.R");
-        let parent1_path = workspace_path.join("parent1.R");
-        let parent2_path = workspace_path.join("parent2.R");
-        std::fs::write(
-            &child_path,
-            "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R",
-        )
-        .unwrap();
-        std::fs::write(&parent1_path, "source('child.R')").unwrap();
-        std::fs::write(&parent2_path, "source('child.R')").unwrap();
-
-        let workspace_url = Url::from_file_path(workspace_path).unwrap();
-        let child_url = Url::from_file_path(&child_path).unwrap();
-        let parent1_url = Url::from_file_path(&parent1_path).unwrap();
-        let parent2_url = Url::from_file_path(&parent2_path).unwrap();
-
-        let mut state = WorldState::new(Vec::new());
-        state.workspace_folders.push(workspace_url.clone());
-        state.cross_file_config.ambiguous_parent_severity = None;
-
-        // Set up the graph so both parents source child.R
-        let meta_p1 = crate::cross_file::directive::parse_directives("source('child.R')");
-        let meta_p2 = crate::cross_file::directive::parse_directives("source('child.R')");
-        state
-            .cross_file_graph
-            .update_file(&parent1_url, &meta_p1, Some(&workspace_url), |_| None);
-        state
-            .cross_file_graph
-            .update_file(&parent2_url, &meta_p2, Some(&workspace_url), |_| None);
-
-        let child_code = "# @lsp-sourced-by parent1.R\n# @lsp-sourced-by parent2.R";
-        let meta = crate::cross_file::directive::parse_directives(child_code);
-
-        let mut diagnostics = Vec::new();
-        collect_ambiguous_parent_diagnostics(&state, &child_url, &meta, &mut diagnostics);
-
-        assert_eq!(
-            diagnostics.len(),
-            0,
-            "Should not emit ambiguous parent diagnostic when severity is off"
-        );
-    }
 
     #[test]
     fn test_out_of_scope_diagnostic_not_emitted_when_severity_off() {
@@ -30535,6 +30395,65 @@ y <- x"#;
         } else {
             panic!("Expected Scalar response");
         }
+    }
+
+    #[test]
+    fn test_line_eof_in_backward_directive_creates_correct_edge() {
+        // Test that line=eof in backward directive creates an edge with u32::MAX call_site_line
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let parent_r = workspace_path.join("parent.R");
+        let child_r = workspace_path.join("child.r");
+
+        std::fs::write(&parent_r, "source('child.r')").unwrap();
+        std::fs::write(&child_r, "# @lsp-sourced-by parent.R line=eof\nx <- 1").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let parent_url = Url::from_file_path(&parent_r).unwrap();
+        let child_url = Url::from_file_path(&child_r).unwrap();
+
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        state.workspace_folders.push(workspace_url.clone());
+
+        let parent_content = std::fs::read_to_string(&parent_r).unwrap();
+        let child_content = std::fs::read_to_string(&child_r).unwrap();
+
+        state
+            .documents
+            .insert(parent_url.clone(), Document::new(&parent_content, None));
+        state
+            .documents
+            .insert(child_url.clone(), Document::new(&child_content, None));
+
+        let parent_meta = crate::cross_file::extract_metadata(&parent_content);
+        let child_meta = crate::cross_file::extract_metadata(&child_content);
+
+        state.cross_file_graph.update_file(
+            &parent_url,
+            &parent_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &child_url,
+            &child_meta,
+            Some(&workspace_url),
+            |uri| state.documents.get(uri).map(|d| d.text()),
+        );
+
+        // Check that an edge was created with call_site_line = u32::MAX
+        let edges = state.cross_file_graph.get_dependents(&child_url);
+        let eof_edge = edges
+            .iter()
+            .find(|e| e.is_backward_directive && e.call_site_line == Some(u32::MAX));
+
+        assert!(
+            eof_edge.is_some(),
+            "Should create backward directive edge with call_site_line = u32::MAX for line=eof"
+        );
     }
 }
 

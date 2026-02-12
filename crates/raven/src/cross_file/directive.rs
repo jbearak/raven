@@ -66,10 +66,10 @@ fn patterns() -> &'static DirectivePatterns {
         // @lsp-ignore, which can appear as a trailing comment (e.g., x <- foo # @lsp-ignore).
         DirectivePatterns {
             backward: Regex::new(
-                r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
+                r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
             ).unwrap(),
             forward: Regex::new(
-                r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+))?"#
+                r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?"#
             ).unwrap(),
             working_dir: Regex::new(
                 r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
@@ -140,9 +140,15 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             if let Some(caps) = patterns.backward.captures(line) {
                 let path = capture_path(&caps, 1).unwrap_or_default();
                 let call_site = if let Some(line_match) = caps.get(4) {
-                    // Convert 1-based user input to 0-based internal
-                    let user_line: u32 = line_match.as_str().parse().unwrap_or(1);
-                    CallSiteSpec::Line(user_line.saturating_sub(1))
+                    let line_str = line_match.as_str();
+                    if line_str == "eof" || line_str == "end" {
+                        // Use u32::MAX as EOF sentinel
+                        CallSiteSpec::Line(u32::MAX)
+                    } else {
+                        // Convert 1-based user input to 0-based internal
+                        let user_line: u32 = line_str.parse().unwrap_or(1);
+                        CallSiteSpec::Line(user_line.saturating_sub(1))
+                    }
                 } else if let Some(match_pattern) = caps.get(5) {
                     CallSiteSpec::Match(match_pattern.as_str().to_string())
                 } else {
@@ -185,15 +191,21 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             // Use directive's own line when no line= parameter
             let (call_site_line, has_explicit_line, is_line_zero) =
                 if let Some(line_match) = caps.get(4) {
-                    let user_line: u32 = line_match.as_str().parse().unwrap_or(0);
-                    let is_zero = user_line == 0;
-                    // For line=0, treat as line=1 (internal 0) but flag it as invalid
-                    let effective_line = if user_line == 0 {
-                        0
+                    let line_str = line_match.as_str();
+                    if line_str == "eof" || line_str == "end" {
+                        // Use u32::MAX as EOF sentinel
+                        (u32::MAX, true, false)
                     } else {
-                        user_line.saturating_sub(1)
-                    };
-                    (effective_line, true, is_zero)
+                        let user_line: u32 = line_str.parse().unwrap_or(0);
+                        let is_zero = user_line == 0;
+                        // For line=0, treat as line=1 (internal 0) but flag it as invalid
+                        let effective_line = if user_line == 0 {
+                            0
+                        } else {
+                            user_line.saturating_sub(1)
+                        };
+                        (effective_line, true, is_zero)
+                    }
                 } else {
                     (line_num, false, false)
                 };
@@ -333,6 +345,22 @@ mod tests {
         let meta = parse_directives(content);
         assert_eq!(meta.sourced_by.len(), 1);
         assert_eq!(meta.sourced_by[0].call_site, CallSiteSpec::Line(14)); // 0-based
+    }
+
+    #[test]
+    fn test_backward_directive_with_line_eof() {
+        let content = "# @lsp-sourced-by ../main.R line=eof";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].call_site, CallSiteSpec::Line(u32::MAX));
+    }
+
+    #[test]
+    fn test_backward_directive_with_line_end() {
+        let content = "# @lsp-sourced-by ../main.R line=end";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].call_site, CallSiteSpec::Line(u32::MAX));
     }
 
     #[test]
@@ -684,6 +712,28 @@ x <- undefined"#;
         assert_eq!(meta.sources[0].path, "utils.R");
         assert_eq!(meta.sources[0].line, 2); // Directive is on line 2 (0-based)
         assert_eq!(meta.sources[0].column, 0);
+    }
+
+    #[test]
+    fn test_forward_directive_with_line_eof() {
+        let content = "# @lsp-source utils.R line=eof";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources[0].line, u32::MAX);
+        assert!(meta.sources[0].explicit_line);
+        assert!(!meta.sources[0].user_line_zero);
+    }
+
+    #[test]
+    fn test_forward_directive_with_line_end() {
+        let content = "# @lsp-source utils.R line=end";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources[0].line, u32::MAX);
+        assert!(meta.sources[0].explicit_line);
+        assert!(!meta.sources[0].user_line_zero);
     }
 
     #[test]

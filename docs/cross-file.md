@@ -29,6 +29,7 @@ Declare that this file is sourced by another file:
 
 Optional parameters:
 - `line=N` - Specify 1-based line number in parent where source() call occurs
+- `line=eof` or `line=end` - Use scope at end of parent file (after all sources complete)
 - `match="pattern"` - Specify text pattern to find source() call in parent
 
 Example with line number:
@@ -36,6 +37,15 @@ Example with line number:
 # @lsp-sourced-by ../main.R line=15
 my_function <- function(x) { x + 1 }
 ```
+
+Example with end-of-file (useful when parent sources multiple files):
+```r
+# @lsp-sourced-by ../main.R line=eof
+# This function sees all symbols defined in main.R, including those from other sourced files
+my_function <- function(x) { helper_from_other_file(x) }
+```
+
+**Note:** `line=eof` currently works for symbols defined directly in the parent file and for packages loaded by the parent. For symbols from files sourced by the parent (multi-level resolution), you may need to add explicit `@lsp-source` directives or use `@lsp-var`/`@lsp-func` declarations to suppress false positives.
 
 Example with match pattern:
 ```r
@@ -60,13 +70,18 @@ All syntax variations are supported:
 - With quotes: `@lsp-source "path/with spaces.R"` or `@lsp-source 'path.R'`
 - Without quotes: `@lsp-source path.R`
 
-Optional `line=N` parameter specifies the call-site (1-based line number):
+Optional `line=` parameter specifies the call-site:
 ```r
 # @lsp-source utils/helpers.R line=25
 # Symbols from helpers.R become available at line 25 (not at this directive's line)
 ```
 
-When `line=N` is omitted, symbols become available after the directive's own line.
+```r
+# @lsp-source utils/helpers.R line=eof
+# Symbols from helpers.R become available at end of file
+```
+
+When `line=` is omitted, symbols become available after the directive's own line. Use `line=eof` or `line=end` to make symbols available at the end of the file.
 
 **Path resolution:** Forward directives use `@lsp-cd` for path resolution (unlike backward directives which ignore it). This matches the behavior of `source()` calls, since forward directives are semantically equivalent to `source()` calls.
 

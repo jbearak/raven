@@ -2395,7 +2395,58 @@ where
 
     // STEP 1: Process parent context from dependency graph edges
     // Get edges where this file is the child (callee)
+    //
+    // If multiple edges exist from the same parent (e.g., AST-detected source()
+    // plus an explicit backward directive), prefer the most inclusive call site
+    // so that `line=eof` correctly includes symbols from later sources.
+    let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
+    let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
     for edge in graph.get_dependents(uri) {
+        let entry = parent_edge_indices.get(&edge.from).copied();
+        match entry {
+            Some(existing_index) => {
+                let existing = parent_edges[existing_index];
+                // None means "call site couldn't be resolved"; u32::MAX makes
+                // unresolved edges the most inclusive so they inherit the full
+                // parent scope (consistent with unwrap_or(u32::MAX) below).
+                let existing_call_site = (
+                    existing.call_site_line.unwrap_or(u32::MAX),
+                    existing.call_site_column.unwrap_or(u32::MAX),
+                );
+                let candidate_call_site = (
+                    edge.call_site_line.unwrap_or(u32::MAX),
+                    edge.call_site_column.unwrap_or(u32::MAX),
+                );
+
+                let should_replace = if candidate_call_site > existing_call_site {
+                    true
+                } else if candidate_call_site == existing_call_site {
+                    if edge.local != existing.local {
+                        // Prefer non-local edge (more inclusive)
+                        !edge.local
+                    } else if edge.is_backward_directive != existing.is_backward_directive {
+                        edge.is_backward_directive
+                    } else if edge.is_directive != existing.is_directive {
+                        edge.is_directive
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if should_replace {
+                    parent_edges[existing_index] = edge;
+                }
+            }
+            None => {
+                parent_edge_indices.insert(edge.from.clone(), parent_edges.len());
+                parent_edges.push(edge);
+            }
+        }
+    }
+
+    for edge in parent_edges {
         // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
         // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
         // Regular symbols are not inherited when local=TRUE
@@ -6856,6 +6907,115 @@ mod tests {
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
             "deep_func should NOT be in scope in A after rm()"
+        );
+    }
+
+    #[test]
+    fn test_backward_directive_line_eof_includes_parent_sourced_symbols() {
+        // Regression test: child with @lsp-sourced-by line=eof should inherit
+        // symbols from files sourced by the parent after the child call site.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/functions.R").unwrap();
+        let child_uri = Url::parse("file:///project/fitModel.R").unwrap();
+        let sourced_uri = Url::parse("file:///project/getMonitors.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: sources child, then sources a helper file
+        let parent_code = "source(\"fitModel.R\")\nsource(\"getMonitors.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: references getMonitors()
+        let child_code = "fitModel <- function() { getMonitors() }";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Helper file defines getMonitors
+        let sourced_code = "getMonitors <- function() { 42 }";
+        let sourced_tree = parse_r(sourced_code);
+        let sourced_artifacts = compute_artifacts(&sourced_uri, &sourced_tree, sourced_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "fitModel.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "getMonitors.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "functions.R".to_string(),
+                call_site: CallSiteSpec::Line(u32::MAX),
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else if uri == &sourced_uri {
+                Some(sourced_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // At end of child file, getMonitors should be available via parent line=eof
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope.symbols.contains_key("getMonitors"),
+            "getMonitors should be available from parent-sourced file when line=eof"
         );
     }
 
