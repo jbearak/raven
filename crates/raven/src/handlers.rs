@@ -29653,6 +29653,77 @@ result <- helper_with_spaces(42)"#;
     }
 
     #[test]
+    fn test_circular_dependency_diagnostic_emitted() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let a_path = workspace_path.join("a.R");
+        let b_path = workspace_path.join("b.R");
+        std::fs::write(&a_path, "source('b.R')").unwrap();
+        std::fs::write(&b_path, "source('a.R')").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let a_url = Url::from_file_path(&a_path).unwrap();
+        let b_url = Url::from_file_path(&b_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+
+        // Use extract_metadata (not parse_directives) to detect AST source() calls
+        let meta_a = crate::cross_file::extract_metadata("source('b.R')");
+        let meta_b = crate::cross_file::extract_metadata("source('a.R')");
+        state
+            .cross_file_graph
+            .update_file(&a_url, &meta_a, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&b_url, &meta_b, Some(&workspace_url), |_| None);
+
+        // Verify cycle is detected in graph
+        let cycle = state.cross_file_graph.detect_cycle(&a_url);
+        assert!(
+            cycle.is_some(),
+            "detect_cycle should find cycle: graph state:\n{}",
+            state.cross_file_graph.dump_state()
+        );
+        let detection = cycle.unwrap();
+        // outgoing_edge from a -> b, closing_edge from b -> a
+        assert_eq!(detection.outgoing_edge.from, a_url);
+        assert_eq!(detection.outgoing_edge.to, b_url);
+        assert_eq!(detection.closing_edge.from, b_url);
+        assert_eq!(detection.closing_edge.to, a_url);
+
+        // Add documents so diagnostics() can run
+        state
+            .documents
+            .insert(a_url.clone(), Document::new("source('b.R')", None));
+
+        let diags = diagnostics(&state, &a_url);
+        let circular_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Circular dependency"))
+            .collect();
+
+        assert_eq!(
+            circular_diags.len(),
+            1,
+            "Should emit exactly one circular dependency diagnostic, got: {:?}",
+            diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the diagnostic message mentions the closing file
+        assert!(
+            circular_diags[0].message.contains("b.R"),
+            "Diagnostic should mention closing file: {}",
+            circular_diags[0].message
+        );
+    }
+
+    #[test]
     fn test_circular_dependency_diagnostic_not_emitted_when_severity_off() {
         use tempfile::TempDir;
 
