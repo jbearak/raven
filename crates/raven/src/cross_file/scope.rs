@@ -2688,11 +2688,27 @@ where
                         }
                     }
 
-                    // Resolve the path using PathContext
-                    let child_uri = path_ctx.as_ref().and_then(|ctx| {
-                        let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
-                        super::path_resolve::path_to_uri(&resolved)
-                    });
+                    // Resolve the child URI: prefer pre-computed dependency graph edges
+                    // (which use workspace-root fallback) over re-resolving the path
+                    // (which doesn't). This ensures paths like source("subdir/file.R")
+                    // that rely on workspace-root-relative resolution work correctly
+                    // in scope resolution, matching the dependency graph's behavior.
+                    let child_uri = graph
+                        .get_dependencies(uri)
+                        .iter()
+                        .find(|edge| {
+                            edge.call_site_line == Some(*src_line)
+                                && edge.call_site_column == Some(*src_col)
+                        })
+                        .map(|edge| edge.to.clone())
+                        .or_else(|| {
+                            // Fallback: resolve path directly (for cases without graph edges)
+                            path_ctx.as_ref().and_then(|ctx| {
+                                let resolved =
+                                    super::path_resolve::resolve_path(&source.path, ctx)?;
+                                super::path_resolve::path_to_uri(&resolved)
+                            })
+                        });
 
                     if let Some(child_uri) = child_uri {
                         // Check if we would exceed max depth
@@ -9997,6 +10013,799 @@ y <- filter(df)"#;
             assert!(
                 scope.symbols.contains_key("sourced_var"),
                 "With hoisting, source() after function should make sourced symbols visible in function body. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // =====================================================================
+        // Cross-file hoisting tests: 2+ degrees of separation
+        // =====================================================================
+
+        /// Backward directive: child file (entirely a function body) sees symbols
+        /// from a sibling file sourced by the parent.
+        ///
+        /// Setup:
+        ///   parent.R:  a <- 1; source("sibling.R"); source("child.R")
+        ///   sibling.R: helper <- function() { 42 }
+        ///   child.R:   # @lsp-sourced-by parent.R
+        ///              f <- function() { helper() }
+        ///
+        /// Inside child.R's function body, `helper` (from sibling.R) should be visible.
+        /// This is 2 degrees of separation: child.R → parent.R → sibling.R
+        #[test]
+        fn test_backward_directive_child_function_sees_sibling_symbols() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // Parent: defines a, sources sibling, then sources child
+            let parent_code = "a <- 1\nsource(\"sibling.R\")\nsource(\"child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            // Sibling: defines helper
+            let sibling_code = "helper <- function() { 42 }";
+            let sibling_tree = parse_r(sibling_code);
+            let sibling_artifacts = compute_artifacts(&sibling_uri, &sibling_tree, sibling_code);
+
+            // Child: backward directive to parent, entire body is a function
+            let child_code = "f <- function() { helper() }";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            // Build dependency graph
+            let mut graph = DependencyGraph::new();
+
+            // Register parent's forward sources
+            let parent_meta = CrossFileMetadata {
+                sources: vec![
+                    ForwardSource {
+                        path: "sibling.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "child.R".to_string(),
+                        line: 2,
+                        column: 0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            // Register child's backward directive
+            let child_meta = CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "parent.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            });
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri { Some(parent_artifacts.clone()) }
+                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
+                else if uri == &child_uri { Some(child_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                if uri == &parent_uri { Some(parent_meta.clone()) }
+                else if uri == &child_uri { Some(child_meta.clone()) }
+                else { None }
+            };
+
+            let base_exports = HashSet::new();
+
+            // Query inside child's function body (line 0, col 20) with hoisting ON
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("helper"),
+                "Child function body should see 'helper' from sibling via backward directive (2 degrees). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("a"),
+                "Child function body should see 'a' from parent via backward directive. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Forward chain 2+ levels: A sources B which sources C.
+        /// Inside A's function body, C's symbols should be visible with hoisting.
+        ///
+        /// Setup:
+        ///   a.R: f <- function() { deep_func() }; source("b.R")
+        ///   b.R: source("c.R")
+        ///   c.R: deep_func <- function() { 42 }
+        ///
+        /// Inside a.R's function body, `deep_func` (from c.R) should be visible
+        /// because source("b.R") is a global source() that gets hoisted, and b.R
+        /// transitively brings in c.R's symbols.
+        #[test]
+        fn test_forward_chain_2_levels_hoisted_into_function() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::CrossFileMetadata;
+
+            let a_uri = Url::parse("file:///project/a.R").unwrap();
+            let b_uri = Url::parse("file:///project/b.R").unwrap();
+            let c_uri = Url::parse("file:///project/c.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // A: function body first, then sources B
+            let a_code = "f <- function() { deep_func() }\nsource(\"b.R\")";
+            let a_tree = parse_r(a_code);
+            let a_artifacts = compute_artifacts(&a_uri, &a_tree, a_code);
+
+            // B: sources C
+            let b_code = "source(\"c.R\")";
+            let b_tree = parse_r(b_code);
+            let b_artifacts = compute_artifacts(&b_uri, &b_tree, b_code);
+
+            // C: defines deep_func
+            let c_code = "deep_func <- function() { 42 }";
+            let c_tree = parse_r(c_code);
+            let c_artifacts = compute_artifacts(&c_uri, &c_tree, c_code);
+
+            // Build graph: no backward directives, just forward sources from AST detection
+            let mut graph = DependencyGraph::new();
+            let a_meta = CrossFileMetadata::default(); // sources detected from AST
+            let b_meta = CrossFileMetadata::default();
+            graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &a_uri { Some(a_artifacts.clone()) }
+                else if uri == &b_uri { Some(b_artifacts.clone()) }
+                else if uri == &c_uri { Some(c_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |_uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                None
+            };
+
+            let base_exports = HashSet::new();
+
+            // Inside A's function body (line 0, col 20) with hoisting ON
+            let scope = scope_at_position_with_graph(
+                &a_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("deep_func"),
+                "A's function body should see 'deep_func' from C via forward chain A→B→C (2+ degrees). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Mixed backward + forward chain: child sees symbols from deep transitive sources.
+        ///
+        /// Setup:
+        ///   parent.R:  source("middle.R"); source("child.R")
+        ///   middle.R:  source("leaf.R"); mid_func <- function() { 1 }
+        ///   leaf.R:    deep_func <- function() { 42 }
+        ///   child.R:   # @lsp-sourced-by parent.R
+        ///              f <- function() { deep_func(); mid_func() }
+        ///
+        /// Inside child.R's function body, both `deep_func` (3 degrees: child→parent→middle→leaf)
+        /// and `mid_func` (2 degrees: child→parent→middle) should be visible.
+        #[test]
+        fn test_mixed_backward_forward_chain_3_levels() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let middle_uri = Url::parse("file:///project/middle.R").unwrap();
+            let leaf_uri = Url::parse("file:///project/leaf.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // Parent: sources middle, then sources child
+            let parent_code = "source(\"middle.R\")\nsource(\"child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            // Middle: sources leaf, defines mid_func
+            let middle_code = "source(\"leaf.R\")\nmid_func <- function() { 1 }";
+            let middle_tree = parse_r(middle_code);
+            let middle_artifacts = compute_artifacts(&middle_uri, &middle_tree, middle_code);
+
+            // Leaf: defines deep_func
+            let leaf_code = "deep_func <- function() { 42 }";
+            let leaf_tree = parse_r(leaf_code);
+            let leaf_artifacts = compute_artifacts(&leaf_uri, &leaf_tree, leaf_code);
+
+            // Child: backward directive to parent, entire body is a function
+            let child_code = "f <- function() { deep_func(); mid_func() }";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            // Build dependency graph
+            let mut graph = DependencyGraph::new();
+
+            // Register parent's forward sources (from AST)
+            let parent_meta = CrossFileMetadata {
+                sources: vec![
+                    ForwardSource {
+                        path: "middle.R".to_string(),
+                        line: 0,
+                        column: 0,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "child.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            // Register middle's forward sources (from AST)
+            let middle_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "leaf.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&middle_uri, &middle_meta, Some(&workspace_root), |_| None);
+
+            // Register child's backward directive
+            let child_meta = CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "parent.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            });
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri { Some(parent_artifacts.clone()) }
+                else if uri == &middle_uri { Some(middle_artifacts.clone()) }
+                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
+                else if uri == &child_uri { Some(child_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                if uri == &parent_uri { Some(parent_meta.clone()) }
+                else if uri == &middle_uri { Some(middle_meta.clone()) }
+                else if uri == &child_uri { Some(child_meta.clone()) }
+                else { None }
+            };
+
+            let base_exports = HashSet::new();
+
+            // Query inside child's function body (line 0, col 20) with hoisting ON
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("deep_func"),
+                "Child function body should see 'deep_func' via backward→forward→forward chain (3 degrees). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("mid_func"),
+                "Child function body should see 'mid_func' via backward→forward chain (2 degrees). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Backward directive: entire child file is a function body, child sees
+        /// sibling symbols from parent's source() calls. All files in same directory
+        /// so paths resolve without workspace-root fallback.
+        ///
+        /// Mimics the real-world scenario: fitModel.r is sourced by functions.R,
+        /// which also sources getMonitors.r and applyDataBlock.r.
+        #[test]
+        fn test_backward_directive_entire_file_is_function_body() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/functions.R").unwrap();
+            let sibling1_uri = Url::parse("file:///project/getMonitors.R").unwrap();
+            let sibling2_uri = Url::parse("file:///project/applyDataBlock.R").unwrap();
+            let child_uri = Url::parse("file:///project/fitModel.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // Parent: defines ww, sources siblings then child
+            let parent_code = "ww <- list(seeds = 1:10)\nsource(\"getMonitors.R\")\nsource(\"applyDataBlock.R\")\nsource(\"fitModel.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            // Sibling 1: defines getMonitors
+            let sibling1_code = "getMonitors <- function(x) { x }";
+            let sibling1_tree = parse_r(sibling1_code);
+            let sibling1_artifacts = compute_artifacts(&sibling1_uri, &sibling1_tree, sibling1_code);
+
+            // Sibling 2: defines applyDataBlock
+            let sibling2_code = "applyDataBlock <- function(data, name) { data }";
+            let sibling2_tree = parse_r(sibling2_code);
+            let sibling2_artifacts = compute_artifacts(&sibling2_uri, &sibling2_tree, sibling2_code);
+
+            // Child: backward directive to parent, entire body is a function
+            let child_code = "fitModel <- function(model.name, data = NULL) {\n    monitor <- getMonitors(TRUE)\n    data <- applyDataBlock(data, model.name)\n    ww$seeds\n}";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            // Build dependency graph
+            let mut graph = DependencyGraph::new();
+
+            let parent_meta = CrossFileMetadata {
+                sources: vec![
+                    ForwardSource {
+                        path: "getMonitors.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "applyDataBlock.R".to_string(),
+                        line: 2,
+                        column: 0,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "fitModel.R".to_string(),
+                        line: 3,
+                        column: 0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let child_meta = CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "functions.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            });
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri { Some(parent_artifacts.clone()) }
+                else if uri == &sibling1_uri { Some(sibling1_artifacts.clone()) }
+                else if uri == &sibling2_uri { Some(sibling2_artifacts.clone()) }
+                else if uri == &child_uri { Some(child_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                if uri == &parent_uri { Some(parent_meta.clone()) }
+                else if uri == &child_uri { Some(child_meta.clone()) }
+                else { None }
+            };
+
+            let base_exports = HashSet::new();
+
+            // Query inside child's function body (line 1, col 15) with hoisting ON
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                1,
+                15,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("getMonitors"),
+                "Inside function body, should see 'getMonitors' from sibling via backward directive. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("applyDataBlock"),
+                "Inside function body, should see 'applyDataBlock' from sibling via backward directive. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("ww"),
+                "Inside function body, should see 'ww' from parent via backward directive. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+
+            // Also verify function parameters are visible
+            assert!(
+                scope.symbols.contains_key("model.name"),
+                "Function parameters should be visible inside function body. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("data"),
+                "Function parameters should be visible inside function body. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Forward directive chain: 3 levels through @lsp-source directives.
+        ///
+        /// Setup:
+        ///   a.R: f <- function() { leaf_var }
+        ///        # @lsp-source b.R
+        ///   b.R: # @lsp-source c.R
+        ///   c.R: leaf_var <- 42
+        #[test]
+        fn test_forward_directive_chain_3_levels_hoisted() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+            let a_uri = Url::parse("file:///project/a.R").unwrap();
+            let b_uri = Url::parse("file:///project/b.R").unwrap();
+            let c_uri = Url::parse("file:///project/c.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // A: function body first, then @lsp-source directive for B
+            // The directive is on line 1, so its source event is at line 1
+            let a_code = "f <- function() { leaf_var }\n# @lsp-source b.R";
+            let a_tree = parse_r(a_code);
+            let a_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "b.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let a_artifacts = compute_artifacts_with_metadata(&a_uri, &a_tree, a_code, Some(&a_meta));
+
+            // B: @lsp-source directive for C
+            let b_code = "# @lsp-source c.R";
+            let b_tree = parse_r(b_code);
+            let b_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "c.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    is_directive: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let b_artifacts = compute_artifacts_with_metadata(&b_uri, &b_tree, b_code, Some(&b_meta));
+
+            // C: defines leaf_var
+            let c_code = "leaf_var <- 42";
+            let c_tree = parse_r(c_code);
+            let c_artifacts = compute_artifacts(&c_uri, &c_tree, c_code);
+
+            // Build graph
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &a_uri { Some(a_artifacts.clone()) }
+                else if uri == &b_uri { Some(b_artifacts.clone()) }
+                else if uri == &c_uri { Some(c_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                if uri == &a_uri { Some(a_meta.clone()) }
+                else if uri == &b_uri { Some(b_meta.clone()) }
+                else { None }
+            };
+
+            let base_exports = HashSet::new();
+
+            // Inside A's function body (line 0, col 20) with hoisting ON
+            let scope = scope_at_position_with_graph(
+                &a_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("leaf_var"),
+                "A's function body should see 'leaf_var' from C via forward directive chain A→B→C (3 levels). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Backward + forward combination: child has backward directive to parent,
+        /// parent has forward source to sibling, sibling has forward source to leaf.
+        /// Verifies 3 degrees of total separation with mixed directive types.
+        ///
+        /// Setup:
+        ///   parent.R: source("sibling.R"); source("child.R")
+        ///   sibling.R: source("leaf.R"); sib_func <- 1
+        ///   leaf.R: leaf_func <- function() { 42 }
+        ///   child.R: # @lsp-sourced-by parent.R
+        ///            f <- function() { leaf_func(); sib_func }
+        #[test]
+        fn test_backward_then_forward_chain_3_degrees() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
+            let leaf_uri = Url::parse("file:///project/leaf.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            let parent_code = "source(\"sibling.R\")\nsource(\"child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            let sibling_code = "source(\"leaf.R\")\nsib_func <- 1";
+            let sibling_tree = parse_r(sibling_code);
+            let sibling_artifacts = compute_artifacts(&sibling_uri, &sibling_tree, sibling_code);
+
+            let leaf_code = "leaf_func <- function() { 42 }";
+            let leaf_tree = parse_r(leaf_code);
+            let leaf_artifacts = compute_artifacts(&leaf_uri, &leaf_tree, leaf_code);
+
+            let child_code = "f <- function() { leaf_func(); sib_func }";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            let mut graph = DependencyGraph::new();
+
+            let parent_meta = CrossFileMetadata {
+                sources: vec![
+                    ForwardSource {
+                        path: "sibling.R".to_string(),
+                        line: 0,
+                        column: 0,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "child.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let sibling_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "leaf.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&sibling_uri, &sibling_meta, Some(&workspace_root), |_| None);
+
+            let child_meta = CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "parent.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            });
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri { Some(parent_artifacts.clone()) }
+                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
+                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
+                else if uri == &child_uri { Some(child_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                if uri == &parent_uri { Some(parent_meta.clone()) }
+                else if uri == &sibling_uri { Some(sibling_meta.clone()) }
+                else if uri == &child_uri { Some(child_meta.clone()) }
+                else { None }
+            };
+
+            let base_exports = HashSet::new();
+
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("leaf_func"),
+                "Child function body should see 'leaf_func' from leaf via backward→forward→forward (3 degrees). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("sib_func"),
+                "Child function body should see 'sib_func' from sibling via backward→forward (2 degrees). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Verify that cross-file symbols from backward directives are available
+        /// inside function bodies even WITHOUT hoisting. Parent symbols come from
+        /// STEP 1 which is position-independent.
+        #[test]
+        fn test_backward_directive_symbols_visible_without_hoisting() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            let parent_code = "a <- 1\nsource(\"sibling.R\")\nsource(\"child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            let sibling_code = "helper <- function() { 42 }";
+            let sibling_tree = parse_r(sibling_code);
+            let sibling_artifacts = compute_artifacts(&sibling_uri, &sibling_tree, sibling_code);
+
+            let child_code = "f <- function() { helper() }";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            let mut graph = DependencyGraph::new();
+
+            let parent_meta = CrossFileMetadata {
+                sources: vec![
+                    ForwardSource {
+                        path: "sibling.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "child.R".to_string(),
+                        line: 2,
+                        column: 0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let child_meta = CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "parent.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
+            });
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri { Some(parent_artifacts.clone()) }
+                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
+                else if uri == &child_uri { Some(child_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+                if uri == &parent_uri { Some(parent_meta.clone()) }
+                else if uri == &child_uri { Some(child_meta.clone()) }
+                else { None }
+            };
+
+            let base_exports = HashSet::new();
+
+            // Query inside child's function body with hoisting OFF
+            // Parent symbols from STEP 1 should still be visible (they're position-independent)
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                false, // hoisting OFF
+            );
+
+            assert!(
+                scope.symbols.contains_key("helper"),
+                "Parent-provided symbols should be visible inside function body even without hoisting (STEP 1 is position-independent). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("a"),
+                "Parent's own symbols should be visible inside function body even without hoisting. Got: {:?}",
                 scope.symbols.keys().collect::<Vec<_>>()
             );
         }
