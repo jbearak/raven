@@ -430,6 +430,7 @@ fn budget_scope_resolution_50_file_workspace() {
         Some(&folder_url),
         20,
         &base_exports,
+        true,
     );
 
     let elapsed = median_of_3(|| {
@@ -443,6 +444,7 @@ fn budget_scope_resolution_50_file_workspace() {
             Some(&folder_url),
             20,
             &base_exports,
+            true,
         );
     });
 

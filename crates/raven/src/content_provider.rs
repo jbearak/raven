@@ -2255,6 +2255,7 @@ mod integration_tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Requirement 12.2: Declared symbol from indexed child file should be available

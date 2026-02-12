@@ -171,6 +171,27 @@ source("a.R")  # Symbols from a.R available after this line
 y <- foo()     # foo() from a.R is now in scope
 ```
 
+## Global Symbol Hoisting
+
+R has late-binding semantics — a function can reference another function or variable that hasn't been defined yet at the time of the function's *definition*, as long as it exists by the time the function is *called*. This is idiomatic R:
+
+```r
+main <- function() {
+  helper()  # helper doesn't exist yet, but will when main() is called
+}
+helper <- function() { 42 }
+main()  # works fine
+```
+
+Raven supports this by hoisting global (top-level) definitions inside function bodies. When the cursor is inside a function body, all global definitions, `source()` calls, `library()` calls, and `rm()` calls are visible regardless of their position in the file. Function-local variables remain strictly positional.
+
+This means:
+- **Inside a function body**: hover, go-to-definition, and completions resolve globals defined anywhere in the file
+- **At the global level**: behavior is unchanged — only definitions above the cursor are visible
+- **`rm()` calls**: a global `rm(x)` after a function will correctly exclude `x` from that function's scope
+
+This behavior is enabled by default and can be disabled with `raven.crossFile.hoistGlobalsInFunctions: false` (see [Configuration](configuration.md)).
+
 ## Symbol Recognition (v1 Model)
 
 The LSP recognizes the following R constructs as symbol definitions:

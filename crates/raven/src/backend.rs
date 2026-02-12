@@ -201,6 +201,13 @@ pub(crate) fn parse_cross_file_config(
             config.redundant_directive_severity = parse_severity(sev);
         }
 
+        if let Some(v) = cross_file
+            .get("hoistGlobalsInFunctions")
+            .and_then(|v| v.as_bool())
+        {
+            config.hoist_globals_in_functions = v;
+        }
+
         // Parse on-demand indexing settings
         if let Some(on_demand) = cross_file.get("onDemandIndexing") {
             if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
@@ -295,6 +302,10 @@ pub(crate) fn parse_cross_file_config(
         config.undefined_variables_enabled
     );
     log::info!("  diagnostics_enabled: {}", config.diagnostics_enabled);
+    log::info!(
+        "  hoist_globals_in_functions: {}",
+        config.hoist_globals_in_functions
+    );
     log::info!("  On-demand indexing:");
     log::info!("    enabled: {}", config.on_demand_indexing_enabled);
     log::info!(
@@ -887,7 +898,7 @@ impl LanguageServer for Backend {
 
         // Compute affected files while holding write lock
         let (
-            work_items,
+            mut work_items,
             debounce_ms,
             files_to_index,
             on_demand_enabled,
@@ -1097,9 +1108,10 @@ impl LanguageServer for Backend {
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
 
-            // Only invalidate dependents if interface changed (optimization)
-            // This avoids cascading revalidation when file content hasn't changed
-            if interface_changed {
+            // Invalidate dependents if interface changed OR dependency edges changed.
+            // Interface changes affect symbol resolution in dependent files.
+            // Edge changes affect cycle detection diagnostics in dependent files.
+            if interface_changed || result.edges_changed {
                 let dependents = state
                     .cross_file_graph
                     .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
@@ -1326,12 +1338,31 @@ impl LanguageServer for Backend {
                     }
                 }
 
-                state.cross_file_graph.update_file(
+                let second_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
+
+                // If re-enrichment changed dependency edges (e.g., inherited WD
+                // altered path resolution), schedule newly affected dependents.
+                if second_result.edges_changed {
+                    let max_chain_depth = state.cross_file_config.max_chain_depth;
+                    let dependents = state
+                        .cross_file_graph
+                        .get_transitive_dependents(&uri, max_chain_depth);
+                    for dep in dependents {
+                        if state.documents.contains_key(&dep) {
+                            state.diagnostics_gate.mark_force_republish(&dep);
+                            let trigger_version =
+                                state.documents.get(&dep).and_then(|d| d.version);
+                            let trigger_revision =
+                                state.documents.get(&dep).map(|d| d.revision);
+                            work_items.push((dep, trigger_version, trigger_revision));
+                        }
+                    }
+                }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
                 if let Some(forward_ctx) =
@@ -1439,6 +1470,7 @@ impl LanguageServer for Backend {
                     state.workspace_folders.first(),
                     state.cross_file_config.max_chain_depth,
                     &empty_base_exports,
+                    false, // package prefetching doesn't need hoisting
                 );
 
                 let mut pkgs = scope.inherited_packages;
@@ -1639,7 +1671,7 @@ impl LanguageServer for Backend {
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // Extract and enrich metadata with inherited working directory
-            let (packages_to_prefetch, enriched_meta, wd_affected) = if let Some(doc) =
+            let (packages_to_prefetch, enriched_meta, wd_affected, edges_changed) = if let Some(doc) =
                 state.documents.get(&uri)
             {
                 let text = doc.text();
@@ -1690,7 +1722,7 @@ impl LanguageServer for Backend {
                     })
                     .collect();
 
-                let _result = state.cross_file_graph.update_file(
+                let graph_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
                     workspace_root.as_ref(),
@@ -1707,9 +1739,9 @@ impl LanguageServer for Backend {
                         &state.cross_file_meta,
                     );
 
-                (pkgs, Some(meta), wd_children)
+                (pkgs, Some(meta), wd_children, graph_result.edges_changed)
             } else {
-                (Vec::new(), None, Vec::new())
+                (Vec::new(), None, Vec::new(), false)
             };
 
             // Update new DocumentStore with enriched metadata (Requirement 1.4)
@@ -1752,9 +1784,11 @@ impl LanguageServer for Backend {
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
 
-            // Only invalidate dependents if interface changed (optimization)
-            // This avoids cascading revalidation when only comments/local variables change
-            if interface_changed {
+            // Invalidate dependents if interface changed OR dependency edges changed.
+            // Interface changes affect symbol resolution in dependent files.
+            // Edge changes affect cycle detection diagnostics in dependent files
+            // (e.g., commenting out a source() call breaks a cycle).
+            if interface_changed || edges_changed {
                 let dependents = state
                     .cross_file_graph
                     .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
@@ -2851,7 +2885,7 @@ impl LanguageServer for Backend {
                             tree.root_node().descendant_for_point_range(point, point)
                         {
                             let is_error = node.is_error()
-                                || node.parent().map_or(false, |p| p.is_error());
+                                || node.parent().is_some_and(|p| p.is_error());
                             if is_error {
                                 log::trace!(
                                     "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
@@ -2884,7 +2918,7 @@ impl LanguageServer for Backend {
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
         let raw_tab_size = params.options.tab_size;
-        let tab_size = raw_tab_size.max(1).min(8);
+        let tab_size = raw_tab_size.clamp(1, 8);
         if raw_tab_size == 0 {
             log::warn!("on_type_formatting: tab_size 0 is invalid, clamped to 1");
         } else if raw_tab_size > 8 {

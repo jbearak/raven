@@ -1926,6 +1926,7 @@ fn get_cross_file_scope(
         state.workspace_folders.first(),
         max_depth,
         &base_exports,
+        state.cross_file_config.hoist_globals_in_functions,
     )
 }
 
@@ -2577,24 +2578,60 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
 
     // Check for circular dependencies
     if let Some(severity) = state.cross_file_config.circular_dependency_severity {
-        if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
-            let line = cycle_edge.call_site_line.unwrap_or(0);
-            let col = cycle_edge.call_site_column.unwrap_or(0);
-            let target = cycle_edge
-                .to
+        if let Some(cycle) = state.cross_file_graph.detect_cycle(uri) {
+            let out = &cycle.outgoing_edge;
+            let close = &cycle.closing_edge;
+
+            // Position: the source() call in THIS file that starts the cycle
+            let line = out.call_site_line.unwrap_or(0);
+            let col = out.call_site_column.unwrap_or(0);
+
+            // Clamp to file bounds as safety net
+            let max_line = text.lines().count().saturating_sub(1) as u32;
+            let line = line.min(max_line);
+
+            // Closing file name + line (1-based for display)
+            let closing_file = close
+                .from
                 .path_segments()
                 .and_then(|mut s| s.next_back().map(|s| s.to_string()))
                 .unwrap_or_default();
+            let closing_line_1based = close.call_site_line.map(|l| l + 1);
+
+            // Try to get the code snippet from the closing edge's file
+            let snippet = close.call_site_line.and_then(|cl| {
+                let content = state
+                    .documents
+                    .get(&close.from)
+                    .map(|d| d.text())
+                    .or_else(|| state.cross_file_file_cache.get(&close.from));
+                content
+                    .and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
+            });
+
+            let message = match (closing_line_1based, snippet) {
+                (Some(cl), Some(code)) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
+                    )
+                }
+                (Some(cl), None) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file"
+                    )
+                }
+                _ => {
+                    format!("Circular dependency: {closing_file} sources this file")
+                }
+            };
+
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(line, col),
-                    end: Position::new(line, col + 1),
+                    end: Position::new(line, col.saturating_add(1)),
                 },
                 severity: Some(severity),
-                message: format!(
-                    "Circular dependency detected: sourcing '{}' creates a cycle",
-                    target
-                ),
+                message,
                 ..Default::default()
             });
         }
@@ -3357,6 +3394,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         state.workspace_folders.first(),
         max_depth,
         &empty_base_exports,
+        false, // depth-exceeded check doesn't need hoisting
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -29615,6 +29653,87 @@ result <- helper_with_spaces(42)"#;
     }
 
     #[test]
+    fn test_circular_dependency_diagnostic_emitted() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let a_path = workspace_path.join("a.R");
+        let b_path = workspace_path.join("b.R");
+        std::fs::write(&a_path, "source('b.R')").unwrap();
+        std::fs::write(&b_path, "source('a.R')").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let a_url = Url::from_file_path(&a_path).unwrap();
+        let b_url = Url::from_file_path(&b_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+
+        // Use extract_metadata (not parse_directives) to detect AST source() calls
+        let meta_a = crate::cross_file::extract_metadata("source('b.R')");
+        let meta_b = crate::cross_file::extract_metadata("source('a.R')");
+        state
+            .cross_file_graph
+            .update_file(&a_url, &meta_a, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&b_url, &meta_b, Some(&workspace_url), |_| None);
+
+        // Verify cycle is detected in graph
+        let cycle = state.cross_file_graph.detect_cycle(&a_url);
+        assert!(
+            cycle.is_some(),
+            "detect_cycle should find cycle: graph state:\n{}",
+            state.cross_file_graph.dump_state()
+        );
+        let detection = cycle.unwrap();
+        // outgoing_edge from a -> b, closing_edge from b -> a
+        assert_eq!(detection.outgoing_edge.from, a_url);
+        assert_eq!(detection.outgoing_edge.to, b_url);
+        assert_eq!(detection.closing_edge.from, b_url);
+        assert_eq!(detection.closing_edge.to, a_url);
+
+        // Add documents so diagnostics() can run; include b.R so the
+        // snippet-retrieval branch is exercised (closing edge comes from b.R).
+        state
+            .documents
+            .insert(a_url.clone(), Document::new("source('b.R')", None));
+        state
+            .documents
+            .insert(b_url.clone(), Document::new("source('a.R')", None));
+
+        let diags = diagnostics(&state, &a_url);
+        let circular_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Circular dependency"))
+            .collect();
+
+        assert_eq!(
+            circular_diags.len(),
+            1,
+            "Should emit exactly one circular dependency diagnostic, got: {:?}",
+            diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the diagnostic message includes the closing file, line number,
+        // and source line snippet (exercises the snippet-retrieval path).
+        assert!(
+            circular_diags[0].message.contains("b.R"),
+            "Diagnostic should mention closing file: {}",
+            circular_diags[0].message
+        );
+        assert!(
+            circular_diags[0].message.contains("source('a.R')"),
+            "Diagnostic should include source line snippet: {}",
+            circular_diags[0].message
+        );
+    }
+
+    #[test]
     fn test_circular_dependency_diagnostic_not_emitted_when_severity_off() {
         use tempfile::TempDir;
 
@@ -29869,7 +29988,7 @@ result <- filter(c(1, -2, 3))"#;
         let base_exports = HashSet::new();
 
         // Query scope at line 2 (after both library and local definition)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Symbol should be in scope
         assert!(
@@ -29972,7 +30091,7 @@ z <- mutate(5)  # Uses local definition"#;
 
         // Query scope at line 1 (before local definition) - should get package export
         let scope_before =
-            scope_at_position_with_packages(&artifacts, 1, 5, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 1, 5, &get_exports, &base_exports, false);
         assert!(
             scope_before.symbols.contains_key("mutate"),
             "mutate should be in scope before local def"
@@ -29986,7 +30105,7 @@ z <- mutate(5)  # Uses local definition"#;
 
         // Query scope at line 3 (after local definition) - should get local definition
         let scope_after =
-            scope_at_position_with_packages(&artifacts, 3, 5, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 3, 5, &get_exports, &base_exports, false);
         assert!(
             scope_after.symbols.contains_key("mutate"),
             "mutate should be in scope after local def"
@@ -30279,7 +30398,7 @@ result <- filter(c(1, -2, 3))"#;
         let base_exports = HashSet::new();
 
         // Query scope at line 2 (after both library and local definition)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Symbol should be in scope
         assert!(
@@ -30989,7 +31108,7 @@ mysymbol
             compute_artifacts_with_metadata(&uri1, &tree1, code1, Some(&directive_meta1));
 
         // Get scope at line 2 (after both declarations)
-        let scope1 = scope_at_position(&artifacts1, 2, 0);
+        let scope1 = scope_at_position(&artifacts1, 2, 0, false);
         let symbol1 = scope1.symbols.get("mysymbol");
         assert!(symbol1.is_some(), "Symbol should be in scope");
         assert_eq!(
@@ -31009,7 +31128,7 @@ mysymbol
             compute_artifacts_with_metadata(&uri2, &tree2, code2, Some(&directive_meta2));
 
         // Get scope at line 2 (after both declarations)
-        let scope2 = scope_at_position(&artifacts2, 2, 0);
+        let scope2 = scope_at_position(&artifacts2, 2, 0, false);
         let symbol2 = scope2.symbols.get("mysymbol");
         assert!(symbol2.is_some(), "Symbol should be in scope");
         assert_eq!(

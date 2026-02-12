@@ -4646,6 +4646,16 @@ child_function <- function() {
     }
 }
 
+/// Parse R source code into a tree-sitter Tree. Shared helper for test modules.
+#[cfg(test)]
+fn parse_r_tree(code: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .unwrap();
+    parser.parse(code, None).unwrap()
+}
+
 // ============================================================================
 // Integration Tests for @lsp-source Forward Directive Scope Resolution
 // ============================================================================
@@ -4668,15 +4678,6 @@ mod lsp_source_scope_tests {
     };
     use crate::cross_file::types::CrossFileMetadata;
     use std::collections::HashSet;
-    use tree_sitter::Parser;
-
-    fn parse_r_tree(code: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_r::LANGUAGE.into())
-            .unwrap();
-        parser.parse(code, None).unwrap()
-    }
 
     /// Test that symbols from @lsp-source directive are available after the directive line.
     ///
@@ -4810,6 +4811,7 @@ child_var <- 100
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4834,6 +4836,7 @@ child_var <- 100
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4857,6 +4860,7 @@ child_var <- 100
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4984,6 +4988,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5004,6 +5009,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5121,6 +5127,7 @@ x <- 1
                 Some(&workspace_root),
                 10,
                 &HashSet::new(),
+                false,
             );
 
             assert!(
@@ -5610,6 +5617,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5684,6 +5692,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5783,6 +5792,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5857,6 +5867,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5869,5 +5880,187 @@ x <- 1
         println!("Requirements Validated:");
         println!("  - 7.2: Removing @lsp-source removes edge and triggers revalidation");
         println!("  - 5.1: Symbols no longer available after directive removed");
+    }
+}
+
+// ============================================================================
+// Integration Tests for Cross-File Hoisting with Workspace-Root Fallback
+// ============================================================================
+
+/// Integration tests verifying that cross-file scope resolution works correctly
+/// when source() paths require workspace-root fallback resolution.
+///
+/// This tests the real-world scenario where a parent script in one directory
+/// sources files in a sibling directory using workspace-root-relative paths
+/// (e.g., `source("functions/helpers.R")` from a script in `scripts/`).
+#[cfg(test)]
+mod cross_directory_hoisting_tests {
+    use super::*;
+    use crate::cross_file::dependency::DependencyGraph;
+    use crate::cross_file::scope::{
+        compute_artifacts, scope_at_position_with_graph,
+        ScopeArtifacts,
+    };
+    use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+    use std::collections::HashSet;
+
+    /// Test that workspace-root fallback in scope resolution enables cross-directory
+    /// source() calls to resolve correctly.
+    ///
+    /// Setup (on-disk temp files):
+    ///   scripts/functions.R:   ww <- 1; source("functions/getMonitors.R"); source("functions/fitModel.R")
+    ///   functions/getMonitors.R: getMonitors <- function(x) { x }
+    ///   functions/fitModel.R:  # @lsp-sourced-by ../scripts/functions.R
+    ///                          fitModel <- function() { getMonitors(TRUE); ww }
+    ///
+    /// The parent (scripts/functions.R) uses workspace-root-relative paths
+    /// (e.g., "functions/getMonitors.R"). When the scope resolution processes the
+    /// parent's source() events, it needs workspace-root fallback to find the files.
+    #[test]
+    fn test_cross_directory_backward_directive_with_workspace_fallback() {
+        println!("\n=== Test: cross-directory backward directive with workspace-root fallback ===\n");
+
+        let mut workspace = TestWorkspace::new().unwrap();
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        // Create files in different subdirectories
+        let parent_code = "ww <- 1\nsource(\"functions/getMonitors.R\")\nsource(\"functions/fitModel.R\")";
+        let parent_uri = workspace.add_file("scripts/functions.R", parent_code).unwrap();
+
+        let sibling_code = "getMonitors <- function(x) { x }";
+        let sibling_uri = workspace.add_file("functions/getMonitors.R", sibling_code).unwrap();
+
+        let child_code = "fitModel <- function(model.name) {\n    monitor <- getMonitors(TRUE)\n    ww\n}";
+        let child_uri = workspace.add_file("functions/fitModel.R", child_code).unwrap();
+
+        println!("  Parent:  {}", parent_uri);
+        println!("  Sibling: {}", sibling_uri);
+        println!("  Child:   {}", child_uri);
+
+        // Parse all files
+        let parent_tree = parse_r_tree(parent_code);
+        let sibling_tree = parse_r_tree(sibling_code);
+        let child_tree = parse_r_tree(child_code);
+
+        // Compute artifacts
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        let sibling_artifacts = compute_artifacts(&sibling_uri, &sibling_tree, sibling_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph - parent's source() calls need workspace-root fallback
+        let mut graph = DependencyGraph::new();
+
+        let parent_meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "functions/getMonitors.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "functions/fitModel.R".to_string(),
+                    line: 2,
+                    column: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        // Synthetic backward directive: constructed directly rather than extracted from
+        // child code, to test graph-build + scope-resolution without the full
+        // metadata-extraction pipeline.
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../scripts/functions.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
+            if uri == &parent_uri {
+                Some(parent_code.to_string())
+            } else {
+                None
+            }
+        });
+
+        // Verify graph edges were created correctly via workspace-root fallback
+        let parent_deps = graph.get_dependencies(&parent_uri);
+        println!("  Parent forward edges: {:?}", parent_deps.iter().map(|e| &e.to).collect::<Vec<_>>());
+        // At least 2 edges from parent's forward sources; the child's backward directive
+        // may also register a parent→child forward edge (3 total) unless the graph
+        // coalesces duplicate (from, to) pairs.
+        assert!(
+            parent_deps.len() >= 2,
+            "Parent should have at least 2 forward edges, got: {:?}",
+            parent_deps.iter().map(|e| &e.to).collect::<Vec<_>>()
+        );
+        assert!(
+            parent_deps.iter().any(|e| e.to == child_uri),
+            "Parent should have forward edge to child (fitModel.R)"
+        );
+        assert!(
+            parent_deps.iter().any(|e| e.to == sibling_uri),
+            "Parent should have forward edge to sibling (via workspace-root fallback)"
+        );
+
+        let child_parents = graph.get_dependents(&child_uri);
+        println!("  Child backward edges: {:?}", child_parents.iter().map(|e| &e.from).collect::<Vec<_>>());
+        assert!(
+            child_parents.iter().any(|e| e.from == parent_uri),
+            "Child should have backward edge from parent"
+        );
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else if uri == &child_uri { Some(child_meta.clone()) }
+            else { None }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query inside child's function body with hoisting ON
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            1,
+            15,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &base_exports,
+            true,
+        );
+
+        println!("  Scope symbols: {:?}", scope.symbols.keys().collect::<Vec<_>>());
+
+        assert!(
+            scope.symbols.contains_key("getMonitors"),
+            "Inside function body, should see 'getMonitors' from sibling via backward directive + workspace-root fallback. Got: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("ww"),
+            "Inside function body, should see 'ww' from parent. Got: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("model.name"),
+            "Function parameter 'model.name' should be visible. Got: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+
+        println!("\n=== Test Passed ===");
     }
 }

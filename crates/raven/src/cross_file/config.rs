@@ -76,6 +76,11 @@ pub struct CrossFileConfig {
     pub cache_existence_max_entries: usize,
     /// Maximum entries in the cross-file workspace index (LRU eviction)
     pub cache_workspace_index_max_entries: usize,
+    /// Whether to hoist global definitions inside function bodies.
+    /// When true, all top-level (global) definitions are visible inside function bodies
+    /// regardless of position, since by the time any function executes the entire file
+    /// has been sourced. Function-local variables remain positional.
+    pub hoist_globals_in_functions: bool,
 }
 
 impl Default for CrossFileConfig {
@@ -126,6 +131,7 @@ impl Default for CrossFileConfig {
             cache_file_content_max_entries: 500,
             cache_existence_max_entries: 2000,
             cache_workspace_index_max_entries: 5000,
+            hoist_globals_in_functions: true,
         }
     }
 }
@@ -137,6 +143,7 @@ impl CrossFileConfig {
             || self.max_chain_depth != other.max_chain_depth
             || self.max_backward_depth != other.max_backward_depth
             || self.max_forward_depth != other.max_forward_depth
+            || self.hoist_globals_in_functions != other.hoist_globals_in_functions
     }
 }
 
@@ -172,6 +179,8 @@ mod tests {
             config.redundant_directive_severity,
             Some(DiagnosticSeverity::HINT)
         );
+        // Hoist globals in functions default
+        assert!(config.hoist_globals_in_functions);
     }
 
     #[test]
@@ -189,6 +198,11 @@ mod tests {
         // Reset and change max_chain_depth
         config2 = CrossFileConfig::default();
         config2.max_chain_depth = 30;
+        assert!(config1.scope_settings_changed(&config2));
+
+        // Reset and change hoist_globals_in_functions
+        config2 = CrossFileConfig::default();
+        config2.hoist_globals_in_functions = false;
         assert!(config1.scope_settings_changed(&config2));
     }
 
