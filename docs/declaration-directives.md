@@ -24,11 +24,9 @@ These directives work in any R file, whether or not it participates in cross-fil
 
 ## Syntax Variations
 
-All syntax variations are supported:
+The `@` prefix is required for all directives. All syntax variations are supported:
 - With or without colon: `@lsp-var: myvar` or `@lsp-var myvar`
 - With quotes for special characters: `@lsp-var "my.var"` or `@lsp-var 'my.var'`
-
-**Important:** Unlike source directives, declaration directives require the `@` prefix. `# lsp-var myvar` (without `@`) is NOT recognized.
 
 ## Position-Aware Behavior
 

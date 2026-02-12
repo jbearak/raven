@@ -16430,11 +16430,6 @@ fn forward_directive_synonym() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just("lsp-source"), Just("lsp-run"), Just("lsp-include"),]
 }
 
-/// Generate optional @ prefix
-fn optional_at_prefix() -> impl Strategy<Value = &'static str> {
-    prop_oneof![Just("@"), Just(""),]
-}
-
 /// Generate optional colon separator
 fn optional_colon() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just(":"), Just(""),]
@@ -16475,14 +16470,13 @@ proptest! {
 
     /// Feature: lsp-source-directive, Property 1: Forward Directive Parsing Completeness
     ///
-    /// For any valid forward directive syntax variation (with/without @, with/without colon,
+    /// For any valid forward directive syntax variation (with/without colon,
     /// with single/double/no quotes, with/without line= parameter), the Directive_Parser
     /// SHALL produce a ForwardSource entry with the correct path and `is_directive=true`.
     ///
     /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9**
     #[test]
     fn prop_forward_directive_parsing_completeness(
-        at_prefix in optional_at_prefix(),
         synonym in forward_directive_synonym(),
         colon in optional_colon(),
         path in relative_path(),  // Use simple path for unquoted case
@@ -16504,7 +16498,7 @@ proptest! {
         for i in 0..prefix_lines {
             lines.push(format!("x{} <- {}", i, i));
         }
-        lines.push(format!("# {}{}{} {}{}", at_prefix, synonym, colon, formatted_path, line_suffix));
+        lines.push(format!("# @{}{} {}{}", synonym, colon, formatted_path, line_suffix));
         let content = lines.join("\n");
 
         let meta = parse_directives(&content);
@@ -16513,8 +16507,8 @@ proptest! {
         prop_assert_eq!(
             meta.sources.len(),
             1,
-            "Expected 1 ForwardSource for directive: # {}{}{} {}{}",
-            at_prefix, synonym, colon, formatted_path, line_suffix
+            "Expected 1 ForwardSource for directive: # @{}{} {}{}",
+            synonym, colon, formatted_path, line_suffix
         );
 
         let source = &meta.sources[0];
@@ -16566,7 +16560,6 @@ proptest! {
     /// **Validates: Requirements 1.6, 1.7, 1.8**
     #[test]
     fn prop_forward_directive_paths_with_spaces(
-        at_prefix in optional_at_prefix(),
         synonym in forward_directive_synonym(),
         colon in optional_colon(),
         dir in path_component(),
@@ -16581,7 +16574,7 @@ proptest! {
             format!("'{}'", path_with_spaces)
         };
 
-        let content = format!("# {}{}{} {}", at_prefix, synonym, colon, formatted_path);
+        let content = format!("# @{}{} {}", synonym, colon, formatted_path);
         let meta = parse_directives(&content);
 
         // Should produce exactly one ForwardSource
@@ -16607,37 +16600,34 @@ proptest! {
     fn prop_forward_directive_all_syntax_combinations(
         path in relative_path(),
     ) {
-        let at_prefixes = ["@", ""];
         let synonyms = ["lsp-source", "lsp-run", "lsp-include"];
         let colons = [":", ""];
         let quote_styles = [QuoteStyle::None, QuoteStyle::Double, QuoteStyle::Single];
 
-        for at_prefix in &at_prefixes {
-            for synonym in &synonyms {
-                for colon in &colons {
-                    for quotes in &quote_styles {
-                        let formatted_path = format_path_with_quotes(&path, *quotes);
-                        let content = format!("# {}{}{} {}", at_prefix, synonym, colon, formatted_path);
-                        let meta = parse_directives(&content);
+        for synonym in &synonyms {
+            for colon in &colons {
+                for quotes in &quote_styles {
+                    let formatted_path = format_path_with_quotes(&path, *quotes);
+                    let content = format!("# @{}{} {}", synonym, colon, formatted_path);
+                    let meta = parse_directives(&content);
 
-                        prop_assert_eq!(
-                            meta.sources.len(),
-                            1,
-                            "Failed for: {}",
-                            content
-                        );
-                        prop_assert_eq!(
-                            &meta.sources[0].path,
-                            &path,
-                            "Path mismatch for: {}",
-                            content
-                        );
-                        prop_assert!(
-                            meta.sources[0].is_directive,
-                            "is_directive should be true for: {}",
-                            content
-                        );
-                    }
+                    prop_assert_eq!(
+                        meta.sources.len(),
+                        1,
+                        "Failed for: {}",
+                        content
+                    );
+                    prop_assert_eq!(
+                        &meta.sources[0].path,
+                        &path,
+                        "Path mismatch for: {}",
+                        content
+                    );
+                    prop_assert!(
+                        meta.sources[0].is_directive,
+                        "is_directive should be true for: {}",
+                        content
+                    );
                 }
             }
         }
@@ -16782,11 +16772,11 @@ proptest! {
 
     /// Feature: lsp-source-directive, Property 2 Extended: Synonym equivalence without @ prefix
     ///
-    /// Synonyms without @ prefix should also produce identical ForwardSource entries.
+    /// Synonyms without @ prefix should NOT be recognized as directives.
     ///
-    /// **Validates: Requirements 1.2, 1.3, 1.4**
+    /// **Validates: All directives require @ prefix**
     #[test]
-    fn prop_forward_directive_synonym_equivalence_no_at_prefix(
+    fn prop_forward_directive_synonym_no_at_prefix_not_recognized(
         path in relative_path_with_parents(),
     ) {
         let source_content = format!("# lsp-source {}", path);
@@ -16797,19 +16787,10 @@ proptest! {
         let meta_run = parse_directives(&run_content);
         let meta_include = parse_directives(&include_content);
 
-        // All should produce exactly one ForwardSource
-        prop_assert_eq!(meta_source.sources.len(), 1);
-        prop_assert_eq!(meta_run.sources.len(), 1);
-        prop_assert_eq!(meta_include.sources.len(), 1);
-
-        // All should have the same path
-        prop_assert_eq!(&meta_source.sources[0].path, &path);
-        prop_assert_eq!(&meta_run.sources[0].path, &path);
-        prop_assert_eq!(&meta_include.sources[0].path, &path);
-
-        // All should have identical ForwardSource structures
-        prop_assert_eq!(&meta_source.sources[0], &meta_run.sources[0], "lsp-source and lsp-run (no @) should produce identical ForwardSource");
-        prop_assert_eq!(&meta_source.sources[0], &meta_include.sources[0], "lsp-source and lsp-include (no @) should produce identical ForwardSource");
+        // None should produce any ForwardSource entries
+        prop_assert_eq!(meta_source.sources.len(), 0, "lsp-source without @ should not be recognized");
+        prop_assert_eq!(meta_run.sources.len(), 0, "lsp-run without @ should not be recognized");
+        prop_assert_eq!(meta_include.sources.len(), 0, "lsp-include without @ should not be recognized");
     }
 }
 
@@ -16901,19 +16882,18 @@ proptest! {
     /// Feature: lsp-source-directive, Property 3 Extended: Line conversion with various syntax
     ///
     /// The line=N to N-1 conversion should work with all syntax variations
-    /// (with/without @, with/without colon, with/without quotes).
+    /// (with/without colon, with/without quotes).
     ///
     /// **Validates: Requirements 2.1**
     #[test]
     fn prop_forward_directive_call_site_line_conversion_syntax_variations(
         path in relative_path(),
         user_line in 1..500u32,
-        at_prefix in optional_at_prefix(),
         colon in optional_colon(),
         quotes in quote_style(),
     ) {
         let formatted_path = format_path_with_quotes(&path, quotes);
-        let content = format!("# {}lsp-source{} {} line={}", at_prefix, colon, formatted_path, user_line);
+        let content = format!("# @lsp-source{} {} line={}", colon, formatted_path, user_line);
         let meta = parse_directives(&content);
 
         let expected_line = user_line.saturating_sub(1);
@@ -17074,14 +17054,13 @@ proptest! {
     /// Feature: lsp-source-directive, Property 4 Extended: Default call-site with syntax variations
     ///
     /// The default call-site assignment should work with all syntax variations
-    /// (with/without @, with/without colon, with/without quotes).
+    /// (with/without colon, with/without quotes).
     ///
     /// **Validates: Requirements 2.2**
     #[test]
     fn prop_forward_directive_default_call_site_syntax_variations(
         path in relative_path(),
         prefix_lines in 0..15u32,
-        at_prefix in optional_at_prefix(),
         colon in optional_colon(),
         quotes in quote_style(),
     ) {
@@ -17092,7 +17071,7 @@ proptest! {
             lines.push(format!("z{} <- {}", i, i));
         }
         // Directive WITHOUT line= parameter
-        lines.push(format!("# {}lsp-source{} {}", at_prefix, colon, formatted_path));
+        lines.push(format!("# @lsp-source{} {}", colon, formatted_path));
         let content = lines.join("\n");
 
         let meta = parse_directives(&content);
@@ -21907,14 +21886,15 @@ proptest! {
         }
     }
 
-    /// Feature: lsp-declaration-directives, Property 4 extended: Same-line code and directive
+    /// Feature: lsp-declaration-directives, Property 4 extended: Trailing-comment directive not recognized
     ///
-    /// When a directive appears on a line with code (e.g., `x <- 1 # @lsp-var foo`),
-    /// the declared symbol SHALL be available starting from line N+1, not on line N.
+    /// Declaration directives must be on their own comment line. When a directive appears
+    /// as a trailing comment (e.g., `x <- 1 # @lsp-var foo`), it is NOT recognized and
+    /// the symbol is not declared.
     ///
-    /// **Validates: Requirements 4.6**
+    /// **Validates: Start-of-line anchoring for declaration directives**
     #[test]
-    fn prop_declaration_same_line_code_and_directive(
+    fn prop_declaration_trailing_comment_not_recognized(
         symbol_name in r_symbol_name(),
         code_var_name in r_symbol_name(),
         directive_line in 0..5u32,
@@ -21929,7 +21909,7 @@ proptest! {
         prop_assume!(!filler_names(directive_line as usize, 3).contains(symbol_name.as_str()));
         prop_assume!(symbol_name != code_var_name);
 
-        // Build content with code and directive on the same line
+        // Build content with code and directive on the same line (trailing comment)
         let mut lines: Vec<String> = (0..directive_line)
             .map(|i| format!("x{} <- {}", i, i))
             .collect();
@@ -21939,7 +21919,7 @@ proptest! {
         } else {
             format!("# @lsp-var {}", symbol_name)
         };
-        // Code with trailing comment directive
+        // Code with trailing comment directive — NOT recognized
         lines.push(format!("{} <- 42 {}", code_var_name, directive));
 
         // Add some lines after
@@ -21959,25 +21939,25 @@ proptest! {
         let metadata = parse_directives(&content);
         let artifacts = compute_artifacts_with_metadata(&uri, &tree, &content, Some(&metadata));
 
-        // The declared symbol should NOT be in scope on the same line as the directive
+        // The declared symbol should NOT be in scope anywhere — directive was not recognized
         let scope_on_directive_line = scope_at_position(&artifacts, directive_line, 0);
         prop_assert!(
             !scope_on_directive_line.symbols.contains_key(symbol_name.as_str()),
-            "Declared symbol '{}' should NOT be in scope on directive line {} (same line as code). Content:\n{}",
+            "Trailing-comment directive should not be recognized: '{}' should NOT be in scope on line {}. Content:\n{}",
             symbol_name, directive_line, content
         );
 
-        // The declared symbol SHOULD be in scope on the next line
         let scope_after_directive = scope_at_position(&artifacts, directive_line + 1, 0);
         prop_assert!(
-            scope_after_directive.symbols.contains_key(symbol_name.as_str()),
-            "Declared symbol '{}' SHOULD be in scope on line {} (after directive on line {}). Content:\n{}",
-            symbol_name, directive_line + 1, directive_line, content
+            !scope_after_directive.symbols.contains_key(symbol_name.as_str()),
+            "Trailing-comment directive should not be recognized: '{}' should NOT be in scope on line {}. Content:\n{}",
+            symbol_name, directive_line + 1, content
         );
 
-        // The code variable (from the assignment) SHOULD be in scope on the same line
-        // (at a position after the assignment)
-        let scope_after_assignment = scope_at_position(&artifacts, directive_line, 10);
+        // The code variable (from the assignment) SHOULD still be in scope
+        // Position past the assignment: `{code_var_name} <- 42 ...`
+        let assignment_col = (code_var_name.len() + " <- 42".len()) as u32;
+        let scope_after_assignment = scope_at_position(&artifacts, directive_line, assignment_col);
         prop_assert!(
             scope_after_assignment.symbols.contains_key(code_var_name.as_str()),
             "Code variable '{}' SHOULD be in scope on line {} after assignment. Content:\n{}",

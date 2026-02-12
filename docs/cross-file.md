@@ -12,7 +12,11 @@ The LSP automatically detects `source()` and `sys.source()` calls:
 
 ## LSP Directives
 
+All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The one exception is `@lsp-ignore`, which can be used as a trailing comment to suppress diagnostics on the same line (e.g., `x <- foo # @lsp-ignore`).
+
 All directives support optional colon and quotes: `# @lsp-sourced-by: "../main.R"` is equivalent to `# @lsp-sourced-by ../main.R`.
+
+**Header-only directives:** Backward directives (`@lsp-sourced-by` and synonyms) and working directory directives (`@lsp-cd` and synonyms) must appear in the **file header** — the region of consecutive blank and comment lines at the top of the file, before any code. They are ignored if they appear after the first line of code. This matches the Sight reference implementation. Forward directives, declaration directives, and ignore directives can appear anywhere in the file.
 
 ### Backward Directives
 
@@ -52,7 +56,6 @@ Explicitly declare that this file sources another file (useful for dynamic or co
 ```
 
 All syntax variations are supported:
-- With or without `@` prefix: `@lsp-source` or `lsp-source`
 - With or without colon: `@lsp-source: path` or `@lsp-source path`
 - With quotes: `@lsp-source "path/with spaces.R"` or `@lsp-source 'path.R'`
 - Without quotes: `@lsp-source path.R`
@@ -135,7 +138,10 @@ source("utils.R")  # Resolves to /data/project/utils.R (not relative to child.R'
 ```r
 # @lsp-ignore           # Suppress diagnostics on current line
 # @lsp-ignore-next      # Suppress diagnostics on next line
+x <- foo # @lsp-ignore  # Also works as a trailing comment
 ```
+
+`@lsp-ignore` is the only directive that can appear as a trailing comment. All other directives must be on their own comment line.
 
 ### Declaration Directives
 

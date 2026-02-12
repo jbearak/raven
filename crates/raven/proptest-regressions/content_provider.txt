@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2ba5991e60235bab35c807787bc341cc99df3c7583911733385a10ccae43908f # shrinks to file_idx = 0, open_func = "if", open_wd = "aa", index_func = "a_", index_wd = "a_"
+cc 4f7ddf2cd9583051319f01954adfbaa870fa42d5b9c40ac2d1804f11ffd1ef46 # shrinks to file_idx = 0, open_marker = 1000, index_marker = 2000, is_open = true

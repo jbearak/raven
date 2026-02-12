@@ -30887,14 +30887,14 @@ MyVar
 
     #[test]
     fn test_declared_symbol_on_same_line_not_available() {
-        // Requirement 4.6: WHEN a directive appears on a line with code,
-        // THE declared symbol SHALL be available starting from line N+1, not on line N
+        // Declaration directives must be on their own comment line (start-of-line anchored).
+        // A trailing comment like `x <- myvar # @lsp-var myvar` is NOT recognized as a directive.
         let mut state = create_test_state();
         let code = "x <- myvar # @lsp-var myvar
 myvar
 ";
-        // Line 0: x <- myvar # @lsp-var myvar - myvar usage is on same line as declaration
-        // Line 1: myvar (usage) - should NOT be flagged (after declaration)
+        // Line 0: x <- myvar # @lsp-var myvar - directive NOT recognized (trailing comment)
+        // Line 1: myvar (usage) - should be flagged (directive was not recognized)
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
@@ -30913,15 +30913,14 @@ myvar
             &mut diagnostics,
         );
 
-        // The usage on line 0 should be flagged (same line as declaration)
-        // The usage on line 1 should NOT be flagged (after declaration)
+        // Both usages should be flagged since the directive is not recognized as a trailing comment
         assert_eq!(
             diagnostics.len(),
-            1,
-            "Usage on same line as declaration should emit diagnostic"
+            2,
+            "Both usages should emit diagnostics since trailing-comment directive is not recognized"
         );
         assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
-        assert_eq!(diagnostics[0].range.start.line, 0);
+        assert!(diagnostics[1].message.contains("Undefined variable: myvar"));
     }
 
     // ========================================================================

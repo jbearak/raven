@@ -1473,10 +1473,10 @@ fn is_within_workspace(resolved_path: &Path, workspace_root: &Path) -> bool {
 /// allowing us to determine where the path portion begins.
 struct DirectivePathPatterns {
     /// Pattern for backward directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
-    /// Matches: # @lsp-sourced-by:  or # lsp-run-by  etc.
+    /// Matches: `# @lsp-sourced-by:` or `# @lsp-run-by` etc. (with optional leading whitespace)
     backward: Regex,
     /// Pattern for forward directive (@lsp-source)
-    /// Matches: # @lsp-source:  or # lsp-source  etc.
+    /// Matches: `# @lsp-source:` or `# @lsp-source` etc. (with optional leading whitespace)
     forward: Regex,
 }
 
@@ -1489,11 +1489,11 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
     PATTERNS.get_or_init(|| {
         // Patterns match the directive keyword and trailing whitespace/colon
         // Consistent with cross_file/directive.rs patterns
-        // The @ is optional, colon is optional, whitespace after is required or end of match
+        // The @ is required, colon is optional, leading whitespace is allowed
         DirectivePathPatterns {
-            backward: Regex::new(r#"^#\s*@?lsp-(?:sourced-by|run-by|included-by)\s*:?\s*"#)
+            backward: Regex::new(r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#)
                 .unwrap(),
-            forward: Regex::new(r#"^#\s*@?lsp-source\s*:?\s*"#).unwrap(),
+            forward: Regex::new(r#"^\s*#\s*@lsp-source(?:\s+:?\s*|:\s*)"#).unwrap(),
         }
     })
 }
@@ -2077,17 +2077,14 @@ mod tests {
     }
 
     #[test]
-    fn test_directive_without_at_prefix() {
+    fn test_directive_without_at_prefix_not_recognized() {
         let content = "# lsp-sourced-by ../main.R";
         let position = Position {
             line: 0,
             character: 20,
         };
         let result = is_directive_path_context(content, position);
-        assert!(result.is_some());
-        let (directive_type, partial, _) = result.unwrap();
-        assert_eq!(directive_type, DirectiveType::SourcedBy);
-        assert_eq!(partial, "../");
+        assert!(result.is_none());
     }
 
     #[test]
@@ -3355,10 +3352,10 @@ mod tests {
                 }
             }
 
-            /// Property 2 extended: Backward directive without @ prefix
+            /// Property 2 extended: Backward directive without @ prefix is not recognized
             ///
             /// Tests that directives without the @ prefix (e.g., `lsp-sourced-by`)
-            /// are also correctly detected.
+            /// are NOT detected.
             #[test]
             fn prop_backward_directive_without_at_prefix(
                 directive_name in prop_oneof![
@@ -3375,11 +3372,8 @@ mod tests {
                 let colon_part = if use_colon { ": " } else { " " };
                 let line = format!("# {}{}{}", directive_name, colon_part, path);
 
-                // Calculate path_start position
+                // Calculate cursor position at middle of path
                 let prefix_len = 2 + directive_name.len() + colon_part.len();
-                let expected_path_start_col = prefix_len as u32;
-
-                // Test cursor at middle of path
                 let cursor_offset = path.len() / 2;
                 let cursor_col = prefix_len + cursor_offset;
                 let position = Position {
@@ -3390,23 +3384,11 @@ mod tests {
                 let result = is_directive_path_context(&line, position);
 
                 prop_assert!(
-                    result.is_some(),
-                    "Expected Some for directive without @ prefix at cursor {} in: {}",
+                    result.is_none(),
+                    "Expected None for directive without @ prefix at cursor {} in: {}",
                     cursor_col,
                     line
                 );
-
-                let (directive_type, partial_path, path_start) = result.unwrap();
-
-                prop_assert_eq!(
-                    directive_type,
-                    DirectiveType::SourcedBy,
-                    "Expected DirectiveType::SourcedBy"
-                );
-
-                let expected_partial = &path[..cursor_offset];
-                prop_assert_eq!(partial_path, expected_partial);
-                prop_assert_eq!(path_start.character, expected_path_start_col);
             }
 
             /// Property 2 extended: Cursor before path returns None
@@ -3638,10 +3620,10 @@ mod tests {
                 }
             }
 
-            /// Property 3 extended: Forward directive without @ prefix
+            /// Property 3 extended: Forward directive without @ prefix is not recognized
             ///
             /// Tests that the directive without the @ prefix (e.g., `lsp-source`)
-            /// is also correctly detected.
+            /// is NOT detected.
             #[test]
             fn prop_forward_directive_without_at_prefix(
                 use_colon in prop::bool::ANY,
@@ -3654,11 +3636,8 @@ mod tests {
                 let colon_part = if use_colon { ": " } else { " " };
                 let line = format!("# {}{}{}", directive_name, colon_part, path);
 
-                // Calculate path_start position
+                // Calculate cursor position at middle of path
                 let prefix_len = 2 + directive_name.len() + colon_part.len();
-                let expected_path_start_col = prefix_len as u32;
-
-                // Test cursor at middle of path
                 let cursor_offset = path.len() / 2;
                 let cursor_col = prefix_len + cursor_offset;
                 let position = Position {
@@ -3669,23 +3648,11 @@ mod tests {
                 let result = is_directive_path_context(&line, position);
 
                 prop_assert!(
-                    result.is_some(),
-                    "Expected Some for directive without @ prefix at cursor {} in: {}",
+                    result.is_none(),
+                    "Expected None for directive without @ prefix at cursor {} in: {}",
                     cursor_col,
                     line
                 );
-
-                let (directive_type, partial_path, path_start) = result.unwrap();
-
-                prop_assert_eq!(
-                    directive_type,
-                    DirectiveType::Source,
-                    "Expected DirectiveType::Source"
-                );
-
-                let expected_partial = &path[..cursor_offset];
-                prop_assert_eq!(partial_path, expected_partial);
-                prop_assert_eq!(path_start.character, expected_path_start_col);
             }
 
             /// Property 3 extended: Cursor before path returns None
