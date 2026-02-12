@@ -2421,7 +2421,10 @@ where
                 let should_replace = if candidate_call_site > existing_call_site {
                     true
                 } else if candidate_call_site == existing_call_site {
-                    if edge.is_backward_directive != existing.is_backward_directive {
+                    if edge.local != existing.local {
+                        // Prefer non-local edge (more inclusive)
+                        !edge.local
+                    } else if edge.is_backward_directive != existing.is_backward_directive {
                         edge.is_backward_directive
                     } else if edge.is_directive != existing.is_directive {
                         edge.is_directive
