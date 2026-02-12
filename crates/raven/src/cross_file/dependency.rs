@@ -553,6 +553,15 @@ impl DependencyEdge {
     }
 }
 
+/// Result of cycle detection, containing both edges needed for diagnostics.
+#[derive(Debug, Clone)]
+pub struct CycleDetection {
+    /// First outgoing edge FROM the queried URI — use for diagnostic position
+    pub outgoing_edge: DependencyEdge,
+    /// Edge that closes the cycle BACK to the queried URI — use for message details
+    pub closing_edge: DependencyEdge,
+}
+
 /// Information about an unresolved forward directive path
 #[derive(Debug, Clone)]
 pub struct UnresolvedForwardPath {
@@ -1164,10 +1173,17 @@ impl DependencyGraph {
         }
     }
 
-    /// Detect cycles involving a URI. Returns the edge that creates the cycle back to `uri`.
-    pub fn detect_cycle(&self, uri: &Url) -> Option<DependencyEdge> {
+    /// Detect cycles involving a URI.
+    ///
+    /// Returns a `CycleDetection` containing:
+    /// - `outgoing_edge`: the first edge FROM `uri` that leads into the cycle
+    ///   (use this for diagnostic positioning in the queried file)
+    /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
+    ///   (use this for the diagnostic message details)
+    pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
         let mut visited = HashSet::new();
-        self.detect_cycle_recursive(uri, uri, &mut visited)
+        let mut path = Vec::new();
+        self.detect_cycle_recursive(uri, uri, &mut visited, &mut path)
     }
 
     /// Dump the current state of the dependency graph for debugging.
@@ -1239,19 +1255,28 @@ impl DependencyGraph {
         start: &Url,
         current: &Url,
         visited: &mut HashSet<Url>,
-    ) -> Option<DependencyEdge> {
+        path: &mut Vec<DependencyEdge>,
+    ) -> Option<CycleDetection> {
         if visited.contains(current) {
             return None;
         }
         visited.insert(current.clone());
 
         for edge in self.get_dependencies(current) {
+            path.push(edge.clone());
             if &edge.to == start {
-                return Some(edge.clone());
+                // path[0] is the outgoing edge from `start`, path[last] closes the cycle
+                return Some(CycleDetection {
+                    outgoing_edge: path[0].clone(),
+                    closing_edge: edge.clone(),
+                });
             }
-            if let Some(cycle_edge) = self.detect_cycle_recursive(start, &edge.to, visited) {
-                return Some(cycle_edge);
+            if let Some(detection) =
+                self.detect_cycle_recursive(start, &edge.to, visited, path)
+            {
+                return Some(detection);
             }
+            path.pop();
         }
         None
     }
@@ -1456,14 +1481,62 @@ mod tests {
         // Cycle should be detected from a
         let cycle = graph.detect_cycle(&a);
         assert!(cycle.is_some());
-        let edge = cycle.unwrap();
-        assert_eq!(edge.from, b);
-        assert_eq!(edge.to, a);
-        assert_eq!(edge.call_site_line, Some(2));
+        let detection = cycle.unwrap();
+        // outgoing_edge: a -> b (the edge FROM the queried file)
+        assert_eq!(detection.outgoing_edge.from, a);
+        assert_eq!(detection.outgoing_edge.to, b);
+        assert_eq!(detection.outgoing_edge.call_site_line, Some(1));
+        // closing_edge: b -> a (the edge that closes the cycle)
+        assert_eq!(detection.closing_edge.from, b);
+        assert_eq!(detection.closing_edge.to, a);
+        assert_eq!(detection.closing_edge.call_site_line, Some(2));
 
         // Cycle should also be detected from b
         let cycle_b = graph.detect_cycle(&b);
         assert!(cycle_b.is_some());
+        let detection_b = cycle_b.unwrap();
+        // outgoing_edge: b -> a (the edge FROM the queried file)
+        assert_eq!(detection_b.outgoing_edge.from, b);
+        assert_eq!(detection_b.outgoing_edge.to, a);
+        // closing_edge: a -> b (the edge that closes the cycle)
+        assert_eq!(detection_b.closing_edge.from, a);
+        assert_eq!(detection_b.closing_edge.to, b);
+    }
+
+    #[test]
+    fn test_detect_cycle_three_nodes() {
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let c = url("c.R");
+
+        // a -> b at line 5
+        let meta_a = make_meta_with_source("b.R", 5);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+
+        // b -> c at line 10
+        let meta_b = make_meta_with_source("c.R", 10);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        // c -> a at line 15 (closes the cycle)
+        let meta_c = make_meta_with_source("a.R", 15);
+        graph.update_file(&c, &meta_c, Some(&workspace_root()), |_| None);
+
+        // From a: outgoing is a->b, closing is c->a
+        let detection = graph.detect_cycle(&a).expect("should detect cycle from a");
+        assert_eq!(detection.outgoing_edge.from, a);
+        assert_eq!(detection.outgoing_edge.to, b);
+        assert_eq!(detection.outgoing_edge.call_site_line, Some(5));
+        assert_eq!(detection.closing_edge.from, c);
+        assert_eq!(detection.closing_edge.to, a);
+        assert_eq!(detection.closing_edge.call_site_line, Some(15));
+
+        // From b: outgoing is b->c, closing is a->b
+        let detection_b = graph.detect_cycle(&b).expect("should detect cycle from b");
+        assert_eq!(detection_b.outgoing_edge.from, b);
+        assert_eq!(detection_b.outgoing_edge.to, c);
+        assert_eq!(detection_b.closing_edge.from, a);
+        assert_eq!(detection_b.closing_edge.to, b);
     }
 
     #[test]

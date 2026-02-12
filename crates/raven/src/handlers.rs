@@ -2578,24 +2578,60 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
 
     // Check for circular dependencies
     if let Some(severity) = state.cross_file_config.circular_dependency_severity {
-        if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
-            let line = cycle_edge.call_site_line.unwrap_or(0);
-            let col = cycle_edge.call_site_column.unwrap_or(0);
-            let target = cycle_edge
-                .to
+        if let Some(cycle) = state.cross_file_graph.detect_cycle(uri) {
+            let out = &cycle.outgoing_edge;
+            let close = &cycle.closing_edge;
+
+            // Position: the source() call in THIS file that starts the cycle
+            let line = out.call_site_line.unwrap_or(0);
+            let col = out.call_site_column.unwrap_or(0);
+
+            // Clamp to file bounds as safety net
+            let max_line = text.lines().count().saturating_sub(1) as u32;
+            let line = line.min(max_line);
+
+            // Closing file name + line (1-based for display)
+            let closing_file = close
+                .from
                 .path_segments()
                 .and_then(|mut s| s.next_back().map(|s| s.to_string()))
                 .unwrap_or_default();
+            let closing_line_1based = close.call_site_line.map(|l| l + 1);
+
+            // Try to get the code snippet from the closing edge's file
+            let snippet = close.call_site_line.and_then(|cl| {
+                let content = state
+                    .documents
+                    .get(&close.from)
+                    .map(|d| d.text())
+                    .or_else(|| state.cross_file_file_cache.get(&close.from));
+                content
+                    .and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
+            });
+
+            let message = match (closing_line_1based, snippet) {
+                (Some(cl), Some(code)) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
+                    )
+                }
+                (Some(cl), None) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file"
+                    )
+                }
+                _ => {
+                    format!("Circular dependency: {closing_file} sources this file")
+                }
+            };
+
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(line, col),
                     end: Position::new(line, col + 1),
                 },
                 severity: Some(severity),
-                message: format!(
-                    "Circular dependency detected: sourcing '{}' creates a cycle",
-                    target
-                ),
+                message,
                 ..Default::default()
             });
         }
