@@ -498,7 +498,7 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u
 
     // 3. Check for both parens and braces, return the innermost one
     // We need to find the actual AST positions to compare, not the indentation values
-    let parens_node = find_unclosed_arguments_at_position(root, position, source);
+    let parens_node = find_unclosed_arguments_at_position(root, position);
     let braces_node = find_unclosed_braces_at_position(root, position, source);
 
     match (parens_node, braces_node) {
@@ -1417,7 +1417,6 @@ fn is_custom_infix_ending(trimmed: &str) -> bool {
 fn find_unclosed_arguments_at_position<'a>(
     node: Node<'a>,
     position: Position,
-    source: &str,
 ) -> Option<Node<'a>> {
     let mut result: Option<Node<'a>> = None;
 
@@ -1452,7 +1451,7 @@ fn find_unclosed_arguments_at_position<'a>(
 
     if cursor.goto_first_child() {
         loop {
-            if let Some(found) = find_unclosed_arguments_at_position(cursor.node(), position, source)
+            if let Some(found) = find_unclosed_arguments_at_position(cursor.node(), position)
             {
                 // Keep the innermost (last found) match
                 result = Some(found);

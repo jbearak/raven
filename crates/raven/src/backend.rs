@@ -2866,7 +2866,7 @@ impl LanguageServer for Backend {
                             tree.root_node().descendant_for_point_range(point, point)
                         {
                             let is_error = node.is_error()
-                                || node.parent().map_or(false, |p| p.is_error());
+                                || node.parent().is_some_and(|p| p.is_error());
                             if is_error {
                                 log::trace!(
                                     "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
@@ -2899,7 +2899,7 @@ impl LanguageServer for Backend {
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
         let raw_tab_size = params.options.tab_size;
-        let tab_size = raw_tab_size.max(1).min(8);
+        let tab_size = raw_tab_size.clamp(1, 8);
         if raw_tab_size == 0 {
             log::warn!("on_type_formatting: tab_size 0 is invalid, clamped to 1");
         } else if raw_tab_size > 8 {

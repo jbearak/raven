@@ -120,19 +120,11 @@ impl Default for CompletionConfig {
 }
 
 /// Indentation configuration settings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IndentationSettings {
     /// Indentation style for R code formatting.
     /// _Requirements: 7.1, 7.2, 7.3, 7.4_
     pub style: IndentationStyle,
-}
-
-impl Default for IndentationSettings {
-    fn default() -> Self {
-        Self {
-            style: IndentationStyle::default(),
-        }
-    }
 }
 
 use tower_lsp::lsp_types::Url;

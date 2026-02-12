@@ -302,7 +302,7 @@ pub fn resolve(
         Some(ns.to_string())
     } else {
         // Use find_package_for_symbol to determine which package exports this function
-        let pkg_list: Vec<String> = all_packages.iter().cloned().collect();
+        let pkg_list: Vec<String> = all_packages.to_vec();
         state
             .package_library
             .find_package_for_symbol(function_name, &pkg_list)
@@ -316,7 +316,7 @@ pub fn resolve(
 
         // R subprocess integration with graceful degradation (Requirement 11.1, 11.2, 11.3)
         // Query R for function formals using get_function_formals
-        if let Some(ref r_subprocess) = state.package_library.r_subprocess() {
+        if let Some(r_subprocess) = state.package_library.r_subprocess() {
             // Get tokio runtime handle for async call from sync context
             let handle = match tokio::runtime::Handle::try_current() {
                 Ok(h) => h,

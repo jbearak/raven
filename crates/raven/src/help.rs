@@ -27,6 +27,9 @@ struct CachedHelp {
     cached_at: Instant,
 }
 
+/// Type alias to reduce complexity of the nested generics in `HelpCache.arguments`.
+type ArgumentsCache = LruCache<String, Option<HashMap<String, String>>>;
+
 /// Bounded cache for help content. Uses LRU eviction to prevent unbounded
 /// memory growth in long-running LSP sessions.
 ///
@@ -49,7 +52,7 @@ pub struct HelpCache {
     /// Cache for structured argument maps: topic+package → HashMap<param_name, description>.
     /// Uses the same composite key format as `inner`. `None` values represent
     /// negative cache entries (no arguments found or no help available).
-    arguments: Arc<RwLock<LruCache<String, Option<HashMap<String, String>>>>>,
+    arguments: Arc<RwLock<ArgumentsCache>>,
     negative_ttl: Duration,
 }
 
