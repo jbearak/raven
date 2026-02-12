@@ -898,7 +898,7 @@ impl LanguageServer for Backend {
 
         // Compute affected files while holding write lock
         let (
-            work_items,
+            mut work_items,
             debounce_ms,
             files_to_index,
             on_demand_enabled,
@@ -1338,12 +1338,31 @@ impl LanguageServer for Backend {
                     }
                 }
 
-                state.cross_file_graph.update_file(
+                let second_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
+
+                // If re-enrichment changed dependency edges (e.g., inherited WD
+                // altered path resolution), schedule newly affected dependents.
+                if second_result.edges_changed {
+                    let max_chain_depth = state.cross_file_config.max_chain_depth;
+                    let dependents = state
+                        .cross_file_graph
+                        .get_transitive_dependents(&uri, max_chain_depth);
+                    for dep in dependents {
+                        if state.documents.contains_key(&dep) {
+                            state.diagnostics_gate.mark_force_republish(&dep);
+                            let trigger_version =
+                                state.documents.get(&dep).and_then(|d| d.version);
+                            let trigger_revision =
+                                state.documents.get(&dep).map(|d| d.revision);
+                            work_items.push((dep, trigger_version, trigger_revision));
+                        }
+                    }
+                }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
                 if let Some(forward_ctx) =

@@ -2628,7 +2628,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(line, col),
-                    end: Position::new(line, col + 1),
+                    end: Position::new(line, col.saturating_add(1)),
                 },
                 severity: Some(severity),
                 message,
@@ -29694,10 +29694,14 @@ result <- helper_with_spaces(42)"#;
         assert_eq!(detection.closing_edge.from, b_url);
         assert_eq!(detection.closing_edge.to, a_url);
 
-        // Add documents so diagnostics() can run
+        // Add documents so diagnostics() can run; include b.R so the
+        // snippet-retrieval branch is exercised (closing edge comes from b.R).
         state
             .documents
             .insert(a_url.clone(), Document::new("source('b.R')", None));
+        state
+            .documents
+            .insert(b_url.clone(), Document::new("source('a.R')", None));
 
         let diags = diagnostics(&state, &a_url);
         let circular_diags: Vec<_> = diags
@@ -29715,10 +29719,16 @@ result <- helper_with_spaces(42)"#;
                 .collect::<Vec<_>>()
         );
 
-        // Verify the diagnostic message mentions the closing file
+        // Verify the diagnostic message includes the closing file, line number,
+        // and source line snippet (exercises the snippet-retrieval path).
         assert!(
             circular_diags[0].message.contains("b.R"),
             "Diagnostic should mention closing file: {}",
+            circular_diags[0].message
+        );
+        assert!(
+            circular_diags[0].message.contains("source('a.R')"),
+            "Diagnostic should include source line snippet: {}",
             circular_diags[0].message
         );
     }

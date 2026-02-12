@@ -4646,6 +4646,16 @@ child_function <- function() {
     }
 }
 
+/// Parse R source code into a tree-sitter Tree. Shared helper for test modules.
+#[cfg(test)]
+fn parse_r_tree(code: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .unwrap();
+    parser.parse(code, None).unwrap()
+}
+
 // ============================================================================
 // Integration Tests for @lsp-source Forward Directive Scope Resolution
 // ============================================================================
@@ -4668,15 +4678,6 @@ mod lsp_source_scope_tests {
     };
     use crate::cross_file::types::CrossFileMetadata;
     use std::collections::HashSet;
-    use tree_sitter::Parser;
-
-    fn parse_r_tree(code: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_r::LANGUAGE.into())
-            .unwrap();
-        parser.parse(code, None).unwrap()
-    }
 
     /// Test that symbols from @lsp-source directive are available after the directive line.
     ///
@@ -5902,15 +5903,6 @@ mod cross_directory_hoisting_tests {
     };
     use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
     use std::collections::HashSet;
-    use tree_sitter::Parser;
-
-    fn parse_r_tree(code: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_r::LANGUAGE.into())
-            .unwrap();
-        parser.parse(code, None).unwrap()
-    }
 
     /// Test that workspace-root fallback in scope resolution enables cross-directory
     /// source() calls to resolve correctly.
@@ -5977,6 +5969,9 @@ mod cross_directory_hoisting_tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        // Synthetic backward directive: constructed directly rather than extracted from
+        // child code, to test graph-build + scope-resolution without the full
+        // metadata-extraction pipeline.
         let child_meta = CrossFileMetadata {
             sourced_by: vec![BackwardDirective {
                 path: "../scripts/functions.R".to_string(),
@@ -5996,6 +5991,14 @@ mod cross_directory_hoisting_tests {
         // Verify graph edges were created correctly via workspace-root fallback
         let parent_deps = graph.get_dependencies(&parent_uri);
         println!("  Parent forward edges: {:?}", parent_deps.iter().map(|e| &e.to).collect::<Vec<_>>());
+        // 3 edges: 2 from parent's forward sources + 1 from child's backward directive
+        // (the backward directive also registers a parent→child forward edge).
+        assert_eq!(
+            parent_deps.len(),
+            3,
+            "Parent should have exactly 3 forward edges, got: {:?}",
+            parent_deps.iter().map(|e| &e.to).collect::<Vec<_>>()
+        );
         assert!(
             parent_deps.iter().any(|e| e.to == sibling_uri),
             "Parent should have forward edge to sibling (via workspace-root fallback)"
