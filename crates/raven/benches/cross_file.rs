@@ -126,6 +126,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
                         Some(&folder_url),
                         black_box(20),
                         &base_exports,
+                        true,
                     ))
                 })
             },
