@@ -16430,11 +16430,6 @@ fn forward_directive_synonym() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just("lsp-source"), Just("lsp-run"), Just("lsp-include"),]
 }
 
-/// Generate @ prefix (required for all directives)
-fn at_prefix() -> impl Strategy<Value = &'static str> {
-    Just("@")
-}
-
 /// Generate optional colon separator
 fn optional_colon() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just(":"), Just(""),]
@@ -16475,14 +16470,13 @@ proptest! {
 
     /// Feature: lsp-source-directive, Property 1: Forward Directive Parsing Completeness
     ///
-    /// For any valid forward directive syntax variation (with/without @, with/without colon,
+    /// For any valid forward directive syntax variation (with/without colon,
     /// with single/double/no quotes, with/without line= parameter), the Directive_Parser
     /// SHALL produce a ForwardSource entry with the correct path and `is_directive=true`.
     ///
     /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9**
     #[test]
     fn prop_forward_directive_parsing_completeness(
-        at_prefix in at_prefix(),
         synonym in forward_directive_synonym(),
         colon in optional_colon(),
         path in relative_path(),  // Use simple path for unquoted case
@@ -16504,7 +16498,7 @@ proptest! {
         for i in 0..prefix_lines {
             lines.push(format!("x{} <- {}", i, i));
         }
-        lines.push(format!("# {}{}{} {}{}", at_prefix, synonym, colon, formatted_path, line_suffix));
+        lines.push(format!("# @{}{} {}{}", synonym, colon, formatted_path, line_suffix));
         let content = lines.join("\n");
 
         let meta = parse_directives(&content);
@@ -16513,8 +16507,8 @@ proptest! {
         prop_assert_eq!(
             meta.sources.len(),
             1,
-            "Expected 1 ForwardSource for directive: # {}{}{} {}{}",
-            at_prefix, synonym, colon, formatted_path, line_suffix
+            "Expected 1 ForwardSource for directive: # @{}{} {}{}",
+            synonym, colon, formatted_path, line_suffix
         );
 
         let source = &meta.sources[0];
@@ -16566,7 +16560,6 @@ proptest! {
     /// **Validates: Requirements 1.6, 1.7, 1.8**
     #[test]
     fn prop_forward_directive_paths_with_spaces(
-        at_prefix in at_prefix(),
         synonym in forward_directive_synonym(),
         colon in optional_colon(),
         dir in path_component(),
@@ -16581,7 +16574,7 @@ proptest! {
             format!("'{}'", path_with_spaces)
         };
 
-        let content = format!("# {}{}{} {}", at_prefix, synonym, colon, formatted_path);
+        let content = format!("# @{}{} {}", synonym, colon, formatted_path);
         let meta = parse_directives(&content);
 
         // Should produce exactly one ForwardSource
@@ -16607,37 +16600,34 @@ proptest! {
     fn prop_forward_directive_all_syntax_combinations(
         path in relative_path(),
     ) {
-        let at_prefixes = ["@"];
         let synonyms = ["lsp-source", "lsp-run", "lsp-include"];
         let colons = [":", ""];
         let quote_styles = [QuoteStyle::None, QuoteStyle::Double, QuoteStyle::Single];
 
-        for at_prefix in &at_prefixes {
-            for synonym in &synonyms {
-                for colon in &colons {
-                    for quotes in &quote_styles {
-                        let formatted_path = format_path_with_quotes(&path, *quotes);
-                        let content = format!("# {}{}{} {}", at_prefix, synonym, colon, formatted_path);
-                        let meta = parse_directives(&content);
+        for synonym in &synonyms {
+            for colon in &colons {
+                for quotes in &quote_styles {
+                    let formatted_path = format_path_with_quotes(&path, *quotes);
+                    let content = format!("# @{}{} {}", synonym, colon, formatted_path);
+                    let meta = parse_directives(&content);
 
-                        prop_assert_eq!(
-                            meta.sources.len(),
-                            1,
-                            "Failed for: {}",
-                            content
-                        );
-                        prop_assert_eq!(
-                            &meta.sources[0].path,
-                            &path,
-                            "Path mismatch for: {}",
-                            content
-                        );
-                        prop_assert!(
-                            meta.sources[0].is_directive,
-                            "is_directive should be true for: {}",
-                            content
-                        );
-                    }
+                    prop_assert_eq!(
+                        meta.sources.len(),
+                        1,
+                        "Failed for: {}",
+                        content
+                    );
+                    prop_assert_eq!(
+                        &meta.sources[0].path,
+                        &path,
+                        "Path mismatch for: {}",
+                        content
+                    );
+                    prop_assert!(
+                        meta.sources[0].is_directive,
+                        "is_directive should be true for: {}",
+                        content
+                    );
                 }
             }
         }
@@ -16892,19 +16882,18 @@ proptest! {
     /// Feature: lsp-source-directive, Property 3 Extended: Line conversion with various syntax
     ///
     /// The line=N to N-1 conversion should work with all syntax variations
-    /// (with/without @, with/without colon, with/without quotes).
+    /// (with/without colon, with/without quotes).
     ///
     /// **Validates: Requirements 2.1**
     #[test]
     fn prop_forward_directive_call_site_line_conversion_syntax_variations(
         path in relative_path(),
         user_line in 1..500u32,
-        at_prefix in at_prefix(),
         colon in optional_colon(),
         quotes in quote_style(),
     ) {
         let formatted_path = format_path_with_quotes(&path, quotes);
-        let content = format!("# {}lsp-source{} {} line={}", at_prefix, colon, formatted_path, user_line);
+        let content = format!("# @lsp-source{} {} line={}", colon, formatted_path, user_line);
         let meta = parse_directives(&content);
 
         let expected_line = user_line.saturating_sub(1);
@@ -17065,14 +17054,13 @@ proptest! {
     /// Feature: lsp-source-directive, Property 4 Extended: Default call-site with syntax variations
     ///
     /// The default call-site assignment should work with all syntax variations
-    /// (with/without @, with/without colon, with/without quotes).
+    /// (with/without colon, with/without quotes).
     ///
     /// **Validates: Requirements 2.2**
     #[test]
     fn prop_forward_directive_default_call_site_syntax_variations(
         path in relative_path(),
         prefix_lines in 0..15u32,
-        at_prefix in at_prefix(),
         colon in optional_colon(),
         quotes in quote_style(),
     ) {
@@ -17083,7 +17071,7 @@ proptest! {
             lines.push(format!("z{} <- {}", i, i));
         }
         // Directive WITHOUT line= parameter
-        lines.push(format!("# {}lsp-source{} {}", at_prefix, colon, formatted_path));
+        lines.push(format!("# @lsp-source{} {}", colon, formatted_path));
         let content = lines.join("\n");
 
         let meta = parse_directives(&content);

@@ -1493,7 +1493,7 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         DirectivePathPatterns {
             backward: Regex::new(r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*"#)
                 .unwrap(),
-            forward: Regex::new(r#"^\s*#\s*@lsp-source\s*:?\s*"#).unwrap(),
+            forward: Regex::new(r#"^\s*#\s*@lsp-source(?:\s+:?\s*|:\s*)"#).unwrap(),
         }
     })
 }
