@@ -1926,6 +1926,7 @@ fn get_cross_file_scope(
         state.workspace_folders.first(),
         max_depth,
         &base_exports,
+        state.cross_file_config.hoist_globals_in_functions,
     )
 }
 
@@ -3357,6 +3358,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         state.workspace_folders.first(),
         max_depth,
         &empty_base_exports,
+        false, // depth-exceeded check doesn't need hoisting
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -29869,7 +29871,7 @@ result <- filter(c(1, -2, 3))"#;
         let base_exports = HashSet::new();
 
         // Query scope at line 2 (after both library and local definition)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Symbol should be in scope
         assert!(
@@ -29972,7 +29974,7 @@ z <- mutate(5)  # Uses local definition"#;
 
         // Query scope at line 1 (before local definition) - should get package export
         let scope_before =
-            scope_at_position_with_packages(&artifacts, 1, 5, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 1, 5, &get_exports, &base_exports, false);
         assert!(
             scope_before.symbols.contains_key("mutate"),
             "mutate should be in scope before local def"
@@ -29986,7 +29988,7 @@ z <- mutate(5)  # Uses local definition"#;
 
         // Query scope at line 3 (after local definition) - should get local definition
         let scope_after =
-            scope_at_position_with_packages(&artifacts, 3, 5, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 3, 5, &get_exports, &base_exports, false);
         assert!(
             scope_after.symbols.contains_key("mutate"),
             "mutate should be in scope after local def"
@@ -30279,7 +30281,7 @@ result <- filter(c(1, -2, 3))"#;
         let base_exports = HashSet::new();
 
         // Query scope at line 2 (after both library and local definition)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Symbol should be in scope
         assert!(
@@ -30989,7 +30991,7 @@ mysymbol
             compute_artifacts_with_metadata(&uri1, &tree1, code1, Some(&directive_meta1));
 
         // Get scope at line 2 (after both declarations)
-        let scope1 = scope_at_position(&artifacts1, 2, 0);
+        let scope1 = scope_at_position(&artifacts1, 2, 0, false);
         let symbol1 = scope1.symbols.get("mysymbol");
         assert!(symbol1.is_some(), "Symbol should be in scope");
         assert_eq!(
@@ -31009,7 +31011,7 @@ mysymbol
             compute_artifacts_with_metadata(&uri2, &tree2, code2, Some(&directive_meta2));
 
         // Get scope at line 2 (after both declarations)
-        let scope2 = scope_at_position(&artifacts2, 2, 0);
+        let scope2 = scope_at_position(&artifacts2, 2, 0, false);
         let symbol2 = scope2.symbols.get("mysymbol");
         assert!(symbol2.is_some(), "Symbol should be in scope");
         assert_eq!(

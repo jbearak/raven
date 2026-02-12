@@ -1133,10 +1133,15 @@ pub fn compute_artifacts_with_metadata(
 /// ```
 /// use raven::cross_file::{ScopeArtifacts, scope_at_position};
 /// let artifacts = ScopeArtifacts::default();
-/// let scope = scope_at_position(&artifacts, 0, 0);
+/// let scope = scope_at_position(&artifacts, 0, 0, false);
 /// assert!(scope.symbols.is_empty());
 /// ```
-pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> ScopeAtPosition {
+pub fn scope_at_position(
+    artifacts: &ScopeArtifacts,
+    line: u32,
+    column: u32,
+    hoist_globals: bool,
+) -> ScopeAtPosition {
     let mut scope = ScopeAtPosition::default();
 
     // Use interval tree for O(log n) query instead of linear scan
@@ -1152,6 +1157,10 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
             .collect()
     };
 
+    // When hoisting is enabled and we're inside a function body, global definitions
+    // are visible regardless of position (R has late-binding semantics).
+    let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
+
     // Process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
@@ -1160,8 +1169,8 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                 column: def_col,
                 symbol,
             } => {
-                // Include if definition is before or at the position
-                if (*def_line, *def_col) <= (line, column) {
+                let passes_position = (*def_line, *def_col) <= (line, column);
+                if passes_position || query_inside_function {
                     // Use interval tree for O(log n) innermost scope lookup
                     let def_function_scope = artifacts
                         .function_scope_tree
@@ -1170,12 +1179,12 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
 
                     match def_function_scope {
                         None => {
-                            // Global definition - always include
+                            // Global definition - include (hoisted or positionally valid)
                             scope.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                         Some(def_scope) => {
-                            // Function-local definition - only include if we're inside the same function
-                            if active_function_scopes.contains(&def_scope) {
+                            // Function-local definition - only include if positional AND in same function
+                            if passes_position && active_function_scopes.contains(&def_scope) {
                                 scope.symbols.insert(symbol.name.clone(), symbol.clone());
                             }
                         }
@@ -1209,14 +1218,24 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                 symbols,
                 function_scope,
             } => {
-                // Only process if removal is strictly before the query position
-                if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(
-                        &mut scope,
-                        &active_function_scopes,
-                        *function_scope,
-                        symbols,
-                    );
+                let passes_position = (*rm_line, *rm_col) < (line, column);
+                if passes_position || query_inside_function {
+                    // For hoisted removals, only apply global ones
+                    if !passes_position {
+                        // Hoisted path: only apply if this is a global removal
+                        if function_scope.is_none() {
+                            for sym_name in symbols {
+                                scope.symbols.remove(sym_name.as_str());
+                            }
+                        }
+                    } else {
+                        apply_removal(
+                            &mut scope,
+                            &active_function_scopes,
+                            *function_scope,
+                            symbols,
+                        );
+                    }
                 }
             }
             ScopeEvent::PackageLoad {
@@ -1225,20 +1244,20 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                 package,
                 function_scope,
             } => {
-                // Requirements 8.1, 8.3: Position-aware package loading
-                // Populate loaded_packages for callers to check package exports
-                if (*pkg_line, *pkg_col) <= (line, column) {
+                let passes_position = (*pkg_line, *pkg_col) <= (line, column);
+                if passes_position || query_inside_function {
                     // Check function scope compatibility
                     let should_include = match function_scope {
-                        None => true, // Global package load - always include
+                        None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
-                            // Function-scoped package load - only include if query is in same function
-                            active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line
-                                    && active_scope.1 == pkg_scope.start.column
-                                    && active_scope.2 == pkg_scope.end.line
-                                    && active_scope.3 == pkg_scope.end.column
-                            })
+                            // Function-scoped package load - only include if positional AND in same function
+                            passes_position
+                                && active_function_scopes.iter().any(|active_scope| {
+                                    active_scope.0 == pkg_scope.start.line
+                                        && active_scope.1 == pkg_scope.start.column
+                                        && active_scope.2 == pkg_scope.end.line
+                                        && active_scope.3 == pkg_scope.end.column
+                                })
                         }
                     };
 
@@ -1252,10 +1271,9 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                 column: decl_col,
                 symbol,
             } => {
-                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
-                // is available starting from line+1, matching source() semantics.
-                // Include if declaration position is before or at the query position.
-                if (*decl_line, *decl_col) <= (line, column) {
+                // Declarations are always global scope - hoist when inside a function
+                let passes_position = (*decl_line, *decl_col) <= (line, column);
+                if passes_position || query_inside_function {
                     // Declared symbols are always global scope (not function-local)
                     // Only insert if no real (non-declared) definition exists
                     scope
@@ -1295,7 +1313,7 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
 /// let artifacts = ScopeArtifacts::default();
 /// let get_exports = |_pkg: &str| -> HashSet<String> { HashSet::new() };
 /// let base_exports = HashSet::new();
-/// let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+/// let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports, false);
 /// assert!(scope.symbols.is_empty());
 /// ```
 pub fn scope_at_position_with_packages<F>(
@@ -1304,6 +1322,7 @@ pub fn scope_at_position_with_packages<F>(
     column: u32,
     get_package_exports: &F,
     base_exports: &HashSet<String>,
+    hoist_globals: bool,
 ) -> ScopeAtPosition
 where
     F: Fn(&str) -> HashSet<String>,
@@ -1345,6 +1364,10 @@ where
             .collect()
     };
 
+    // When hoisting is enabled and we're inside a function body, global definitions
+    // are visible regardless of position (R has late-binding semantics).
+    let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
+
     // Process events and apply function scope filtering
     // Note: Local definitions and explicit package loads will override base exports
     // because we use insert() for definitions (which overwrites) and entry().or_insert_with()
@@ -1356,8 +1379,8 @@ where
                 column: def_col,
                 symbol,
             } => {
-                // Include if definition is before or at the position
-                if (*def_line, *def_col) <= (line, column) {
+                let passes_position = (*def_line, *def_col) <= (line, column);
+                if passes_position || query_inside_function {
                     // Use interval tree for O(log n) innermost scope lookup
                     let def_function_scope = artifacts
                         .function_scope_tree
@@ -1366,12 +1389,12 @@ where
 
                     match def_function_scope {
                         None => {
-                            // Global definition - always include
+                            // Global definition - include (hoisted or positionally valid)
                             scope.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                         Some(def_scope) => {
-                            // Function-local definition - only include if we're inside the same function
-                            if active_function_scopes.contains(&def_scope) {
+                            // Function-local definition - only include if positional AND in same function
+                            if passes_position && active_function_scopes.contains(&def_scope) {
                                 scope.symbols.insert(symbol.name.clone(), symbol.clone());
                             }
                         }
@@ -1405,14 +1428,23 @@ where
                 symbols,
                 function_scope,
             } => {
-                // Only process if removal is strictly before the query position
-                if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(
-                        &mut scope,
-                        &active_function_scopes,
-                        *function_scope,
-                        symbols,
-                    );
+                let passes_position = (*rm_line, *rm_col) < (line, column);
+                if passes_position || query_inside_function {
+                    if !passes_position {
+                        // Hoisted path: only apply global removals
+                        if function_scope.is_none() {
+                            for sym_name in symbols {
+                                scope.symbols.remove(sym_name.as_str());
+                            }
+                        }
+                    } else {
+                        apply_removal(
+                            &mut scope,
+                            &active_function_scopes,
+                            *function_scope,
+                            symbols,
+                        );
+                    }
                 }
             }
             ScopeEvent::PackageLoad {
@@ -1421,32 +1453,23 @@ where
                 package,
                 function_scope,
             } => {
-                // Process PackageLoad events for position-aware package loading
-                // Requirements 2.1, 2.2: Only include if package is loaded before query position
-                if (*pkg_line, *pkg_col) <= (line, column) {
-                    // Requirements 2.4, 2.5: Check function scope compatibility
+                let passes_position = (*pkg_line, *pkg_col) <= (line, column);
+                if passes_position || query_inside_function {
                     let should_include = match function_scope {
-                        None => {
-                            // Global package load - always available after the load position
-                            true
-                        }
+                        None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
-                            // Function-scoped package load - only available within that function
-                            // Check if query position is inside the same function scope
-                            active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line
-                                    && active_scope.1 == pkg_scope.start.column
-                                    && active_scope.2 == pkg_scope.end.line
-                                    && active_scope.3 == pkg_scope.end.column
-                            })
+                            // Function-scoped package load - only include if positional AND in same function
+                            passes_position
+                                && active_function_scopes.iter().any(|active_scope| {
+                                    active_scope.0 == pkg_scope.start.line
+                                        && active_scope.1 == pkg_scope.start.column
+                                        && active_scope.2 == pkg_scope.end.line
+                                        && active_scope.3 == pkg_scope.end.column
+                                })
                         }
                     };
 
                     if should_include {
-                        // Validate package name before URI construction to avoid
-                        // malformed URIs or collisions at "package:unknown".
-                        // Note: dots (including "..") are valid in R package names
-                        // (e.g., data.table) and safe in package: URIs.
                         if package.is_empty()
                             || package.contains('/')
                             || package.contains('\\')
@@ -1455,21 +1478,14 @@ where
                             continue;
                         }
 
-                        // Get package exports and add them to scope
                         let exports = get_package_exports(package);
-
-                        // Create a pseudo-URI for the package source
-                        // This allows hover/definition to identify package symbols
                         let package_uri = Url::parse(&format!("package:{}", package))
                             .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
 
                         for export_name in exports {
-                            // Check if symbol already exists
                             let should_insert = match scope.symbols.get(export_name.as_str()) {
-                                None => true, // No existing symbol, insert
+                                None => true,
                                 Some(existing) => {
-                                    // Override if existing is from any package (later library() masks earlier)
-                                    // Local definitions (non-package URIs) take precedence
                                     existing.source_uri.as_str().starts_with("package:")
                                 }
                             };
@@ -1480,7 +1496,7 @@ where
                                     name.clone(),
                                     ScopedSymbol {
                                         name,
-                                        kind: SymbolKind::Variable, // Package exports are treated as variables
+                                        kind: SymbolKind::Variable,
                                         source_uri: package_uri.clone(),
                                         defined_line: 0,
                                         defined_column: 0,
@@ -1498,12 +1514,8 @@ where
                 column: decl_col,
                 symbol,
             } => {
-                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
-                // is available starting from line+1, matching source() semantics.
-                // Include if declaration position is before or at the query position.
-                if (*decl_line, *decl_col) <= (line, column) {
-                    // Declared symbols are always global scope (not function-local)
-                    // Only insert if no real (non-declared) definition exists
+                let passes_position = (*decl_line, *decl_col) <= (line, column);
+                if passes_position || query_inside_function {
                     scope
                         .symbols
                         .entry(symbol.name.clone())
@@ -2287,6 +2299,7 @@ pub fn scope_at_position_with_graph<F, G>(
     workspace_root: Option<&Url>,
     max_depth: usize,
     base_exports: &HashSet<String>,
+    hoist_globals: bool,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2316,6 +2329,7 @@ where
         &mut visited,
         &empty_packages,
         base_exports,
+        hoist_globals,
     )
 }
 
@@ -2346,6 +2360,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     visited: &mut HashSet<Url>,
     inherited_packages: &HashSet<String>,
     base_exports: &HashSet<String>,
+    hoist_globals: bool,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2507,6 +2522,7 @@ where
             visited,
             &empty_packages, // Parent collects its own inherited packages
             base_exports,
+            hoist_globals,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -2604,6 +2620,10 @@ where
             .collect()
     };
 
+    // When hoisting is enabled and we're inside a function body, global definitions
+    // are visible regardless of position (R has late-binding semantics).
+    let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
+
     // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
@@ -2612,7 +2632,8 @@ where
                 column: def_col,
                 symbol,
             } => {
-                if (*def_line, *def_col) <= (line, column) {
+                let passes_position = (*def_line, *def_col) <= (line, column);
+                if passes_position || query_inside_function {
                     // Use interval tree for O(log n) innermost scope lookup
                     let def_function_scope = artifacts
                         .function_scope_tree
@@ -2621,12 +2642,12 @@ where
 
                     match def_function_scope {
                         None => {
-                            // Global definition - always include (local definitions take precedence over inherited symbols)
+                            // Global definition - include (hoisted or positionally valid)
                             scope.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                         Some(def_scope) => {
-                            // Function-local definition - only include if we're inside the same function
-                            if active_function_scopes.contains(&def_scope) {
+                            // Function-local definition - only include if positional AND in same function
+                            if passes_position && active_function_scopes.contains(&def_scope) {
                                 scope.symbols.insert(symbol.name.clone(), symbol.clone());
                             }
                         }
@@ -2638,8 +2659,16 @@ where
                 column: src_col,
                 source,
             } => {
-                // Only include if source() call is before the position
-                if (*src_line, *src_col) < (line, column) {
+                // Include source() if before position, or if hoisting and it's a global source()
+                let passes_position = (*src_line, *src_col) < (line, column);
+                let is_global_source = query_inside_function && {
+                    let source_function_scope = artifacts
+                        .function_scope_tree
+                        .query_innermost(Position::new(*src_line, *src_col))
+                        .map(|interval| interval.as_tuple());
+                    source_function_scope.is_none()
+                };
+                if passes_position || is_global_source {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
@@ -2775,6 +2804,7 @@ where
                             visited,
                             packages_for_child, // Pass inherited packages to child
                             base_exports,
+                            hoist_globals,
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -2819,14 +2849,23 @@ where
                 symbols,
                 function_scope,
             } => {
-                // Only process if removal is strictly before the query position
-                if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(
-                        &mut scope,
-                        &active_function_scopes,
-                        *function_scope,
-                        symbols,
-                    );
+                let passes_position = (*rm_line, *rm_col) < (line, column);
+                if passes_position || query_inside_function {
+                    if !passes_position {
+                        // Hoisted path: only apply global removals
+                        if function_scope.is_none() {
+                            for sym_name in symbols {
+                                scope.symbols.remove(sym_name.as_str());
+                            }
+                        }
+                    } else {
+                        apply_removal(
+                            &mut scope,
+                            &active_function_scopes,
+                            *function_scope,
+                            symbols,
+                        );
+                    }
                 }
             }
             ScopeEvent::PackageLoad {
@@ -2835,20 +2874,19 @@ where
                 package,
                 function_scope,
             } => {
-                // Requirements 8.1, 8.3: Position-aware package loading
-                // Only include packages loaded before the query position
-                if (*pkg_line, *pkg_col) <= (line, column) {
-                    // Check function scope compatibility
+                let passes_position = (*pkg_line, *pkg_col) <= (line, column);
+                if passes_position || query_inside_function {
                     let should_include = match function_scope {
-                        None => true, // Global package load - always include
+                        None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
-                            // Function-scoped package load - only include if query is in same function
-                            active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line
-                                    && active_scope.1 == pkg_scope.start.column
-                                    && active_scope.2 == pkg_scope.end.line
-                                    && active_scope.3 == pkg_scope.end.column
-                            })
+                            // Function-scoped package load - only include if positional AND in same function
+                            passes_position
+                                && active_function_scopes.iter().any(|active_scope| {
+                                    active_scope.0 == pkg_scope.start.line
+                                        && active_scope.1 == pkg_scope.start.column
+                                        && active_scope.2 == pkg_scope.end.line
+                                        && active_scope.3 == pkg_scope.end.column
+                                })
                         }
                     };
 
@@ -2862,10 +2900,8 @@ where
                 column: decl_col,
                 symbol,
             } => {
-                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
-                // is available starting from line+1, matching source() semantics.
-                // Include if declaration position is before or at the query position.
-                if (*decl_line, *decl_col) <= (line, column) {
+                let passes_position = (*decl_line, *decl_col) <= (line, column);
+                if passes_position || query_inside_function {
                     // Declared symbols are always global scope (not function-local)
                     // Only insert if no real (non-declared) definition exists;
                     // among declared symbols, later ones win (timeline is sorted).
@@ -2998,18 +3034,18 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // At line 0, only x should be in scope
-        let scope = scope_at_position(&artifacts, 0, 10);
+        let scope = scope_at_position(&artifacts, 0, 10, false);
         assert!(scope.symbols.contains_key("x"));
         assert!(!scope.symbols.contains_key("y"));
 
         // At line 1, x and y should be in scope
-        let scope = scope_at_position(&artifacts, 1, 10);
+        let scope = scope_at_position(&artifacts, 1, 10, false);
         assert!(scope.symbols.contains_key("x"));
         assert!(scope.symbols.contains_key("y"));
         assert!(!scope.symbols.contains_key("z"));
 
         // At line 2, all should be in scope
-        let scope = scope_at_position(&artifacts, 2, 10);
+        let scope = scope_at_position(&artifacts, 2, 10, false);
         assert_eq!(scope.symbols.len(), 3);
     }
 
@@ -3191,6 +3227,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -3427,6 +3464,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -3502,6 +3540,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -3619,6 +3658,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -3759,6 +3799,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -3837,7 +3878,7 @@ mod tests {
     #[test]
     fn test_max_depth_exceeded_backward() {
         // Test that depth_exceeded is populated when max depth is hit on backward directives
-        use super::super::dependency::DependencyGraph;
+        use crate::cross_file::dependency::DependencyGraph;
         use super::super::types::{CrossFileMetadata, ForwardSource};
 
         let uri_a = Url::parse("file:///project/a.R").unwrap();
@@ -3925,6 +3966,7 @@ mod tests {
             Some(&workspace_root),
             2,
             &HashSet::new(),
+            false,
         );
 
         // Should have depth_exceeded entry
@@ -4117,6 +4159,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -4204,6 +4247,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4219,7 +4263,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Inside function body, parameters should be available
-        let scope_inside = scope_at_position(&artifacts, 0, 30); // Position within function body
+        let scope_inside = scope_at_position(&artifacts, 0, 30, false); // Position within function body
         assert!(
             scope_inside.symbols.contains_key("x"),
             "Parameter x should be available inside function"
@@ -4241,7 +4285,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Outside function, parameters should NOT be available
-        let scope_outside = scope_at_position(&artifacts, 1, 10); // Position on second line
+        let scope_outside = scope_at_position(&artifacts, 1, 10, false); // Position on second line
         assert!(
             scope_outside.symbols.contains_key("my_func"),
             "Function name should be available outside function"
@@ -4267,7 +4311,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Outside function, local variable should NOT be available
-        let scope_outside = scope_at_position(&artifacts, 1, 10);
+        let scope_outside = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope_outside.symbols.contains_key("my_func"),
             "Function name should be available outside function"
@@ -4282,7 +4326,7 @@ mod tests {
         );
 
         // Inside function, local variable SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        let scope_inside = scope_at_position(&artifacts, 0, 40, false);
         assert!(
             scope_inside.symbols.contains_key("my_func"),
             "Function name should be available inside function"
@@ -4304,7 +4348,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Outside all functions
-        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        let scope_outside = scope_at_position(&artifacts, 10, 0, false);
         assert!(
             scope_outside.symbols.contains_key("outer"),
             "Outer function should be available outside"
@@ -4329,7 +4373,7 @@ mod tests {
             .or_else(|| code.find("inner"))
             .map(|i| (i + 1) as u32)
             .unwrap_or(0);
-        let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def);
+        let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def, false);
         assert!(
             scope_outer.symbols.contains_key("outer"),
             "Outer function should be available inside itself"
@@ -4354,7 +4398,7 @@ mod tests {
             .or_else(|| code.rfind("inner_var"))
             .map(|i| (i + 1) as u32)
             .unwrap_or(0);
-        let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def);
+        let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def, false);
         assert!(
             scope_inner.symbols.contains_key("outer"),
             "Outer function should be available inside inner function"
@@ -4380,7 +4424,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Inside first function
-        let scope_func1 = scope_at_position(&artifacts, 0, 25);
+        let scope_func1 = scope_at_position(&artifacts, 0, 25, false);
         assert!(
             scope_func1.symbols.contains_key("func1"),
             "Function 1 should be available inside itself"
@@ -4407,7 +4451,7 @@ mod tests {
         );
 
         // Inside second function
-        let scope_func2 = scope_at_position(&artifacts, 1, 25);
+        let scope_func2 = scope_at_position(&artifacts, 1, 25, false);
         assert!(
             scope_func2.symbols.contains_key("func1"),
             "Function 1 should be available inside function 2"
@@ -4434,7 +4478,7 @@ mod tests {
         );
 
         // Outside both functions
-        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        let scope_outside = scope_at_position(&artifacts, 10, 0, false);
         assert!(
             scope_outside.symbols.contains_key("func1"),
             "Function 1 should be available outside"
@@ -4482,7 +4526,7 @@ mod tests {
         }
 
         // Parameters should be available within function body
-        let scope_in_body = scope_at_position(&artifacts, 0, 40);
+        let scope_in_body = scope_at_position(&artifacts, 0, 40, false);
         assert!(scope_in_body.symbols.contains_key("x"));
         assert!(scope_in_body.symbols.contains_key("y"));
     }
@@ -4508,7 +4552,7 @@ mod tests {
         }
 
         // Parameters should be available within function body
-        let scope_in_body = scope_at_position(&artifacts, 0, 40);
+        let scope_in_body = scope_at_position(&artifacts, 0, 40, false);
         assert!(scope_in_body.symbols.contains_key("x"));
         assert!(scope_in_body.symbols.contains_key("..."));
     }
@@ -4531,7 +4575,7 @@ mod tests {
         }
 
         // Function name should still be available within body
-        let scope_in_body = scope_at_position(&artifacts, 0, 25);
+        let scope_in_body = scope_at_position(&artifacts, 0, 25, false);
         assert!(scope_in_body.symbols.contains_key("my_func"));
     }
 
@@ -4543,7 +4587,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Query at EOF position
-        let scope_eof = scope_at_position(&artifacts, u32::MAX, u32::MAX);
+        let scope_eof = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
 
         // Should have global symbols
         assert!(
@@ -5575,21 +5619,21 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Before rm() (line 0, after definition), x should be in scope
-        let scope_before_rm = scope_at_position(&artifacts, 0, 10);
+        let scope_before_rm = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             scope_before_rm.symbols.contains_key("x"),
             "x should be in scope after definition but before rm()"
         );
 
         // After rm() (line 1, after rm call), x should NOT be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm()"
         );
 
         // At end of file, x should NOT be in scope
-        let scope_eof = scope_at_position(&artifacts, 10, 0);
+        let scope_eof = scope_at_position(&artifacts, 10, 0, false);
         assert!(
             !scope_eof.symbols.contains_key("x"),
             "x should NOT be in scope at end of file after rm()"
@@ -5606,21 +5650,21 @@ mod tests {
 
         // After rm() but before definition (line 0), x should NOT be in scope
         // (rm() on undefined symbol has no effect, but x is still not defined)
-        let scope_after_rm = scope_at_position(&artifacts, 0, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm() of undefined symbol"
         );
 
         // After definition (line 1), x should be in scope
-        let scope_after_def = scope_at_position(&artifacts, 1, 10);
+        let scope_after_def = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope_after_def.symbols.contains_key("x"),
             "x should be in scope after definition"
         );
 
         // At end of file, x should be in scope
-        let scope_eof = scope_at_position(&artifacts, 10, 0);
+        let scope_eof = scope_at_position(&artifacts, 10, 0, false);
         assert!(
             scope_eof.symbols.contains_key("x"),
             "x should be in scope at end of file after definition"
@@ -5636,28 +5680,28 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // After first definition (line 0), x should be in scope
-        let scope_after_first_def = scope_at_position(&artifacts, 0, 10);
+        let scope_after_first_def = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             scope_after_first_def.symbols.contains_key("x"),
             "x should be in scope after first definition"
         );
 
         // After rm() (line 1), x should NOT be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm()"
         );
 
         // After second definition (line 2), x should be in scope again
-        let scope_after_second_def = scope_at_position(&artifacts, 2, 10);
+        let scope_after_second_def = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             scope_after_second_def.symbols.contains_key("x"),
             "x should be in scope after second definition"
         );
 
         // At end of file, x should be in scope
-        let scope_eof = scope_at_position(&artifacts, 10, 0);
+        let scope_eof = scope_at_position(&artifacts, 10, 0, false);
         assert!(
             scope_eof.symbols.contains_key("x"),
             "x should be in scope at end of file after re-definition"
@@ -5673,7 +5717,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Line 0: only 'a' is defined
-        let scope_line0 = scope_at_position(&artifacts, 0, 10);
+        let scope_line0 = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             scope_line0.symbols.contains_key("a"),
             "a should be in scope on line 0"
@@ -5688,7 +5732,7 @@ mod tests {
         );
 
         // Line 1: 'a' and 'b' are defined
-        let scope_line1 = scope_at_position(&artifacts, 1, 10);
+        let scope_line1 = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope_line1.symbols.contains_key("a"),
             "a should be in scope on line 1"
@@ -5703,7 +5747,7 @@ mod tests {
         );
 
         // Line 2: 'a' is removed, only 'b' remains
-        let scope_line2 = scope_at_position(&artifacts, 2, 10);
+        let scope_line2 = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             !scope_line2.symbols.contains_key("a"),
             "a should NOT be in scope on line 2 (after rm)"
@@ -5718,7 +5762,7 @@ mod tests {
         );
 
         // Line 3: 'b' and 'c' are defined, 'a' is still removed
-        let scope_line3 = scope_at_position(&artifacts, 3, 10);
+        let scope_line3 = scope_at_position(&artifacts, 3, 10, false);
         assert!(
             !scope_line3.symbols.contains_key("a"),
             "a should NOT be in scope on line 3"
@@ -5733,7 +5777,7 @@ mod tests {
         );
 
         // Line 4: 'b' and 'c' are removed, nothing remains
-        let scope_line4 = scope_at_position(&artifacts, 4, 10);
+        let scope_line4 = scope_at_position(&artifacts, 4, 10, false);
         assert!(
             !scope_line4.symbols.contains_key("a"),
             "a should NOT be in scope on line 4"
@@ -5757,7 +5801,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Before rm() (line 1), both x and y should be in scope
-        let scope_before_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_before_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope_before_rm.symbols.contains_key("x"),
             "x should be in scope before rm()"
@@ -5768,7 +5812,7 @@ mod tests {
         );
 
         // After rm() (line 2), neither x nor y should be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 2, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm()"
@@ -5788,7 +5832,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Before rm() (line 1), both x and y should be in scope
-        let scope_before_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_before_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope_before_rm.symbols.contains_key("x"),
             "x should be in scope before rm()"
@@ -5799,7 +5843,7 @@ mod tests {
         );
 
         // After rm() (line 2), neither x nor y should be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 2, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm(list=...)"
@@ -5819,14 +5863,14 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Before remove() (line 0), x should be in scope
-        let scope_before_rm = scope_at_position(&artifacts, 0, 10);
+        let scope_before_rm = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             scope_before_rm.symbols.contains_key("x"),
             "x should be in scope before remove()"
         );
 
         // After remove() (line 1), x should NOT be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after remove()"
@@ -5842,7 +5886,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // After rm(x) (line 2), x should NOT be in scope but y should be
-        let scope_after_rm = scope_at_position(&artifacts, 2, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm(x)"
@@ -5862,7 +5906,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Outside function (after function definition), x should be in scope
-        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        let scope_outside = scope_at_position(&artifacts, 10, 0, false);
         assert!(
             scope_outside.symbols.contains_key("x"),
             "x should be in scope outside function"
@@ -5883,14 +5927,14 @@ mod tests {
 
         // Inside function, after rm(y) but before z definition (line 3)
         // Find position inside function body after rm(y)
-        let scope_inside_after_rm = scope_at_position(&artifacts, 3, 10);
+        let scope_inside_after_rm = scope_at_position(&artifacts, 3, 10, false);
         assert!(
             !scope_inside_after_rm.symbols.contains_key("y"),
             "y should NOT be in scope inside function after rm(y)"
         );
 
         // Inside function, after z definition (line 4)
-        let scope_inside_after_z = scope_at_position(&artifacts, 4, 10);
+        let scope_inside_after_z = scope_at_position(&artifacts, 4, 10, false);
         assert!(
             scope_inside_after_z.symbols.contains_key("z"),
             "z should be in scope inside function after definition"
@@ -5910,14 +5954,14 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // After rm(x) at global level, x should NOT be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after global rm(x)"
         );
 
         // Inside function, y should be in scope (unaffected by global rm)
-        let scope_inside_func = scope_at_position(&artifacts, 3, 10);
+        let scope_inside_func = scope_at_position(&artifacts, 3, 10, false);
         assert!(
             scope_inside_func.symbols.contains_key("y"),
             "y should be in scope inside function"
@@ -5937,7 +5981,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // After rm() with envir=globalenv(), x should NOT be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm(x, envir=globalenv())"
@@ -5953,7 +5997,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // After rm() with non-default envir, x should still be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope_after_rm.symbols.contains_key("x"),
             "x should still be in scope after rm(x, envir=my_env) - non-default envir is ignored"
@@ -5969,43 +6013,43 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Line 0: a defined
-        let scope_l0 = scope_at_position(&artifacts, 0, 10);
+        let scope_l0 = scope_at_position(&artifacts, 0, 10, false);
         assert!(scope_l0.symbols.contains_key("a"));
         assert!(!scope_l0.symbols.contains_key("b"));
         assert!(!scope_l0.symbols.contains_key("c"));
 
         // Line 1: a, b defined
-        let scope_l1 = scope_at_position(&artifacts, 1, 10);
+        let scope_l1 = scope_at_position(&artifacts, 1, 10, false);
         assert!(scope_l1.symbols.contains_key("a"));
         assert!(scope_l1.symbols.contains_key("b"));
         assert!(!scope_l1.symbols.contains_key("c"));
 
         // Line 2: a removed, b remains
-        let scope_l2 = scope_at_position(&artifacts, 2, 10);
+        let scope_l2 = scope_at_position(&artifacts, 2, 10, false);
         assert!(!scope_l2.symbols.contains_key("a"));
         assert!(scope_l2.symbols.contains_key("b"));
         assert!(!scope_l2.symbols.contains_key("c"));
 
         // Line 3: a re-defined, b remains
-        let scope_l3 = scope_at_position(&artifacts, 3, 10);
+        let scope_l3 = scope_at_position(&artifacts, 3, 10, false);
         assert!(scope_l3.symbols.contains_key("a"));
         assert!(scope_l3.symbols.contains_key("b"));
         assert!(!scope_l3.symbols.contains_key("c"));
 
         // Line 4: a, b, c defined
-        let scope_l4 = scope_at_position(&artifacts, 4, 10);
+        let scope_l4 = scope_at_position(&artifacts, 4, 10, false);
         assert!(scope_l4.symbols.contains_key("a"));
         assert!(scope_l4.symbols.contains_key("b"));
         assert!(scope_l4.symbols.contains_key("c"));
 
         // Line 5: b, c removed, a remains
-        let scope_l5 = scope_at_position(&artifacts, 5, 10);
+        let scope_l5 = scope_at_position(&artifacts, 5, 10, false);
         assert!(scope_l5.symbols.contains_key("a"));
         assert!(!scope_l5.symbols.contains_key("b"));
         assert!(!scope_l5.symbols.contains_key("c"));
 
         // Line 6: a re-defined again
-        let scope_l6 = scope_at_position(&artifacts, 6, 10);
+        let scope_l6 = scope_at_position(&artifacts, 6, 10, false);
         assert!(scope_l6.symbols.contains_key("a"));
         assert!(!scope_l6.symbols.contains_key("b"));
         assert!(!scope_l6.symbols.contains_key("c"));
@@ -6022,7 +6066,7 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // At position (0, 10) - after x definition on line 0, x should be in scope
-        let scope_before_rm_line = scope_at_position(&artifacts, 0, 10);
+        let scope_before_rm_line = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             scope_before_rm_line.symbols.contains_key("x"),
             "x should be in scope on line 0 (before rm line)"
@@ -6030,14 +6074,14 @@ mod tests {
 
         // At position (1, 0) - at the start of rm(x) line, the removal is not processed
         // because scope resolution uses strict-before comparison
-        let scope_at_rm_start = scope_at_position(&artifacts, 1, 0);
+        let scope_at_rm_start = scope_at_position(&artifacts, 1, 0, false);
         assert!(
             scope_at_rm_start.symbols.contains_key("x"),
             "x should be in scope at rm() position (removal is processed strictly before)"
         );
 
         // At position (1, 5) - after rm(x), x should NOT be in scope
-        let scope_after_rm = scope_at_position(&artifacts, 1, 5);
+        let scope_after_rm = scope_at_position(&artifacts, 1, 5, false);
         assert!(
             !scope_after_rm.symbols.contains_key("x"),
             "x should NOT be in scope after rm(x) on the same line"
@@ -6172,6 +6216,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -6189,6 +6234,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6206,6 +6252,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -6282,6 +6329,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -6307,6 +6355,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6400,6 +6449,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -6488,6 +6538,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -6569,6 +6620,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -6586,6 +6638,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6603,6 +6656,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -6686,6 +6740,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6769,6 +6824,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -6786,6 +6842,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -6886,6 +6943,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -6903,6 +6961,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -7011,6 +7070,7 @@ mod tests {
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -8103,7 +8163,7 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query at line 0 (before library call on line 1)
-        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
 
         // Should have x but NOT package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8128,7 +8188,7 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query at line 2 (after library call on line 1)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Should have x, y, and package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8158,7 +8218,7 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query at line 0, after the library call ends
-        let scope = scope_at_position_with_packages(&artifacts, 0, 20, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 0, 20, &get_exports, &base_exports, false);
 
         // Package exports should be available
         assert!(
@@ -8183,7 +8243,7 @@ mod tests {
 
         // Query inside the function (line 2, after library call)
         let scope_inside =
-            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Package exports should be available inside the function
         assert!(
@@ -8208,7 +8268,7 @@ mod tests {
 
         // Query outside the function (line 4)
         let scope_outside =
-            scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports, false);
 
         // Package exports should NOT be available outside the function
         assert!(
@@ -8238,7 +8298,7 @@ mod tests {
 
         // Query inside the function
         let scope_inside =
-            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
         assert!(
             scope_inside.symbols.contains_key("mutate"),
             "Global package exports should be available inside function"
@@ -8246,7 +8306,7 @@ mod tests {
 
         // Query outside the function
         let scope_outside =
-            scope_at_position_with_packages(&artifacts, 3, 10, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 3, 10, &get_exports, &base_exports, false);
         assert!(
             scope_outside.symbols.contains_key("filter"),
             "Global package exports should be available outside function"
@@ -8267,7 +8327,7 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query after both library calls
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Should have exports from both packages
         assert!(
@@ -8299,7 +8359,7 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query after local definition
-        let scope = scope_at_position_with_packages(&artifacts, 1, 50, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 50, &get_exports, &base_exports, false);
 
         // mutate should be the local definition, not the package export
         assert!(
@@ -8334,7 +8394,7 @@ mod tests {
         let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         let mutate_symbol = scope.symbols.get("mutate").unwrap();
         assert_eq!(
@@ -8354,7 +8414,7 @@ mod tests {
         let get_exports = mock_package_exports(&[("emptypackage", &[])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         // Should just have x, no package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8372,7 +8432,7 @@ mod tests {
         let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         // Should just have x, no package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8392,7 +8452,7 @@ mod tests {
         let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         assert!(
             scope.symbols.contains_key("mutate"),
@@ -8415,7 +8475,7 @@ x <- 1"#;
         let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         assert!(
             scope.symbols.contains_key("mutate"),
@@ -8448,7 +8508,7 @@ x <- 1"#;
 
         // Query at the very beginning of the file
         let scope_start =
-            scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports, false);
         assert!(
             scope_start.symbols.contains_key("print"),
             "print should be in scope at start"
@@ -8464,7 +8524,7 @@ x <- 1"#;
 
         // Query at the end of the file
         let scope_end =
-            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
         assert!(
             scope_end.symbols.contains_key("print"),
             "print should be in scope at end"
@@ -8513,7 +8573,7 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query at line 0 (before library call)
-        let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports, false);
         assert!(
             scope.symbols.contains_key("print"),
             "print should be in scope before library()"
@@ -8535,7 +8595,7 @@ x <- 1"#;
         let mut base_exports = HashSet::new();
         base_exports.insert("print".to_string());
 
-        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
         let print_symbol = scope.symbols.get("print").unwrap();
         assert_eq!(
             print_symbol.source_uri.as_str(),
@@ -8556,7 +8616,7 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query after local definition
-        let scope = scope_at_position_with_packages(&artifacts, 0, 50, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 0, 50, &get_exports, &base_exports, false);
 
         let print_symbol = scope.symbols.get("print").unwrap();
         assert_eq!(
@@ -8583,7 +8643,7 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query after library call
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         let print_symbol = scope.symbols.get("print").unwrap();
         // The package export should override the base export
@@ -8606,7 +8666,7 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query inside the function
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
         assert!(
             scope.symbols.contains_key("print"),
             "print should be in scope inside function"
@@ -8623,7 +8683,7 @@ x <- 1"#;
         let get_exports = mock_package_exports(&[]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
         assert_eq!(scope.symbols.len(), 1, "Should only have x in scope");
     }
@@ -8702,6 +8762,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Child should have inherited dplyr from parent
@@ -8778,6 +8839,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -8854,6 +8916,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Child should have both packages
@@ -8935,6 +8998,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -9017,6 +9081,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -9095,6 +9160,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -9211,6 +9277,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -9232,6 +9299,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -9311,6 +9379,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -9332,6 +9401,7 @@ x <- 1"#;
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -9357,14 +9427,14 @@ x <- 1"#;
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Query at line 0 (before library call) - should NOT have dplyr in loaded_packages
-        let scope_before = scope_at_position(&artifacts, 0, 10);
+        let scope_before = scope_at_position(&artifacts, 0, 10, false);
         assert!(
             !scope_before.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should NOT be in loaded_packages before library() call"
         );
 
         // Query at line 2 (after library call) - should have dplyr in loaded_packages
-        let scope_after = scope_at_position(&artifacts, 2, 10);
+        let scope_after = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             scope_after.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages after library() call"
@@ -9379,7 +9449,7 @@ x <- 1"#;
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Query at line 0 (after first library, before second)
-        let scope_mid = scope_at_position(&artifacts, 0, 20);
+        let scope_mid = scope_at_position(&artifacts, 0, 20, false);
         assert!(
             scope_mid.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages after first library() call"
@@ -9390,7 +9460,7 @@ x <- 1"#;
         );
 
         // Query at line 2 (after both library calls)
-        let scope_end = scope_at_position(&artifacts, 2, 10);
+        let scope_end = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             scope_end.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages"
@@ -9413,14 +9483,14 @@ y <- filter(df)"#;
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Query inside the function (line 2) - should have dplyr
-        let scope_inside = scope_at_position(&artifacts, 2, 10);
+        let scope_inside = scope_at_position(&artifacts, 2, 10, false);
         assert!(
             scope_inside.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages inside function"
         );
 
         // Query outside the function (line 4) - should NOT have dplyr
-        let scope_outside = scope_at_position(&artifacts, 4, 10);
+        let scope_outside = scope_at_position(&artifacts, 4, 10, false);
         assert!(
             !scope_outside.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should NOT be in loaded_packages outside function (function-scoped)"
@@ -9434,7 +9504,7 @@ y <- filter(df)"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let scope = scope_at_position(&artifacts, 1, 10);
+        let scope = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages after require() call"
@@ -9448,7 +9518,7 @@ y <- filter(df)"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let scope = scope_at_position(&artifacts, 1, 10);
+        let scope = scope_at_position(&artifacts, 1, 10, false);
         assert!(
             scope.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages after loadNamespace() call"
@@ -9681,6 +9751,254 @@ y <- filter(df)"#;
                     "Only one symbol should be in exported_interface (the valid identifier)"
                 );
             }
+        }
+    }
+
+    // ============================================================================
+    // Global Symbol Hoisting Tests
+    // ============================================================================
+    mod hoist_globals_tests {
+        use super::*;
+        use std::collections::HashSet;
+        use tree_sitter::Parser;
+
+        fn parse_r(code: &str) -> Tree {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        }
+
+        fn test_uri() -> Url {
+            Url::parse("file:///test.R").unwrap()
+        }
+
+        #[test]
+        fn test_function_body_sees_global_defined_after_function() {
+            // main <- function() { helper() }
+            // helper <- function() { 42 }
+            let code = "main <- function() { helper() }\nhelper <- function() { 42 }";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // Inside main's body (line 0, col ~25), with hoisting ON, helper should be visible
+            let scope = scope_at_position(&artifacts, 0, 25, true);
+            assert!(
+                scope.symbols.contains_key("helper"),
+                "With hoisting, function body should see globals defined after the function. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn test_function_body_does_not_see_later_global_without_hoisting() {
+            let code = "main <- function() { helper() }\nhelper <- function() { 42 }";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // Inside main's body, with hoisting OFF, helper should NOT be visible
+            let scope = scope_at_position(&artifacts, 0, 25, false);
+            assert!(
+                !scope.symbols.contains_key("helper"),
+                "Without hoisting, function body should NOT see globals defined after the function"
+            );
+        }
+
+        #[test]
+        fn test_function_locals_remain_positional_with_hoisting() {
+            // f <- function() {
+            //   x <- 1
+            //   # query here at line 2 col 0 is before x
+            //   y <- 2
+            // }
+            let code = "f <- function() {\n  x <- 1\n  y <- 2\n}";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // Query inside f's body before y is defined (line 1, col 8 is after x <- 1)
+            let scope = scope_at_position(&artifacts, 1, 8, true);
+            assert!(
+                scope.symbols.contains_key("x"),
+                "Local x should be visible after its definition"
+            );
+            assert!(
+                !scope.symbols.contains_key("y"),
+                "Local y should NOT be visible before its definition even with hoisting"
+            );
+        }
+
+        #[test]
+        fn test_global_level_remains_positional_with_hoisting() {
+            let code = "a <- 1\nb <- 2\nc <- 3";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // At global level (line 1, col 8), only a and b should be visible
+            let scope = scope_at_position(&artifacts, 1, 8, true);
+            assert!(
+                scope.symbols.contains_key("a"),
+                "a should be visible at global level"
+            );
+            assert!(
+                scope.symbols.contains_key("b"),
+                "b should be visible at global level"
+            );
+            assert!(
+                !scope.symbols.contains_key("c"),
+                "c should NOT be visible at global level before its definition, even with hoisting"
+            );
+        }
+
+        #[test]
+        fn test_rm_after_function_removes_symbol_with_hoisting() {
+            // x <- 1
+            // f <- function() { x }
+            // rm(x)
+            let code = "x <- 1\nf <- function() { x }\nrm(x)";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // Inside f's body with hoisting, x should be removed by the later rm()
+            let scope = scope_at_position(&artifacts, 1, 20, true);
+            assert!(
+                !scope.symbols.contains_key("x"),
+                "With hoisting, rm() after function should remove the symbol from function body scope"
+            );
+        }
+
+        #[test]
+        fn test_library_after_function_visible_with_hoisting() {
+            // f <- function() { ... }
+            // library(dplyr)
+            let code = "f <- function() { x }\nlibrary(dplyr)";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // Inside f's body with hoisting, dplyr should be loaded
+            let scope = scope_at_position(&artifacts, 0, 20, true);
+            assert!(
+                scope.loaded_packages.contains("dplyr"),
+                "With hoisting, library() after function should be visible in function body. Got: {:?}",
+                scope.loaded_packages
+            );
+        }
+
+        #[test]
+        fn test_nested_function_inner_sees_globals() {
+            // outer <- function() {
+            //   inner <- function() { helper() }
+            //   local_var <- 1
+            // }
+            // helper <- function() { 42 }
+            let code = "outer <- function() {\n  inner <- function() { helper() }\n  local_var <- 1\n}\nhelper <- function() { 42 }";
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            // Inside inner's body (line 1, col ~30), with hoisting, helper should be visible
+            let scope = scope_at_position(&artifacts, 1, 30, true);
+            assert!(
+                scope.symbols.contains_key("helper"),
+                "Nested inner function should see hoisted global 'helper'"
+            );
+        }
+
+        #[test]
+        fn test_hoisting_with_graph_function_sees_later_global() {
+            // Same test but using scope_at_position_with_graph
+            let code = "main <- function() { helper() }\nhelper <- function() { 42 }";
+            let tree = parse_r(code);
+            let uri = test_uri();
+            let artifacts = compute_artifacts(&uri, &tree, code);
+
+            let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+                if u == &uri { Some(artifacts.clone()) } else { None }
+            };
+            let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+            let graph = crate::cross_file::dependency::DependencyGraph::new();
+            let base_exports = HashSet::new();
+
+            let scope = scope_at_position_with_graph(
+                &uri,
+                0,
+                25,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                None,
+                10,
+                &base_exports,
+                true, // hoisting ON
+            );
+
+            assert!(
+                scope.symbols.contains_key("helper"),
+                "With hoisting via graph, function body should see later-defined global 'helper'"
+            );
+
+            // Same query without hoisting
+            let scope_no_hoist = scope_at_position_with_graph(
+                &uri,
+                0,
+                25,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                None,
+                10,
+                &base_exports,
+                false, // hoisting OFF
+            );
+
+            assert!(
+                !scope_no_hoist.symbols.contains_key("helper"),
+                "Without hoisting via graph, function body should NOT see later-defined global 'helper'"
+            );
+        }
+
+        #[test]
+        fn test_hoisting_source_after_function() {
+            // f <- function() { sourced_var }
+            // source("child.R")
+            let parent_code = "f <- function() { sourced_var }\nsource(\"child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_uri = Url::parse("file:///parent.R").unwrap();
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            // Create child artifacts with a variable
+            let child_code = "sourced_var <- 42";
+            let child_tree = parse_r(child_code);
+            let child_uri = Url::parse("file:///child.R").unwrap();
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+                if u == &parent_uri { Some(parent_artifacts.clone()) }
+                else if u == &child_uri { Some(child_artifacts.clone()) }
+                else { None }
+            };
+            let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+            let graph = crate::cross_file::dependency::DependencyGraph::new();
+            let base_exports = HashSet::new();
+
+            // Inside f's body with hoisting, sourced_var from child.R should be visible
+            let scope = scope_at_position_with_graph(
+                &parent_uri,
+                0,
+                20,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                None,
+                10,
+                &base_exports,
+                true,
+            );
+
+            assert!(
+                scope.symbols.contains_key("sourced_var"),
+                "With hoisting, source() after function should make sourced symbols visible in function body. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
         }
     }
 }

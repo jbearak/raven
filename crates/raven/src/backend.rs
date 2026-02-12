@@ -201,6 +201,13 @@ pub(crate) fn parse_cross_file_config(
             config.redundant_directive_severity = parse_severity(sev);
         }
 
+        if let Some(v) = cross_file
+            .get("hoistGlobalsInFunctions")
+            .and_then(|v| v.as_bool())
+        {
+            config.hoist_globals_in_functions = v;
+        }
+
         // Parse on-demand indexing settings
         if let Some(on_demand) = cross_file.get("onDemandIndexing") {
             if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
@@ -295,6 +302,10 @@ pub(crate) fn parse_cross_file_config(
         config.undefined_variables_enabled
     );
     log::info!("  diagnostics_enabled: {}", config.diagnostics_enabled);
+    log::info!(
+        "  hoist_globals_in_functions: {}",
+        config.hoist_globals_in_functions
+    );
     log::info!("  On-demand indexing:");
     log::info!("    enabled: {}", config.on_demand_indexing_enabled);
     log::info!(
@@ -1439,6 +1450,7 @@ impl LanguageServer for Backend {
                     state.workspace_folders.first(),
                     state.cross_file_config.max_chain_depth,
                     &empty_base_exports,
+                    false, // package prefetching doesn't need hoisting
                 );
 
                 let mut pkgs = scope.inherited_packages;

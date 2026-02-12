@@ -4810,6 +4810,7 @@ child_var <- 100
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4834,6 +4835,7 @@ child_var <- 100
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4857,6 +4859,7 @@ child_var <- 100
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -4984,6 +4987,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5004,6 +5008,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5121,6 +5126,7 @@ x <- 1
                 Some(&workspace_root),
                 10,
                 &HashSet::new(),
+                false,
             );
 
             assert!(
@@ -5610,6 +5616,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5684,6 +5691,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5783,6 +5791,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(
@@ -5857,6 +5866,7 @@ x <- 1
             Some(&workspace_root),
             10,
             &HashSet::new(),
+            false,
         );
 
         assert!(

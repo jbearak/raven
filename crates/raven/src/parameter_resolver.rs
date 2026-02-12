@@ -779,6 +779,7 @@ fn get_scope(
         state.workspace_folders.first(),
         max_depth,
         &base_exports,
+        state.cross_file_config.hoist_globals_in_functions,
     )
 }
 
