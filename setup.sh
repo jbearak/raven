@@ -27,8 +27,9 @@ echo "Packaging extension..."
 npm run package
 
 echo "Installing extension to VS Code..."
-VSIX_FILE=$(ls raven-*.vsix | head -n 1)
-if [ -n "$VSIX_FILE" ]; then
+VERSION=$(node -p "require('./package.json').version")
+VSIX_FILE="raven-${VERSION}.vsix"
+if [ -f "$VSIX_FILE" ]; then
     code --install-extension "$VSIX_FILE"
     echo "✓ Extension installed: $VSIX_FILE"
 else
