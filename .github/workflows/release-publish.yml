@@ -138,12 +138,12 @@ jobs:
         run: |
           echo "=== Generating SHA-256 checksums ==="
           for f in $(find lsp-artifacts -name '*.zip' | sort) $(find vscode-artifacts -name '*.vsix' | sort); do
-            sha256sum "$f" > "$f.sha256"
+            (cd "$(dirname "$f")" && sha256sum "$(basename "$f")" > "$(basename "$f").sha256")
             cat "$f.sha256"
           done
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           tag_name: ${{ inputs.tag }}
           name: Release ${{ inputs.tag }}
@@ -168,7 +168,7 @@ jobs:
           path: vscode-artifacts
 
       - name: Install vsce and ovsx
-        run: npm install -g @vscode/vsce ovsx
+        run: npm install -g @vscode/vsce@3.7.1 ovsx@0.10.9
 
       - name: Publish to VS Code Marketplace
         run: |
