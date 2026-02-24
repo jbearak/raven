@@ -6,6 +6,8 @@ cargo build --release -p raven
 
 echo "Installing binary to ~/bin..."
 mkdir -p ~/bin
+# Remove before copying to avoid macOS code-signing cache invalidation (tainted signature → SIGKILL)
+rm -f ~/bin/raven
 cp target/release/raven ~/bin/raven
 chmod +x ~/bin/raven
 echo "✓ Binary installed to ~/bin/raven"
@@ -15,6 +17,7 @@ cd editors/vscode
 
 echo "Copying binary to extension..."
 mkdir -p bin
+rm -f bin/raven
 cp ../../target/release/raven bin/raven
 
 echo "Installing npm dependencies..."
