@@ -169,3 +169,97 @@ jobs:
           name: vscode-${{ matrix.target }}
           path: editors/vscode/*.vsix
           retention-days: 30
+
+  # ── Publish (gated by GitHub Environment approval) ──────────────────
+  # After builds complete, these jobs appear as "Waiting for review" in
+  # the Actions UI. Approve the "release" environment to create a GitHub
+  # Release; approve "marketplace" to publish to VS Code Marketplace and
+  # Open VSX.
+  #
+  # Setup (one-time): Go to repo Settings > Environments and create:
+  #   1. "release"      – add yourself as a required reviewer
+  #   2. "marketplace"  – add yourself as a required reviewer
+
+  github-release:
+    needs: [build-lsp, build-vscode]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Download LSP artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: lsp-*
+          path: lsp-artifacts
+          merge-multiple: true
+
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vscode-*
+          path: vscode-artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: |
+          echo "=== LSP binaries ==="
+          find lsp-artifacts -type f | sort
+          echo "=== VSIX packages ==="
+          find vscode-artifacts -type f | sort
+
+      - name: Generate SHA-256 checksums
+        run: |
+          echo "=== Generating SHA-256 checksums ==="
+          for f in $(find lsp-artifacts -name '*.zip' | sort) $(find vscode-artifacts -name '*.vsix' | sort); do
+            sha256sum "$f" > "$f.sha256"
+            cat "$f.sha256"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: |
+            lsp-artifacts/**/*.zip
+            lsp-artifacts/**/*.zip.sha256
+            vscode-artifacts/**/*.vsix
+            vscode-artifacts/**/*.vsix.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-marketplace:
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment: marketplace
+    steps:
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vscode-*
+          path: vscode-artifacts
+          merge-multiple: true
+
+      - name: Install vsce and ovsx
+        run: npm install -g @vscode/vsce ovsx
+
+      - name: Publish to VS Code Marketplace
+        run: |
+          for vsix in $(find vscode-artifacts -name '*.vsix' | sort); do
+            echo "Publishing $vsix to VS Code Marketplace..."
+            vsce publish --packagePath "$vsix"
+          done
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Publish to Open VSX
+        continue-on-error: true
+        run: |
+          for vsix in $(find vscode-artifacts -name '*.vsix' | sort); do
+            echo "Publishing $vsix to Open VSX..."
+            ovsx publish "$vsix"
+          done
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
