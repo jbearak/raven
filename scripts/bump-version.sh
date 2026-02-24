@@ -106,15 +106,18 @@ echo "Bumping version to $VERSION..."
 # Update workspace Cargo.toml
 sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
 
+# Update Cargo.lock to reflect the new version
+cargo update -p raven --manifest-path "$REPO_ROOT/Cargo.toml"
+
 # Update VS Code extension package.json
 cd "$REPO_ROOT/editors/vscode"
 npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
 cd "$REPO_ROOT"
 
-echo "Updated Cargo.toml and editors/vscode/package.json"
+echo "Updated Cargo.toml, Cargo.lock, and editors/vscode/package.json"
 
 # Commit, tag, and push
-git -C "$REPO_ROOT" add Cargo.toml editors/vscode/package.json
+git -C "$REPO_ROOT" add Cargo.toml Cargo.lock editors/vscode/package.json
 if [ -f "$REPO_ROOT/editors/vscode/package-lock.json" ]; then
   git -C "$REPO_ROOT" add editors/vscode/package-lock.json
 fi
