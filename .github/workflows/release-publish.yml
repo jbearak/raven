@@ -129,6 +129,14 @@ jobs:
           echo "=== VSIX packages ==="
           find vscode-artifacts -type f | sort
 
+      - name: Generate SHA-256 checksums
+        run: |
+          echo "=== Generating SHA-256 checksums ==="
+          for f in $(find lsp-artifacts -name '*.zip' | sort) $(find vscode-artifacts -name '*.vsix' | sort); do
+            sha256sum "$f" > "$f.sha256"
+            cat "$f.sha256"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -136,7 +144,9 @@ jobs:
           name: Release ${{ inputs.tag }}
           files: |
             lsp-artifacts/**/*.zip
+            lsp-artifacts/**/*.zip.sha256
             vscode-artifacts/**/*.vsix
+            vscode-artifacts/**/*.vsix.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
