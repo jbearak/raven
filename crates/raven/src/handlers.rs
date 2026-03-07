@@ -6063,6 +6063,25 @@ pub(crate) fn collect_undefined_variables_position_aware(
             if is_package_export(&name, &position_aware_packages, package_library) {
                 continue;
             }
+
+            log::trace!(
+                "Undefined variable '{}' at line {}: not in scope ({} symbols, chain={:?}) and not in packages {:?}",
+                name,
+                usage_line,
+                scope.symbols.len(),
+                scope.chain.iter().map(|u| u.path()).collect::<Vec<_>>(),
+                position_aware_packages,
+            );
+        } else {
+            log::trace!(
+                "Undefined variable '{}' at line {}: not in scope ({} symbols, chain={:?}), packages_enabled={}, package_library_ready={}",
+                name,
+                usage_line,
+                scope.symbols.len(),
+                scope.chain.iter().map(|u| u.path()).collect::<Vec<_>>(),
+                state.cross_file_config.packages_enabled,
+                state.package_library_ready,
+            );
         }
 
         // Symbol is undefined - emit diagnostic
