@@ -2305,7 +2305,7 @@ where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
-    let mut visited = HashSet::new();
+    let mut visited = HashMap::new();
 
     // Build initial PathContext for the root file
     let meta = get_metadata(uri);
@@ -2357,7 +2357,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     path_ctx: Option<super::path_resolve::PathContext>,
     max_depth: usize,
     current_depth: usize,
-    visited: &mut HashSet<Url>,
+    visited: &mut HashMap<Url, (u32, u32)>,
     inherited_packages: &HashSet<String>,
     base_exports: &HashSet<String>,
     hoist_globals: bool,
@@ -2397,11 +2397,25 @@ where
         }
     }
 
-    if current_depth >= max_depth || visited.contains(uri) {
+    if current_depth >= max_depth {
         return scope;
     }
-    visited.insert(uri.clone());
-    scope.chain.push(uri.clone());
+
+    // Allow re-visiting a file at a strictly wider position. This handles the case where
+    // a file is first visited as a parent (backward edge) at a partial position, and later
+    // needs to be visited as a forward source() target at (MAX, MAX).
+    let is_revisit = if let Some(&(prev_line, prev_col)) = visited.get(uri) {
+        if (line, column) <= (prev_line, prev_col) {
+            return scope;
+        }
+        true
+    } else {
+        false
+    };
+    visited.insert(uri.clone(), (line, column));
+    if !is_revisit {
+        scope.chain.push(uri.clone());
+    }
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
@@ -2428,6 +2442,13 @@ where
     let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
 
     // STEP 1: Process parent context from dependency graph edges
+    // Skip on re-visit: parent symbols were already collected on the first visit.
+    // Re-visits only need to extend the timeline (STEP 2) to the wider position.
+    if is_revisit {
+        // On re-visit, jump directly to STEP 2 with the wider position.
+        // We don't need parent symbols again — they were already merged
+        // into the caller's scope during the first visit.
+    } else {
     // Get edges where this file is the child (callee)
     //
     // If multiple edges exist from the same parent (e.g., AST-detected source()
@@ -2638,6 +2659,7 @@ where
             scope.inherited_packages.insert(pkg.clone());
         }
     }
+    } // end if !is_revisit (STEP 1)
 
     // STEP 2: Process timeline events (local definitions and forward sources)
     // Second pass: process events and apply function scope filtering

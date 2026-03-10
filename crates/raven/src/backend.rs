@@ -590,6 +590,117 @@ impl Backend {
     }
 }
 
+/// Run debounced diagnostics for a single URI.
+///
+/// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
+/// work-item loops and post-prefetch revalidation callbacks. It handles:
+/// scheduling → debounce/cancel → freshness check → compute → async file checks → publish.
+async fn run_debounced_diagnostics(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    affected_uri: Url,
+    debounce_ms: u64,
+    trigger_version: Option<i32>,
+    trigger_revision: Option<u64>,
+) {
+    // Schedule with cancellation token
+    let token = {
+        let state = state_arc.read().await;
+        state.cross_file_revalidation.schedule(affected_uri.clone())
+    };
+
+    // Debounce / cancellation
+    tokio::select! {
+        _ = token.cancelled() => { return; }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
+    }
+
+    // Extract data for async diagnostics while holding lock briefly
+    let diagnostics_data = {
+        let state = state_arc.read().await;
+
+        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+
+        if current_version != trigger_version || current_revision != trigger_revision {
+            log::trace!(
+                "Skipping stale diagnostics for {}: revision changed",
+                affected_uri
+            );
+            return;
+        }
+
+        if let Some(ver) = current_version {
+            if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: monotonic gate",
+                    affected_uri
+                );
+                return;
+            }
+        }
+
+        let sync_diagnostics = handlers::diagnostics(&state, &affected_uri);
+        let directive_meta = state
+            .documents
+            .get(&affected_uri)
+            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+            .unwrap_or_default();
+        let workspace_folder = state.workspace_folders.first().cloned();
+        let missing_file_severity = state.cross_file_config.missing_file_severity;
+
+        Some((
+            sync_diagnostics,
+            directive_meta,
+            workspace_folder,
+            missing_file_severity,
+        ))
+    };
+
+    let Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) =
+        diagnostics_data
+    else {
+        return;
+    };
+
+    // Perform async missing file existence checks (non-blocking I/O)
+    let diagnostics = handlers::diagnostics_async_standalone(
+        &affected_uri,
+        sync_diagnostics,
+        &directive_meta,
+        workspace_folder.as_ref(),
+        missing_file_severity,
+    )
+    .await;
+
+    // Second freshness check before publishing
+    let can_publish = {
+        let state = state_arc.read().await;
+        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
+        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+
+        if current_version != trigger_version || current_revision != trigger_revision {
+            false
+        } else if let Some(ver) = current_version {
+            state.diagnostics_gate.can_publish(&affected_uri, ver)
+        } else {
+            true
+        }
+    };
+
+    if can_publish {
+        client
+            .publish_diagnostics(affected_uri.clone(), diagnostics, None)
+            .await;
+
+        let state = state_arc.read().await;
+        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
+            state.diagnostics_gate.record_publish(&affected_uri, ver);
+        }
+        state.cross_file_revalidation.complete(&affected_uri);
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     /// Initializes the server state from the client's InitializeParams and returns the LSP
@@ -904,7 +1015,6 @@ impl LanguageServer for Backend {
             on_demand_enabled,
             packages_to_prefetch,
             packages_enabled,
-            package_library,
         ) = {
             let mut state = self.state.write().await;
 
@@ -964,7 +1074,6 @@ impl LanguageServer for Backend {
             } else {
                 Vec::new()
             };
-            let package_library = state.package_library.clone();
 
             // On-demand indexing: Collect sourced files that need indexing
             // Synchronous indexing: Files directly sourced by this open document and backward directive targets
@@ -1175,20 +1284,20 @@ impl LanguageServer for Backend {
                 on_demand_enabled,
                 packages_to_prefetch,
                 packages_enabled,
-                package_library,
             )
         };
+        let needs_open_stabilization = !files_to_index.is_empty() || !packages_to_prefetch.is_empty();
 
-        // Background prefetch package exports (without holding WorldState lock)
+        // Prefetch package exports synchronously before scheduling diagnostics so
+        // did_open diagnostics don't race package cache warm-up.
         if packages_enabled && !packages_to_prefetch.is_empty() {
-            let pkg_lib = package_library;
-            tokio::spawn(async move {
-                log::trace!(
-                    "Background prefetching {} packages",
-                    packages_to_prefetch.len()
-                );
-                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
-            });
+            let _ = self.ensure_package_library_initialized().await;
+            let package_library = self.state.read().await.package_library.clone();
+            log::trace!(
+                "Synchronously prefetching {} packages before did_open diagnostics",
+                packages_to_prefetch.len()
+            );
+            package_library.prefetch_packages(&packages_to_prefetch).await;
         }
 
         // Only perform on-demand indexing if enabled
@@ -1399,51 +1508,74 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        // Even when on-demand indexing is disabled, re-enrich metadata so inherited
+        // working-directory context and graph edges match did_change behavior.
+        else {
+            let mut state = self.state.write().await;
+            let workspace_root = state.workspace_folders.first().cloned();
+            let max_chain_depth = state.cross_file_config.max_chain_depth;
+
+            let mut meta = crate::cross_file::extract_metadata(&text);
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut meta,
+                &uri,
+                workspace_root.as_ref(),
+                |parent_uri| state.get_enriched_metadata(parent_uri),
+                max_chain_depth,
+            );
+
+            state
+                .document_store
+                .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                .await;
+            state.open_document(uri.clone(), &text, Some(version));
+
+            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                &uri,
+                workspace_root.as_ref(),
+            );
+            let parent_content: std::collections::HashMap<Url, String> = meta
+                .sourced_by
+                .iter()
+                .filter_map(|d| {
+                    let ctx = backward_path_ctx.as_ref()?;
+                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                    let parent_uri = Url::from_file_path(resolved).ok()?;
+                    let content = state
+                        .documents
+                        .get(&parent_uri)
+                        .map(|doc| doc.text())
+                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    Some((parent_uri, content))
+                })
+                .collect();
+
+            let second_result = state.cross_file_graph.update_file(
+                &uri,
+                &meta,
+                workspace_root.as_ref(),
+                |parent_uri| parent_content.get(parent_uri).cloned(),
+            );
+
+            if second_result.edges_changed {
+                let max_chain_depth = state.cross_file_config.max_chain_depth;
+                let dependents = state
+                    .cross_file_graph
+                    .get_transitive_dependents(&uri, max_chain_depth);
+                for dep in dependents {
+                    if state.documents.contains_key(&dep) {
+                        state.diagnostics_gate.mark_force_republish(&dep);
+                        let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
+                        let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
+                        work_items.push((dep, trigger_version, trigger_revision));
+                    }
+                }
+            }
+        }
 
         // Prefetch packages for inherited scope to avoid transient undefined diagnostics.
         if packages_enabled {
             let _ = self.ensure_package_library_initialized().await;
-            // If package library wasn't initialized yet, reinitialize now so lib_paths are available.
-            let reinit = {
-                let state = self.state.read().await;
-                state.package_library.lib_paths().is_empty()
-                    && state.cross_file_config.packages_enabled
-            };
-
-            if reinit {
-                let (packages_r_path, additional_paths, workspace_root) = {
-                    let state = self.state.read().await;
-                    (
-                        state.cross_file_config.packages_r_path.clone(),
-                        state
-                            .cross_file_config
-                            .packages_additional_library_paths
-                            .clone(),
-                        state
-                            .workspace_folders
-                            .first()
-                            .and_then(|url| url.to_file_path().ok()),
-                    )
-                };
-                log::trace!("Reinitializing PackageLibrary for did_open prefetch");
-                let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-                let r_subprocess = match (r_subprocess, workspace_root) {
-                    (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-                    (sub, _) => sub,
-                };
-                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-                let ready = match lib.initialize().await {
-                    Ok(()) => !lib.lib_paths().is_empty(),
-                    Err(e) => {
-                        log::warn!("Failed to reinitialize PackageLibrary: {}", e);
-                        false
-                    }
-                };
-                lib.add_library_paths(&additional_paths);
-                let mut state = self.state.write().await;
-                state.package_library = std::sync::Arc::new(lib);
-                state.package_library_ready = ready;
-            }
 
             let (package_library, scope_packages) = {
                 let state = self.state.read().await;
@@ -1503,114 +1635,51 @@ impl LanguageServer for Backend {
             }
         }
 
+
         // Schedule debounced diagnostics for all affected files via revalidation system
         for (affected_uri, trigger_version, trigger_revision) in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
 
+            tokio::spawn(run_debounced_diagnostics(
+                state_arc,
+                client,
+                affected_uri,
+                debounce_ms,
+                trigger_version,
+                trigger_revision,
+            ));
+        }
+
+        if needs_open_stabilization {
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            let stabilization_uri = uri.clone();
             tokio::spawn(async move {
-                // Schedule with cancellation token
-                let token = {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                let (trigger_version, trigger_revision) = {
                     let state = state_arc.read().await;
-                    state.cross_file_revalidation.schedule(affected_uri.clone())
-                };
-
-                // Debounce / cancellation
-                tokio::select! {
-                    _ = token.cancelled() => { return; }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
-                }
-
-                // Extract data for async diagnostics while holding lock briefly
-                let diagnostics_data = {
-                    let state = state_arc.read().await;
-
-                    let current_version =
-                        state.documents.get(&affected_uri).and_then(|d| d.version);
-                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
-
-                    if current_version != trigger_version || current_revision != trigger_revision {
-                        log::trace!(
-                            "Skipping stale diagnostics for {}: revision changed",
-                            affected_uri
-                        );
+                    if !state.documents.contains_key(&stabilization_uri) {
                         return;
                     }
-
-                    if let Some(ver) = current_version {
-                        if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
-                            log::trace!(
-                                "Skipping diagnostics for {}: monotonic gate",
-                                affected_uri
-                            );
-                            return;
-                        }
-                    }
-
-                    let sync_diagnostics = handlers::diagnostics(&state, &affected_uri);
-                    let directive_meta = state
+                    state.diagnostics_gate.mark_force_republish(&stabilization_uri);
+                    let ver = state
                         .documents
-                        .get(&affected_uri)
-                        .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-                        .unwrap_or_default();
-                    let workspace_folder = state.workspace_folders.first().cloned();
-                    let missing_file_severity = state.cross_file_config.missing_file_severity;
-
-                    Some((
-                        sync_diagnostics,
-                        directive_meta,
-                        workspace_folder,
-                        missing_file_severity,
-                    ))
+                        .get(&stabilization_uri)
+                        .and_then(|d| d.version);
+                    let rev = state.documents.get(&stabilization_uri).map(|d| d.revision);
+                    (ver, rev)
                 };
 
-                let Some((
-                    sync_diagnostics,
-                    directive_meta,
-                    workspace_folder,
-                    missing_file_severity,
-                )) = diagnostics_data
-                else {
-                    return;
-                };
-
-                // Perform async missing file existence checks (non-blocking I/O)
-                let diagnostics = handlers::diagnostics_async_standalone(
-                    &affected_uri,
-                    sync_diagnostics,
-                    &directive_meta,
-                    workspace_folder.as_ref(),
-                    missing_file_severity,
+                run_debounced_diagnostics(
+                    state_arc,
+                    client,
+                    stabilization_uri,
+                    0,
+                    trigger_version,
+                    trigger_revision,
                 )
                 .await;
-
-                // Second freshness check before publishing
-                let can_publish = {
-                    let state = state_arc.read().await;
-                    let current_version =
-                        state.documents.get(&affected_uri).and_then(|d| d.version);
-                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
-
-                    if current_version != trigger_version || current_revision != trigger_revision {
-                        false
-                    } else if let Some(ver) = current_version {
-                        state.diagnostics_gate.can_publish(&affected_uri, ver)
-                    } else {
-                        true
-                    }
-                };
-
-                if can_publish {
-                    client
-                        .publish_diagnostics(affected_uri.clone(), diagnostics, None)
-                        .await;
-
-                    let state = state_arc.read().await;
-                    if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
-                        state.diagnostics_gate.record_publish(&affected_uri, ver);
-                    }
-                    state.cross_file_revalidation.complete(&affected_uri);
-                }
             });
         }
     }
@@ -1857,14 +1926,49 @@ impl LanguageServer for Backend {
         };
 
         // Background prefetch package exports (without holding WorldState lock)
+        // After prefetch completes, schedule diagnostic revalidation so newly
+        // cached exports clear false-positive "undefined variable" diagnostics.
         if packages_enabled && !packages_to_prefetch.is_empty() {
             let pkg_lib = package_library;
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            let revalidation_uri = uri.clone();
             tokio::spawn(async move {
                 log::trace!(
                     "Background prefetching {} packages",
                     packages_to_prefetch.len()
                 );
                 pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+
+                // After prefetch completes, trigger diagnostic revalidation
+                let (debounce_ms, trigger_version, trigger_revision) = {
+                    let state = state_arc.read().await;
+                    if !state.documents.contains_key(&revalidation_uri) {
+                        return; // Document was closed during prefetch
+                    }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish(&revalidation_uri);
+                    let ver = state
+                        .documents
+                        .get(&revalidation_uri)
+                        .and_then(|d| d.version);
+                    let rev = state
+                        .documents
+                        .get(&revalidation_uri)
+                        .map(|d| d.revision);
+                    (state.cross_file_config.revalidation_debounce_ms, ver, rev)
+                };
+
+                run_debounced_diagnostics(
+                    state_arc,
+                    client,
+                    revalidation_uri,
+                    debounce_ms,
+                    trigger_version,
+                    trigger_revision,
+                )
+                .await;
             });
         }
 
@@ -1873,122 +1977,14 @@ impl LanguageServer for Backend {
             let state_arc = self.state.clone();
             let client = self.client.clone();
 
-            tokio::spawn(async move {
-                // 1) Schedule with cancellation token
-                let token = {
-                    let state = state_arc.read().await;
-                    state.cross_file_revalidation.schedule(affected_uri.clone())
-                };
-
-                // 2) Debounce / cancellation (Requirement 0.5)
-                tokio::select! {
-                    _ = token.cancelled() => { return; }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
-                }
-
-                // 3) Extract data for async diagnostics while holding lock briefly (Requirement 0.6)
-                let diagnostics_data = {
-                    let state = state_arc.read().await;
-
-                    let current_version =
-                        state.documents.get(&affected_uri).and_then(|d| d.version);
-                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
-
-                    // Check freshness: both version and revision must match
-                    if current_version != trigger_version || current_revision != trigger_revision {
-                        log::trace!(
-                            "Skipping stale diagnostics for {}: revision changed",
-                            affected_uri
-                        );
-                        return;
-                    }
-
-                    // Check monotonic publishing gate (Requirement 0.7)
-                    if let Some(ver) = current_version {
-                        if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
-                            log::trace!(
-                                "Skipping diagnostics for {}: monotonic gate",
-                                affected_uri
-                            );
-                            return;
-                        }
-                    }
-
-                    let sync_diagnostics = handlers::diagnostics(&state, &affected_uri);
-                    let directive_meta = state
-                        .documents
-                        .get(&affected_uri)
-                        .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-                        .unwrap_or_default();
-                    let workspace_folder = state.workspace_folders.first().cloned();
-                    let missing_file_severity = state.cross_file_config.missing_file_severity;
-
-                    Some((
-                        sync_diagnostics,
-                        directive_meta,
-                        workspace_folder,
-                        missing_file_severity,
-                    ))
-                };
-
-                let Some((
-                    sync_diagnostics,
-                    directive_meta,
-                    workspace_folder,
-                    missing_file_severity,
-                )) = diagnostics_data
-                else {
-                    return;
-                };
-
-                // Perform async missing file existence checks (non-blocking I/O)
-                let diagnostics = handlers::diagnostics_async_standalone(
-                    &affected_uri,
-                    sync_diagnostics,
-                    &directive_meta,
-                    workspace_folder.as_ref(),
-                    missing_file_severity,
-                )
-                .await;
-
-                // 4) Second freshness check before publishing
-                let can_publish = {
-                    let state = state_arc.read().await;
-                    let current_version =
-                        state.documents.get(&affected_uri).and_then(|d| d.version);
-                    let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
-
-                    if current_version != trigger_version || current_revision != trigger_revision {
-                        log::trace!("Skipping stale diagnostics publish for {}: revision changed during computation", affected_uri);
-                        false
-                    } else if let Some(ver) = current_version {
-                        if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
-                            log::trace!(
-                                "Skipping diagnostics for {}: monotonic gate (pre-publish)",
-                                affected_uri
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    }
-                };
-
-                if can_publish {
-                    client
-                        .publish_diagnostics(affected_uri.clone(), diagnostics, None)
-                        .await;
-
-                    // Record successful publish
-                    let state = state_arc.read().await;
-                    if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
-                        state.diagnostics_gate.record_publish(&affected_uri, ver);
-                    }
-                    state.cross_file_revalidation.complete(&affected_uri);
-                }
-            });
+            tokio::spawn(run_debounced_diagnostics(
+                state_arc,
+                client,
+                affected_uri,
+                debounce_ms,
+                trigger_version,
+                trigger_revision,
+            ));
         }
     }
 
