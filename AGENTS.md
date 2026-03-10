@@ -105,7 +105,7 @@ When making significant changes:
 - The workspace-root fallback should ONLY apply when the file has no explicit @lsp-cd and no inherited working directory from parent chain; don't override intentional working directory configuration.
 - When profiling LSP startup, use binary mode (not `text=True`) in Python subprocess calls - text mode can cause 30+ second delays due to buffering/encoding issues with LSP protocol.
 - Profile with realistic workspaces: a workspace with many `library()` calls across files reveals bottlenecks that toy examples miss.
-- Package export prefetching happens in background after `did_open` returns, but diagnostics wait for it - batch queries to minimize wait time.
+- In `did_open`, package exports are prefetched synchronously before scheduling diagnostics to avoid false-positive "unknown function" errors. In `did_change`, prefetching still happens in background with diagnostics waiting for it. Batch queries to minimize wait time.
 - Filter already-cached packages before querying R to avoid redundant subprocess calls.
 - 94% of CRAN packages use explicit `export()` directives (roxygen2); only ~6% use `exportPattern()`. Static NAMESPACE parsing eliminates R subprocess calls for most packages.
 - The `base` package is special: it has no NAMESPACE file (only DESCRIPTION and INDEX). Handle this by checking for DESCRIPTION existence, not just NAMESPACE.
