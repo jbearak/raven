@@ -38,6 +38,9 @@ pub struct CrossFileConfig {
     pub max_revalidations_per_trigger: usize,
     /// Debounce delay for cross-file diagnostics fanout in milliseconds
     pub revalidation_debounce_ms: u64,
+    /// Debounce delay for the actively-edited file in milliseconds.
+    /// Lower than revalidation_debounce_ms for near-instant feedback.
+    pub edited_file_debounce_ms: u64,
     /// Whether undefined variable diagnostics are enabled
     pub undefined_variables_enabled: bool,
     /// Severity for missing file diagnostics (None = disabled)
@@ -113,6 +116,7 @@ impl Default for CrossFileConfig {
             index_workspace: true,
             max_revalidations_per_trigger: 10,
             revalidation_debounce_ms: 200,
+            edited_file_debounce_ms: 50,
             undefined_variables_enabled: true,
             missing_file_severity: Some(DiagnosticSeverity::WARNING),
             circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
@@ -161,6 +165,7 @@ mod tests {
         assert!(config.index_workspace);
         assert_eq!(config.max_revalidations_per_trigger, 10);
         assert_eq!(config.revalidation_debounce_ms, 200);
+        assert_eq!(config.edited_file_debounce_ms, 50);
         assert!(config.undefined_variables_enabled);
         // On-demand indexing defaults
         assert!(config.on_demand_indexing_enabled);

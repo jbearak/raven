@@ -160,6 +160,12 @@ pub(crate) fn parse_cross_file_config(
         {
             config.revalidation_debounce_ms = v;
         }
+        if let Some(v) = cross_file
+            .get("editedFileDebounceMs")
+            .and_then(|v| v.as_u64())
+        {
+            config.edited_file_debounce_ms = v;
+        }
 
         // Parse diagnostic severities
         if let Some(sev) = cross_file
@@ -609,6 +615,9 @@ async fn run_debounced_diagnostics(
         state.cross_file_revalidation.schedule(affected_uri.clone())
     };
 
+    // Clone token before select so we can pass it into diagnostic computation
+    let cancel = handlers::DiagCancelToken::from_token(token.clone());
+
     // Debounce / cancellation
     tokio::select! {
         _ = token.cancelled() => { return; }
@@ -640,7 +649,7 @@ async fn run_debounced_diagnostics(
             }
         }
 
-        let sync_diagnostics = handlers::diagnostics(&state, &affected_uri);
+        let sync_diagnostics = handlers::diagnostics(&state, &affected_uri, &cancel);
         let directive_meta = state
             .documents
             .get(&affected_uri)
@@ -1706,7 +1715,7 @@ impl LanguageServer for Backend {
         let changes = params.content_changes;
 
         // Compute affected files and debounce config while holding write lock
-        let (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
+        let (work_items, edited_file_debounce_ms, dependent_debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
 
             // Capture old metadata before recomputing (for WD change detection)
@@ -1915,10 +1924,12 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
-            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
+            let edited_file_debounce_ms = state.cross_file_config.edited_file_debounce_ms;
+            let dependent_debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (
                 work_items,
-                debounce_ms,
+                edited_file_debounce_ms,
+                dependent_debounce_ms,
                 packages_to_prefetch,
                 packages_enabled,
                 package_library,
@@ -1973,15 +1984,22 @@ impl LanguageServer for Backend {
         }
 
         // Schedule debounced diagnostics for all affected files (Requirement 0.5)
+        // The edited file uses a shorter debounce for near-instant feedback;
+        // dependent files use the longer revalidation debounce.
         for (affected_uri, trigger_version, trigger_revision) in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let debounce = if affected_uri == uri {
+                edited_file_debounce_ms
+            } else {
+                dependent_debounce_ms
+            };
 
             tokio::spawn(run_debounced_diagnostics(
                 state_arc,
                 client,
                 affected_uri,
-                debounce_ms,
+                debounce,
                 trigger_version,
                 trigger_revision,
             ));
@@ -2518,7 +2536,7 @@ impl LanguageServer for Backend {
                         if !can_publish {
                             None
                         } else {
-                            let sync_diagnostics = crate::handlers::diagnostics(&state, &child_uri);
+                            let sync_diagnostics = crate::handlers::diagnostics(&state, &child_uri, &handlers::DiagCancelToken::never());
                             let directive_meta = state
                                 .documents
                                 .get(&child_uri)
@@ -3503,7 +3521,7 @@ impl Backend {
             }
 
             // Get sync diagnostics (uses cached-only existence checks)
-            let sync_diagnostics = handlers::diagnostics(&state, uri);
+            let sync_diagnostics = handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
 
             // Extract metadata for async missing file checks
             let directive_meta = state
