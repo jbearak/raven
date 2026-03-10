@@ -2523,8 +2523,12 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     let text = doc.text();
     let mut diagnostics = Vec::new();
 
-    // Parse directives to get ignored lines and cross-file metadata
-    let mut directive_meta = crate::cross_file::directive::parse_directives(&text);
+    // Use enriched cross-file metadata from state when available so diagnostics
+    // can see source() and library()/require()/loadNamespace() context at open time.
+    // Fall back to extraction from current text+tree when metadata is unavailable.
+    let mut directive_meta = state.get_enriched_metadata(uri).unwrap_or_else(|| {
+        crate::cross_file::extract_metadata_with_tree(&text, Some(tree))
+    });
 
     // Compute inherited working directory for files with backward directives
     // This enables child files to inherit the parent's working directory context
@@ -3444,6 +3448,16 @@ fn collect_missing_package_diagnostics(
     if !state.cross_file_config.packages_enabled {
         return;
     }
+    // Avoid startup false positives while package metadata/cache initialization
+    // has not completed yet.
+    if !state.package_library_ready {
+        return;
+    }
+    // If R subprocess is unavailable, package existence checks are filesystem-only
+    // and can be unreliable across environments; avoid false positives.
+    if state.package_library.r_subprocess().is_none() {
+        return;
+    }
     let severity = match state.cross_file_config.packages_missing_package_severity {
         Some(sev) => sev,
         None => return,
@@ -3670,6 +3684,24 @@ fn collect_out_of_scope_diagnostics(
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
     collect_identifier_usages_utf16(node, text, &mut usages);
 
+    // Pre-compute identifier usages that resolve to a local symbol at that position.
+    // This prevents false positives when a sourced file exports a symbol name that is
+    // also defined locally in the current document (e.g., function parameters, loop iterators).
+    let mut locally_resolved_usages: std::collections::HashSet<(String, u32, u32)> =
+        std::collections::HashSet::new();
+    for (name, usage_line, usage_col, _) in &usages {
+        let scope = get_cross_file_scope(state, uri, *usage_line, *usage_col);
+        if let Some(symbol) = scope.symbols.get(name.as_str()) {
+            if symbol.source_uri == *uri {
+                locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
+            }
+        }
+    }
+
+    // Deduplicate by symbol+position so the same usage is reported at most once even if
+    // multiple source() calls/files could explain it.
+    let mut emitted: std::collections::HashSet<(String, u32, u32)> = std::collections::HashSet::new();
+
     // For each source() call, check if any symbols from that file are used before the call
     for source in &source_calls {
         let source_line = source.line;
@@ -3722,8 +3754,17 @@ fn collect_out_of_scope_diagnostics(
                 continue;
             }
 
+            // Skip if this usage resolves to a local symbol at this position.
+            if locally_resolved_usages.contains(&(name.clone(), *usage_line, *usage_col)) {
+                continue;
+            }
+
             // Check if usage is before the source() call (both columns are UTF-16)
             if (*usage_line, *usage_col) < (source_line, source_col) {
+                // Emit at most one diagnostic per symbol usage position.
+                if !emitted.insert((name.clone(), *usage_line, *usage_col)) {
+                    continue;
+                }
                 // Skip if line is ignored
                 if crate::cross_file::directive::is_line_ignored(directive_meta, *usage_line) {
                     continue;
@@ -3786,6 +3827,18 @@ fn collect_identifier_usages_utf16<'a>(
                         for child in node.children(&mut cursor) {
                             collect_identifier_usages_utf16(child, text, usages);
                         }
+                        return;
+                    }
+                }
+            }
+            // Skip declaration sites for function parameters.
+            if matches!(parent.kind(), "parameter" | "default_parameter" | "parameters") {
+                return;
+            }
+            // Skip declaration site for for-loop iterator variable.
+            if parent.kind() == "for_statement" {
+                if let Some(var_node) = parent.child_by_field_name("variable") {
+                    if var_node.id() == node.id() {
                         return;
                     }
                 }
@@ -4661,6 +4714,7 @@ mod syntax_error_range_tests {
                 .collect::<Vec<_>>()
         );
     }
+
 
     #[test]
     fn empty_switch_case_is_valid() {
@@ -5965,6 +6019,10 @@ pub(crate) fn collect_undefined_variables_position_aware(
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    use crate::content_provider::ContentProvider;
+    use crate::cross_file::path_resolve::{
+        resolve_path_with_workspace_fallback, PathContext,
+    };
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     let mut used: Vec<(String, Node)> = Vec::new();
@@ -6015,6 +6073,30 @@ pub(crate) fn collect_undefined_variables_position_aware(
     let workspace_imports_set: std::collections::HashSet<&str> =
         workspace_imports.iter().map(|s| s.as_str()).collect();
 
+    // Build a position-aware list of directly sourced files whose symbols are inherited.
+    // This is a fallback path for cases where a sourced file has not been indexed into
+    // the cross-file scope yet (e.g., transient startup/index timing).
+    let content_provider = state.content_provider();
+    let source_path_ctx = PathContext::from_metadata(
+        uri,
+        directive_meta,
+        state.workspace_folders.first(),
+    );
+    let direct_sources: Vec<(u32, u32, Url)> = directive_meta
+        .sources
+        .iter()
+        .filter(|source| source.inherits_symbols())
+        .filter_map(|source| {
+            let ctx = source_path_ctx.as_ref()?;
+            let resolved =
+                resolve_path_with_workspace_fallback(&source.path, ctx)?;
+            let source_uri = Url::from_file_path(resolved).ok()?;
+            Some((source.line, source.column, source_uri))
+        })
+        .collect();
+    let mut source_exports_cache: std::collections::HashMap<Url, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+
     // Report undefined variables with position-aware cross-file scope
     for (name, usage_node) in used {
         // Skip reserved words BEFORE any other checks (Requirement 3.4)
@@ -6047,6 +6129,78 @@ pub(crate) fn collect_undefined_variables_position_aware(
             continue;
         }
 
+        let usage_col_utf16 =
+            byte_offset_to_utf16_column(
+                get_line(usage_node.start_position().row),
+                usage_node.start_position().column,
+            );
+
+        // Fallback: check direct source() files loaded on/before this position even if they
+        // are not yet present in cross-file scope cache/index.
+        let defined_in_loaded_direct_source = direct_sources
+            .iter()
+            .filter(|(source_line, source_col, _)| {
+                *source_line < usage_line
+                    || (*source_line == usage_line
+                        && *source_col <= usage_col_utf16)
+            })
+            .any(|(_, _, source_uri)| {
+                let exported = source_exports_cache
+                    .entry(source_uri.clone())
+                    .or_insert_with(|| {
+                        if let Some(artifacts) =
+                            content_provider.get_artifacts(source_uri)
+                        {
+                            return artifacts
+                                .exported_interface
+                                .keys()
+                                .map(|k| k.to_string())
+                                .collect();
+                        }
+
+                        let source_text = content_provider
+                            .get_content(source_uri)
+                            .or_else(|| {
+                                source_uri
+                                    .to_file_path()
+                                    .ok()
+                                    .and_then(|path| std::fs::read_to_string(path).ok())
+                            });
+                        let Some(source_text) = source_text else {
+                            return std::collections::HashSet::new();
+                        };
+
+                        let source_meta = content_provider
+                            .get_metadata(source_uri)
+                            .unwrap_or_else(|| {
+                                crate::cross_file::extract_metadata(&source_text)
+                            });
+
+                        let Some(source_tree) =
+                            crate::parser_pool::with_parser(|parser| {
+                                parser.parse(&source_text, None)
+                            })
+                        else {
+                            return std::collections::HashSet::new();
+                        };
+
+                        crate::cross_file::scope::compute_artifacts_with_metadata(
+                            source_uri,
+                            &source_tree,
+                            &source_text,
+                            Some(&source_meta),
+                        )
+                        .exported_interface
+                        .keys()
+                        .map(|k| k.to_string())
+                        .collect()
+                    });
+                exported.contains(name.as_str())
+            });
+        if defined_in_loaded_direct_source {
+            continue;
+        }
+
         // Check package exports only if packages feature is enabled and library is ready
         if state.cross_file_config.packages_enabled && state.package_library_ready {
             // Build position-aware package list: inherited packages + locally loaded packages
@@ -6061,6 +6215,20 @@ pub(crate) fn collect_undefined_variables_position_aware(
 
             // Check if symbol is exported by any package loaded at this position
             if is_package_export(&name, &position_aware_packages, package_library) {
+                continue;
+            }
+
+            let has_prior_library_call = has_prior_package_loader_call_textually(
+                text,
+                usage_node.start_byte(),
+            );
+            let package_cache_pending = position_aware_packages
+                .iter()
+                .any(|pkg| !package_library.is_cached_sync(pkg));
+            if has_prior_library_call
+                && (position_aware_packages.is_empty() || package_cache_pending)
+                && is_function_call_identifier_textually(usage_node, text)
+            {
                 continue;
             }
 
@@ -6082,6 +6250,29 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 state.cross_file_config.packages_enabled,
                 state.package_library_ready,
             );
+
+            // Conservative suppression: when package awareness is enabled but package
+            // metadata is not ready yet, avoid flagging unresolved call targets after
+            // library()/require()/loadNamespace() calls as undefined.
+            let has_prior_library_call = directive_meta.library_calls.iter().any(|call| {
+                call.line < usage_line
+                    || (call.line == usage_line
+                        && call.column <= usage_col_utf16)
+            });
+            let has_prior_library_call = has_prior_library_call
+                || has_prior_package_loader_call_textually(
+                    text,
+                    usage_node.start_byte(),
+                );
+            if state.cross_file_config.packages_enabled
+                && !state.package_library_ready
+                && is_function_call_identifier_textually(usage_node, text)
+                && (!scope.loaded_packages.is_empty()
+                    || !scope.inherited_packages.is_empty()
+                    || has_prior_library_call)
+            {
+                continue;
+            }
         }
 
         // Symbol is undefined - emit diagnostic
@@ -6181,6 +6372,24 @@ fn collect_undefined_variables(
     }
 }
 
+/// True when an identifier is textually followed by `(` (ignoring whitespace),
+/// indicating call-target usage.
+fn is_function_call_identifier_textually(node: Node, text: &str) -> bool {
+    let mut byte_index = node.end_byte();
+    let bytes = text.as_bytes();
+    while byte_index < bytes.len() && bytes[byte_index].is_ascii_whitespace() {
+        byte_index += 1;
+    }
+    byte_index < bytes.len() && bytes[byte_index] == b'('
+}
+
+/// Returns true when source text before `byte_limit` contains a package loader call.
+fn has_prior_package_loader_call_textually(text: &str, byte_limit: usize) -> bool {
+    let prefix = &text[..byte_limit.min(text.len())];
+    prefix.contains("library(")
+        || prefix.contains("require(")
+        || prefix.contains("loadNamespace(")
+}
 fn collect_definitions(node: Node, text: &str, defined: &mut std::collections::HashSet<String>) {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
@@ -29342,7 +29551,14 @@ result <- helper_with_spaces(42)"#;
                 function_scope: None,
             });
 
-        let state = WorldState::new(Vec::new());
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
+        let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        state.package_library = std::sync::Arc::new(
+            crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
+        );
         let mut diagnostics = Vec::new();
 
         collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
@@ -29373,6 +29589,7 @@ result <- helper_with_spaces(42)"#;
             });
 
         let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
         // Ensure base is in base_packages by creating a new PackageLibrary
         let mut base_packages = std::collections::HashSet::new();
         base_packages.insert("base".to_string());
@@ -29406,7 +29623,14 @@ result <- helper_with_spaces(42)"#;
         // Mark line 5 as ignored
         meta.ignored_lines.insert(5);
 
-        let state = WorldState::new(Vec::new());
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
+        let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        state.package_library = std::sync::Arc::new(
+            crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
+        );
         let mut diagnostics = Vec::new();
 
         collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
@@ -29438,7 +29662,14 @@ result <- helper_with_spaces(42)"#;
                 function_scope: None,
             });
 
-        let state = WorldState::new(Vec::new());
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
+        let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        state.package_library = std::sync::Arc::new(
+            crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
+        );
         let mut diagnostics = Vec::new();
 
         collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
@@ -29450,6 +29681,55 @@ result <- helper_with_spaces(42)"#;
         );
         assert!(diagnostics[0].message.contains("__missing_pkg1__"));
         assert!(diagnostics[1].message.contains("__missing_pkg2__"));
+    }
+
+    #[test]
+    fn test_missing_package_diagnostic_suppressed_while_package_library_not_ready() {
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls
+            .push(crate::cross_file::source_detect::LibraryCall {
+                package: "__nonexistent_package_xyz__".to_string(),
+                line: 0,
+                column: 30,
+                function_scope: None,
+            });
+
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = false;
+
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should suppress missing-package diagnostics while package library is not ready"
+        );
+    }
+
+    #[test]
+    fn test_missing_package_diagnostic_suppressed_without_r_subprocess() {
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls
+            .push(crate::cross_file::source_detect::LibraryCall {
+                package: "__nonexistent_package_xyz__".to_string(),
+                line: 0,
+                column: 30,
+                function_scope: None,
+            });
+
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
+        state.package_library = std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty());
+
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "Should suppress missing-package diagnostics when R subprocess is unavailable"
+        );
     }
 
     // ============================================================================
@@ -29862,7 +30142,6 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
 
-        let meta = crate::cross_file::directive::parse_directives(main_code);
         let tree = {
             let mut parser = tree_sitter::Parser::new();
             parser
@@ -29870,6 +30149,7 @@ result <- helper_with_spaces(42)"#;
                 .unwrap();
             parser.parse(main_code, None).unwrap()
         };
+        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
 
         let mut diagnostics = Vec::new();
         collect_out_of_scope_diagnostics(
@@ -29885,6 +30165,146 @@ result <- helper_with_spaces(42)"#;
             diagnostics.len(),
             0,
             "Should not emit out-of-scope diagnostic when severity is off"
+        );
+    }
+
+    #[test]
+    fn test_out_of_scope_ignores_locally_scoped_names() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let utils_path = workspace_path.join("utils.R");
+
+        // Source file exports names that collide with local symbols in main.R.
+        std::fs::write(
+            &utils_path,
+            "method <- function(x) x\nfor (j in 1:2) { print(j) }",
+        )
+        .unwrap();
+        std::fs::write(
+            &main_path,
+            "analyze <- function(method) { method }\nfor (j in 1:3) { print(j) }\nsource('utils.R')",
+        )
+        .unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let utils_url = Url::from_file_path(&utils_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url);
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+
+        let utils_code = "method <- function(x) x\nfor (j in 1:2) { print(j) }";
+        state
+            .documents
+            .insert(utils_url.clone(), Document::new(utils_code, None));
+
+        let main_code =
+            "analyze <- function(method) { method }\nfor (j in 1:3) { print(j) }\nsource('utils.R')";
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(main_code, None).unwrap()
+        };
+        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
+
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics(
+            &state,
+            &main_url,
+            tree.root_node(),
+            main_code,
+            &meta,
+            &mut diagnostics,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("Symbol 'method' used before source()")),
+            "Local parameter 'method' should not be reported as out-of-scope: {:?}",
+            diagnostics
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("Symbol 'j' used before source()")),
+            "Local loop iterator 'j' should not be reported as out-of-scope: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn test_out_of_scope_deduplicates_same_usage_across_multiple_sources() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let a_path = workspace_path.join("a.R");
+        let b_path = workspace_path.join("b.R");
+
+        std::fs::write(&a_path, "for (j in 1:2) { print(j) }").unwrap();
+        std::fs::write(&b_path, "for (j in 1:3) { print(j) }").unwrap();
+        std::fs::write(&main_path, "print(j)\nsource('a.R')\nsource('b.R')").unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let a_url = Url::from_file_path(&a_path).unwrap();
+        let b_url = Url::from_file_path(&b_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url);
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(a_url.clone(), Document::new("for (j in 1:2) { print(j) }", None));
+        state
+            .documents
+            .insert(b_url.clone(), Document::new("for (j in 1:3) { print(j) }", None));
+        let main_code = "print(j)\nsource('a.R')\nsource('b.R')";
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(main_code, None).unwrap()
+        };
+        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
+
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics(
+            &state,
+            &main_url,
+            tree.root_node(),
+            main_code,
+            &meta,
+            &mut diagnostics,
+        );
+
+        let j_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Symbol 'j' used before source()"))
+            .collect();
+        assert_eq!(
+            j_diags.len(),
+            1,
+            "Expected one deduplicated diagnostic for j usage, got: {:?}",
+            j_diags
         );
     }
 
@@ -31590,6 +32010,183 @@ my_func <- function(a = default_value) {
             undefined_var_diags
                 .iter()
                 .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_direct_source_export_suppresses_undefined_variable() {
+        let mut state = create_test_state();
+        let workspace_dir = tempfile::tempdir().expect("tempdir should be created");
+
+        let main_uri = Url::from_file_path(workspace_dir.path().join("main.R"))
+            .expect("main uri should be valid");
+        let child_uri = Url::from_file_path(workspace_dir.path().join("characteristics.R"))
+            .expect("child uri should be valid");
+
+        let child_code = "tbl_user_demographics <- data.frame(x = 1)\n";
+        state
+            .workspace_index
+            .insert(child_uri.clone(), Document::new(child_code, None));
+
+        let main_code = "source(\"characteristics.R\")\ntbl_user_demographics\n";
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &main_uri,
+            &parse_directives(main_code),
+            None,
+            |_| None,
+        );
+
+        let tree = parse_r_code(main_code);
+        let directive_meta = parse_directives(main_code);
+        let mut diagnostics = Vec::new();
+
+        collect_undefined_variables_position_aware(
+            &state,
+            &main_uri,
+            tree.root_node(),
+            main_code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: tbl_user_demographics"),
+            "Symbol exported by sourced file should not be flagged as undefined: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_direct_source_export_suppresses_undefined_variable_from_disk_fallback() {
+        let mut state = create_test_state();
+        let workspace_dir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace_url = Url::from_file_path(workspace_dir.path())
+            .expect("workspace uri should be valid");
+        state.workspace_folders.push(workspace_url);
+
+        let main_path = workspace_dir.path().join("main.R");
+        let child_path = workspace_dir.path().join("characteristics.R");
+        let main_uri = Url::from_file_path(&main_path).expect("main uri should be valid");
+
+        std::fs::write(
+            &child_path,
+            "tbl_user_demographics <- data.frame(x = 1)\n",
+        )
+        .expect("child file should be written");
+
+        let main_code = "source(\"characteristics.R\")\ntbl_user_demographics\n";
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(main_code, None));
+
+        let tree = parse_r_code(main_code);
+        let directive_meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
+        let mut diagnostics = Vec::new();
+
+        collect_undefined_variables_position_aware(
+            &state,
+            &main_uri,
+            tree.root_node(),
+            main_code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: tbl_user_demographics"),
+            "Symbol exported by sourced on-disk file should not be flagged as undefined: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_package_function_call_not_flagged_while_package_metadata_initializes() {
+        let mut state = create_test_state();
+        state.package_library_ready = false;
+        state.cross_file_config.packages_enabled = true;
+
+        let code = "library(openxlsx)\nwb <- createWorkbook()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: createWorkbook"),
+            "Package call target should be suppressed until package metadata is ready: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_package_function_call_not_flagged_while_package_cache_pending() {
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+
+        let code = "library(openxlsx)\nwb <- createWorkbook()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: createWorkbook"),
+            "Package call target should be suppressed while package cache is pending: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
                 .collect::<Vec<_>>()
         );
     }

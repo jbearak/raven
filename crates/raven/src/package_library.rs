@@ -384,6 +384,17 @@ impl PackageLibrary {
         cache.contains_key(name)
     }
 
+    /// Synchronous cache probe for use in hot diagnostic paths.
+    ///
+    /// Returns true when package metadata is currently cached, false otherwise.
+    /// Uses `try_read()` to avoid blocking.
+    pub fn is_cached_sync(&self, name: &str) -> bool {
+        self.packages
+            .try_read()
+            .map(|cache| cache.contains_key(name))
+            .unwrap_or(false)
+    }
+
     /// Get the number of cached packages
     pub async fn cached_count(&self) -> usize {
         let cache = self.packages.read().await;
@@ -463,6 +474,10 @@ impl PackageLibrary {
                         static_packages.push((pkg_name.clone(), pkg_dir, parse_result));
                     }
                 }
+            } else {
+                // Filesystem lookup may miss packages in some environments; probe
+                // these directly through the R subprocess batch path.
+                pattern_packages.push(pkg_name.clone());
             }
         }
 
