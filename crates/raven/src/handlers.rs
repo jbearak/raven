@@ -22,6 +22,33 @@ use crate::utf16::utf16_column_to_byte_offset;
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
 
+/// Lightweight cooperative cancellation handle for diagnostic computation.
+///
+/// Wraps an optional `CancellationToken` so that diagnostic functions can
+/// periodically check whether the computation should be aborted (e.g., because
+/// a newer edit arrived). `DiagCancelToken::never()` returns a no-op token
+/// that is always uncancelled — used by tests and non-debounced call sites.
+#[derive(Clone, Default)]
+pub struct DiagCancelToken(Option<tokio_util::sync::CancellationToken>);
+
+impl DiagCancelToken {
+    /// A token that is never cancelled. Use for tests and non-debounced paths.
+    pub fn never() -> Self {
+        Self(None)
+    }
+
+    /// Wrap a live cancellation token.
+    pub fn from_token(token: tokio_util::sync::CancellationToken) -> Self {
+        Self(Some(token))
+    }
+
+    /// Returns `true` if the computation should stop.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.as_ref().is_some_and(|t| t.is_cancelled())
+    }
+}
+
 /// Maximum valid character value for LSP positions.
 ///
 /// The LSP specification defines position characters as `uinteger` (0..2147483647).
@@ -2496,17 +2523,17 @@ fn collect_workspace_symbols_from_artifacts(
 /// # Examples
 ///
 /// ```no_run
-/// use raven::handlers::diagnostics;
+/// use raven::handlers::{diagnostics, DiagCancelToken};
 /// use raven::state::WorldState;
 /// use url::Url;
 ///
 /// // Given a prepared `WorldState` and a `Url` referring to an open document:
 /// # let state: WorldState = todo!();
 /// # let uri: Url = todo!();
-/// let diags = diagnostics(&state, &uri);
+/// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
-pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
+pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
         return Vec::new();
@@ -2650,6 +2677,14 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Note: "Ambiguous parent" diagnostics removed - multiple parents is a valid use case
     // A file can legitimately be sourced by multiple scripts
 
+    if cancel.is_cancelled() {
+        return diagnostics;
+    }
+
+    // Shared scope cache: computed once, reused by both out-of-scope and undefined-variable
+    // collectors. Keyed by line number — within a single line the cross-file scope is identical.
+    let mut scope_cache: HashMap<u32, scope::ScopeAtPosition> = HashMap::new();
+
     // Check for out-of-scope symbol usage (Requirement 10.3)
     collect_out_of_scope_diagnostics(
         state,
@@ -2658,6 +2693,8 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
         &text,
         &directive_meta,
         &mut diagnostics,
+        &mut scope_cache,
+        cancel,
     );
 
     // Check for missing packages in library() calls (Requirement 15.1)
@@ -2668,6 +2705,10 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
 
     // Check for invalid line=0 in forward directives
     collect_invalid_line_param_diagnostics(&directive_meta, &mut diagnostics);
+
+    if cancel.is_cancelled() {
+        return diagnostics;
+    }
 
     // Collect undefined variable errors if enabled in config
     if state.cross_file_config.undefined_variables_enabled {
@@ -2681,6 +2722,8 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut scope_cache,
+            cancel,
         );
     }
 
@@ -3664,6 +3707,8 @@ fn collect_out_of_scope_diagnostics(
     text: &str,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
+    scope_cache: &mut HashMap<u32, scope::ScopeAtPosition>,
+    cancel: &DiagCancelToken,
 ) {
     // Skip if out-of-scope diagnostics are disabled
     let severity = match state.cross_file_config.out_of_scope_severity {
@@ -3680,9 +3725,14 @@ fn collect_out_of_scope_diagnostics(
         return;
     }
 
+    // Pre-compute line start offsets for O(1) line lookups
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
     // Collect all identifier usages with UTF-16 columns
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
-    collect_identifier_usages_utf16(node, text, &mut usages);
+    collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
 
     // Pre-compute identifier usages that resolve to a local symbol at that position.
     // This prevents false positives when a sourced file exports a symbol name that is
@@ -3690,12 +3740,18 @@ fn collect_out_of_scope_diagnostics(
     let mut locally_resolved_usages: std::collections::HashSet<(String, u32, u32)> =
         std::collections::HashSet::new();
     for (name, usage_line, usage_col, _) in &usages {
-        let scope = get_cross_file_scope(state, uri, *usage_line, *usage_col);
+        let scope = scope_cache.entry(*usage_line).or_insert_with(|| {
+            get_cross_file_scope(state, uri, *usage_line, *usage_col)
+        });
         if let Some(symbol) = scope.symbols.get(name.as_str()) {
             if symbol.source_uri == *uri {
                 locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
             }
         }
+    }
+
+    if cancel.is_cancelled() {
+        return;
     }
 
     // Deduplicate by symbol+position so the same usage is reported at most once even if
@@ -3704,6 +3760,9 @@ fn collect_out_of_scope_diagnostics(
 
     // For each source() call, check if any symbols from that file are used before the call
     for source in &source_calls {
+        if cancel.is_cancelled() {
+            return;
+        }
         let source_line = source.line;
         let source_col = source.column; // Already UTF-16
 
@@ -3808,9 +3867,27 @@ fn collect_out_of_scope_diagnostics(
 fn collect_identifier_usages_utf16<'a>(
     node: Node<'a>,
     text: &str,
+    line_starts: &[usize],
     usages: &mut Vec<(String, u32, u32, Node<'a>)>,
 ) {
     use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    // O(1) line text lookup from pre-computed offsets
+    let get_line = |row: usize| -> &str {
+        if row >= line_starts.len() {
+            return "";
+        }
+        let start = line_starts[row];
+        let end = if row + 1 < line_starts.len() {
+            line_starts[row + 1].saturating_sub(1).min(text.len())
+        } else {
+            text.len()
+        };
+        if start > text.len() || end > text.len() || start > end {
+            return "";
+        }
+        &text[start..end]
+    };
 
     if node.kind() == "identifier" {
         // Skip if this is the LHS of an assignment
@@ -3825,7 +3902,7 @@ fn collect_identifier_usages_utf16<'a>(
                         // Skip LHS of assignment, but recurse into children
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
-                            collect_identifier_usages_utf16(child, text, usages);
+                            collect_identifier_usages_utf16(child, text, line_starts, usages);
                         }
                         return;
                     }
@@ -3855,15 +3932,15 @@ fn collect_identifier_usages_utf16<'a>(
 
         let name = text[node.byte_range()].to_string();
         let line = node.start_position().row as u32;
-        // Convert byte column to UTF-16
-        let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
+        // Convert byte column to UTF-16 using pre-computed line offsets
+        let line_text = get_line(node.start_position().row);
         let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
         usages.push((name, line, col, node));
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_identifier_usages_utf16(child, text, usages);
+        collect_identifier_usages_utf16(child, text, line_starts, usages);
     }
 }
 
@@ -6018,6 +6095,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
     package_library: &crate::package_library::PackageLibrary,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
+    scope_cache: &mut HashMap<u32, scope::ScopeAtPosition>,
+    cancel: &DiagCancelToken,
 ) {
     use crate::content_provider::ContentProvider;
     use crate::cross_file::path_resolve::{
@@ -6054,20 +6133,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
         &text[start..end]
     };
 
-    // Cache scope resolution by line number. Within a single line, the cross-file
-    // scope (symbols, inherited_packages, loaded_packages) is identical for all
-    // identifiers. This avoids calling get_cross_file_scope() N times per file
-    // where N is the number of identifiers — instead we call it at most once per
-    // unique line that has an identifier needing a scope check.
-    //
-    // Note: Keying by line alone means two identifiers at different columns on
-    // the same line reuse the first identifier's column for function-scope
-    // filtering. In theory this is incorrect when multiple function bodies
-    // start/end on one line, but in practice R code is one-statement-per-line
-    // and the performance benefit (avoiding per-identifier scope resolution)
-    // outweighs the risk of this edge case.
-    let mut scope_cache: std::collections::HashMap<u32, crate::cross_file::scope::ScopeAtPosition> =
-        std::collections::HashMap::new();
+    // scope_cache is shared with collect_out_of_scope_diagnostics — entries populated
+    // there are reused here, avoiding redundant cross-file scope resolution.
 
     // Pre-compute workspace_imports as a HashSet for O(1) lookups
     let workspace_imports_set: std::collections::HashSet<&str> =
@@ -6098,7 +6165,10 @@ pub(crate) fn collect_undefined_variables_position_aware(
         std::collections::HashMap::new();
 
     // Report undefined variables with position-aware cross-file scope
-    for (name, usage_node) in used {
+    for (idx, (name, usage_node)) in used.into_iter().enumerate() {
+        if idx & 63 == 0 && cancel.is_cancelled() {
+            return;
+        }
         // Skip reserved words BEFORE any other checks (Requirement 3.4)
         if crate::reserved_words::is_reserved_word(&name) {
             continue;
@@ -20715,6 +20785,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this reserved word
@@ -20770,6 +20842,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this reserved word
@@ -20823,6 +20897,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this reserved word
@@ -20875,6 +20951,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this variable
@@ -21802,6 +21880,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this variable
@@ -21862,6 +21942,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this function
@@ -21925,6 +22007,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this symbol
@@ -22008,6 +22092,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Exact match should NOT produce diagnostic
@@ -22092,6 +22178,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // var1 on line 0 (before declaration) should produce diagnostic
@@ -22211,6 +22299,8 @@ mod proptests {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             // Filter for "Undefined variable" diagnostics for this symbol
@@ -28178,7 +28268,7 @@ mod integration_tests {
             let uri = tower_lsp::lsp_types::Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), doc);
 
-            let diagnostics = diagnostics(&state, &uri);
+            let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
 
             // Check that expected functions don't generate undefined variable errors
             for func in expected_funcs {
@@ -29038,7 +29128,7 @@ process_data <- function(data, threshold = 0.5, ...) {
         }
 
         // Test no false-positive undefined variable diagnostics
-        let diagnostics = diagnostics(&state, &uri);
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
         let undefined_errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("undefined") || d.message.contains("not found"))
@@ -29251,7 +29341,7 @@ helper_transform <- function(data) {
         }
 
         // Test no false positives for valid symbols
-        let diagnostics = diagnostics(&state, &main_uri);
+        let diagnostics = diagnostics(&state, &main_uri, &DiagCancelToken::never());
         let undefined_errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("undefined"))
@@ -30002,7 +30092,7 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(b_url.clone(), Document::new("source('a.R')", None));
 
-        let diags = diagnostics(&state, &a_url);
+        let diags = diagnostics(&state, &a_url, &DiagCancelToken::never());
         let circular_diags: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("Circular dependency"))
@@ -30066,7 +30156,7 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(a_url.clone(), Document::new("source('b.R')", None));
 
-        let diags = diagnostics(&state, &a_url);
+        let diags = diagnostics(&state, &a_url, &DiagCancelToken::never());
         let circular_diags: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("Circular dependency"))
@@ -30159,6 +30249,8 @@ result <- helper_with_spaces(42)"#;
             main_code,
             &meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -30225,6 +30317,8 @@ result <- helper_with_spaces(42)"#;
             main_code,
             &meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert!(
@@ -30294,6 +30388,8 @@ result <- helper_with_spaces(42)"#;
             main_code,
             &meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         let j_diags: Vec<_> = diagnostics
@@ -31018,7 +31114,7 @@ y <- x"#;
 #[cfg(test)]
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
-    use crate::handlers::{collect_undefined_variables_position_aware, goto_definition};
+    use crate::handlers::{collect_undefined_variables_position_aware, goto_definition, DiagCancelToken};
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{Position, Url};
 
@@ -31066,6 +31162,8 @@ x <- 1
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -31098,6 +31196,8 @@ x
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
@@ -31130,6 +31230,8 @@ x <- 2
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
@@ -31166,6 +31268,8 @@ myvar
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -31201,6 +31305,8 @@ myfunc()
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -31236,6 +31342,8 @@ myfunc()
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -31275,6 +31383,8 @@ MyVar
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -31313,6 +31423,8 @@ MyVar
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             assert_eq!(
@@ -31351,6 +31463,8 @@ MyVar
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             assert_eq!(
@@ -31388,6 +31502,8 @@ myvar
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         // Both usages should be flagged since the directive is not recognized as a trailing comment
@@ -31490,6 +31606,8 @@ mysymbol
             &state.package_library,
             &directive_meta1,
             &mut diagnostics1,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -31519,6 +31637,8 @@ mysymbol
             &state.package_library,
             &directive_meta2,
             &mut diagnostics2,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert_eq!(
@@ -31716,7 +31836,7 @@ x
 #[cfg(test)]
 mod function_parameter_tests {
     use crate::cross_file::directive::parse_directives;
-    use crate::handlers::collect_undefined_variables_position_aware;
+    use crate::handlers::{collect_undefined_variables_position_aware, DiagCancelToken};
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::Url;
 
@@ -31764,6 +31884,8 @@ add <- function(a, b) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
@@ -31823,6 +31945,8 @@ outer_func <- function(x) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
@@ -31881,6 +32005,8 @@ my_func <- function(a = undefined_var) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         // Filter to only undefined variable warnings
@@ -31940,6 +32066,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         // Filter to only undefined variable warnings
@@ -31996,6 +32124,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -32054,6 +32184,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert!(
@@ -32105,6 +32237,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert!(
@@ -32141,6 +32275,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert!(
@@ -32177,6 +32313,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         assert!(
@@ -32228,6 +32366,8 @@ my_func <- function(a = default_value) {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -32277,6 +32417,8 @@ my_func <- function(a = default_value) {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -32321,6 +32463,8 @@ my_func <- function(a = default_value) {
             &state.package_library,
             &directive_meta,
             &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -32380,6 +32524,8 @@ my_func <- function(a = default_value) {
                 &state.package_library,
                 &directive_meta,
                 &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -32407,7 +32553,7 @@ my_func <- function(a = default_value) {
 
 #[cfg(test)]
 mod diagnostics_master_switch_tests {
-    use crate::handlers::diagnostics;
+    use crate::handlers::{diagnostics, DiagCancelToken};
     use crate::state::{Document, WorldState};
     use proptest::prelude::*;
     use tower_lsp::lsp_types::Url;
@@ -32476,7 +32622,7 @@ mod diagnostics_master_switch_tests {
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Call diagnostics - should always return empty when master switch is disabled
-            let result = diagnostics(&state, &uri);
+            let result = diagnostics(&state, &uri, &DiagCancelToken::never());
 
             prop_assert!(
                 result.is_empty(),
@@ -32506,7 +32652,7 @@ mod diagnostics_master_switch_tests {
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        let result = diagnostics(&state, &uri);
+        let result = diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
             result.is_empty(),
             "Syntax errors should be suppressed when master switch is disabled"
@@ -32528,7 +32674,7 @@ mod diagnostics_master_switch_tests {
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        let result = diagnostics(&state, &uri);
+        let result = diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
             result.is_empty(),
             "Undefined variable diagnostics should be suppressed when master switch is disabled"
@@ -32558,7 +32704,7 @@ result <- undefined_var
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        let result = diagnostics(&state, &uri);
+        let result = diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
             result.is_empty(),
             "Master switch should suppress all diagnostics regardless of individual settings"
@@ -32613,7 +32759,7 @@ result <- undefined_var
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Call diagnostics - should return non-empty for code with issues
-            let result = diagnostics(&state, &uri);
+            let result = diagnostics(&state, &uri, &DiagCancelToken::never());
 
             prop_assert!(
                 !result.is_empty(),
@@ -32642,7 +32788,7 @@ result <- undefined_var
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        let result = diagnostics(&state, &uri);
+        let result = diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
             !result.is_empty(),
             "Syntax errors should produce diagnostics when master switch is enabled"
@@ -32662,7 +32808,7 @@ result <- undefined_var
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        let result_enabled = diagnostics(&state_enabled, &uri);
+        let result_enabled = diagnostics(&state_enabled, &uri, &DiagCancelToken::never());
 
         // The result should be non-empty (diagnostics are computed normally)
         assert!(
@@ -32702,7 +32848,7 @@ result <- undefined_var
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        let result = diagnostics(&state, &uri);
+        let result = diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
             !result.is_empty(),
             "Default configuration should allow diagnostics to be computed"

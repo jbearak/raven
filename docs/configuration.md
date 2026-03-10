@@ -12,7 +12,8 @@ All settings can be configured via VS Code settings or LSP initialization option
 | `raven.crossFile.assumeCallSite` | "end" | Default call site when not specified ("end" or "start") |
 | `raven.crossFile.indexWorkspace` | true | Enable workspace file indexing |
 | `raven.crossFile.maxRevalidationsPerTrigger` | 10 | Max open documents to revalidate per change |
-| `raven.crossFile.revalidationDebounceMs` | 200 | Debounce delay for cross-file diagnostics (ms) |
+| `raven.crossFile.revalidationDebounceMs` | 200 | Debounce delay for dependent file diagnostics (ms) |
+| `raven.crossFile.editedFileDebounceMs` | 50 | Debounce delay for the actively-edited file (ms) |
 | `raven.crossFile.hoistGlobalsInFunctions` | true | Hoist global definitions inside function bodies (see [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting)) |
 
 ## Diagnostic Severity Settings
