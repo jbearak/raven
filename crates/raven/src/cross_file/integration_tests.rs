@@ -889,7 +889,7 @@ pub fn dump_graph(graph: &DependencyGraph) -> String {
 /// assert_eq!(dependents.len(), 1); // main.r depends on utils.r
 /// ```
 pub fn get_transitive_dependents(graph: &DependencyGraph, uri: &Url, max_depth: usize) -> Vec<Url> {
-    graph.get_transitive_dependents(uri, max_depth)
+    graph.get_transitive_dependents(uri, max_depth, 200)
 }
 
 // ============================================================================

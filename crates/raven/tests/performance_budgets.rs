@@ -454,6 +454,94 @@ fn budget_scope_resolution_50_file_workspace() {
 }
 
 // ---------------------------------------------------------------------------
+// Scope resolution budget (auto backward dependency mode)
+// Requirements: 2.1 — 50-file workspace with auto backward deps < 75ms
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_scope_resolution_50_file_workspace_auto() {
+    // Create a 50-file workspace (medium preset)
+    let config = FixtureConfig::medium(); // 50 files, 10 funcs, depth 10
+    let workspace = create_fixture_workspace(&config);
+    let workspace_path = workspace.path();
+    let folder_url = Url::from_file_path(workspace_path).unwrap();
+
+    // Pre-compute artifacts and metadata for all files
+    let mut artifacts_map: HashMap<Url, raven::cross_file::ScopeArtifacts> = HashMap::new();
+    let mut metadata_map: HashMap<Url, raven::cross_file::types::CrossFileMetadata> =
+        HashMap::new();
+
+    let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "R")
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort_by_key(|e| e.path());
+
+    for entry in &entries {
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+
+        let meta = raven::cross_file::extract_metadata(&content);
+        let tree = raven::parser_pool::with_parser(|parser| parser.parse(&content, None));
+        if let Some(tree) = tree {
+            let arts = raven::cross_file::compute_artifacts(&uri, &tree, &content);
+            artifacts_map.insert(uri.clone(), arts);
+        }
+        metadata_map.insert(uri, meta);
+    }
+
+    // Build dependency graph — in Auto mode, forward source() calls also create
+    // backward entries, making the graph denser than Explicit mode.
+    let mut graph = raven::cross_file::DependencyGraph::new();
+    for (uri, meta) in &metadata_map {
+        graph.update_file(uri, meta, Some(&folder_url), |_| None);
+    }
+
+    let uri = Url::from_file_path(workspace_path.join("file_0.R")).unwrap();
+    let base_exports: HashSet<String> = HashSet::new();
+
+    // Warm up
+    let _ = raven::cross_file::scope_at_position_with_graph(
+        &uri,
+        u32::MAX,
+        u32::MAX,
+        &|u| artifacts_map.get(u).cloned(),
+        &|u| metadata_map.get(u).cloned(),
+        &graph,
+        Some(&folder_url),
+        20,
+        &base_exports,
+        true,
+        raven::cross_file::config::BackwardDependencyMode::Auto,
+    );
+
+    let elapsed = median_of_3(|| {
+        let _ = raven::cross_file::scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &|u| artifacts_map.get(u).cloned(),
+            &|u| metadata_map.get(u).cloned(),
+            &graph,
+            Some(&folder_url),
+            20,
+            &base_exports,
+            true,
+            raven::cross_file::config::BackwardDependencyMode::Auto,
+        );
+    });
+
+    assert_within_budget("scope_resolution_50_files_auto", elapsed, 75);
+}
+
+// ---------------------------------------------------------------------------
 // Single-file completion budget
 // Requirements: 2.1 — single-file completion < 20ms
 // ---------------------------------------------------------------------------

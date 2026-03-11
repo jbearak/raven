@@ -127,6 +127,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
                         black_box(20),
                         &base_exports,
                         true,
+                        raven::cross_file::config::BackwardDependencyMode::Explicit,
                     ))
                 })
             },
@@ -215,7 +216,7 @@ fn bench_dependency_graph(c: &mut Criterion) {
             &(&graph, &chain_end_uri),
             |b, &(graph, uri)| {
                 b.iter(|| {
-                    black_box(graph.get_transitive_dependents(black_box(uri), 20))
+                    black_box(graph.get_transitive_dependents(black_box(uri), 20, 200))
                 })
             },
         );

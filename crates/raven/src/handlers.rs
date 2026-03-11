@@ -6202,6 +6202,17 @@ pub(crate) fn collect_undefined_variables_position_aware(
     let mut source_exports_cache: std::collections::HashMap<Url, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
+    // Pre-compute parent scope at (0, 0) to avoid per-position graph traversal
+    // for symbols inherited from parent files. At position (0, 0), scope resolution
+    // returns parent symbols (from backward edges) + base exports, before any local
+    // timeline events. Identifiers matched here skip per-position resolution entirely.
+    let parent_symbol_names: std::collections::HashSet<String> = {
+        let scope_0_0 = scope_cache.entry((0, 0)).or_insert_with(|| {
+            get_cross_file_scope(state, uri, 0, 0)
+        });
+        scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
+    };
+
     // Report undefined variables with position-aware cross-file scope
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
@@ -6243,6 +6254,12 @@ pub(crate) fn collect_undefined_variables_position_aware(
                     }
                 }
             }
+        }
+
+        // Fast path: skip if symbol is in pre-computed parent scope (avoids per-position
+        // graph traversal for symbols inherited from parent files via backward edges).
+        if parent_symbol_names.contains(name.as_str()) {
+            continue;
         }
 
         // Get or compute the scope for this position (cached)

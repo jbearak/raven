@@ -1302,7 +1302,7 @@ impl LanguageServer for Backend {
             if interface_changed || result.edges_changed {
                 let dependents = state
                     .cross_file_graph
-                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
+                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth, state.cross_file_config.max_transitive_dependents_visited);
                 // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
@@ -1537,9 +1537,10 @@ impl LanguageServer for Backend {
                 // altered path resolution), schedule newly affected dependents.
                 if second_result.edges_changed {
                     let max_chain_depth = state.cross_file_config.max_chain_depth;
+                    let max_visited = state.cross_file_config.max_transitive_dependents_visited;
                     let dependents = state
                         .cross_file_graph
-                        .get_transitive_dependents(&uri, max_chain_depth);
+                        .get_transitive_dependents(&uri, max_chain_depth, max_visited);
                     for dep in dependents {
                         if state.documents.contains_key(&dep) {
                             state.diagnostics_gate.mark_force_republish(&dep);
@@ -1638,9 +1639,10 @@ impl LanguageServer for Backend {
 
             if second_result.edges_changed {
                 let max_chain_depth = state.cross_file_config.max_chain_depth;
+                let max_visited = state.cross_file_config.max_transitive_dependents_visited;
                 let dependents = state
                     .cross_file_graph
-                    .get_transitive_dependents(&uri, max_chain_depth);
+                    .get_transitive_dependents(&uri, max_chain_depth, max_visited);
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
                         state.diagnostics_gate.mark_force_republish(&dep);
@@ -1931,7 +1933,7 @@ impl LanguageServer for Backend {
             if interface_changed || edges_changed {
                 let dependents = state
                     .cross_file_graph
-                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
+                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth, state.cross_file_config.max_transitive_dependents_visited);
                 // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
@@ -2406,6 +2408,7 @@ impl LanguageServer for Backend {
                         let dependents = state.cross_file_graph.get_transitive_dependents(
                             uri,
                             state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
                             if state.documents.contains_key(&dep) && !affected.contains(&dep) {
@@ -2420,6 +2423,7 @@ impl LanguageServer for Backend {
                         let dependents = state.cross_file_graph.get_transitive_dependents(
                             uri,
                             state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
                             if state.documents.contains_key(&dep) && !affected.contains(&dep) {

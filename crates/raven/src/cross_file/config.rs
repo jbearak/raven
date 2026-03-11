@@ -105,6 +105,8 @@ pub struct CrossFileConfig {
     /// Controls whether the LSP auto-detects parent files from forward source() calls
     /// in other workspace files, or requires explicit @lsp-sourced-by directives.
     pub backward_dependencies: BackwardDependencyMode,
+    /// Maximum nodes visited during transitive dependent search (caps DFS in dense graphs).
+    pub max_transitive_dependents_visited: usize,
 }
 
 impl Default for CrossFileConfig {
@@ -158,6 +160,7 @@ impl Default for CrossFileConfig {
             cache_workspace_index_max_entries: 5000,
             hoist_globals_in_functions: true,
             backward_dependencies: BackwardDependencyMode::Auto,
+            max_transitive_dependents_visited: 200,
         }
     }
 }

@@ -1348,7 +1348,7 @@ proptest! {
         graph.update_file(&uri_b, &meta_b, None, |_| None);
 
         // Transitive dependents of C should include both B and A
-        let dependents = graph.get_transitive_dependents(&uri_c, 10);
+        let dependents = graph.get_transitive_dependents(&uri_c, 10, 200);
         prop_assert!(dependents.contains(&uri_b));
         prop_assert!(dependents.contains(&uri_a));
     }
@@ -1375,7 +1375,7 @@ proptest! {
         graph.update_file(&uri_b, &meta_b, None, |_| None);
 
         // With depth 1, only B should be returned (not A)
-        let dependents = graph.get_transitive_dependents(&uri_c, 1);
+        let dependents = graph.get_transitive_dependents(&uri_c, 1, 200);
         prop_assert!(dependents.contains(&uri_b));
         prop_assert!(!dependents.contains(&uri_a));
     }

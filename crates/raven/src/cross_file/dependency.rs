@@ -1040,11 +1040,14 @@ impl DependencyGraph {
             .unwrap_or_default()
     }
 
-    /// Get all transitive dependents (files that depend on uri directly or indirectly)
-    pub fn get_transitive_dependents(&self, uri: &Url, max_depth: usize) -> Vec<Url> {
+    /// Get all transitive dependents (files that depend on uri directly or indirectly).
+    ///
+    /// `max_visited` caps the total number of nodes explored during DFS to prevent
+    /// unbounded traversal in dense graphs (e.g., auto backward dependency mode).
+    pub fn get_transitive_dependents(&self, uri: &Url, max_depth: usize, max_visited: usize) -> Vec<Url> {
         let mut result = Vec::new();
         let mut visited = HashSet::new();
-        self.collect_dependents(uri, max_depth, 0, &mut visited, &mut result);
+        self.collect_dependents(uri, max_depth, 0, &mut visited, &mut result, max_visited);
         result
     }
 
@@ -1055,8 +1058,9 @@ impl DependencyGraph {
         current_depth: usize,
         visited: &mut HashSet<Url>,
         result: &mut Vec<Url>,
+        max_visited: usize,
     ) {
-        if current_depth >= max_depth || visited.contains(uri) {
+        if current_depth >= max_depth || visited.contains(uri) || visited.len() >= max_visited {
             return;
         }
         visited.insert(uri.clone());
@@ -1064,7 +1068,7 @@ impl DependencyGraph {
         for edge in self.get_dependents(uri) {
             if !visited.contains(&edge.from) {
                 result.push(edge.from.clone());
-                self.collect_dependents(&edge.from, max_depth, current_depth + 1, visited, result);
+                self.collect_dependents(&edge.from, max_depth, current_depth + 1, visited, result, max_visited);
             }
         }
     }
@@ -1412,7 +1416,7 @@ mod tests {
         graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
 
         // Dependents of c should include b and a
-        let dependents = graph.get_transitive_dependents(&c, 10);
+        let dependents = graph.get_transitive_dependents(&c, 10, 200);
         assert_eq!(dependents.len(), 2);
         assert!(dependents.contains(&b));
         assert!(dependents.contains(&a));
