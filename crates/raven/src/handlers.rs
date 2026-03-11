@@ -6647,6 +6647,13 @@ fn collect_usages_with_context<'a>(
                 }
             }
 
+            // Skip if this identifier is inside a namespace_operator (pkg:: or pkg:::)
+            // Both the package name (LHS) and function name (RHS) are qualified
+            // references and should not be checked as standalone variables.
+            if parent.kind() == "namespace_operator" {
+                return;
+            }
+
             // Skip if this is the RHS of an extract operator ($ or @)
             // e.g., df$column or obj@slot - we don't want to check if column/slot is defined
             // The LHS (df, obj) should still be checked for undefined variables
@@ -10186,6 +10193,52 @@ mod tests {
             1,
             "Only 'df' should be collected in chained extracts"
         );
+    }
+
+    /// Test that namespace-qualified calls (pkg::func) don't produce diagnostics
+    /// for either the package name or the function name.
+    #[test]
+    fn test_namespace_operator_skipped() {
+        let code = "knitr::knit('file.Rmd')";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+
+        let knitr_used = used.iter().any(|(name, _)| name == "knitr");
+        assert!(!knitr_used, "Package name 'knitr' in pkg::func should NOT be collected");
+
+        let knit_used = used.iter().any(|(name, _)| name == "knit");
+        assert!(!knit_used, "Function name 'knit' in pkg::func should NOT be collected");
+    }
+
+    /// Test that triple-colon namespace operator (pkg:::func) is also skipped.
+    #[test]
+    fn test_triple_colon_namespace_operator_skipped() {
+        let code = "stats:::C_something()";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+
+        let stats_used = used.iter().any(|(name, _)| name == "stats");
+        assert!(!stats_used, "Package name 'stats' in pkg:::func should NOT be collected");
+
+        let func_used = used.iter().any(|(name, _)| name == "C_something");
+        assert!(!func_used, "Function name in pkg:::func should NOT be collected");
+    }
+
+    /// Test that arguments to namespace-qualified calls are still checked.
+    #[test]
+    fn test_namespace_call_arguments_still_checked() {
+        // Arguments in call-like nodes are suppressed by in_call_like_arguments,
+        // but if the argument is not in a call (e.g., pkg::var + x), x should be checked.
+        let code = "y <- stats::median(x)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+
+        // Neither 'stats' nor 'median' should be collected
+        assert!(!used.iter().any(|(name, _)| name == "stats"));
+        assert!(!used.iter().any(|(name, _)| name == "median"));
     }
 
     // ========================================================================
