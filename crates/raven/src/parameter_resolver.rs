@@ -753,7 +753,7 @@ fn get_scope(
 
     let content_provider = state.content_provider();
 
-    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+    let get_artifacts = |target_uri: &Url| -> Option<std::sync::Arc<scope::ScopeArtifacts>> {
         content_provider.get_artifacts(target_uri)
     };
 

@@ -1655,7 +1655,7 @@ impl LanguageServer for Backend {
                 let state = self.state.read().await;
                 let content_provider = state.content_provider();
                 let get_artifacts =
-                    |target_uri: &Url| -> Option<crate::cross_file::scope::ScopeArtifacts> {
+                    |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
                         content_provider.get_artifacts(target_uri)
                     };
                 let get_metadata =
@@ -2478,7 +2478,7 @@ impl LanguageServer for Backend {
 
                     // Compute metadata and artifacts
                     let cross_file_meta = crate::cross_file::extract_metadata(&content);
-                    let artifacts = {
+                    let artifacts = std::sync::Arc::new({
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
                             if let Some(tree) = parser.parse(&content, None) {
@@ -2496,7 +2496,7 @@ impl LanguageServer for Backend {
                         } else {
                             crate::cross_file::scope::ScopeArtifacts::default()
                         }
-                    };
+                    });
 
                     let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(
                         &metadata, &content,
@@ -3109,7 +3109,7 @@ impl Backend {
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
         let mut cross_file_meta =
             crate::cross_file::extract_metadata_with_tree(&content, tree.as_ref());
-        let artifacts = match tree.as_ref() {
+        let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 file_uri,
                 tree,
@@ -3117,7 +3117,7 @@ impl Backend {
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
-        };
+        });
 
         let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) =
             {
@@ -3439,7 +3439,7 @@ impl Backend {
             cross_file_meta.inherited_working_directory =
                 Some(inherited_wd.to_string_lossy().to_string());
         }
-        let artifacts = match tree.as_ref() {
+        let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 file_uri,
                 tree,
@@ -3447,7 +3447,7 @@ impl Backend {
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
-        };
+        });
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);

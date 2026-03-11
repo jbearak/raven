@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use lru::LruCache;
 use ropey::Rope;
@@ -95,7 +95,7 @@ pub struct IndexEntry {
     /// Cross-file metadata (source() calls, directives)
     pub metadata: CrossFileMetadata,
     /// Scope artifacts (exported symbols, timeline)
-    pub artifacts: ScopeArtifacts,
+    pub artifacts: Arc<ScopeArtifacts>,
     /// Index version when this entry was created
     pub indexed_at_version: u64,
 }
@@ -241,7 +241,7 @@ impl WorkspaceIndex {
     ///
     /// # Returns
     /// Clone of ScopeArtifacts if found, None otherwise
-    pub fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
+    pub fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         let guard = self.inner.read().ok()?;
         guard.peek(uri).map(|entry| entry.artifacts.clone())
     }
@@ -668,7 +668,7 @@ mod tests {
             loaded_packages: vec!["dplyr".to_string()],
             snapshot: make_test_snapshot(),
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: version,
         }
     }
@@ -1299,7 +1299,7 @@ mod tests {
                 content_hash: Some(12345),
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: version,
         }
     }

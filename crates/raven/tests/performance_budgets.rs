@@ -13,6 +13,7 @@
 // Only compile in release mode — debug timings are meaningless.
 #![cfg(not(debug_assertions))]
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -380,7 +381,7 @@ fn budget_scope_resolution_50_file_workspace() {
     let folder_url = Url::from_file_path(workspace_path).unwrap();
 
     // Pre-compute artifacts and metadata for all files (same pattern as cross_file bench)
-    let mut artifacts_map: HashMap<Url, raven::cross_file::ScopeArtifacts> = HashMap::new();
+    let mut artifacts_map: HashMap<Url, Arc<raven::cross_file::ScopeArtifacts>> = HashMap::new();
     let mut metadata_map: HashMap<Url, raven::cross_file::types::CrossFileMetadata> =
         HashMap::new();
 
@@ -405,7 +406,7 @@ fn budget_scope_resolution_50_file_workspace() {
         let tree = raven::parser_pool::with_parser(|parser| parser.parse(&content, None));
         if let Some(tree) = tree {
             let arts = raven::cross_file::compute_artifacts(&uri, &tree, &content);
-            artifacts_map.insert(uri.clone(), arts);
+            artifacts_map.insert(uri.clone(), Arc::new(arts));
         }
         metadata_map.insert(uri, meta);
     }
@@ -469,7 +470,7 @@ fn budget_scope_resolution_50_file_workspace_auto() {
     let folder_url = Url::from_file_path(workspace_path).unwrap();
 
     // Pre-compute artifacts and metadata for all files
-    let mut artifacts_map: HashMap<Url, raven::cross_file::ScopeArtifacts> = HashMap::new();
+    let mut artifacts_map: HashMap<Url, Arc<raven::cross_file::ScopeArtifacts>> = HashMap::new();
     let mut metadata_map: HashMap<Url, raven::cross_file::types::CrossFileMetadata> =
         HashMap::new();
 
@@ -494,7 +495,7 @@ fn budget_scope_resolution_50_file_workspace_auto() {
         let tree = raven::parser_pool::with_parser(|parser| parser.parse(&content, None));
         if let Some(tree) = tree {
             let arts = raven::cross_file::compute_artifacts(&uri, &tree, &content);
-            artifacts_map.insert(uri.clone(), arts);
+            artifacts_map.insert(uri.clone(), Arc::new(arts));
         }
         metadata_map.insert(uri, meta);
     }

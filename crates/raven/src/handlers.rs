@@ -6,7 +6,7 @@
 //
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 use tower_lsp::lsp_types::*;
@@ -72,7 +72,7 @@ pub(crate) struct DiagnosticsSnapshot {
     pub workspace_imports: Vec<String>,
 
     // Pre-collected scope data for all reachable files
-    pub artifacts_map: HashMap<Url, scope::ScopeArtifacts>,
+    pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
     pub metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata>,
 
     // Package library (Arc, cheap clone)
@@ -188,7 +188,7 @@ impl DiagnosticsSnapshot {
         column: u32,
         cancel: &DiagCancelToken,
     ) -> scope::ScopeAtPosition {
-        let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+        let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
         };
         let get_metadata =
@@ -2215,7 +2215,7 @@ fn get_cross_file_scope(
     let content_provider = state.content_provider();
 
     // Closure to get artifacts for a URI
-    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         content_provider.get_artifacts(target_uri)
     };
 
@@ -3698,10 +3698,10 @@ pub async fn collect_missing_file_diagnostics_async(
 fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mut Vec<Diagnostic>) {
     use crate::cross_file::scope;
 
-    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         if let Some(doc) = state.documents.get(target_uri) {
             if let Some(tree) = &doc.tree {
-                return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+                return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
             }
         }
         if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
@@ -3709,7 +3709,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         }
         if let Some(doc) = state.workspace_index.get(target_uri) {
             if let Some(tree) = &doc.tree {
-                return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+                return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
             }
         }
         None
@@ -3993,7 +3993,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         return;
     };
 
-    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
     let get_metadata =
@@ -4650,11 +4650,11 @@ fn collect_out_of_scope_diagnostics(
 
         // Get symbols from the sourced file
         let source_symbols: std::collections::HashSet<String> = {
-            let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+            let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
                 // Try open documents first (authoritative)
                 if let Some(doc) = state.documents.get(target_uri) {
                     if let Some(tree) = &doc.tree {
-                        return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+                        return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
                     }
                 }
                 // Try cross-file workspace index (preferred for closed files)
@@ -4665,7 +4665,7 @@ fn collect_out_of_scope_diagnostics(
                 // Fallback to legacy workspace index
                 if let Some(doc) = state.workspace_index.get(target_uri) {
                     if let Some(tree) = &doc.tree {
-                        return Some(scope::compute_artifacts(target_uri, tree, &doc.text()));
+                        return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
                     }
                 }
                 None

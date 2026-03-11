@@ -309,7 +309,7 @@ impl BackgroundIndexer {
         // Use compute_artifacts_with_metadata to include declared symbols from directives
         // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
         // **Validates: Requirements 12.1** (Workspace index declaration extraction)
-        let artifacts = match tree.as_ref() {
+        let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 uri,
                 tree,
@@ -317,7 +317,7 @@ impl BackgroundIndexer {
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
-        };
+        });
 
         let snapshot = FileSnapshot::with_content_hash(&metadata_fs, &content);
 

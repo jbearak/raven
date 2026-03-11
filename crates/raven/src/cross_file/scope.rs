@@ -1544,7 +1544,7 @@ pub fn scope_at_position_with_deps<F>(
     max_depth: usize,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
 {
     log::trace!("Resolving scope at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
@@ -1590,7 +1590,7 @@ where
 /// use std::collections::HashSet;
 ///
 /// let uri = Url::parse("file:///project/main.R").unwrap();
-/// let get_artifacts = |_u: &Url| -> Option<ScopeArtifacts> { None };
+/// let get_artifacts = |_u: &Url| -> Option<Arc<ScopeArtifacts>> { None };
 /// let resolve_path = |_path: &str, _base: &Url| -> Option<Url> { None };
 /// let mut visited = HashSet::new();
 ///
@@ -1617,7 +1617,7 @@ fn scope_at_position_recursive<F>(
     visited: &mut HashSet<Url>,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
 {
     log::trace!("Traversing to file: {} (depth {})", uri, current_depth);
     let mut scope = ScopeAtPosition::default();
@@ -2304,7 +2304,7 @@ pub fn scope_at_position_with_graph<F, G>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
     let mut visited = HashMap::new();
@@ -2369,7 +2369,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
     // Initialize scope with inherited_packages from parameter
@@ -3292,11 +3292,11 @@ mod tests {
             },
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3440,11 +3440,11 @@ mod tests {
         let child_tree = parse_r(child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(artifacts.clone())
+                Some(Arc::new(artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3531,11 +3531,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3609,11 +3609,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3728,11 +3728,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3870,11 +3870,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3936,13 +3936,13 @@ mod tests {
         let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
         let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &uri_a {
-                Some(artifacts_a.clone())
+                Some(Arc::new(artifacts_a.clone()))
             } else if uri == &uri_b {
-                Some(artifacts_b.clone())
+                Some(Arc::new(artifacts_b.clone()))
             } else if uri == &uri_c {
-                Some(artifacts_c.clone())
+                Some(Arc::new(artifacts_c.clone()))
             } else {
                 None
             }
@@ -4037,13 +4037,13 @@ mod tests {
         graph.update_file(&uri_a, &meta_a, Some(&workspace_root), |_| None);
         graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &uri_a {
-                Some(artifacts_a.clone())
+                Some(Arc::new(artifacts_a.clone()))
             } else if uri == &uri_b {
-                Some(artifacts_b.clone())
+                Some(Arc::new(artifacts_b.clone()))
             } else if uri == &uri_c {
-                Some(artifacts_c.clone())
+                Some(Arc::new(artifacts_c.clone()))
             } else {
                 None
             }
@@ -4130,11 +4130,11 @@ mod tests {
         let child_tree = parse_r(child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -4229,13 +4229,13 @@ mod tests {
         graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
         graph.update_file(&loader_uri, &loader_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &main_uri {
-                Some(main_artifacts.clone())
+                Some(Arc::new(main_artifacts.clone()))
             } else if uri == &loader_uri {
-                Some(loader_artifacts.clone())
+                Some(Arc::new(loader_artifacts.clone()))
             } else if uri == &helpers_uri {
-                Some(helpers_artifacts.clone())
+                Some(Arc::new(helpers_artifacts.clone()))
             } else {
                 None
             }
@@ -4324,11 +4324,11 @@ mod tests {
 
         graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &main_uri {
-                Some(main_artifacts.clone())
+                Some(Arc::new(main_artifacts.clone()))
             } else if uri == &helpers_uri {
-                Some(helpers_artifacts.clone())
+                Some(Arc::new(helpers_artifacts.clone()))
             } else {
                 None
             }
@@ -6207,9 +6207,9 @@ mod tests {
         let uri = test_uri();
         let artifacts = compute_artifacts(&uri, &tree, code);
 
-        let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
             if u == &uri {
-                Some(artifacts.clone())
+                Some(Arc::new(artifacts.clone()))
             } else {
                 None
             }
@@ -6234,9 +6234,9 @@ mod tests {
         let uri = test_uri();
         let artifacts = compute_artifacts(&uri, &tree, code);
 
-        let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
             if u == &uri {
-                Some(artifacts.clone())
+                Some(Arc::new(artifacts.clone()))
             } else {
                 None
             }
@@ -6297,11 +6297,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6416,11 +6416,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6539,11 +6539,11 @@ mod tests {
             },
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6631,11 +6631,11 @@ mod tests {
             },
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6715,11 +6715,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6841,11 +6841,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6927,11 +6927,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -7046,13 +7046,13 @@ mod tests {
         graph.update_file(&uri_a, &meta_a, Some(&workspace_root), |_| None);
         graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &uri_a {
-                Some(artifacts_a.clone())
+                Some(Arc::new(artifacts_a.clone()))
             } else if uri == &uri_b {
-                Some(artifacts_b.clone())
+                Some(Arc::new(artifacts_b.clone()))
             } else if uri == &uri_c {
-                Some(artifacts_c.clone())
+                Some(Arc::new(artifacts_c.clone()))
             } else {
                 None
             }
@@ -7177,13 +7177,13 @@ mod tests {
         };
         graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else if uri == &sourced_uri {
-                Some(sourced_artifacts.clone())
+                Some(Arc::new(sourced_artifacts.clone()))
             } else {
                 None
             }
@@ -8875,11 +8875,11 @@ x <- 1"#;
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         // Create artifacts lookup
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -8954,11 +8954,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9033,11 +9033,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9117,11 +9117,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9201,11 +9201,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9283,11 +9283,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9398,13 +9398,13 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &grandparent_uri {
-                Some(grandparent_artifacts.clone())
+                Some(Arc::new(grandparent_artifacts.clone()))
             } else if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9508,11 +9508,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -10073,8 +10073,8 @@ y <- filter(df)"#;
             let uri = test_uri();
             let artifacts = compute_artifacts(&uri, &tree, code);
 
-            let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
-                if u == &uri { Some(artifacts.clone()) } else { None }
+            let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if u == &uri { Some(Arc::new(artifacts.clone())) } else { None }
             };
             let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
@@ -10137,9 +10137,9 @@ y <- filter(df)"#;
             let child_uri = Url::parse("file:///child.R").unwrap();
             let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
-            let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
-                if u == &parent_uri { Some(parent_artifacts.clone()) }
-                else if u == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if u == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if u == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
@@ -10249,10 +10249,10 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10334,10 +10334,10 @@ y <- filter(df)"#;
             graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
             graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &a_uri { Some(a_artifacts.clone()) }
-                else if uri == &b_uri { Some(b_artifacts.clone()) }
-                else if uri == &c_uri { Some(c_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &a_uri { Some(Arc::new(a_artifacts.clone())) }
+                else if uri == &b_uri { Some(Arc::new(b_artifacts.clone())) }
+                else if uri == &c_uri { Some(Arc::new(c_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |_uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10463,11 +10463,11 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &middle_uri { Some(middle_artifacts.clone()) }
-                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &middle_uri { Some(Arc::new(middle_artifacts.clone())) }
+                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10588,11 +10588,11 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling1_uri { Some(sibling1_artifacts.clone()) }
-                else if uri == &sibling2_uri { Some(sibling2_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling1_uri { Some(Arc::new(sibling1_artifacts.clone())) }
+                else if uri == &sibling2_uri { Some(Arc::new(sibling2_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10706,10 +10706,10 @@ y <- filter(df)"#;
             graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
             graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &a_uri { Some(a_artifacts.clone()) }
-                else if uri == &b_uri { Some(b_artifacts.clone()) }
-                else if uri == &c_uri { Some(c_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &a_uri { Some(Arc::new(a_artifacts.clone())) }
+                else if uri == &b_uri { Some(Arc::new(b_artifacts.clone())) }
+                else if uri == &c_uri { Some(Arc::new(c_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10828,11 +10828,11 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10933,10 +10933,10 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11050,10 +11050,10 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11141,9 +11141,9 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11237,10 +11237,10 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11362,11 +11362,11 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &grandparent_uri { Some(grandparent_artifacts.clone()) }
-                else if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
+                else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11482,11 +11482,11 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &helper_uri { Some(helper_artifacts.clone()) }
-                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &helper_uri { Some(Arc::new(helper_artifacts.clone())) }
+                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11569,11 +11569,11 @@ y <- filter(df)"#;
             let child_meta = CrossFileMetadata::default(); // No sourced_by!
             graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11681,13 +11681,13 @@ y <- filter(df)"#;
             graph.update_file(&parent_b_uri, &parent_b_meta, Some(&workspace_root), |_| None);
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_a_uri {
-                    Some(parent_a_artifacts.clone())
+                    Some(Arc::new(parent_a_artifacts.clone()))
                 } else if uri == &parent_b_uri {
-                    Some(parent_b_artifacts.clone())
+                    Some(Arc::new(parent_b_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11770,11 +11770,11 @@ y <- filter(df)"#;
             let child_meta = CrossFileMetadata::default();
             graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11900,13 +11900,13 @@ y <- filter(df)"#;
             graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
             graph.update_file(&runner_uri, &runner_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &main_uri {
-                    Some(main_artifacts.clone())
+                    Some(Arc::new(main_artifacts.clone()))
                 } else if uri == &runner_uri {
-                    Some(runner_artifacts.clone())
+                    Some(Arc::new(runner_artifacts.clone()))
                 } else if uri == &format_uri {
-                    Some(format_artifacts.clone())
+                    Some(Arc::new(format_artifacts.clone()))
                 } else {
                     None
                 }
@@ -12017,11 +12017,11 @@ y <- filter(df)"#;
             let child_meta = CrossFileMetadata::default();
             graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }

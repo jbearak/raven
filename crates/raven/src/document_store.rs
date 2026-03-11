@@ -91,7 +91,7 @@ pub struct DocumentState {
     /// Cross-file metadata (source() calls, directives)
     pub metadata: CrossFileMetadata,
     /// Scope artifacts (exported symbols, timeline)
-    pub artifacts: ScopeArtifacts,
+    pub artifacts: Arc<ScopeArtifacts>,
     /// Internal revision counter for change detection
     pub revision: u64,
 }
@@ -250,7 +250,7 @@ impl DocumentStore {
         let tree = Self::parse_content(content);
         let loaded_packages = Self::extract_packages(&tree, content);
         let metadata = crate::cross_file::extract_metadata(content);
-        let artifacts = if let Some(ref tree) = tree {
+        let artifacts = Arc::new(if let Some(ref tree) = tree {
             // Use compute_artifacts_with_metadata to include declared symbols from directives
             // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
@@ -262,7 +262,7 @@ impl DocumentStore {
             )
         } else {
             ScopeArtifacts::default()
-        };
+        });
 
         let state = DocumentState {
             uri: uri.clone(),
@@ -337,7 +337,7 @@ impl DocumentStore {
         let contents = Rope::from_str(content);
         let tree = Self::parse_content(content);
         let loaded_packages = Self::extract_packages(&tree, content);
-        let artifacts = if let Some(ref tree) = tree {
+        let artifacts = Arc::new(if let Some(ref tree) = tree {
             // Use compute_artifacts_with_metadata to include declared symbols from directives
             // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
@@ -349,7 +349,7 @@ impl DocumentStore {
             )
         } else {
             ScopeArtifacts::default()
-        };
+        });
 
         let state = DocumentState {
             uri: uri.clone(),
@@ -427,7 +427,7 @@ impl DocumentStore {
             state.tree = Self::parse_content(&content);
             state.loaded_packages = Self::extract_packages(&state.tree, &content);
             state.metadata = crate::cross_file::extract_metadata(&content);
-            state.artifacts = if let Some(ref tree) = state.tree {
+            state.artifacts = Arc::new(if let Some(ref tree) = state.tree {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
@@ -439,7 +439,7 @@ impl DocumentStore {
                 )
             } else {
                 ScopeArtifacts::default()
-            };
+            });
 
             // Update access order
             self.touch_access(uri);
@@ -473,7 +473,7 @@ impl DocumentStore {
             state.tree = Self::parse_content(&content);
             state.loaded_packages = Self::extract_packages(&state.tree, &content);
             state.metadata = metadata;
-            state.artifacts = if let Some(ref tree) = state.tree {
+            state.artifacts = Arc::new(if let Some(ref tree) = state.tree {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
@@ -485,7 +485,7 @@ impl DocumentStore {
                 )
             } else {
                 ScopeArtifacts::default()
-            };
+            });
 
             self.touch_access(uri);
             self.signal_update_complete(uri);

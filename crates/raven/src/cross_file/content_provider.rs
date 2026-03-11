@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
@@ -26,7 +27,7 @@ pub trait ContentProvider {
     fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata>;
 
     /// Get scope artifacts for a URI, preferring open documents over cache.
-    fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts>;
+    fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>>;
 }
 
 /// Document content accessor (minimal interface for open documents)
@@ -100,7 +101,7 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
         None
     }
 
-    fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
+    fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         // 1. Open document - would need to compute artifacts
         if self.open_documents.contains_key(uri) {
             // Open doc - caller should use their own artifacts computation

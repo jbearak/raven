@@ -8,6 +8,7 @@
 //
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tower_lsp::lsp_types::Url;
@@ -46,7 +47,7 @@ pub trait ContentProvider: Send + Sync {
     ///
     /// Returns the scope artifacts (exported interface, timeline, etc.)
     /// for the given URI, or None if not available.
-    fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts>;
+    fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>>;
 
     /// Check if URI exists in cache (no I/O)
     ///
@@ -271,7 +272,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// 5. Legacy workspace_index (for migration compatibility)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
-    fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
+    fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         // 1. Check DocumentStore
         if let Some(doc) = self.document_store.get_without_touch(uri) {
             return Some(doc.artifacts.clone());
@@ -285,12 +286,12 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
                     // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
                     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                     let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(scope::compute_artifacts_with_metadata(
+                    return Some(Arc::new(scope::compute_artifacts_with_metadata(
                         uri,
                         tree,
                         &text,
                         Some(&metadata),
-                    ));
+                    )));
                 }
             }
         }
@@ -315,12 +316,12 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
                     // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
                     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                     let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(scope::compute_artifacts_with_metadata(
+                    return Some(Arc::new(scope::compute_artifacts_with_metadata(
                         uri,
                         tree,
                         &text,
                         Some(&metadata),
-                    ));
+                    )));
                 }
             }
         }
@@ -433,7 +434,7 @@ mod tests {
     struct MockContentProvider {
         content: HashMap<Url, String>,
         metadata: HashMap<Url, CrossFileMetadata>,
-        artifacts: HashMap<Url, ScopeArtifacts>,
+        artifacts: HashMap<Url, Arc<ScopeArtifacts>>,
         open_uris: std::collections::HashSet<Url>,
     }
 
@@ -467,7 +468,7 @@ mod tests {
             self.metadata.get(uri).cloned()
         }
 
-        fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
+        fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
             self.artifacts.get(uri).cloned()
         }
 
@@ -604,7 +605,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -639,7 +640,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -693,7 +694,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri2.clone(), index_entry);
@@ -738,7 +739,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: index_metadata,
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -787,7 +788,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: index_artifacts,
+            artifacts: Arc::new(index_artifacts),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -828,7 +829,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri2.clone(), index_entry);
@@ -954,7 +955,7 @@ mod tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         }
     }
@@ -1053,7 +1054,7 @@ mod tests {
                         content_hash: None,
                     },
                     metadata: index_metadata,
-                    artifacts: ScopeArtifacts::default(),
+                    artifacts: Arc::new(ScopeArtifacts::default()),
                     indexed_at_version: 0,
                 };
                 workspace_index.insert(uri.clone(), index_entry);
@@ -1126,7 +1127,7 @@ mod tests {
                         content_hash: None,
                     },
                     metadata: CrossFileMetadata::default(),
-                    artifacts: index_artifacts,
+                    artifacts: Arc::new(index_artifacts),
                     indexed_at_version: 0,
                 };
                 workspace_index.insert(uri.clone(), index_entry);
@@ -1208,7 +1209,7 @@ mod tests {
                         content_hash: None,
                     },
                     metadata: index_metadata,
-                    artifacts: index_artifacts,
+                    artifacts: Arc::new(index_artifacts),
                     indexed_at_version: 0,
                 };
                 workspace_index.insert(uri.clone(), index_entry);
@@ -1419,7 +1420,7 @@ mod tests {
                         content_hash: None,
                     },
                     metadata,
-                    artifacts,
+                    artifacts: Arc::new(artifacts),
                     indexed_at_version: 0,
                 };
                 workspace_index.insert(uri.clone(), index_entry);
@@ -1566,7 +1567,7 @@ mod tests {
                         content_hash: None,
                     },
                     metadata: index_metadata,
-                    artifacts: index_artifacts,
+                    artifacts: Arc::new(index_artifacts),
                     indexed_at_version: 0,
                 };
                 workspace_index.insert(uri.clone(), index_entry);
@@ -1727,7 +1728,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -1777,7 +1778,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: utils_artifacts.clone(),
+            artifacts: Arc::new(utils_artifacts.clone()),
             indexed_at_version: 0,
         };
         workspace_index.insert(utils_uri.clone(), utils_entry);
@@ -1827,7 +1828,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri2.clone(), entry);
@@ -1866,7 +1867,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -1978,7 +1979,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata,
-            artifacts,
+            artifacts: Arc::new(artifacts),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -2086,7 +2087,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata: old_metadata,
-            artifacts: old_artifacts,
+            artifacts: Arc::new(old_artifacts),
             indexed_at_version: 0,
         };
         workspace_index.insert(uri.clone(), index_entry);
@@ -2208,7 +2209,7 @@ mod integration_tests {
                 content_hash: None,
             },
             metadata: child_metadata.clone(),
-            artifacts: child_artifacts.clone(),
+            artifacts: Arc::new(child_artifacts.clone()),
             indexed_at_version: 0,
         };
         workspace_index.insert(child_uri.clone(), child_entry);
@@ -2241,7 +2242,7 @@ mod integration_tests {
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
         // Create closures for scope resolution
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> { provider.get_artifacts(uri) };
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> { provider.get_artifacts(uri) };
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> { provider.get_metadata(uri) };
 
         // Query scope at end of parent file

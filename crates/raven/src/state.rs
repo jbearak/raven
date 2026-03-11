@@ -1068,7 +1068,7 @@ fn scan_directory(
                             // Compute artifacts if we have a tree
                             // Use compute_artifacts_with_metadata to include declared symbols from directives
                             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                            let artifacts = if let Some(tree) = doc.tree.as_ref() {
+                            let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
                                 crate::cross_file::scope::compute_artifacts_with_metadata(
                                     &uri,
                                     tree,
@@ -1077,7 +1077,7 @@ fn scan_directory(
                                 )
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
-                            };
+                            });
 
                             let snapshot =
                                 crate::cross_file::file_cache::FileSnapshot::with_content_hash(

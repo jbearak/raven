@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::{Position, Url};
 
@@ -4781,11 +4782,11 @@ child_var <- 100
 
         println!("\nStep 3: Test scope resolution at different positions");
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -4965,11 +4966,11 @@ x <- 1
             content_provider,
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -5108,11 +5109,11 @@ x <- 1
                 content_provider,
             );
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -5601,11 +5602,11 @@ x <- 1
         );
 
         // Test scope - child symbols should NOT be available
-        let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts_v1 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v1.clone())
+                Some(Arc::new(parent_artifacts_v1.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -5678,11 +5679,11 @@ x <- 1
         );
 
         // Test scope - child symbols SHOULD now be available
-        let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts_v2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v2.clone())
+                Some(Arc::new(parent_artifacts_v2.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -5780,11 +5781,11 @@ x <- 1
         );
 
         // Test scope - child symbols SHOULD be available
-        let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts_v1 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v1.clone())
+                Some(Arc::new(parent_artifacts_v1.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -5857,11 +5858,11 @@ x <- 1
         );
 
         // Test scope - child symbols should NOT be available anymore
-        let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts_v2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v2.clone())
+                Some(Arc::new(parent_artifacts_v2.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6035,10 +6036,10 @@ mod cross_directory_hoisting_tests {
             "Child should have backward edge from parent"
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+            else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
             else { None }
         };
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
