@@ -781,6 +781,7 @@ fn get_scope(
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
+        &|| false, // non-diagnostic path, no cancellation
     )
 }
 

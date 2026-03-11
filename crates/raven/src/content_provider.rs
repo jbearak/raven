@@ -2257,6 +2257,7 @@ mod integration_tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Requirement 12.2: Declared symbol from indexed child file should be available

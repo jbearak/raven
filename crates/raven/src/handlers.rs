@@ -49,6 +49,272 @@ impl DiagCancelToken {
     }
 }
 
+// ============================================================================
+// Diagnostics Snapshot
+// ============================================================================
+
+/// A snapshot of all state needed for diagnostic computation.
+///
+/// Built under the read lock, then used to compute diagnostics
+/// without holding any lock — preventing write starvation on `did_change`.
+pub(crate) struct DiagnosticsSnapshot {
+    // Document data
+    pub tree: tree_sitter::Tree,
+    pub text: String,
+    // Cross-file state (pre-collected)
+    pub directive_meta: crate::cross_file::CrossFileMetadata,
+    pub cross_file_config: crate::cross_file::config::CrossFileConfig,
+    pub cross_file_graph: crate::cross_file::dependency::DependencyGraph,
+    pub workspace_folders: Vec<Url>,
+    pub base_exports: HashSet<String>,
+    pub package_library_ready: bool,
+    pub workspace_scan_complete: bool,
+    pub workspace_imports: Vec<String>,
+
+    // Pre-collected scope data for all reachable files
+    pub artifacts_map: HashMap<Url, scope::ScopeArtifacts>,
+    pub metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata>,
+
+    // Package library (Arc, cheap clone)
+    pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
+}
+
+impl DiagnosticsSnapshot {
+    /// Build a snapshot from WorldState under the read lock.
+    pub fn build(state: &WorldState, uri: &Url) -> Option<Self> {
+        let doc = state.get_document(uri)?;
+        let tree = doc.tree.as_ref()?.clone();
+        let text = doc.text();
+        // Get enriched metadata
+        let mut directive_meta = state.get_enriched_metadata(uri).unwrap_or_else(|| {
+            crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
+        });
+
+        // Compute inherited working directory if needed
+        if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
+            let workspace_root = state.workspace_folders.first();
+            let content_provider = state.content_provider();
+            let get_metadata_for_uri =
+                |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                    if let Some(doc) = state.documents.get(target_uri) {
+                        return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+                    }
+                    if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
+                        return Some(meta);
+                    }
+                    if let Some(content) = content_provider.get_content(target_uri) {
+                        return Some(crate::cross_file::extract_metadata(&content));
+                    }
+                    None
+                };
+            directive_meta.inherited_working_directory = compute_inherited_working_directory(
+                uri,
+                &directive_meta,
+                workspace_root,
+                get_metadata_for_uri,
+            );
+        }
+
+        // Pre-collect artifacts and metadata for all files in the dependency neighborhood
+        let max_depth = state.cross_file_config.max_chain_depth;
+        let neighborhood = state.cross_file_graph.collect_neighborhood(uri, max_depth);
+        let content_provider = state.content_provider();
+
+        let mut artifacts_map = HashMap::new();
+        let mut metadata_map = HashMap::new();
+        for neighbor_uri in &neighborhood {
+            if let Some(artifacts) = content_provider.get_artifacts(neighbor_uri) {
+                artifacts_map.insert(neighbor_uri.clone(), artifacts);
+            }
+            if let Some(metadata) = content_provider.get_metadata(neighbor_uri) {
+                metadata_map.insert(neighbor_uri.clone(), metadata);
+            }
+        }
+
+        let base_exports = if state.package_library_ready {
+            state.package_library.base_exports().clone()
+        } else {
+            HashSet::new()
+        };
+
+        Some(DiagnosticsSnapshot {
+            tree,
+            text,
+            directive_meta,
+            cross_file_config: state.cross_file_config.clone(),
+            cross_file_graph: state.cross_file_graph.clone(),
+            workspace_folders: state.workspace_folders.clone(),
+            base_exports,
+            package_library_ready: state.package_library_ready,
+            workspace_scan_complete: state.workspace_scan_complete,
+            workspace_imports: state.workspace_imports.clone(),
+            artifacts_map,
+            metadata_map,
+            package_library: state.package_library.clone(),
+        })
+    }
+
+    /// Resolve cross-file scope from pre-collected snapshot data.
+    fn get_scope(
+        &self,
+        uri: &Url,
+        line: u32,
+        column: u32,
+        cancel: &DiagCancelToken,
+    ) -> scope::ScopeAtPosition {
+        let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+            self.artifacts_map.get(target_uri).cloned()
+        };
+        let get_metadata =
+            |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                self.metadata_map.get(target_uri).cloned()
+            };
+
+        let is_cancelled = || cancel.is_cancelled();
+
+        scope::scope_at_position_with_graph(
+            uri,
+            line,
+            column,
+            &get_artifacts,
+            &get_metadata,
+            &self.cross_file_graph,
+            self.workspace_folders.first(),
+            self.cross_file_config.max_chain_depth,
+            &self.base_exports,
+            self.cross_file_config.hoist_globals_in_functions,
+            self.cross_file_config.backward_dependencies,
+            &is_cancelled,
+        )
+    }
+}
+
+/// Compute diagnostics from a pre-built snapshot (no lock held).
+///
+/// This is the main entry point for debounced diagnostics.
+/// The snapshot captures all needed state so computation can proceed
+/// without holding the read lock, preventing write starvation.
+pub(crate) fn diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> Vec<Diagnostic> {
+    let start = std::time::Instant::now();
+
+    if !snapshot.cross_file_config.diagnostics_enabled {
+        return Vec::new();
+    }
+
+    let mut diagnostics = Vec::new();
+
+    // Fast collectors (no scope resolution needed)
+    collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+
+    // Cycle detection
+    if let Some(severity) = snapshot.cross_file_config.circular_dependency_severity {
+        if let Some(cycle) = snapshot.cross_file_graph.detect_cycle(uri) {
+            let out = &cycle.outgoing_edge;
+            let close = &cycle.closing_edge;
+            let line = out.call_site_line.unwrap_or(0);
+            let col = out.call_site_column.unwrap_or(0);
+            let max_line = snapshot.text.lines().count().saturating_sub(1) as u32;
+            let line = line.min(max_line);
+
+            let closing_file = close
+                .from
+                .path_segments()
+                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let closing_line_1based = close.call_site_line.map(|l| l + 1);
+
+            let message = match closing_line_1based {
+                Some(cl) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file"
+                    )
+                }
+                _ => {
+                    format!("Circular dependency: {closing_file} sources this file")
+                }
+            };
+
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(line, col),
+                    end: Position::new(line, col.saturating_add(1)),
+                },
+                severity: Some(severity),
+                message,
+                ..Default::default()
+            });
+        }
+    }
+
+    // Max depth diagnostics
+    collect_max_depth_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+
+    // Missing file diagnostics (sync check from snapshot metadata)
+    collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+
+    // Missing package diagnostics
+    collect_missing_package_diagnostics_from_snapshot(snapshot, &mut diagnostics);
+
+    // Redundant directive diagnostics
+    collect_redundant_directive_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+
+    // Invalid line param diagnostics
+    collect_invalid_line_param_diagnostics(&snapshot.directive_meta, &mut diagnostics);
+
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled after fast collectors ({}ms)", start.elapsed().as_millis());
+        return diagnostics;
+    }
+
+    // Shared scope cache for expensive collectors
+    let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
+
+    let scope_start = std::time::Instant::now();
+
+    // Out-of-scope diagnostics
+    collect_out_of_scope_diagnostics_from_snapshot(
+        snapshot,
+        uri,
+        snapshot.tree.root_node(),
+        &snapshot.text,
+        &mut diagnostics,
+        &mut scope_cache,
+        cancel,
+    );
+
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled after out-of-scope ({}ms)", start.elapsed().as_millis());
+        return diagnostics;
+    }
+
+    // Undefined variable diagnostics
+    if snapshot.cross_file_config.undefined_variables_enabled {
+        collect_undefined_variables_from_snapshot(
+            snapshot,
+            uri,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut scope_cache,
+            cancel,
+        );
+    }
+
+    log::trace!(
+        "Diagnostics computed in {}ms (scope resolution: {}ms, {} scope cache entries)",
+        start.elapsed().as_millis(),
+        scope_start.elapsed().as_millis(),
+        scope_cache.len(),
+    );
+
+    diagnostics
+}
+
 /// Maximum valid character value for LSP positions.
 ///
 /// The LSP specification defines position characters as `uinteger` (0..2147483647).
@@ -1901,7 +2167,7 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
-    get_cross_file_scope(state, uri, line, column).symbols
+    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never()).symbols
 }
 
 /// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
@@ -1917,6 +2183,7 @@ fn get_cross_file_scope(
     uri: &Url,
     line: u32,
     column: u32,
+    cancel: &DiagCancelToken,
 ) -> scope::ScopeAtPosition {
     // Use ContentProvider for unified access
     let content_provider = state.content_provider();
@@ -1942,6 +2209,8 @@ fn get_cross_file_scope(
         std::collections::HashSet::new()
     };
 
+    let is_cancelled = || cancel.is_cancelled();
+
     // Use the graph-aware scope resolution with PathContext
     scope::scope_at_position_with_graph(
         uri,
@@ -1955,6 +2224,7 @@ fn get_cross_file_scope(
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
+        &is_cancelled,
     )
 }
 
@@ -3445,6 +3715,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         &empty_base_exports,
         false, // depth-exceeded check doesn't need hoisting
         state.cross_file_config.backward_dependencies,
+        &|| false, // depth check is fast, no cancellation needed
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -3682,6 +3953,570 @@ fn collect_invalid_line_param_diagnostics(
     }
 }
 
+// ============================================================================
+// Snapshot-based diagnostic collectors
+// ============================================================================
+
+fn collect_max_depth_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+        snapshot.artifacts_map.get(target_uri).cloned()
+    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+            snapshot.metadata_map.get(target_uri).cloned()
+        };
+
+    let empty_base_exports = HashSet::new();
+    let scope_result = scope::scope_at_position_with_graph(
+        uri,
+        u32::MAX,
+        u32::MAX,
+        &get_artifacts,
+        &get_metadata,
+        &snapshot.cross_file_graph,
+        snapshot.workspace_folders.first(),
+        snapshot.cross_file_config.max_chain_depth,
+        &empty_base_exports,
+        false,
+        snapshot.cross_file_config.backward_dependencies,
+        &|| false,
+    );
+
+    if let Some(severity) = snapshot.cross_file_config.max_chain_depth_severity {
+        for (exceeded_uri, line, col) in &scope_result.depth_exceeded {
+            if exceeded_uri == uri {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(*line, *col),
+                        end: Position::new(*line, col.saturating_add(1)),
+                    },
+                    severity: Some(severity),
+                    message: format!(
+                        "Maximum chain depth ({}) exceeded; some symbols may not be resolved",
+                        snapshot.cross_file_config.max_chain_depth
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+}
+
+fn collect_missing_file_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(severity) = snapshot.cross_file_config.missing_file_severity else {
+        return;
+    };
+    let meta = &snapshot.directive_meta;
+    let workspace_root = snapshot.workspace_folders.first();
+
+    let forward_ctx =
+        crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
+    let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
+
+    for source in &meta.sources {
+        let resolved = forward_ctx.as_ref().and_then(|ctx| {
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                &source.path,
+                ctx,
+            )
+        });
+        if resolved.is_none() {
+            let message = if source.is_directive {
+                format!(
+                    "Cannot resolve path '{}' in @lsp-source directive",
+                    source.path
+                )
+            } else {
+                format!("Cannot resolve path: '{}'", source.path)
+            };
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(source.line, source.column),
+                    end: Position::new(
+                        source.line,
+                        source
+                            .column
+                            .saturating_add(source.path.len() as u32)
+                            .saturating_add(10),
+                    ),
+                },
+                severity: Some(severity),
+                message,
+                ..Default::default()
+            });
+        }
+    }
+
+    for sourced_by in &meta.sourced_by {
+        let resolved = backward_ctx.as_ref().and_then(|ctx| {
+            crate::cross_file::path_resolve::resolve_path(&sourced_by.path, ctx)
+        });
+        if resolved.is_none() {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(sourced_by.directive_line, 0),
+                    end: Position::new(sourced_by.directive_line, LSP_EOL_CHARACTER),
+                },
+                severity: Some(severity),
+                message: format!(
+                    "Cannot resolve parent path: '{}'",
+                    sourced_by.path
+                ),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn collect_missing_package_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !snapshot.cross_file_config.packages_enabled {
+        return;
+    }
+    if !snapshot.package_library_ready {
+        return;
+    }
+    if snapshot.package_library.r_subprocess().is_none() {
+        return;
+    }
+    let Some(severity) = snapshot.cross_file_config.packages_missing_package_severity else {
+        return;
+    };
+
+    for lib_call in &snapshot.directive_meta.library_calls {
+        if crate::cross_file::directive::is_line_ignored(
+            &snapshot.directive_meta,
+            lib_call.line,
+        ) {
+            continue;
+        }
+        if !snapshot.package_library.package_exists(&lib_call.package) {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(lib_call.line, 0),
+                    end: Position::new(lib_call.line, lib_call.column),
+                },
+                severity: Some(severity),
+                message: format!("Package '{}' is not installed", lib_call.package),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn collect_redundant_directive_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(severity) = snapshot.cross_file_config.redundant_directive_severity else {
+        return;
+    };
+
+    for edge in snapshot.cross_file_graph.get_dependencies(uri) {
+        if edge.is_directive && !edge.is_backward_directive {
+            let has_ast_edge = snapshot
+                .cross_file_graph
+                .get_dependencies(uri)
+                .iter()
+                .any(|e| e.to == edge.to && !e.is_directive);
+            if has_ast_edge {
+                let line = edge.call_site_line.unwrap_or(0);
+                let target_name = edge
+                    .to
+                    .path_segments()
+                    .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(line, 0),
+                        end: Position::new(line, LSP_EOL_CHARACTER),
+                    },
+                    severity: Some(severity),
+                    message: format!(
+                        "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
+                        target_name
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+}
+
+fn collect_out_of_scope_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    node: Node,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+    cancel: &DiagCancelToken,
+) {
+    let Some(severity) = snapshot.cross_file_config.out_of_scope_severity else {
+        return;
+    };
+
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let source_calls: Vec<_> = snapshot.directive_meta.sources.iter().collect();
+    if source_calls.is_empty() {
+        return;
+    }
+
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    let get_line = |row: usize| -> &str {
+        if row >= line_starts.len() {
+            return "";
+        }
+        let start = line_starts[row];
+        let end = if row + 1 < line_starts.len() {
+            line_starts[row + 1].saturating_sub(1).min(text.len())
+        } else {
+            text.len()
+        };
+        if start > text.len() || end > text.len() || start > end {
+            return "";
+        }
+        &text[start..end]
+    };
+
+    // Collect usages
+    let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
+    collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
+
+    // Filter to only usages that appear before their source() call
+    let mut locally_resolved_usages: HashSet<(String, u32, u32)> = HashSet::new();
+    for (name, usage_line, usage_col, _) in &usages {
+        let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
+            snapshot.get_scope(uri, *usage_line, *usage_col, cancel)
+        });
+        if let Some(symbol) = scope.symbols.get(name.as_str()) {
+            if symbol.source_uri == *uri {
+                locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
+            }
+        }
+    }
+
+    for (idx, (name, usage_line, usage_col, usage_node)) in usages.iter().enumerate() {
+        if idx & 63 == 0 && cancel.is_cancelled() {
+            return;
+        }
+
+        if locally_resolved_usages.contains(&(name.clone(), *usage_line, *usage_col)) {
+            continue;
+        }
+
+        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, *usage_line) {
+            continue;
+        }
+        if is_reserved_word(name) {
+            continue;
+        }
+
+        let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
+            snapshot.get_scope(uri, *usage_line, *usage_col, cancel)
+        });
+
+        if scope.symbols.contains_key(name.as_str()) {
+            continue;
+        }
+
+        for source in &source_calls {
+            if !source.inherits_symbols() {
+                continue;
+            }
+            if (source.line, source.column) <= (*usage_line, *usage_col) {
+                continue;
+            }
+
+            let source_scope = scope_cache
+                .entry((source.line, source.column))
+                .or_insert_with(|| {
+                    snapshot.get_scope(uri, source.line, source.column, cancel)
+                });
+
+            if source_scope.symbols.contains_key(name.as_str()) {
+                let line_text = get_line(usage_node.start_position().row);
+                let start_col = byte_offset_to_utf16_column(
+                    line_text,
+                    usage_node.start_position().column,
+                );
+                let end_line_text = get_line(usage_node.end_position().row);
+                let end_col = byte_offset_to_utf16_column(
+                    end_line_text,
+                    usage_node.end_position().column,
+                );
+
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(*usage_line, start_col),
+                        end: Position::new(usage_node.end_position().row as u32, end_col),
+                    },
+                    severity: Some(severity),
+                    message: format!(
+                        "'{}' is used before it's available (sourced on line {})",
+                        name,
+                        source.line + 1
+                    ),
+                    ..Default::default()
+                });
+                break;
+            }
+        }
+    }
+}
+
+fn collect_undefined_variables_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    node: Node,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+    cancel: &DiagCancelToken,
+) {
+    use crate::cross_file::config::BackwardDependencyMode;
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    match snapshot.cross_file_config.backward_dependencies {
+        BackwardDependencyMode::Off => return,
+        BackwardDependencyMode::Auto => {
+            if snapshot.directive_meta.sourced_by.is_empty() && !snapshot.workspace_scan_complete {
+                return;
+            }
+        }
+        BackwardDependencyMode::Explicit => {}
+    }
+
+    let mut used: Vec<(String, Node)> = Vec::new();
+    collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
+
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    let get_line = |row: usize| -> &str {
+        if row >= line_starts.len() {
+            return "";
+        }
+        let start = line_starts[row];
+        let end = if row + 1 < line_starts.len() {
+            line_starts[row + 1].saturating_sub(1).min(text.len())
+        } else {
+            text.len()
+        };
+        if start > text.len() || end > text.len() || start > end {
+            return "";
+        }
+        &text[start..end]
+    };
+
+    let workspace_imports_set: HashSet<&str> =
+        snapshot.workspace_imports.iter().map(|s| s.as_str()).collect();
+
+    let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
+    let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> = snapshot
+        .artifacts_map
+        .get(uri)
+        .map(|artifacts| {
+            let exports = artifacts
+                .exported_interface
+                .keys()
+                .map(|k| k.to_string())
+                .collect();
+            (exports, artifacts.function_scope_tree.clone())
+        });
+
+    let parent_symbol_names: HashSet<String> = {
+        let scope_0_0 = scope_cache.entry((0, 0)).or_insert_with(|| {
+            snapshot.get_scope(uri, 0, 0, cancel)
+        });
+        scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
+    };
+
+    let workspace_root = snapshot.workspace_folders.first();
+    let source_path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri,
+        &snapshot.directive_meta,
+        workspace_root,
+    );
+    let direct_sources: Vec<(u32, u32, Url)> = snapshot
+        .directive_meta
+        .sources
+        .iter()
+        .filter(|source| source.inherits_symbols())
+        .filter_map(|source| {
+            let ctx = source_path_ctx.as_ref()?;
+            let resolved =
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                    &source.path,
+                    ctx,
+                )?;
+            let source_uri = Url::from_file_path(resolved).ok()?;
+            Some((source.line, source.column, source_uri))
+        })
+        .collect();
+    let mut source_exports_cache: HashMap<Url, HashSet<String>> = HashMap::new();
+
+    for (idx, (name, usage_node)) in used.into_iter().enumerate() {
+        if idx & 63 == 0 && cancel.is_cancelled() {
+            return;
+        }
+
+        if is_reserved_word(&name) {
+            continue;
+        }
+
+        let usage_line = usage_node.start_position().row as u32;
+
+        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, usage_line) {
+            continue;
+        }
+
+        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
+            continue;
+        }
+
+        if hoist_globals {
+            if let Some((ref exports, ref fn_tree)) = local_opt {
+                if exports.contains(name.as_str()) {
+                    let usage_col_byte = usage_node.start_position().column as u32;
+                    let line_text = get_line(usage_node.start_position().row);
+                    let usage_col_utf16 =
+                        byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
+                    let inside_function = !fn_tree
+                        .query_point(scope::Position::new(usage_line, usage_col_utf16))
+                        .is_empty();
+                    if inside_function {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if parent_symbol_names.contains(name.as_str()) {
+            continue;
+        }
+
+        let scope = {
+            let line_text = get_line(usage_node.start_position().row);
+            let usage_col =
+                byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
+            scope_cache.entry((usage_line, usage_col)).or_insert_with(|| {
+                snapshot.get_scope(uri, usage_line, usage_col, cancel)
+            })
+        };
+
+        if scope.symbols.contains_key(name.as_str()) {
+            continue;
+        }
+
+        let usage_col_utf16 = byte_offset_to_utf16_column(
+            get_line(usage_node.start_position().row),
+            usage_node.start_position().column,
+        );
+
+        let defined_in_loaded_direct_source = direct_sources
+            .iter()
+            .filter(|(source_line, source_col, _)| {
+                *source_line < usage_line
+                    || (*source_line == usage_line && *source_col <= usage_col_utf16)
+            })
+            .any(|(_, _, source_uri)| {
+                let exported = source_exports_cache
+                    .entry(source_uri.clone())
+                    .or_insert_with(|| {
+                        if let Some(artifacts) = snapshot.artifacts_map.get(source_uri) {
+                            return artifacts
+                                .exported_interface
+                                .keys()
+                                .map(|k| k.to_string())
+                                .collect();
+                        }
+                        HashSet::new()
+                    });
+                exported.contains(name.as_str())
+            });
+        if defined_in_loaded_direct_source {
+            continue;
+        }
+
+        if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
+            let position_aware_packages: Vec<String> = scope
+                .inherited_packages
+                .iter()
+                .chain(scope.loaded_packages.iter())
+                .cloned()
+                .collect();
+
+            if is_package_export(&name, &position_aware_packages, &snapshot.package_library) {
+                continue;
+            }
+
+            let has_prior_library_call = has_prior_package_loader_call_textually(
+                text,
+                usage_node.start_byte(),
+            );
+            let package_cache_pending = position_aware_packages
+                .iter()
+                .any(|pkg| !snapshot.package_library.is_cached_sync(pkg));
+            if has_prior_library_call
+                && (position_aware_packages.is_empty() || package_cache_pending)
+                && is_function_call_identifier_textually(usage_node, text)
+            {
+                continue;
+            }
+        } else {
+            let has_prior_library_call = snapshot.directive_meta.library_calls.iter().any(|call| {
+                call.line < usage_line
+                    || (call.line == usage_line && call.column <= usage_col_utf16)
+            });
+            let has_prior_library_call = has_prior_library_call
+                || has_prior_package_loader_call_textually(text, usage_node.start_byte());
+            if snapshot.cross_file_config.packages_enabled
+                && !snapshot.package_library_ready
+                && is_function_call_identifier_textually(usage_node, text)
+                && (!scope.loaded_packages.is_empty()
+                    || !scope.inherited_packages.is_empty()
+                    || has_prior_library_call)
+            {
+                continue;
+            }
+        }
+
+        let start_line_text = get_line(usage_node.start_position().row);
+        let end_line_text = get_line(usage_node.end_position().row);
+        let start_col =
+            byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
+        let end_col =
+            byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(usage_node.start_position().row as u32, start_col),
+                end: Position::new(usage_node.end_position().row as u32, end_col),
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            message: format!("Undefined variable: {}", name),
+            ..Default::default()
+        });
+    }
+}
+
 /// Emit diagnostics for symbols defined in sourced files that are referenced
 /// earlier in the current document than the corresponding `source()` call.
 ///
@@ -3744,7 +4579,7 @@ fn collect_out_of_scope_diagnostics(
         std::collections::HashSet::new();
     for (name, usage_line, usage_col, _) in &usages {
         let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
-            get_cross_file_scope(state, uri, *usage_line, *usage_col)
+            get_cross_file_scope(state, uri, *usage_line, *usage_col, cancel)
         });
         if let Some(symbol) = scope.symbols.get(name.as_str()) {
             if symbol.source_uri == *uri {
@@ -6208,7 +7043,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // timeline events. Identifiers matched here skip per-position resolution entirely.
     let parent_symbol_names: std::collections::HashSet<String> = {
         let scope_0_0 = scope_cache.entry((0, 0)).or_insert_with(|| {
-            get_cross_file_scope(state, uri, 0, 0)
+            get_cross_file_scope(state, uri, 0, 0, cancel)
         });
         scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
     };
@@ -6268,7 +7103,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
             let usage_col =
                 byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
             scope_cache.entry((usage_line, usage_col)).or_insert_with(|| {
-                get_cross_file_scope(state, uri, usage_line, usage_col)
+                get_cross_file_scope(state, uri, usage_line, usage_col, cancel)
             })
         };
 
@@ -6992,7 +7827,7 @@ pub fn completion(
 
     // Get scope at cursor position for package exports
     // Requirements 9.1, 9.2: Add package exports to completions with package attribution
-    let scope = get_cross_file_scope(state, uri, position.line, position.character);
+    let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
@@ -8270,7 +9105,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     // Check package exports from combined_exports cache (if packages enabled)
     // This surfaces package exports without blocking on R subprocess
     if state.cross_file_config.packages_enabled {
-        let scope = get_cross_file_scope(state, uri, position.line, position.character);
+        let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
         let all_packages: Vec<String> = scope
             .inherited_packages
             .iter()
@@ -8841,7 +9676,7 @@ pub fn prepare_signature_help(
     let func_name = node_text(func_node, &text);
 
     // Determine if package or user function using cross-file scope
-    let scope = get_cross_file_scope(state, uri, position.line, position.character);
+    let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
 
     /// Try user signature, falling back to a minimal signature with source attribution.
     fn resolve_user_or_fallback(
@@ -9065,7 +9900,7 @@ pub fn goto_definition(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(state, uri, position.line, position.character);
+    let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")

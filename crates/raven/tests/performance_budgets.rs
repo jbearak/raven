@@ -432,6 +432,7 @@ fn budget_scope_resolution_50_file_workspace() {
         &base_exports,
         true,
         raven::cross_file::config::BackwardDependencyMode::Explicit,
+        &|| false,
     );
 
     let elapsed = median_of_3(|| {
@@ -447,6 +448,7 @@ fn budget_scope_resolution_50_file_workspace() {
             &base_exports,
             true,
             raven::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
     });
 
@@ -520,6 +522,7 @@ fn budget_scope_resolution_50_file_workspace_auto() {
         &base_exports,
         true,
         raven::cross_file::config::BackwardDependencyMode::Auto,
+        &|| false,
     );
 
     let elapsed = median_of_3(|| {
@@ -535,6 +538,7 @@ fn budget_scope_resolution_50_file_workspace_auto() {
             &base_exports,
             true,
             raven::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
     });
 

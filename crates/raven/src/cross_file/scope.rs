@@ -2301,6 +2301,7 @@ pub fn scope_at_position_with_graph<F, G>(
     base_exports: &HashSet<String>,
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2332,6 +2333,7 @@ where
         base_exports,
         hoist_globals,
         backward_dep_mode,
+        is_cancelled,
     )
 }
 
@@ -2364,6 +2366,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     base_exports: &HashSet<String>,
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2579,6 +2582,11 @@ where
         } else {
             (call_site_line, call_site_col)
         };
+        // Early exit on cancellation before expensive recursive traversal
+        if is_cancelled() {
+            return scope;
+        }
+
         let empty_packages = HashSet::new();
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
@@ -2596,6 +2604,7 @@ where
             base_exports,
             hoist_globals,
             backward_dep_mode,
+            is_cancelled,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -2870,6 +2879,11 @@ where
                             }
                         });
 
+                        // Early exit on cancellation before expensive recursive traversal
+                        if is_cancelled() {
+                            return scope;
+                        }
+
                         let child_scope = scope_at_position_with_graph_recursive(
                             &child_uri,
                             u32::MAX, // Include all symbols from sourced file
@@ -2886,6 +2900,7 @@ where
                             base_exports,
                             hoist_globals,
                             backward_dep_mode,
+                            is_cancelled,
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -3310,6 +3325,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -3548,6 +3564,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -3625,6 +3642,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         assert!(
@@ -3744,6 +3762,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         assert!(
@@ -3886,6 +3905,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         assert!(
@@ -4054,6 +4074,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Should have depth_exceeded entry
@@ -4248,6 +4269,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -4337,6 +4359,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6307,6 +6330,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -6326,6 +6350,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6345,6 +6370,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -6423,6 +6449,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -6450,6 +6477,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6545,6 +6573,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6635,6 +6664,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6718,6 +6748,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -6737,6 +6768,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6756,6 +6788,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -6841,6 +6874,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6926,6 +6960,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -6945,6 +6980,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -7047,6 +7083,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -7066,6 +7103,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -7176,6 +7214,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -8869,6 +8908,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Child should have inherited dplyr from parent
@@ -8947,6 +8987,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -9025,6 +9066,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Child should have both packages
@@ -9108,6 +9150,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -9192,6 +9235,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -9272,6 +9316,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -9390,6 +9435,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -9413,6 +9459,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -9494,6 +9541,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -9517,6 +9565,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -10045,6 +10094,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true, // hoisting ON
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10065,6 +10115,7 @@ y <- filter(df)"#;
                 &base_exports,
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10110,6 +10161,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10226,6 +10278,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10308,6 +10361,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10440,6 +10494,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10563,6 +10618,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10679,6 +10735,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10801,6 +10858,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10905,6 +10963,7 @@ y <- filter(df)"#;
                 &base_exports,
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11020,6 +11079,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11108,6 +11168,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11205,6 +11266,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true, // hoisting ON, but query is at global level
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             // At global level, parent is queried at call site (line 0 col 0),
@@ -11330,6 +11392,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11449,6 +11512,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11540,6 +11604,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11655,6 +11720,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11739,6 +11805,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11873,6 +11940,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11899,6 +11967,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11983,6 +12052,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(

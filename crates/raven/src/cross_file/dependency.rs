@@ -618,7 +618,7 @@ pub struct UpdateResult {
 }
 
 /// Dependency graph tracking source relationships between files
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,
@@ -1203,6 +1203,38 @@ impl DependencyGraph {
     ///   (use this for diagnostic positioning in the queried file)
     /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
     ///   (use this for the diagnostic message details)
+    /// Collect all URIs reachable from `uri` within `max_depth` hops,
+    /// following both forward and backward edges.
+    pub fn collect_neighborhood(&self, uri: &Url, max_depth: usize) -> HashSet<Url> {
+        let mut visited = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((uri.clone(), 0usize));
+        visited.insert(uri.clone());
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            // Follow forward edges (children)
+            if let Some(edges) = self.forward.get(&current) {
+                for edge in edges {
+                    if visited.insert(edge.to.clone()) {
+                        queue.push_back((edge.to.clone(), depth + 1));
+                    }
+                }
+            }
+            // Follow backward edges (parents)
+            if let Some(edges) = self.backward.get(&current) {
+                for edge in edges {
+                    if visited.insert(edge.from.clone()) {
+                        queue.push_back((edge.from.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+        visited
+    }
+
     pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
         let mut visited = HashSet::new();
         let mut path = Vec::new();

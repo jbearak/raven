@@ -647,8 +647,8 @@ async fn run_debounced_diagnostics(
         _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
     }
 
-    // Extract data for async diagnostics while holding lock briefly
-    let diagnostics_data = {
+    // Build snapshot under the read lock (brief hold), then compute diagnostics outside
+    let snapshot_data = {
         let state = state_arc.read().await;
 
         let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
@@ -672,34 +672,27 @@ async fn run_debounced_diagnostics(
             }
         }
 
-        let sync_diagnostics = handlers::diagnostics(&state, &affected_uri, &cancel);
-        let directive_meta = state
-            .documents
-            .get(&affected_uri)
-            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-            .unwrap_or_default();
+        // Build the snapshot (captures all state needed for diagnostics)
+        let snapshot = handlers::DiagnosticsSnapshot::build(&state, &affected_uri);
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
 
-        Some((
-            sync_diagnostics,
-            directive_meta,
-            workspace_folder,
-            missing_file_severity,
-        ))
-    };
+        snapshot.map(|s| (s, workspace_folder, missing_file_severity))
+    }; // Read lock released here
 
-    let Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) =
-        diagnostics_data
-    else {
+    let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
         return;
     };
+
+    // Compute diagnostics WITHOUT holding any lock
+    let sync_diagnostics =
+        handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel);
 
     // Perform async missing file existence checks (non-blocking I/O)
     let diagnostics = handlers::diagnostics_async_standalone(
         &affected_uri,
         sync_diagnostics,
-        &directive_meta,
+        &snapshot.directive_meta,
         workspace_folder.as_ref(),
         missing_file_severity,
     )
@@ -1685,6 +1678,7 @@ impl LanguageServer for Backend {
                     &empty_base_exports,
                     false, // package prefetching doesn't need hoisting
                     state.cross_file_config.backward_dependencies,
+                    &|| false, // package prefetching, no cancellation
                 );
 
                 let mut pkgs = scope.inherited_packages;
