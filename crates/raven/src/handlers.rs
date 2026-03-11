@@ -2981,7 +2981,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     }
 
     // Check for max chain depth exceeded (Requirement 5.8)
-    collect_max_depth_diagnostics(state, uri, &mut diagnostics);
+    collect_max_depth_diagnostics(state, uri, &mut diagnostics, cancel);
 
     // Check for missing files in source() calls and directives (Requirement 10.2)
     collect_missing_file_diagnostics(state, uri, &directive_meta, &mut diagnostics);
@@ -3710,7 +3710,7 @@ pub async fn collect_missing_file_diagnostics_async(
 }
 
 /// Collect diagnostics for max chain depth exceeded (Requirement 5.8)
-fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mut Vec<Diagnostic>) {
+fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mut Vec<Diagnostic>, cancel: &DiagCancelToken) {
     use crate::cross_file::scope;
 
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
@@ -3756,7 +3756,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         &empty_base_exports,
         false, // depth-exceeded check doesn't need hoisting
         state.cross_file_config.backward_dependencies,
-        &|| false, // depth check is fast, no cancellation needed
+        &|| cancel.is_cancelled(),
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -4170,14 +4170,16 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
         return;
     };
 
-    for edge in snapshot.cross_file_graph.get_dependencies(uri) {
+    let deps = snapshot.cross_file_graph.get_dependencies(uri);
+    let ast_targets: HashSet<&Url> = deps
+        .iter()
+        .filter(|e| !e.is_directive)
+        .map(|e| &e.to)
+        .collect();
+
+    for edge in &deps {
         if edge.is_directive && !edge.is_backward_directive {
-            let has_ast_edge = snapshot
-                .cross_file_graph
-                .get_dependencies(uri)
-                .iter()
-                .any(|e| e.to == edge.to && !e.is_directive);
-            if has_ast_edge {
+            if ast_targets.contains(&edge.to) {
                 let line = edge.call_site_line.unwrap_or(0);
                 let target_name = edge
                     .to
@@ -4247,7 +4249,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 
     // Filter to only usages that appear before their source() call
     let mut locally_resolved_usages: HashSet<(String, u32, u32)> = HashSet::new();
-    for (name, usage_line, usage_col, _) in &usages {
+    for (idx, (name, usage_line, usage_col, _)) in usages.iter().enumerate() {
+        if idx & 63 == 0 && cancel.is_cancelled() {
+            return;
+        }
         let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
             snapshot.get_scope(uri, *usage_line, *usage_col, cancel)
         });
