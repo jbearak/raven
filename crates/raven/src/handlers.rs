@@ -2682,8 +2682,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     }
 
     // Shared scope cache: computed once, reused by both out-of-scope and undefined-variable
-    // collectors. Keyed by line number — within a single line the cross-file scope is identical.
-    let mut scope_cache: HashMap<u32, scope::ScopeAtPosition> = HashMap::new();
+    // collectors. Keyed by (line, column) — different columns on the same line can have
+    // different scopes (e.g., inside vs outside a single-line anonymous function).
+    let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
 
     // Check for out-of-scope symbol usage (Requirement 10.3)
     collect_out_of_scope_diagnostics(
@@ -3707,7 +3708,7 @@ fn collect_out_of_scope_diagnostics(
     text: &str,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
-    scope_cache: &mut HashMap<u32, scope::ScopeAtPosition>,
+    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
 ) {
     // Skip if out-of-scope diagnostics are disabled
@@ -3740,7 +3741,7 @@ fn collect_out_of_scope_diagnostics(
     let mut locally_resolved_usages: std::collections::HashSet<(String, u32, u32)> =
         std::collections::HashSet::new();
     for (name, usage_line, usage_col, _) in &usages {
-        let scope = scope_cache.entry(*usage_line).or_insert_with(|| {
+        let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
             get_cross_file_scope(state, uri, *usage_line, *usage_col)
         });
         if let Some(symbol) = scope.symbols.get(name.as_str()) {
@@ -6095,7 +6096,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
     package_library: &crate::package_library::PackageLibrary,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
-    scope_cache: &mut HashMap<u32, scope::ScopeAtPosition>,
+    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
 ) {
     use crate::content_provider::ContentProvider;
@@ -6186,13 +6187,15 @@ pub(crate) fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Get or compute the scope for this line (cached)
-        let scope = scope_cache.entry(usage_line).or_insert_with(|| {
+        // Get or compute the scope for this position (cached)
+        let scope = {
             let line_text = get_line(usage_node.start_position().row);
             let usage_col =
                 byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-            get_cross_file_scope(state, uri, usage_line, usage_col)
-        });
+            scope_cache.entry((usage_line, usage_col)).or_insert_with(|| {
+                get_cross_file_scope(state, uri, usage_line, usage_col)
+            })
+        };
 
         // Check if symbol is in cross-file scope
         if scope.symbols.contains_key(name.as_str()) {
