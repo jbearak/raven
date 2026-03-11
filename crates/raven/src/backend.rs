@@ -577,9 +577,17 @@ impl Backend {
         };
         lib.add_library_paths(&additional_paths);
         let mut state = self.state.write().await;
-        state.package_library = std::sync::Arc::new(lib);
-        state.package_library_ready = ready;
-        ready
+        // Re-check under write lock: `initialized()` may have raced ahead
+        // and already written a library with prefetched caches.
+        if state.package_library.lib_paths().is_empty() {
+            state.package_library = std::sync::Arc::new(lib);
+            state.package_library_ready = ready;
+        } else {
+            log::trace!(
+                "PackageLibrary already initialized (race), keeping existing"
+            );
+        }
+        state.package_library_ready
     }
     pub fn new(client: Client) -> Self {
         let library_paths = r_env::find_library_paths();
@@ -963,11 +971,21 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Apply PackageLibrary immediately (workspace index will be applied when background scan completes)
+        // Apply PackageLibrary only if not already initialized.
+        // `ensure_package_library_initialized` (called from `did_open`) may have raced
+        // ahead and already written a library with prefetched package caches.
+        // Overwriting it would discard those caches and cause false-positive
+        // "Package is not installed" diagnostics until the next prefetch.
         {
             let mut state = self.state.write().await;
-            state.package_library = new_package_library;
-            state.package_library_ready = package_library_ready;
+            if state.package_library.lib_paths().is_empty() {
+                state.package_library = new_package_library;
+                state.package_library_ready = package_library_ready;
+            } else {
+                log::info!(
+                    "PackageLibrary already initialized (from did_open), skipping overwrite"
+                );
+            }
         }
 
         let init_duration = init_start.elapsed();
@@ -1632,15 +1650,6 @@ impl LanguageServer for Backend {
                 } else {
                     log::trace!("did_open prefetch: package library not ready, skipping");
                 }
-                let has_ddply =
-                    package_library.is_symbol_from_loaded_packages("ddply", &scope_packages);
-                let has_row_medians =
-                    package_library.is_symbol_from_loaded_packages("rowMedians", &scope_packages);
-                log::trace!(
-                    "did_open prefetch: symbol check ddply={} rowMedians={}",
-                    has_ddply,
-                    has_row_medians
-                );
             }
         }
 
