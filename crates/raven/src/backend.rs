@@ -531,19 +531,19 @@ pub struct Backend {
 
 impl Backend {
     async fn ensure_package_library_initialized(&self) -> bool {
-        let (enabled, lib_paths_empty) = {
+        let (enabled, already_ready) = {
             let state = self.state.read().await;
             (
                 state.cross_file_config.packages_enabled,
-                state.package_library.lib_paths().is_empty(),
+                state.package_library_ready,
             )
         };
 
         if !enabled {
             return false;
         }
-        if !lib_paths_empty {
-            return self.state.read().await.package_library_ready;
+        if already_ready {
+            return true;
         }
 
         let (packages_r_path, additional_paths, workspace_root) = {
@@ -561,7 +561,7 @@ impl Backend {
             )
         };
 
-        log::trace!("Initializing PackageLibrary on demand (lib_paths empty)");
+        log::trace!("Initializing PackageLibrary on demand (not yet ready)");
         let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
         let r_subprocess = match (r_subprocess, workspace_root) {
             (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
@@ -579,7 +579,7 @@ impl Backend {
         let mut state = self.state.write().await;
         // Re-check under write lock: `initialized()` may have raced ahead
         // and already written a library with prefetched caches.
-        if state.package_library.lib_paths().is_empty() {
+        if !state.package_library_ready {
             state.package_library = std::sync::Arc::new(lib);
             state.package_library_ready = ready;
         } else {
@@ -978,7 +978,7 @@ impl LanguageServer for Backend {
         // "Package is not installed" diagnostics until the next prefetch.
         {
             let mut state = self.state.write().await;
-            if state.package_library.lib_paths().is_empty() {
+            if !state.package_library_ready {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
             } else {
