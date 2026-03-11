@@ -2300,6 +2300,7 @@ pub fn scope_at_position_with_graph<F, G>(
     max_depth: usize,
     base_exports: &HashSet<String>,
     hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2330,6 +2331,7 @@ where
         &empty_packages,
         base_exports,
         hoist_globals,
+        backward_dep_mode,
     )
 }
 
@@ -2361,6 +2363,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     inherited_packages: &HashSet<String>,
     base_exports: &HashSet<String>,
     hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
@@ -2501,6 +2504,28 @@ where
         }
     }
 
+    // Filter backward edges based on the backward dependency mode.
+    //
+    // - Explicit: Only use backward-directive edges (edges created from
+    //   @lsp-sourced-by directives). Forward-created backward entries from
+    //   the workspace scan are ignored.
+    // - Auto: Use all backward edges, UNLESS the file has explicit backward
+    //   directives — then only use those (per-file opt-out).
+    // - Off: No filtering here (diagnostics are suppressed at a higher level).
+    match backward_dep_mode {
+        super::config::BackwardDependencyMode::Explicit => {
+            parent_edges.retain(|e| e.is_backward_directive);
+        }
+        super::config::BackwardDependencyMode::Auto => {
+            let file_has_backward_directives = get_metadata(uri)
+                .map_or(false, |m| !m.sourced_by.is_empty());
+            if file_has_backward_directives {
+                parent_edges.retain(|e| e.is_backward_directive);
+            }
+        }
+        super::config::BackwardDependencyMode::Off => {}
+    }
+
     for edge in parent_edges {
         // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
         // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
@@ -2570,6 +2595,7 @@ where
             &empty_packages, // Parent collects its own inherited packages
             base_exports,
             hoist_globals,
+            backward_dep_mode,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -2859,6 +2885,7 @@ where
                             packages_for_child, // Pass inherited packages to child
                             base_exports,
                             hoist_globals,
+                            backward_dep_mode,
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -3282,6 +3309,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -3519,6 +3547,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -3595,6 +3624,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         assert!(
@@ -3713,6 +3743,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         assert!(
@@ -3854,6 +3885,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         assert!(
@@ -4021,6 +4053,7 @@ mod tests {
             2,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Should have depth_exceeded entry
@@ -4214,6 +4247,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -4302,6 +4336,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -6271,6 +6306,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -6289,6 +6325,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6307,6 +6344,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -6384,6 +6422,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -6410,6 +6449,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6504,6 +6544,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -6593,6 +6634,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -6675,6 +6717,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -6693,6 +6736,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6711,6 +6755,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -6795,6 +6840,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6879,6 +6925,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -6897,6 +6944,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -6998,6 +7046,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -7016,6 +7065,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -7125,6 +7175,7 @@ mod tests {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -8817,6 +8868,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited dplyr from parent
@@ -8894,6 +8946,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -8971,6 +9024,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have both packages
@@ -9053,6 +9107,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -9136,6 +9191,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -9215,6 +9271,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -9332,6 +9389,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -9354,6 +9412,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -9434,6 +9493,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -9456,6 +9516,7 @@ x <- 1"#;
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -9983,6 +10044,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true, // hoisting ON
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10002,6 +10064,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 false, // hoisting OFF
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10046,6 +10109,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10161,6 +10225,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10242,6 +10307,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10373,6 +10439,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10495,6 +10562,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10610,6 +10678,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10731,6 +10800,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10834,6 +10904,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 false, // hoisting OFF
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -10948,6 +11019,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -11035,6 +11107,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -11131,6 +11204,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true, // hoisting ON, but query is at global level
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             // At global level, parent is queried at call site (line 0 col 0),
@@ -11255,6 +11329,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -11373,6 +11448,7 @@ y <- filter(df)"#;
                 10,
                 &base_exports,
                 true,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -11383,6 +11459,535 @@ y <- filter(df)"#;
             assert!(
                 scope.symbols.contains_key("leaf_var"),
                 "Child function body should see 'leaf_var' from leaf via helper sourced after child. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // =======================================================================
+        // Auto backward dependency mode tests
+        // =======================================================================
+
+        /// Test: In Auto mode, child file sees parent symbols via forward-created
+        /// backward edge (no @lsp-sourced-by directive needed).
+        #[test]
+        fn test_auto_mode_child_sees_parent_symbols() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let child_uri = Url::parse("file:///project/helpers/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // Parent defines config, then sources child at line 2
+            let parent_code = "library(jsonlite)\nconfig <- list()\nsource(\"helpers/child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            // Child — no @lsp-sourced-by directive
+            let child_code = "child_result <- 42";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            // Build dependency graph from parent's forward source
+            let mut graph = DependencyGraph::new();
+            let parent_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helpers/child.R".to_string(),
+                    line: 2,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let child_meta = CrossFileMetadata::default(); // No sourced_by!
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri {
+                    Some(parent_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+
+            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+
+            // In Auto mode, child should see parent's 'config' via auto-detected backward edge
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+            );
+
+            assert!(
+                scope.symbols.contains_key("config"),
+                "In Auto mode, child should see 'config' from parent via auto-detected backward edge. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Test: In Auto mode, if a child has explicit @lsp-sourced-by, only those
+        /// declared parents are used (per-file opt-out of auto-inference).
+        #[test]
+        fn test_auto_mode_explicit_directive_opts_out() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource, BackwardDirective, CallSiteSpec};
+
+            let parent_a_uri = Url::parse("file:///project/parent_a.R").unwrap();
+            let parent_b_uri = Url::parse("file:///project/parent_b.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // Parent A defines var_a, sources child at line 1
+            let parent_a_code = "var_a <- 1\nsource(\"child.R\")";
+            let parent_a_tree = parse_r(parent_a_code);
+            let parent_a_artifacts = compute_artifacts(&parent_a_uri, &parent_a_tree, parent_a_code);
+
+            // Parent B defines var_b, sources child at line 1
+            let parent_b_code = "var_b <- 2\nsource(\"child.R\")";
+            let parent_b_tree = parse_r(parent_b_code);
+            let parent_b_artifacts = compute_artifacts(&parent_b_uri, &parent_b_tree, parent_b_code);
+
+            // Child explicitly declares only parent_a as its parent
+            let child_code = "# @lsp-sourced-by parent_a.R\nchild_var <- 3";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            // Build dependency graph from both parents' forward sources
+            let mut graph = DependencyGraph::new();
+            let parent_a_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let parent_b_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let child_meta = CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "parent_a.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            };
+            graph.update_file(&parent_a_uri, &parent_a_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&parent_b_uri, &parent_b_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_a_uri {
+                    Some(parent_a_artifacts.clone())
+                } else if uri == &parent_b_uri {
+                    Some(parent_b_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+
+            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+                if uri == &parent_a_uri {
+                    Some(parent_a_meta.clone())
+                } else if uri == &parent_b_uri {
+                    Some(parent_b_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+
+            // In Auto mode, child with explicit directive should only see parent_a
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                1, // line 1 (after directive)
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+            );
+
+            assert!(
+                scope.symbols.contains_key("var_a"),
+                "Child with explicit directive should see var_a from declared parent_a. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                !scope.symbols.contains_key("var_b"),
+                "Child with explicit directive should NOT see var_b from undeclared parent_b. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Test: In Auto mode, child does NOT see parent symbols when Explicit mode
+        /// is used (backward compatibility — the old behavior).
+        #[test]
+        fn test_explicit_mode_child_does_not_see_parent_without_directive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            let parent_code = "parent_var <- 1\nsource(\"child.R\")";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            let child_code = "child_var <- 2";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            let mut graph = DependencyGraph::new();
+            let parent_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let child_meta = CrossFileMetadata::default();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri {
+                    Some(parent_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+
+            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+
+            // In Explicit mode, child without directive should NOT see parent's symbols
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
+            );
+
+            assert!(
+                !scope.symbols.contains_key("parent_var"),
+                "In Explicit mode, child without directive should NOT see parent_var. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Test: Multi-level chain — main sources runner which sources
+        /// helpers/format.R. In Auto mode, format.R sees symbols from runner.R
+        /// (its direct parent) and the chain respects call-site position (only
+        /// symbols defined before the source() call).
+        #[test]
+        fn test_auto_mode_multi_level_chain() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let runner_uri = Url::parse("file:///project/runner.R").unwrap();
+            let format_uri = Url::parse("file:///project/helpers/format.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // main.R sources setup.R, runner.R, output.R sequentially
+            let main_code = "source(\"setup.R\")\nsource(\"runner.R\")\nsource(\"output.R\")";
+            let main_tree = parse_r(main_code);
+            let main_artifacts = compute_artifacts(&main_uri, &main_tree, main_code);
+
+            // runner.R: defines conn and max_items, then sources format.R
+            let runner_code = "conn <- db_connect()\nmax_items <- 100\nsource(\"helpers/format.R\")\nformatted <- format_output";
+            let runner_tree = parse_r(runner_code);
+            let runner_artifacts = compute_artifacts(&runner_uri, &runner_tree, runner_code);
+
+            // helpers/format.R: defines render_opts and format_output
+            let format_code = "render_opts <- list(width = 80)\nformat_output <- NULL";
+            let format_tree = parse_r(format_code);
+            let format_artifacts = compute_artifacts(&format_uri, &format_tree, format_code);
+
+            // Build the full dependency graph
+            let mut graph = DependencyGraph::new();
+            let main_meta = CrossFileMetadata {
+                sources: vec![
+                    ForwardSource {
+                        path: "setup.R".to_string(),
+                        line: 0,
+                        column: 0,
+                        is_directive: false,
+                        local: false,
+                        chdir: false,
+                        is_sys_source: false,
+                        sys_source_global_env: true,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "runner.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        is_directive: false,
+                        local: false,
+                        chdir: false,
+                        is_sys_source: false,
+                        sys_source_global_env: true,
+                        ..Default::default()
+                    },
+                    ForwardSource {
+                        path: "output.R".to_string(),
+                        line: 2,
+                        column: 0,
+                        is_directive: false,
+                        local: false,
+                        chdir: false,
+                        is_sys_source: false,
+                        sys_source_global_env: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            let runner_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helpers/format.R".to_string(),
+                    line: 2,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let format_meta = CrossFileMetadata::default(); // No sourced_by directive
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&runner_uri, &runner_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &main_uri {
+                    Some(main_artifacts.clone())
+                } else if uri == &runner_uri {
+                    Some(runner_artifacts.clone())
+                } else if uri == &format_uri {
+                    Some(format_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+
+            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+                if uri == &main_uri {
+                    Some(main_meta.clone())
+                } else if uri == &runner_uri {
+                    Some(runner_meta.clone())
+                } else if uri == &format_uri {
+                    Some(format_meta.clone())
+                } else {
+                    None
+                }
+            };
+
+            // helpers/format.R should see 'conn' and 'max_items' from runner.R
+            // (both defined before the source() call at line 2)
+            let scope = scope_at_position_with_graph(
+                &format_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                20,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+            );
+
+            assert!(
+                scope.symbols.contains_key("conn"),
+                "format.R should see 'conn' from runner.R via auto backward edge. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("max_items"),
+                "format.R should see 'max_items' from runner.R. Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+
+            // runner.R after sourcing format.R should see its exports
+            let parent_scope = scope_at_position_with_graph(
+                &runner_uri,
+                3, // line 3, after source()
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                20,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+            );
+
+            assert!(
+                parent_scope.symbols.contains_key("format_output"),
+                "runner.R should see 'format_output' from sourced format.R. Got: {:?}",
+                parent_scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                parent_scope.symbols.contains_key("render_opts"),
+                "runner.R should see 'render_opts' from sourced format.R. Got: {:?}",
+                parent_scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Test: Auto mode with local=TRUE — parent sources child with local=TRUE,
+        /// child should NOT see parent's globals through that edge.
+        #[test]
+        fn test_auto_mode_local_true_blocks_parent_scope() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            let parent_code = "parent_var <- 1\nsource(\"child.R\", local = TRUE)";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            let child_code = "child_var <- 2";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            let mut graph = DependencyGraph::new();
+            let parent_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: true, // local=TRUE
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let child_meta = CrossFileMetadata::default();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+                if uri == &parent_uri {
+                    Some(parent_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+
+            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+
+            // In Auto mode, local=TRUE should block parent scope from child
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+            );
+
+            assert!(
+                !scope.symbols.contains_key("parent_var"),
+                "With local=TRUE, child should NOT see parent_var. Got: {:?}",
                 scope.symbols.keys().collect::<Vec<_>>()
             );
         }

@@ -214,6 +214,17 @@ pub(crate) fn parse_cross_file_config(
             config.hoist_globals_in_functions = v;
         }
 
+        if let Some(v) = cross_file
+            .get("backwardDependencies")
+            .and_then(|v| v.as_str())
+        {
+            config.backward_dependencies = match v {
+                "explicit" => crate::cross_file::BackwardDependencyMode::Explicit,
+                "off" => crate::cross_file::BackwardDependencyMode::Off,
+                _ => crate::cross_file::BackwardDependencyMode::Auto,
+            };
+        }
+
         // Parse on-demand indexing settings
         if let Some(on_demand) = cross_file.get("onDemandIndexing") {
             if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
@@ -311,6 +322,10 @@ pub(crate) fn parse_cross_file_config(
     log::info!(
         "  hoist_globals_in_functions: {}",
         config.hoist_globals_in_functions
+    );
+    log::info!(
+        "  backward_dependencies: {:?}",
+        config.backward_dependencies
     );
     log::info!("  On-demand indexing:");
     log::info!("    enabled: {}", config.on_demand_indexing_enabled);
@@ -881,6 +896,7 @@ impl LanguageServer for Backend {
         // priority over the background scan.
         let state_clone = self.state.clone();
         let folders_clone = folders.clone();
+        let client_clone = self.client.clone();
         if index_workspace {
             tokio::task::spawn(async move {
                 // Run the blocking scan in a blocking task
@@ -902,20 +918,56 @@ impl LanguageServer for Backend {
                 // Apply results when scan completes
                 match scan_result {
                     Ok((index, imports, cross_file_entries, new_index_entries)) => {
-                        let mut state = state_clone.write().await;
-                        state.apply_workspace_index(
-                            index,
-                            imports,
-                            cross_file_entries,
-                            new_index_entries,
-                        );
+                        // Apply index and snapshot trigger versions under a single write lock
+                        let (work_items, debounce_ms) = {
+                            let mut state = state_clone.write().await;
+                            state.apply_workspace_index(
+                                index,
+                                imports,
+                                cross_file_entries,
+                                new_index_entries,
+                            );
+                            // Mark force republish for all open documents so they pick up
+                            // newly discovered backward edges from the dependency graph
+                            // and snapshot trigger versions while we hold the lock
+                            let items: Vec<(Url, Option<i32>, Option<u64>)> = state
+                                .documents
+                                .keys()
+                                .map(|uri| {
+                                    state.diagnostics_gate.mark_force_republish(uri);
+                                    let v = state.documents.get(uri).and_then(|d| d.version);
+                                    let r = state.documents.get(uri).map(|d| d.revision);
+                                    (uri.clone(), v, r)
+                                })
+                                .collect();
+                            let debounce = state.cross_file_config.revalidation_debounce_ms;
+                            (items, debounce)
+                        };
                         log::info!("[Background] Workspace index applied");
+
+                        // Revalidate all open documents to pick up auto-detected backward edges
+                        for (uri, trigger_version, trigger_revision) in work_items {
+                            let state_arc = state_clone.clone();
+                            let client = client_clone.clone();
+                            tokio::spawn(run_debounced_diagnostics(
+                                state_arc,
+                                client,
+                                uri,
+                                debounce_ms,
+                                trigger_version,
+                                trigger_revision,
+                            ));
+                        }
                     }
                     Err(e) => {
                         log::error!("Background workspace scan task failed: {}", e);
                     }
                 }
             });
+        } else {
+            // No workspace scan — mark complete immediately
+            let mut state = self.state.write().await;
+            state.workspace_scan_complete = true;
         }
 
         // Task B: Initialize PackageLibrary (await this - diagnostics need it)
@@ -1630,6 +1682,7 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_chain_depth,
                     &empty_base_exports,
                     false, // package prefetching doesn't need hoisting
+                    state.cross_file_config.backward_dependencies,
                 );
 
                 let mut pkgs = scope.inherited_packages;

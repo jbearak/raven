@@ -323,3 +323,53 @@ source("b.R")  # ERROR: Circular dependency if b.R sources a.R
 # b.R
 source("a.R")  # Creates cycle back to a.R
 ```
+
+## Backward Dependency Modes
+
+The `raven.crossFile.backwardDependencies` setting controls how the LSP discovers which files source the current file. This affects undefined variable diagnostics, completions, hover, and go-to-definition.
+
+**Why this matters:** In multi-file R projects, a child file (e.g., `helpers.R`) often references symbols defined in its parent (e.g., `main.R`). For Raven to resolve these symbols, it needs to know the backward relationship — that `helpers.R` is sourced by `main.R`. This setting controls how those relationships are discovered.
+
+### `"auto"` (default)
+
+The LSP automatically infers backward relationships by scanning the workspace for files that contain `source()` calls or `@lsp-source` directives pointing to the current file. No `@lsp-sourced-by` directives are needed.
+
+**How it works:**
+1. On startup, Raven scans the workspace and builds a dependency graph from all `source()` calls and forward directives.
+2. Undefined variable diagnostics are deferred for files without explicit `@lsp-sourced-by` directives until the workspace scan completes. This prevents false positives during startup — symbols from parent files are not yet discoverable until the graph is built.
+3. After the scan, all open files are revalidated with the complete dependency graph.
+4. As files are added or modified, the dependency graph is updated in real time.
+
+**Rationale:** `@lsp-sourced-by` directives are Raven-specific — without auto mode, you'd have to annotate your entire codebase before cross-file diagnostics become useful. Auto mode provides cross-file intelligence out of the box for any workspace where files are connected via `source()` calls. The startup deferral ensures diagnostics are accurate rather than prematurely flagging symbols that come from parent files.
+
+**Per-file opt-out:** If a file has explicit `@lsp-sourced-by` directives, only those declared parents are used — auto-inference is disabled for that file. This gives you full control when needed, and means adding a directive is never additive — it replaces auto-detection entirely for that file.
+
+**Performance:** Helper files where all symbols are defined locally do not incur graph traversal costs — a local-first optimization skips cross-file scope resolution when the symbol is found in the file's own definitions. This means self-contained files — utilities, function libraries, or any file where all referenced symbols are defined locally — have zero overhead from the backward dependency graph.
+
+**`local=TRUE` is respected:** If a parent sources a child with `source("child.R", local = TRUE)`, the child does not inherit the parent's global scope through that edge. This matches R's runtime behavior where `local = TRUE` evaluates the sourced file in a local environment.
+
+**Example:**
+```r
+# main.R
+source("helpers.R")
+result <- helper_func(42)
+```
+
+```r
+# helpers.R (no @lsp-sourced-by needed in auto mode)
+helper_func <- function(x) {
+  parent_var + x  # parent_var from main.R is in scope
+}
+```
+
+### `"explicit"`
+
+The LSP only uses backward relationships explicitly declared via `@lsp-sourced-by` directives. Forward-created backward edges from workspace scanning are not used for scope resolution.
+
+**Rationale:** Use this mode if you prefer full manual control over cross-file relationships, or if your workspace has complex sourcing patterns where automatic inference produces unwanted results (e.g., a file is sourced by multiple parents with conflicting scopes). Diagnostics are not deferred for the workspace scan.
+
+### `"off"`
+
+Suppresses all undefined variable diagnostics. Other cross-file features (completions, hover, go-to-definition) still work based on whatever dependency edges are available.
+
+**Rationale:** Use this when your project uses patterns that Raven's static analysis cannot resolve (e.g., heavy use of `eval`, `do.call`, or metaprogramming) and the resulting false positives are not helpful.

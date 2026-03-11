@@ -8,6 +8,23 @@ use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
 
+/// How backward dependencies (parent files that source this file) are resolved
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackwardDependencyMode {
+    /// Require explicit `@lsp-sourced-by` directives (current behavior).
+    /// Forward-created backward edges from the dependency graph are still used
+    /// when available, but diagnostics are not deferred for the workspace scan.
+    Explicit,
+    /// Automatically infer backward relationships from forward directives and
+    /// `source()` calls in other workspace files. Files without explicit backward
+    /// directives defer undefined variable diagnostics until the workspace scan
+    /// completes. Files with explicit backward directives use only those directives.
+    #[default]
+    Auto,
+    /// Suppress all undefined variable diagnostics.
+    Off,
+}
+
 /// Default call site assumption when not specified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CallSiteDefault {
@@ -84,6 +101,10 @@ pub struct CrossFileConfig {
     /// regardless of position, since by the time any function executes the entire file
     /// has been sourced. Function-local variables remain positional.
     pub hoist_globals_in_functions: bool,
+    /// How backward dependencies are resolved.
+    /// Controls whether the LSP auto-detects parent files from forward source() calls
+    /// in other workspace files, or requires explicit @lsp-sourced-by directives.
+    pub backward_dependencies: BackwardDependencyMode,
 }
 
 impl Default for CrossFileConfig {
@@ -136,6 +157,7 @@ impl Default for CrossFileConfig {
             cache_existence_max_entries: 2000,
             cache_workspace_index_max_entries: 5000,
             hoist_globals_in_functions: true,
+            backward_dependencies: BackwardDependencyMode::Auto,
         }
     }
 }
@@ -148,6 +170,7 @@ impl CrossFileConfig {
             || self.max_backward_depth != other.max_backward_depth
             || self.max_forward_depth != other.max_forward_depth
             || self.hoist_globals_in_functions != other.hoist_globals_in_functions
+            || self.backward_dependencies != other.backward_dependencies
     }
 }
 
@@ -186,6 +209,8 @@ mod tests {
         );
         // Hoist globals in functions default
         assert!(config.hoist_globals_in_functions);
+        // Backward dependencies default
+        assert_eq!(config.backward_dependencies, BackwardDependencyMode::Auto);
     }
 
     #[test]
@@ -208,6 +233,11 @@ mod tests {
         // Reset and change hoist_globals_in_functions
         config2 = CrossFileConfig::default();
         config2.hoist_globals_in_functions = false;
+        assert!(config1.scope_settings_changed(&config2));
+
+        // Reset and change backward_dependencies
+        config2 = CrossFileConfig::default();
+        config2.backward_dependencies = BackwardDependencyMode::Explicit;
         assert!(config1.scope_settings_changed(&config2));
     }
 

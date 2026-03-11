@@ -1954,6 +1954,7 @@ fn get_cross_file_scope(
         max_depth,
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
+        state.cross_file_config.backward_dependencies,
     )
 }
 
@@ -3443,6 +3444,7 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         max_depth,
         &empty_base_exports,
         false, // depth-exceeded check doesn't need hoisting
+        state.cross_file_config.backward_dependencies,
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -6100,10 +6102,26 @@ pub(crate) fn collect_undefined_variables_position_aware(
     cancel: &DiagCancelToken,
 ) {
     use crate::content_provider::ContentProvider;
+    use crate::cross_file::config::BackwardDependencyMode;
     use crate::cross_file::path_resolve::{
         resolve_path_with_workspace_fallback, PathContext,
     };
     use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    // Backward dependency mode gating:
+    // - Off: suppress all undefined variable diagnostics
+    // - Auto + no backward directives + workspace scan incomplete: defer diagnostics
+    match state.cross_file_config.backward_dependencies {
+        BackwardDependencyMode::Off => return,
+        BackwardDependencyMode::Auto => {
+            if directive_meta.sourced_by.is_empty() && !state.workspace_scan_complete {
+                // Defer: the workspace scan hasn't finished building the dependency
+                // graph yet, so auto-inferred backward edges may not be available.
+                return;
+            }
+        }
+        BackwardDependencyMode::Explicit => {} // proceed normally
+    }
 
     let mut used: Vec<(String, Node)> = Vec::new();
 
@@ -6140,6 +6158,25 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // Pre-compute workspace_imports as a HashSet for O(1) lookups
     let workspace_imports_set: std::collections::HashSet<&str> =
         workspace_imports.iter().map(|s| s.as_str()).collect();
+
+    // Local-first optimization: collect this file's own exported symbols and
+    // function scope tree for a fast check before expensive cross-file scope
+    // resolution. When hoisting is enabled and the usage is inside a function
+    // body, any symbol in exported_interface is guaranteed to be in scope
+    // (R late-binding semantics) — so we can skip graph traversal entirely.
+    let hoist_globals = state.cross_file_config.hoist_globals_in_functions;
+    let local_opt: Option<(std::collections::HashSet<String>, scope::FunctionScopeTree)> = {
+        let provider = state.content_provider();
+        use crate::content_provider::ContentProvider;
+        provider.get_artifacts(uri).map(|artifacts| {
+            let exports = artifacts
+                .exported_interface
+                .keys()
+                .map(|k| k.to_string())
+                .collect();
+            (exports, artifacts.function_scope_tree.clone())
+        })
+    };
 
     // Build a position-aware list of directly sourced files whose symbols are inherited.
     // This is a fallback path for cases where a sourced file has not been indexed into
@@ -6185,6 +6222,27 @@ pub(crate) fn collect_undefined_variables_position_aware(
         // Skip if builtin or workspace import
         if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
             continue;
+        }
+
+        // Local-first fast path: if the symbol is in this file's exported_interface,
+        // hoisting is enabled, and the usage is inside a function body, we know it's
+        // in scope without graph traversal (R late-binding semantics). This avoids
+        // expensive cross-file scope computation for helper files where all symbols
+        // are defined locally. At the global level, position matters, so we can't skip.
+        if hoist_globals {
+            if let Some((ref exports, ref fn_tree)) = local_opt {
+                if exports.contains(name.as_str()) {
+                    let usage_col_byte = usage_node.start_position().column as u32;
+                    let line_text = get_line(usage_node.start_position().row);
+                    let usage_col_utf16 = byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
+                    let inside_function = !fn_tree
+                        .query_point(scope::Position::new(usage_line, usage_col_utf16))
+                        .is_empty();
+                    if inside_function {
+                        continue;
+                    }
+                }
+            }
         }
 
         // Get or compute the scope for this position (cached)
@@ -20827,6 +20885,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -20884,6 +20943,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -20939,6 +20999,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -20993,6 +21054,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -21922,6 +21984,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -21984,6 +22047,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -22049,6 +22113,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -22134,6 +22199,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -22220,6 +22286,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -22341,6 +22408,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variables_enabled = true;
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
@@ -31186,7 +31254,9 @@ mod position_aware_tests {
     }
 
     fn create_test_state() -> WorldState {
-        WorldState::new(vec![])
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state
     }
 
     fn add_document(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
@@ -31908,7 +31978,9 @@ mod function_parameter_tests {
     }
 
     fn create_test_state() -> WorldState {
-        WorldState::new(vec![])
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state
     }
 
     fn add_document(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
@@ -32210,15 +32282,15 @@ my_func <- function(a = default_value) {
 
         let main_uri = Url::from_file_path(workspace_dir.path().join("main.R"))
             .expect("main uri should be valid");
-        let child_uri = Url::from_file_path(workspace_dir.path().join("characteristics.R"))
+        let child_uri = Url::from_file_path(workspace_dir.path().join("helpers.R"))
             .expect("child uri should be valid");
 
-        let child_code = "tbl_user_demographics <- data.frame(x = 1)\n";
+        let child_code = "summary_table <- data.frame(x = 1)\n";
         state
             .workspace_index
             .insert(child_uri.clone(), Document::new(child_code, None));
 
-        let main_code = "source(\"characteristics.R\")\ntbl_user_demographics\n";
+        let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
@@ -32250,7 +32322,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: tbl_user_demographics"),
+                .any(|d| d.message == "Undefined variable: summary_table"),
             "Symbol exported by sourced file should not be flagged as undefined: {:?}",
             diagnostics
                 .iter()
@@ -32268,16 +32340,16 @@ my_func <- function(a = default_value) {
         state.workspace_folders.push(workspace_url);
 
         let main_path = workspace_dir.path().join("main.R");
-        let child_path = workspace_dir.path().join("characteristics.R");
+        let child_path = workspace_dir.path().join("helpers.R");
         let main_uri = Url::from_file_path(&main_path).expect("main uri should be valid");
 
         std::fs::write(
             &child_path,
-            "tbl_user_demographics <- data.frame(x = 1)\n",
+            "summary_table <- data.frame(x = 1)\n",
         )
         .expect("child file should be written");
 
-        let main_code = "source(\"characteristics.R\")\ntbl_user_demographics\n";
+        let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
@@ -32303,7 +32375,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: tbl_user_demographics"),
+                .any(|d| d.message == "Undefined variable: summary_table"),
             "Symbol exported by sourced on-disk file should not be flagged as undefined: {:?}",
             diagnostics
                 .iter()
