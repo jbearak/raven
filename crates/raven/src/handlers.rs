@@ -82,6 +82,7 @@ pub(crate) struct DiagnosticsSnapshot {
 impl DiagnosticsSnapshot {
     /// Build a snapshot from WorldState under the read lock.
     pub fn build(state: &WorldState, uri: &Url) -> Option<Self> {
+        let build_start = std::time::Instant::now();
         let doc = state.get_document(uri)?;
         let tree = doc.tree.as_ref()?.clone();
         let text = doc.text();
@@ -89,6 +90,7 @@ impl DiagnosticsSnapshot {
         let mut directive_meta = state.get_enriched_metadata(uri).unwrap_or_else(|| {
             crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
         });
+        let metadata_elapsed = build_start.elapsed();
 
         // Compute inherited working directory if needed
         if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
@@ -116,10 +118,13 @@ impl DiagnosticsSnapshot {
         }
 
         // Pre-collect artifacts and metadata for all files in the dependency neighborhood
+        let neighborhood_start = std::time::Instant::now();
         let max_depth = state.cross_file_config.max_chain_depth;
         let neighborhood = state.cross_file_graph.collect_neighborhood(uri, max_depth);
+        let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider();
 
+        let precollect_start = std::time::Instant::now();
         let mut artifacts_map = HashMap::new();
         let mut metadata_map = HashMap::new();
         for neighbor_uri in &neighborhood {
@@ -130,6 +135,7 @@ impl DiagnosticsSnapshot {
                 metadata_map.insert(neighbor_uri.clone(), metadata);
             }
         }
+        let precollect_elapsed = precollect_start.elapsed();
 
         let base_exports = if state.package_library_ready {
             state.package_library.base_exports().clone()
@@ -137,12 +143,32 @@ impl DiagnosticsSnapshot {
             HashSet::new()
         };
 
+        // Build a trimmed graph containing only the neighborhood edges
+        // instead of cloning the entire workspace graph.
+        let subgraph_start = std::time::Instant::now();
+        let trimmed_graph = state.cross_file_graph.extract_subgraph(&neighborhood);
+        let subgraph_elapsed = subgraph_start.elapsed();
+
+        let total_elapsed = build_start.elapsed();
+        log::trace!(
+            "DiagnosticsSnapshot::build for {}: metadata={:?}, neighborhood={:?} ({} files), pre-collect={:?} ({} artifacts, {} metadata), subgraph={:?}, total={:?}",
+            uri.path(),
+            metadata_elapsed,
+            neighborhood_elapsed,
+            neighborhood.len(),
+            precollect_elapsed,
+            artifacts_map.len(),
+            metadata_map.len(),
+            subgraph_elapsed,
+            total_elapsed,
+        );
+
         Some(DiagnosticsSnapshot {
             tree,
             text,
             directive_meta,
             cross_file_config: state.cross_file_config.clone(),
-            cross_file_graph: state.cross_file_graph.clone(),
+            cross_file_graph: trimmed_graph,
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
             package_library_ready: state.package_library_ready,
@@ -3962,6 +3988,11 @@ fn collect_max_depth_diagnostics_from_snapshot(
     uri: &Url,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Early exit: skip expensive graph traversal if severity is disabled
+    let Some(severity) = snapshot.cross_file_config.max_chain_depth_severity else {
+        return;
+    };
+
     let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
@@ -3986,7 +4017,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         &|| false,
     );
 
-    if let Some(severity) = snapshot.cross_file_config.max_chain_depth_severity {
+    {
         for (exceeded_uri, line, col) in &scope_result.depth_exceeded {
             if exceeded_uri == uri {
                 diagnostics.push(Diagnostic {

@@ -2653,8 +2653,8 @@ where
                             Some(pkg_scope) => {
                                 // Function-scoped package load - only propagate if the source() call
                                 // is within the same function scope
-                                if let Some(parent_artifacts_ref) = get_artifacts(&edge.from) {
-                                    let call_site_scope = parent_artifacts_ref
+                                {
+                                    let call_site_scope = parent_artifacts
                                         .function_scope_tree
                                         .query_innermost(Position::new(
                                             effective_call_site_line,
@@ -2668,8 +2668,6 @@ where
                                             && cs_scope.2 == pkg_scope.end.line
                                             && cs_scope.3 == pkg_scope.end.column
                                     })
-                                } else {
-                                    false
                                 }
                             }
                         };
