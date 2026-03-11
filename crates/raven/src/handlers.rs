@@ -75,6 +75,10 @@ pub(crate) struct DiagnosticsSnapshot {
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
     pub metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata>,
 
+    // Cycle detection result (pre-computed from the full graph, not the trimmed subgraph,
+    // so cycles longer than max_chain_depth are still detected)
+    pub cycle_detection: Option<crate::cross_file::dependency::CycleDetection>,
+
     // Package library (Arc, cheap clone)
     pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
 }
@@ -144,6 +148,10 @@ impl DiagnosticsSnapshot {
             HashSet::new()
         };
 
+        // Pre-compute cycle detection from the FULL graph (not trimmed) so that
+        // cycles longer than max_chain_depth are still detected.
+        let cycle_detection = state.cross_file_graph.detect_cycle(uri);
+
         // Build a trimmed graph containing only the neighborhood edges
         // instead of cloning the entire workspace graph.
         let subgraph_start = std::time::Instant::now();
@@ -177,6 +185,7 @@ impl DiagnosticsSnapshot {
             workspace_imports: state.workspace_imports.clone(),
             artifacts_map,
             metadata_map,
+            cycle_detection,
             package_library: state.package_library.clone(),
         })
     }
@@ -238,9 +247,9 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
 
-    // Cycle detection
+    // Cycle detection (uses pre-computed result from full graph, not trimmed subgraph)
     if let Some(severity) = snapshot.cross_file_config.circular_dependency_severity {
-        if let Some(cycle) = snapshot.cross_file_graph.detect_cycle(uri) {
+        if let Some(cycle) = &snapshot.cycle_detection {
             let out = &cycle.outgoing_edge;
             let close = &cycle.closing_edge;
             let line = out.call_site_line.unwrap_or(0);
