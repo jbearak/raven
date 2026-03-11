@@ -10229,9 +10229,10 @@ mod tests {
     /// Test that arguments to namespace-qualified calls are still checked.
     #[test]
     fn test_namespace_call_arguments_still_checked() {
-        // Arguments in call-like nodes are suppressed by in_call_like_arguments,
-        // but if the argument is not in a call (e.g., pkg::var + x), x should be checked.
-        let code = "y <- stats::median(x)";
+        // Use a non-call context so x is not suppressed by in_call_like_arguments.
+        // This verifies that namespace-qualified references don't suppress
+        // surrounding non-qualified identifiers.
+        let code = "y <- stats::median + x";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
@@ -10239,6 +10240,8 @@ mod tests {
         // Neither 'stats' nor 'median' should be collected
         assert!(!used.iter().any(|(name, _)| name == "stats"));
         assert!(!used.iter().any(|(name, _)| name == "median"));
+        // 'x' should still be collected
+        assert!(used.iter().any(|(name, _)| name == "x"));
     }
 
     // ========================================================================
