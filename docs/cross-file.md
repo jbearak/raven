@@ -340,11 +340,11 @@ The LSP automatically infers backward relationships by scanning the workspace fo
 3. After the scan, all open files are revalidated with the complete dependency graph.
 4. As files are added or modified, the dependency graph is updated in real time.
 
-**Rationale:** Most R projects do not use `@lsp-sourced-by` directives. Auto mode provides cross-file intelligence out of the box for any workspace where files are connected via `source()` calls. The startup deferral ensures diagnostics are accurate rather than prematurely flagging symbols that come from parent files.
+**Rationale:** `@lsp-sourced-by` directives are Raven-specific — without auto mode, you'd have to annotate your entire codebase before cross-file diagnostics become useful. Auto mode provides cross-file intelligence out of the box for any workspace where files are connected via `source()` calls. The startup deferral ensures diagnostics are accurate rather than prematurely flagging symbols that come from parent files.
 
 **Per-file opt-out:** If a file has explicit `@lsp-sourced-by` directives, only those declared parents are used — auto-inference is disabled for that file. This gives you full control when needed, and means adding a directive is never additive — it replaces auto-detection entirely for that file.
 
-**Performance:** Helper files where all symbols are defined locally do not incur graph traversal costs — a local-first optimization skips cross-file scope resolution when the symbol is found in the file's own definitions. This means the majority of files in a workspace (self-contained utilities, function libraries) have zero overhead from the backward dependency graph.
+**Performance:** Helper files where all symbols are defined locally do not incur graph traversal costs — a local-first optimization skips cross-file scope resolution when the symbol is found in the file's own definitions. This means self-contained files — utilities, function libraries, or any file where all referenced symbols are defined locally — have zero overhead from the backward dependency graph.
 
 **`local=TRUE` is respected:** If a parent sources a child with `source("child.R", local = TRUE)`, the child does not inherit the parent's global scope through that edge. This matches R's runtime behavior where `local = TRUE` evaluates the sourced file in a local environment.
 
