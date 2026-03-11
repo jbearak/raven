@@ -431,6 +431,7 @@ fn budget_scope_resolution_50_file_workspace() {
         20,
         &base_exports,
         true,
+        raven::cross_file::config::BackwardDependencyMode::Explicit,
     );
 
     let elapsed = median_of_3(|| {
@@ -445,6 +446,7 @@ fn budget_scope_resolution_50_file_workspace() {
             20,
             &base_exports,
             true,
+            raven::cross_file::config::BackwardDependencyMode::Explicit,
         );
     });
 
