@@ -500,8 +500,8 @@ fn budget_scope_resolution_50_file_workspace_auto() {
         metadata_map.insert(uri, meta);
     }
 
-    // Build dependency graph — in Auto mode, forward source() calls also create
-    // backward entries, making the graph denser than Explicit mode.
+    // Build dependency graph — graph construction is the same regardless of mode.
+    // Auto mode changes which backward edges the scope resolution traversal follows.
     let mut graph = raven::cross_file::DependencyGraph::new();
     for (uri, meta) in &metadata_map {
         graph.update_file(uri, meta, Some(&folder_url), |_| None);

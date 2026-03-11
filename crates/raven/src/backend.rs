@@ -686,7 +686,13 @@ async fn run_debounced_diagnostics(
 
     // Compute diagnostics WITHOUT holding any lock
     let sync_diagnostics =
-        handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel);
+        match handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel) {
+            Some(diags) => diags,
+            None => {
+                log::trace!("Diagnostics cancelled for {}", affected_uri);
+                return;
+            }
+        };
 
     // Perform async missing file existence checks (non-blocking I/O)
     let diagnostics = handlers::diagnostics_async_standalone(

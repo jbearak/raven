@@ -645,40 +645,6 @@ impl DependencyGraph {
     /// BEFORE calling this method. The `PathContext::from_metadata()` will then use the inherited
     /// working directory when resolving forward source paths.
     ///
-    /// Extract a subgraph containing only edges involving URIs in the given set.
-    ///
-    /// This is much cheaper than cloning the entire graph when only a
-    /// neighborhood of files is needed (e.g., for diagnostic snapshots).
-    pub fn extract_subgraph(&self, uris: &HashSet<Url>) -> Self {
-        let mut forward = HashMap::new();
-        let mut backward = HashMap::new();
-
-        for uri in uris {
-            if let Some(edges) = self.forward.get(uri) {
-                let filtered: Vec<_> = edges
-                    .iter()
-                    .filter(|e| uris.contains(&e.to))
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() {
-                    forward.insert(uri.clone(), filtered);
-                }
-            }
-            if let Some(edges) = self.backward.get(uri) {
-                let filtered: Vec<_> = edges
-                    .iter()
-                    .filter(|e| uris.contains(&e.from))
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() {
-                    backward.insert(uri.clone(), filtered);
-                }
-            }
-        }
-
-        Self { forward, backward }
-    }
-
     /// _Requirements: 5.1, 5.2_
     pub fn update_file<F>(
         &mut self,
@@ -993,6 +959,40 @@ impl DependencyGraph {
     /// Uses file-relative path resolution only (no workspace root)
     pub fn update_file_simple(&mut self, uri: &Url, meta: &CrossFileMetadata) {
         let _ = self.update_file(uri, meta, None, |_| None);
+    }
+
+    /// Extract a subgraph containing only edges involving URIs in the given set.
+    ///
+    /// This is much cheaper than cloning the entire graph when only a
+    /// neighborhood of files is needed (e.g., for diagnostic snapshots).
+    pub fn extract_subgraph(&self, uris: &HashSet<Url>) -> Self {
+        let mut forward = HashMap::new();
+        let mut backward = HashMap::new();
+
+        for uri in uris {
+            if let Some(edges) = self.forward.get(uri) {
+                let filtered: Vec<_> = edges
+                    .iter()
+                    .filter(|e| uris.contains(&e.to))
+                    .cloned()
+                    .collect();
+                if !filtered.is_empty() {
+                    forward.insert(uri.clone(), filtered);
+                }
+            }
+            if let Some(edges) = self.backward.get(uri) {
+                let filtered: Vec<_> = edges
+                    .iter()
+                    .filter(|e| uris.contains(&e.from))
+                    .cloned()
+                    .collect();
+                if !filtered.is_empty() {
+                    backward.insert(uri.clone(), filtered);
+                }
+            }
+        }
+
+        Self { forward, backward }
     }
 
     /// Remove edges where the given URI is the child that were created from backward directives

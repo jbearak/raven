@@ -224,11 +224,11 @@ pub(crate) fn diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
     cancel: &DiagCancelToken,
-) -> Vec<Diagnostic> {
+) -> Option<Vec<Diagnostic>> {
     let start = std::time::Instant::now();
 
     if !snapshot.cross_file_config.diagnostics_enabled {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let mut diagnostics = Vec::new();
@@ -278,7 +278,7 @@ pub(crate) fn diagnostics_from_snapshot(
     }
 
     // Max depth diagnostics
-    collect_max_depth_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+    collect_max_depth_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics, cancel);
 
     // Missing file diagnostics (sync check from snapshot metadata)
     collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
@@ -294,7 +294,7 @@ pub(crate) fn diagnostics_from_snapshot(
 
     if cancel.is_cancelled() {
         log::trace!("Diagnostics cancelled after fast collectors ({}ms)", start.elapsed().as_millis());
-        return diagnostics;
+        return None;
     }
 
     // Shared scope cache for expensive collectors
@@ -315,7 +315,7 @@ pub(crate) fn diagnostics_from_snapshot(
 
     if cancel.is_cancelled() {
         log::trace!("Diagnostics cancelled after out-of-scope ({}ms)", start.elapsed().as_millis());
-        return diagnostics;
+        return None;
     }
 
     // Undefined variable diagnostics
@@ -331,6 +331,11 @@ pub(crate) fn diagnostics_from_snapshot(
         );
     }
 
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled after undefined-variables ({}ms)", start.elapsed().as_millis());
+        return None;
+    }
+
     log::trace!(
         "Diagnostics computed in {}ms (scope resolution: {}ms, {} scope cache entries)",
         start.elapsed().as_millis(),
@@ -338,7 +343,7 @@ pub(crate) fn diagnostics_from_snapshot(
         scope_cache.len(),
     );
 
-    diagnostics
+    Some(diagnostics)
 }
 
 /// Maximum valid character value for LSP positions.
@@ -3987,6 +3992,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
     diagnostics: &mut Vec<Diagnostic>,
+    cancel: &DiagCancelToken,
 ) {
     // Early exit: skip expensive graph traversal if severity is disabled
     let Some(severity) = snapshot.cross_file_config.max_chain_depth_severity else {
@@ -4014,7 +4020,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         &empty_base_exports,
         false,
         snapshot.cross_file_config.backward_dependencies,
-        &|| false,
+        &|| cancel.is_cancelled(),
     );
 
     {
@@ -4075,7 +4081,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
                         source.line,
                         source
                             .column
-                            .saturating_add(source.path.len() as u32)
+                            .saturating_add(source.path.encode_utf16().count() as u32)
                             .saturating_add(10),
                     ),
                 },

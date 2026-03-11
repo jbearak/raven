@@ -174,6 +174,7 @@ impl CrossFileConfig {
             || self.max_forward_depth != other.max_forward_depth
             || self.hoist_globals_in_functions != other.hoist_globals_in_functions
             || self.backward_dependencies != other.backward_dependencies
+            || self.max_transitive_dependents_visited != other.max_transitive_dependents_visited
     }
 }
 
@@ -241,6 +242,11 @@ mod tests {
         // Reset and change backward_dependencies
         config2 = CrossFileConfig::default();
         config2.backward_dependencies = BackwardDependencyMode::Explicit;
+        assert!(config1.scope_settings_changed(&config2));
+
+        // Reset and change max_transitive_dependents_visited
+        config2 = CrossFileConfig::default();
+        config2.max_transitive_dependents_visited = 500;
         assert!(config1.scope_settings_changed(&config2));
     }
 
