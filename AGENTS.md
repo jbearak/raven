@@ -113,7 +113,7 @@ When making significant changes:
 - Tiered loading (static → R → INDEX fallback) provides both speed and accuracy: sub-5ms for 94% of packages, accurate exports for all.
 - When parsing structured R output (markers like `__PKG:name__`), handle missing end markers gracefully to avoid losing partial results.
 - Always wrap R subprocess calls with `tokio::time::timeout()` to prevent hung R processes from blocking the LSP indefinitely.
-- When iterating over identifiers in a file for diagnostics, cache scope resolution results by line number — the cross-file scope is identical for all identifiers on the same line, so calling `get_cross_file_scope()` per-identifier is wasteful.
+- When iterating over identifiers in a file for diagnostics, cache scope resolution results by `(line, column)` — different columns on the same line can have different scopes (e.g., inside vs outside a single-line anonymous function like `sapply(x, function(p) p + 1)`). Line-only caching causes false positives for function parameters.
 - Pre-compute a line-offset index (`Vec<usize>` of line start positions) to avoid repeated `text.lines().nth(row)` calls, which are O(n) each time.
 - Use `HashSet` for membership checks in hot loops (package deduplication, workspace imports); `Vec::contains()` is O(n) and adds up quickly in completion/diagnostic paths.
 - For background work queues, maintain a companion `HashSet` of pending URIs alongside the `VecDeque` to enable O(1) duplicate detection instead of O(n) `iter().any()` scans.
