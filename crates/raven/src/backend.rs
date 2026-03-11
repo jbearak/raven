@@ -694,6 +694,11 @@ async fn run_debounced_diagnostics(
             }
         };
 
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled before async phase for {}", affected_uri);
+        return;
+    }
+
     // Perform async missing file existence checks (non-blocking I/O)
     let diagnostics = handlers::diagnostics_async_standalone(
         &affected_uri,
@@ -703,6 +708,11 @@ async fn run_debounced_diagnostics(
         missing_file_severity,
     )
     .await;
+
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled after async phase for {}", affected_uri);
+        return;
+    }
 
     // Second freshness check before publishing
     let can_publish = {
@@ -1299,9 +1309,11 @@ impl LanguageServer for Backend {
             // Interface changes affect symbol resolution in dependent files.
             // Edge changes affect cycle detection diagnostics in dependent files.
             if interface_changed || result.edges_changed {
-                let dependents = state
-                    .cross_file_graph
-                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth, state.cross_file_config.max_transitive_dependents_visited);
+                let dependents = state.cross_file_graph.get_transitive_dependents(
+                    &uri,
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                );
                 // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
@@ -1931,9 +1943,11 @@ impl LanguageServer for Backend {
             // Edge changes affect cycle detection diagnostics in dependent files
             // (e.g., commenting out a source() call breaks a cycle).
             if interface_changed || edges_changed {
-                let dependents = state
-                    .cross_file_graph
-                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth, state.cross_file_config.max_transitive_dependents_visited);
+                let dependents = state.cross_file_graph.get_transitive_dependents(
+                    &uri,
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                );
                 // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {

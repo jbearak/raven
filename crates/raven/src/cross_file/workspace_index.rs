@@ -232,10 +232,18 @@ mod tests {
         let index = CrossFileWorkspaceIndex::new();
         let uri = test_uri("test.R");
 
-        index.insert(uri.clone(), test_entry(1));
+        let entry = test_entry(1);
+        let expected_artifacts = entry.artifacts.clone();
+        index.insert(uri.clone(), entry);
 
         assert!(index.get_metadata(&uri).is_some());
-        assert!(index.get_artifacts(&uri).is_some());
+        let actual_artifacts = index.get_artifacts(&uri).unwrap();
+        // Verify pointer sharing: get_artifacts should return the same Arc allocation,
+        // not a deep clone (regression test for O(1) Arc sharing).
+        assert!(
+            Arc::ptr_eq(&actual_artifacts, &expected_artifacts),
+            "get_artifacts should return the same Arc, not a deep clone"
+        );
     }
 
     #[test]

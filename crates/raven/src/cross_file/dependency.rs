@@ -1094,16 +1094,29 @@ impl DependencyGraph {
         result: &mut Vec<Url>,
         max_visited: usize,
     ) {
-        if current_depth >= max_depth || visited.contains(uri) || visited.len() >= max_visited {
+        if current_depth > max_depth || visited.len() >= max_visited || !visited.insert(uri.clone())
+        {
             return;
         }
-        visited.insert(uri.clone());
+        if current_depth > 0 {
+            result.push(uri.clone());
+        }
+        if current_depth == max_depth {
+            return;
+        }
 
         for edge in self.get_dependents(uri) {
-            if !visited.contains(&edge.from) {
-                result.push(edge.from.clone());
-                self.collect_dependents(&edge.from, max_depth, current_depth + 1, visited, result, max_visited);
+            if visited.len() >= max_visited {
+                break;
             }
+            self.collect_dependents(
+                &edge.from,
+                max_depth,
+                current_depth + 1,
+                visited,
+                result,
+                max_visited,
+            );
         }
     }
 
@@ -1239,19 +1252,25 @@ impl DependencyGraph {
     ///   (use this for the diagnostic message details)
     /// Collect all URIs reachable from `uri` within `max_depth` hops,
     /// following both forward and backward edges.
-    pub fn collect_neighborhood(&self, uri: &Url, max_depth: usize) -> HashSet<Url> {
+    ///
+    /// `max_visited` caps the total number of nodes collected to prevent
+    /// unbounded expansion in dense bidirectional graphs.
+    pub fn collect_neighborhood(&self, uri: &Url, max_depth: usize, max_visited: usize) -> HashSet<Url> {
         let mut visited = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((uri.clone(), 0usize));
         visited.insert(uri.clone());
 
         while let Some((current, depth)) = queue.pop_front() {
-            if depth >= max_depth {
+            if depth >= max_depth || visited.len() >= max_visited {
                 continue;
             }
             // Follow forward edges (children)
             if let Some(edges) = self.forward.get(&current) {
                 for edge in edges {
+                    if visited.len() >= max_visited {
+                        break;
+                    }
                     if visited.insert(edge.to.clone()) {
                         queue.push_back((edge.to.clone(), depth + 1));
                     }
@@ -1260,6 +1279,9 @@ impl DependencyGraph {
             // Follow backward edges (parents)
             if let Some(edges) = self.backward.get(&current) {
                 for edge in edges {
+                    if visited.len() >= max_visited {
+                        break;
+                    }
                     if visited.insert(edge.from.clone()) {
                         queue.push_back((edge.from.clone(), depth + 1));
                     }
@@ -1528,6 +1550,81 @@ mod tests {
         // Should only have one edge (deduplicated)
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn test_transitive_dependents_star_graph_respects_max_visited() {
+        // Star graph: a, b, c, d, e all source "hub.R"
+        let mut graph = DependencyGraph::new();
+        let hub = url("hub.R");
+        let spokes: Vec<Url> = (0..5)
+            .map(|i| url(&format!("spoke_{}.R", i)))
+            .collect();
+
+        for spoke in &spokes {
+            let meta = make_meta_with_source("hub.R", 1);
+            graph.update_file(spoke, &meta, Some(&workspace_root()), |_| None);
+        }
+
+        // With max_visited=3, only 2 dependents should be returned (root + 2 = 3 visited)
+        let dependents = graph.get_transitive_dependents(&hub, 10, 3);
+        assert!(
+            dependents.len() <= 2,
+            "max_visited=3 should cap at 2 dependents (plus root), got {}",
+            dependents.len()
+        );
+
+        // No duplicates
+        let unique: std::collections::HashSet<_> = dependents.iter().collect();
+        assert_eq!(unique.len(), dependents.len(), "should have no duplicates");
+
+        // Full traversal returns all 5
+        let all_dependents = graph.get_transitive_dependents(&hub, 10, 200);
+        assert_eq!(all_dependents.len(), 5);
+    }
+
+    #[test]
+    fn test_transitive_dependents_diamond_no_duplicates() {
+        // Diamond: a->c, b->c, d->a, d->b (so d depends on c transitively via both a and b)
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let c = url("c.R");
+        let d = url("d.R");
+
+        let meta_a = make_meta_with_source("c.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+
+        let meta_b = make_meta_with_source("c.R", 1);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        use super::super::types::ForwardSource;
+        let meta_d = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "a.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "b.R".to_string(),
+                    line: 2,
+                    column: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&d, &meta_d, Some(&workspace_root()), |_| None);
+
+        let dependents = graph.get_transitive_dependents(&c, 10, 200);
+        // Should include a, b, d — no duplicates
+        let unique: std::collections::HashSet<_> = dependents.iter().collect();
+        assert_eq!(unique.len(), dependents.len(), "should have no duplicates");
+        assert!(dependents.contains(&a));
+        assert!(dependents.contains(&b));
+        assert!(dependents.contains(&d));
     }
 
     #[test]

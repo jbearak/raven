@@ -120,7 +120,8 @@ impl DiagnosticsSnapshot {
         // Pre-collect artifacts and metadata for all files in the dependency neighborhood
         let neighborhood_start = std::time::Instant::now();
         let max_depth = state.cross_file_config.max_chain_depth;
-        let neighborhood = state.cross_file_graph.collect_neighborhood(uri, max_depth);
+        let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+        let neighborhood = state.cross_file_graph.collect_neighborhood(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider();
 

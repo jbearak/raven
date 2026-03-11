@@ -1594,11 +1594,14 @@ proptest! {
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
         // Create artifacts lookup
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -1668,11 +1671,14 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -1861,9 +1867,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -1912,9 +1921,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -1981,9 +1993,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -2522,9 +2537,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -2613,10 +2631,14 @@ proptest! {
             },
         );
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let sibling_artifacts = Arc::new(sibling_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-            else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
+            else if uri == &sibling_uri { Some(Arc::clone(&sibling_artifacts)) }
             else { None }
         };
 
@@ -2710,9 +2732,12 @@ proptest! {
             },
         );
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -2803,9 +2828,12 @@ proptest! {
             },
         );
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -2886,9 +2914,12 @@ proptest! {
             },
         );
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -2965,9 +2996,12 @@ proptest! {
             },
         );
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -3748,9 +3782,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -3796,9 +3833,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -3847,9 +3887,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -3902,9 +3945,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -3955,9 +4001,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -4003,9 +4052,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -4303,9 +4355,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -4598,9 +4653,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -4644,9 +4702,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -4703,9 +4764,12 @@ proptest! {
         let child_tree = parse_r_tree(&child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -6958,9 +7022,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7034,9 +7101,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7093,9 +7163,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7160,9 +7233,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7219,9 +7295,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7289,9 +7368,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7345,9 +7427,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -7415,9 +7500,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -9639,9 +9727,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -9702,9 +9793,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -9769,9 +9863,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 2)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -9844,9 +9941,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -9920,9 +10020,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 3)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -9996,10 +10099,14 @@ proptest! {
         graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let grandparent_artifacts = Arc::new(grandparent_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
-            else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &grandparent_uri { Some(Arc::clone(&grandparent_artifacts)) }
+            else if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10053,9 +10160,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10136,9 +10246,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10211,10 +10324,14 @@ proptest! {
         graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let grandparent_artifacts = Arc::new(grandparent_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
-            else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &grandparent_uri { Some(Arc::clone(&grandparent_artifacts)) }
+            else if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10296,9 +10413,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10374,9 +10494,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10443,9 +10566,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -10509,9 +10635,12 @@ proptest! {
         let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -19755,11 +19884,14 @@ proptest! {
         graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
 
         // Create closures for scope resolution
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -19933,11 +20065,14 @@ proptest! {
         graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
 
         // Create closures for scope resolution
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -20107,11 +20242,14 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -20279,11 +20417,14 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_url), content_provider);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -22434,9 +22575,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -22523,9 +22667,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -22611,9 +22758,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -22704,9 +22854,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -22825,10 +22978,14 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let grandparent_artifacts = Arc::new(grandparent_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
-            else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &grandparent_uri { Some(Arc::clone(&grandparent_artifacts)) }
+            else if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -22912,9 +23069,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -23006,9 +23166,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -23619,9 +23782,12 @@ proptest! {
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
         // Simulate workspace index providing artifacts for the indexed child
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &indexed_child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &indexed_child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -23764,9 +23930,12 @@ proptest! {
         );
 
         // Simulate opening the file: now use new artifacts (re-extracted from live content)
+        let new_child_artifacts = Arc::new(new_child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(new_child_artifacts.clone())) }  // Live content
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&new_child_artifacts)) }  // Live content
             else { None }
         };
 
@@ -23891,9 +24060,12 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &indexed_child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &indexed_child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 
@@ -24026,10 +24198,14 @@ proptest! {
         };
         graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
 
+        let child_artifacts = Arc::new(child_artifacts);
+        let grandparent_artifacts = Arc::new(grandparent_artifacts);
+        let parent_artifacts = Arc::new(parent_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<super::scope::ScopeArtifacts>> {
-            if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
-            else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &grandparent_uri { Some(Arc::clone(&grandparent_artifacts)) }
+            else if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
 

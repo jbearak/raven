@@ -4782,11 +4782,14 @@ child_var <- 100
 
         println!("\nStep 3: Test scope resolution at different positions");
 
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let child_artifacts = Arc::new(child_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -4966,11 +4969,14 @@ x <- 1
             content_provider,
         );
 
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let child_artifacts = Arc::new(child_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5109,11 +5115,14 @@ x <- 1
                 content_provider,
             );
 
+            let parent_artifacts = Arc::new(parent_artifacts);
+            let child_artifacts = Arc::new(child_artifacts);
+
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(Arc::new(parent_artifacts.clone()))
+                    Some(Arc::clone(&parent_artifacts))
                 } else if uri == &child_uri {
-                    Some(Arc::new(child_artifacts.clone()))
+                    Some(Arc::clone(&child_artifacts))
                 } else {
                     None
                 }
@@ -5579,7 +5588,7 @@ x <- 1
         );
 
         let child_tree = parse_r_tree(child_content);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+        let child_artifacts = Arc::new(compute_artifacts(&child_uri, &child_tree, child_content));
 
         // Build dependency graph
         let workspace_root = Url::from_file_path(workspace.root()).unwrap();
@@ -5602,11 +5611,12 @@ x <- 1
         );
 
         // Test scope - child symbols should NOT be available
+        let parent_artifacts_v1 = Arc::new(parent_artifacts_v1);
         let get_artifacts_v1 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts_v1.clone()))
+                Some(Arc::clone(&parent_artifacts_v1))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5679,11 +5689,12 @@ x <- 1
         );
 
         // Test scope - child symbols SHOULD now be available
+        let parent_artifacts_v2 = Arc::new(parent_artifacts_v2);
         let get_artifacts_v2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts_v2.clone()))
+                Some(Arc::clone(&parent_artifacts_v2))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5758,7 +5769,7 @@ x <- 1
         );
 
         let child_tree = parse_r_tree(child_content);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+        let child_artifacts = Arc::new(compute_artifacts(&child_uri, &child_tree, child_content));
 
         // Build dependency graph
         let workspace_root = Url::from_file_path(workspace.root()).unwrap();
@@ -5781,11 +5792,12 @@ x <- 1
         );
 
         // Test scope - child symbols SHOULD be available
+        let parent_artifacts_v1 = Arc::new(parent_artifacts_v1);
         let get_artifacts_v1 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts_v1.clone()))
+                Some(Arc::clone(&parent_artifacts_v1))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5858,11 +5870,12 @@ x <- 1
         );
 
         // Test scope - child symbols should NOT be available anymore
+        let parent_artifacts_v2 = Arc::new(parent_artifacts_v2);
         let get_artifacts_v2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts_v2.clone()))
+                Some(Arc::clone(&parent_artifacts_v2))
             } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -6036,10 +6049,14 @@ mod cross_directory_hoisting_tests {
             "Child should have backward edge from parent"
         );
 
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let sibling_artifacts = Arc::new(sibling_artifacts);
+        let child_artifacts = Arc::new(child_artifacts);
+
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-            else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-            else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &sibling_uri { Some(Arc::clone(&sibling_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
