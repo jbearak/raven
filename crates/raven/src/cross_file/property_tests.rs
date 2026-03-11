@@ -2629,6 +2629,7 @@ proptest! {
         let scope_at_start = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_at_start.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should be available at start due to backward directive");
@@ -2639,6 +2640,7 @@ proptest! {
         let scope_at_middle = scope_at_position_with_graph(
             &child_uri, 1, 10, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_at_middle.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should still be available");
@@ -2651,6 +2653,7 @@ proptest! {
         let scope_at_end = scope_at_position_with_graph(
             &child_uri, 3, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_at_end.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should be available at end");
@@ -2718,6 +2721,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol from backward directive should be available at (0, 0)");
@@ -2809,6 +2813,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // symbol_before (defined on line 0) should be available (before call site)
@@ -2890,6 +2895,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Default is "end", so all parent symbols should be included
@@ -2970,6 +2976,7 @@ proptest! {
         let scope_with_end = scope_at_position_with_graph(
             &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_with_end.symbols.contains_key(parent_symbol.as_str()),
             "With assume_call_site=End, parent symbol should be available");
@@ -6958,6 +6965,7 @@ proptest! {
         let scope_before_rm = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before rm()");
@@ -6966,6 +6974,7 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm()");
@@ -6974,6 +6983,7 @@ proptest! {
         let scope_eof = scope_at_position_with_graph(
             &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_eof.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope at end of file after rm()");
@@ -7028,6 +7038,7 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol_to_remove.as_str()),
             "Removed symbol should NOT be in scope after rm()");
@@ -7085,6 +7096,7 @@ proptest! {
         let scope_before_rm = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_before_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should be in scope before rm()");
@@ -7097,6 +7109,7 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should NOT be in scope after rm()");
@@ -7148,6 +7161,7 @@ proptest! {
         let scope_before_remove = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_before_remove.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before remove()");
@@ -7156,6 +7170,7 @@ proptest! {
         let scope_after_remove = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_remove.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after remove()");
@@ -7203,6 +7218,7 @@ proptest! {
         let scope_before_rm = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before rm(list=...)");
@@ -7211,6 +7227,7 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm(list=...)");
@@ -7269,6 +7286,7 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should NOT be in scope after rm(list=c(...))");
@@ -7323,6 +7341,7 @@ proptest! {
         let scope_after_source = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_after_source.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after source() but before rm()");
@@ -7331,6 +7350,7 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm() but before redefinition");
@@ -7339,6 +7359,7 @@ proptest! {
         let scope_after_redef = scope_at_position_with_graph(
             &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_after_redef.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after redefinition");
@@ -7387,6 +7408,7 @@ proptest! {
         let scope_in_child = scope_at_position_with_graph(
             &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(scope_in_child.symbols.contains_key(symbol.as_str()),
             "Symbol should still be in scope in child file (child's own definition)");
@@ -7395,6 +7417,7 @@ proptest! {
         let scope_in_parent = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
         prop_assert!(!scope_in_parent.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope in parent file after rm()");
@@ -9607,6 +9630,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited the package from parent
@@ -9668,6 +9692,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Child should NOT have the package (loaded after source() call)
@@ -9733,6 +9758,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited both packages from parent
@@ -9806,6 +9832,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited pkg_before (loaded before source())
@@ -9880,6 +9907,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Child should NOT have the package (it's function-scoped in parent)
@@ -9956,6 +9984,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited the package from grandparent (through parent)
@@ -10009,6 +10038,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited the package at any position
@@ -10090,6 +10120,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Parent should have the package (loaded in child, available after source())
@@ -10165,6 +10196,7 @@ proptest! {
         let grandparent_scope = scope_at_position_with_graph(
             &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Grandparent should have the package (loaded in grandchild)
@@ -10179,6 +10211,7 @@ proptest! {
         let parent_scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Parent should also have the package (loaded in child)
@@ -10244,6 +10277,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -10320,6 +10354,7 @@ proptest! {
         let child_scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child SHOULD have parent's package (forward propagation works)
@@ -10333,6 +10368,7 @@ proptest! {
         let parent_scope = scope_at_position_with_graph(
             &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Parent should have child's package (propagated from child via loaded_packages)
@@ -10385,6 +10421,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Packages from sourced files go into loaded_packages, not inherited_packages
@@ -10449,6 +10486,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Parent should have all of the child's packages (via loaded_packages)
@@ -19709,6 +19747,7 @@ proptest! {
                 10,
                 &HashSet::new(),
                 false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             prop_assert!(
@@ -19733,6 +19772,7 @@ proptest! {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         prop_assert!(
@@ -19883,6 +19923,7 @@ proptest! {
                 10,
                 &HashSet::new(),
                 false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             prop_assert!(
@@ -19908,6 +19949,7 @@ proptest! {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         prop_assert!(
@@ -20052,6 +20094,7 @@ proptest! {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         prop_assert!(
@@ -20078,6 +20121,7 @@ proptest! {
                 10,
                 &HashSet::new(),
                 false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             prop_assert!(
@@ -20221,6 +20265,7 @@ proptest! {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         prop_assert!(
@@ -20243,6 +20288,7 @@ proptest! {
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         prop_assert!(
@@ -22356,6 +22402,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited the declared symbol from parent (Requirement 9.1)
@@ -22443,6 +22490,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Child should NOT have the declared symbol (declaration is after source() call)
@@ -22529,6 +22577,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited the declared symbol even with local=TRUE (Requirement 9.4)
@@ -22620,6 +22669,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Declared symbol should be available (Requirement 9.4)
@@ -22741,6 +22791,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Child should have inherited the declared symbol from grandparent through parent (Requirement 9.3)
@@ -22824,6 +22875,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Both declared symbols should be available in child file
@@ -22916,6 +22968,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
         );
 
         // Symbol declared BEFORE source() should be available (Requirement 9.1)
@@ -23528,6 +23581,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Requirement 12.2: Declared symbol from indexed child should be available in parent's scope
@@ -23671,6 +23725,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Requirement 12.3: After opening, new declared symbol should be available
@@ -23796,6 +23851,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // All declared variables should be available
@@ -23931,6 +23987,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         // Declared symbol from child should be available in grandparent's scope

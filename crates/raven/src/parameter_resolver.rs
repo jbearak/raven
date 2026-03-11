@@ -780,6 +780,7 @@ fn get_scope(
         max_depth,
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
+        state.cross_file_config.backward_dependencies,
     )
 }
 

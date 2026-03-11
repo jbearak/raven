@@ -547,6 +547,11 @@ pub struct WorldState {
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
     pub package_library_ready: bool,
+    /// Whether the background workspace scan has completed and the dependency
+    /// graph has been populated from workspace entries. In `Auto` backward
+    /// dependency mode, undefined variable diagnostics are deferred for files
+    /// without explicit backward directives until this flag is true.
+    pub workspace_scan_complete: bool,
 }
 
 impl WorldState {
@@ -641,6 +646,7 @@ impl WorldState {
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
             package_library_ready: false,
+            workspace_scan_complete: false,
         }
     }
 
@@ -778,6 +784,50 @@ impl WorldState {
             self.workspace_imports.len(),
             self.cross_file_workspace_index.uris().len(),
             self.workspace_index_new.len()
+        );
+
+        // Build the dependency graph from all workspace entries so that
+        // forward-created backward edges are available for auto-detect mode.
+        self.build_dependency_graph_from_workspace();
+        self.workspace_scan_complete = true;
+        log::info!("[Background] Dependency graph built from workspace entries, workspace_scan_complete = true");
+    }
+
+    /// Build the dependency graph from all entries in the workspace index.
+    ///
+    /// For each file, calls `update_file` on the dependency graph using its
+    /// metadata. This creates forward edges (parent→child) and their
+    /// corresponding backward entries (child→parent) for all workspace files,
+    /// enabling auto-detection of backward dependencies.
+    fn build_dependency_graph_from_workspace(&mut self) {
+        let workspace_root = self.workspace_folders.first().cloned();
+
+        // Collect URIs and metadata to avoid borrow conflicts with self.
+        // Build the content map directly (no intermediate Vec with cloned content).
+        let mut entries: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
+        let mut content_map: std::collections::HashMap<Url, String> =
+            std::collections::HashMap::new();
+
+        for (uri, entry) in self.workspace_index_new.iter() {
+            entries.push((uri.clone(), entry.metadata.clone()));
+            content_map.insert(uri, entry.contents.to_string());
+        }
+
+        for (uri, meta) in &entries {
+            let get_content = |parent_uri: &Url| -> Option<String> {
+                content_map.get(parent_uri).cloned()
+            };
+            let _result = self.cross_file_graph.update_file(
+                uri,
+                meta,
+                workspace_root.as_ref(),
+                get_content,
+            );
+        }
+
+        log::info!(
+            "Built dependency graph from {} workspace files",
+            entries.len()
         );
     }
 

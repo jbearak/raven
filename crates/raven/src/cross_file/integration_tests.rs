@@ -4812,6 +4812,7 @@ child_var <- 100
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -4837,6 +4838,7 @@ child_var <- 100
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -4861,6 +4863,7 @@ child_var <- 100
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -4989,6 +4992,7 @@ x <- 1
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -5010,6 +5014,7 @@ x <- 1
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -5128,6 +5133,7 @@ x <- 1
                 10,
                 &HashSet::new(),
                 false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
             );
 
             assert!(
@@ -5618,6 +5624,7 @@ x <- 1
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -5693,6 +5700,7 @@ x <- 1
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -5793,6 +5801,7 @@ x <- 1
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -5868,6 +5877,7 @@ x <- 1
             10,
             &HashSet::new(),
             false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         assert!(
@@ -6041,6 +6051,7 @@ mod cross_directory_hoisting_tests {
             10,
             &base_exports,
             true,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
         );
 
         println!("  Scope symbols: {:?}", scope.symbols.keys().collect::<Vec<_>>());

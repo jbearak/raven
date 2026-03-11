@@ -33,7 +33,9 @@ When you open `main.R`, Raven:
 3. Provides completions, hover, and go-to-definition for `helper_function`
 4. Only shows `helper_function` as available *after* the `source()` line
 
-But if you open `utils.R` directly, Raven doesn’t know which file sources it. Add a directive to tell it:
+And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it (by scanning the workspace) and resolves the full chain in both directions — no configuration needed.
+
+For complex setups or when you want explicit control, you can add directives:
 
 ```r
 # utils.R
@@ -41,7 +43,7 @@ But if you open `utils.R` directly, Raven doesn’t know which file sources it. 
 helper_function <- function(x) { x * 2 }
 ```
 
-Now Raven resolves the full chain in both directions. See [Cross-File Awareness](docs/cross-file.md) for more directives and dynamic-path handling.
+See [Cross-File Awareness](docs/cross-file.md) for directives, dynamic-path handling, and [backward dependency modes](docs/cross-file.md#backward-dependency-modes).
 
 ## Installation
 
