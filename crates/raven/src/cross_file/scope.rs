@@ -483,7 +483,8 @@ impl FunctionScopeTree {
         // Since the tree is sorted by start position, if the current node's start is greater
         // than the query position, all nodes in the right subtree also have start > pos,
         // so none of them can contain the position.
-        // We also check max_end to prune subtrees that end before the query position.
+        // We also skip the right subtree when its max_end is before the query position,
+        // since no interval in it can contain pos.
         if let Some(ref right) = node.right {
             if node.interval.start <= pos && right.max_end >= pos {
                 Self::query_point_recursive(right, pos, results);
