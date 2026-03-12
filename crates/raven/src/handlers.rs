@@ -22999,7 +22999,7 @@ mod proptests {
         ///
         /// **Validates: Requirements 5.3**
         fn prop_usage_before_declaration_emits_diagnostic(
-            symbol_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            symbol_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !super::is_builtin(s)),
             is_function in any::<bool>(),
             lines_between in 0usize..3
         ) {
