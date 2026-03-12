@@ -302,11 +302,9 @@ impl Package {
         // Also include symbols from INDEX file (for datasets)
         let mut all_exports = exports;
         if let Some(index_exports) = parse_index(&path.join("INDEX")) {
-            for sym in index_exports {
-                if !all_exports.contains(&sym) {
-                    all_exports.push(sym);
-                }
-            }
+            all_exports.extend(index_exports);
+            all_exports.sort();
+            all_exports.dedup();
         }
 
         Some(Self {
@@ -486,14 +484,16 @@ impl Library {
     /// List all installed package names
     #[allow(dead_code)]
     pub fn list_packages(&self) -> Vec<String> {
+        let mut names_set = HashSet::new();
         let mut names = Vec::new();
         for lib_path in &self.paths {
             if let Ok(entries) = fs::read_dir(lib_path) {
                 for entry in entries.flatten() {
                     if entry.path().join("DESCRIPTION").exists() {
                         if let Some(name) = entry.file_name().to_str() {
-                            if !names.contains(&name.to_string()) {
-                                names.push(name.to_string());
+                            let s = name.to_string();
+                            if names_set.insert(s.clone()) {
+                                names.push(s);
                             }
                         }
                     }
