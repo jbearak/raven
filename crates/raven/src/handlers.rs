@@ -4379,6 +4379,7 @@ fn collect_undefined_variables_from_snapshot(
 
     let workspace_imports_set: HashSet<&str> =
         snapshot.workspace_imports.iter().map(|s| s.as_str()).collect();
+    let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
     let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> = snapshot
@@ -4519,8 +4520,8 @@ fn collect_undefined_variables_from_snapshot(
                 continue;
             }
 
-            let has_prior_library_call = has_prior_package_loader_call_textually(
-                text,
+            let has_prior_library_call = has_prior_package_loader_call(
+                &package_loader_call_end_offsets,
                 usage_node.start_byte(),
             );
             let package_cache_pending = position_aware_packages
@@ -4538,7 +4539,10 @@ fn collect_undefined_variables_from_snapshot(
                     || (call.line == usage_line && call.column <= usage_col_utf16)
             });
             let has_prior_library_call = has_prior_library_call
-                || has_prior_package_loader_call_textually(text, usage_node.start_byte());
+                || has_prior_package_loader_call(
+                    &package_loader_call_end_offsets,
+                    usage_node.start_byte(),
+                );
             if snapshot.cross_file_config.packages_enabled
                 && !snapshot.package_library_ready
                 && is_function_call_identifier_textually(usage_node, text)
@@ -7046,6 +7050,10 @@ pub(crate) fn collect_undefined_variables_position_aware(
     let workspace_imports_set: std::collections::HashSet<&str> =
         workspace_imports.iter().map(|s| s.as_str()).collect();
 
+    // Pre-compute package loader call locations once for O(log n) lookups in
+    // the usage loop instead of rescanning text prefixes (O(n) per usage).
+    let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
+
     // Local-first optimization: collect this file's own exported symbols and
     // function scope tree for a fast check before expensive cross-file scope
     // resolution. When hoisting is enabled and the usage is inside a function
@@ -7253,8 +7261,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 continue;
             }
 
-            let has_prior_library_call = has_prior_package_loader_call_textually(
-                text,
+            let has_prior_library_call = has_prior_package_loader_call(
+                &package_loader_call_end_offsets,
                 usage_node.start_byte(),
             );
             let package_cache_pending = position_aware_packages
@@ -7295,8 +7303,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
                         && call.column <= usage_col_utf16)
             });
             let has_prior_library_call = has_prior_library_call
-                || has_prior_package_loader_call_textually(
-                    text,
+                || has_prior_package_loader_call(
+                    &package_loader_call_end_offsets,
                     usage_node.start_byte(),
                 );
             if state.cross_file_config.packages_enabled
@@ -7342,12 +7350,22 @@ fn is_function_call_identifier_textually(node: Node, text: &str) -> bool {
     byte_index < bytes.len() && bytes[byte_index] == b'('
 }
 
-/// Returns true when source text before `byte_limit` contains a package loader call.
-fn has_prior_package_loader_call_textually(text: &str, byte_limit: usize) -> bool {
-    let prefix = &text[..byte_limit.min(text.len())];
-    prefix.contains("library(")
-        || prefix.contains("require(")
-        || prefix.contains("loadNamespace(")
+/// Pre-compute end byte offsets for package-loader call tokens in source text.
+fn collect_package_loader_call_end_offsets(text: &str) -> Vec<usize> {
+    let mut end_offsets: Vec<usize> = Vec::new();
+    for pattern in ["library(", "require(", "loadNamespace("] {
+        end_offsets.extend(text.match_indices(pattern).map(|(idx, _)| idx + pattern.len()));
+    }
+    end_offsets.sort_unstable();
+    end_offsets.dedup();
+    end_offsets
+}
+
+/// Returns true when there is a package loader token fully before `byte_limit`.
+fn has_prior_package_loader_call(call_end_offsets: &[usize], byte_limit: usize) -> bool {
+    // Match original semantics of `&text[..byte_limit].contains(...)`:
+    // a match counts only when the full token is inside the prefix.
+    call_end_offsets.partition_point(|&end| end <= byte_limit) > 0
 }
 
 /// Context for tracking NSE-related state during AST traversal
@@ -10244,6 +10262,68 @@ fn find_function_definition_node<'a>(node: Node<'a>, name: &str, text: &str) -> 
     }
 
     None
+}
+
+#[cfg(test)]
+fn collect_function_parameters(
+    node: Node,
+    text: &str,
+    defined: &mut std::collections::HashSet<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "parameters" {
+            continue;
+        }
+
+        let mut params_cursor = child.walk();
+        for param_child in child.children(&mut params_cursor) {
+            if param_child.kind() != "parameter" {
+                continue;
+            }
+
+            let mut leaf_cursor = param_child.walk();
+            for leaf in param_child.children(&mut leaf_cursor) {
+                if leaf.kind() == "identifier" {
+                    defined.insert(node_text(leaf, text).to_string());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn collect_definitions(node: Node, text: &str, defined: &mut std::collections::HashSet<String>) {
+    if node.kind() == "binary_operator" {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        if children.len() >= 3 {
+            let lhs = children[0];
+            let op = children[1];
+            let rhs = children[2];
+            let op_text = node_text(op, text);
+
+            if matches!(op_text, "<-" | "=" | "<<-") {
+                if lhs.kind() == "identifier" {
+                    defined.insert(node_text(lhs, text).to_string());
+                }
+                if rhs.kind() == "function_definition" {
+                    collect_function_parameters(rhs, text, defined);
+                }
+            } else if matches!(op_text, "->" | "->>") && rhs.kind() == "identifier" {
+                defined.insert(node_text(rhs, text).to_string());
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" {
+            continue;
+        }
+        collect_definitions(child, text, defined);
+    }
 }
 
 #[cfg(test)]
@@ -32045,6 +32125,43 @@ mod position_aware_tests {
         let document = Document::new(content, None);
         state.documents.insert(uri.clone(), document);
         uri
+    }
+
+    #[test]
+    fn test_package_loader_call_lookup_matches_textual_scan() {
+        fn naive(text: &str, byte_limit: usize) -> bool {
+            let prefix = &text[..byte_limit.min(text.len())];
+            prefix.contains("library(")
+                || prefix.contains("require(")
+                || prefix.contains("loadNamespace(")
+        }
+        let code = "x <- 1\nlibrary(foo)\nrequire(bar)\nloadNamespace(baz)\n";
+        let end_offsets = super::collect_package_loader_call_end_offsets(code);
+
+        for byte_limit in 0..=code.len() {
+            assert_eq!(
+                super::has_prior_package_loader_call(&end_offsets, byte_limit),
+                naive(code, byte_limit),
+                "Mismatch at byte_limit={}",
+                byte_limit
+            );
+        }
+    }
+
+    #[test]
+    fn test_package_loader_call_lookup_uses_strict_prior_boundary() {
+        let code = "library(foo)\nx <- 1\n";
+        let end_offsets = super::collect_package_loader_call_end_offsets(code);
+        let call_end = end_offsets[0];
+        // Match old semantics of prefix scan: full token must be inside the prefix.
+        assert!(!super::has_prior_package_loader_call(
+            &end_offsets,
+            call_end.saturating_sub(1)
+        ));
+        assert!(super::has_prior_package_loader_call(
+            &end_offsets,
+            call_end
+        ));
     }
 
     #[test]
