@@ -10319,6 +10319,9 @@ fn collect_definitions(node: Node, text: &str, defined: &mut std::collections::H
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" {
+            continue;
+        }
         collect_definitions(child, text, defined);
     }
 }
