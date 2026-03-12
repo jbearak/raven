@@ -491,8 +491,9 @@ impl Library {
                 for entry in entries.flatten() {
                     if entry.path().join("DESCRIPTION").exists() {
                         if let Some(name) = entry.file_name().to_str() {
-                            if names_set.insert(name.to_string()) {
-                                names.push(name.to_string());
+                            let s = name.to_string();
+                            if names_set.insert(s.clone()) {
+                                names.push(s);
                             }
                         }
                     }
