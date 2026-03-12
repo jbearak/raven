@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use lru::LruCache;
 use tower_lsp::lsp_types::Url;
@@ -24,7 +24,7 @@ pub struct IndexEntry {
     /// Extracted cross-file metadata
     pub metadata: CrossFileMetadata,
     /// Computed scope artifacts
-    pub artifacts: ScopeArtifacts,
+    pub artifacts: Arc<ScopeArtifacts>,
     /// Index version when this entry was created
     pub indexed_at_version: u64,
 }
@@ -101,7 +101,7 @@ impl CrossFileWorkspaceIndex {
     }
 
     /// Get artifacts for a URI (without freshness check)
-    pub fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
+    pub fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         self.inner
             .read()
             .ok()?
@@ -119,7 +119,7 @@ impl CrossFileWorkspaceIndex {
         open_documents: &HashSet<Url>,
         snapshot: FileSnapshot,
         metadata: CrossFileMetadata,
-        artifacts: ScopeArtifacts,
+        artifacts: Arc<ScopeArtifacts>,
     ) {
         if open_documents.contains(uri) {
             log::trace!("Skipping disk update for open document: {}", uri);
@@ -211,7 +211,7 @@ mod tests {
         IndexEntry {
             snapshot: test_snapshot(),
             metadata: CrossFileMetadata::default(),
-            artifacts: ScopeArtifacts::default(),
+            artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: version,
         }
     }
@@ -232,10 +232,18 @@ mod tests {
         let index = CrossFileWorkspaceIndex::new();
         let uri = test_uri("test.R");
 
-        index.insert(uri.clone(), test_entry(1));
+        let entry = test_entry(1);
+        let expected_artifacts = entry.artifacts.clone();
+        index.insert(uri.clone(), entry);
 
         assert!(index.get_metadata(&uri).is_some());
-        assert!(index.get_artifacts(&uri).is_some());
+        let actual_artifacts = index.get_artifacts(&uri).unwrap();
+        // Verify pointer sharing: get_artifacts should return the same Arc allocation,
+        // not a deep clone (regression test for O(1) Arc sharing).
+        assert!(
+            Arc::ptr_eq(&actual_artifacts, &expected_artifacts),
+            "get_artifacts should return the same Arc, not a deep clone"
+        );
     }
 
     #[test]
@@ -271,7 +279,7 @@ mod tests {
             &open_docs,
             test_snapshot(),
             CrossFileMetadata::default(),
-            ScopeArtifacts::default(),
+            Arc::new(ScopeArtifacts::default()),
         );
 
         assert!(!index.contains(&uri));
@@ -288,7 +296,7 @@ mod tests {
             &open_docs,
             test_snapshot(),
             CrossFileMetadata::default(),
-            ScopeArtifacts::default(),
+            Arc::new(ScopeArtifacts::default()),
         );
 
         assert!(index.contains(&uri));

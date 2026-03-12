@@ -803,21 +803,26 @@ impl WorldState {
         let workspace_root = self.workspace_folders.first().cloned();
 
         // Collect URIs and metadata to avoid borrow conflicts with self.
-        // Build the content map directly (no intermediate Vec with cloned content).
         let mut entries: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
-        let mut content_map: std::collections::HashMap<Url, String> =
-            std::collections::HashMap::new();
-
         for (uri, entry) in self.workspace_index_new.iter() {
             entries.push((uri.clone(), entry.metadata.clone()));
-            content_map.insert(uri, entry.contents.to_string());
         }
+
+        // Destructure self to split borrows: cross_file_graph (mutable) and
+        // workspace_index_new (shared) can coexist without pre-cloning all contents.
+        let Self {
+            cross_file_graph,
+            workspace_index_new,
+            ..
+        } = self;
 
         for (uri, meta) in &entries {
             let get_content = |parent_uri: &Url| -> Option<String> {
-                content_map.get(parent_uri).cloned()
+                workspace_index_new
+                    .get(parent_uri)
+                    .map(|e| e.contents.to_string())
             };
-            let _result = self.cross_file_graph.update_file(
+            let _result = cross_file_graph.update_file(
                 uri,
                 meta,
                 workspace_root.as_ref(),
@@ -1063,7 +1068,7 @@ fn scan_directory(
                             // Compute artifacts if we have a tree
                             // Use compute_artifacts_with_metadata to include declared symbols from directives
                             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                            let artifacts = if let Some(tree) = doc.tree.as_ref() {
+                            let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
                                 crate::cross_file::scope::compute_artifacts_with_metadata(
                                     &uri,
                                     tree,
@@ -1072,7 +1077,7 @@ fn scan_directory(
                                 )
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
-                            };
+                            });
 
                             let snapshot =
                                 crate::cross_file::file_cache::FileSnapshot::with_content_hash(

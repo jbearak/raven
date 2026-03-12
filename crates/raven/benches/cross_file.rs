@@ -9,6 +9,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use url::Url;
 
 use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
@@ -24,7 +25,7 @@ use raven::cross_file::types::CrossFileMetadata;
 fn precompute_artifacts(
     workspace_path: &std::path::Path,
 ) -> (
-    HashMap<Url, ScopeArtifacts>,
+    HashMap<Url, Arc<ScopeArtifacts>>,
     HashMap<Url, CrossFileMetadata>,
 ) {
     let mut artifacts_map = HashMap::new();
@@ -50,7 +51,7 @@ fn precompute_artifacts(
         let meta = extract_metadata(&content);
         let tree = raven::parser_pool::with_parser(|parser| parser.parse(&content, None));
         if let Some(tree) = tree {
-            let arts = compute_artifacts(&uri, &tree, &content);
+            let arts = Arc::new(compute_artifacts(&uri, &tree, &content));
             artifacts_map.insert(uri.clone(), arts);
         }
         metadata_map.insert(uri, meta);
@@ -127,6 +128,8 @@ fn bench_scope_resolution(c: &mut Criterion) {
                         black_box(20),
                         &base_exports,
                         true,
+                        raven::cross_file::config::BackwardDependencyMode::Explicit,
+                        &|| false,
                     ))
                 })
             },
@@ -210,12 +213,17 @@ fn bench_dependency_graph(c: &mut Criterion) {
         );
 
         // Benchmark: querying transitive dependents from the chain end
+        let default_config = raven::cross_file::CrossFileConfig::default();
         group.bench_with_input(
             BenchmarkId::new("get_transitive_dependents", *label),
             &(&graph, &chain_end_uri),
             |b, &(graph, uri)| {
                 b.iter(|| {
-                    black_box(graph.get_transitive_dependents(black_box(uri), 20))
+                    black_box(graph.get_transitive_dependents(
+                        black_box(uri),
+                        default_config.max_chain_depth,
+                        default_config.max_transitive_dependents_visited,
+                    ))
                 })
             },
         );

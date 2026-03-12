@@ -753,7 +753,7 @@ fn get_scope(
 
     let content_provider = state.content_provider();
 
-    let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
+    let get_artifacts = |target_uri: &Url| -> Option<std::sync::Arc<scope::ScopeArtifacts>> {
         content_provider.get_artifacts(target_uri)
     };
 
@@ -781,6 +781,7 @@ fn get_scope(
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
+        &|| false, // non-diagnostic path, no cancellation
     )
 }
 

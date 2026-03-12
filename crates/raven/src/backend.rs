@@ -647,8 +647,8 @@ async fn run_debounced_diagnostics(
         _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
     }
 
-    // Extract data for async diagnostics while holding lock briefly
-    let diagnostics_data = {
+    // Build snapshot under the read lock (brief hold), then compute diagnostics outside
+    let snapshot_data = {
         let state = state_arc.read().await;
 
         let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
@@ -672,38 +672,47 @@ async fn run_debounced_diagnostics(
             }
         }
 
-        let sync_diagnostics = handlers::diagnostics(&state, &affected_uri, &cancel);
-        let directive_meta = state
-            .documents
-            .get(&affected_uri)
-            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-            .unwrap_or_default();
+        // Build the snapshot (captures all state needed for diagnostics)
+        let snapshot = handlers::DiagnosticsSnapshot::build(&state, &affected_uri);
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
 
-        Some((
-            sync_diagnostics,
-            directive_meta,
-            workspace_folder,
-            missing_file_severity,
-        ))
-    };
+        snapshot.map(|s| (s, workspace_folder, missing_file_severity))
+    }; // Read lock released here
 
-    let Some((sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)) =
-        diagnostics_data
-    else {
+    let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
         return;
     };
+
+    // Compute diagnostics WITHOUT holding any lock
+    let sync_diagnostics =
+        match handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel) {
+            Some(diags) => diags,
+            None => {
+                log::trace!("Diagnostics cancelled for {}", affected_uri);
+                return;
+            }
+        };
+
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled before async phase for {}", affected_uri);
+        return;
+    }
 
     // Perform async missing file existence checks (non-blocking I/O)
     let diagnostics = handlers::diagnostics_async_standalone(
         &affected_uri,
         sync_diagnostics,
-        &directive_meta,
+        &snapshot.directive_meta,
         workspace_folder.as_ref(),
         missing_file_severity,
     )
     .await;
+
+    if cancel.is_cancelled() {
+        log::trace!("Diagnostics cancelled after async phase for {}", affected_uri);
+        return;
+    }
 
     // Second freshness check before publishing
     let can_publish = {
@@ -1300,9 +1309,11 @@ impl LanguageServer for Backend {
             // Interface changes affect symbol resolution in dependent files.
             // Edge changes affect cycle detection diagnostics in dependent files.
             if interface_changed || result.edges_changed {
-                let dependents = state
-                    .cross_file_graph
-                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
+                let dependents = state.cross_file_graph.get_transitive_dependents(
+                    &uri,
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                );
                 // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
@@ -1537,9 +1548,10 @@ impl LanguageServer for Backend {
                 // altered path resolution), schedule newly affected dependents.
                 if second_result.edges_changed {
                     let max_chain_depth = state.cross_file_config.max_chain_depth;
+                    let max_visited = state.cross_file_config.max_transitive_dependents_visited;
                     let dependents = state
                         .cross_file_graph
-                        .get_transitive_dependents(&uri, max_chain_depth);
+                        .get_transitive_dependents(&uri, max_chain_depth, max_visited);
                     for dep in dependents {
                         if state.documents.contains_key(&dep) {
                             state.diagnostics_gate.mark_force_republish(&dep);
@@ -1638,9 +1650,10 @@ impl LanguageServer for Backend {
 
             if second_result.edges_changed {
                 let max_chain_depth = state.cross_file_config.max_chain_depth;
+                let max_visited = state.cross_file_config.max_transitive_dependents_visited;
                 let dependents = state
                     .cross_file_graph
-                    .get_transitive_dependents(&uri, max_chain_depth);
+                    .get_transitive_dependents(&uri, max_chain_depth, max_visited);
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
                         state.diagnostics_gate.mark_force_republish(&dep);
@@ -1660,7 +1673,7 @@ impl LanguageServer for Backend {
                 let state = self.state.read().await;
                 let content_provider = state.content_provider();
                 let get_artifacts =
-                    |target_uri: &Url| -> Option<crate::cross_file::scope::ScopeArtifacts> {
+                    |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
                         content_provider.get_artifacts(target_uri)
                     };
                 let get_metadata =
@@ -1683,6 +1696,7 @@ impl LanguageServer for Backend {
                     &empty_base_exports,
                     false, // package prefetching doesn't need hoisting
                     state.cross_file_config.backward_dependencies,
+                    &|| false, // package prefetching, no cancellation
                 );
 
                 let mut pkgs = scope.inherited_packages;
@@ -1929,9 +1943,11 @@ impl LanguageServer for Backend {
             // Edge changes affect cycle detection diagnostics in dependent files
             // (e.g., commenting out a source() call breaks a cycle).
             if interface_changed || edges_changed {
-                let dependents = state
-                    .cross_file_graph
-                    .get_transitive_dependents(&uri, state.cross_file_config.max_chain_depth);
+                let dependents = state.cross_file_graph.get_transitive_dependents(
+                    &uri,
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                );
                 // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
@@ -2406,6 +2422,7 @@ impl LanguageServer for Backend {
                         let dependents = state.cross_file_graph.get_transitive_dependents(
                             uri,
                             state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
                             if state.documents.contains_key(&dep) && !affected.contains(&dep) {
@@ -2420,6 +2437,7 @@ impl LanguageServer for Backend {
                         let dependents = state.cross_file_graph.get_transitive_dependents(
                             uri,
                             state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
                             if state.documents.contains_key(&dep) && !affected.contains(&dep) {
@@ -2480,7 +2498,7 @@ impl LanguageServer for Backend {
 
                     // Compute metadata and artifacts
                     let cross_file_meta = crate::cross_file::extract_metadata(&content);
-                    let artifacts = {
+                    let artifacts = std::sync::Arc::new({
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
                             if let Some(tree) = parser.parse(&content, None) {
@@ -2498,7 +2516,7 @@ impl LanguageServer for Backend {
                         } else {
                             crate::cross_file::scope::ScopeArtifacts::default()
                         }
-                    };
+                    });
 
                     let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(
                         &metadata, &content,
@@ -3111,7 +3129,7 @@ impl Backend {
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
         let mut cross_file_meta =
             crate::cross_file::extract_metadata_with_tree(&content, tree.as_ref());
-        let artifacts = match tree.as_ref() {
+        let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 file_uri,
                 tree,
@@ -3119,7 +3137,7 @@ impl Backend {
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
-        };
+        });
 
         let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) =
             {
@@ -3441,7 +3459,7 @@ impl Backend {
             cross_file_meta.inherited_working_directory =
                 Some(inherited_wd.to_string_lossy().to_string());
         }
-        let artifacts = match tree.as_ref() {
+        let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 file_uri,
                 tree,
@@ -3449,7 +3467,7 @@ impl Backend {
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
-        };
+        });
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);

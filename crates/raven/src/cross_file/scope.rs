@@ -1544,7 +1544,7 @@ pub fn scope_at_position_with_deps<F>(
     max_depth: usize,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
 {
     log::trace!("Resolving scope at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
@@ -1590,7 +1590,7 @@ where
 /// use std::collections::HashSet;
 ///
 /// let uri = Url::parse("file:///project/main.R").unwrap();
-/// let get_artifacts = |_u: &Url| -> Option<ScopeArtifacts> { None };
+/// let get_artifacts = |_u: &Url| -> Option<Arc<ScopeArtifacts>> { None };
 /// let resolve_path = |_path: &str, _base: &Url| -> Option<Url> { None };
 /// let mut visited = HashSet::new();
 ///
@@ -1617,7 +1617,7 @@ fn scope_at_position_recursive<F>(
     visited: &mut HashSet<Url>,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
 {
     log::trace!("Traversing to file: {} (depth {})", uri, current_depth);
     let mut scope = ScopeAtPosition::default();
@@ -2301,9 +2301,10 @@ pub fn scope_at_position_with_graph<F, G>(
     base_exports: &HashSet<String>,
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
     let mut visited = HashMap::new();
@@ -2332,6 +2333,7 @@ where
         base_exports,
         hoist_globals,
         backward_dep_mode,
+        is_cancelled,
     )
 }
 
@@ -2364,9 +2366,10 @@ fn scope_at_position_with_graph_recursive<F, G>(
     base_exports: &HashSet<String>,
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> ScopeAtPosition
 where
-    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
     // Initialize scope with inherited_packages from parameter
@@ -2579,6 +2582,11 @@ where
         } else {
             (call_site_line, call_site_col)
         };
+        // Early exit on cancellation before expensive recursive traversal
+        if is_cancelled() {
+            return scope;
+        }
+
         let empty_packages = HashSet::new();
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
@@ -2596,6 +2604,7 @@ where
             base_exports,
             hoist_globals,
             backward_dep_mode,
+            is_cancelled,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -2644,8 +2653,8 @@ where
                             Some(pkg_scope) => {
                                 // Function-scoped package load - only propagate if the source() call
                                 // is within the same function scope
-                                if let Some(parent_artifacts_ref) = get_artifacts(&edge.from) {
-                                    let call_site_scope = parent_artifacts_ref
+                                {
+                                    let call_site_scope = parent_artifacts
                                         .function_scope_tree
                                         .query_innermost(Position::new(
                                             effective_call_site_line,
@@ -2659,8 +2668,6 @@ where
                                             && cs_scope.2 == pkg_scope.end.line
                                             && cs_scope.3 == pkg_scope.end.column
                                     })
-                                } else {
-                                    false
                                 }
                             }
                         };
@@ -2870,6 +2877,11 @@ where
                             }
                         });
 
+                        // Early exit on cancellation before expensive recursive traversal
+                        if is_cancelled() {
+                            return scope;
+                        }
+
                         let child_scope = scope_at_position_with_graph_recursive(
                             &child_uri,
                             u32::MAX, // Include all symbols from sourced file
@@ -2886,6 +2898,7 @@ where
                             base_exports,
                             hoist_globals,
                             backward_dep_mode,
+                            is_cancelled,
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -3279,11 +3292,11 @@ mod tests {
             },
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3310,6 +3323,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -3426,11 +3440,11 @@ mod tests {
         let child_tree = parse_r(child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(artifacts.clone())
+                Some(Arc::new(artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3517,11 +3531,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3548,6 +3562,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -3594,11 +3609,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3625,6 +3640,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         assert!(
@@ -3712,11 +3728,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3744,6 +3760,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         assert!(
@@ -3853,11 +3870,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -3886,6 +3903,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         assert!(
@@ -3918,13 +3936,13 @@ mod tests {
         let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
         let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &uri_a {
-                Some(artifacts_a.clone())
+                Some(Arc::new(artifacts_a.clone()))
             } else if uri == &uri_b {
-                Some(artifacts_b.clone())
+                Some(Arc::new(artifacts_b.clone()))
             } else if uri == &uri_c {
-                Some(artifacts_c.clone())
+                Some(Arc::new(artifacts_c.clone()))
             } else {
                 None
             }
@@ -4019,13 +4037,13 @@ mod tests {
         graph.update_file(&uri_a, &meta_a, Some(&workspace_root), |_| None);
         graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &uri_a {
-                Some(artifacts_a.clone())
+                Some(Arc::new(artifacts_a.clone()))
             } else if uri == &uri_b {
-                Some(artifacts_b.clone())
+                Some(Arc::new(artifacts_b.clone()))
             } else if uri == &uri_c {
-                Some(artifacts_c.clone())
+                Some(Arc::new(artifacts_c.clone()))
             } else {
                 None
             }
@@ -4054,6 +4072,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Should have depth_exceeded entry
@@ -4111,11 +4130,11 @@ mod tests {
         let child_tree = parse_r(child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -4210,13 +4229,13 @@ mod tests {
         graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
         graph.update_file(&loader_uri, &loader_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &main_uri {
-                Some(main_artifacts.clone())
+                Some(Arc::new(main_artifacts.clone()))
             } else if uri == &loader_uri {
-                Some(loader_artifacts.clone())
+                Some(Arc::new(loader_artifacts.clone()))
             } else if uri == &helpers_uri {
-                Some(helpers_artifacts.clone())
+                Some(Arc::new(helpers_artifacts.clone()))
             } else {
                 None
             }
@@ -4248,6 +4267,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -4304,11 +4324,11 @@ mod tests {
 
         graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &main_uri {
-                Some(main_artifacts.clone())
+                Some(Arc::new(main_artifacts.clone()))
             } else if uri == &helpers_uri {
-                Some(helpers_artifacts.clone())
+                Some(Arc::new(helpers_artifacts.clone()))
             } else {
                 None
             }
@@ -4337,6 +4357,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6186,9 +6207,9 @@ mod tests {
         let uri = test_uri();
         let artifacts = compute_artifacts(&uri, &tree, code);
 
-        let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
             if u == &uri {
-                Some(artifacts.clone())
+                Some(Arc::new(artifacts.clone()))
             } else {
                 None
             }
@@ -6213,9 +6234,9 @@ mod tests {
         let uri = test_uri();
         let artifacts = compute_artifacts(&uri, &tree, code);
 
-        let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
             if u == &uri {
-                Some(artifacts.clone())
+                Some(Arc::new(artifacts.clone()))
             } else {
                 None
             }
@@ -6276,11 +6297,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6307,6 +6328,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -6326,6 +6348,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6345,6 +6368,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -6392,11 +6416,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6423,6 +6447,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -6450,6 +6475,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6513,11 +6539,11 @@ mod tests {
             },
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6545,6 +6571,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6604,11 +6631,11 @@ mod tests {
             },
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6635,6 +6662,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6687,11 +6715,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6718,6 +6746,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -6737,6 +6766,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -6756,6 +6786,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -6810,11 +6841,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6841,6 +6872,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -6895,11 +6927,11 @@ mod tests {
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -6926,6 +6958,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -6945,6 +6978,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -7012,13 +7046,13 @@ mod tests {
         graph.update_file(&uri_a, &meta_a, Some(&workspace_root), |_| None);
         graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &uri_a {
-                Some(artifacts_a.clone())
+                Some(Arc::new(artifacts_a.clone()))
             } else if uri == &uri_b {
-                Some(artifacts_b.clone())
+                Some(Arc::new(artifacts_b.clone()))
             } else if uri == &uri_c {
-                Some(artifacts_c.clone())
+                Some(Arc::new(artifacts_c.clone()))
             } else {
                 None
             }
@@ -7047,6 +7081,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -7066,6 +7101,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -7141,13 +7177,13 @@ mod tests {
         };
         graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else if uri == &sourced_uri {
-                Some(sourced_artifacts.clone())
+                Some(Arc::new(sourced_artifacts.clone()))
             } else {
                 None
             }
@@ -7176,6 +7212,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -8838,11 +8875,11 @@ x <- 1"#;
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         // Create artifacts lookup
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -8869,6 +8906,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Child should have inherited dplyr from parent
@@ -8916,11 +8954,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -8947,6 +8985,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -8994,11 +9033,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9025,6 +9064,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Child should have both packages
@@ -9077,11 +9117,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9108,6 +9148,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -9160,11 +9201,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9192,6 +9233,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -9241,11 +9283,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9272,6 +9314,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -9355,13 +9398,13 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &grandparent_uri {
-                Some(grandparent_artifacts.clone())
+                Some(Arc::new(grandparent_artifacts.clone()))
             } else if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9390,6 +9433,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -9413,6 +9457,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -9463,11 +9508,11 @@ x <- 1"#;
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::new(child_artifacts.clone()))
             } else {
                 None
             }
@@ -9494,6 +9539,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -9517,6 +9563,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -10026,8 +10073,8 @@ y <- filter(df)"#;
             let uri = test_uri();
             let artifacts = compute_artifacts(&uri, &tree, code);
 
-            let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
-                if u == &uri { Some(artifacts.clone()) } else { None }
+            let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if u == &uri { Some(Arc::new(artifacts.clone())) } else { None }
             };
             let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
@@ -10045,6 +10092,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true, // hoisting ON
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10065,6 +10113,7 @@ y <- filter(df)"#;
                 &base_exports,
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10088,9 +10137,9 @@ y <- filter(df)"#;
             let child_uri = Url::parse("file:///child.R").unwrap();
             let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
-            let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
-                if u == &parent_uri { Some(parent_artifacts.clone()) }
-                else if u == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if u == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if u == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
@@ -10110,6 +10159,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10199,10 +10249,10 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10226,6 +10276,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10283,10 +10334,10 @@ y <- filter(df)"#;
             graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
             graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &a_uri { Some(a_artifacts.clone()) }
-                else if uri == &b_uri { Some(b_artifacts.clone()) }
-                else if uri == &c_uri { Some(c_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &a_uri { Some(Arc::new(a_artifacts.clone())) }
+                else if uri == &b_uri { Some(Arc::new(b_artifacts.clone())) }
+                else if uri == &c_uri { Some(Arc::new(c_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |_uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10308,6 +10359,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10411,11 +10463,11 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &middle_uri { Some(middle_artifacts.clone()) }
-                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &middle_uri { Some(Arc::new(middle_artifacts.clone())) }
+                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10440,6 +10492,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10535,11 +10588,11 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling1_uri { Some(sibling1_artifacts.clone()) }
-                else if uri == &sibling2_uri { Some(sibling2_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling1_uri { Some(Arc::new(sibling1_artifacts.clone())) }
+                else if uri == &sibling2_uri { Some(Arc::new(sibling2_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10563,6 +10616,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10652,10 +10706,10 @@ y <- filter(df)"#;
             graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
             graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &a_uri { Some(a_artifacts.clone()) }
-                else if uri == &b_uri { Some(b_artifacts.clone()) }
-                else if uri == &c_uri { Some(c_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &a_uri { Some(Arc::new(a_artifacts.clone())) }
+                else if uri == &b_uri { Some(Arc::new(b_artifacts.clone())) }
+                else if uri == &c_uri { Some(Arc::new(c_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10679,6 +10733,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10773,11 +10828,11 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10801,6 +10856,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10877,10 +10933,10 @@ y <- filter(df)"#;
                 }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -10905,6 +10961,7 @@ y <- filter(df)"#;
                 &base_exports,
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -10993,10 +11050,10 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11020,6 +11077,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11083,9 +11141,9 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11108,6 +11166,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11178,10 +11237,10 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11205,6 +11264,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true, // hoisting ON, but query is at global level
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             // At global level, parent is queried at call site (line 0 col 0),
@@ -11302,11 +11362,11 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &grandparent_uri { Some(grandparent_artifacts.clone()) }
-                else if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
+                else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11330,6 +11390,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11421,11 +11482,11 @@ y <- filter(df)"#;
                 if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
             });
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-                if uri == &parent_uri { Some(parent_artifacts.clone()) }
-                else if uri == &helper_uri { Some(helper_artifacts.clone()) }
-                else if uri == &leaf_uri { Some(leaf_artifacts.clone()) }
-                else if uri == &child_uri { Some(child_artifacts.clone()) }
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
+                else if uri == &helper_uri { Some(Arc::new(helper_artifacts.clone())) }
+                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
+                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
                 else { None }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
@@ -11449,6 +11510,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11507,11 +11569,11 @@ y <- filter(df)"#;
             let child_meta = CrossFileMetadata::default(); // No sourced_by!
             graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11540,6 +11602,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11618,13 +11681,13 @@ y <- filter(df)"#;
             graph.update_file(&parent_b_uri, &parent_b_meta, Some(&workspace_root), |_| None);
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_a_uri {
-                    Some(parent_a_artifacts.clone())
+                    Some(Arc::new(parent_a_artifacts.clone()))
                 } else if uri == &parent_b_uri {
-                    Some(parent_b_artifacts.clone())
+                    Some(Arc::new(parent_b_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11655,6 +11718,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11706,11 +11770,11 @@ y <- filter(df)"#;
             let child_meta = CrossFileMetadata::default();
             graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11739,6 +11803,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -11835,13 +11900,13 @@ y <- filter(df)"#;
             graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
             graph.update_file(&runner_uri, &runner_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &main_uri {
-                    Some(main_artifacts.clone())
+                    Some(Arc::new(main_artifacts.clone()))
                 } else if uri == &runner_uri {
-                    Some(runner_artifacts.clone())
+                    Some(Arc::new(runner_artifacts.clone()))
                 } else if uri == &format_uri {
-                    Some(format_artifacts.clone())
+                    Some(Arc::new(format_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11873,6 +11938,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11899,6 +11965,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(
@@ -11950,11 +12017,11 @@ y <- filter(df)"#;
             let child_meta = CrossFileMetadata::default();
             graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::new(parent_artifacts.clone()))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::new(child_artifacts.clone()))
                 } else {
                     None
                 }
@@ -11983,6 +12050,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
             );
 
             assert!(

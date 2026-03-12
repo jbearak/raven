@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::{Position, Url};
 
@@ -889,7 +890,7 @@ pub fn dump_graph(graph: &DependencyGraph) -> String {
 /// assert_eq!(dependents.len(), 1); // main.r depends on utils.r
 /// ```
 pub fn get_transitive_dependents(graph: &DependencyGraph, uri: &Url, max_depth: usize) -> Vec<Url> {
-    graph.get_transitive_dependents(uri, max_depth)
+    graph.get_transitive_dependents(uri, max_depth, 200)
 }
 
 // ============================================================================
@@ -4781,11 +4782,14 @@ child_var <- 100
 
         println!("\nStep 3: Test scope resolution at different positions");
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let child_artifacts = Arc::new(child_artifacts);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -4813,6 +4817,7 @@ child_var <- 100
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -4839,6 +4844,7 @@ child_var <- 100
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -4864,6 +4870,7 @@ child_var <- 100
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -4962,11 +4969,14 @@ x <- 1
             content_provider,
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let child_artifacts = Arc::new(child_artifacts);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts.clone())
+                Some(Arc::clone(&parent_artifacts))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -4993,6 +5003,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -5015,6 +5026,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -5103,11 +5115,14 @@ x <- 1
                 content_provider,
             );
 
-            let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            let parent_artifacts = Arc::new(parent_artifacts);
+            let child_artifacts = Arc::new(child_artifacts);
+
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
                 if uri == &parent_uri {
-                    Some(parent_artifacts.clone())
+                    Some(Arc::clone(&parent_artifacts))
                 } else if uri == &child_uri {
-                    Some(child_artifacts.clone())
+                    Some(Arc::clone(&child_artifacts))
                 } else {
                     None
                 }
@@ -5134,6 +5149,7 @@ x <- 1
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
             );
 
             assert!(
@@ -5572,7 +5588,7 @@ x <- 1
         );
 
         let child_tree = parse_r_tree(child_content);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+        let child_artifacts = Arc::new(compute_artifacts(&child_uri, &child_tree, child_content));
 
         // Build dependency graph
         let workspace_root = Url::from_file_path(workspace.root()).unwrap();
@@ -5595,11 +5611,12 @@ x <- 1
         );
 
         // Test scope - child symbols should NOT be available
-        let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let parent_artifacts_v1 = Arc::new(parent_artifacts_v1);
+        let get_artifacts_v1 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v1.clone())
+                Some(Arc::clone(&parent_artifacts_v1))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5625,6 +5642,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -5671,11 +5689,12 @@ x <- 1
         );
 
         // Test scope - child symbols SHOULD now be available
-        let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let parent_artifacts_v2 = Arc::new(parent_artifacts_v2);
+        let get_artifacts_v2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v2.clone())
+                Some(Arc::clone(&parent_artifacts_v2))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5701,6 +5720,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -5749,7 +5769,7 @@ x <- 1
         );
 
         let child_tree = parse_r_tree(child_content);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
+        let child_artifacts = Arc::new(compute_artifacts(&child_uri, &child_tree, child_content));
 
         // Build dependency graph
         let workspace_root = Url::from_file_path(workspace.root()).unwrap();
@@ -5772,11 +5792,12 @@ x <- 1
         );
 
         // Test scope - child symbols SHOULD be available
-        let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let parent_artifacts_v1 = Arc::new(parent_artifacts_v1);
+        let get_artifacts_v1 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v1.clone())
+                Some(Arc::clone(&parent_artifacts_v1))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5802,6 +5823,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -5848,11 +5870,12 @@ x <- 1
         );
 
         // Test scope - child symbols should NOT be available anymore
-        let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
+        let parent_artifacts_v2 = Arc::new(parent_artifacts_v2);
+        let get_artifacts_v2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &parent_uri {
-                Some(parent_artifacts_v2.clone())
+                Some(Arc::clone(&parent_artifacts_v2))
             } else if uri == &child_uri {
-                Some(child_artifacts.clone())
+                Some(Arc::clone(&child_artifacts))
             } else {
                 None
             }
@@ -5878,6 +5901,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         assert!(
@@ -6025,10 +6049,14 @@ mod cross_directory_hoisting_tests {
             "Child should have backward edge from parent"
         );
 
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
+        let parent_artifacts = Arc::new(parent_artifacts);
+        let sibling_artifacts = Arc::new(sibling_artifacts);
+        let child_artifacts = Arc::new(child_artifacts);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
+            else if uri == &sibling_uri { Some(Arc::clone(&sibling_artifacts)) }
+            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
             else { None }
         };
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
@@ -6052,6 +6080,7 @@ mod cross_directory_hoisting_tests {
             &base_exports,
             true,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
         );
 
         println!("  Scope symbols: {:?}", scope.symbols.keys().collect::<Vec<_>>());

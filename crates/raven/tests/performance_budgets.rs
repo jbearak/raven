@@ -13,6 +13,7 @@
 // Only compile in release mode — debug timings are meaningless.
 #![cfg(not(debug_assertions))]
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -367,20 +368,20 @@ data <- data.frame(x = 1:100, y = rnorm(100))
 }
 
 // ---------------------------------------------------------------------------
-// Scope resolution budget
-// Requirements: 2.1 — 50-file workspace < 50ms
+// Scope resolution budget helpers
 // ---------------------------------------------------------------------------
 
-#[test]
-fn budget_scope_resolution_50_file_workspace() {
-    // Create a 50-file workspace (medium preset)
+fn assert_scope_resolution_budget_50_file_workspace(
+    mode: raven::cross_file::config::BackwardDependencyMode,
+    label: &str,
+    budget_ms: u64,
+) {
     let config = FixtureConfig::medium(); // 50 files, 10 funcs, depth 10
     let workspace = create_fixture_workspace(&config);
     let workspace_path = workspace.path();
     let folder_url = Url::from_file_path(workspace_path).unwrap();
 
-    // Pre-compute artifacts and metadata for all files (same pattern as cross_file bench)
-    let mut artifacts_map: HashMap<Url, raven::cross_file::ScopeArtifacts> = HashMap::new();
+    let mut artifacts_map: HashMap<Url, Arc<raven::cross_file::ScopeArtifacts>> = HashMap::new();
     let mut metadata_map: HashMap<Url, raven::cross_file::types::CrossFileMetadata> =
         HashMap::new();
 
@@ -405,12 +406,13 @@ fn budget_scope_resolution_50_file_workspace() {
         let tree = raven::parser_pool::with_parser(|parser| parser.parse(&content, None));
         if let Some(tree) = tree {
             let arts = raven::cross_file::compute_artifacts(&uri, &tree, &content);
-            artifacts_map.insert(uri.clone(), arts);
+            artifacts_map.insert(uri.clone(), Arc::new(arts));
         }
         metadata_map.insert(uri, meta);
     }
 
-    // Build dependency graph
+    // Build dependency graph — graph construction is the same regardless of mode.
+    // Auto mode changes which backward edges the scope resolution traversal follows.
     let mut graph = raven::cross_file::DependencyGraph::new();
     for (uri, meta) in &metadata_map {
         graph.update_file(uri, meta, Some(&folder_url), |_| None);
@@ -418,6 +420,7 @@ fn budget_scope_resolution_50_file_workspace() {
 
     let uri = Url::from_file_path(workspace_path.join("file_0.R")).unwrap();
     let base_exports: HashSet<String> = HashSet::new();
+    let never_cancel = || false;
 
     // Warm up
     let _ = raven::cross_file::scope_at_position_with_graph(
@@ -431,7 +434,8 @@ fn budget_scope_resolution_50_file_workspace() {
         20,
         &base_exports,
         true,
-        raven::cross_file::config::BackwardDependencyMode::Explicit,
+        mode,
+        &never_cancel,
     );
 
     let elapsed = median_of_3(|| {
@@ -446,11 +450,40 @@ fn budget_scope_resolution_50_file_workspace() {
             20,
             &base_exports,
             true,
-            raven::cross_file::config::BackwardDependencyMode::Explicit,
+            mode,
+            &never_cancel,
         );
     });
 
-    assert_within_budget("scope_resolution_50_files", elapsed, 50);
+    assert_within_budget(label, elapsed, budget_ms);
+}
+
+// ---------------------------------------------------------------------------
+// Scope resolution budget
+// Requirements: 2.1 — 50-file workspace < 50ms
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_scope_resolution_50_file_workspace() {
+    assert_scope_resolution_budget_50_file_workspace(
+        raven::cross_file::config::BackwardDependencyMode::Explicit,
+        "scope_resolution_50_files",
+        50,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scope resolution budget (auto backward dependency mode)
+// Requirements: 2.1 — 50-file workspace with auto backward deps < 75ms
+// ---------------------------------------------------------------------------
+
+#[test]
+fn budget_scope_resolution_50_file_workspace_auto() {
+    assert_scope_resolution_budget_50_file_workspace(
+        raven::cross_file::config::BackwardDependencyMode::Auto,
+        "scope_resolution_50_files_auto",
+        75,
+    );
 }
 
 // ---------------------------------------------------------------------------
