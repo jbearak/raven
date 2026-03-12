@@ -17,6 +17,43 @@ use super::source_detect::{detect_library_calls, detect_rm_calls, detect_source_
 use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 // ============================================================================
+// Line Index for Fast Lookups
+// ============================================================================
+
+/// Helper for O(1) text slice lookups by line number
+#[derive(Debug, Clone)]
+pub struct LineIndex<'a> {
+    pub text: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    pub fn new(text: &'a str) -> Self {
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        Self { text, line_starts }
+    }
+
+    pub fn get_line(&self, row: usize) -> &str {
+        if row >= self.line_starts.len() {
+            return "";
+        }
+        let start = self.line_starts[row];
+        let end = if row + 1 < self.line_starts.len() {
+            self.line_starts[row + 1].saturating_sub(1).min(self.text.len())
+        } else {
+            self.text.len()
+        };
+        if start > self.text.len() || end > self.text.len() || start > end {
+            return "";
+        }
+        let line = &self.text[start..end];
+        line.strip_suffix('\r').unwrap_or(line)
+    }
+}
+
+// ============================================================================
 // Position and Interval Types for Interval Tree
 // ============================================================================
 
@@ -713,9 +750,10 @@ fn apply_removal(
 pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifacts {
     let mut artifacts = ScopeArtifacts::default();
     let root = tree.root_node();
+    let line_index = LineIndex::new(content);
 
     // Collect definitions from AST
-    collect_definitions(root, content, uri, &mut artifacts);
+    collect_definitions(root, &line_index, uri, &mut artifacts);
 
     // Collect source() calls and add them to timeline.
     // Note: even when local=TRUE (or sys.source targets a non-global env), the symbols can still
@@ -885,9 +923,10 @@ pub fn compute_artifacts_with_metadata(
 ) -> ScopeArtifacts {
     let mut artifacts = ScopeArtifacts::default();
     let root = tree.root_node();
+    let line_index = LineIndex::new(content);
 
     // Collect definitions from AST
-    collect_definitions(root, content, uri, &mut artifacts);
+    collect_definitions(root, &line_index, uri, &mut artifacts);
 
     // Collect source() calls from AST and add them to timeline.
     let ast_source_calls = detect_source_calls(tree, content);
@@ -1821,10 +1860,10 @@ where
     scope
 }
 
-fn collect_definitions(node: Node, content: &str, uri: &Url, artifacts: &mut ScopeArtifacts) {
+fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts: &mut ScopeArtifacts) {
     // Check for assignment expressions
     if node.kind() == "binary_operator" {
-        if let Some(symbol) = try_extract_assignment(node, content, uri) {
+        if let Some(symbol) = try_extract_assignment(node, line_index, uri) {
             let event = ScopeEvent::Def {
                 line: symbol.defined_line,
                 column: symbol.defined_column,
@@ -1839,7 +1878,7 @@ fn collect_definitions(node: Node, content: &str, uri: &Url, artifacts: &mut Sco
 
     // Check for assign() calls (Requirement 17.4)
     if node.kind() == "call" {
-        if let Some(symbol) = try_extract_assign_call(node, content, uri) {
+        if let Some(symbol) = try_extract_assign_call(node, line_index, uri) {
             let event = ScopeEvent::Def {
                 line: symbol.defined_line,
                 column: symbol.defined_column,
@@ -1854,7 +1893,7 @@ fn collect_definitions(node: Node, content: &str, uri: &Url, artifacts: &mut Sco
 
     // Check for for loop iterators
     if node.kind() == "for_statement" {
-        if let Some(symbol) = try_extract_for_loop_iterator(node, content, uri) {
+        if let Some(symbol) = try_extract_for_loop_iterator(node, line_index, uri) {
             let event = ScopeEvent::Def {
                 line: symbol.defined_line,
                 column: symbol.defined_column,
@@ -1869,20 +1908,20 @@ fn collect_definitions(node: Node, content: &str, uri: &Url, artifacts: &mut Sco
 
     // Check for function definitions to extract parameter scope
     if node.kind() == "function_definition" {
-        if let Some(function_scope) = try_extract_function_scope(node, content, uri) {
+        if let Some(function_scope) = try_extract_function_scope(node, line_index, uri) {
             artifacts.timeline.push(function_scope);
         }
     }
 
     // Recurse into children
     for child in node.children(&mut node.walk()) {
-        collect_definitions(child, content, uri, artifacts);
+        collect_definitions(child, line_index, uri, artifacts);
     }
 }
 
 /// Extract function parameter scope from function_definition nodes.
 /// Creates ScopedSymbol for each parameter and determines function body boundaries.
-fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<ScopeEvent> {
+fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopeEvent> {
     // tree-sitter-r node shapes have changed across versions; be robust by falling back
     // to scanning children by kind if field lookups fail.
     let params_node = node.child_by_field_name("parameters").or_else(|| {
@@ -1912,7 +1951,7 @@ fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<Sc
             child.kind(),
             "parameter" | "default_parameter" | "identifier" | "dots"
         ) {
-            if let Some(param_symbol) = extract_parameter_symbol(child, content, uri) {
+            if let Some(param_symbol) = extract_parameter_symbol(child, line_index, uri) {
                 parameters.push(param_symbol);
             }
         }
@@ -1923,8 +1962,8 @@ fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<Sc
     let body_end = body_node.end_position();
 
     // Convert to UTF-16 columns
-    let start_line_text = content.lines().nth(body_start.row).unwrap_or("");
-    let end_line_text = content.lines().nth(body_end.row).unwrap_or("");
+    let start_line_text = line_index.get_line(body_start.row);
+    let end_line_text = line_index.get_line(body_end.row);
     let start_column = byte_offset_to_utf16_column(start_line_text, body_start.column);
     let end_column = byte_offset_to_utf16_column(end_line_text, body_end.column);
 
@@ -1938,16 +1977,16 @@ fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<Sc
 }
 
 /// Extract a parameter symbol from a parameter node
-fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+fn extract_parameter_symbol(param_node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
     // Handle different parameter types
     match param_node.kind() {
         "parameter" | "default_parameter" => {
             // Look for identifier or dots child.
             for child in param_node.children(&mut param_node.walk()) {
                 if child.kind() == "identifier" {
-                    let name: Arc<str> = Arc::from(node_text(child, content));
+                    let name: Arc<str> = Arc::from(node_text(child, line_index.text));
                     let start = child.start_position();
-                    let line_text = content.lines().nth(start.row).unwrap_or("");
+                    let line_text = line_index.get_line(start.row);
                     let column = byte_offset_to_utf16_column(line_text, start.column);
 
                     return Some(ScopedSymbol {
@@ -1961,7 +2000,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                     });
                 } else if child.kind() == "dots" {
                     let start = child.start_position();
-                    let line_text = content.lines().nth(start.row).unwrap_or("");
+                    let line_text = line_index.get_line(start.row);
                     let column = byte_offset_to_utf16_column(line_text, start.column);
 
                     return Some(ScopedSymbol {
@@ -1978,9 +2017,9 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
         }
         "identifier" => {
             // Direct identifier (some grammars may use this directly under parameters)
-            let name: Arc<str> = Arc::from(node_text(param_node, content));
+            let name: Arc<str> = Arc::from(node_text(param_node, line_index.text));
             let start = param_node.start_position();
-            let line_text = content.lines().nth(start.row).unwrap_or("");
+            let line_text = line_index.get_line(start.row);
             let column = byte_offset_to_utf16_column(line_text, start.column);
 
             return Some(ScopedSymbol {
@@ -1996,7 +2035,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
         "dots" => {
             // Handle ellipsis (...) parameter when it's the parameter node itself
             let start = param_node.start_position();
-            let line_text = content.lines().nth(start.row).unwrap_or("");
+            let line_text = line_index.get_line(start.row);
             let column = byte_offset_to_utf16_column(line_text, start.column);
 
             return Some(ScopedSymbol {
@@ -2017,10 +2056,10 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
 
 /// Extract definition from assign("name", value) calls.
 /// Only handles string literal names per Requirement 17.4.
-fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
     // Get function name
     let func_node = node.child_by_field_name("function")?;
-    let func_name = node_text(func_node, content);
+    let func_name = node_text(func_node, line_index.text);
 
     if func_name != "assign" {
         return None;
@@ -2035,7 +2074,7 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
         if child.kind() == "argument" {
             // Check if it's a named argument
             if let Some(name_node) = child.child_by_field_name("name") {
-                let arg_name = node_text(name_node, content);
+                let arg_name = node_text(name_node, line_index.text);
                 if arg_name == "x" {
                     // This is the name argument
                     name_arg = child.child_by_field_name("value");
@@ -2057,7 +2096,7 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
     }
 
     // Extract the string content (remove quotes)
-    let name_text = node_text(name_node, content);
+    let name_text = node_text(name_node, line_index.text);
     let name_str = name_text.trim_matches(|c| c == '"' || c == '\'');
 
     if name_str.is_empty() {
@@ -2066,7 +2105,7 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
 
     // Get position with UTF-16 column
     let start = node.start_position();
-    let line_text = content.lines().nth(start.row).unwrap_or("");
+    let line_text = line_index.get_line(start.row);
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ScopedSymbol {
@@ -2082,7 +2121,7 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
 
 /// Extract loop iterator from for_statement nodes.
 /// In R, loop iterators persist after the loop completes.
-fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+fn try_extract_for_loop_iterator(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
     // Get the variable field (iterator)
     let var_node = node.child_by_field_name("variable")?;
 
@@ -2091,11 +2130,11 @@ fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option
         return None;
     }
 
-    let name: Arc<str> = Arc::from(node_text(var_node, content));
+    let name: Arc<str> = Arc::from(node_text(var_node, line_index.text));
 
     // Get position with UTF-16 column
     let start = var_node.start_position();
-    let line_text = content.lines().nth(start.row).unwrap_or("");
+    let line_text = line_index.get_line(start.row);
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ScopedSymbol {
@@ -2109,7 +2148,7 @@ fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option
     })
 }
 
-fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
+fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
     // Check if this is an assignment operator - the operator is a direct child, not a field
     let mut cursor = node.walk();
     let children = crate::parser_pool::non_extra_children(node, &mut cursor);
@@ -2123,14 +2162,14 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     let rhs = children[2];
 
     // Check operator
-    let op_text = node_text(op, content);
+    let op_text = node_text(op, line_index.text);
 
     // Handle -> and ->> operators: RHS is the name, LHS is the value
     if matches!(op_text, "->" | "->>") {
         if rhs.kind() != "identifier" {
             return None;
         }
-        let name_str = node_text(rhs, content);
+        let name_str = node_text(rhs, line_index.text);
 
         // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
         if crate::reserved_words::is_reserved_word(name_str) {
@@ -2138,7 +2177,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
         }
 
         let (kind, signature) = if lhs.kind() == "function_definition" {
-            let sig = extract_function_signature(lhs, name_str, content);
+            let sig = extract_function_signature(lhs, name_str, line_index.text);
             (SymbolKind::Function, Some(sig))
         } else {
             (SymbolKind::Variable, None)
@@ -2146,7 +2185,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
 
         // Position is at RHS (the identifier being defined)
         let start = rhs.start_position();
-        let line_text = content.lines().nth(start.row).unwrap_or("");
+        let line_text = line_index.get_line(start.row);
         let column = byte_offset_to_utf16_column(line_text, start.column);
 
         return Some(ScopedSymbol {
@@ -2169,7 +2208,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     if lhs.kind() != "identifier" {
         return None;
     }
-    let name_str = node_text(lhs, content);
+    let name_str = node_text(lhs, line_index.text);
 
     // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
     if crate::reserved_words::is_reserved_word(name_str) {
@@ -2178,7 +2217,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
 
     // Get the right-hand side to determine kind
     let (kind, signature) = if rhs.kind() == "function_definition" {
-        let sig = extract_function_signature(rhs, name_str, content);
+        let sig = extract_function_signature(rhs, name_str, line_index.text);
         (SymbolKind::Function, Some(sig))
     } else {
         (SymbolKind::Variable, None)
@@ -2186,7 +2225,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
 
     // Get position with UTF-16 column
     let start = lhs.start_position();
-    let line_text = content.lines().nth(start.row).unwrap_or("");
+    let line_text = line_index.get_line(start.row);
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ScopedSymbol {
