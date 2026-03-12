@@ -622,12 +622,14 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbol: ScopedSymbol,
+        function_scope: Option<(u32, u32, u32, u32)>,
     },
     /// A source() call that introduces symbols from another file
     Source {
         line: u32,
         column: u32,
         source: ForwardSource,
+        function_scope: Option<(u32, u32, u32, u32)>,
     },
     /// A function definition that introduces parameter scope
     FunctionScope {
@@ -777,6 +779,38 @@ fn apply_removal(
     }
 }
 
+fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
+    for event in &mut artifacts.timeline {
+        match event {
+            ScopeEvent::Def {
+                line,
+                column,
+                function_scope,
+                ..
+            }
+            | ScopeEvent::Source {
+                line,
+                column,
+                function_scope,
+                ..
+            } => {
+                *function_scope =
+                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+            }
+            ScopeEvent::Removal {
+                line,
+                column,
+                function_scope,
+                ..
+            } => {
+                *function_scope =
+                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Build scope artifacts for a source file by extracting definitions, source() calls, and removals.
 ///
 /// The returned ScopeArtifacts contains a document-ordered timeline of scope events (definitions,
@@ -817,6 +851,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             line: source.line,
             column: source.column,
             source,
+            function_scope: None,
         });
     }
 
@@ -871,18 +906,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         })
         .collect();
     artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
-    for event in &mut artifacts.timeline {
-        if let ScopeEvent::Removal {
-            line,
-            column,
-            function_scope,
-            ..
-        } = event
-        {
-            *function_scope =
-                find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
-        }
-    }
+    annotate_event_function_scopes(&mut artifacts);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     // (Requirements 14.2, 14.4)
@@ -999,6 +1023,7 @@ pub fn compute_artifacts_with_metadata(
             line: source.line,
             column: source.column,
             source,
+            function_scope: None,
         });
     }
 
@@ -1016,6 +1041,7 @@ pub fn compute_artifacts_with_metadata(
                         line: source.line,
                         column: source.column,
                         source: source.clone(),
+                        function_scope: None,
                     });
                 }
             }
@@ -1259,23 +1285,18 @@ pub fn scope_at_position(
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
                 let passes_position = (*def_line, *def_col) <= (line, column);
                 if passes_position || query_inside_function {
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
+                    match function_scope {
                         None => {
                             // Global definition - include (hoisted or positionally valid)
                             scope.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                         Some(def_scope) => {
                             // Function-local definition - only include if positional AND in same function
-                            if passes_position && active_function_scopes.contains(&def_scope) {
+                            if passes_position && active_function_scopes.contains(def_scope) {
                                 scope.symbols.insert(symbol.name.clone(), symbol.clone());
                             }
                         }
@@ -1469,23 +1490,18 @@ where
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
                 let passes_position = (*def_line, *def_col) <= (line, column);
                 if passes_position || query_inside_function {
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
+                    match function_scope {
                         None => {
                             // Global definition - include (hoisted or positionally valid)
                             scope.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                         Some(def_scope) => {
                             // Function-local definition - only include if positional AND in same function
-                            if passes_position && active_function_scopes.contains(&def_scope) {
+                            if passes_position && active_function_scopes.contains(def_scope) {
                                 scope.symbols.insert(symbol.name.clone(), symbol.clone());
                             }
                         }
@@ -1747,18 +1763,14 @@ where
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
 
                     // Skip function-local definitions not in our scope
-                    if let Some(def_scope) = def_function_scope {
-                        if !active_function_scopes.contains(&def_scope) {
+                    if let Some(def_scope) = function_scope {
+                        if !active_function_scopes.contains(def_scope) {
                             continue;
                         }
                     }
@@ -1780,20 +1792,20 @@ where
                 line: src_line,
                 column: src_col,
                 source,
+                function_scope,
             } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
+                    if let Some(src_scope) = function_scope {
+                        if !active_function_scopes.contains(src_scope) {
+                            continue;
+                        }
+                    }
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
-                        // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
-
-                        if let Some(src_scope) = source_function_scope {
-                            if !active_function_scopes.contains(&src_scope) {
+                        if let Some(src_scope) = function_scope {
+                            if !active_function_scopes.contains(src_scope) {
                                 continue;
                             }
                         } else {
@@ -1920,6 +1932,7 @@ fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts:
                 line: symbol.defined_line,
                 column: symbol.defined_column,
                 symbol: symbol.clone(),
+                function_scope: None,
             };
             artifacts.timeline.push(event);
             artifacts
@@ -1935,6 +1948,7 @@ fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts:
                 line: symbol.defined_line,
                 column: symbol.defined_column,
                 symbol: symbol.clone(),
+                function_scope: None,
             };
             artifacts.timeline.push(event);
             artifacts
@@ -1950,6 +1964,7 @@ fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts:
                 line: symbol.defined_line,
                 column: symbol.defined_column,
                 symbol: symbol.clone(),
+                function_scope: None,
             };
             artifacts.timeline.push(event);
             artifacts
@@ -2793,23 +2808,18 @@ where
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
                 let passes_position = (*def_line, *def_col) <= (line, column);
                 if passes_position || query_inside_function {
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
+                    match function_scope {
                         None => {
                             // Global definition - include (hoisted or positionally valid)
                             scope.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                         Some(def_scope) => {
                             // Function-local definition - only include if positional AND in same function
-                            if passes_position && active_function_scopes.contains(&def_scope) {
+                            if passes_position && active_function_scopes.contains(def_scope) {
                                 scope.symbols.insert(symbol.name.clone(), symbol.clone());
                             }
                         }
@@ -2820,28 +2830,22 @@ where
                 line: src_line,
                 column: src_col,
                 source,
+                function_scope,
             } => {
                 // Include source() if before position, or if hoisting and it's a global source()
                 let passes_position = (*src_line, *src_col) < (line, column);
-                let is_global_source = query_inside_function && {
-                    let source_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*src_line, *src_col))
-                        .map(|interval| interval.as_tuple());
-                    source_function_scope.is_none()
-                };
+                if let Some(src_scope) = function_scope {
+                    if !active_function_scopes.contains(src_scope) {
+                        continue;
+                    }
+                }
+                let is_global_source = query_inside_function && function_scope.is_none();
                 if passes_position || is_global_source {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
-                        // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
-
-                        if let Some(src_scope) = source_function_scope {
-                            if !active_function_scopes.contains(&src_scope) {
+                        if let Some(src_scope) = function_scope {
+                            if !active_function_scopes.contains(src_scope) {
                                 continue;
                             }
                         } else {
@@ -2885,10 +2889,7 @@ where
                         // to pass to the child file. The child will have access to these packages
                         // from position (0, 0).
                         // Get the function scope of the source() call for filtering function-scoped packages
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
+                        let source_function_scope = *function_scope;
 
                         let mut extra_packages: HashSet<String> = HashSet::new();
 
@@ -3347,6 +3348,7 @@ mod tests {
                     line,
                     column,
                     symbol,
+                    ..
                 } => {
                     println!("  Def: {} at ({}, {})", symbol.name, line, column);
                 }
@@ -3554,6 +3556,101 @@ mod tests {
         assert!(
             !scope.symbols.contains_key("child_var"),
             "local=TRUE should not leak symbols to global scope"
+        );
+    }
+
+    #[test]
+    fn test_scope_with_graph_local_source_stays_function_scoped() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let parent_code = r#"wrapper <- function() {
+    local_only <- 1
+    source("child.R", local = TRUE)
+    child_var + local_only
+}
+outside_var <- 2"#;
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata =
+            |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope_inside_function = scope_at_position_with_graph(
+            &parent_uri,
+            3,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("child_var"),
+            "child_var should be visible inside the function after source(local=TRUE)"
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("local_only"),
+            "local_only should stay visible inside the containing function"
+        );
+
+        let scope_after_function = scope_at_position_with_graph(
+            &parent_uri,
+            5,
+            12,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            !scope_after_function.symbols.contains_key("child_var"),
+            "child_var should not leak into outer scope after source(local=TRUE)"
+        );
+        assert!(
+            !scope_after_function.symbols.contains_key("local_only"),
+            "local_only should not be visible outside the function"
+        );
+        assert!(
+            scope_after_function.symbols.contains_key("outside_var"),
+            "outside_var should remain visible in outer scope"
         );
     }
 
@@ -4202,6 +4299,7 @@ mod tests {
                 sys_source_global_env: true,
                 ..Default::default()
             },
+            function_scope: None,
         });
         parent_artifacts.timeline.sort_by_key(|e| match e {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
@@ -5037,6 +5135,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
             ScopeEvent::Def {
                 line: 5,
@@ -5050,6 +5149,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
         ];
 
@@ -5117,6 +5217,7 @@ mod tests {
                     sys_source_global_env: true,
                     ..Default::default()
                 },
+                function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 4,
@@ -5177,6 +5278,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
             ScopeEvent::Source {
                 line: 3,
@@ -5192,6 +5294,7 @@ mod tests {
                     sys_source_global_env: true,
                     ..Default::default()
                 },
+                function_scope: None,
             },
             ScopeEvent::FunctionScope {
                 start_line: 7,
@@ -5279,6 +5382,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
         ];
 
