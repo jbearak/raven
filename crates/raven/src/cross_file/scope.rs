@@ -22,8 +22,8 @@ use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 /// Helper for O(1) text slice lookups by line number
 #[derive(Debug, Clone)]
-pub struct LineIndex<'a> {
-    pub text: &'a str,
+pub(crate) struct LineIndex<'a> {
+    text: &'a str,
     line_starts: Vec<usize>,
 }
 
@@ -50,6 +50,56 @@ impl<'a> LineIndex<'a> {
         }
         let line = &self.text[start..end];
         line.strip_suffix('\r').unwrap_or(line)
+    }
+}
+
+#[cfg(test)]
+mod line_index_tests {
+    use super::LineIndex;
+
+    #[test]
+    fn empty_string() {
+        let idx = LineIndex::new("");
+        assert_eq!(idx.get_line(0), "");
+        assert_eq!(idx.get_line(1), "");
+    }
+
+    #[test]
+    fn single_line_no_newline() {
+        let idx = LineIndex::new("hello");
+        assert_eq!(idx.get_line(0), "hello");
+        assert_eq!(idx.get_line(1), "");
+    }
+
+    #[test]
+    fn multiple_lf_lines() {
+        let idx = LineIndex::new("foo\nbar\nbaz");
+        assert_eq!(idx.get_line(0), "foo");
+        assert_eq!(idx.get_line(1), "bar");
+        assert_eq!(idx.get_line(2), "baz");
+        assert_eq!(idx.get_line(3), "");
+    }
+
+    #[test]
+    fn crlf_lines() {
+        let idx = LineIndex::new("foo\r\nbar\r\nbaz");
+        assert_eq!(idx.get_line(0), "foo");
+        assert_eq!(idx.get_line(1), "bar");
+        assert_eq!(idx.get_line(2), "baz");
+    }
+
+    #[test]
+    fn trailing_newline() {
+        let idx = LineIndex::new("foo\nbar\n");
+        assert_eq!(idx.get_line(0), "foo");
+        assert_eq!(idx.get_line(1), "bar");
+        assert_eq!(idx.get_line(2), "");
+    }
+
+    #[test]
+    fn out_of_bounds() {
+        let idx = LineIndex::new("foo\nbar");
+        assert_eq!(idx.get_line(99), "");
     }
 }
 
