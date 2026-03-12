@@ -7377,12 +7377,16 @@ fn collect_undefined_variables(
     // Second pass: collect all usages
     collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
 
+    // Pre-compute workspace_imports as a HashSet for O(1) lookups
+    let workspace_imports_set: HashSet<&str> =
+        workspace_imports.iter().map(|s| s.as_str()).collect();
+
     // Report undefined variables
     for (name, node) in used {
         if !defined.contains(&name)
             && !is_builtin(&name)
             && !is_package_export(&name, loaded_packages, package_library)
-            && !workspace_imports.contains(&name)
+            && !workspace_imports_set.contains(name.as_str())
             && !cross_file_symbols.contains_key(&name)
         {
             let start_pos = node.start_position();
