@@ -1333,13 +1333,20 @@ impl PackageLibrary {
             all_exports.len()
         );
 
-        // Collect packages to process: depends + attached_packages (for meta-packages)
+        // Collect packages to process: depends + attached_packages (for meta-packages).
+        // Keep a companion HashSet so deduplication stays O(1) while preserving
+        // the original dependency-first traversal order in the Vec.
         let mut packages_to_process: Vec<String> = package_info.depends.clone();
+        let mut packages_seen: HashSet<&str> = package_info
+            .depends
+            .iter()
+            .map(|dep| dep.as_str())
+            .collect();
 
         // For meta-packages (tidyverse, tidymodels), also process attached packages
         if package_info.is_meta_package {
             for attached in &package_info.attached_packages {
-                if !packages_to_process.contains(attached) {
+                if packages_seen.insert(attached.as_str()) {
                     packages_to_process.push(attached.clone());
                 }
             }
