@@ -188,6 +188,7 @@ Key ideas:
 - Parse `NAMESPACE` exports when available (fast)
 - Detect `exportPattern()` and only then fall back to an R subprocess for accurate expansion
 - If R is unavailable, fall back to `INDEX` parsing (best-effort)
+- When merging `Depends` with meta-package `attached_packages`, keep a companion `HashSet` for dedupe; repeated `Vec::contains()` checks make recursive export expansion quadratic.
 
 All R subprocess calls must:
 - validate user-controlled inputs (package names, paths)
