@@ -802,7 +802,14 @@ y <- second(a, )
         let code = "f(\"(\", ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 7));
-        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("f"));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "f".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
     }
 
     #[test]
@@ -810,7 +817,14 @@ y <- second(a, )
         let code = "g(')', ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 7));
-        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("g"));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "g".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
     }
 
     #[test]
@@ -818,7 +832,14 @@ y <- second(a, )
         let code = "h(`(`, ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 7));
-        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("h"));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "h".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
     }
 
     #[test]
@@ -826,7 +847,14 @@ y <- second(a, )
         let code = "f(\"a\\\"(b\", ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 11));
-        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("f"));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "f".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
     }
 
     #[test]
@@ -834,7 +862,14 @@ y <- second(a, )
         let code = "f(x, # adjust ( balance\n  ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(1, 2));
-        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("f"));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "f".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
     }
 
     #[test]

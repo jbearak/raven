@@ -32,7 +32,7 @@ fn precompute_artifacts(
     let mut metadata_map = HashMap::new();
 
     let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
-        .unwrap()
+        .expect("failed to read workspace directory")
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|ext| ext == "R").unwrap_or(false))
         .collect();
@@ -40,8 +40,10 @@ fn precompute_artifacts(
 
     for entry in &entries {
         let path = entry.path();
-        let content = std::fs::read_to_string(&path).unwrap();
-        let uri = Url::from_file_path(&path).unwrap();
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let uri = Url::from_file_path(&path)
+            .unwrap_or_else(|_| panic!("invalid file path: {}", path.display()));
 
         let meta = extract_metadata(&content);
         let tree = raven::parser_pool::with_parser(|parser| parser.parse(&content, None));
@@ -268,16 +270,31 @@ fn bench_interval_tree_queries(c: &mut Criterion) {
     let the_depths: &[usize] = &[256, 1024, 4096];
     for &depth in the_depths {
         let tree = build_nested_interval_tree(depth);
-        let query_position = Position::new(depth as u32, 0);
 
-        group.bench_with_input(BenchmarkId::new("query_point", depth), &tree, |b, tree| {
-            b.iter(|| black_box(tree.query_point(black_box(query_position))))
-        });
-
+        // Near-leaf: query at the deepest nesting level
+        let leaf_position = Position::new(depth as u32, 0);
         group.bench_with_input(
-            BenchmarkId::new("query_innermost", depth),
+            BenchmarkId::new("query_point_leaf", depth),
             &tree,
-            |b, tree| b.iter(|| black_box(tree.query_innermost(black_box(query_position)))),
+            |b, tree| b.iter(|| black_box(tree.query_point(black_box(leaf_position)))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("query_innermost_leaf", depth),
+            &tree,
+            |b, tree| b.iter(|| black_box(tree.query_innermost(black_box(leaf_position)))),
+        );
+
+        // Near-root: query at the shallowest nesting level
+        let root_position = Position::new(1, 0);
+        group.bench_with_input(
+            BenchmarkId::new("query_point_root", depth),
+            &tree,
+            |b, tree| b.iter(|| black_box(tree.query_point(black_box(root_position)))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("query_innermost_root", depth),
+            &tree,
+            |b, tree| b.iter(|| black_box(tree.query_innermost(black_box(root_position)))),
         );
     }
 

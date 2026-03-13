@@ -130,9 +130,10 @@ fn bench_workspace_scan(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("scan", *label), &workspace, |b, ws| {
             let folder_url = Url::from_file_path(ws.path()).unwrap();
+            let folder_urls = [folder_url];
             b.iter(|| {
                 black_box(raven::state::scan_workspace(
-                    black_box(&[folder_url.clone()]),
+                    black_box(&folder_urls),
                     20, // default max_chain_depth
                 ))
             })

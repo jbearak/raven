@@ -3168,7 +3168,14 @@ async fn collect_missing_file_diagnostics_standalone(
 
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
+            if source.is_directive {
+                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+            } else {
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                    &source.path,
+                    ctx,
+                )
+            }
         });
         if let Some(path) = resolved {
             if let Some(root) = &workspace_root {
@@ -3401,11 +3408,18 @@ fn collect_missing_file_diagnostics(
         .and_then(|w| w.to_file_path().ok());
 
     // Check forward sources (source() calls and @lsp-source directives)
-    // Uses workspace-root fallback for files without @lsp-cd directives
+    // Workspace-root fallback is for AST source() calls only, not directives
     // _Requirements: 6.1, 6.3_ (for @lsp-source directive missing file diagnostics)
     for source in &meta.sources {
         let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
+            if source.is_directive {
+                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+            } else {
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                    &source.path,
+                    ctx,
+                )
+            }
         });
         if let Some(path) = resolved_path {
             // Guard against paths outside workspace
@@ -3561,10 +3575,17 @@ pub async fn collect_missing_file_diagnostics_async(
     // Collect all URIs to check: (uri, path, line, col, is_backward, is_directive)
     let mut uris_to_check: Vec<(Url, String, u32, u32, bool, bool)> = Vec::new();
 
-    // Uses workspace-root fallback for files without @lsp-cd directives
+    // Workspace-root fallback is for AST source() calls only, not directives
     for source in &meta.sources {
         let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
+            if source.is_directive {
+                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+            } else {
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                    &source.path,
+                    ctx,
+                )
+            }
         });
         if let Some(path) = resolved_path {
             // Guard against paths outside workspace
@@ -3928,12 +3949,9 @@ fn collect_redundant_directive_diagnostics(
 
     // For each directive source, check if there's an AST source to the same file at an earlier line
     for directive in &directive_sources {
-        // Resolve the directive's target path
+        // Resolve the directive's target path (directives never use workspace-root fallback)
         let directive_target =
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                &directive.path,
-                &path_ctx,
-            );
+            crate::cross_file::path_resolve::resolve_path(&directive.path, &path_ctx);
         let directive_target = match directive_target {
             Some(path) => path,
             None => continue,
@@ -4086,7 +4104,14 @@ fn collect_missing_file_diagnostics_from_snapshot(
 
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
+            if source.is_directive {
+                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+            } else {
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                    &source.path,
+                    ctx,
+                )
+            }
         });
         if resolved.is_none() {
             let message = if source.is_directive {
@@ -4416,10 +4441,14 @@ fn collect_undefined_variables_from_snapshot(
         .filter(|source| source.inherits_symbols())
         .filter_map(|source| {
             let ctx = source_path_ctx.as_ref()?;
-            let resolved = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                &source.path,
-                ctx,
-            )?;
+            let resolved = if source.is_directive {
+                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+            } else {
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                    &source.path,
+                    ctx,
+                )
+            }?;
             let source_uri = Url::from_file_path(resolved).ok()?;
             Some((source.line, source.column, source_uri))
         })
@@ -7005,7 +7034,9 @@ pub(crate) fn collect_undefined_variables_position_aware(
 ) {
     use crate::content_provider::ContentProvider;
     use crate::cross_file::config::BackwardDependencyMode;
-    use crate::cross_file::path_resolve::{resolve_path_with_workspace_fallback, PathContext};
+    use crate::cross_file::path_resolve::{
+        resolve_path, resolve_path_with_workspace_fallback, PathContext,
+    };
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     // Backward dependency mode gating:
@@ -7094,7 +7125,11 @@ pub(crate) fn collect_undefined_variables_position_aware(
         .filter(|source| source.inherits_symbols())
         .filter_map(|source| {
             let ctx = source_path_ctx.as_ref()?;
-            let resolved = resolve_path_with_workspace_fallback(&source.path, ctx)?;
+            let resolved = if source.is_directive {
+                resolve_path(&source.path, ctx)
+            } else {
+                resolve_path_with_workspace_fallback(&source.path, ctx)
+            }?;
             let source_uri = Url::from_file_path(resolved).ok()?;
             Some((source.line, source.column, source_uri))
         })
