@@ -3704,7 +3704,13 @@ pub async fn start_lsp() -> anyhow::Result<()> {
             Backend::handle_active_documents_changed,
         )
         .finish();
-    Server::new(stdin, stdout, socket).serve(service).await;
+    // Force sequential message processing to prevent out-of-order did_change
+    // notifications from corrupting incremental text sync.
+    // tower-lsp 0.20 defaults to buffer_unordered(4) which can reorder messages.
+    Server::new(stdin, stdout, socket)
+        .concurrency_level(1)
+        .serve(service)
+        .await;
 
     Ok(())
 }
