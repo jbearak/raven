@@ -3634,6 +3634,62 @@ mod tests {
     }
 
     #[test]
+    fn test_local_source_inside_function_visible_in_same_scope() {
+        // source("child.R", local=TRUE) inside a function body should make child
+        // symbols visible when queried from inside that same function, but NOT
+        // from global scope.
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        //                          line 0: f <- function() {
+        //                          line 1:   source("child.R", local = TRUE)
+        //                          line 2:   x <- 1
+        //                          line 3: }
+        let parent_code =
+            "f <- function() {\n  source(\"child.R\", local = TRUE)\n  x <- 1\n}";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        // Query from inside f (line 2) — child_var should be visible
+        let scope_inside =
+            scope_at_position_with_deps(&parent_uri, 2, 5, &get_artifacts, &resolve_path, 10);
+        assert!(
+            scope_inside.symbols.contains_key("child_var"),
+            "local=TRUE source inside function should be visible when queried from same function"
+        );
+
+        // Query from global scope (after f) — child_var should NOT be visible
+        let scope_outside =
+            scope_at_position_with_deps(&parent_uri, 10, 0, &get_artifacts, &resolve_path, 10);
+        assert!(
+            !scope_outside.symbols.contains_key("child_var"),
+            "local=TRUE source inside function should NOT be visible at global scope"
+        );
+    }
+
+    #[test]
     fn test_scope_at_position_with_graph() {
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
