@@ -178,7 +178,7 @@ impl Position {
 }
 
 /// A function scope interval with start and end positions
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FunctionScopeInterval {
     pub start: Position,
     pub end: Position,
@@ -622,14 +622,14 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbol: ScopedSymbol,
-        function_scope: Option<(u32, u32, u32, u32)>,
+        function_scope: Option<FunctionScopeInterval>,
     },
     /// A source() call that introduces symbols from another file
     Source {
         line: u32,
         column: u32,
         source: ForwardSource,
-        function_scope: Option<(u32, u32, u32, u32)>,
+        function_scope: Option<FunctionScopeInterval>,
     },
     /// A function definition that introduces parameter scope
     FunctionScope {
@@ -644,7 +644,7 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbols: Vec<String>,
-        function_scope: Option<(u32, u32, u32, u32)>,
+        function_scope: Option<FunctionScopeInterval>,
     },
     /// A package load that introduces symbols from a package
     PackageLoad {
@@ -738,9 +738,21 @@ fn find_containing_function_scope(
     tree: &FunctionScopeTree,
     line: u32,
     column: u32,
-) -> Option<(u32, u32, u32, u32)> {
+) -> Option<FunctionScopeInterval> {
     tree.query_innermost(Position::new(line, column))
-        .map(|interval| interval.as_tuple())
+}
+fn active_function_scopes_at(
+    tree: &FunctionScopeTree,
+    line: u32,
+    column: u32,
+) -> HashSet<FunctionScopeInterval> {
+    if Position::new(line, column).is_full_eof() {
+        HashSet::new()
+    } else {
+        tree.query_point(Position::new(line, column))
+            .into_iter()
+            .collect()
+    }
 }
 /// Remove the given symbols from a computed scope when the removal applies.
 ///
@@ -760,8 +772,8 @@ fn find_containing_function_scope(
 /// ```
 fn apply_removal(
     scope: &mut ScopeAtPosition,
-    active_function_scopes: &[(u32, u32, u32, u32)],
-    removal_scope: Option<(u32, u32, u32, u32)>,
+    active_function_scopes: &HashSet<FunctionScopeInterval>,
+    removal_scope: Option<FunctionScopeInterval>,
     symbols: &[String],
 ) {
     match removal_scope {
@@ -928,8 +940,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             &artifacts.function_scope_tree,
             lib_call.line,
             lib_call.column,
-        )
-        .map(FunctionScopeInterval::from_tuple);
+        );
 
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: lib_call.line,
@@ -1161,8 +1172,7 @@ pub fn compute_artifacts_with_metadata(
             &artifacts.function_scope_tree,
             lib_call.line,
             lib_call.column,
-        )
-        .map(FunctionScopeInterval::from_tuple);
+        );
 
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: lib_call.line,
@@ -1265,16 +1275,8 @@ pub fn scope_at_position(
 
     // Use interval tree for O(log n) query instead of linear scan
     let is_full_eof_position = Position::new(line, column).is_full_eof();
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
@@ -1366,12 +1368,7 @@ pub fn scope_at_position(
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
                             passes_position
-                                && active_function_scopes.iter().any(|active_scope| {
-                                    active_scope.0 == pkg_scope.start.line
-                                        && active_scope.1 == pkg_scope.start.column
-                                        && active_scope.2 == pkg_scope.end.line
-                                        && active_scope.3 == pkg_scope.end.column
-                                })
+                                && active_function_scopes.contains(pkg_scope)
                         }
                     };
 
@@ -1467,16 +1464,8 @@ where
 
     // Use interval tree for O(log n) query instead of linear scan
     let is_full_eof_position = Position::new(line, column).is_full_eof();
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
@@ -1569,12 +1558,7 @@ where
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
                             passes_position
-                                && active_function_scopes.iter().any(|active_scope| {
-                                    active_scope.0 == pkg_scope.start.line
-                                        && active_scope.1 == pkg_scope.start.column
-                                        && active_scope.2 == pkg_scope.end.line
-                                        && active_scope.3 == pkg_scope.end.column
-                                })
+                                && active_function_scopes.contains(pkg_scope)
                         }
                     };
 
@@ -1747,16 +1731,8 @@ where
 
     // Use interval tree for O(log n) query instead of linear scan
     let is_full_eof_position = Position::new(line, column).is_full_eof();
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // Process timeline events up to the requested position
     for event in &artifacts.timeline {
@@ -2535,17 +2511,8 @@ where
     // Compute function scope context early — needed for STEP 1 hoisting.
     // When the query position is inside a function body, STEP 1 should query
     // parents at EOF to get their full global scope (R late-binding semantics).
-    let is_eof_position = line == u32::MAX && column == u32::MAX;
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
@@ -2764,14 +2731,9 @@ where
                                             effective_call_site_line,
                                             effective_call_site_col,
                                         ))
-                                        .map(|interval| interval.as_tuple());
+                                        ;
 
-                                    call_site_scope.is_some_and(|cs_scope| {
-                                        cs_scope.0 == pkg_scope.start.line
-                                            && cs_scope.1 == pkg_scope.start.column
-                                            && cs_scope.2 == pkg_scope.end.line
-                                            && cs_scope.3 == pkg_scope.end.column
-                                    })
+                                    call_site_scope == Some(*pkg_scope)
                                 }
                             }
                         };
@@ -2905,12 +2867,7 @@ where
                                             // Function-scoped package load - only include if:
                                             // 1. The source() call is in the same function scope, OR
                                             // 2. The source() call is nested within the package's function scope
-                                            source_function_scope.is_some_and(|src_scope| {
-                                                src_scope.0 == pkg_scope.start.line
-                                                    && src_scope.1 == pkg_scope.start.column
-                                                    && src_scope.2 == pkg_scope.end.line
-                                                    && src_scope.3 == pkg_scope.end.column
-                                            })
+                                            source_function_scope == Some(*pkg_scope)
                                         }
                                     };
 
@@ -3061,12 +3018,7 @@ where
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
                             passes_position
-                                && active_function_scopes.iter().any(|active_scope| {
-                                    active_scope.0 == pkg_scope.start.line
-                                        && active_scope.1 == pkg_scope.start.column
-                                        && active_scope.2 == pkg_scope.end.line
-                                        && active_scope.3 == pkg_scope.end.column
-                                })
+                                && active_function_scopes.contains(pkg_scope)
                         }
                     };
 
