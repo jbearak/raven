@@ -740,6 +740,30 @@ fn find_containing_function_scope(
     tree.query_innermost(Position::new(line, column))
         .map(|interval| interval.as_tuple())
 }
+
+/// Returns `true` when a `Source` event's symbols should be visible given
+/// the active function scopes at the query position.
+///
+/// Non-local sources are always visible. Local sources (`local=TRUE` or
+/// `sys.source` into a non-global env) are visible only when the source
+/// call is inside one of the active function scopes; a local source at
+/// top-level is never visible in global scope.
+fn is_source_visible_in_active_scopes(
+    source: &ForwardSource,
+    function_scope_tree: &FunctionScopeTree,
+    src_line: u32,
+    src_col: u32,
+    active_function_scopes: &[(u32, u32, u32, u32)],
+) -> bool {
+    if !should_apply_local_scoping(source) {
+        return true;
+    }
+    match find_containing_function_scope(function_scope_tree, src_line, src_col) {
+        Some(src_scope) => active_function_scopes.contains(&src_scope),
+        None => false,
+    }
+}
+
 /// Remove the given symbols from a computed scope when the removal applies.
 ///
 /// If `removal_scope` is `None`, this removes all listed `symbols` from `scope.symbols`.
@@ -1783,23 +1807,14 @@ where
             } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
-                    // If this is a local-only source (or sys.source into a non-global env), only
-                    // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source) {
-                        // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
-
-                        if let Some(src_scope) = source_function_scope {
-                            if !active_function_scopes.contains(&src_scope) {
-                                continue;
-                            }
-                        } else {
-                            // local=TRUE at top-level doesn't contribute to global scope
-                            continue;
-                        }
+                    if !is_source_visible_in_active_scopes(
+                        source,
+                        &artifacts.function_scope_tree,
+                        *src_line,
+                        *src_col,
+                        &active_function_scopes,
+                    ) {
+                        continue;
                     }
 
                     // Resolve the path and get symbols from sourced file
@@ -2831,23 +2846,14 @@ where
                     source_function_scope.is_none()
                 };
                 if passes_position || is_global_source {
-                    // If this is a local-only source (or sys.source into a non-global env), only
-                    // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source) {
-                        // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
-
-                        if let Some(src_scope) = source_function_scope {
-                            if !active_function_scopes.contains(&src_scope) {
-                                continue;
-                            }
-                        } else {
-                            // local=TRUE at top-level doesn't contribute to global scope
-                            continue;
-                        }
+                    if !is_source_visible_in_active_scopes(
+                        source,
+                        &artifacts.function_scope_tree,
+                        *src_line,
+                        *src_col,
+                        &active_function_scopes,
+                    ) {
+                        continue;
                     }
 
                     // Resolve the child URI: prefer pre-computed dependency graph edges
@@ -3582,6 +3588,48 @@ mod tests {
         assert!(
             source_events[0].inherits_symbols(),
             "Source should inherit symbols by default"
+        );
+    }
+
+    #[test]
+    fn test_nonlocal_source_inside_function_visible_globally() {
+        // source() without local=TRUE inside a function body modifies the global
+        // environment, so its symbols should be visible at global scope.
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        let parent_code = "f <- function() {\n  source(\"child.R\")\n}\nf()";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        // Query at end of file (global scope, outside f)
+        let scope =
+            scope_at_position_with_deps(&parent_uri, 10, 0, &get_artifacts, &resolve_path, 10);
+        assert!(
+            scope.symbols.contains_key("child_var"),
+            "non-local source() inside a function should make symbols visible at global scope"
         );
     }
 
