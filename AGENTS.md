@@ -23,9 +23,6 @@ Code (authoritative for behavior):
 - Indentation: `crates/raven/src/indentation/`
 - Packages: `crates/raven/src/package_library.rs`, `crates/raven/src/r_subprocess.rs`
 
-Reference implementation:
-- `sight/` (git submodule) is the TypeScript reference implementation for several cross-file UX patterns.
-
 ## Documentation requirements
 
 When making significant changes:
@@ -128,7 +125,7 @@ When making significant changes:
 - Use `peek()` (not `get()`) for LRU reads under `RwLock` read locks — `get()` promotes the entry (mutates) and requires `&mut self`, while `peek()` takes `&self` and keeps reads concurrent.
 - When migrating from reject-at-limit to LRU eviction, update property tests: entries can be silently evicted, so "was_present" tracking based on prior inserts becomes unreliable.
 - Tree-sitter wraps incomplete expressions inside blocks (e.g., `x <-` inside `if (TRUE) { }`) in a single ERROR node spanning the entire block. Use content-line detection to place diagnostics on the first line with actual code content (not structural keywords or braces). When *emitting* diagnostics, emit once per ERROR node and do not recurse into ERROR children to avoid duplicates (but content-line detection may need to traverse ERROR subtrees to find the first content token).
-- Backward directives and working directory directives are header-only: they must appear before any code (matching Sight). When tracking the header boundary in the parsing loop, check *before* the `@lsp-` pre-filter so code lines without directives still end the header.
+- Backward directives and working directory directives are header-only: they must appear before any code. When tracking the header boundary in the parsing loop, check *before* the `@lsp-` pre-filter so code lines without directives still end the header.
 - VS Code auto-closing pairs (e.g., `(` → `()`) mean that when `onTypeFormatting` fires after Enter, the closing delimiter is already present in the document. A line containing only a closing delimiter (with optional whitespace) should be treated as "inside parens/braces" for indentation, not as a "closing delimiter line" — the delimiter was pushed down by the Enter press and the user wants content-level indentation.
 - "Ambiguous parent" diagnostics are misleading: a file being sourced by multiple parents is a valid use case, not an error. The diagnostic was removed entirely (previously controlled by `ambiguous_parent_severity` config).
 - Backward and forward directives support `line=eof` and `line=end` as synonyms for "use scope at end of file" — useful when a parent file sources multiple helpers and child functions need access to all of them.
