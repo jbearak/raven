@@ -787,15 +787,28 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
                 column,
                 function_scope,
                 ..
-            }
-            | ScopeEvent::Source {
-                line,
-                column,
-                function_scope,
-                ..
             } => {
                 *function_scope =
                     find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+            }
+            ScopeEvent::Source {
+                line,
+                column,
+                function_scope,
+                source,
+                ..
+            } => {
+                // Only set function_scope for local-scoped source calls.
+                // Non-local source() (the default) evaluates in .GlobalEnv,
+                // so its symbols should be globally visible regardless of
+                // where the call site is.
+                if should_apply_local_scoping(source) {
+                    *function_scope = find_containing_function_scope(
+                        &artifacts.function_scope_tree,
+                        *line,
+                        *column,
+                    );
+                }
             }
             ScopeEvent::Removal {
                 line,
@@ -1793,11 +1806,7 @@ where
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
-                        if let Some(src_scope) = function_scope {
-                            if !active_function_scopes.contains(src_scope) {
-                                continue;
-                            }
-                        } else {
+                        if function_scope.is_none() {
                             // local=TRUE at top-level doesn't contribute to global scope
                             continue;
                         }
@@ -2833,11 +2842,7 @@ where
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
-                        if let Some(src_scope) = function_scope {
-                            if !active_function_scopes.contains(src_scope) {
-                                continue;
-                            }
-                        } else {
+                        if function_scope.is_none() {
                             // local=TRUE at top-level doesn't contribute to global scope
                             continue;
                         }
@@ -3636,6 +3641,106 @@ outside_var <- 2"#;
         assert!(
             !scope_after_function.symbols.contains_key("local_only"),
             "local_only should not be visible outside the function"
+        );
+        assert!(
+            scope_after_function.symbols.contains_key("outside_var"),
+            "outside_var should remain visible in outer scope"
+        );
+    }
+
+    #[test]
+    fn test_scope_with_graph_nonlocal_source_in_function_is_globally_visible() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // source() without local=TRUE inside a function — child symbols should be
+        // globally visible (R's default behavior: source() evaluates in .GlobalEnv).
+        let parent_code = r#"wrapper <- function() {
+    fn_only <- 1
+    source("child.R")
+    child_var + fn_only
+}
+outside_var <- 2"#;
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata =
+            |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Inside the function: child_var should be visible (source is before this point)
+        let scope_inside_function = scope_at_position_with_graph(
+            &parent_uri,
+            3,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("child_var"),
+            "child_var should be visible inside the function after non-local source()"
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("fn_only"),
+            "fn_only should be visible inside its defining function"
+        );
+
+        // Outside the function: child_var should still be visible (non-local source
+        // evaluates in .GlobalEnv, so its symbols are globally available)
+        let scope_after_function = scope_at_position_with_graph(
+            &parent_uri,
+            5,
+            12,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_after_function.symbols.contains_key("child_var"),
+            "child_var should be visible in outer scope after non-local source()"
+        );
+        assert!(
+            !scope_after_function.symbols.contains_key("fn_only"),
+            "fn_only should not leak outside its defining function"
         );
         assert!(
             scope_after_function.symbols.contains_key("outside_var"),
