@@ -83,17 +83,20 @@ pub fn calculate_indentation(
                         opener_col.saturating_add(1)
                     } else {
                         // Indent from function line
-                        get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
+                        get_line_indent(source, opener_line, config.tab_size)
+                            .saturating_add(config.tab_size)
                     }
                 }
                 IndentationStyle::RStudioMinus => {
                     // Always indent from opener line + tab_size
-                    get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
+                    get_line_indent(source, opener_line, config.tab_size)
+                        .saturating_add(config.tab_size)
                 }
                 IndentationStyle::Off => {
                     // Off should be handled before reaching calculate_indentation
                     // (the handler returns None early). Fallback to basic indent.
-                    get_line_indent(source, opener_line, config.tab_size).saturating_add(config.tab_size)
+                    get_line_indent(source, opener_line, config.tab_size)
+                        .saturating_add(config.tab_size)
                 }
             }
         }

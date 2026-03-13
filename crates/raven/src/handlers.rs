@@ -91,9 +91,9 @@ impl DiagnosticsSnapshot {
         let tree = doc.tree.as_ref()?.clone();
         let text = doc.text();
         // Get enriched metadata
-        let mut directive_meta = state.get_enriched_metadata(uri).unwrap_or_else(|| {
-            crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
-        });
+        let mut directive_meta = state
+            .get_enriched_metadata(uri)
+            .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
         let metadata_elapsed = build_start.elapsed();
 
         // Compute inherited working directory if needed
@@ -125,7 +125,9 @@ impl DiagnosticsSnapshot {
         let neighborhood_start = std::time::Instant::now();
         let max_depth = state.cross_file_config.max_chain_depth;
         let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-        let neighborhood = state.cross_file_graph.collect_neighborhood(uri, max_depth, max_visited);
+        let neighborhood = state
+            .cross_file_graph
+            .collect_neighborhood(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider();
 
@@ -201,10 +203,9 @@ impl DiagnosticsSnapshot {
         let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
         };
-        let get_metadata =
-            |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-                self.metadata_map.get(target_uri).cloned()
-            };
+        let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+            self.metadata_map.get(target_uri).cloned()
+        };
 
         let is_cancelled = || cancel.is_cancelled();
 
@@ -266,9 +267,7 @@ pub(crate) fn diagnostics_from_snapshot(
 
             let message = match closing_line_1based {
                 Some(cl) => {
-                    format!(
-                        "Circular dependency: {closing_file} line {cl} sources this file"
-                    )
+                    format!("Circular dependency: {closing_file} line {cl} sources this file")
                 }
                 _ => {
                     format!("Circular dependency: {closing_file} sources this file")
@@ -303,7 +302,10 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_invalid_line_param_diagnostics(&snapshot.directive_meta, &mut diagnostics);
 
     if cancel.is_cancelled() {
-        log::trace!("Diagnostics cancelled after fast collectors ({}ms)", start.elapsed().as_millis());
+        log::trace!(
+            "Diagnostics cancelled after fast collectors ({}ms)",
+            start.elapsed().as_millis()
+        );
         return None;
     }
 
@@ -324,7 +326,10 @@ pub(crate) fn diagnostics_from_snapshot(
     );
 
     if cancel.is_cancelled() {
-        log::trace!("Diagnostics cancelled after out-of-scope ({}ms)", start.elapsed().as_millis());
+        log::trace!(
+            "Diagnostics cancelled after out-of-scope ({}ms)",
+            start.elapsed().as_millis()
+        );
         return None;
     }
 
@@ -342,7 +347,10 @@ pub(crate) fn diagnostics_from_snapshot(
     }
 
     if cancel.is_cancelled() {
-        log::trace!("Diagnostics cancelled after undefined-variables ({}ms)", start.elapsed().as_millis());
+        log::trace!(
+            "Diagnostics cancelled after undefined-variables ({}ms)",
+            start.elapsed().as_millis()
+        );
         return None;
     }
 
@@ -2865,9 +2873,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     // Use enriched cross-file metadata from state when available so diagnostics
     // can see source() and library()/require()/loadNamespace() context at open time.
     // Fall back to extraction from current text+tree when metadata is unavailable.
-    let mut directive_meta = state.get_enriched_metadata(uri).unwrap_or_else(|| {
-        crate::cross_file::extract_metadata_with_tree(&text, Some(tree))
-    });
+    let mut directive_meta = state
+        .get_enriched_metadata(uri)
+        .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(tree)));
 
     // Compute inherited working directory for files with backward directives
     // This enables child files to inherit the parent's working directory context
@@ -2948,8 +2956,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
                     .get(&close.from)
                     .map(|d| d.text())
                     .or_else(|| state.cross_file_file_cache.get(&close.from));
-                content
-                    .and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
+                content.and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
             });
 
             let message = match (closing_line_1based, snippet) {
@@ -2959,9 +2966,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
                     )
                 }
                 (Some(cl), None) => {
-                    format!(
-                        "Circular dependency: {closing_file} line {cl} sources this file"
-                    )
+                    format!("Circular dependency: {closing_file} line {cl} sources this file")
                 }
                 _ => {
                     format!("Circular dependency: {closing_file} sources this file")
@@ -3710,13 +3715,22 @@ pub async fn collect_missing_file_diagnostics_async(
 }
 
 /// Collect diagnostics for max chain depth exceeded (Requirement 5.8)
-fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mut Vec<Diagnostic>, cancel: &DiagCancelToken) {
+fn collect_max_depth_diagnostics(
+    state: &WorldState,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+    cancel: &DiagCancelToken,
+) {
     use crate::cross_file::scope;
 
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         if let Some(doc) = state.documents.get(target_uri) {
             if let Some(tree) = &doc.tree {
-                return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
+                return Some(Arc::new(scope::compute_artifacts(
+                    target_uri,
+                    tree,
+                    &doc.text(),
+                )));
             }
         }
         if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
@@ -3724,7 +3738,11 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         }
         if let Some(doc) = state.workspace_index.get(target_uri) {
             if let Some(tree) = &doc.tree {
-                return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
+                return Some(Arc::new(scope::compute_artifacts(
+                    target_uri,
+                    tree,
+                    &doc.text(),
+                )));
             }
         }
         None
@@ -3779,7 +3797,6 @@ fn collect_max_depth_diagnostics(state: &WorldState, uri: &Url, diagnostics: &mu
         }
     }
 }
-
 
 /// Emit diagnostics for `library()` calls that reference packages not present in the package library.
 ///
@@ -4012,10 +4029,9 @@ fn collect_max_depth_diagnostics_from_snapshot(
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
-    let get_metadata =
-        |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-            snapshot.metadata_map.get(target_uri).cloned()
-        };
+    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+        snapshot.metadata_map.get(target_uri).cloned()
+    };
 
     let empty_base_exports = HashSet::new();
     let scope_result = scope::scope_at_position_with_graph(
@@ -4070,10 +4086,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
 
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                &source.path,
-                ctx,
-            )
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
         if resolved.is_none() {
             let message = if source.is_directive {
@@ -4103,9 +4116,9 @@ fn collect_missing_file_diagnostics_from_snapshot(
     }
 
     for sourced_by in &meta.sourced_by {
-        let resolved = backward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path(&sourced_by.path, ctx)
-        });
+        let resolved = backward_ctx
+            .as_ref()
+            .and_then(|ctx| crate::cross_file::path_resolve::resolve_path(&sourced_by.path, ctx));
         if resolved.is_none() {
             diagnostics.push(Diagnostic {
                 range: Range {
@@ -4113,10 +4126,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
                     end: Position::new(sourced_by.directive_line, LSP_EOL_CHARACTER),
                 },
                 severity: Some(severity),
-                message: format!(
-                    "Cannot resolve parent path: '{}'",
-                    sourced_by.path
-                ),
+                message: format!("Cannot resolve parent path: '{}'", sourced_by.path),
                 ..Default::default()
             });
         }
@@ -4141,10 +4151,7 @@ fn collect_missing_package_diagnostics_from_snapshot(
     };
 
     for lib_call in &snapshot.directive_meta.library_calls {
-        if crate::cross_file::directive::is_line_ignored(
-            &snapshot.directive_meta,
-            lib_call.line,
-        ) {
+        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, lib_call.line) {
             continue;
         }
         if !snapshot.package_library.package_exists(&lib_call.package) {
@@ -4253,9 +4260,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
         }
-        let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
-            snapshot.get_scope(uri, *usage_line, *usage_col, cancel)
-        });
+        let scope = scope_cache
+            .entry((*usage_line, *usage_col))
+            .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
         if let Some(symbol) = scope.symbols.get(name.as_str()) {
             if symbol.source_uri == *uri {
                 locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
@@ -4279,9 +4286,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             continue;
         }
 
-        let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
-            snapshot.get_scope(uri, *usage_line, *usage_col, cancel)
-        });
+        let scope = scope_cache
+            .entry((*usage_line, *usage_col))
+            .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
 
         if scope.symbols.contains_key(name.as_str()) {
             continue;
@@ -4297,21 +4304,15 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 
             let source_scope = scope_cache
                 .entry((source.line, source.column))
-                .or_insert_with(|| {
-                    snapshot.get_scope(uri, source.line, source.column, cancel)
-                });
+                .or_insert_with(|| snapshot.get_scope(uri, source.line, source.column, cancel));
 
             if source_scope.symbols.contains_key(name.as_str()) {
                 let line_text = get_line(usage_node.start_position().row);
-                let start_col = byte_offset_to_utf16_column(
-                    line_text,
-                    usage_node.start_position().column,
-                );
+                let start_col =
+                    byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
                 let end_line_text = get_line(usage_node.end_position().row);
-                let end_col = byte_offset_to_utf16_column(
-                    end_line_text,
-                    usage_node.end_position().column,
-                );
+                let end_col =
+                    byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
 
                 diagnostics.push(Diagnostic {
                     range: Range {
@@ -4377,15 +4378,16 @@ fn collect_undefined_variables_from_snapshot(
         &text[start..end]
     };
 
-    let workspace_imports_set: HashSet<&str> =
-        snapshot.workspace_imports.iter().map(|s| s.as_str()).collect();
+    let workspace_imports_set: HashSet<&str> = snapshot
+        .workspace_imports
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
-    let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> = snapshot
-        .artifacts_map
-        .get(uri)
-        .map(|artifacts| {
+    let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> =
+        snapshot.artifacts_map.get(uri).map(|artifacts| {
             let exports = artifacts
                 .exported_interface
                 .keys()
@@ -4395,9 +4397,9 @@ fn collect_undefined_variables_from_snapshot(
         });
 
     let parent_symbol_names: HashSet<String> = {
-        let scope_0_0 = scope_cache.entry((0, 0)).or_insert_with(|| {
-            snapshot.get_scope(uri, 0, 0, cancel)
-        });
+        let scope_0_0 = scope_cache
+            .entry((0, 0))
+            .or_insert_with(|| snapshot.get_scope(uri, 0, 0, cancel));
         scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
     };
 
@@ -4414,11 +4416,10 @@ fn collect_undefined_variables_from_snapshot(
         .filter(|source| source.inherits_symbols())
         .filter_map(|source| {
             let ctx = source_path_ctx.as_ref()?;
-            let resolved =
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &source.path,
-                    ctx,
-                )?;
+            let resolved = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                &source.path,
+                ctx,
+            )?;
             let source_uri = Url::from_file_path(resolved).ok()?;
             Some((source.line, source.column, source_uri))
         })
@@ -4469,9 +4470,9 @@ fn collect_undefined_variables_from_snapshot(
             let line_text = get_line(usage_node.start_position().row);
             let usage_col =
                 byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-            scope_cache.entry((usage_line, usage_col)).or_insert_with(|| {
-                snapshot.get_scope(uri, usage_line, usage_col, cancel)
-            })
+            scope_cache
+                .entry((usage_line, usage_col))
+                .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col, cancel))
         };
 
         if scope.symbols.contains_key(name.as_str()) {
@@ -4558,8 +4559,7 @@ fn collect_undefined_variables_from_snapshot(
         let end_line_text = get_line(usage_node.end_position().row);
         let start_col =
             byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
-        let end_col =
-            byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+        let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
 
         diagnostics.push(Diagnostic {
             range: Range {
@@ -4634,9 +4634,9 @@ fn collect_out_of_scope_diagnostics(
     let mut locally_resolved_usages: std::collections::HashSet<(String, u32, u32)> =
         std::collections::HashSet::new();
     for (name, usage_line, usage_col, _) in &usages {
-        let scope = scope_cache.entry((*usage_line, *usage_col)).or_insert_with(|| {
-            get_cross_file_scope(state, uri, *usage_line, *usage_col, cancel)
-        });
+        let scope = scope_cache
+            .entry((*usage_line, *usage_col))
+            .or_insert_with(|| get_cross_file_scope(state, uri, *usage_line, *usage_col, cancel));
         if let Some(symbol) = scope.symbols.get(name.as_str()) {
             if symbol.source_uri == *uri {
                 locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
@@ -4650,7 +4650,8 @@ fn collect_out_of_scope_diagnostics(
 
     // Deduplicate by symbol+position so the same usage is reported at most once even if
     // multiple source() calls/files could explain it.
-    let mut emitted: std::collections::HashSet<(String, u32, u32)> = std::collections::HashSet::new();
+    let mut emitted: std::collections::HashSet<(String, u32, u32)> =
+        std::collections::HashSet::new();
 
     // For each source() call, check if any symbols from that file are used before the call
     for source in &source_calls {
@@ -4679,7 +4680,11 @@ fn collect_out_of_scope_diagnostics(
                 // Try open documents first (authoritative)
                 if let Some(doc) = state.documents.get(target_uri) {
                     if let Some(tree) = &doc.tree {
-                        return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
+                        return Some(Arc::new(scope::compute_artifacts(
+                            target_uri,
+                            tree,
+                            &doc.text(),
+                        )));
                     }
                 }
                 // Try cross-file workspace index (preferred for closed files)
@@ -4690,7 +4695,11 @@ fn collect_out_of_scope_diagnostics(
                 // Fallback to legacy workspace index
                 if let Some(doc) = state.workspace_index.get(target_uri) {
                     if let Some(tree) = &doc.tree {
-                        return Some(Arc::new(scope::compute_artifacts(target_uri, tree, &doc.text())));
+                        return Some(Arc::new(scope::compute_artifacts(
+                            target_uri,
+                            tree,
+                            &doc.text(),
+                        )));
                     }
                 }
                 None
@@ -4803,7 +4812,10 @@ fn collect_identifier_usages_utf16<'a>(
                 }
             }
             // Skip declaration sites for function parameters.
-            if matches!(parent.kind(), "parameter" | "default_parameter" | "parameters") {
+            if matches!(
+                parent.kind(),
+                "parameter" | "default_parameter" | "parameters"
+            ) {
                 return;
             }
             // Skip declaration site for for-loop iterator variable.
@@ -5685,7 +5697,6 @@ mod syntax_error_range_tests {
                 .collect::<Vec<_>>()
         );
     }
-
 
     #[test]
     fn empty_switch_case_is_valid() {
@@ -6994,9 +7005,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
 ) {
     use crate::content_provider::ContentProvider;
     use crate::cross_file::config::BackwardDependencyMode;
-    use crate::cross_file::path_resolve::{
-        resolve_path_with_workspace_fallback, PathContext,
-    };
+    use crate::cross_file::path_resolve::{resolve_path_with_workspace_fallback, PathContext};
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     // Backward dependency mode gating:
@@ -7077,34 +7086,32 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // This is a fallback path for cases where a sourced file has not been indexed into
     // the cross-file scope yet (e.g., transient startup/index timing).
     let content_provider = state.content_provider();
-    let source_path_ctx = PathContext::from_metadata(
-        uri,
-        directive_meta,
-        state.workspace_folders.first(),
-    );
+    let source_path_ctx =
+        PathContext::from_metadata(uri, directive_meta, state.workspace_folders.first());
     let direct_sources: Vec<(u32, u32, Url)> = directive_meta
         .sources
         .iter()
         .filter(|source| source.inherits_symbols())
         .filter_map(|source| {
             let ctx = source_path_ctx.as_ref()?;
-            let resolved =
-                resolve_path_with_workspace_fallback(&source.path, ctx)?;
+            let resolved = resolve_path_with_workspace_fallback(&source.path, ctx)?;
             let source_uri = Url::from_file_path(resolved).ok()?;
             Some((source.line, source.column, source_uri))
         })
         .collect();
-    let mut source_exports_cache: std::collections::HashMap<Url, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    let mut source_exports_cache: std::collections::HashMap<
+        Url,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
 
     // Pre-compute parent scope at (0, 0) to avoid per-position graph traversal
     // for symbols inherited from parent files. At position (0, 0), scope resolution
     // returns parent symbols (from backward edges) + base exports, before any local
     // timeline events. Identifiers matched here skip per-position resolution entirely.
     let parent_symbol_names: std::collections::HashSet<String> = {
-        let scope_0_0 = scope_cache.entry((0, 0)).or_insert_with(|| {
-            get_cross_file_scope(state, uri, 0, 0, cancel)
-        });
+        let scope_0_0 = scope_cache
+            .entry((0, 0))
+            .or_insert_with(|| get_cross_file_scope(state, uri, 0, 0, cancel));
         scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
     };
 
@@ -7140,7 +7147,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 if exports.contains(name.as_str()) {
                     let usage_col_byte = usage_node.start_position().column as u32;
                     let line_text = get_line(usage_node.start_position().row);
-                    let usage_col_utf16 = byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
+                    let usage_col_utf16 =
+                        byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
                     let inside_function = !fn_tree
                         .query_point(scope::Position::new(usage_line, usage_col_utf16))
                         .is_empty();
@@ -7162,9 +7170,9 @@ pub(crate) fn collect_undefined_variables_position_aware(
             let line_text = get_line(usage_node.start_position().row);
             let usage_col =
                 byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-            scope_cache.entry((usage_line, usage_col)).or_insert_with(|| {
-                get_cross_file_scope(state, uri, usage_line, usage_col, cancel)
-            })
+            scope_cache
+                .entry((usage_line, usage_col))
+                .or_insert_with(|| get_cross_file_scope(state, uri, usage_line, usage_col, cancel))
         };
 
         // Check if symbol is in cross-file scope
@@ -7172,11 +7180,10 @@ pub(crate) fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        let usage_col_utf16 =
-            byte_offset_to_utf16_column(
-                get_line(usage_node.start_position().row),
-                usage_node.start_position().column,
-            );
+        let usage_col_utf16 = byte_offset_to_utf16_column(
+            get_line(usage_node.start_position().row),
+            usage_node.start_position().column,
+        );
 
         // Fallback: check direct source() files loaded on/before this position even if they
         // are not yet present in cross-file scope cache/index.
@@ -7184,16 +7191,13 @@ pub(crate) fn collect_undefined_variables_position_aware(
             .iter()
             .filter(|(source_line, source_col, _)| {
                 *source_line < usage_line
-                    || (*source_line == usage_line
-                        && *source_col <= usage_col_utf16)
+                    || (*source_line == usage_line && *source_col <= usage_col_utf16)
             })
             .any(|(_, _, source_uri)| {
                 let exported = source_exports_cache
                     .entry(source_uri.clone())
                     .or_insert_with(|| {
-                        if let Some(artifacts) =
-                            content_provider.get_artifacts(source_uri)
-                        {
+                        if let Some(artifacts) = content_provider.get_artifacts(source_uri) {
                             return artifacts
                                 .exported_interface
                                 .keys()
@@ -7201,29 +7205,23 @@ pub(crate) fn collect_undefined_variables_position_aware(
                                 .collect();
                         }
 
-                        let source_text = content_provider
-                            .get_content(source_uri)
-                            .or_else(|| {
-                                source_uri
-                                    .to_file_path()
-                                    .ok()
-                                    .and_then(|path| std::fs::read_to_string(path).ok())
-                            });
+                        let source_text = content_provider.get_content(source_uri).or_else(|| {
+                            source_uri
+                                .to_file_path()
+                                .ok()
+                                .and_then(|path| std::fs::read_to_string(path).ok())
+                        });
                         let Some(source_text) = source_text else {
                             return std::collections::HashSet::new();
                         };
 
                         let source_meta = content_provider
                             .get_metadata(source_uri)
-                            .unwrap_or_else(|| {
-                                crate::cross_file::extract_metadata(&source_text)
-                            });
+                            .unwrap_or_else(|| crate::cross_file::extract_metadata(&source_text));
 
-                        let Some(source_tree) =
-                            crate::parser_pool::with_parser(|parser| {
-                                parser.parse(&source_text, None)
-                            })
-                        else {
+                        let Some(source_tree) = crate::parser_pool::with_parser(|parser| {
+                            parser.parse(&source_text, None)
+                        }) else {
                             return std::collections::HashSet::new();
                         };
 
@@ -7299,8 +7297,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
             // library()/require()/loadNamespace() calls as undefined.
             let has_prior_library_call = directive_meta.library_calls.iter().any(|call| {
                 call.line < usage_line
-                    || (call.line == usage_line
-                        && call.column <= usage_col_utf16)
+                    || (call.line == usage_line && call.column <= usage_col_utf16)
             });
             let has_prior_library_call = has_prior_library_call
                 || has_prior_package_loader_call(
@@ -7338,7 +7335,6 @@ pub(crate) fn collect_undefined_variables_position_aware(
     }
 }
 
-
 /// True when an identifier is textually followed by `(` (ignoring whitespace),
 /// indicating call-target usage.
 fn is_function_call_identifier_textually(node: Node, text: &str) -> bool {
@@ -7354,7 +7350,10 @@ fn is_function_call_identifier_textually(node: Node, text: &str) -> bool {
 fn collect_package_loader_call_end_offsets(text: &str) -> Vec<usize> {
     let mut end_offsets: Vec<usize> = Vec::new();
     for pattern in ["library(", "require(", "loadNamespace("] {
-        end_offsets.extend(text.match_indices(pattern).map(|(idx, _)| idx + pattern.len()));
+        end_offsets.extend(
+            text.match_indices(pattern)
+                .map(|(idx, _)| idx + pattern.len()),
+        );
     }
     end_offsets.sort_unstable();
     end_offsets.dedup();
@@ -7774,7 +7773,13 @@ pub fn completion(
 
     // Get scope at cursor position for package exports
     // Requirements 9.1, 9.2: Add package exports to completions with package attribution
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+    );
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
@@ -7873,9 +7878,7 @@ pub fn completion(
 
         let detail = match (&symbol.signature, is_cross_file) {
             (Some(sig), _) => Some(sig.clone()),
-            (None, true) => {
-                Some(format!("from {}", relative_path.as_ref().unwrap()))
-            }
+            (None, true) => Some(format!("from {}", relative_path.as_ref().unwrap())),
             (None, false) => None,
         };
 
@@ -8490,7 +8493,6 @@ pub fn extract_definition_statement(
     extract_statement_from_tree(tree, symbol, &content)
 }
 
-
 fn next_utf8_char_boundary(line: &str, byte_offset: usize) -> usize {
     if byte_offset >= line.len() {
         return line.len();
@@ -9052,7 +9054,13 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     // Check package exports from combined_exports cache (if packages enabled)
     // This surfaces package exports without blocking on R subprocess
     if state.cross_file_config.packages_enabled {
-        let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
+        let scope = get_cross_file_scope(
+            state,
+            uri,
+            position.line,
+            position.character,
+            &DiagCancelToken::never(),
+        );
         let all_packages: Vec<String> = scope
             .inherited_packages
             .iter()
@@ -9623,7 +9631,13 @@ pub fn prepare_signature_help(
     let func_name = node_text(func_node, &text);
 
     // Determine if package or user function using cross-file scope
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+    );
 
     /// Try user signature, falling back to a minimal signature with source attribution.
     fn resolve_user_or_fallback(
@@ -9847,7 +9861,13 @@ pub fn goto_definition(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, &DiagCancelToken::never());
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+    );
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
@@ -11124,10 +11144,16 @@ mod tests {
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
         let knitr_used = used.iter().any(|(name, _)| name == "knitr");
-        assert!(!knitr_used, "Package name 'knitr' in pkg::func should NOT be collected");
+        assert!(
+            !knitr_used,
+            "Package name 'knitr' in pkg::func should NOT be collected"
+        );
 
         let knit_used = used.iter().any(|(name, _)| name == "knit");
-        assert!(!knit_used, "Function name 'knit' in pkg::func should NOT be collected");
+        assert!(
+            !knit_used,
+            "Function name 'knit' in pkg::func should NOT be collected"
+        );
     }
 
     /// Test that triple-colon namespace operator (pkg:::func) is also skipped.
@@ -11139,10 +11165,16 @@ mod tests {
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
         let stats_used = used.iter().any(|(name, _)| name == "stats");
-        assert!(!stats_used, "Package name 'stats' in pkg:::func should NOT be collected");
+        assert!(
+            !stats_used,
+            "Package name 'stats' in pkg:::func should NOT be collected"
+        );
 
         let func_used = used.iter().any(|(name, _)| name == "C_something");
-        assert!(!func_used, "Function name in pkg:::func should NOT be collected");
+        assert!(
+            !func_used,
+            "Function name in pkg:::func should NOT be collected"
+        );
     }
 
     /// Test that arguments to namespace-qualified calls are still checked.
@@ -11627,9 +11659,7 @@ x <- "#;
             if let Some(CompletionResponse::Array(items)) = completions {
                 let param_items: Vec<_> = items
                     .iter()
-                    .filter(|item| {
-                        item.detail.as_deref() == Some("parameter")
-                    })
+                    .filter(|item| item.detail.as_deref() == Some("parameter"))
                     .collect();
 
                 // Check insert_text includes " = " suffix for named params
@@ -11637,7 +11667,10 @@ x <- "#;
                 assert!(x_item.is_some(), "Should have 'x' parameter");
                 let x_item = x_item.unwrap();
                 assert!(
-                    x_item.insert_text.as_ref().map_or(false, |t| t.contains("= ")),
+                    x_item
+                        .insert_text
+                        .as_ref()
+                        .map_or(false, |t| t.contains("= ")),
                     "Parameter 'x' insert_text should contain '= ', got {:?}",
                     x_item.insert_text
                 );
@@ -30798,7 +30831,8 @@ result <- helper_with_spaces(42)"#;
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
-        state.package_library = std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty());
+        state.package_library =
+            std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty());
 
         let mut diagnostics = Vec::new();
         collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
@@ -31090,10 +31124,7 @@ result <- helper_with_spaces(42)"#;
             circular_diags.len(),
             1,
             "Should emit exactly one circular dependency diagnostic, got: {:?}",
-            diags
-                .iter()
-                .map(|d| &d.message)
-                .collect::<Vec<_>>()
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
 
         // Verify the diagnostic message includes the closing file, line number,
@@ -31188,7 +31219,6 @@ result <- helper_with_spaces(42)"#;
             "Should not emit missing file diagnostic when severity is off"
         );
     }
-
 
     #[test]
     fn test_out_of_scope_diagnostic_not_emitted_when_severity_off() {
@@ -31348,12 +31378,14 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
-        state
-            .documents
-            .insert(a_url.clone(), Document::new("for (j in 1:2) { print(j) }", None));
-        state
-            .documents
-            .insert(b_url.clone(), Document::new("for (j in 1:3) { print(j) }", None));
+        state.documents.insert(
+            a_url.clone(),
+            Document::new("for (j in 1:2) { print(j) }", None),
+        );
+        state.documents.insert(
+            b_url.clone(),
+            Document::new("for (j in 1:3) { print(j) }", None),
+        );
         let main_code = "print(j)\nsource('a.R')\nsource('b.R')";
         state
             .documents
@@ -31511,7 +31543,8 @@ result <- filter(c(1, -2, 3))"#;
         let base_exports = HashSet::new();
 
         // Query scope at line 2 (after both library and local definition)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Symbol should be in scope
         assert!(
@@ -31921,7 +31954,8 @@ result <- filter(c(1, -2, 3))"#;
         let base_exports = HashSet::new();
 
         // Query scope at line 2 (after both library and local definition)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Symbol should be in scope
         assert!(
@@ -32073,18 +32107,14 @@ y <- x"#;
         let parent_meta = crate::cross_file::extract_metadata(&parent_content);
         let child_meta = crate::cross_file::extract_metadata(&child_content);
 
-        state.cross_file_graph.update_file(
-            &parent_url,
-            &parent_meta,
-            Some(&workspace_url),
-            |_| None,
-        );
-        state.cross_file_graph.update_file(
-            &child_url,
-            &child_meta,
-            Some(&workspace_url),
-            |uri| state.documents.get(uri).map(|d| d.text()),
-        );
+        state
+            .cross_file_graph
+            .update_file(&parent_url, &parent_meta, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&child_url, &child_meta, Some(&workspace_url), |uri| {
+                state.documents.get(uri).map(|d| d.text())
+            });
 
         // Check that an edge was created with call_site_line = u32::MAX
         let edges = state.cross_file_graph.get_dependents(&child_url);
@@ -32102,7 +32132,9 @@ y <- x"#;
 #[cfg(test)]
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
-    use crate::handlers::{collect_undefined_variables_position_aware, goto_definition, DiagCancelToken};
+    use crate::handlers::{
+        collect_undefined_variables_position_aware, goto_definition, DiagCancelToken,
+    };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{Position, Url};
 
@@ -32158,10 +32190,7 @@ mod position_aware_tests {
             &end_offsets,
             call_end.saturating_sub(1)
         ));
-        assert!(super::has_prior_package_loader_call(
-            &end_offsets,
-            call_end
-        ));
+        assert!(super::has_prior_package_loader_call(&end_offsets, call_end));
     }
 
     #[test]
@@ -33192,12 +33221,9 @@ my_func <- function(a = default_value) {
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
-        state.cross_file_graph.update_file(
-            &main_uri,
-            &parse_directives(main_code),
-            None,
-            |_| None,
-        );
+        state
+            .cross_file_graph
+            .update_file(&main_uri, &parse_directives(main_code), None, |_| None);
 
         let tree = parse_r_code(main_code);
         let directive_meta = parse_directives(main_code);
@@ -33233,19 +33259,16 @@ my_func <- function(a = default_value) {
     fn test_direct_source_export_suppresses_undefined_variable_from_disk_fallback() {
         let mut state = create_test_state();
         let workspace_dir = tempfile::tempdir().expect("tempdir should be created");
-        let workspace_url = Url::from_file_path(workspace_dir.path())
-            .expect("workspace uri should be valid");
+        let workspace_url =
+            Url::from_file_path(workspace_dir.path()).expect("workspace uri should be valid");
         state.workspace_folders.push(workspace_url);
 
         let main_path = workspace_dir.path().join("main.R");
         let child_path = workspace_dir.path().join("helpers.R");
         let main_uri = Url::from_file_path(&main_path).expect("main uri should be valid");
 
-        std::fs::write(
-            &child_path,
-            "summary_table <- data.frame(x = 1)\n",
-        )
-        .expect("child file should be written");
+        std::fs::write(&child_path, "summary_table <- data.frame(x = 1)\n")
+            .expect("child file should be written");
 
         let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state

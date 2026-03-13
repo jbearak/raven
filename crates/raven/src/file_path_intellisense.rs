@@ -342,7 +342,6 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
 }
 
-
 /// Check if cursor is after an LSP directive where a path is expected
 ///
 /// Uses regex patterns consistent with cross_file/directive.rs to detect
@@ -1491,8 +1490,10 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         // Consistent with cross_file/directive.rs patterns
         // The @ is required, colon is optional, leading whitespace is allowed
         DirectivePathPatterns {
-            backward: Regex::new(r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#)
-                .unwrap(),
+            backward: Regex::new(
+                r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
+            )
+            .unwrap(),
             forward: Regex::new(r#"^\s*#\s*@lsp-source(?:\s+:?\s*|:\s*)"#).unwrap(),
         }
     })

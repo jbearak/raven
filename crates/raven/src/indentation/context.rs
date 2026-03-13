@@ -450,7 +450,12 @@ pub enum OperatorType {
 /// # Returns
 ///
 /// The detected `IndentContext` that should be used for indentation calculation.
-pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u32) -> IndentContext {
+pub fn detect_context(
+    tree: &Tree,
+    source: &str,
+    position: Position,
+    tab_size: u32,
+) -> IndentContext {
     // Validate position is within document bounds
     if !is_position_valid(source, position) {
         log::warn!(
@@ -509,7 +514,8 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u
 
             // Compare positions: later line wins, or same line with later column
             if braces_start.row > parens_start.row
-                || (braces_start.row == parens_start.row && braces_start.column > parens_start.column)
+                || (braces_start.row == parens_start.row
+                    && braces_start.column > parens_start.column)
             {
                 // Braces are innermost
                 let opener_line = braces_start.row as u32;
@@ -553,7 +559,9 @@ pub fn detect_context(tree: &Tree, source: &str, position: Position, tab_size: u
         (None, None) => {
             // 4. Default to complete expression
             IndentContext::AfterCompleteExpression {
-                enclosing_block_indent: get_enclosing_block_indent(tree, source, position, tab_size),
+                enclosing_block_indent: get_enclosing_block_indent(
+                    tree, source, position, tab_size,
+                ),
             }
         }
     }
@@ -911,10 +919,7 @@ fn find_chain_start_heuristic(source: &str, start_line: u32, tab_size: u32) -> (
 /// # Returns
 ///
 /// `Some((line, col, delimiter))` of the innermost unclosed opener, or `None`.
-fn find_unclosed_delimiter_heuristic(
-    source: &str,
-    current_line: u32,
-) -> Option<(u32, u32, char)> {
+fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<(u32, u32, char)> {
     let lines: Vec<&str> = source.lines().collect();
 
     // Track unclosed delimiters with their positions
@@ -1015,7 +1020,9 @@ fn detect_closing_delimiter(source: &str, position: Position) -> Option<IndentCo
         // after Enter means we're inserting content, not aligning the delimiter.
         let after_delimiter = trimmed[first_char.len_utf8()..].trim();
         if after_delimiter.is_empty()
-            || after_delimiter.chars().all(|c| matches!(c, ')' | ']' | '}'))
+            || after_delimiter
+                .chars()
+                .all(|c| matches!(c, ')' | ']' | '}'))
         {
             return None;
         }
@@ -1256,8 +1263,7 @@ fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Optio
     // Verify this is a continuation operator or its parent is a binary_operator
     let chain_binop = if matches!(node.kind(), "|>" | "+" | "~" | "special") {
         // Direct hit on operator node - parent should be binary_operator
-        node.parent()
-            .filter(|p| p.kind() == "binary_operator")?
+        node.parent().filter(|p| p.kind() == "binary_operator")?
     } else if node.kind() == "binary_operator" {
         node
     } else {
@@ -1356,8 +1362,8 @@ fn detect_continuation_operator(
     }?;
 
     // Try AST-based chain start detection first, fall back to text-based heuristic
-    let (chain_start_line, chain_start_col) =
-        find_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
+    let (chain_start_line, chain_start_col) = find_chain_start_from_ast(tree, source, prev_line)
+        .unwrap_or_else(|| {
             let walker = ChainWalker::new(tree, source, tab_size);
             walker.find_chain_start(position)
         });
@@ -1414,10 +1420,7 @@ fn is_custom_infix_ending(trimmed: &str) -> bool {
 /// Finds an unclosed arguments node that contains the given position.
 ///
 /// This handles the case where tree-sitter marks the closing paren as MISSING.
-fn find_unclosed_arguments_at_position<'a>(
-    node: Node<'a>,
-    position: Position,
-) -> Option<Node<'a>> {
+fn find_unclosed_arguments_at_position<'a>(node: Node<'a>, position: Position) -> Option<Node<'a>> {
     let mut result: Option<Node<'a>> = None;
 
     // Check if this node is an arguments node
@@ -1427,8 +1430,7 @@ fn find_unclosed_arguments_at_position<'a>(
 
         // Check if cursor is after the start
         let cursor_after_start = position.line as usize > start.row
-            || (position.line as usize == start.row
-                && position.character as usize > start.column);
+            || (position.line as usize == start.row && position.character as usize > start.column);
 
         if cursor_after_start {
             // Check if the arguments node is unclosed (has MISSING close)
@@ -1451,8 +1453,7 @@ fn find_unclosed_arguments_at_position<'a>(
 
     if cursor.goto_first_child() {
         loop {
-            if let Some(found) = find_unclosed_arguments_at_position(cursor.node(), position)
-            {
+            if let Some(found) = find_unclosed_arguments_at_position(cursor.node(), position) {
                 // Keep the innermost (last found) match
                 result = Some(found);
             }
@@ -1526,8 +1527,7 @@ fn find_unclosed_braces_at_position<'a>(
 
         // Check if cursor is after the start
         let cursor_after_start = position.line as usize > start.row
-            || (position.line as usize == start.row
-                && position.character as usize > start.column);
+            || (position.line as usize == start.row && position.character as usize > start.column);
 
         if cursor_after_start {
             // Check if the braced_expression node is unclosed (has MISSING close)
@@ -1635,7 +1635,11 @@ impl<'a> ChainWalker<'a> {
     /// * `source` - The source code text
     /// * `tab_size` - Tab size for visual column calculation
     pub fn new(tree: &'a Tree, source: &'a str, tab_size: u32) -> Self {
-        Self { tree, source, tab_size }
+        Self {
+            tree,
+            source,
+            tab_size,
+        }
     }
 
     /// Finds the chain start by walking backward through operator-terminated lines.
@@ -1832,9 +1836,6 @@ fn strip_trailing_comment(line: &str) -> &str {
     line
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1871,48 +1872,111 @@ mod tests {
     #[test]
     fn test_is_position_valid_within_bounds() {
         let source = "line0\nline1\nline2";
-        assert!(is_position_valid(source, Position { line: 0, character: 0 }));
-        assert!(is_position_valid(source, Position { line: 1, character: 3 }));
-        assert!(is_position_valid(source, Position { line: 2, character: 5 }));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 0,
+                character: 0
+            }
+        ));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 1,
+                character: 3
+            }
+        ));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 2,
+                character: 5
+            }
+        ));
     }
 
     #[test]
     fn test_is_position_valid_at_end_of_line() {
         let source = "line0\nline1";
         // Position at end of line should be valid
-        assert!(is_position_valid(source, Position { line: 0, character: 5 }));
-        assert!(is_position_valid(source, Position { line: 1, character: 5 }));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 0,
+                character: 5
+            }
+        ));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 1,
+                character: 5
+            }
+        ));
     }
 
     #[test]
     fn test_is_position_valid_out_of_bounds_line() {
         let source = "line0\nline1";
         // Line 5 doesn't exist
-        assert!(!is_position_valid(source, Position { line: 5, character: 0 }));
+        assert!(!is_position_valid(
+            source,
+            Position {
+                line: 5,
+                character: 0
+            }
+        ));
     }
 
     #[test]
     fn test_is_position_valid_empty_source() {
         let source = "";
         // Empty source - line 0 is valid (for new line after EOF)
-        assert!(is_position_valid(source, Position { line: 0, character: 0 }));
-        assert!(!is_position_valid(source, Position { line: 1, character: 0 }));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 0,
+                character: 0
+            }
+        ));
+        assert!(!is_position_valid(
+            source,
+            Position {
+                line: 1,
+                character: 0
+            }
+        ));
     }
 
     #[test]
     fn test_is_position_valid_new_line_after_eof() {
         let source = "line0";
         // Position on line after last line (e.g., after pressing Enter at EOF)
-        assert!(is_position_valid(source, Position { line: 1, character: 0 }));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 1,
+                character: 0
+            }
+        ));
         // But not two lines after
-        assert!(!is_position_valid(source, Position { line: 2, character: 0 }));
+        assert!(!is_position_valid(
+            source,
+            Position {
+                line: 2,
+                character: 0
+            }
+        ));
     }
 
     #[test]
     fn test_should_use_fallback_no_errors() {
         let code = "x <- 1 + 2";
         let tree = parse_r_code(code);
-        let position = Position { line: 0, character: 5 };
+        let position = Position {
+            line: 0,
+            character: 5,
+        };
         assert!(!should_use_fallback(tree.root_node(), code, position));
     }
 
@@ -1921,7 +1985,10 @@ mod tests {
         // Use a more clearly invalid syntax that tree-sitter will mark as error
         let code = "x <- <- y"; // Double assignment operator is invalid
         let tree = parse_r_code(code);
-        let position = Position { line: 0, character: 5 };
+        let position = Position {
+            line: 0,
+            character: 5,
+        };
         // This may or may not trigger fallback depending on how tree-sitter handles it
         // The important thing is that it doesn't panic
         let _ = should_use_fallback(tree.root_node(), code, position);
@@ -1933,7 +2000,10 @@ mod tests {
         // The important thing is that the function handles them gracefully
         let code = "x <-"; // Incomplete assignment
         let tree = parse_r_code(code);
-        let position = Position { line: 0, character: 4 };
+        let position = Position {
+            line: 0,
+            character: 4,
+        };
         // This may or may not trigger fallback - just verify it doesn't panic
         let _ = should_use_fallback(tree.root_node(), code, position);
     }
@@ -1945,7 +2015,10 @@ mod tests {
         let code = "\u{4E16} <- 1 + 2";
         let tree = parse_r_code(code);
         // character=2 in UTF-16 is after the CJK char + space
-        let position = Position { line: 0, character: 2 };
+        let position = Position {
+            line: 0,
+            character: 2,
+        };
         // Should not panic regardless of fallback result
         let _ = should_use_fallback(tree.root_node(), code, position);
     }
@@ -1954,21 +2027,42 @@ mod tests {
     fn test_is_position_valid_multibyte() {
         // CJK character: 3 bytes, 1 UTF-16 code unit
         let source = "\u{4E16}\u{754C}"; // 世界 — 2 chars, 2 UTF-16 code units, 6 bytes
-        // character=2 (UTF-16 count) should be valid (end of line)
-        assert!(is_position_valid(source, Position { line: 0, character: 2 }));
+                                         // character=2 (UTF-16 count) should be valid (end of line)
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 0,
+                character: 2
+            }
+        ));
         // character=3 is one past end → still valid (end-of-line sentinel)
-        assert!(is_position_valid(source, Position { line: 0, character: 3 }));
+        assert!(is_position_valid(
+            source,
+            Position {
+                line: 0,
+                character: 3
+            }
+        ));
         // character=7 is way past → would fail with byte comparison but might pass with UTF-16
         // 6 bytes, 2 UTF-16 units, so character=7 is well beyond
-        assert!(!is_position_valid(source, Position { line: 0, character: 7 }));
+        assert!(!is_position_valid(
+            source,
+            Position {
+                line: 0,
+                character: 7
+            }
+        ));
     }
 
     #[test]
     fn test_fallback_detect_context_closing_delimiter() {
         let source = "func(\n  arg1\n)";
-        let position = Position { line: 2, character: 0 };
+        let position = Position {
+            line: 2,
+            character: 0,
+        };
         let ctx = fallback_detect_context(source, position, 2);
-        
+
         match ctx {
             IndentContext::ClosingDelimiter { delimiter, .. } => {
                 assert_eq!(delimiter, ')');
@@ -1980,9 +2074,12 @@ mod tests {
     #[test]
     fn test_fallback_detect_context_continuation_operator() {
         let source = "data %>%\n";
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = fallback_detect_context(source, position, 2);
-        
+
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
@@ -1994,9 +2091,12 @@ mod tests {
     #[test]
     fn test_fallback_detect_context_native_pipe() {
         let source = "data |>\n";
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = fallback_detect_context(source, position, 2);
-        
+
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Pipe);
@@ -2008,11 +2108,18 @@ mod tests {
     #[test]
     fn test_fallback_detect_context_unclosed_paren() {
         let source = "func(\n";
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = fallback_detect_context(source, position, 2);
-        
+
         match ctx {
-            IndentContext::InsideParens { opener_line, opener_col, .. } => {
+            IndentContext::InsideParens {
+                opener_line,
+                opener_col,
+                ..
+            } => {
                 assert_eq!(opener_line, 0);
                 assert_eq!(opener_col, 4);
             }
@@ -2023,9 +2130,12 @@ mod tests {
     #[test]
     fn test_fallback_detect_context_unclosed_brace() {
         let source = "if (TRUE) {\n";
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = fallback_detect_context(source, position, 2);
-        
+
         match ctx {
             IndentContext::InsideBraces { opener_line, .. } => {
                 assert_eq!(opener_line, 0);
@@ -2037,11 +2147,16 @@ mod tests {
     #[test]
     fn test_fallback_detect_context_complete_expression() {
         let source = "x <- 1\n";
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = fallback_detect_context(source, position, 2);
-        
+
         match ctx {
-            IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
+            IndentContext::AfterCompleteExpression {
+                enclosing_block_indent,
+            } => {
                 assert_eq!(enclosing_block_indent, 0);
             }
             _ => panic!("Expected AfterCompleteExpression context, got {:?}", ctx),
@@ -2146,12 +2261,17 @@ mod tests {
         let code = "x <- 1";
         let tree = parse_r_code(code);
         // Position way out of bounds
-        let position = Position { line: 100, character: 0 };
+        let position = Position {
+            line: 100,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
-        
+
         // Should return AfterCompleteExpression with indent 0
         match ctx {
-            IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
+            IndentContext::AfterCompleteExpression {
+                enclosing_block_indent,
+            } => {
                 assert_eq!(enclosing_block_indent, 0);
             }
             _ => panic!("Expected AfterCompleteExpression for invalid position"),
@@ -2162,11 +2282,14 @@ mod tests {
     fn test_detect_context_with_syntax_error_uses_fallback() {
         let code = "x <- + +\n"; // Invalid syntax
         let tree = parse_r_code(code);
-        let position = Position { line: 1, character: 0 };
-        
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
+
         // Should not panic, should return a valid context
         let ctx = detect_context(&tree, code, position, 2);
-        
+
         // The fallback should detect this as a complete expression
         match ctx {
             IndentContext::AfterCompleteExpression { .. } => {}
@@ -2211,11 +2334,11 @@ mod tests {
     /// Enum representing continuation operator types for chain generation
     #[derive(Debug, Clone, Copy)]
     enum ChainOperator {
-        NativePipe,    // |>
-        MagrittrPipe,  // %>%
-        Plus,          // +
-        Tilde,         // ~
-        CustomInfix,   // %word%
+        NativePipe,   // |>
+        MagrittrPipe, // %>%
+        Plus,         // +
+        Tilde,        // ~
+        CustomInfix,  // %word%
     }
 
     impl ChainOperator {
@@ -2252,7 +2375,11 @@ mod tests {
     ///   step0() %>%
     ///   step1()
     /// ```
-    fn generate_pipe_chain(length: usize, operator: ChainOperator, leading_spaces: usize) -> String {
+    fn generate_pipe_chain(
+        length: usize,
+        operator: ChainOperator,
+        leading_spaces: usize,
+    ) -> String {
         let indent = " ".repeat(leading_spaces);
         let mut code = format!("{}data", indent);
 
@@ -3177,7 +3304,10 @@ mod tests {
         let nodes = collect_all_nodes(tree.root_node());
 
         let found_args = nodes.iter().any(|n| is_arguments_node(*n));
-        assert!(found_args, "Should find an arguments node even for empty args");
+        assert!(
+            found_args,
+            "Should find an arguments node even for empty args"
+        );
     }
 
     // ========================================================================
@@ -3531,7 +3661,10 @@ mod tests {
         for node in &nodes {
             if node.kind() == "identifier" && node_text(*node, code) == "x" {
                 let opener = find_matching_opener(*node, ')');
-                assert!(opener.is_none(), "Should not find opener when not inside parens");
+                assert!(
+                    opener.is_none(),
+                    "Should not find opener when not inside parens"
+                );
             }
         }
     }
@@ -3944,7 +4077,10 @@ mod tests {
             IndentContext::InsideParens { opener_col, .. } => {
                 assert_eq!(opener_col, 4); // column of the opening paren
             }
-            _ => panic!("Expected InsideParens context (auto-close heuristic), got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens context (auto-close heuristic), got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -3965,7 +4101,10 @@ mod tests {
             IndentContext::InsideBraces { opener_line, .. } => {
                 assert_eq!(opener_line, 0);
             }
-            _ => panic!("Expected InsideBraces context (auto-close heuristic), got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideBraces context (auto-close heuristic), got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -3990,10 +4129,7 @@ mod tests {
                 assert_eq!(chain_start_line, 0);
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4009,15 +4145,10 @@ mod tests {
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
-            IndentContext::AfterContinuationOperator {
-                operator_type, ..
-            } => {
+            IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Pipe);
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4033,15 +4164,10 @@ mod tests {
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
-            IndentContext::AfterContinuationOperator {
-                operator_type, ..
-            } => {
+            IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Plus);
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4057,15 +4183,10 @@ mod tests {
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
-            IndentContext::AfterContinuationOperator {
-                operator_type, ..
-            } => {
+            IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Tilde);
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4179,10 +4300,7 @@ mod tests {
                 assert_eq!(chain_start_line, 0, "Chain should start at line 0");
                 assert_eq!(chain_start_col, 0, "Chain should start at column 0");
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4206,7 +4324,10 @@ mod tests {
             IndentContext::InsideParens { .. } => {
                 // Expected: auto-close heuristic kicks in
             }
-            _ => panic!("Expected InsideParens context (auto-close heuristic), got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens context (auto-close heuristic), got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4253,15 +4374,10 @@ mod tests {
 
         // Should still detect continuation operator despite comment
         match ctx {
-            IndentContext::AfterContinuationOperator {
-                operator_type, ..
-            } => {
+            IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4277,15 +4393,10 @@ mod tests {
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
-            IndentContext::AfterContinuationOperator {
-                operator_type, ..
-            } => {
+            IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::CustomInfix);
             }
-            _ => panic!(
-                "Expected AfterContinuationOperator context, got {:?}",
-                ctx
-            ),
+            _ => panic!("Expected AfterContinuationOperator context, got {:?}", ctx),
         }
     }
 
@@ -4383,7 +4494,10 @@ mod tests {
                 //   step())
                 // Cursor after %>% should detect pipe context
                 let code = format!("{}(data %>%\n  step())", func_name);
-                let position = Position { line: 1, character: 2 };
+                let position = Position {
+                    line: 1,
+                    character: 2,
+                };
                 (code, position, "AfterContinuationOperator")
             }
             NestedStructure::CallInsidePipe => {
@@ -4392,7 +4506,10 @@ mod tests {
                 //     more)
                 // Cursor inside func() should detect parens context
                 let code = format!("data %>%\n  {}(arg,\n    more)", func_name);
-                let position = Position { line: 2, character: 4 };
+                let position = Position {
+                    line: 2,
+                    character: 4,
+                };
                 (code, position, "InsideParens")
             }
             NestedStructure::BracesInsideCall => {
@@ -4401,7 +4518,10 @@ mod tests {
                 // })
                 // Cursor inside braces should detect brace context
                 let code = format!("{}({{\n  x <- 1\n}})", func_name);
-                let position = Position { line: 1, character: 2 };
+                let position = Position {
+                    line: 1,
+                    character: 2,
+                };
                 (code, position, "InsideBraces")
             }
             NestedStructure::PipeInsideBraces => {
@@ -4411,7 +4531,10 @@ mod tests {
                 // }
                 // Cursor after %>% should detect pipe context
                 let code = "{{\n  data %>%\n    step()\n}}".to_string();
-                let position = Position { line: 2, character: 4 };
+                let position = Position {
+                    line: 2,
+                    character: 4,
+                };
                 (code, position, "AfterContinuationOperator")
             }
             NestedStructure::CallInsideBraces => {
@@ -4421,7 +4544,10 @@ mod tests {
                 // }
                 // Cursor inside func() should detect parens context
                 let code = format!("{{\n  {}(arg,\n    more)\n}}", func_name);
-                let position = Position { line: 2, character: 4 };
+                let position = Position {
+                    line: 2,
+                    character: 4,
+                };
                 (code, position, "InsideParens")
             }
             NestedStructure::NestedCalls => {
@@ -4429,7 +4555,10 @@ mod tests {
                 //   y))
                 // Cursor inside inner() should detect parens context for inner
                 let code = format!("{}({}(x,\n  y))", func_name, inner_func);
-                let position = Position { line: 1, character: 2 };
+                let position = Position {
+                    line: 1,
+                    character: 2,
+                };
                 (code, position, "InsideParens")
             }
             NestedStructure::PipeInsidePipeViaCall => {
@@ -4438,7 +4567,10 @@ mod tests {
                 //     step())
                 // Cursor after inner %>% should detect pipe context
                 let code = format!("data %>%\n  {}(x %>%\n    step())", func_name);
-                let position = Position { line: 2, character: 4 };
+                let position = Position {
+                    line: 2,
+                    character: 4,
+                };
                 (code, position, "AfterContinuationOperator")
             }
         }
@@ -4754,7 +4886,10 @@ mod tests {
         let code = "func(data %>%\n  step())";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
@@ -4773,7 +4908,10 @@ mod tests {
         let code = "data %>%\n  func(arg,\n    more)";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 2, character: 4 };
+        let position = Position {
+            line: 2,
+            character: 4,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
@@ -4792,7 +4930,10 @@ mod tests {
         let code = "func({\n  x <- 1\n})";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
@@ -4812,14 +4953,20 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor after inner pipe
-        let position = Position { line: 2, character: 4 };
+        let position = Position {
+            line: 2,
+            character: 4,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { .. } => {
                 // Correct - detected innermost pipe
             }
-            _ => panic!("Expected AfterContinuationOperator for innermost pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for innermost pipe, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4830,14 +4977,20 @@ mod tests {
         let code = "func(data |>\n  step())";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Pipe);
             }
-            _ => panic!("Expected AfterContinuationOperator with Pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator with Pipe, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4850,14 +5003,20 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor inside aes() call
-        let position = Position { line: 2, character: 4 };
+        let position = Position {
+            line: 2,
+            character: 4,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens { .. } => {
                 // Correct - detected innermost parens (aes call)
             }
-            _ => panic!("Expected InsideParens for aes() inside ggplot chain, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens for aes() inside ggplot chain, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4877,7 +5036,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (empty line)
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator from line 0
@@ -4885,7 +5047,10 @@ mod tests {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!("Expected AfterContinuationOperator after pipe with empty line, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator after pipe with empty line, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4896,7 +5061,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (empty line)
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens
@@ -4904,7 +5072,10 @@ mod tests {
             IndentContext::InsideParens { .. } => {
                 // Correct
             }
-            _ => panic!("Expected InsideParens for empty line inside function call, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens for empty line inside function call, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4915,7 +5086,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (empty line)
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces
@@ -4923,7 +5097,10 @@ mod tests {
             IndentContext::InsideBraces { opener_line, .. } => {
                 assert_eq!(opener_line, 0);
             }
-            _ => panic!("Expected InsideBraces for empty line inside braces, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideBraces for empty line inside braces, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4938,18 +5115,29 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (first empty line after pipe) - should detect continuation
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line, ..
+            } => {
                 assert_eq!(chain_start_line, 0);
             }
-            _ => panic!("Expected AfterContinuationOperator on first empty line after pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator on first empty line after pipe, got {:?}",
+                ctx
+            ),
         }
 
         // Cursor on line 2 (second empty line) - previous line is empty, so no continuation detected
-        let position2 = Position { line: 2, character: 0 };
+        let position2 = Position {
+            line: 2,
+            character: 0,
+        };
         let ctx2 = detect_context(&tree, code, position2, 2);
 
         // This is expected to be AfterCompleteExpression since line 1 is empty
@@ -4957,7 +5145,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Expected - previous line is empty, no continuation operator
             }
-            _ => panic!("Expected AfterCompleteExpression on second empty line, got {:?}", ctx2),
+            _ => panic!(
+                "Expected AfterCompleteExpression on second empty line, got {:?}",
+                ctx2
+            ),
         }
     }
 
@@ -4972,7 +5163,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (after the pipe with comment)
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator despite comment
@@ -4980,7 +5174,10 @@ mod tests {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!("Expected AfterContinuationOperator with trailing comment, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator with trailing comment, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -4991,15 +5188,23 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (comment-only line)
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator from line 0
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line, ..
+            } => {
                 assert_eq!(chain_start_line, 0);
             }
-            _ => panic!("Expected AfterContinuationOperator with comment-only line, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator with comment-only line, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5013,18 +5218,29 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (comment line) - previous line has pipe
-        let position1 = Position { line: 1, character: 2 };
+        let position1 = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx1 = detect_context(&tree, code, position1, 2);
 
         match ctx1 {
-            IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line, ..
+            } => {
                 assert_eq!(chain_start_line, 0);
             }
-            _ => panic!("Expected AfterContinuationOperator on comment line after pipe, got {:?}", ctx1),
+            _ => panic!(
+                "Expected AfterContinuationOperator on comment line after pipe, got {:?}",
+                ctx1
+            ),
         }
 
         // Cursor on line 2 (after comment line) - previous line is comment, no operator
-        let position2 = Position { line: 2, character: 2 };
+        let position2 = Position {
+            line: 2,
+            character: 2,
+        };
         let ctx2 = detect_context(&tree, code, position2, 2);
 
         // This is expected to be AfterCompleteExpression since line 1 is a comment
@@ -5032,7 +5248,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Expected - previous line is comment, no continuation operator
             }
-            _ => panic!("Expected AfterCompleteExpression after comment line, got {:?}", ctx2),
+            _ => panic!(
+                "Expected AfterCompleteExpression after comment line, got {:?}",
+                ctx2
+            ),
         }
     }
 
@@ -5043,7 +5262,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator (hash in string is not a comment)
@@ -5051,7 +5273,10 @@ mod tests {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!("Expected AfterContinuationOperator with hash in string, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator with hash in string, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5061,14 +5286,20 @@ mod tests {
         let code = "data |> # native pipe comment\n  step()";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Pipe);
             }
-            _ => panic!("Expected AfterContinuationOperator for native pipe with comment, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for native pipe with comment, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5083,7 +5314,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (EOF)
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator
@@ -5091,7 +5325,10 @@ mod tests {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!("Expected AfterContinuationOperator at EOF after pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator at EOF after pipe, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5102,7 +5339,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (EOF)
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens
@@ -5110,7 +5350,10 @@ mod tests {
             IndentContext::InsideParens { .. } => {
                 // Correct
             }
-            _ => panic!("Expected InsideParens at EOF inside unclosed parens, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens at EOF inside unclosed parens, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5121,7 +5364,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 2 (EOF)
-        let position = Position { line: 2, character: 0 };
+        let position = Position {
+            line: 2,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces
@@ -5129,7 +5375,10 @@ mod tests {
             IndentContext::InsideBraces { opener_line, .. } => {
                 assert_eq!(opener_line, 0);
             }
-            _ => panic!("Expected InsideBraces at EOF inside unclosed braces, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideBraces at EOF inside unclosed braces, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5139,14 +5388,20 @@ mod tests {
         let code = "data |>\n";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Pipe);
             }
-            _ => panic!("Expected AfterContinuationOperator at EOF after native pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator at EOF after native pipe, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5156,14 +5411,20 @@ mod tests {
         let code = "ggplot(data) +\n";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Plus);
             }
-            _ => panic!("Expected AfterContinuationOperator at EOF after plus, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator at EOF after plus, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5178,7 +5439,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at end of line 0
-        let position = Position { line: 0, character: 8 };
+        let position = Position {
+            line: 0,
+            character: 8,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully - either detect pipe context or complete expression
@@ -5202,15 +5466,27 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at end of line 0
-        let position = Position { line: 0, character: 7 };
+        let position = Position {
+            line: 0,
+            character: 7,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside parens (unclosed)
         match ctx {
-            IndentContext::InsideParens { has_content_on_opener_line, .. } => {
-                assert!(has_content_on_opener_line, "Should detect content after opener");
+            IndentContext::InsideParens {
+                has_content_on_opener_line,
+                ..
+            } => {
+                assert!(
+                    has_content_on_opener_line,
+                    "Should detect content after opener"
+                );
             }
-            _ => panic!("Expected InsideParens for unclosed parenthesis, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens for unclosed parenthesis, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5221,7 +5497,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at end of line 0
-        let position = Position { line: 0, character: 8 };
+        let position = Position {
+            line: 0,
+            character: 8,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect inside braces (unclosed)
@@ -5241,7 +5520,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at end of line 0
-        let position = Position { line: 0, character: 7 };
+        let position = Position {
+            line: 0,
+            character: 7,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully without panicking
@@ -5264,7 +5546,10 @@ mod tests {
         let code = "data %>% %>%\n  step()";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully - detect some context without panicking
@@ -5287,7 +5572,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 2 (inside inner call)
-        let position = Position { line: 2, character: 4 };
+        let position = Position {
+            line: 2,
+            character: 4,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect innermost unclosed context (parens)
@@ -5301,7 +5589,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Acceptable for incomplete code
             }
-            _ => panic!("Expected InsideParens or InsideBraces for deeply nested unclosed, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens or InsideBraces for deeply nested unclosed, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5316,7 +5607,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor inside empty parens
-        let position = Position { line: 0, character: 5 };
+        let position = Position {
+            line: 0,
+            character: 5,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression (parens are closed)
@@ -5338,7 +5632,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor inside empty braces
-        let position = Position { line: 0, character: 1 };
+        let position = Position {
+            line: 0,
+            character: 1,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression or inside braces
@@ -5349,7 +5646,10 @@ mod tests {
             IndentContext::InsideBraces { .. } => {
                 // Also acceptable if cursor is considered inside
             }
-            _ => panic!("Expected AfterCompleteExpression or InsideBraces for empty braces, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterCompleteExpression or InsideBraces for empty braces, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5360,7 +5660,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at end of line
-        let position = Position { line: 0, character: 15 };
+        let position = Position {
+            line: 0,
+            character: 15,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression (pipe chain is complete)
@@ -5368,7 +5671,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Correct - single line pipe is complete
             }
-            _ => panic!("Expected AfterCompleteExpression for single-line pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterCompleteExpression for single-line pipe, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5379,7 +5685,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 0 (empty line)
-        let position = Position { line: 0, character: 0 };
+        let position = Position {
+            line: 0,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect complete expression (nothing before cursor)
@@ -5387,7 +5696,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Correct
             }
-            _ => panic!("Expected AfterCompleteExpression for empty line at start, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterCompleteExpression for empty line at start, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5398,15 +5710,23 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 1 (whitespace-only line)
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator from line 0
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line, ..
+            } => {
                 assert_eq!(chain_start_line, 0);
             }
-            _ => panic!("Expected AfterContinuationOperator for whitespace-only line, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for whitespace-only line, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5417,14 +5737,20 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at column 0 on line 1
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::InsideParens { .. } => {
                 // Correct
             }
-            _ => panic!("Expected InsideParens at column 0 inside function call, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens at column 0 inside function call, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5438,15 +5764,23 @@ mod tests {
         let tree = parse_r_code(&code);
 
         // Cursor on last line
-        let position = Position { line: 50, character: 2 };
+        let position = Position {
+            line: 50,
+            character: 2,
+        };
         let ctx = detect_context(&tree, &code, position, 2);
 
         // Should detect continuation operator with chain start at line 0
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, .. } => {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line, ..
+            } => {
                 assert_eq!(chain_start_line, 0);
             }
-            _ => panic!("Expected AfterContinuationOperator for very long chain, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for very long chain, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5457,19 +5791,30 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 3 (after +)
-        let position = Position { line: 3, character: 2 };
+        let position = Position {
+            line: 3,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect continuation operator with sub-chain start column at 2
         // (the RHS of the |> boundary, where `mutate(y)` starts) but line 0
         // (outermost expression start, for correct indent calculation)
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, chain_start_col, operator_type, .. } => {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line,
+                chain_start_col,
+                operator_type,
+                ..
+            } => {
                 assert_eq!(chain_start_line, 0);
                 assert_eq!(chain_start_col, 2);
                 assert_eq!(operator_type, OperatorType::Plus);
             }
-            _ => panic!("Expected AfterContinuationOperator for mixed operators, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for mixed operators, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5480,14 +5825,25 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 6 (after `x + y +`)
-        let position = Position { line: 6, character: 0 };
+        let position = Position {
+            line: 6,
+            character: 0,
+        };
         let ctx = detect_context(&tree, code, position, 4);
 
         // Sub-chain start col should be 5 (RHS of |>, where `x` is).
         // Line should be 0 (outermost expression start) for correct indent calc.
         match ctx {
-            IndentContext::AfterContinuationOperator { chain_start_line, chain_start_col, operator_type, .. } => {
-                assert_eq!(chain_start_col, 5, "Should align with sub-chain start after pipe");
+            IndentContext::AfterContinuationOperator {
+                chain_start_line,
+                chain_start_col,
+                operator_type,
+                ..
+            } => {
+                assert_eq!(
+                    chain_start_col, 5,
+                    "Should align with sub-chain start after pipe"
+                );
                 assert_eq!(chain_start_line, 0);
                 assert_eq!(operator_type, OperatorType::Plus);
             }
@@ -5502,14 +5858,16 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor at end of line 0
-        let position = Position { line: 0, character: 4 };
+        let position = Position {
+            line: 0,
+            character: 4,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully - may detect as complete expression or inside parens
         // depending on how tree-sitter handles subset syntax
         match ctx {
-            IndentContext::InsideParens { .. }
-            | IndentContext::AfterCompleteExpression { .. } => {
+            IndentContext::InsideParens { .. } | IndentContext::AfterCompleteExpression { .. } => {
                 // Both acceptable
             }
             _ => {
@@ -5525,7 +5883,10 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 3 (deepest level)
-        let position = Position { line: 3, character: 6 };
+        let position = Position {
+            line: 3,
+            character: 6,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should detect some context without panicking
@@ -5547,14 +5908,20 @@ mod tests {
         let code = "func(x) %>%\n  step()";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!("Expected AfterContinuationOperator for pipe after closing paren, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for pipe after closing paren, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5565,14 +5932,20 @@ mod tests {
         let tree = parse_r_code(code);
 
         // Cursor on line 3 (after pipe)
-        let position = Position { line: 3, character: 2 };
+        let position = Position {
+            line: 3,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::MagrittrPipe);
             }
-            _ => panic!("Expected AfterContinuationOperator after closing delimiter with pipe, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator after closing delimiter with pipe, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5582,14 +5955,20 @@ mod tests {
         let code = "y ~\n  x1 + x2";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::Tilde);
             }
-            _ => panic!("Expected AfterContinuationOperator for tilde in formula, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for tilde in formula, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5599,14 +5978,20 @@ mod tests {
         let code = "x %myop%\n  y";
         let tree = parse_r_code(code);
 
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
         let ctx = detect_context(&tree, code, position, 2);
 
         match ctx {
             IndentContext::AfterContinuationOperator { operator_type, .. } => {
                 assert_eq!(operator_type, OperatorType::CustomInfix);
             }
-            _ => panic!("Expected AfterContinuationOperator for custom infix, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterContinuationOperator for custom infix, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5620,7 +6005,10 @@ mod tests {
         // Invalid AST: double operators should trigger fallback detection
         let code = "x %>% %>%\n";
         let tree = parse_r_code(code);
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
 
         // Should not panic, should return a valid context using fallback
         let ctx = detect_context(&tree, code, position, 2);
@@ -5642,7 +6030,10 @@ mod tests {
         // Invalid AST: incomplete assignment
         let code = "x <-\n";
         let tree = parse_r_code(code);
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5661,13 +6052,18 @@ mod tests {
         // Position with line number far beyond document
         let code = "x <- 1";
         let tree = parse_r_code(code);
-        let position = Position { line: 1000, character: 0 };
+        let position = Position {
+            line: 1000,
+            character: 0,
+        };
 
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression with indent 0
         match ctx {
-            IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
+            IndentContext::AfterCompleteExpression {
+                enclosing_block_indent,
+            } => {
                 assert_eq!(enclosing_block_indent, 0);
             }
             _ => panic!("Expected AfterCompleteExpression for far out-of-bounds line"),
@@ -5680,7 +6076,10 @@ mod tests {
         let code = "short";
         let tree = parse_r_code(code);
         // Column 100 is way beyond the 5-character line
-        let position = Position { line: 0, character: 100 };
+        let position = Position {
+            line: 0,
+            character: 100,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5697,14 +6096,19 @@ mod tests {
         // Position with maximum u32 values
         let code = "x <- 1";
         let tree = parse_r_code(code);
-        let position = Position { line: u32::MAX, character: u32::MAX };
+        let position = Position {
+            line: u32::MAX,
+            character: u32::MAX,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression with indent 0
         match ctx {
-            IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
+            IndentContext::AfterCompleteExpression {
+                enclosing_block_indent,
+            } => {
                 assert_eq!(enclosing_block_indent, 0);
             }
             _ => panic!("Expected AfterCompleteExpression for max u32 position"),
@@ -5716,7 +6120,10 @@ mod tests {
         // Unclosed parenthesis spanning multiple lines
         let code = "func(\n  arg1,\n  arg2,\n";
         let tree = parse_r_code(code);
-        let position = Position { line: 3, character: 0 };
+        let position = Position {
+            line: 3,
+            character: 0,
+        };
 
         let ctx = detect_context(&tree, code, position, 2);
 
@@ -5728,7 +6135,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Also acceptable if fallback is used
             }
-            _ => panic!("Expected InsideParens or AfterCompleteExpression for unclosed paren, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideParens or AfterCompleteExpression for unclosed paren, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5737,7 +6147,10 @@ mod tests {
         // Unclosed brace spanning multiple lines
         let code = "if (TRUE) {\n  x <- 1\n  y <- 2\n";
         let tree = parse_r_code(code);
-        let position = Position { line: 3, character: 0 };
+        let position = Position {
+            line: 3,
+            character: 0,
+        };
 
         let ctx = detect_context(&tree, code, position, 2);
 
@@ -5749,7 +6162,10 @@ mod tests {
             IndentContext::AfterCompleteExpression { .. } => {
                 // Also acceptable if fallback is used
             }
-            _ => panic!("Expected InsideBraces or AfterCompleteExpression for unclosed brace, got {:?}", ctx),
+            _ => panic!(
+                "Expected InsideBraces or AfterCompleteExpression for unclosed brace, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -5758,7 +6174,10 @@ mod tests {
         // Mismatched delimiters: opening paren, closing bracket
         let code = "func(x]";
         let tree = parse_r_code(code);
-        let position = Position { line: 0, character: 7 };
+        let position = Position {
+            line: 0,
+            character: 7,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5777,7 +6196,10 @@ mod tests {
         // Mismatched delimiters: opening brace, closing paren
         let code = "{ x <- 1 )";
         let tree = parse_r_code(code);
-        let position = Position { line: 0, character: 10 };
+        let position = Position {
+            line: 0,
+            character: 10,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5796,7 +6218,10 @@ mod tests {
         // Deeply nested structure with syntax error
         let code = "outer({\n  inner(x, {\n    <- broken\n  })\n})";
         let tree = parse_r_code(code);
-        let position = Position { line: 2, character: 4 };
+        let position = Position {
+            line: 2,
+            character: 4,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5816,13 +6241,18 @@ mod tests {
         // Empty source code
         let code = "";
         let tree = parse_r_code(code);
-        let position = Position { line: 0, character: 0 };
+        let position = Position {
+            line: 0,
+            character: 0,
+        };
 
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should return AfterCompleteExpression with indent 0
         match ctx {
-            IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
+            IndentContext::AfterCompleteExpression {
+                enclosing_block_indent,
+            } => {
                 assert_eq!(enclosing_block_indent, 0);
             }
             _ => panic!("Expected AfterCompleteExpression for empty source"),
@@ -5834,7 +6264,10 @@ mod tests {
         // Source with only whitespace
         let code = "   \n   \n   ";
         let tree = parse_r_code(code);
-        let position = Position { line: 1, character: 0 };
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5851,7 +6284,10 @@ mod tests {
         // Source with only comments
         let code = "# comment 1\n# comment 2\n";
         let tree = parse_r_code(code);
-        let position = Position { line: 2, character: 0 };
+        let position = Position {
+            line: 2,
+            character: 0,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5868,7 +6304,10 @@ mod tests {
         // Code with unicode characters
         let code = "变量 <- 1 %>%\n  处理()";
         let tree = parse_r_code(code);
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
@@ -5887,7 +6326,10 @@ mod tests {
         let long_content = "x".repeat(10000);
         let code = format!("{} %>%\n  step()", long_content);
         let tree = parse_r_code(&code);
-        let position = Position { line: 1, character: 2 };
+        let position = Position {
+            line: 1,
+            character: 2,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, &code, position, 2);
@@ -5909,32 +6351,37 @@ mod tests {
         }
         code.push('x');
         // Don't close the parens - test unclosed handling
-        
+
         let tree = parse_r_code(&code);
-        let position = Position { line: 0, character: code.len() as u32 };
+        let position = Position {
+            line: 0,
+            character: code.len() as u32,
+        };
 
         // Should not panic
         let ctx = detect_context(&tree, &code, position, 2);
 
         // Should detect inside parens or complete expression
         match ctx {
-            IndentContext::InsideParens { .. }
-            | IndentContext::AfterCompleteExpression { .. } => {}
+            IndentContext::InsideParens { .. } | IndentContext::AfterCompleteExpression { .. } => {}
             _ => {}
         }
     }
 }
 
-
 #[cfg(test)]
 mod auto_close_tests {
     use super::*;
-    use crate::indentation::calculator::{IndentationConfig, IndentationStyle, calculate_indentation};
+    use crate::indentation::calculator::{
+        calculate_indentation, IndentationConfig, IndentationStyle,
+    };
     use tower_lsp::lsp_types::Position;
 
     fn parse_r(code: &str) -> Tree {
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
         parser.parse(code, None).unwrap()
     }
 
@@ -5951,18 +6398,40 @@ mod auto_close_tests {
         // VS Code auto-inserts `)`, user presses Enter → `func(\n)`
         let code = "x <- some_func(\n)";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 }, 2);
-        assert!(matches!(ctx, IndentContext::InsideParens { .. }),
-            "Auto-closed paren should be treated as InsideParens, got {:?}", ctx);
+        let ctx = detect_context(
+            &tree,
+            code,
+            Position {
+                line: 1,
+                character: 0,
+            },
+            2,
+        );
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "Auto-closed paren should be treated as InsideParens, got {:?}",
+            ctx
+        );
     }
 
     #[test]
     fn unclosed_paren_gets_inside_parens_context() {
         let code = "x <- some_func(\n";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 }, 2);
-        assert!(matches!(ctx, IndentContext::InsideParens { .. }),
-            "Unclosed paren should be InsideParens, got {:?}", ctx);
+        let ctx = detect_context(
+            &tree,
+            code,
+            Position {
+                line: 1,
+                character: 0,
+            },
+            2,
+        );
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "Unclosed paren should be InsideParens, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -5971,16 +6440,34 @@ mod auto_close_tests {
 
         let code_auto = "x <- some_func(\n)";
         let tree_auto = parse_r(code_auto);
-        let ctx_auto = detect_context(&tree_auto, code_auto, Position { line: 1, character: 0 }, 2);
+        let ctx_auto = detect_context(
+            &tree_auto,
+            code_auto,
+            Position {
+                line: 1,
+                character: 0,
+            },
+            2,
+        );
         let indent_auto = calculate_indentation(ctx_auto, config.clone(), code_auto);
 
         let code_open = "x <- some_func(\n";
         let tree_open = parse_r(code_open);
-        let ctx_open = detect_context(&tree_open, code_open, Position { line: 1, character: 0 }, 2);
+        let ctx_open = detect_context(
+            &tree_open,
+            code_open,
+            Position {
+                line: 1,
+                character: 0,
+            },
+            2,
+        );
         let indent_open = calculate_indentation(ctx_open, config, code_open);
 
-        assert_eq!(indent_auto, indent_open,
-            "Auto-closed and unclosed parens should produce identical indentation");
+        assert_eq!(
+            indent_auto, indent_open,
+            "Auto-closed and unclosed parens should produce identical indentation"
+        );
     }
 
     #[test]
@@ -5988,10 +6475,22 @@ mod auto_close_tests {
         // The key user-reported scenario: content after opener should align
         let code = "if (TRUE) {\n  x <- some_func(\"file\",\n  )\n}";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 2, character: 0 }, 2);
+        let ctx = detect_context(
+            &tree,
+            code,
+            Position {
+                line: 2,
+                character: 0,
+            },
+            2,
+        );
 
         match &ctx {
-            IndentContext::InsideParens { opener_col, has_content_on_opener_line, .. } => {
+            IndentContext::InsideParens {
+                opener_col,
+                has_content_on_opener_line,
+                ..
+            } => {
                 assert_eq!(*opener_col, 16);
                 assert!(*has_content_on_opener_line);
             }
@@ -6007,9 +6506,20 @@ mod auto_close_tests {
     fn auto_closed_brace_gets_inside_braces_context() {
         let code = "if (TRUE) {\n}";
         let tree = parse_r(code);
-        let ctx = detect_context(&tree, code, Position { line: 1, character: 0 }, 2);
-        assert!(matches!(ctx, IndentContext::InsideBraces { .. }),
-            "Auto-closed brace should be treated as InsideBraces, got {:?}", ctx);
+        let ctx = detect_context(
+            &tree,
+            code,
+            Position {
+                line: 1,
+                character: 0,
+            },
+            2,
+        );
+        assert!(
+            matches!(ctx, IndentContext::InsideBraces { .. }),
+            "Auto-closed brace should be treated as InsideBraces, got {:?}",
+            ctx
+        );
     }
 
     #[test]
@@ -6025,12 +6535,26 @@ mod auto_close_tests {
         let tree = parse_r(code);
 
         // Cursor at line 2 with nonzero character (matching previous line's indent)
-        let ctx = detect_context(&tree, code, Position { line: 2, character: 19 }, 2);
-        assert!(matches!(ctx, IndentContext::InsideParens { .. }),
-            "Second Enter with auto-closed paren should be InsideParens, got {:?}", ctx);
+        let ctx = detect_context(
+            &tree,
+            code,
+            Position {
+                line: 2,
+                character: 19,
+            },
+            2,
+        );
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "Second Enter with auto-closed paren should be InsideParens, got {:?}",
+            ctx
+        );
 
         let indent = calculate_indentation(ctx, rstudio_config(2), code);
         // Should align to column after `(` since there's content after opener
-        assert_eq!(indent, 19, "Should maintain paren alignment on second Enter");
+        assert_eq!(
+            indent, 19,
+            "Should maintain paren alignment on second Enter"
+        );
     }
 }

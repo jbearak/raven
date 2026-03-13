@@ -114,9 +114,8 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
     };
     let mut results = Vec::new();
 
-    let should_run = |phase: &str| -> bool {
-        args.only.as_ref().map_or(true, |only| only == phase)
-    };
+    let should_run =
+        |phase: &str| -> bool { args.only.as_ref().map_or(true, |only| only == phase) };
 
     // Phase 1: Scan — discover R files
     let mut r_files: Vec<(PathBuf, String)> = Vec::new();
@@ -148,7 +147,10 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
             let uri = match Url::from_file_path(path) {
                 Ok(url) => url,
                 Err(_) => {
-                    log::warn!("Skipping file with non-convertible path: {}", path.display());
+                    log::warn!(
+                        "Skipping file with non-convertible path: {}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -171,7 +173,10 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
             let uri = match Url::from_file_path(path) {
                 Ok(url) => url,
                 Err(_) => {
-                    log::warn!("Skipping file with non-convertible path: {}", path.display());
+                    log::warn!(
+                        "Skipping file with non-convertible path: {}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -221,12 +226,8 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
         for (uri, content, tree) in &parsed_trees {
             if let Some(tree) = tree {
                 let meta = metadata_map.get(uri);
-                let artifacts = cross_file::scope::compute_artifacts_with_metadata(
-                    uri,
-                    tree,
-                    content,
-                    meta,
-                );
+                let artifacts =
+                    cross_file::scope::compute_artifacts_with_metadata(uri, tree, content, meta);
                 total_symbols += artifacts.timeline.len();
                 artifacts_count += 1;
             }
@@ -349,8 +350,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-
-
 fn collect_r_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -398,12 +397,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_only_flag() {
-        let mut args = vec![
-            ".".to_string(),
-            "--only".to_string(),
-            "parse".to_string(),
-        ]
-        .into_iter();
+        let mut args = vec![".".to_string(), "--only".to_string(), "parse".to_string()].into_iter();
         let result = parse_args(&mut args).unwrap();
         assert_eq!(result.only.as_deref(), Some("parse"));
     }
@@ -432,12 +426,8 @@ mod tests {
 
     #[test]
     fn test_parse_args_invalid_phase() {
-        let mut args = vec![
-            ".".to_string(),
-            "--only".to_string(),
-            "invalid".to_string(),
-        ]
-        .into_iter();
+        let mut args =
+            vec![".".to_string(), "--only".to_string(), "invalid".to_string()].into_iter();
         let result = parse_args(&mut args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown phase"));
@@ -461,18 +451,17 @@ mod tests {
 
     #[test]
     fn test_valid_phases_list() {
-        assert_eq!(VALID_PHASES, &["scan", "parse", "metadata", "scope", "packages"]);
+        assert_eq!(
+            VALID_PHASES,
+            &["scan", "parse", "metadata", "scope", "packages"]
+        );
     }
 
     #[test]
     fn test_parse_args_all_valid_phases() {
         for phase in VALID_PHASES {
-            let mut args = vec![
-                ".".to_string(),
-                "--only".to_string(),
-                phase.to_string(),
-            ]
-            .into_iter();
+            let mut args =
+                vec![".".to_string(), "--only".to_string(), phase.to_string()].into_iter();
             let result = parse_args(&mut args);
             assert!(result.is_ok(), "Phase '{}' should be valid", phase);
             assert_eq!(result.unwrap().only.as_deref(), Some(*phase));

@@ -7,7 +7,6 @@
 //   RAVEN_PERF=1 raven --stdio      # Enable basic timing logs
 //   RAVEN_PERF=verbose raven --stdio # Enable detailed timing with thresholds
 
-
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -283,7 +282,6 @@ fn peak_rss_linux() -> Option<u64> {
     None
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,12 +315,18 @@ mod tests {
         let rss = peak_rss_bytes();
         // On macOS and Linux, we should get a value; on other platforms, None.
         if cfg!(any(target_os = "macos", target_os = "linux")) {
-            assert!(rss.is_some(), "peak_rss_bytes() should return Some on macOS/Linux");
+            assert!(
+                rss.is_some(),
+                "peak_rss_bytes() should return Some on macOS/Linux"
+            );
             let bytes = rss.unwrap();
             // A running process should have at least some RSS (> 0)
             assert!(bytes > 0, "peak RSS should be > 0, got {}", bytes);
         } else {
-            assert!(rss.is_none(), "peak_rss_bytes() should return None on unsupported platforms");
+            assert!(
+                rss.is_none(),
+                "peak_rss_bytes() should return None on unsupported platforms"
+            );
         }
     }
 }

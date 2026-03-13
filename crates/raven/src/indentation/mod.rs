@@ -30,14 +30,9 @@ pub use formatter::format_indentation;
 pub fn on_type_formatting_capability() -> DocumentOnTypeFormattingOptions {
     DocumentOnTypeFormattingOptions {
         first_trigger_character: "\n".to_string(),
-        more_trigger_character: Some(vec![
-            ")".to_string(),
-            "]".to_string(),
-            "}".to_string(),
-        ]),
+        more_trigger_character: Some(vec![")".to_string(), "]".to_string(), "}".to_string()]),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -52,10 +47,11 @@ mod tests {
             "first_trigger_character should be newline"
         );
 
-        let more = capability.more_trigger_character.expect("should have more triggers");
+        let more = capability
+            .more_trigger_character
+            .expect("should have more triggers");
         assert!(more.contains(&")".to_string()), "should trigger on )");
         assert!(more.contains(&"]".to_string()), "should trigger on ]");
         assert!(more.contains(&"}".to_string()), "should trigger on }}");
     }
 }
-

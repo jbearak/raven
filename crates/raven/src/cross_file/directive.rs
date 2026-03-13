@@ -552,7 +552,12 @@ x <- undefined"#;
         for directive in ["lsp-source", "lsp-run", "lsp-include"] {
             let content = format!("# {} utils.R", directive);
             let meta = parse_directives(&content);
-            assert_eq!(meta.sources.len(), 0, "Should not recognize {} without @ prefix", directive);
+            assert_eq!(
+                meta.sources.len(),
+                0,
+                "Should not recognize {} without @ prefix",
+                directive
+            );
         }
     }
 
@@ -976,7 +981,11 @@ x <- undefined"#;
         let content = "x <- 1\n# @lsp-sourced-by ../main.R";
         let meta = parse_directives(content);
         assert_eq!(meta.sourced_by.len(), 0);
-        assert_eq!(meta.sources.len(), 0, "backward directive must not be misinterpreted as forward");
+        assert_eq!(
+            meta.sources.len(),
+            0,
+            "backward directive must not be misinterpreted as forward"
+        );
     }
 
     #[test]

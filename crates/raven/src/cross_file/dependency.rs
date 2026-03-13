@@ -1078,7 +1078,12 @@ impl DependencyGraph {
     ///
     /// `max_visited` caps the total number of nodes explored during DFS to prevent
     /// unbounded traversal in dense graphs (e.g., auto backward dependency mode).
-    pub fn get_transitive_dependents(&self, uri: &Url, max_depth: usize, max_visited: usize) -> Vec<Url> {
+    pub fn get_transitive_dependents(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> Vec<Url> {
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         self.collect_dependents(uri, max_depth, 0, &mut visited, &mut result, max_visited);
@@ -1255,7 +1260,12 @@ impl DependencyGraph {
     ///
     /// `max_visited` caps the total number of nodes collected to prevent
     /// unbounded expansion in dense bidirectional graphs.
-    pub fn collect_neighborhood(&self, uri: &Url, max_depth: usize, max_visited: usize) -> HashSet<Url> {
+    pub fn collect_neighborhood(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> HashSet<Url> {
         let mut visited = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((uri.clone(), 0usize));
@@ -1382,9 +1392,7 @@ impl DependencyGraph {
                     closing_edge: edge.clone(),
                 });
             }
-            if let Some(detection) =
-                self.detect_cycle_recursive(start, &edge.to, visited, path)
-            {
+            if let Some(detection) = self.detect_cycle_recursive(start, &edge.to, visited, path) {
                 return Some(detection);
             }
             path.pop();
@@ -1557,9 +1565,7 @@ mod tests {
         // Star graph: a, b, c, d, e all source "hub.R"
         let mut graph = DependencyGraph::new();
         let hub = url("hub.R");
-        let spokes: Vec<Url> = (0..5)
-            .map(|i| url(&format!("spoke_{}.R", i)))
-            .collect();
+        let spokes: Vec<Url> = (0..5).map(|i| url(&format!("spoke_{}.R", i))).collect();
 
         for spoke in &spokes {
             let meta = make_meta_with_source("hub.R", 1);

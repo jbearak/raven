@@ -2477,9 +2477,7 @@ mod tests {
             None => return,
         };
 
-        let result = subprocess
-            .get_function_formals("", None, true)
-            .await;
+        let result = subprocess.get_function_formals("", None, true).await;
 
         assert!(
             result.is_err(),
@@ -2561,7 +2559,8 @@ mod property_tests {
         ]
         .prop_filter("must not be empty", |s| !s.is_empty())
         .prop_filter("must contain at least one invalid char", |s| {
-            s.chars().any(|c| !c.is_ascii_alphanumeric() && c != '.' && c != '_')
+            s.chars()
+                .any(|c| !c.is_ascii_alphanumeric() && c != '.' && c != '_')
         })
     }
 
@@ -2609,4 +2608,3 @@ mod property_tests {
         }
     }
 }
-

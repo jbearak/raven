@@ -22,8 +22,7 @@ pub struct FixtureConfig {
 
 /// A set of well-known library names used deterministically in generated code.
 const LIBRARIES: &[&str] = &[
-    "stats", "utils", "dplyr", "ggplot2", "tidyr",
-    "stringr", "purrr", "readr", "tibble", "forcats",
+    "stats", "utils", "dplyr", "ggplot2", "tidyr", "stringr", "purrr", "readr", "tibble", "forcats",
 ];
 
 impl FixtureConfig {
@@ -90,7 +89,9 @@ fn generate_r_file_content(index: usize, config: &FixtureConfig) -> String {
         writeln!(
             content,
             "func_{}_{} <- function(x, y = {}) {{",
-            index, func_i, func_i + 1
+            index,
+            func_i,
+            func_i + 1
         )
         .unwrap();
         writeln!(content, "    result <- x + y * {}", func_i + 1).unwrap();
@@ -170,12 +171,7 @@ mod tests {
         let r_files: Vec<_> = std::fs::read_dir(workspace.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "R")
-                    .unwrap_or(false)
-            })
+            .filter(|e| e.path().extension().map(|ext| ext == "R").unwrap_or(false))
             .collect();
         assert_eq!(r_files.len(), config.file_count);
     }
@@ -190,7 +186,11 @@ mod tests {
             let filename = format!("file_{}.R", i);
             let content1 = std::fs::read_to_string(ws1.path().join(&filename)).unwrap();
             let content2 = std::fs::read_to_string(ws2.path().join(&filename)).unwrap();
-            assert_eq!(content1, content2, "File {} should be identical across runs", filename);
+            assert_eq!(
+                content1, content2,
+                "File {} should be identical across runs",
+                filename
+            );
         }
     }
 
@@ -207,23 +207,38 @@ mod tests {
 
         // file_0 should source file_1
         let content_0 = std::fs::read_to_string(workspace.path().join("file_0.R")).unwrap();
-        assert!(content_0.contains("source(\"file_1.R\")"), "file_0 should source file_1");
+        assert!(
+            content_0.contains("source(\"file_1.R\")"),
+            "file_0 should source file_1"
+        );
 
         // file_1 should source file_2
         let content_1 = std::fs::read_to_string(workspace.path().join("file_1.R")).unwrap();
-        assert!(content_1.contains("source(\"file_2.R\")"), "file_1 should source file_2");
+        assert!(
+            content_1.contains("source(\"file_2.R\")"),
+            "file_1 should source file_2"
+        );
 
         // file_2 should source file_3
         let content_2 = std::fs::read_to_string(workspace.path().join("file_2.R")).unwrap();
-        assert!(content_2.contains("source(\"file_3.R\")"), "file_2 should source file_3");
+        assert!(
+            content_2.contains("source(\"file_3.R\")"),
+            "file_2 should source file_3"
+        );
 
         // file_3 should NOT source anything (depth = 3 means indices 0,1,2 source)
         let content_3 = std::fs::read_to_string(workspace.path().join("file_3.R")).unwrap();
-        assert!(!content_3.contains("source("), "file_3 should not have source() calls");
+        assert!(
+            !content_3.contains("source("),
+            "file_3 should not have source() calls"
+        );
 
         // file_4 should NOT source anything
         let content_4 = std::fs::read_to_string(workspace.path().join("file_4.R")).unwrap();
-        assert!(!content_4.contains("source("), "file_4 should not have source() calls");
+        assert!(
+            !content_4.contains("source("),
+            "file_4 should not have source() calls"
+        );
     }
 
     #[test]
@@ -261,7 +276,10 @@ mod tests {
         let workspace = create_fixture_workspace(&config);
         let content = std::fs::read_to_string(workspace.path().join("file_0.R")).unwrap();
 
-        let lib_count = content.lines().filter(|l| l.starts_with("library(")).count();
+        let lib_count = content
+            .lines()
+            .filter(|l| l.starts_with("library("))
+            .count();
         assert_eq!(lib_count, 3, "Should have exactly 3 library() calls");
     }
 
@@ -277,7 +295,10 @@ mod tests {
         let workspace = create_fixture_workspace(&config);
         let content = std::fs::read_to_string(workspace.path().join("file_0.R")).unwrap();
 
-        let func_count = content.lines().filter(|l| l.contains("<- function(")).count();
+        let func_count = content
+            .lines()
+            .filter(|l| l.contains("<- function("))
+            .count();
         assert_eq!(func_count, 4, "Should have exactly 4 function definitions");
     }
 }

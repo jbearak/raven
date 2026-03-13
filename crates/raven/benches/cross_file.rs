@@ -12,13 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use url::Url;
 
-use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
-use raven::cross_file::{
-    compute_artifacts, extract_metadata, scope_at_position, DependencyGraph,
-    FunctionScopeTree, Position, ScopeArtifacts,
-};
 use raven::cross_file::types::CrossFileMetadata;
-
+use raven::cross_file::{
+    compute_artifacts, extract_metadata, scope_at_position, DependencyGraph, FunctionScopeTree,
+    Position, ScopeArtifacts,
+};
+use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
 
 /// Pre-compute scope artifacts and metadata for all files in a workspace.
 ///
@@ -35,12 +34,7 @@ fn precompute_artifacts(
     let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "R")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|ext| ext == "R").unwrap_or(false))
         .collect();
     entries.sort_by_key(|e| e.path());
 
@@ -160,28 +154,24 @@ fn bench_scope_resolution(c: &mut Criterion) {
         let uri = file_0_uri(workspace_path);
         let base_exports: HashSet<String> = HashSet::new();
 
-        group.bench_with_input(
-            BenchmarkId::new("depth", depth),
-            &depth,
-            |b, _| {
-                b.iter(|| {
-                    black_box(raven::cross_file::scope_at_position_with_graph(
-                        black_box(&uri),
-                        u32::MAX,
-                        u32::MAX,
-                        &|u| artifacts_map.get(u).cloned(),
-                        &|u| metadata_map.get(u).cloned(),
-                        &graph,
-                        Some(&folder_url),
-                        black_box(20),
-                        &base_exports,
-                        true,
-                        raven::cross_file::config::BackwardDependencyMode::Explicit,
-                        &|| false,
-                    ))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("depth", depth), &depth, |b, _| {
+            b.iter(|| {
+                black_box(raven::cross_file::scope_at_position_with_graph(
+                    black_box(&uri),
+                    u32::MAX,
+                    u32::MAX,
+                    &|u| artifacts_map.get(u).cloned(),
+                    &|u| metadata_map.get(u).cloned(),
+                    &graph,
+                    Some(&folder_url),
+                    black_box(20),
+                    &base_exports,
+                    true,
+                    raven::cross_file::config::BackwardDependencyMode::Explicit,
+                    &|| false,
+                ))
+            })
+        });
     }
 
     group.finish();
@@ -252,16 +242,20 @@ fn bench_scope_hotspots(c: &mut Criterion) {
         let (_uri, artifacts, query_line, query_column) =
             build_nested_scope_artifacts(depth, defs_per_scope);
         let label = format!("depth_{depth}_defs_{defs_per_scope}");
-        group.bench_with_input(BenchmarkId::new("nested_scope", label), &artifacts, |b, artifacts| {
-            b.iter(|| {
-                black_box(scope_at_position(
-                    artifacts,
-                    black_box(query_line),
-                    black_box(query_column),
-                    false,
-                ))
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("nested_scope", label),
+            &artifacts,
+            |b, artifacts| {
+                b.iter(|| {
+                    black_box(scope_at_position(
+                        artifacts,
+                        black_box(query_line),
+                        black_box(query_column),
+                        false,
+                    ))
+                })
+            },
+        );
     }
 
     group.finish();
@@ -338,29 +332,19 @@ fn bench_dependency_graph(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("get_dependencies", *label),
             &(&graph, &root_uri),
-            |b, &(graph, uri)| {
-                b.iter(|| {
-                    black_box(graph.get_dependencies(black_box(uri)))
-                })
-            },
+            |b, &(graph, uri)| b.iter(|| black_box(graph.get_dependencies(black_box(uri)))),
         );
 
         // Benchmark: querying direct dependents of the last file in the chain
         // (the most-sourced file has the most dependents)
         let chain_end_idx = config.source_chain_depth.min(config.file_count - 1);
-        let chain_end_uri = Url::from_file_path(
-            workspace_path.join(format!("file_{}.R", chain_end_idx)),
-        )
-        .unwrap();
+        let chain_end_uri =
+            Url::from_file_path(workspace_path.join(format!("file_{}.R", chain_end_idx))).unwrap();
 
         group.bench_with_input(
             BenchmarkId::new("get_dependents", *label),
             &(&graph, &chain_end_uri),
-            |b, &(graph, uri)| {
-                b.iter(|| {
-                    black_box(graph.get_dependents(black_box(uri)))
-                })
-            },
+            |b, &(graph, uri)| b.iter(|| black_box(graph.get_dependents(black_box(uri)))),
         );
 
         // Benchmark: querying transitive dependents from the chain end

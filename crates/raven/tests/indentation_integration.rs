@@ -35,11 +35,7 @@ fn parse_r_code(code: &str) -> tree_sitter::Tree {
 
 /// Simulate the full onTypeFormatting flow: parse → detect context → calculate → format.
 /// Returns the generated indentation string.
-fn simulate_on_type_formatting(
-    code: &str,
-    line: u32,
-    config: IndentationConfig,
-) -> String {
+fn simulate_on_type_formatting(code: &str, line: u32, config: IndentationConfig) -> String {
     let tree = parse_r_code(code);
     let position = Position { line, character: 0 };
     let context = detect_context(&tree, code, position, config.tab_size);
@@ -102,7 +98,10 @@ fn test_simple_pipe_chain_magrittr_pipe() {
     // Magrittr pipe %>% after assignment: align to RHS ("data" at col 10)
     let code = "result <- data %>%\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 10, "Magrittr pipe should align to RHS of assignment");
+    assert_eq!(
+        column, 10,
+        "Magrittr pipe should align to RHS of assignment"
+    );
 }
 
 #[test]
@@ -111,7 +110,10 @@ fn test_pipe_chain_multiple_lines() {
     // "result <- data %>%" — RHS "data" at col 10
     let code = "result <- data %>%\n          filter(x > 0) %>%\n";
     let column = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(column, 10, "All pipe chain continuations should have uniform indentation");
+    assert_eq!(
+        column, 10,
+        "All pipe chain continuations should have uniform indentation"
+    );
 }
 
 #[test]
@@ -136,7 +138,10 @@ fn test_pipe_after_multiline_call_aligns_to_rhs() {
     // The outermost pipe binary_operator starts at "merp" (col 5)
     let code = "x <- merp(x,\n          y) |>\n";
     let column = get_indentation_column(code, 2, rstudio_config(4));
-    assert_eq!(column, 5, "Pipe after multiline call should align to RHS of assignment");
+    assert_eq!(
+        column, 5,
+        "Pipe after multiline call should align to RHS of assignment"
+    );
 }
 
 #[test]
@@ -152,7 +157,10 @@ fn test_pipe_indented_with_assignment() {
     // "  x <- data |>" with tab_size=2: "data" at col 7, line_indent=2, max(7, 2+2) = 7
     let code = "  x <- data |>\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 7, "Indented pipe after assignment should align to RHS");
+    assert_eq!(
+        column, 7,
+        "Indented pipe after assignment should align to RHS"
+    );
 }
 
 #[test]
@@ -169,7 +177,10 @@ fn test_formula_tilde_operator() {
     // Formula with ~ operator: `y` starts at col 9, align continuation there
     let code = "model <- y ~\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 9, "Formula ~ operator after assignment should align to RHS");
+    assert_eq!(
+        column, 9,
+        "Formula ~ operator after assignment should align to RHS"
+    );
 }
 
 // ============================================================================
@@ -183,7 +194,10 @@ fn test_function_call_same_line_args_rstudio() {
     let code = "func(arg1,\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // "func(" is 5 chars, so opener_col=4, alignment should be at column 5
-    assert_eq!(column, 5, "RStudio style should align to column after opening paren");
+    assert_eq!(
+        column, 5,
+        "RStudio style should align to column after opening paren"
+    );
 }
 
 #[test]
@@ -192,7 +206,10 @@ fn test_function_call_same_line_args_longer_name() {
     let code = "longer_function_name(first_arg,\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // "longer_function_name(" is 21 chars, opener_col=20, alignment at 21
-    assert_eq!(column, 21, "Should align to column after opening paren for longer names");
+    assert_eq!(
+        column, 21,
+        "Should align to column after opening paren for longer names"
+    );
 }
 
 #[test]
@@ -202,7 +219,10 @@ fn test_nested_function_call_same_line() {
     let code = "outer(inner(x, y))\n";
     // After the complete expression, we're at base indent
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 0, "After complete nested call, should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete nested call, should return to base indent"
+    );
 }
 
 #[test]
@@ -231,7 +251,10 @@ fn test_function_call_next_line_args_rstudio() {
     let code = "func(\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // Line indent is 0, so should be 0 + tab_size = 2
-    assert_eq!(column, 2, "RStudio style should indent from function line + tab_size");
+    assert_eq!(
+        column, 2,
+        "RStudio style should indent from function line + tab_size"
+    );
 }
 
 #[test]
@@ -240,7 +263,10 @@ fn test_function_call_next_line_args_indented() {
     let code = "  func(\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // Line indent is 2, so should be 2 + tab_size = 4
-    assert_eq!(column, 4, "Should indent from indented function line + tab_size");
+    assert_eq!(
+        column, 4,
+        "Should indent from indented function line + tab_size"
+    );
 }
 
 #[test]
@@ -261,7 +287,10 @@ fn test_function_call_rstudio_minus_same_line() {
     let code = "func(arg1,\n";
     let column = get_indentation_column(code, 1, rstudio_minus_config(2));
     // Line indent is 0, so should be 0 + tab_size = 2 (not aligned to paren)
-    assert_eq!(column, 2, "RStudio-minus should indent from line, not align to paren");
+    assert_eq!(
+        column, 2,
+        "RStudio-minus should indent from line, not align to paren"
+    );
 }
 
 #[test]
@@ -269,7 +298,10 @@ fn test_function_call_rstudio_minus_next_line() {
     // RStudio-minus with next-line args
     let code = "func(\n";
     let column = get_indentation_column(code, 1, rstudio_minus_config(2));
-    assert_eq!(column, 2, "RStudio-minus should indent from line + tab_size");
+    assert_eq!(
+        column, 2,
+        "RStudio-minus should indent from line + tab_size"
+    );
 }
 
 #[test]
@@ -278,21 +310,30 @@ fn test_function_call_rstudio_minus_indented() {
     let code = "    func(arg1,\n";
     let column = get_indentation_column(code, 1, rstudio_minus_config(2));
     // Line indent is 4, so should be 4 + tab_size = 6
-    assert_eq!(column, 6, "RStudio-minus should indent from indented line + tab_size");
+    assert_eq!(
+        column, 6,
+        "RStudio-minus should indent from indented line + tab_size"
+    );
 }
 
 #[test]
 fn test_rstudio_vs_rstudio_minus_difference() {
     // Same code, different styles should produce different results
     let code = "func(arg1,\n";
-    
+
     let rstudio_col = get_indentation_column(code, 1, rstudio_config(2));
     let rstudio_minus_col = get_indentation_column(code, 1, rstudio_minus_config(2));
-    
+
     // RStudio aligns to paren (col 5), RStudio-minus indents from line (col 2)
     assert_eq!(rstudio_col, 5, "RStudio should align to paren");
-    assert_eq!(rstudio_minus_col, 2, "RStudio-minus should indent from line");
-    assert_ne!(rstudio_col, rstudio_minus_col, "Styles should produce different results");
+    assert_eq!(
+        rstudio_minus_col, 2,
+        "RStudio-minus should indent from line"
+    );
+    assert_ne!(
+        rstudio_col, rstudio_minus_col,
+        "Styles should produce different results"
+    );
 }
 
 // ============================================================================
@@ -311,7 +352,10 @@ fn test_brace_block_basic() {
 fn test_brace_block_indented() {
     let code = "  if (TRUE) {\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 4, "Brace block should indent from line indent + tab_size");
+    assert_eq!(
+        column, 4,
+        "Brace block should indent from line indent + tab_size"
+    );
 }
 
 #[test]
@@ -327,7 +371,10 @@ fn test_nested_brace_blocks() {
   if (FALSE) {
 "#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(column, 4, "Nested brace should indent from inner brace line");
+    assert_eq!(
+        column, 4,
+        "Nested brace should indent from inner brace line"
+    );
 }
 
 #[test]
@@ -353,7 +400,10 @@ fn test_closing_paren_alignment() {
 )"#;
     let column = get_indentation_column(code, 3, rstudio_config(2));
     // Inside parens with no content after opener → line_indent + tab_size = 0 + 2
-    assert_eq!(column, 2, "Auto-close heuristic: indent as inside-parens content");
+    assert_eq!(
+        column, 2,
+        "Auto-close heuristic: indent as inside-parens content"
+    );
 }
 
 #[test]
@@ -363,7 +413,10 @@ fn test_closing_paren_indented_opener() {
   )"#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
     // Inside parens with no content after opener → line_indent + tab_size = 2 + 2
-    assert_eq!(column, 4, "Auto-close heuristic: indent as inside-parens content");
+    assert_eq!(
+        column, 4,
+        "Auto-close heuristic: indent as inside-parens content"
+    );
 }
 
 #[test]
@@ -373,7 +426,10 @@ fn test_closing_brace_alignment() {
 }"#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
     // Inside braces → opener_indent + tab_size = 0 + 2
-    assert_eq!(column, 2, "Auto-close heuristic: indent as inside-braces content");
+    assert_eq!(
+        column, 2,
+        "Auto-close heuristic: indent as inside-braces content"
+    );
 }
 
 #[test]
@@ -384,7 +440,10 @@ fn test_closing_bracket_alignment() {
 ]"#;
     let column = get_indentation_column(code, 3, rstudio_config(2));
     // Inside parens (brackets) with no content after opener → line_indent + tab_size = 0 + 2
-    assert_eq!(column, 2, "Auto-close heuristic: indent as inside-parens content");
+    assert_eq!(
+        column, 2,
+        "Auto-close heuristic: indent as inside-parens content"
+    );
 }
 
 // ============================================================================
@@ -398,7 +457,10 @@ fn test_complete_expression_deindent() {
     let code = r#"x <- 1
 "#;
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 0, "After complete expression, should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete expression, should return to base indent"
+    );
 }
 
 #[test]
@@ -449,10 +511,10 @@ fn test_tab_size_8() {
 #[test]
 fn test_tab_size_affects_pipe_chain() {
     let code = "data %>%\n";
-    
+
     let col_2 = get_indentation_column(code, 1, rstudio_config(2));
     let col_4 = get_indentation_column(code, 1, rstudio_config(4));
-    
+
     assert_eq!(col_2, 2, "Pipe chain with tab_size=2");
     assert_eq!(col_4, 4, "Pipe chain with tab_size=4");
 }
@@ -460,10 +522,10 @@ fn test_tab_size_affects_pipe_chain() {
 #[test]
 fn test_tab_size_affects_brace_block() {
     let code = "{\n";
-    
+
     let col_2 = get_indentation_column(code, 1, rstudio_config(2));
     let col_4 = get_indentation_column(code, 1, rstudio_config(4));
-    
+
     assert_eq!(col_2, 2, "Brace block with tab_size=2");
     assert_eq!(col_4, 4, "Brace block with tab_size=4");
 }
@@ -478,7 +540,10 @@ fn test_insert_spaces_true() {
     let code = "func(\n";
     let indent = simulate_on_type_formatting(code, 1, rstudio_config(4));
     assert_eq!(indent, "    ", "insert_spaces=true should produce spaces");
-    assert!(indent.chars().all(|c| c == ' '), "Should contain only spaces");
+    assert!(
+        indent.chars().all(|c| c == ' '),
+        "Should contain only spaces"
+    );
 }
 
 #[test]
@@ -486,7 +551,10 @@ fn test_insert_spaces_false() {
     let code = "func(\n";
     let config = tabs_config(4, IndentationStyle::RStudio);
     let indent = simulate_on_type_formatting(code, 1, config);
-    assert_eq!(indent, "\t", "insert_spaces=false should produce tab for 4 columns");
+    assert_eq!(
+        indent, "\t",
+        "insert_spaces=false should produce tab for 4 columns"
+    );
 }
 
 #[test]
@@ -517,7 +585,7 @@ fn test_insert_spaces_false_multiple_tabs() {
     let column = get_indentation_column(code, 1, config.clone());
     // Line indent is 8, so should be 8 + 4 = 12
     assert_eq!(column, 12, "Should calculate correct column");
-    
+
     let indent = simulate_on_type_formatting(code, 1, config);
     // 12 columns = 3 tabs
     assert_eq!(indent, "\t\t\t", "12 columns should be 3 tabs");
@@ -558,7 +626,7 @@ fn test_tidyverse_ggplot_layers() {
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
     let col_3 = get_indentation_column(code, 3, rstudio_config(2));
     let col_4 = get_indentation_column(code, 4, rstudio_config(2));
-    
+
     assert_eq!(col_2, 2, "ggplot layer should have uniform indent");
     assert_eq!(col_3, 2, "ggplot layer should have uniform indent");
     assert_eq!(col_4, 2, "ggplot layer should have uniform indent");
@@ -592,7 +660,10 @@ fn test_tidyverse_across_function() {
     let code = "mutate(data, across(where(is.numeric), mean))\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // After complete expression, return to base indent
-    assert_eq!(column, 0, "After complete across call, should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete across call, should return to base indent"
+    );
 }
 
 #[test]
@@ -603,7 +674,10 @@ fn test_tidyverse_across_function_incomplete() {
     // The fallback heuristic handles incomplete code
     // This documents the current behavior for incomplete code
     // The test passes as long as we don't panic
-    assert!(column <= 120, "Fallback indentation should remain within a reasonable bound");
+    assert!(
+        column <= 120,
+        "Fallback indentation should remain within a reasonable bound"
+    );
 }
 
 // ============================================================================
@@ -614,12 +688,17 @@ fn test_tidyverse_across_function_incomplete() {
 fn test_empty_file() {
     let code = "";
     let tree = parse_r_code(code);
-    let position = Position { line: 0, character: 0 };
+    let position = Position {
+        line: 0,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, 2);
-    
+
     // Should return AfterCompleteExpression with indent 0
     match context {
-        IndentContext::AfterCompleteExpression { enclosing_block_indent } => {
+        IndentContext::AfterCompleteExpression {
+            enclosing_block_indent,
+        } => {
             assert_eq!(enclosing_block_indent, 0, "Empty file should have 0 indent");
         }
         _ => panic!("Empty file should return AfterCompleteExpression context"),
@@ -630,7 +709,10 @@ fn test_empty_file() {
 fn test_single_line_no_special_context() {
     let code = "x <- 1\n";
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 0, "After simple assignment, should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After simple assignment, should return to base indent"
+    );
 }
 
 #[test]
@@ -647,7 +729,10 @@ fn test_whitespace_only_line() {
     // Line 2 is whitespace only, but we're inside parens
     let column = get_indentation_column(code, 2, rstudio_config(2));
     // Should still detect InsideParens context
-    assert_eq!(column, 2, "Whitespace line inside parens should maintain indent");
+    assert_eq!(
+        column, 2,
+        "Whitespace line inside parens should maintain indent"
+    );
 }
 
 // ============================================================================
@@ -659,21 +744,30 @@ fn test_whitespace_only_line() {
 fn test_textedit_replaces_existing_whitespace() {
     let code = "    existing_indent\n";
     let tree = parse_r_code(code);
-    let position = Position { line: 0, character: 0 };
+    let position = Position {
+        line: 0,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, 2);
     let target_column = calculate_indentation(context, rstudio_config(2), code);
     let edit = format_indentation(0, target_column, rstudio_config(2), code);
-    
+
     // Range should span from column 0 to 4 (length of existing whitespace)
-    assert_eq!(edit.range.start.character, 0, "Range should start at column 0");
-    assert_eq!(edit.range.end.character, 4, "Range should end at existing whitespace length");
+    assert_eq!(
+        edit.range.start.character, 0,
+        "Range should start at column 0"
+    );
+    assert_eq!(
+        edit.range.end.character, 4,
+        "Range should end at existing whitespace length"
+    );
 }
 
 #[test]
 fn test_textedit_no_existing_whitespace() {
     let code = "no_indent\n";
     let edit = format_indentation(0, 4, rstudio_config(2), code);
-    
+
     // Range should be empty (0 to 0)
     assert_eq!(edit.range.start.character, 0);
     assert_eq!(edit.range.end.character, 0);
@@ -684,7 +778,7 @@ fn test_textedit_no_existing_whitespace() {
 fn test_textedit_multiline_correct_line() {
     let code = "line0\n  line1\n    line2\n";
     let edit = format_indentation(1, 4, rstudio_config(2), code);
-    
+
     assert_eq!(edit.range.start.line, 1, "Should target line 1");
     assert_eq!(edit.range.end.line, 1, "Should target line 1");
     assert_eq!(edit.range.start.character, 0);
@@ -700,7 +794,11 @@ fn test_textedit_multiline_correct_line() {
 #[test]
 fn test_default_config_is_rstudio() {
     let config = IndentationConfig::default();
-    assert_eq!(config.style, IndentationStyle::RStudio, "Default should be RStudio style");
+    assert_eq!(
+        config.style,
+        IndentationStyle::RStudio,
+        "Default should be RStudio style"
+    );
     assert_eq!(config.tab_size, 2, "Default tab_size should be 2");
     assert!(config.insert_spaces, "Default should use spaces");
 }
@@ -711,7 +809,10 @@ fn test_default_style_same_line_alignment() {
     let code = "func(arg1,\n";
     let column = get_indentation_column(code, 1, IndentationConfig::default());
     // RStudio style aligns to paren: "func(" = 5 chars, opener at 4, align at 5
-    assert_eq!(column, 5, "Default config should use RStudio-style alignment");
+    assert_eq!(
+        column, 5,
+        "Default config should use RStudio-style alignment"
+    );
 }
 
 // ============================================================================
@@ -724,14 +825,17 @@ fn test_full_cycle_pipe_chain() {
     // Use complete code that parses without errors
     let code = "result <- data %>%\n  filter(x > 0)";
     let config = rstudio_config(2);
-    
+
     // Step 1: Parse
     let tree = parse_r_code(code);
     // Note: Incomplete pipe chains may have parse errors, which is expected
     // The context detection handles this with fallback
-    
+
     // Step 2: Detect context at line 1 (after the pipe)
-    let position = Position { line: 1, character: 0 };
+    let position = Position {
+        line: 1,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, config.tab_size);
 
     // Step 3: Calculate indentation
@@ -741,7 +845,10 @@ fn test_full_cycle_pipe_chain() {
 
     // Step 4: Format TextEdit
     let edit = format_indentation(1, target_column, config, code);
-    assert_eq!(edit.new_text, "          ", "Should generate correct whitespace");
+    assert_eq!(
+        edit.new_text, "          ",
+        "Should generate correct whitespace"
+    );
     assert_eq!(edit.range.start.line, 1);
     assert_eq!(edit.range.end.line, 1);
 }
@@ -752,20 +859,29 @@ fn test_full_cycle_function_args_rstudio() {
     let config = rstudio_config(2);
 
     let tree = parse_r_code(code);
-    let position = Position { line: 1, character: 0 };
+    let position = Position {
+        line: 1,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, config.tab_size);
-    
+
     match &context {
-        IndentContext::InsideParens { has_content_on_opener_line, .. } => {
-            assert!(*has_content_on_opener_line, "Should detect content after paren");
+        IndentContext::InsideParens {
+            has_content_on_opener_line,
+            ..
+        } => {
+            assert!(
+                *has_content_on_opener_line,
+                "Should detect content after paren"
+            );
         }
         _ => panic!("Should detect InsideParens context"),
     }
-    
+
     let target_column = calculate_indentation(context, config.clone(), code);
     // "mutate(" is 7 chars, opener at 6, align at 7
     assert_eq!(target_column, 7);
-    
+
     let edit = format_indentation(1, target_column, config, code);
     assert_eq!(edit.new_text, "       ", "Should generate 7 spaces");
 }
@@ -776,13 +892,16 @@ fn test_full_cycle_function_args_rstudio_minus() {
     let config = rstudio_minus_config(2);
 
     let tree = parse_r_code(code);
-    let position = Position { line: 1, character: 0 };
+    let position = Position {
+        line: 1,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, config.tab_size);
-    
+
     let target_column = calculate_indentation(context, config.clone(), code);
     // RStudio-minus: line indent (0) + tab_size (2) = 2
     assert_eq!(target_column, 2);
-    
+
     let edit = format_indentation(1, target_column, config, code);
     assert_eq!(edit.new_text, "  ", "Should generate 2 spaces");
 }
@@ -795,21 +914,30 @@ fn test_full_cycle_closing_delimiter() {
     let config = rstudio_config(2);
 
     let tree = parse_r_code(code);
-    let position = Position { line: 2, character: 0 };
+    let position = Position {
+        line: 2,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, config.tab_size);
-    
+
     // With cursor at character 0, auto-close heuristic kicks in:
     // the line has only ")" so we treat it as inside-parens
     match &context {
         IndentContext::InsideParens { opener_col, .. } => {
             assert_eq!(*opener_col, 4, "Should detect opening paren column");
         }
-        _ => panic!("Expected InsideParens context (auto-close heuristic), got {:?}", context),
+        _ => panic!(
+            "Expected InsideParens context (auto-close heuristic), got {:?}",
+            context
+        ),
     }
-    
+
     let target_column = calculate_indentation(context, config.clone(), code);
-    assert_eq!(target_column, 2, "Inside parens, no content after opener → line_indent + tab_size");
-    
+    assert_eq!(
+        target_column, 2,
+        "Inside parens, no content after opener → line_indent + tab_size"
+    );
+
     let edit = format_indentation(2, target_column, config, code);
     assert_eq!(edit.new_text, "  ", "Should generate 2 spaces");
 }
@@ -820,17 +948,20 @@ fn test_full_cycle_brace_block() {
     let config = rstudio_config(4);
 
     let tree = parse_r_code(code);
-    let position = Position { line: 1, character: 0 };
+    let position = Position {
+        line: 1,
+        character: 0,
+    };
     let context = detect_context(&tree, code, position, config.tab_size);
-    
+
     match &context {
         IndentContext::InsideBraces { .. } => {}
         _ => panic!("Should detect InsideBraces context"),
     }
-    
+
     let target_column = calculate_indentation(context, config.clone(), code);
     assert_eq!(target_column, 4, "Brace block should indent by tab_size");
-    
+
     let edit = format_indentation(1, target_column, config, code);
     assert_eq!(edit.new_text, "    ", "Should generate 4 spaces");
 }
@@ -843,12 +974,12 @@ fn test_full_cycle_brace_block() {
 #[test]
 fn test_style_comparison_same_line_args() {
     let code = "function_call(first_arg,\n";
-    
+
     // RStudio: align to paren
     let rstudio_col = get_indentation_column(code, 1, rstudio_config(2));
     // "function_call(" is 14 chars, opener at 13, align at 14
     assert_eq!(rstudio_col, 14, "RStudio should align to paren");
-    
+
     // RStudio-minus: indent from line
     let minus_col = get_indentation_column(code, 1, rstudio_minus_config(2));
     assert_eq!(minus_col, 2, "RStudio-minus should indent from line");
@@ -857,34 +988,46 @@ fn test_style_comparison_same_line_args() {
 #[test]
 fn test_style_comparison_next_line_args() {
     let code = "function_call(\n";
-    
+
     // Both styles should behave the same for next-line args
     let rstudio_col = get_indentation_column(code, 1, rstudio_config(2));
     let minus_col = get_indentation_column(code, 1, rstudio_minus_config(2));
-    
+
     assert_eq!(rstudio_col, 2, "RStudio next-line should indent from line");
-    assert_eq!(minus_col, 2, "RStudio-minus next-line should indent from line");
-    assert_eq!(rstudio_col, minus_col, "Both styles same for next-line args");
+    assert_eq!(
+        minus_col, 2,
+        "RStudio-minus next-line should indent from line"
+    );
+    assert_eq!(
+        rstudio_col, minus_col,
+        "Both styles same for next-line args"
+    );
 }
 
 #[test]
 fn test_style_does_not_affect_pipe_chains() {
     let code = "data %>%\n";
-    
+
     let rstudio_col = get_indentation_column(code, 1, rstudio_config(2));
     let minus_col = get_indentation_column(code, 1, rstudio_minus_config(2));
-    
-    assert_eq!(rstudio_col, minus_col, "Style should not affect pipe chain indentation");
+
+    assert_eq!(
+        rstudio_col, minus_col,
+        "Style should not affect pipe chain indentation"
+    );
 }
 
 #[test]
 fn test_style_does_not_affect_brace_blocks() {
     let code = "{\n";
-    
+
     let rstudio_col = get_indentation_column(code, 1, rstudio_config(2));
     let minus_col = get_indentation_column(code, 1, rstudio_minus_config(2));
-    
-    assert_eq!(rstudio_col, minus_col, "Style should not affect brace block indentation");
+
+    assert_eq!(
+        rstudio_col, minus_col,
+        "Style should not affect brace block indentation"
+    );
 }
 
 #[test]
@@ -892,11 +1035,14 @@ fn test_style_does_not_affect_closing_delimiters() {
     let code = r#"func(
   arg
 )"#;
-    
+
     let rstudio_col = get_indentation_column(code, 2, rstudio_config(2));
     let minus_col = get_indentation_column(code, 2, rstudio_minus_config(2));
-    
-    assert_eq!(rstudio_col, minus_col, "Style should not affect closing delimiter alignment");
+
+    assert_eq!(
+        rstudio_col, minus_col,
+        "Style should not affect closing delimiter alignment"
+    );
 }
 
 // ============================================================================
@@ -936,7 +1082,10 @@ fn test_pipe_chain_with_deeply_nested_functions() {
           mutate(x = outer(middle(inner(value)))) %>%
 "#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(column, 10, "Deeply nested functions in pipe should align to RHS");
+    assert_eq!(
+        column, 10,
+        "Deeply nested functions in pipe should align to RHS"
+    );
 }
 
 #[test]
@@ -950,7 +1099,10 @@ fn test_pipe_chain_with_anonymous_function() {
 "#;
     // Line 5 is after the complete pipe chain
     let column = get_indentation_column(code, 5, rstudio_config(2));
-    assert_eq!(column, 0, "After complete pipe chain should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete pipe chain should return to base indent"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -967,7 +1119,10 @@ fn test_pipe_inside_function_argument() {
     let column = get_indentation_column(code, 1, rstudio_config(2));
     // The pipe chain starts at "x %>%", so continuation should be relative to that
     // This tests that pipe context takes priority over function argument context
-    assert!(column >= 2, "Pipe inside function arg should indent for continuation");
+    assert!(
+        column >= 2,
+        "Pipe inside function arg should indent for continuation"
+    );
 }
 
 #[test]
@@ -984,7 +1139,10 @@ fn test_pipe_inside_function_argument_complete() {
     // Line 4 is a pipe continuation inside the function argument
     let col_4 = get_indentation_column(code, 4, rstudio_config(2));
     // Should align to RHS of assignment (col 12)
-    assert_eq!(col_4, 12, "Pipe continuation inside function arg should align to RHS");
+    assert_eq!(
+        col_4, 12,
+        "Pipe continuation inside function arg should align to RHS"
+    );
 }
 
 #[test]
@@ -995,7 +1153,10 @@ fn test_nested_pipe_in_across() {
 "#;
     let column = get_indentation_column(code, 2, rstudio_config(2));
     // Inside a nested pipe context
-    assert!(column >= 2, "Pipe inside across should indent for continuation");
+    assert!(
+        column >= 2,
+        "Pipe inside across should indent for continuation"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -1012,7 +1173,10 @@ fn test_function_call_inside_pipe_same_line_args() {
     // Line 2 is after the complete expression
     let column = get_indentation_column(code, 2, rstudio_config(2));
     // After complete expression, return to base indent
-    assert_eq!(column, 0, "After complete function in pipe should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete function in pipe should return to base indent"
+    );
 }
 
 #[test]
@@ -1027,7 +1191,10 @@ fn test_function_call_inside_pipe_next_line_args() {
     // Line 5 is after the complete expression
     let column = get_indentation_column(code, 5, rstudio_config(2));
     // After complete expression, return to base indent
-    assert_eq!(column, 0, "After complete function in pipe should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete function in pipe should return to base indent"
+    );
 }
 
 #[test]
@@ -1038,7 +1205,10 @@ fn test_function_call_inside_pipe_rstudio_minus() {
 "#;
     let column = get_indentation_column(code, 2, rstudio_minus_config(2));
     // After complete expression, return to base indent
-    assert_eq!(column, 0, "After complete function in pipe should return to base indent (RStudio-minus)");
+    assert_eq!(
+        column, 0,
+        "After complete function in pipe should return to base indent (RStudio-minus)"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -1088,7 +1258,10 @@ fn test_formula_with_pipe() {
     // Inside the formula, the + is a continuation
     let column = get_indentation_column(code, 2, rstudio_config(2));
     // This is inside the lm() call's arguments
-    assert!(column >= 2, "Formula continuation inside pipe should indent");
+    assert!(
+        column >= 2,
+        "Formula continuation inside pipe should indent"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -1107,7 +1280,10 @@ fn test_three_level_nesting_pipe_func_pipe() {
     // Line 4 is inside a pipe chain that's inside a function that's inside a pipe
     let column = get_indentation_column(code, 4, rstudio_config(2));
     // Should maintain the inner pipe chain's indentation
-    assert_eq!(column, 6, "Inner pipe chain should maintain its own indent level");
+    assert_eq!(
+        column, 6,
+        "Inner pipe chain should maintain its own indent level"
+    );
 }
 
 #[test]
@@ -1135,7 +1311,10 @@ fn test_deeply_nested_braces_and_parens() {
     // Line 4 is inside inner_call's arguments
     let column = get_indentation_column(code, 4, rstudio_config(2));
     // "    inner_call(" - paren at column 14
-    assert_eq!(column, 6, "Deeply nested function args should indent correctly");
+    assert_eq!(
+        column, 6,
+        "Deeply nested function args should indent correctly"
+    );
 }
 
 #[test]
@@ -1150,7 +1329,10 @@ fn test_nested_anonymous_functions() {
     // Line 2 is inside the inner function body (function(y) { ... })
     // The inner { is on line 1 which has indent 2, so body indent = 2 + tab_size = 4
     let col_2 = get_indentation_column(code, 2, rstudio_config(2));
-    assert_eq!(col_2, 4, "Inner function body should indent from inner brace line");
+    assert_eq!(
+        col_2, 4,
+        "Inner function body should indent from inner brace line"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -1179,7 +1361,10 @@ fn test_tidyverse_data_wrangling_pipeline() {
 
     assert_eq!(col_2, 14, "janitor call should align to RHS");
     assert_eq!(col_3, 14, "filter call should align to RHS");
-    assert_eq!(col_8, 0, "After complete pipeline should return to base indent");
+    assert_eq!(
+        col_8, 0,
+        "After complete pipeline should return to base indent"
+    );
 }
 
 #[test]
@@ -1197,7 +1382,10 @@ fn test_tidyverse_summarise_with_across() {
 "#;
     // Line 9 is after the complete expression
     let column = get_indentation_column(code, 9, rstudio_config(2));
-    assert_eq!(column, 0, "After complete summarise should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete summarise should return to base indent"
+    );
 }
 
 #[test]
@@ -1214,7 +1402,10 @@ fn test_tidyverse_pivot_operations() {
     // Line 7 is after the complete expression
     let col_7 = get_indentation_column(code, 7, rstudio_config(2));
 
-    assert_eq!(col_7, 0, "After complete pipeline should return to base indent");
+    assert_eq!(
+        col_7, 0,
+        "After complete pipeline should return to base indent"
+    );
 }
 
 #[test]
@@ -1231,7 +1422,10 @@ fn test_tidyverse_join_operations() {
 "#;
     // Line 8 is after the complete expression
     let column = get_indentation_column(code, 8, rstudio_config(2));
-    assert_eq!(column, 0, "After complete join pipeline should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete join pipeline should return to base indent"
+    );
 }
 
 #[test]
@@ -1249,7 +1443,10 @@ fn test_tidyverse_nested_mutate_case_when() {
 "#;
     // Line 9 is after the complete expression
     let column = get_indentation_column(code, 9, rstudio_config(2));
-    assert_eq!(column, 0, "After complete nested case_when should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete nested case_when should return to base indent"
+    );
 }
 
 #[test]
@@ -1264,7 +1461,10 @@ fn test_purrr_map_with_pipe() {
 "#;
     // Line 6 is after the complete expression
     let column = get_indentation_column(code, 6, rstudio_config(2));
-    assert_eq!(column, 0, "After complete map with nested pipe should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete map with nested pipe should return to base indent"
+    );
 }
 
 #[test]
@@ -1285,11 +1485,18 @@ fn test_ggplot_with_facets_and_themes() {
     // Lines 2-7 are continuation lines in the chain
     for line in 2..8 {
         let column = get_indentation_column(code, line, rstudio_config(2));
-        assert_eq!(column, 2, "ggplot line {} should have uniform chain indent", line);
+        assert_eq!(
+            column, 2,
+            "ggplot line {} should have uniform chain indent",
+            line
+        );
     }
     // Line 11 is after the complete expression
     let col_11 = get_indentation_column(code, 11, rstudio_config(2));
-    assert_eq!(col_11, 0, "After complete ggplot should return to base indent");
+    assert_eq!(
+        col_11, 0,
+        "After complete ggplot should return to base indent"
+    );
 }
 
 #[test]
@@ -1305,8 +1512,14 @@ fn test_shiny_reactive_chain() {
     let col_4 = get_indentation_column(code, 4, rstudio_config(2));
     let col_5 = get_indentation_column(code, 5, rstudio_config(2));
 
-    assert_eq!(col_4, 4, "Pipe chain inside reactive should maintain indent");
-    assert_eq!(col_5, 4, "Continuation inside reactive should maintain indent");
+    assert_eq!(
+        col_4, 4,
+        "Pipe chain inside reactive should maintain indent"
+    );
+    assert_eq!(
+        col_5, 4,
+        "Continuation inside reactive should maintain indent"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -1325,7 +1538,10 @@ fn test_pipe_after_closing_brace() {
 "#;
     // Line 6 is after the complete expression
     let column = get_indentation_column(code, 6, rstudio_config(2));
-    assert_eq!(column, 0, "After complete pipe chain should return to base indent");
+    assert_eq!(
+        column, 0,
+        "After complete pipe chain should return to base indent"
+    );
 }
 
 #[test]
@@ -1335,7 +1551,10 @@ fn test_multiple_pipes_same_line() {
     let code = r#"result <- data %>% filter(x > 0) %>%
 "#;
     let column = get_indentation_column(code, 1, rstudio_config(2));
-    assert_eq!(column, 10, "Continuation after multiple pipes should align to RHS");
+    assert_eq!(
+        column, 10,
+        "Continuation after multiple pipes should align to RHS"
+    );
 }
 
 #[test]
@@ -1352,7 +1571,10 @@ fn test_pipe_with_comment_between_lines() {
     let col_5 = get_indentation_column(code, 5, rstudio_config(2));
 
     // After complete expression should return to base indent
-    assert_eq!(col_5, 0, "After complete expression should return to base indent");
+    assert_eq!(
+        col_5, 0,
+        "After complete expression should return to base indent"
+    );
 }
 
 #[test]
@@ -1391,7 +1613,10 @@ fn test_nested_parens_in_pipe_chain_with_autoclose() {
     // We want line 2 to get col 13 (align with "1"), not col 0
     let code = "x <- f() |>\n     z(x = f(1,\n))\n";
     let column = get_indentation_column(code, 2, rstudio_config(4));
-    assert_eq!(column, 13, "Should align inside f() to where '1' is, even with auto-closed parens");
+    assert_eq!(
+        column, 13,
+        "Should align inside f() to where '1' is, even with auto-closed parens"
+    );
 }
 
 #[test]
@@ -1436,7 +1661,10 @@ fn test_nested_call_simple_with_autoclose() {
     let col = get_indentation_column(code, 1, rstudio_config(4));
     // a( starts at col 8, so align to col 9
     // With the fix, )) is treated as content (not closing delimiter), so we get InsideParens context
-    assert_eq!(col, 9, "Should align to first arg position even with auto-closed parens");
+    assert_eq!(
+        col, 9,
+        "Should align to first arg position even with auto-closed parens"
+    );
 }
 
 #[test]
@@ -1447,5 +1675,8 @@ fn test_nested_call_with_named_arg_and_autoclose() {
     let code = "x <- f(a, x = f(a,\n))\n";
     let col = get_indentation_column(code, 1, rstudio_config(4));
     // f( starts at col 15, so align to col 16
-    assert_eq!(col, 16, "Should align to first arg position even with auto-closed parens");
+    assert_eq!(
+        col, 16,
+        "Should align to first arg position even with auto-closed parens"
+    );
 }

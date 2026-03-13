@@ -2242,7 +2242,8 @@ mod integration_tests {
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
         // Create closures for scope resolution
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> { provider.get_artifacts(uri) };
+        let get_artifacts =
+            |uri: &Url| -> Option<Arc<ScopeArtifacts>> { provider.get_artifacts(uri) };
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> { provider.get_metadata(uri) };
 
         // Query scope at end of parent file

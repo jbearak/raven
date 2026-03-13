@@ -10,9 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::indentation::IndentationStyle;
 use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
-use crate::indentation::IndentationStyle;
 
 /// Symbol provider configuration
 ///
@@ -822,12 +822,8 @@ impl WorldState {
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
             };
-            let _result = cross_file_graph.update_file(
-                uri,
-                meta,
-                workspace_root.as_ref(),
-                get_content,
-            );
+            let _result =
+                cross_file_graph.update_file(uri, meta, workspace_root.as_ref(), get_content);
         }
 
         log::info!(
@@ -1012,16 +1008,16 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 /// Comparison is case-insensitive. This list is also used by the
 /// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
-    ".git",          // Git internal files
-    ".svn",          // Subversion internal files
-    ".hg",           // Mercurial internal files
-    "node_modules",  // JavaScript dependencies (can have 100k+ files)
-    ".Rproj.user",   // RStudio user-local project state
-    "renv",          // renv package library cache
-    "packrat",       // packrat package library cache
-    ".vscode",       // VS Code settings
-    ".idea",         // JetBrains IDE settings
-    "target",        // Rust build artifacts
+    ".git",         // Git internal files
+    ".svn",         // Subversion internal files
+    ".hg",          // Mercurial internal files
+    "node_modules", // JavaScript dependencies (can have 100k+ files)
+    ".Rproj.user",  // RStudio user-local project state
+    "renv",         // renv package library cache
+    "packrat",      // packrat package library cache
+    ".vscode",      // VS Code settings
+    ".idea",        // JetBrains IDE settings
+    "target",       // Rust build artifacts
 ];
 
 /// Check if a directory should be skipped during scanning.
@@ -1068,16 +1064,17 @@ fn scan_directory(
                             // Compute artifacts if we have a tree
                             // Use compute_artifacts_with_metadata to include declared symbols from directives
                             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                            let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
-                                crate::cross_file::scope::compute_artifacts_with_metadata(
-                                    &uri,
-                                    tree,
-                                    &text,
-                                    Some(&cross_file_meta),
-                                )
-                            } else {
-                                crate::cross_file::scope::ScopeArtifacts::default()
-                            });
+                            let artifacts =
+                                std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
+                                    crate::cross_file::scope::compute_artifacts_with_metadata(
+                                        &uri,
+                                        tree,
+                                        &text,
+                                        Some(&cross_file_meta),
+                                    )
+                                } else {
+                                    crate::cross_file::scope::ScopeArtifacts::default()
+                                });
 
                             let snapshot =
                                 crate::cross_file::file_cache::FileSnapshot::with_content_hash(

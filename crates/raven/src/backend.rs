@@ -299,7 +299,6 @@ pub(crate) fn parse_cross_file_config(
         }
     }
 
-
     log::info!("Cross-file configuration loaded from LSP settings:");
     log::info!("  max_backward_depth: {}", config.max_backward_depth);
     log::info!("  max_forward_depth: {}", config.max_forward_depth);
@@ -515,10 +514,7 @@ pub(crate) fn parse_completion_config(
     }
 
     log::info!("Completion configuration loaded from LSP settings:");
-    log::info!(
-        "  trigger_on_open_paren: {}",
-        config.trigger_on_open_paren
-    );
+    log::info!("  trigger_on_open_paren: {}", config.trigger_on_open_paren);
 
     Some(config)
 }
@@ -598,9 +594,7 @@ impl Backend {
             state.package_library = std::sync::Arc::new(lib);
             state.package_library_ready = ready;
         } else {
-            log::trace!(
-                "PackageLibrary already initialized (race), keeping existing"
-            );
+            log::trace!("PackageLibrary already initialized (race), keeping existing");
         }
         state.package_library_ready
     }
@@ -664,10 +658,7 @@ async fn run_debounced_diagnostics(
 
         if let Some(ver) = current_version {
             if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
-                log::trace!(
-                    "Skipping diagnostics for {}: monotonic gate",
-                    affected_uri
-                );
+                log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
                 return;
             }
         }
@@ -695,7 +686,10 @@ async fn run_debounced_diagnostics(
         };
 
     if cancel.is_cancelled() {
-        log::trace!("Diagnostics cancelled before async phase for {}", affected_uri);
+        log::trace!(
+            "Diagnostics cancelled before async phase for {}",
+            affected_uri
+        );
         return;
     }
 
@@ -710,7 +704,10 @@ async fn run_debounced_diagnostics(
     .await;
 
     if cancel.is_cancelled() {
-        log::trace!("Diagnostics cancelled after async phase for {}", affected_uri);
+        log::trace!(
+            "Diagnostics cancelled after async phase for {}",
+            affected_uri
+        );
         return;
     }
 
@@ -1376,7 +1373,8 @@ impl LanguageServer for Backend {
                 packages_enabled,
             )
         };
-        let needs_open_stabilization = !files_to_index.is_empty() || !packages_to_prefetch.is_empty();
+        let needs_open_stabilization =
+            !files_to_index.is_empty() || !packages_to_prefetch.is_empty();
 
         // Prefetch package exports synchronously before scheduling diagnostics so
         // did_open diagnostics don't race package cache warm-up.
@@ -1387,7 +1385,9 @@ impl LanguageServer for Backend {
                 "Synchronously prefetching {} packages before did_open diagnostics",
                 packages_to_prefetch.len()
             );
-            package_library.prefetch_packages(&packages_to_prefetch).await;
+            package_library
+                .prefetch_packages(&packages_to_prefetch)
+                .await;
         }
 
         // Only perform on-demand indexing if enabled
@@ -1549,16 +1549,16 @@ impl LanguageServer for Backend {
                 if second_result.edges_changed {
                     let max_chain_depth = state.cross_file_config.max_chain_depth;
                     let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-                    let dependents = state
-                        .cross_file_graph
-                        .get_transitive_dependents(&uri, max_chain_depth, max_visited);
+                    let dependents = state.cross_file_graph.get_transitive_dependents(
+                        &uri,
+                        max_chain_depth,
+                        max_visited,
+                    );
                     for dep in dependents {
                         if state.documents.contains_key(&dep) {
                             state.diagnostics_gate.mark_force_republish(&dep);
-                            let trigger_version =
-                                state.documents.get(&dep).and_then(|d| d.version);
-                            let trigger_revision =
-                                state.documents.get(&dep).map(|d| d.revision);
+                            let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
+                            let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                             work_items.push((dep, trigger_version, trigger_revision));
                         }
                     }
@@ -1621,10 +1621,8 @@ impl LanguageServer for Backend {
                 .await;
             state.open_document(uri.clone(), &text, Some(version));
 
-            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                &uri,
-                workspace_root.as_ref(),
-            );
+            let backward_path_ctx =
+                crate::cross_file::path_resolve::PathContext::new(&uri, workspace_root.as_ref());
             let parent_content: std::collections::HashMap<Url, String> = meta
                 .sourced_by
                 .iter()
@@ -1651,9 +1649,11 @@ impl LanguageServer for Backend {
             if second_result.edges_changed {
                 let max_chain_depth = state.cross_file_config.max_chain_depth;
                 let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-                let dependents = state
-                    .cross_file_graph
-                    .get_transitive_dependents(&uri, max_chain_depth, max_visited);
+                let dependents = state.cross_file_graph.get_transitive_dependents(
+                    &uri,
+                    max_chain_depth,
+                    max_visited,
+                );
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
                         state.diagnostics_gate.mark_force_republish(&dep);
@@ -1672,10 +1672,11 @@ impl LanguageServer for Backend {
             let (package_library, scope_packages) = {
                 let state = self.state.read().await;
                 let content_provider = state.content_provider();
-                let get_artifacts =
-                    |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
-                        content_provider.get_artifacts(target_uri)
-                    };
+                let get_artifacts = |target_uri: &Url| -> Option<
+                    std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
+                > {
+                    content_provider.get_artifacts(target_uri)
+                };
                 let get_metadata =
                     |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
                         content_provider.get_metadata(target_uri)
@@ -1720,7 +1721,6 @@ impl LanguageServer for Backend {
             }
         }
 
-
         // Schedule debounced diagnostics for all affected files via revalidation system
         for (affected_uri, trigger_version, trigger_revision) in work_items {
             let state_arc = self.state.clone();
@@ -1747,7 +1747,9 @@ impl LanguageServer for Backend {
                     if !state.documents.contains_key(&stabilization_uri) {
                         return;
                     }
-                    state.diagnostics_gate.mark_force_republish(&stabilization_uri);
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish(&stabilization_uri);
                     let ver = state
                         .documents
                         .get(&stabilization_uri)
@@ -1791,7 +1793,14 @@ impl LanguageServer for Backend {
         let changes = params.content_changes;
 
         // Compute affected files and debounce config while holding write lock
-        let (work_items, edited_file_debounce_ms, dependent_debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
+        let (
+            work_items,
+            edited_file_debounce_ms,
+            dependent_debounce_ms,
+            packages_to_prefetch,
+            packages_enabled,
+            package_library,
+        ) = {
             let mut state = self.state.write().await;
 
             // Capture old metadata before recomputing (for WD change detection)
@@ -1825,78 +1834,78 @@ impl LanguageServer for Backend {
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // Extract and enrich metadata with inherited working directory
-            let (packages_to_prefetch, enriched_meta, wd_affected, edges_changed) = if let Some(doc) =
-                state.documents.get(&uri)
-            {
-                let text = doc.text();
-                let mut meta = crate::cross_file::extract_metadata(&text);
-                let uri_clone = uri.clone();
-                let workspace_root = state.workspace_folders.first().cloned();
+            let (packages_to_prefetch, enriched_meta, wd_affected, edges_changed) =
+                if let Some(doc) = state.documents.get(&uri) {
+                    let text = doc.text();
+                    let mut meta = crate::cross_file::extract_metadata(&text);
+                    let uri_clone = uri.clone();
+                    let workspace_root = state.workspace_folders.first().cloned();
 
-                // Enrich metadata with inherited working directory before any use
-                // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
-                crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut meta,
-                    &uri_clone,
-                    workspace_root.as_ref(),
-                    |parent_uri| state.get_enriched_metadata(parent_uri),
-                    max_chain_depth,
-                );
-
-                // Collect package names for prefetch
-                let pkgs: Vec<String> = if packages_enabled {
-                    meta.library_calls
-                        .iter()
-                        .map(|c| c.package.clone())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Pre-collect content for potential parent files to avoid borrow conflicts
-                // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
-                // Backward directives should always be resolved relative to the file's directory
-                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                    &uri_clone,
-                    workspace_root.as_ref(),
-                );
-                let parent_content: std::collections::HashMap<Url, String> = meta
-                    .sourced_by
-                    .iter()
-                    .filter_map(|d| {
-                        let ctx = backward_path_ctx.as_ref()?;
-                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                        let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state
-                            .documents
-                            .get(&parent_uri)
-                            .map(|doc| doc.text())
-                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                        Some((parent_uri, content))
-                    })
-                    .collect();
-
-                let graph_result = state.cross_file_graph.update_file(
-                    &uri,
-                    &meta,
-                    workspace_root.as_ref(),
-                    |parent_uri| parent_content.get(parent_uri).cloned(),
-                );
-
-                // Invalidate children affected by working directory change (Requirement 8)
-                let wd_children =
-                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                        &uri,
-                        old_meta.as_ref(),
-                        &meta,
-                        &state.cross_file_graph,
-                        &state.cross_file_meta,
+                    // Enrich metadata with inherited working directory before any use
+                    // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
+                    crate::cross_file::enrich_metadata_with_inherited_wd(
+                        &mut meta,
+                        &uri_clone,
+                        workspace_root.as_ref(),
+                        |parent_uri| state.get_enriched_metadata(parent_uri),
+                        max_chain_depth,
                     );
 
-                (pkgs, Some(meta), wd_children, graph_result.edges_changed)
-            } else {
-                (Vec::new(), None, Vec::new(), false)
-            };
+                    // Collect package names for prefetch
+                    let pkgs: Vec<String> = if packages_enabled {
+                        meta.library_calls
+                            .iter()
+                            .map(|c| c.package.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Pre-collect content for potential parent files to avoid borrow conflicts
+                    // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                    // Backward directives should always be resolved relative to the file's directory
+                    let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                        &uri_clone,
+                        workspace_root.as_ref(),
+                    );
+                    let parent_content: std::collections::HashMap<Url, String> = meta
+                        .sourced_by
+                        .iter()
+                        .filter_map(|d| {
+                            let ctx = backward_path_ctx.as_ref()?;
+                            let resolved =
+                                crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                            let parent_uri = Url::from_file_path(resolved).ok()?;
+                            let content = state
+                                .documents
+                                .get(&parent_uri)
+                                .map(|doc| doc.text())
+                                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                            Some((parent_uri, content))
+                        })
+                        .collect();
+
+                    let graph_result = state.cross_file_graph.update_file(
+                        &uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                        |parent_uri| parent_content.get(parent_uri).cloned(),
+                    );
+
+                    // Invalidate children affected by working directory change (Requirement 8)
+                    let wd_children =
+                        crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                            &uri,
+                            old_meta.as_ref(),
+                            &meta,
+                            &state.cross_file_graph,
+                            &state.cross_file_meta,
+                        );
+
+                    (pkgs, Some(meta), wd_children, graph_result.edges_changed)
+                } else {
+                    (Vec::new(), None, Vec::new(), false)
+                };
 
             // Update new DocumentStore with enriched metadata (Requirement 1.4)
             if let Some(meta) = enriched_meta {
@@ -2042,10 +2051,7 @@ impl LanguageServer for Backend {
                         .documents
                         .get(&revalidation_uri)
                         .and_then(|d| d.version);
-                    let rev = state
-                        .documents
-                        .get(&revalidation_uri)
-                        .map(|d| d.revision);
+                    let rev = state.documents.get(&revalidation_uri).map(|d| d.revision);
                     (state.cross_file_config.revalidation_debounce_ms, ver, rev)
                 };
 
@@ -2616,7 +2622,11 @@ impl LanguageServer for Backend {
                         if !can_publish {
                             None
                         } else {
-                            let sync_diagnostics = crate::handlers::diagnostics(&state, &child_uri, &handlers::DiagCancelToken::never());
+                            let sync_diagnostics = crate::handlers::diagnostics(
+                                &state,
+                                &child_uri,
+                                &handlers::DiagCancelToken::never(),
+                            );
                             let directive_meta = state
                                 .documents
                                 .get(&child_uri)
@@ -2973,13 +2983,12 @@ impl LanguageServer for Backend {
                     if next_byte == typed_byte {
                         // Potential duplicate — check if the next delimiter is
                         // inside an ERROR node (unmatched bracket).
-                        let point =
-                            tree_sitter::Point::new(position.line as usize, byte_col);
+                        let point = tree_sitter::Point::new(position.line as usize, byte_col);
                         if let Some(node) =
                             tree.root_node().descendant_for_point_range(point, point)
                         {
-                            let is_error = node.is_error()
-                                || node.parent().is_some_and(|p| p.is_error());
+                            let is_error =
+                                node.is_error() || node.parent().is_some_and(|p| p.is_error());
                             if is_error {
                                 log::trace!(
                                     "on_type_formatting: removing duplicate auto-closed '{}' at ({},{})",
@@ -3139,53 +3148,51 @@ impl Backend {
             None => crate::cross_file::scope::ScopeArtifacts::default(),
         });
 
-        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) =
-            {
-                let state = self.state.read().await;
-                let workspace_root = state.workspace_folders.first().cloned();
-                let max_chain_depth = state.cross_file_config.max_chain_depth;
-                let packages_enabled = state.cross_file_config.packages_enabled;
+        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) = {
+            let state = self.state.read().await;
+            let workspace_root = state.workspace_folders.first().cloned();
+            let max_chain_depth = state.cross_file_config.max_chain_depth;
+            let packages_enabled = state.cross_file_config.packages_enabled;
 
-                crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut cross_file_meta,
-                    file_uri,
-                    workspace_root.as_ref(),
-                    |parent_uri| state.get_enriched_metadata(parent_uri),
-                    max_chain_depth,
-                );
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut cross_file_meta,
+                file_uri,
+                workspace_root.as_ref(),
+                |parent_uri| state.get_enriched_metadata(parent_uri),
+                max_chain_depth,
+            );
 
-                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                    file_uri,
-                    workspace_root.as_ref(),
-                );
-                let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
-                    .sourced_by
-                    .iter()
-                    .filter_map(|d| {
-                        let ctx = backward_path_ctx.as_ref()?;
-                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                        let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state
-                            .documents
-                            .get(&parent_uri)
-                            .map(|doc| doc.text())
-                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                        Some((parent_uri, content))
-                    })
-                    .collect();
+            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                file_uri,
+                workspace_root.as_ref(),
+            );
+            let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
+                .sourced_by
+                .iter()
+                .filter_map(|d| {
+                    let ctx = backward_path_ctx.as_ref()?;
+                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                    let parent_uri = Url::from_file_path(resolved).ok()?;
+                    let content = state
+                        .documents
+                        .get(&parent_uri)
+                        .map(|doc| doc.text())
+                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    Some((parent_uri, content))
+                })
+                .collect();
 
-                let open_docs: std::collections::HashSet<_> =
-                    state.documents.keys().cloned().collect();
-                let workspace_index_version = state.workspace_index_new.version();
+            let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
+            let workspace_index_version = state.workspace_index_new.version();
 
-                (
-                    workspace_root,
-                    packages_enabled,
-                    open_docs,
-                    workspace_index_version,
-                    parent_content,
-                )
-            };
+            (
+                workspace_root,
+                packages_enabled,
+                open_docs,
+                workspace_index_version,
+                parent_content,
+            )
+        };
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -3210,11 +3217,9 @@ impl Backend {
 
         {
             let mut state = self.state.write().await;
-            state.cross_file_file_cache.insert(
-                file_uri.clone(),
-                snapshot.clone(),
-                content.clone(),
-            );
+            state
+                .cross_file_file_cache
+                .insert(file_uri.clone(), snapshot.clone(), content.clone());
             state
                 .workspace_index_new
                 .insert(file_uri.clone(), index_entry);
@@ -3250,7 +3255,6 @@ impl Backend {
                 pkg_lib.prefetch_packages(&packages_to_prefetch).await;
             }
         }
-
 
         log::info!(
             "On-demand indexed: {} (exported {} symbols)",
@@ -3472,44 +3476,42 @@ impl Backend {
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) =
-            {
-                let state = self.state.read().await;
-                let workspace_root = state.workspace_folders.first().cloned();
-                let packages_enabled = state.cross_file_config.packages_enabled;
+        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) = {
+            let state = self.state.read().await;
+            let workspace_root = state.workspace_folders.first().cloned();
+            let packages_enabled = state.cross_file_config.packages_enabled;
 
-                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                    file_uri,
-                    workspace_root.as_ref(),
-                );
-                let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
-                    .sourced_by
-                    .iter()
-                    .filter_map(|d| {
-                        let ctx = backward_path_ctx.as_ref()?;
-                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                        let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state
-                            .documents
-                            .get(&parent_uri)
-                            .map(|doc| doc.text())
-                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                        Some((parent_uri, content))
-                    })
-                    .collect();
+            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                file_uri,
+                workspace_root.as_ref(),
+            );
+            let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
+                .sourced_by
+                .iter()
+                .filter_map(|d| {
+                    let ctx = backward_path_ctx.as_ref()?;
+                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                    let parent_uri = Url::from_file_path(resolved).ok()?;
+                    let content = state
+                        .documents
+                        .get(&parent_uri)
+                        .map(|doc| doc.text())
+                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    Some((parent_uri, content))
+                })
+                .collect();
 
-                let open_docs: std::collections::HashSet<_> =
-                    state.documents.keys().cloned().collect();
-                let workspace_index_version = state.workspace_index_new.version();
+            let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
+            let workspace_index_version = state.workspace_index_new.version();
 
-                (
-                    workspace_root,
-                    packages_enabled,
-                    open_docs,
-                    workspace_index_version,
-                    parent_content,
-                )
-            };
+            (
+                workspace_root,
+                packages_enabled,
+                open_docs,
+                workspace_index_version,
+                parent_content,
+            )
+        };
 
         let loaded_packages =
             extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
@@ -3531,11 +3533,9 @@ impl Backend {
 
         {
             let mut state = self.state.write().await;
-            state.cross_file_file_cache.insert(
-                file_uri.clone(),
-                snapshot.clone(),
-                content.clone(),
-            );
+            state
+                .cross_file_file_cache
+                .insert(file_uri.clone(), snapshot.clone(), content.clone());
             state
                 .workspace_index_new
                 .insert(file_uri.clone(), index_entry);
@@ -3572,7 +3572,6 @@ impl Backend {
             }
         }
 
-
         Some(cross_file_meta)
     }
 
@@ -3601,7 +3600,8 @@ impl Backend {
             }
 
             // Get sync diagnostics (uses cached-only existence checks)
-            let sync_diagnostics = handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
+            let sync_diagnostics =
+                handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
 
             // Extract metadata for async missing file checks
             let directive_meta = state
@@ -3714,7 +3714,6 @@ pub async fn start_lsp() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3865,7 +3864,6 @@ mod tests {
                 "diagnostics_enabled should default to true when diagnostics section is absent"
             );
         }
-
     }
 
     // ============================================================================
@@ -3935,7 +3933,10 @@ mod tests {
             });
 
             let config = crate::backend::parse_completion_config(&settings);
-            assert!(config.is_some(), "Should return Some when completion section exists");
+            assert!(
+                config.is_some(),
+                "Should return Some when completion section exists"
+            );
             let config = config.unwrap();
             assert!(
                 config.trigger_on_open_paren,

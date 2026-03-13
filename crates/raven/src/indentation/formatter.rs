@@ -42,10 +42,7 @@ pub fn format_indentation(
     // Create TextEdit that replaces existing whitespace
     TextEdit {
         range: Range {
-            start: Position {
-                line,
-                character: 0,
-            },
+            start: Position { line, character: 0 },
             end: Position {
                 line,
                 character: existing_ws_len as u32,
@@ -191,12 +188,15 @@ mod tests {
         let config = make_config(100, false);
         // With tab_size 100: 50 / 100 = 0 tabs, 50 % 100 = 50 spaces
         assert_eq!(generate_whitespace(50, &config), " ".repeat(50));
-        
+
         // With tab_size 100: 100 / 100 = 1 tab, 100 % 100 = 0 spaces
         assert_eq!(generate_whitespace(100, &config), "\t");
-        
+
         // With tab_size 100: 150 / 100 = 1 tab, 150 % 100 = 50 spaces
-        assert_eq!(generate_whitespace(150, &config), format!("\t{}", " ".repeat(50)));
+        assert_eq!(
+            generate_whitespace(150, &config),
+            format!("\t{}", " ".repeat(50))
+        );
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         // In spaces mode, tab_size doesn't affect the output (only column count matters)
         let config_small = make_config(1, true);
         let config_large = make_config(100, true);
-        
+
         // Both should produce the same output for the same target column
         assert_eq!(generate_whitespace(10, &config_small), "          ");
         assert_eq!(generate_whitespace(10, &config_large), "          ");
@@ -298,14 +298,20 @@ mod tests {
         // Default should use insert_spaces = true
         let source = "  code";
         let config = IndentationConfig::default();
-        
-        assert!(config.insert_spaces, "Default config should have insert_spaces = true");
-        
+
+        assert!(
+            config.insert_spaces,
+            "Default config should have insert_spaces = true"
+        );
+
         let edit = format_indentation(0, 4, config, source);
-        
+
         // Should produce spaces, not tabs
         assert_eq!(edit.new_text, "    ");
-        assert!(edit.new_text.chars().all(|c| c == ' '), "Default should produce only spaces");
+        assert!(
+            edit.new_text.chars().all(|c| c == ' '),
+            "Default should produce only spaces"
+        );
     }
 
     #[test]
@@ -313,9 +319,9 @@ mod tests {
         // Edge case: very large target column
         let source = "code";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(0, 1000, config, source);
-        
+
         // Should produce 1000 spaces without panicking
         assert_eq!(edit.new_text.len(), 1000);
         assert!(edit.new_text.chars().all(|c| c == ' '));
@@ -326,9 +332,9 @@ mod tests {
         // Edge case: target column of 0 (no indentation)
         let source = "    code";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(0, 0, config, source);
-        
+
         // Should produce empty string
         assert_eq!(edit.new_text, "");
         // Range should still cover existing whitespace
@@ -341,9 +347,9 @@ mod tests {
         // Edge case: line with only tab characters as whitespace
         let source = "\t\t\tcode";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(0, 8, config, source);
-        
+
         // Range should cover 3 tab characters
         assert_eq!(edit.range.start.character, 0);
         assert_eq!(edit.range.end.character, 3);
@@ -356,9 +362,9 @@ mod tests {
         // Edge case: line with mixed tabs and spaces
         let source = "\t  \t code";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(0, 4, config, source);
-        
+
         // Range should cover all whitespace characters (tab, space, space, tab, space)
         assert_eq!(edit.range.start.character, 0);
         assert_eq!(edit.range.end.character, 5);
@@ -371,9 +377,9 @@ mod tests {
         // Edge case: line with unicode content after whitespace
         let source = "  变量 <- 1";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(0, 4, config, source);
-        
+
         // Range should cover 2 space characters
         assert_eq!(edit.range.start.character, 0);
         assert_eq!(edit.range.end.character, 2);
@@ -386,9 +392,9 @@ mod tests {
         // Edge case: source with multiple lines, format middle line
         let source = "line0\n  line1\nline2";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(1, 4, config, source);
-        
+
         // Should format line 1
         assert_eq!(edit.range.start.line, 1);
         assert_eq!(edit.range.end.line, 1);
@@ -402,9 +408,9 @@ mod tests {
         // Edge case: last line without trailing newline
         let source = "line0\nline1";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(1, 4, config, source);
-        
+
         // Should format line 1
         assert_eq!(edit.range.start.line, 1);
         assert_eq!(edit.range.end.line, 1);
@@ -418,9 +424,9 @@ mod tests {
         // Edge case: single character line
         let source = "x";
         let config = make_config(4, true);
-        
+
         let edit = format_indentation(0, 4, config, source);
-        
+
         assert_eq!(edit.range.start.character, 0);
         assert_eq!(edit.range.end.character, 0); // No leading whitespace
         assert_eq!(edit.new_text, "    ");
@@ -431,10 +437,10 @@ mod tests {
         // Test tabs mode with alignment (trailing spaces)
         let source = "code";
         let config = make_config(4, false);
-        
+
         // Target column 6: 1 tab (4 cols) + 2 spaces
         let edit = format_indentation(0, 6, config, source);
-        
+
         assert_eq!(edit.new_text, "\t  ");
     }
 
@@ -443,10 +449,10 @@ mod tests {
         // Test tabs mode when target is exact multiple of tab_size
         let source = "code";
         let config = make_config(4, false);
-        
+
         // Target column 8: 2 tabs, no spaces
         let edit = format_indentation(0, 8, config, source);
-        
+
         assert_eq!(edit.new_text, "\t\t");
     }
 
@@ -850,7 +856,7 @@ mod tests {
             let line_content: String = (0..line_content_len)
                 .map(|i| (b'a' + (i % 26) as u8) as char)
                 .collect();
-            
+
             // Build multi-line source with the target line at the specified position
             let mut lines: Vec<String> = Vec::new();
             for i in 0..=line_num {

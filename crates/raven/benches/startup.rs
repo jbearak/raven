@@ -21,11 +21,7 @@ mod alloc_counter;
 static ALLOC: alloc_counter::CountingAllocator = alloc_counter::CountingAllocator;
 
 /// Generate a synthetic R file with specified characteristics (for inline use).
-fn generate_r_file(
-    index: usize,
-    functions_per_file: usize,
-    include_source: bool,
-) -> String {
+fn generate_r_file(index: usize, functions_per_file: usize, include_source: bool) -> String {
     let mut content = String::new();
 
     content.push_str("library(stats)\n\n");
@@ -102,17 +98,13 @@ data <- data.frame(x = 1:100, y = rnorm(100))
 "#;
 
     group.bench_function("extract_metadata_small", |b| {
-        b.iter(|| {
-            black_box(raven::cross_file::extract_metadata(black_box(small_code)))
-        })
+        b.iter(|| black_box(raven::cross_file::extract_metadata(black_box(small_code))))
     });
 
     // Larger code: ~50 repetitions of the sample
     let large_code = small_code.repeat(50);
     group.bench_function("extract_metadata_large", |b| {
-        b.iter(|| {
-            black_box(raven::cross_file::extract_metadata(black_box(&large_code)))
-        })
+        b.iter(|| black_box(raven::cross_file::extract_metadata(black_box(&large_code))))
     });
 
     group.finish();
@@ -136,19 +128,15 @@ fn bench_workspace_scan(c: &mut Criterion) {
         // Pre-create the workspace so fixture generation isn't measured.
         let workspace = create_fixture_workspace(config);
 
-        group.bench_with_input(
-            BenchmarkId::new("scan", *label),
-            &workspace,
-            |b, ws| {
-                let folder_url = Url::from_file_path(ws.path()).unwrap();
-                b.iter(|| {
-                    black_box(raven::state::scan_workspace(
-                        black_box(&[folder_url.clone()]),
-                        20, // default max_chain_depth
-                    ))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("scan", *label), &workspace, |b, ws| {
+            let folder_url = Url::from_file_path(ws.path()).unwrap();
+            b.iter(|| {
+                black_box(raven::state::scan_workspace(
+                    black_box(&[folder_url.clone()]),
+                    20, // default max_chain_depth
+                ))
+            })
+        });
     }
 
     group.finish();

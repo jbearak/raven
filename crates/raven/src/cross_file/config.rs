@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
-
 /// How backward dependencies (parent files that source this file) are resolved
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackwardDependencyMode {
@@ -274,5 +273,4 @@ mod tests {
             "diagnostics_enabled should default to true"
         );
     }
-
 }
