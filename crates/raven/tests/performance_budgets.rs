@@ -388,12 +388,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
     let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "R")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|ext| ext == "R").unwrap_or(false))
         .collect();
     entries.sort_by_key(|e| e.path());
 
@@ -510,12 +505,7 @@ fn budget_single_file_completion() {
     let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "R")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|ext| ext == "R").unwrap_or(false))
         .collect();
     entries.sort_by_key(|e| e.path());
 
@@ -527,8 +517,7 @@ fn budget_single_file_completion() {
     }
 
     // Run workspace scan and apply index (populates cross-file state)
-    let (index, imports, cross_file_entries, new_index_entries) =
-        scan_workspace(&[folder_url], 20);
+    let (index, imports, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
     state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
 
     let uri = Url::from_file_path(workspace_path.join("file_0.R")).unwrap();

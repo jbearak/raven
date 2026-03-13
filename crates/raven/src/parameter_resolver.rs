@@ -81,8 +81,7 @@ pub struct SignatureCache {
 // LruCache doesn't derive Debug; implement manually using finish_non_exhaustive()
 impl fmt::Debug for SignatureCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SignatureCache")
-            .finish_non_exhaustive()
+        f.debug_struct("SignatureCache").finish_non_exhaustive()
     }
 }
 
@@ -192,12 +191,12 @@ pub fn extract_from_ast(params_node: Node, text: &str) -> Vec<ParameterInfo> {
                 let param_name = node_text(*identifier, text).to_string();
 
                 // Check for default value: identifier = value
-                let default_value =
-                    if param_children.len() >= 3 && param_children[1].kind() == "=" {
-                        Some(node_text(param_children[2], text).to_string())
-                    } else {
-                        None
-                    };
+                let default_value = if param_children.len() >= 3 && param_children[1].kind() == "="
+                {
+                    Some(node_text(param_children[2], text).to_string())
+                } else {
+                    None
+                };
 
                 params.push(ParameterInfo {
                     name: param_name,
@@ -425,7 +424,10 @@ fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitt
         if let Some(tree) = &entry.tree {
             return Some((entry.contents.to_string(), tree.clone()));
         } else {
-            log::debug!("Document in workspace_index_new has no parsed tree: {}", uri);
+            log::debug!(
+                "Document in workspace_index_new has no parsed tree: {}",
+                uri
+            );
         }
     }
 
@@ -467,12 +469,8 @@ fn resolve_from_current_file(
     let text = doc.text();
 
     // Search for the nearest function definition before cursor position
-    let func_node = find_function_definition_before_position(
-        tree.root_node(),
-        function_name,
-        &text,
-        position,
-    )?;
+    let func_node =
+        find_function_definition_before_position(tree.root_node(), function_name, &text, position)?;
 
     // Find the formal_parameters child of the function_definition node
     let params_node = func_node
@@ -917,10 +915,7 @@ mod tests {
                 line: 0,
             },
         };
-        cache.insert_user(
-            "file:///test.R#my_func".to_string(),
-            sig.clone(),
-        );
+        cache.insert_user("file:///test.R#my_func".to_string(), sig.clone());
         let cached = cache.get_user("file:///test.R#my_func");
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().name, "my_func");
@@ -1132,20 +1127,10 @@ mod tests {
 
         // At line 2 (the call site), both f and g should be findable
         let pos = tower_lsp::lsp_types::Position::new(2, 0);
-        let f_node = find_function_definition_before_position(
-            tree.root_node(),
-            "f",
-            code,
-            pos,
-        );
+        let f_node = find_function_definition_before_position(tree.root_node(), "f", code, pos);
         assert!(f_node.is_some());
 
-        let g_node = find_function_definition_before_position(
-            tree.root_node(),
-            "g",
-            code,
-            pos,
-        );
+        let g_node = find_function_definition_before_position(tree.root_node(), "g", code, pos);
         assert!(g_node.is_some());
     }
 
@@ -1156,12 +1141,7 @@ mod tests {
 
         // At line 0 (before the definition), f should not be found
         let pos = tower_lsp::lsp_types::Position::new(0, 0);
-        let result = find_function_definition_before_position(
-            tree.root_node(),
-            "f",
-            code,
-            pos,
-        );
+        let result = find_function_definition_before_position(tree.root_node(), "f", code, pos);
         // The definition is on line 1, cursor is on line 0
         assert!(result.is_none());
     }
@@ -1173,13 +1153,8 @@ mod tests {
 
         // At line 2, the second definition (line 1) should win
         let pos = tower_lsp::lsp_types::Position::new(2, 0);
-        let func_node = find_function_definition_before_position(
-            tree.root_node(),
-            "f",
-            code,
-            pos,
-        )
-        .unwrap();
+        let func_node =
+            find_function_definition_before_position(tree.root_node(), "f", code, pos).unwrap();
 
         let params_node = func_node
             .children(&mut func_node.walk())
@@ -1199,12 +1174,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let pos = tower_lsp::lsp_types::Position::new(3, 0);
-        let func_node = find_function_definition_before_position(
-            tree.root_node(),
-            "f",
-            code,
-            pos,
-        );
+        let func_node = find_function_definition_before_position(tree.root_node(), "f", code, pos);
         assert!(
             func_node.is_some(),
             "Should find function definition even with comment between <- and function()"
@@ -1229,12 +1199,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         // The identifier `f` is at line 0
-        let func_node = find_function_definition_at_line(
-            tree.root_node(),
-            "f",
-            code,
-            0,
-        );
+        let func_node = find_function_definition_at_line(tree.root_node(), "f", code, 0);
         assert!(
             func_node.is_some(),
             "find_function_definition_at_line should handle comments between <- and function()"
@@ -1257,12 +1222,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let pos = tower_lsp::lsp_types::Position::new(4, 0);
-        let func_node = find_function_definition_before_position(
-            tree.root_node(),
-            "g",
-            code,
-            pos,
-        );
+        let func_node = find_function_definition_before_position(tree.root_node(), "g", code, pos);
         assert!(
             func_node.is_some(),
             "Should find function definition with multiple comments between <- and function()"
@@ -1364,7 +1324,10 @@ mod property_tests {
     }
 
     /// Strategy to generate a list of unique parameter definitions (0-6 params).
-    fn r_param_list(min: usize, max: usize) -> impl Strategy<Value = Vec<(String, Option<String>)>> {
+    fn r_param_list(
+        min: usize,
+        max: usize,
+    ) -> impl Strategy<Value = Vec<(String, Option<String>)>> {
         prop::collection::vec(r_param_def(), min..=max).prop_filter(
             "parameter names must be unique",
             |params| {
@@ -1392,7 +1355,11 @@ mod property_tests {
             param_strs.push("...".to_string());
         }
 
-        format!("{} <- function({}) {{ NULL }}", func_name, param_strs.join(", "))
+        format!(
+            "{} <- function({}) {{ NULL }}",
+            func_name,
+            param_strs.join(", ")
+        )
     }
 
     use super::test_utils::find_function_def_in_tree;

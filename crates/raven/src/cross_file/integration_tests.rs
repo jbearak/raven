@@ -5932,10 +5932,11 @@ mod cross_directory_hoisting_tests {
     use super::*;
     use crate::cross_file::dependency::DependencyGraph;
     use crate::cross_file::scope::{
-        compute_artifacts, scope_at_position_with_graph,
-        ScopeArtifacts,
+        compute_artifacts, scope_at_position_with_graph, ScopeArtifacts,
     };
-    use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+    use crate::cross_file::types::{
+        BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+    };
     use std::collections::HashSet;
 
     /// Test that workspace-root fallback in scope resolution enables cross-directory
@@ -5952,20 +5953,30 @@ mod cross_directory_hoisting_tests {
     /// parent's source() events, it needs workspace-root fallback to find the files.
     #[test]
     fn test_cross_directory_backward_directive_with_workspace_fallback() {
-        println!("\n=== Test: cross-directory backward directive with workspace-root fallback ===\n");
+        println!(
+            "\n=== Test: cross-directory backward directive with workspace-root fallback ===\n"
+        );
 
         let mut workspace = TestWorkspace::new().unwrap();
         let workspace_root = Url::from_file_path(workspace.root()).unwrap();
 
         // Create files in different subdirectories
-        let parent_code = "ww <- 1\nsource(\"functions/getMonitors.R\")\nsource(\"functions/fitModel.R\")";
-        let parent_uri = workspace.add_file("scripts/functions.R", parent_code).unwrap();
+        let parent_code =
+            "ww <- 1\nsource(\"functions/getMonitors.R\")\nsource(\"functions/fitModel.R\")";
+        let parent_uri = workspace
+            .add_file("scripts/functions.R", parent_code)
+            .unwrap();
 
         let sibling_code = "getMonitors <- function(x) { x }";
-        let sibling_uri = workspace.add_file("functions/getMonitors.R", sibling_code).unwrap();
+        let sibling_uri = workspace
+            .add_file("functions/getMonitors.R", sibling_code)
+            .unwrap();
 
-        let child_code = "fitModel <- function(model.name) {\n    monitor <- getMonitors(TRUE)\n    ww\n}";
-        let child_uri = workspace.add_file("functions/fitModel.R", child_code).unwrap();
+        let child_code =
+            "fitModel <- function(model.name) {\n    monitor <- getMonitors(TRUE)\n    ww\n}";
+        let child_uri = workspace
+            .add_file("functions/fitModel.R", child_code)
+            .unwrap();
 
         println!("  Parent:  {}", parent_uri);
         println!("  Sibling: {}", sibling_uri);
@@ -6024,7 +6035,10 @@ mod cross_directory_hoisting_tests {
 
         // Verify graph edges were created correctly via workspace-root fallback
         let parent_deps = graph.get_dependencies(&parent_uri);
-        println!("  Parent forward edges: {:?}", parent_deps.iter().map(|e| &e.to).collect::<Vec<_>>());
+        println!(
+            "  Parent forward edges: {:?}",
+            parent_deps.iter().map(|e| &e.to).collect::<Vec<_>>()
+        );
         // At least 2 edges from parent's forward sources; the child's backward directive
         // may also register a parent→child forward edge (3 total) unless the graph
         // coalesces duplicate (from, to) pairs.
@@ -6043,7 +6057,10 @@ mod cross_directory_hoisting_tests {
         );
 
         let child_parents = graph.get_dependents(&child_uri);
-        println!("  Child backward edges: {:?}", child_parents.iter().map(|e| &e.from).collect::<Vec<_>>());
+        println!(
+            "  Child backward edges: {:?}",
+            child_parents.iter().map(|e| &e.from).collect::<Vec<_>>()
+        );
         assert!(
             child_parents.iter().any(|e| e.from == parent_uri),
             "Child should have backward edge from parent"
@@ -6054,15 +6071,24 @@ mod cross_directory_hoisting_tests {
         let child_artifacts = Arc::new(child_artifacts);
 
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &sibling_uri { Some(Arc::clone(&sibling_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
+            if uri == &parent_uri {
+                Some(Arc::clone(&parent_artifacts))
+            } else if uri == &sibling_uri {
+                Some(Arc::clone(&sibling_artifacts))
+            } else if uri == &child_uri {
+                Some(Arc::clone(&child_artifacts))
+            } else {
+                None
+            }
         };
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else if uri == &child_uri { Some(child_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
         };
 
         let base_exports = HashSet::new();
@@ -6083,7 +6109,10 @@ mod cross_directory_hoisting_tests {
             &|| false,
         );
 
-        println!("  Scope symbols: {:?}", scope.symbols.keys().collect::<Vec<_>>());
+        println!(
+            "  Scope symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
 
         assert!(
             scope.symbols.contains_key("getMonitors"),

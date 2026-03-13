@@ -2294,4 +2294,69 @@ mod tests {
             });
         }
     }
+
+    /// Proves that applying incremental `did_change` edits out of order corrupts text.
+    ///
+    /// tower-lsp 0.20 defaults to `buffer_unordered(4)` which can reorder
+    /// notifications.  This test demonstrates that two sequential edits
+    /// (insert then delete) produce different results when applied in the
+    /// wrong order.
+    #[test]
+    fn test_out_of_order_incremental_changes_corrupt_text() {
+        use tower_lsp::lsp_types::{Position, Range};
+
+        let original = "createWorkbook()\n";
+
+        // Change A: insert "f" at position (0, 2) → "crfeateWorkbook()\n"
+        let change_a = TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 2,
+                },
+                end: Position {
+                    line: 0,
+                    character: 2,
+                },
+            }),
+            range_length: None,
+            text: "f".to_string(),
+        };
+
+        // Change B: delete (0, 2)-(0, 3) — removes the "f" that A inserted
+        let change_b = TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 2,
+                },
+                end: Position {
+                    line: 0,
+                    character: 3,
+                },
+            }),
+            range_length: None,
+            text: String::new(),
+        };
+
+        // Correct order: A then B → round-trips back to original
+        let mut rope_correct = Rope::from_str(original);
+        DocumentStore::apply_change_to_rope(&mut rope_correct, change_a.clone());
+        DocumentStore::apply_change_to_rope(&mut rope_correct, change_b.clone());
+        assert_eq!(
+            rope_correct.to_string(),
+            original,
+            "A then B should round-trip to the original text"
+        );
+
+        // Wrong order: B then A → text is corrupted
+        let mut rope_wrong = Rope::from_str(original);
+        DocumentStore::apply_change_to_rope(&mut rope_wrong, change_b);
+        DocumentStore::apply_change_to_rope(&mut rope_wrong, change_a);
+        assert_eq!(
+            rope_wrong.to_string(),
+            "crfateWorkbook()\n",
+            "B then A should produce the expected corrupted text"
+        );
+    }
 }

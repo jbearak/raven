@@ -11,8 +11,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use tower_lsp::lsp_types::Position;
 use url::Url;
 
-use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
 use raven::state::{scan_workspace, Document, WorldState};
+use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,12 +32,7 @@ fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
     let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "R")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|ext| ext == "R").unwrap_or(false))
         .collect();
     entries.sort_by_key(|e| e.path());
 
@@ -49,8 +44,7 @@ fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
     }
 
     // Run workspace scan and apply index (populates cross-file state)
-    let (index, imports, cross_file_entries, new_index_entries) =
-        scan_workspace(&[folder_url], 20);
+    let (index, imports, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
     state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
 
     state

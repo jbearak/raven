@@ -334,7 +334,10 @@ mod tests {
 my_mean <- function(x) mean(x)
 ";
         let block = extract_roxygen_block(code, 1).unwrap();
-        assert_eq!(block.title.as_deref(), Some("Calculate the mean of a vector"));
+        assert_eq!(
+            block.title.as_deref(),
+            Some("Calculate the mean of a vector")
+        );
         assert!(block.description.is_none());
         assert!(block.params.is_empty());
         // No tags → fallback is populated
@@ -357,7 +360,10 @@ my_mean <- function(x) mean(x)
             block.description.as_deref(),
             Some("This function computes the arithmetic mean of a numeric vector.")
         );
-        assert_eq!(block.params.get("x").map(|s| s.as_str()), Some("A numeric vector"));
+        assert_eq!(
+            block.params.get("x").map(|s| s.as_str()),
+            Some("A numeric vector")
+        );
         assert!(block.fallback.is_none()); // has tags
     }
 
@@ -372,8 +378,14 @@ add <- function(x, y) x + y
 ";
         let block = extract_roxygen_block(code, 4).unwrap();
         assert_eq!(block.title.as_deref(), Some("Add two numbers"));
-        assert_eq!(block.params.get("x").map(|s| s.as_str()), Some("First number"));
-        assert_eq!(block.params.get("y").map(|s| s.as_str()), Some("Second number"));
+        assert_eq!(
+            block.params.get("x").map(|s| s.as_str()),
+            Some("First number")
+        );
+        assert_eq!(
+            block.params.get("y").map(|s| s.as_str()),
+            Some("Second number")
+        );
         assert_eq!(block.params.len(), 2);
     }
 
@@ -413,7 +425,10 @@ my_func <- function(x) x
             block.description.as_deref(),
             Some("This is an explicit description that spans multiple lines.")
         );
-        assert_eq!(block.params.get("x").map(|s| s.as_str()), Some("Input value"));
+        assert_eq!(
+            block.params.get("x").map(|s| s.as_str()),
+            Some("Input value")
+        );
     }
 
     #[test]
@@ -588,8 +603,14 @@ my_func <- function(x) x
             },
             fallback: None,
         };
-        assert_eq!(get_param_doc(&block, "x"), Some("A numeric vector".to_string()));
-        assert_eq!(get_param_doc(&block, "y"), Some("Another vector".to_string()));
+        assert_eq!(
+            get_param_doc(&block, "x"),
+            Some("A numeric vector".to_string())
+        );
+        assert_eq!(
+            get_param_doc(&block, "y"),
+            Some("Another vector".to_string())
+        );
     }
 
     #[test]
@@ -651,7 +672,10 @@ my_func <- function(x) x
             params: HashMap::new(),
             fallback: Some("Plain comment text".to_string()),
         };
-        assert_eq!(get_function_doc(&block), Some("Plain comment text".to_string()));
+        assert_eq!(
+            get_function_doc(&block),
+            Some("Plain comment text".to_string())
+        );
     }
 
     #[test]
@@ -738,7 +762,10 @@ filter_and_summarize <- function(df, threshold = 0, cols = NULL, na.rm = TRUE, .
         // Test helpers
         assert_eq!(
             get_param_doc(&block, "threshold"),
-            Some("Minimum value for filtering. Values below this threshold are excluded.".to_string())
+            Some(
+                "Minimum value for filtering. Values below this threshold are excluded."
+                    .to_string()
+            )
         );
         assert_eq!(get_param_doc(&block, "nonexistent"), None);
 
@@ -810,8 +837,7 @@ mod prop_tests {
 
     /// Strategy to generate a valid R-style parameter name (letters, digits, dots, underscores).
     fn param_name_strategy() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_.]{0,8}"
-            .prop_filter("param name must not be empty", |s| !s.is_empty())
+        "[a-z][a-z0-9_.]{0,8}".prop_filter("param name must not be empty", |s| !s.is_empty())
     }
 
     /// Strategy to generate a param description.
@@ -1101,4 +1127,3 @@ mod prop_tests {
         }
     }
 }
-

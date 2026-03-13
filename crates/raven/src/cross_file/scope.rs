@@ -41,7 +41,9 @@ impl<'a> LineIndex<'a> {
         }
         let start = self.line_starts[row];
         let end = if row + 1 < self.line_starts.len() {
-            self.line_starts[row + 1].saturating_sub(1).min(self.text.len())
+            self.line_starts[row + 1]
+                .saturating_sub(1)
+                .min(self.text.len())
         } else {
             self.text.len()
         };
@@ -178,7 +180,7 @@ impl Position {
 }
 
 /// A function scope interval with start and end positions
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FunctionScopeInterval {
     pub start: Position,
     pub end: Position,
@@ -622,12 +624,14 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbol: ScopedSymbol,
+        function_scope: Option<FunctionScopeInterval>,
     },
     /// A source() call that introduces symbols from another file
     Source {
         line: u32,
         column: u32,
         source: ForwardSource,
+        function_scope: Option<FunctionScopeInterval>,
     },
     /// A function definition that introduces parameter scope
     FunctionScope {
@@ -642,7 +646,7 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbols: Vec<String>,
-        function_scope: Option<(u32, u32, u32, u32)>,
+        function_scope: Option<FunctionScopeInterval>,
     },
     /// A package load that introduces symbols from a package
     PackageLoad {
@@ -736,9 +740,52 @@ fn find_containing_function_scope(
     tree: &FunctionScopeTree,
     line: u32,
     column: u32,
-) -> Option<(u32, u32, u32, u32)> {
+) -> Option<FunctionScopeInterval> {
     tree.query_innermost(Position::new(line, column))
-        .map(|interval| interval.as_tuple())
+}
+fn active_function_scopes_at(
+    tree: &FunctionScopeTree,
+    line: u32,
+    column: u32,
+) -> HashSet<FunctionScopeInterval> {
+    if Position::new(line, column).is_full_eof() {
+        HashSet::new()
+    } else {
+        tree.query_point(Position::new(line, column))
+            .into_iter()
+            .collect()
+    }
+}
+
+fn is_symbol_visible(
+    def_line: u32,
+    def_col: u32,
+    function_scope: Option<FunctionScopeInterval>,
+    active_function_scopes: &HashSet<FunctionScopeInterval>,
+    line: u32,
+    column: u32,
+    query_inside_function: bool,
+) -> bool {
+    let passes_position = (def_line, def_col) <= (line, column);
+    if !passes_position && !query_inside_function {
+        return false;
+    }
+
+    match function_scope {
+        None => true,
+        Some(def_scope) => passes_position && active_function_scopes.contains(&def_scope),
+    }
+}
+
+fn is_same_or_descendant_function_scope(
+    scope: Option<FunctionScopeInterval>,
+    ancestor_scope: FunctionScopeInterval,
+) -> bool {
+    matches!(
+        scope,
+        Some(scope)
+            if ancestor_scope.start <= scope.start && scope.end <= ancestor_scope.end
+    )
 }
 /// Remove the given symbols from a computed scope when the removal applies.
 ///
@@ -758,8 +805,8 @@ fn find_containing_function_scope(
 /// ```
 fn apply_removal(
     scope: &mut ScopeAtPosition,
-    active_function_scopes: &[(u32, u32, u32, u32)],
-    removal_scope: Option<(u32, u32, u32, u32)>,
+    active_function_scopes: &HashSet<FunctionScopeInterval>,
+    removal_scope: Option<FunctionScopeInterval>,
     symbols: &[String],
 ) {
     match removal_scope {
@@ -774,6 +821,51 @@ fn apply_removal(
             }
         }
         _ => {}
+    }
+}
+
+fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
+    for event in &mut artifacts.timeline {
+        match event {
+            ScopeEvent::Def {
+                line,
+                column,
+                function_scope,
+                ..
+            } => {
+                *function_scope =
+                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+            }
+            ScopeEvent::Source {
+                line,
+                column,
+                function_scope,
+                source,
+                ..
+            } => {
+                // Only set function_scope for local-scoped source calls.
+                // Non-local source() (the default) evaluates in .GlobalEnv,
+                // so its symbols should be globally visible regardless of
+                // where the call site is.
+                if should_apply_local_scoping(source) {
+                    *function_scope = find_containing_function_scope(
+                        &artifacts.function_scope_tree,
+                        *line,
+                        *column,
+                    );
+                }
+            }
+            ScopeEvent::Removal {
+                line,
+                column,
+                function_scope,
+                ..
+            } => {
+                *function_scope =
+                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -817,6 +909,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             line: source.line,
             column: source.column,
             source,
+            function_scope: None,
         });
     }
 
@@ -871,18 +964,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         })
         .collect();
     artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
-    for event in &mut artifacts.timeline {
-        if let ScopeEvent::Removal {
-            line,
-            column,
-            function_scope,
-            ..
-        } = event
-        {
-            *function_scope =
-                find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
-        }
-    }
+    annotate_event_function_scopes(&mut artifacts);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     // (Requirements 14.2, 14.4)
@@ -891,8 +973,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             &artifacts.function_scope_tree,
             lib_call.line,
             lib_call.column,
-        )
-        .map(FunctionScopeInterval::from_tuple);
+        );
 
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: lib_call.line,
@@ -999,6 +1080,7 @@ pub fn compute_artifacts_with_metadata(
             line: source.line,
             column: source.column,
             source,
+            function_scope: None,
         });
     }
 
@@ -1016,6 +1098,7 @@ pub fn compute_artifacts_with_metadata(
                         line: source.line,
                         column: source.column,
                         source: source.clone(),
+                        function_scope: None,
                     });
                 }
             }
@@ -1114,18 +1197,7 @@ pub fn compute_artifacts_with_metadata(
         })
         .collect();
     artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
-    for event in &mut artifacts.timeline {
-        if let ScopeEvent::Removal {
-            line,
-            column,
-            function_scope,
-            ..
-        } = event
-        {
-            *function_scope =
-                find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
-        }
-    }
+    annotate_event_function_scopes(&mut artifacts);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     for lib_call in library_calls {
@@ -1133,8 +1205,7 @@ pub fn compute_artifacts_with_metadata(
             &artifacts.function_scope_tree,
             lib_call.line,
             lib_call.column,
-        )
-        .map(FunctionScopeInterval::from_tuple);
+        );
 
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: lib_call.line,
@@ -1237,16 +1308,8 @@ pub fn scope_at_position(
 
     // Use interval tree for O(log n) query instead of linear scan
     let is_full_eof_position = Position::new(line, column).is_full_eof();
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
@@ -1259,27 +1322,18 @@ pub fn scope_at_position(
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
-                let passes_position = (*def_line, *def_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
-                        None => {
-                            // Global definition - include (hoisted or positionally valid)
-                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                        }
-                        Some(def_scope) => {
-                            // Function-local definition - only include if positional AND in same function
-                            if passes_position && active_function_scopes.contains(&def_scope) {
-                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                            }
-                        }
-                    }
+                if is_symbol_visible(
+                    *def_line,
+                    *def_col,
+                    *function_scope,
+                    &active_function_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                ) {
+                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
             ScopeEvent::Source { .. } => {
@@ -1342,13 +1396,7 @@ pub fn scope_at_position(
                         None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
-                            passes_position
-                                && active_function_scopes.iter().any(|active_scope| {
-                                    active_scope.0 == pkg_scope.start.line
-                                        && active_scope.1 == pkg_scope.start.column
-                                        && active_scope.2 == pkg_scope.end.line
-                                        && active_scope.3 == pkg_scope.end.column
-                                })
+                            passes_position && active_function_scopes.contains(pkg_scope)
                         }
                     };
 
@@ -1444,16 +1492,8 @@ where
 
     // Use interval tree for O(log n) query instead of linear scan
     let is_full_eof_position = Position::new(line, column).is_full_eof();
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
@@ -1469,27 +1509,18 @@ where
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
-                let passes_position = (*def_line, *def_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
-                        None => {
-                            // Global definition - include (hoisted or positionally valid)
-                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                        }
-                        Some(def_scope) => {
-                            // Function-local definition - only include if positional AND in same function
-                            if passes_position && active_function_scopes.contains(&def_scope) {
-                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                            }
-                        }
-                    }
+                if is_symbol_visible(
+                    *def_line,
+                    *def_col,
+                    *function_scope,
+                    &active_function_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                ) {
+                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
             ScopeEvent::Source { .. } => {
@@ -1550,13 +1581,7 @@ where
                         None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
-                            passes_position
-                                && active_function_scopes.iter().any(|active_scope| {
-                                    active_scope.0 == pkg_scope.start.line
-                                        && active_scope.1 == pkg_scope.start.column
-                                        && active_scope.2 == pkg_scope.end.line
-                                        && active_scope.3 == pkg_scope.end.column
-                                })
+                            passes_position && active_function_scopes.contains(pkg_scope)
                         }
                     };
 
@@ -1729,16 +1754,8 @@ where
 
     // Use interval tree for O(log n) query instead of linear scan
     let is_full_eof_position = Position::new(line, column).is_full_eof();
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // Process timeline events up to the requested position
     for event in &artifacts.timeline {
@@ -1747,18 +1764,14 @@ where
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
 
                     // Skip function-local definitions not in our scope
-                    if let Some(def_scope) = def_function_scope {
-                        if !active_function_scopes.contains(&def_scope) {
+                    if let Some(def_scope) = function_scope {
+                        if !active_function_scopes.contains(def_scope) {
                             continue;
                         }
                     }
@@ -1780,23 +1793,19 @@ where
                 line: src_line,
                 column: src_col,
                 source,
+                function_scope,
             } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
+                    if let Some(src_scope) = function_scope {
+                        if !active_function_scopes.contains(src_scope) {
+                            continue;
+                        }
+                    }
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
-                        // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
-
-                        if let Some(src_scope) = source_function_scope {
-                            if !active_function_scopes.contains(&src_scope) {
-                                continue;
-                            }
-                        } else {
+                        if function_scope.is_none() {
                             // local=TRUE at top-level doesn't contribute to global scope
                             continue;
                         }
@@ -1912,7 +1921,12 @@ where
     scope
 }
 
-fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts: &mut ScopeArtifacts) {
+fn collect_definitions(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+    artifacts: &mut ScopeArtifacts,
+) {
     // Check for assignment expressions
     if node.kind() == "binary_operator" {
         if let Some(symbol) = try_extract_assignment(node, line_index, uri) {
@@ -1920,6 +1934,7 @@ fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts:
                 line: symbol.defined_line,
                 column: symbol.defined_column,
                 symbol: symbol.clone(),
+                function_scope: None,
             };
             artifacts.timeline.push(event);
             artifacts
@@ -1935,6 +1950,7 @@ fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts:
                 line: symbol.defined_line,
                 column: symbol.defined_column,
                 symbol: symbol.clone(),
+                function_scope: None,
             };
             artifacts.timeline.push(event);
             artifacts
@@ -1950,6 +1966,7 @@ fn collect_definitions(node: Node, line_index: &LineIndex, uri: &Url, artifacts:
                 line: symbol.defined_line,
                 column: symbol.defined_column,
                 symbol: symbol.clone(),
+                function_scope: None,
             };
             artifacts.timeline.push(event);
             artifacts
@@ -2029,7 +2046,11 @@ fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> 
 }
 
 /// Extract a parameter symbol from a parameter node
-fn extract_parameter_symbol(param_node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
+fn extract_parameter_symbol(
+    param_node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<ScopedSymbol> {
     // Handle different parameter types
     match param_node.kind() {
         "parameter" | "default_parameter" => {
@@ -2173,7 +2194,11 @@ fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Opt
 
 /// Extract loop iterator from for_statement nodes.
 /// In R, loop iterators persist after the loop completes.
-fn try_extract_for_loop_iterator(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
+fn try_extract_for_loop_iterator(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<ScopedSymbol> {
     // Get the variable field (iterator)
     let var_node = node.child_by_field_name("variable")?;
 
@@ -2522,17 +2547,8 @@ where
     // Compute function scope context early — needed for STEP 1 hoisting.
     // When the query position is inside a function body, STEP 1 should query
     // parents at EOF to get their full global scope (R late-binding semantics).
-    let is_eof_position = line == u32::MAX && column == u32::MAX;
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
-        Vec::new()
-    } else {
-        artifacts
-            .function_scope_tree
-            .query_point(Position::new(line, column))
-            .into_iter()
-            .map(|interval| interval.as_tuple())
-            .collect()
-    };
+    let active_function_scopes =
+        active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
@@ -2546,243 +2562,239 @@ where
         // We don't need parent symbols again — they were already merged
         // into the caller's scope during the first visit.
     } else {
-    // Get edges where this file is the child (callee)
-    //
-    // If multiple edges exist from the same parent (e.g., AST-detected source()
-    // plus an explicit backward directive), prefer the most inclusive call site
-    // so that `line=eof` correctly includes symbols from later sources.
-    let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
-    let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
-    for edge in graph.get_dependents(uri) {
-        let entry = parent_edge_indices.get(&edge.from).copied();
-        match entry {
-            Some(existing_index) => {
-                let existing = parent_edges[existing_index];
-                // None means "call site couldn't be resolved"; u32::MAX makes
-                // unresolved edges the most inclusive so they inherit the full
-                // parent scope (consistent with unwrap_or(u32::MAX) below).
-                let existing_call_site = (
-                    existing.call_site_line.unwrap_or(u32::MAX),
-                    existing.call_site_column.unwrap_or(u32::MAX),
-                );
-                let candidate_call_site = (
-                    edge.call_site_line.unwrap_or(u32::MAX),
-                    edge.call_site_column.unwrap_or(u32::MAX),
-                );
+        // Get edges where this file is the child (callee)
+        //
+        // If multiple edges exist from the same parent (e.g., AST-detected source()
+        // plus an explicit backward directive), prefer the most inclusive call site
+        // so that `line=eof` correctly includes symbols from later sources.
+        let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
+        let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
+        for edge in graph.get_dependents(uri) {
+            let entry = parent_edge_indices.get(&edge.from).copied();
+            match entry {
+                Some(existing_index) => {
+                    let existing = parent_edges[existing_index];
+                    // None means "call site couldn't be resolved"; u32::MAX makes
+                    // unresolved edges the most inclusive so they inherit the full
+                    // parent scope (consistent with unwrap_or(u32::MAX) below).
+                    let existing_call_site = (
+                        existing.call_site_line.unwrap_or(u32::MAX),
+                        existing.call_site_column.unwrap_or(u32::MAX),
+                    );
+                    let candidate_call_site = (
+                        edge.call_site_line.unwrap_or(u32::MAX),
+                        edge.call_site_column.unwrap_or(u32::MAX),
+                    );
 
-                let should_replace = if candidate_call_site > existing_call_site {
-                    true
-                } else if candidate_call_site == existing_call_site {
-                    if edge.local != existing.local {
-                        // Prefer non-local edge (more inclusive)
-                        !edge.local
-                    } else if edge.is_backward_directive != existing.is_backward_directive {
-                        edge.is_backward_directive
-                    } else if edge.is_directive != existing.is_directive {
-                        edge.is_directive
+                    let should_replace = if candidate_call_site > existing_call_site {
+                        true
+                    } else if candidate_call_site == existing_call_site {
+                        if edge.local != existing.local {
+                            // Prefer non-local edge (more inclusive)
+                            !edge.local
+                        } else if edge.is_backward_directive != existing.is_backward_directive {
+                            edge.is_backward_directive
+                        } else if edge.is_directive != existing.is_directive {
+                            edge.is_directive
+                        } else {
+                            false
+                        }
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
 
-                if should_replace {
-                    parent_edges[existing_index] = edge;
+                    if should_replace {
+                        parent_edges[existing_index] = edge;
+                    }
+                }
+                None => {
+                    parent_edge_indices.insert(edge.from.clone(), parent_edges.len());
+                    parent_edges.push(edge);
                 }
             }
-            None => {
-                parent_edge_indices.insert(edge.from.clone(), parent_edges.len());
-                parent_edges.push(edge);
-            }
         }
-    }
 
-    // Filter backward edges based on the backward dependency mode.
-    //
-    // - Explicit: Only use backward-directive edges (edges created from
-    //   @lsp-sourced-by directives). Forward-created backward entries from
-    //   the workspace scan are ignored.
-    // - Auto: Use all backward edges, UNLESS the file has explicit backward
-    //   directives — then only use those (per-file opt-out).
-    // - Off: No filtering here (diagnostics are suppressed at a higher level).
-    match backward_dep_mode {
-        super::config::BackwardDependencyMode::Explicit => {
-            parent_edges.retain(|e| e.is_backward_directive);
-        }
-        super::config::BackwardDependencyMode::Auto => {
-            let file_has_backward_directives = get_metadata(uri)
-                .map_or(false, |m| !m.sourced_by.is_empty());
-            if file_has_backward_directives {
+        // Filter backward edges based on the backward dependency mode.
+        //
+        // - Explicit: Only use backward-directive edges (edges created from
+        //   @lsp-sourced-by directives). Forward-created backward entries from
+        //   the workspace scan are ignored.
+        // - Auto: Use all backward edges, UNLESS the file has explicit backward
+        //   directives — then only use those (per-file opt-out).
+        // - Off: No filtering here (diagnostics are suppressed at a higher level).
+        match backward_dep_mode {
+            super::config::BackwardDependencyMode::Explicit => {
                 parent_edges.retain(|e| e.is_backward_directive);
             }
-        }
-        super::config::BackwardDependencyMode::Off => {}
-    }
-
-    for edge in parent_edges {
-        // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
-        // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
-        // Regular symbols are not inherited when local=TRUE
-        let is_local_scoped = if edge.local {
-            true
-        } else if edge.is_sys_source {
-            // For sys.source, check if it's targeting global env
-            if let Some(meta) = get_metadata(&edge.from) {
-                !meta.sources.iter().any(|s| {
-                    s.is_sys_source
-                        && s.sys_source_global_env
-                        && s.line == edge.call_site_line.unwrap_or(u32::MAX)
-                })
-            } else {
-                true // Assume non-global if no metadata
+            super::config::BackwardDependencyMode::Auto => {
+                let file_has_backward_directives =
+                    get_metadata(uri).map_or(false, |m| !m.sourced_by.is_empty());
+                if file_has_backward_directives {
+                    parent_edges.retain(|e| e.is_backward_directive);
+                }
             }
-        } else {
-            false
-        };
-
-        // Get call site position for filtering
-        let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
-        let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
-
-        // Check if we would exceed max depth
-        if current_depth + 1 >= max_depth {
-            scope
-                .depth_exceeded
-                .push((uri.clone(), call_site_line, call_site_col));
-            continue;
+            super::config::BackwardDependencyMode::Off => {}
         }
 
-        // Build PathContext for parent
-        let parent_meta = get_metadata(&edge.from);
-        let parent_ctx = parent_meta
-            .as_ref()
-            .and_then(|m| {
-                super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root)
-            })
-            .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
-
-        // Get parent's scope at the call site (or EOF when hoisting from inside a function).
-        // When the child query is inside a function body, R's late-binding means we need
-        // the parent's full global scope, not just what's defined before the source() call.
-        // Note: We pass empty inherited_packages here because the parent will collect
-        // its own inherited packages from its parents via the dependency graph
-        // We pass base_exports since child files also need access to base R functions
-        let (parent_query_line, parent_query_col) = if query_inside_function {
-            (u32::MAX, u32::MAX)
-        } else {
-            (call_site_line, call_site_col)
-        };
-        // Early exit on cancellation before expensive recursive traversal
-        if is_cancelled() {
-            return scope;
-        }
-
-        let empty_packages = HashSet::new();
-        let parent_scope = scope_at_position_with_graph_recursive(
-            &edge.from,
-            parent_query_line,
-            parent_query_col,
-            get_artifacts,
-            get_metadata,
-            graph,
-            workspace_root,
-            parent_ctx,
-            max_depth,
-            current_depth + 1,
-            visited,
-            &empty_packages, // Parent collects its own inherited packages
-            base_exports,
-            hoist_globals,
-            backward_dep_mode,
-            is_cancelled,
-        );
-
-        // Merge parent symbols (they are available at the START of this file)
-        // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
-        // (declarations describe symbol existence, not export behavior)
-        for (name, symbol) in parent_scope.symbols {
-            if is_local_scoped {
-                // For local-scoped edges, only inherit declared symbols
-                if symbol.is_declared {
-                    scope.symbols.entry(name).or_insert(symbol);
+        for edge in parent_edges {
+            // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
+            // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
+            // Regular symbols are not inherited when local=TRUE
+            let is_local_scoped = if edge.local {
+                true
+            } else if edge.is_sys_source {
+                // For sys.source, check if it's targeting global env
+                if let Some(meta) = get_metadata(&edge.from) {
+                    !meta.sources.iter().any(|s| {
+                        s.is_sys_source
+                            && s.sys_source_global_env
+                            && s.line == edge.call_site_line.unwrap_or(u32::MAX)
+                    })
+                } else {
+                    true // Assume non-global if no metadata
                 }
             } else {
-                // For non-local edges, inherit all symbols
-                scope.symbols.entry(name).or_insert(symbol);
-            }
-        }
-        scope.chain.extend(parent_scope.chain);
-        scope.depth_exceeded.extend(parent_scope.depth_exceeded);
+                false
+            };
 
-        // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
-        // Collect packages loaded in parent before the source() call site
-        // These packages are available in the child file from position (0, 0)
-        // When hoisting (child query is inside a function body), use EOF to include
-        // all global packages from the parent (matching R late-binding semantics).
-        let (effective_call_site_line, effective_call_site_col) = if query_inside_function {
-            (u32::MAX, u32::MAX)
-        } else {
-            (call_site_line, call_site_col)
-        };
-        if let Some(parent_artifacts) = get_artifacts(&edge.from) {
-            for event in &parent_artifacts.timeline {
-                if let ScopeEvent::PackageLoad {
-                    line: pkg_line,
-                    column: pkg_col,
-                    package,
-                    function_scope,
-                } = event
-                {
-                    // Only propagate packages loaded before the effective call site
-                    // Requirement 5.1: Package loaded before source() call is available in sourced file
-                    if (*pkg_line, *pkg_col) <= (effective_call_site_line, effective_call_site_col) {
-                        // Requirement 5.3: Respect function scope - only propagate global packages
-                        // or packages in the same function scope as the source() call
-                        let should_propagate = match function_scope {
-                            None => true, // Global package load - always propagate
-                            Some(pkg_scope) => {
-                                // Function-scoped package load - only propagate if the source() call
-                                // is within the same function scope
-                                {
+            // Get call site position for filtering
+            let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
+            let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
+
+            // Check if we would exceed max depth
+            if current_depth + 1 >= max_depth {
+                scope
+                    .depth_exceeded
+                    .push((uri.clone(), call_site_line, call_site_col));
+                continue;
+            }
+
+            // Build PathContext for parent
+            let parent_meta = get_metadata(&edge.from);
+            let parent_ctx = parent_meta
+                .as_ref()
+                .and_then(|m| {
+                    super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root)
+                })
+                .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
+
+            // Get parent's scope at the call site (or EOF when hoisting from inside a function).
+            // When the child query is inside a function body, R's late-binding means we need
+            // the parent's full global scope, not just what's defined before the source() call.
+            // Note: We pass empty inherited_packages here because the parent will collect
+            // its own inherited packages from its parents via the dependency graph
+            // We pass base_exports since child files also need access to base R functions
+            let (parent_query_line, parent_query_col) = if query_inside_function {
+                (u32::MAX, u32::MAX)
+            } else {
+                (call_site_line, call_site_col)
+            };
+            // Early exit on cancellation before expensive recursive traversal
+            if is_cancelled() {
+                return scope;
+            }
+
+            let empty_packages = HashSet::new();
+            let parent_scope = scope_at_position_with_graph_recursive(
+                &edge.from,
+                parent_query_line,
+                parent_query_col,
+                get_artifacts,
+                get_metadata,
+                graph,
+                workspace_root,
+                parent_ctx,
+                max_depth,
+                current_depth + 1,
+                visited,
+                &empty_packages, // Parent collects its own inherited packages
+                base_exports,
+                hoist_globals,
+                backward_dep_mode,
+                is_cancelled,
+            );
+
+            // Merge parent symbols (they are available at the START of this file)
+            // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
+            // (declarations describe symbol existence, not export behavior)
+            for (name, symbol) in parent_scope.symbols {
+                if is_local_scoped {
+                    // For local-scoped edges, only inherit declared symbols
+                    if symbol.is_declared {
+                        scope.symbols.entry(name).or_insert(symbol);
+                    }
+                } else {
+                    // For non-local edges, inherit all symbols
+                    scope.symbols.entry(name).or_insert(symbol);
+                }
+            }
+            scope.chain.extend(parent_scope.chain);
+            scope.depth_exceeded.extend(parent_scope.depth_exceeded);
+
+            // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
+            // Collect packages loaded in parent before the source() call site
+            // These packages are available in the child file from position (0, 0)
+            // When hoisting (child query is inside a function body), use EOF to include
+            // all global packages from the parent (matching R late-binding semantics).
+            let (effective_call_site_line, effective_call_site_col) = if query_inside_function {
+                (u32::MAX, u32::MAX)
+            } else {
+                (call_site_line, call_site_col)
+            };
+            if let Some(parent_artifacts) = get_artifacts(&edge.from) {
+                for event in &parent_artifacts.timeline {
+                    if let ScopeEvent::PackageLoad {
+                        line: pkg_line,
+                        column: pkg_col,
+                        package,
+                        function_scope,
+                    } = event
+                    {
+                        // Only propagate packages loaded before the effective call site
+                        // Requirement 5.1: Package loaded before source() call is available in sourced file
+                        if (*pkg_line, *pkg_col)
+                            <= (effective_call_site_line, effective_call_site_col)
+                        {
+                            // Requirement 5.3: Respect function scope - only propagate global packages
+                            // or packages in the same function scope as the source() call
+                            let should_propagate = match function_scope {
+                                None => true, // Global package load - always propagate
+                                Some(pkg_scope) => {
+                                    // Function-scoped package load - only propagate if the source() call
+                                    // is within the same function scope or nested inside it
                                     let call_site_scope = parent_artifacts
                                         .function_scope_tree
                                         .query_innermost(Position::new(
                                             effective_call_site_line,
                                             effective_call_site_col,
-                                        ))
-                                        .map(|interval| interval.as_tuple());
-
-                                    call_site_scope.is_some_and(|cs_scope| {
-                                        cs_scope.0 == pkg_scope.start.line
-                                            && cs_scope.1 == pkg_scope.start.column
-                                            && cs_scope.2 == pkg_scope.end.line
-                                            && cs_scope.3 == pkg_scope.end.column
-                                    })
+                                        ));
+                                    is_same_or_descendant_function_scope(
+                                        call_site_scope,
+                                        *pkg_scope,
+                                    )
                                 }
-                            }
-                        };
+                            };
 
-                        if should_propagate {
-                            scope.inherited_packages.insert(package.clone());
+                            if should_propagate {
+                                scope.inherited_packages.insert(package.clone());
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Also propagate packages that the parent inherited from its parents
-        // Requirement 5.2: Inherit loaded packages from parent up to call site
-        for pkg in &parent_scope.inherited_packages {
-            scope.inherited_packages.insert(pkg.clone());
-        }
+            // Also propagate packages that the parent inherited from its parents
+            // Requirement 5.2: Inherit loaded packages from parent up to call site
+            for pkg in &parent_scope.inherited_packages {
+                scope.inherited_packages.insert(pkg.clone());
+            }
 
-        // Also propagate packages that are loaded in the parent at the call site.
-        // This includes packages loaded in sourced files before the call site.
-        for pkg in &parent_scope.loaded_packages {
-            scope.inherited_packages.insert(pkg.clone());
+            // Also propagate packages that are loaded in the parent at the call site.
+            // This includes packages loaded in sourced files before the call site.
+            for pkg in &parent_scope.loaded_packages {
+                scope.inherited_packages.insert(pkg.clone());
+            }
         }
-    }
     } // end if !is_revisit (STEP 1)
 
     // STEP 2: Process timeline events (local definitions and forward sources)
@@ -2793,58 +2805,39 @@ where
                 line: def_line,
                 column: def_col,
                 symbol,
+                function_scope,
             } => {
-                let passes_position = (*def_line, *def_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.as_tuple());
-
-                    match def_function_scope {
-                        None => {
-                            // Global definition - include (hoisted or positionally valid)
-                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                        }
-                        Some(def_scope) => {
-                            // Function-local definition - only include if positional AND in same function
-                            if passes_position && active_function_scopes.contains(&def_scope) {
-                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                            }
-                        }
-                    }
+                if is_symbol_visible(
+                    *def_line,
+                    *def_col,
+                    *function_scope,
+                    &active_function_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                ) {
+                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
             ScopeEvent::Source {
                 line: src_line,
                 column: src_col,
                 source,
+                function_scope,
             } => {
                 // Include source() if before position, or if hoisting and it's a global source()
                 let passes_position = (*src_line, *src_col) < (line, column);
-                let is_global_source = query_inside_function && {
-                    let source_function_scope = artifacts
-                        .function_scope_tree
-                        .query_innermost(Position::new(*src_line, *src_col))
-                        .map(|interval| interval.as_tuple());
-                    source_function_scope.is_none()
-                };
+                if let Some(src_scope) = function_scope {
+                    if !active_function_scopes.contains(src_scope) {
+                        continue;
+                    }
+                }
+                let is_global_source = query_inside_function && function_scope.is_none();
                 if passes_position || is_global_source {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
-                        // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
-
-                        if let Some(src_scope) = source_function_scope {
-                            if !active_function_scopes.contains(&src_scope) {
-                                continue;
-                            }
-                        } else {
+                        if function_scope.is_none() {
                             // local=TRUE at top-level doesn't contribute to global scope
                             continue;
                         }
@@ -2885,10 +2878,7 @@ where
                         // to pass to the child file. The child will have access to these packages
                         // from position (0, 0).
                         // Get the function scope of the source() call for filtering function-scoped packages
-                        let source_function_scope = artifacts
-                            .function_scope_tree
-                            .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.as_tuple());
+                        let source_function_scope = *function_scope;
 
                         let mut extra_packages: HashSet<String> = HashSet::new();
 
@@ -2910,12 +2900,10 @@ where
                                             // Function-scoped package load - only include if:
                                             // 1. The source() call is in the same function scope, OR
                                             // 2. The source() call is nested within the package's function scope
-                                            source_function_scope.is_some_and(|src_scope| {
-                                                src_scope.0 == pkg_scope.start.line
-                                                    && src_scope.1 == pkg_scope.start.column
-                                                    && src_scope.2 == pkg_scope.end.line
-                                                    && src_scope.3 == pkg_scope.end.column
-                                            })
+                                            is_same_or_descendant_function_scope(
+                                                source_function_scope,
+                                                *pkg_scope,
+                                            )
                                         }
                                     };
 
@@ -3065,13 +3053,7 @@ where
                         None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
-                            passes_position
-                                && active_function_scopes.iter().any(|active_scope| {
-                                    active_scope.0 == pkg_scope.start.line
-                                        && active_scope.1 == pkg_scope.start.column
-                                        && active_scope.2 == pkg_scope.end.line
-                                        && active_scope.3 == pkg_scope.end.column
-                                })
+                            passes_position && active_function_scopes.contains(pkg_scope)
                         }
                     };
 
@@ -3347,6 +3329,7 @@ mod tests {
                     line,
                     column,
                     symbol,
+                    ..
                 } => {
                     println!("  Def: {} at ({}, {})", symbol.name, line, column);
                 }
@@ -3554,6 +3537,199 @@ mod tests {
         assert!(
             !scope.symbols.contains_key("child_var"),
             "local=TRUE should not leak symbols to global scope"
+        );
+    }
+
+    #[test]
+    fn test_scope_with_graph_local_source_stays_function_scoped() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let parent_code = r#"wrapper <- function() {
+    local_only <- 1
+    source("child.R", local = TRUE)
+    child_var + local_only
+}
+outside_var <- 2"#;
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope_inside_function = scope_at_position_with_graph(
+            &parent_uri,
+            3,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("child_var"),
+            "child_var should be visible inside the function after source(local=TRUE)"
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("local_only"),
+            "local_only should stay visible inside the containing function"
+        );
+
+        let scope_after_function = scope_at_position_with_graph(
+            &parent_uri,
+            5,
+            12,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            !scope_after_function.symbols.contains_key("child_var"),
+            "child_var should not leak into outer scope after source(local=TRUE)"
+        );
+        assert!(
+            !scope_after_function.symbols.contains_key("local_only"),
+            "local_only should not be visible outside the function"
+        );
+        assert!(
+            scope_after_function.symbols.contains_key("outside_var"),
+            "outside_var should remain visible in outer scope"
+        );
+    }
+
+    #[test]
+    fn test_scope_with_graph_nonlocal_source_in_function_is_globally_visible() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // source() without local=TRUE inside a function — child symbols should be
+        // globally visible (R's default behavior: source() evaluates in .GlobalEnv).
+        let parent_code = r#"wrapper <- function() {
+    fn_only <- 1
+    source("child.R")
+    child_var + fn_only
+}
+outside_var <- 2"#;
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Inside the function: child_var should be visible (source is before this point)
+        let scope_inside_function = scope_at_position_with_graph(
+            &parent_uri,
+            3,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("child_var"),
+            "child_var should be visible inside the function after non-local source()"
+        );
+        assert!(
+            scope_inside_function.symbols.contains_key("fn_only"),
+            "fn_only should be visible inside its defining function"
+        );
+
+        // Outside the function: child_var should still be visible (non-local source
+        // evaluates in .GlobalEnv, so its symbols are globally available)
+        let scope_after_function = scope_at_position_with_graph(
+            &parent_uri,
+            5,
+            12,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_after_function.symbols.contains_key("child_var"),
+            "child_var should be visible in outer scope after non-local source()"
+        );
+        assert!(
+            !scope_after_function.symbols.contains_key("fn_only"),
+            "fn_only should not leak outside its defining function"
+        );
+        assert!(
+            scope_after_function.symbols.contains_key("outside_var"),
+            "outside_var should remain visible in outer scope"
         );
     }
 
@@ -4073,8 +4249,8 @@ mod tests {
     #[test]
     fn test_max_depth_exceeded_backward() {
         // Test that depth_exceeded is populated when max depth is hit on backward directives
-        use crate::cross_file::dependency::DependencyGraph;
         use super::super::types::{CrossFileMetadata, ForwardSource};
+        use crate::cross_file::dependency::DependencyGraph;
 
         let uri_a = Url::parse("file:///project/a.R").unwrap();
         let uri_b = Url::parse("file:///project/b.R").unwrap();
@@ -4202,6 +4378,7 @@ mod tests {
                 sys_source_global_env: true,
                 ..Default::default()
             },
+            function_scope: None,
         });
         parent_artifacts.timeline.sort_by_key(|e| match e {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
@@ -4535,6 +4712,48 @@ mod tests {
         assert!(
             scope_inside.symbols.contains_key("local_var"),
             "Function-local variable should be available inside function"
+        );
+        assert!(
+            !scope_inside.symbols.contains_key("global_var"),
+            "Global variable defined after function should NOT be available inside function"
+        );
+    }
+
+    #[test]
+    fn test_function_local_variables_not_available_outside_metadata_path() {
+        use crate::cross_file::types::CrossFileMetadata;
+        // Regression test: compute_artifacts_with_metadata must annotate Def/Source events
+        // with function_scope (not just Removal events), otherwise function-local symbols
+        // leak into global scope.
+        let code = "my_func <- function() { local_var <- 42; local_var }\nglobal_var <- 100";
+        let tree = parse_r(&code);
+        let metadata = CrossFileMetadata::default();
+        let artifacts = compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&metadata));
+
+        // Outside function, local variable should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 1, 10, false);
+        assert!(
+            scope_outside.symbols.contains_key("my_func"),
+            "Function name should be available outside function"
+        );
+        assert!(
+            scope_outside.symbols.contains_key("global_var"),
+            "Global variable should be available outside function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("local_var"),
+            "Function-local variable should NOT be available outside function (metadata path)"
+        );
+
+        // Inside function, local variable SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40, false);
+        assert!(
+            scope_inside.symbols.contains_key("my_func"),
+            "Function name should be available inside function"
+        );
+        assert!(
+            scope_inside.symbols.contains_key("local_var"),
+            "Function-local variable should be available inside function (metadata path)"
         );
         assert!(
             !scope_inside.symbols.contains_key("global_var"),
@@ -5037,6 +5256,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
             ScopeEvent::Def {
                 line: 5,
@@ -5050,6 +5270,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
         ];
 
@@ -5117,6 +5338,7 @@ mod tests {
                     sys_source_global_env: true,
                     ..Default::default()
                 },
+                function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 4,
@@ -5177,6 +5399,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
             ScopeEvent::Source {
                 line: 3,
@@ -5192,6 +5415,7 @@ mod tests {
                     sys_source_global_env: true,
                     ..Default::default()
                 },
+                function_scope: None,
             },
             ScopeEvent::FunctionScope {
                 start_line: 7,
@@ -5279,6 +5503,7 @@ mod tests {
                     signature: None,
                     is_declared: false,
                 },
+                function_scope: None,
             },
         ];
 
@@ -7205,7 +7430,9 @@ mod tests {
         // Regression test: child with @lsp-sourced-by line=eof should inherit
         // symbols from files sourced by the parent after the child call site.
         use crate::cross_file::dependency::DependencyGraph;
-        use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+        use crate::cross_file::types::{
+            BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+        };
 
         let parent_uri = Url::parse("file:///project/functions.R").unwrap();
         let child_uri = Url::parse("file:///project/fitModel.R").unwrap();
@@ -8396,7 +8623,8 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query at line 0 (before library call on line 1)
-        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
 
         // Should have x but NOT package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8421,7 +8649,8 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query at line 2 (after library call on line 1)
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Should have x, y, and package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8451,7 +8680,8 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query at line 0, after the library call ends
-        let scope = scope_at_position_with_packages(&artifacts, 0, 20, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 0, 20, &get_exports, &base_exports, false);
 
         // Package exports should be available
         assert!(
@@ -8560,7 +8790,8 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query after both library calls
-        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports, false);
 
         // Should have exports from both packages
         assert!(
@@ -8592,7 +8823,8 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query after local definition
-        let scope = scope_at_position_with_packages(&artifacts, 1, 50, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 50, &get_exports, &base_exports, false);
 
         // mutate should be the local definition, not the package export
         assert!(
@@ -8627,7 +8859,8 @@ mod tests {
         let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         let mutate_symbol = scope.symbols.get("mutate").unwrap();
         assert_eq!(
@@ -8647,7 +8880,8 @@ mod tests {
         let get_exports = mock_package_exports(&[("emptypackage", &[])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         // Should just have x, no package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8665,7 +8899,8 @@ mod tests {
         let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         // Should just have x, no package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
@@ -8685,7 +8920,8 @@ mod tests {
         let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         assert!(
             scope.symbols.contains_key("mutate"),
@@ -8708,7 +8944,8 @@ x <- 1"#;
         let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         assert!(
             scope.symbols.contains_key("mutate"),
@@ -8806,7 +9043,8 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query at line 0 (before library call)
-        let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports, false);
         assert!(
             scope.symbols.contains_key("print"),
             "print should be in scope before library()"
@@ -8828,7 +9066,8 @@ x <- 1"#;
         let mut base_exports = HashSet::new();
         base_exports.insert("print".to_string());
 
-        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
         let print_symbol = scope.symbols.get("print").unwrap();
         assert_eq!(
             print_symbol.source_uri.as_str(),
@@ -8849,7 +9088,8 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query after local definition
-        let scope = scope_at_position_with_packages(&artifacts, 0, 50, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 0, 50, &get_exports, &base_exports, false);
 
         let print_symbol = scope.symbols.get("print").unwrap();
         assert_eq!(
@@ -8876,7 +9116,8 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query after library call
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
 
         let print_symbol = scope.symbols.get("print").unwrap();
         // The package export should override the base export
@@ -8899,7 +9140,8 @@ x <- 1"#;
         base_exports.insert("print".to_string());
 
         // Query inside the function
-        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports, false);
         assert!(
             scope.symbols.contains_key("print"),
             "print should be in scope inside function"
@@ -8916,7 +9158,8 @@ x <- 1"#;
         let get_exports = mock_package_exports(&[]);
         let base_exports = empty_base_exports();
 
-        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
+        let scope =
+            scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports, false);
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
         assert_eq!(scope.symbols.len(), 1, "Should only have x in scope");
     }
@@ -9246,6 +9489,79 @@ x <- 1"#;
         assert!(
             !scope.inherited_packages.contains(&"dplyr".to_string()),
             "Child should NOT inherit function-scoped dplyr from parent"
+        );
+    }
+
+    #[test]
+    fn test_cross_file_package_propagation_nested_local_source_inherits_outer_package() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_code = "outer <- function() {\n  library(dplyr)\n  inner <- function() {\n    source(\"child.R\", local = TRUE)\n  }\n}";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        let child_code = "x <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 3,
+                column: 4,
+                is_directive: false,
+                local: true,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+
+        assert!(
+            scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should inherit dplyr when a nested local source() call runs inside an outer function that loaded it"
         );
     }
 
@@ -10165,9 +10481,14 @@ y <- filter(df)"#;
             let artifacts = compute_artifacts(&uri, &tree, code);
 
             let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if u == &uri { Some(Arc::new(artifacts.clone())) } else { None }
+                if u == &uri {
+                    Some(Arc::new(artifacts.clone()))
+                } else {
+                    None
+                }
             };
-            let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+            let get_metadata =
+                |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
             let base_exports = HashSet::new();
 
@@ -10229,11 +10550,16 @@ y <- filter(df)"#;
             let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
             let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if u == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if u == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if u == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if u == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
-            let get_metadata = |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+            let get_metadata =
+                |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
             let base_exports = HashSet::new();
 
@@ -10278,7 +10604,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_directive_child_function_sees_sibling_symbols() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
@@ -10341,15 +10669,24 @@ y <- filter(df)"#;
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -10426,14 +10763,18 @@ y <- filter(df)"#;
             graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &a_uri { Some(Arc::new(a_artifacts.clone())) }
-                else if uri == &b_uri { Some(Arc::new(b_artifacts.clone())) }
-                else if uri == &c_uri { Some(Arc::new(c_artifacts.clone())) }
-                else { None }
+                if uri == &a_uri {
+                    Some(Arc::new(a_artifacts.clone()))
+                } else if uri == &b_uri {
+                    Some(Arc::new(b_artifacts.clone()))
+                } else if uri == &c_uri {
+                    Some(Arc::new(c_artifacts.clone()))
+                } else {
+                    None
+                }
             };
-            let get_metadata = |_uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                None
-            };
+            let get_metadata =
+                |_uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
 
             let base_exports = HashSet::new();
 
@@ -10474,7 +10815,9 @@ y <- filter(df)"#;
         #[test]
         fn test_mixed_backward_forward_chain_3_levels() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let middle_uri = Url::parse("file:///project/middle.R").unwrap();
@@ -10555,17 +10898,28 @@ y <- filter(df)"#;
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &middle_uri { Some(Arc::new(middle_artifacts.clone())) }
-                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &middle_uri {
+                    Some(Arc::new(middle_artifacts.clone()))
+                } else if uri == &leaf_uri {
+                    Some(Arc::new(leaf_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &middle_uri { Some(middle_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &middle_uri {
+                    Some(middle_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -10607,7 +10961,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_directive_entire_file_is_function_body() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/functions.R").unwrap();
             let sibling1_uri = Url::parse("file:///project/getMonitors.R").unwrap();
@@ -10623,12 +10979,14 @@ y <- filter(df)"#;
             // Sibling 1: defines getMonitors
             let sibling1_code = "getMonitors <- function(x) { x }";
             let sibling1_tree = parse_r(sibling1_code);
-            let sibling1_artifacts = compute_artifacts(&sibling1_uri, &sibling1_tree, sibling1_code);
+            let sibling1_artifacts =
+                compute_artifacts(&sibling1_uri, &sibling1_tree, sibling1_code);
 
             // Sibling 2: defines applyDataBlock
             let sibling2_code = "applyDataBlock <- function(data, name) { data }";
             let sibling2_tree = parse_r(sibling2_code);
-            let sibling2_artifacts = compute_artifacts(&sibling2_uri, &sibling2_tree, sibling2_code);
+            let sibling2_artifacts =
+                compute_artifacts(&sibling2_uri, &sibling2_tree, sibling2_code);
 
             // Child: backward directive to parent, entire body is a function
             let child_code = "fitModel <- function(model.name, data = NULL) {\n    monitor <- getMonitors(TRUE)\n    data <- applyDataBlock(data, model.name)\n    ww$seeds\n}";
@@ -10680,16 +11038,26 @@ y <- filter(df)"#;
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling1_uri { Some(Arc::new(sibling1_artifacts.clone())) }
-                else if uri == &sibling2_uri { Some(Arc::new(sibling2_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling1_uri {
+                    Some(Arc::new(sibling1_artifacts.clone()))
+                } else if uri == &sibling2_uri {
+                    Some(Arc::new(sibling2_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -10770,7 +11138,8 @@ y <- filter(df)"#;
                 }],
                 ..Default::default()
             };
-            let a_artifacts = compute_artifacts_with_metadata(&a_uri, &a_tree, a_code, Some(&a_meta));
+            let a_artifacts =
+                compute_artifacts_with_metadata(&a_uri, &a_tree, a_code, Some(&a_meta));
 
             // B: @lsp-source directive for C
             let b_code = "# @lsp-source c.R";
@@ -10785,7 +11154,8 @@ y <- filter(df)"#;
                 }],
                 ..Default::default()
             };
-            let b_artifacts = compute_artifacts_with_metadata(&b_uri, &b_tree, b_code, Some(&b_meta));
+            let b_artifacts =
+                compute_artifacts_with_metadata(&b_uri, &b_tree, b_code, Some(&b_meta));
 
             // C: defines leaf_var
             let c_code = "leaf_var <- 42";
@@ -10798,15 +11168,24 @@ y <- filter(df)"#;
             graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &a_uri { Some(Arc::new(a_artifacts.clone())) }
-                else if uri == &b_uri { Some(Arc::new(b_artifacts.clone())) }
-                else if uri == &c_uri { Some(Arc::new(c_artifacts.clone())) }
-                else { None }
+                if uri == &a_uri {
+                    Some(Arc::new(a_artifacts.clone()))
+                } else if uri == &b_uri {
+                    Some(Arc::new(b_artifacts.clone()))
+                } else if uri == &c_uri {
+                    Some(Arc::new(c_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &a_uri { Some(a_meta.clone()) }
-                else if uri == &b_uri { Some(b_meta.clone()) }
-                else { None }
+                if uri == &a_uri {
+                    Some(a_meta.clone())
+                } else if uri == &b_uri {
+                    Some(b_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -10847,7 +11226,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_then_forward_chain_3_degrees() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
@@ -10920,17 +11301,28 @@ y <- filter(df)"#;
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &leaf_uri {
+                    Some(Arc::new(leaf_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &sibling_uri { Some(sibling_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &sibling_uri {
+                    Some(sibling_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -10968,7 +11360,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_directive_symbols_visible_without_hoisting() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
@@ -11025,15 +11419,24 @@ y <- filter(df)"#;
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -11085,7 +11488,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_child_sourced_before_sibling_hoisted() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
@@ -11138,19 +11543,32 @@ y <- filter(df)"#;
                 ..Default::default()
             };
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
-                if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -11193,7 +11611,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_parent_global_after_source_child() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let child_uri = Url::parse("file:///project/child.R").unwrap();
@@ -11229,18 +11649,30 @@ y <- filter(df)"#;
                 ..Default::default()
             };
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
-                if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -11274,7 +11706,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_child_sourced_before_sibling_global_level_positional() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
@@ -11325,19 +11759,32 @@ y <- filter(df)"#;
                 ..Default::default()
             };
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
-                if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -11384,7 +11831,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_2degree_chain_sibling_after_child() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let grandparent_uri = Url::parse("file:///project/grandparent.R").unwrap();
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
@@ -11394,7 +11843,8 @@ y <- filter(df)"#;
 
             let grandparent_code = "source(\"parent.R\")";
             let grandparent_tree = parse_r(grandparent_code);
-            let grandparent_artifacts = compute_artifacts(&grandparent_uri, &grandparent_tree, grandparent_code);
+            let grandparent_artifacts =
+                compute_artifacts(&grandparent_uri, &grandparent_tree, grandparent_code);
 
             // Parent: sources child FIRST, then sibling
             let parent_code = "source(\"child.R\")\nsource(\"sibling.R\")";
@@ -11420,7 +11870,12 @@ y <- filter(df)"#;
                 }],
                 ..Default::default()
             };
-            graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
+            graph.update_file(
+                &grandparent_uri,
+                &grandparent_meta,
+                Some(&workspace_root),
+                |_| None,
+            );
 
             let parent_meta = CrossFileMetadata {
                 sources: vec![
@@ -11450,21 +11905,36 @@ y <- filter(df)"#;
                 ..Default::default()
             };
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
-                if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &grandparent_uri { Some(Arc::new(grandparent_artifacts.clone())) }
-                else if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &sibling_uri { Some(Arc::new(sibling_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &grandparent_uri {
+                    Some(Arc::new(grandparent_artifacts.clone()))
+                } else if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &grandparent_uri { Some(grandparent_meta.clone()) }
-                else if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &grandparent_uri {
+                    Some(grandparent_meta.clone())
+                } else if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -11503,7 +11973,9 @@ y <- filter(df)"#;
         #[test]
         fn test_backward_forward_mixed_sibling_after_child() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_uri = Url::parse("file:///project/parent.R").unwrap();
             let helper_uri = Url::parse("file:///project/helper.R").unwrap();
@@ -11570,21 +12042,36 @@ y <- filter(df)"#;
                 ..Default::default()
             };
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |uri| {
-                if uri == &parent_uri { Some(parent_code.to_string()) } else { None }
+                if uri == &parent_uri {
+                    Some(parent_code.to_string())
+                } else {
+                    None
+                }
             });
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-                if uri == &parent_uri { Some(Arc::new(parent_artifacts.clone())) }
-                else if uri == &helper_uri { Some(Arc::new(helper_artifacts.clone())) }
-                else if uri == &leaf_uri { Some(Arc::new(leaf_artifacts.clone())) }
-                else if uri == &child_uri { Some(Arc::new(child_artifacts.clone())) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &helper_uri {
+                    Some(Arc::new(helper_artifacts.clone()))
+                } else if uri == &leaf_uri {
+                    Some(Arc::new(leaf_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
             };
             let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
-                if uri == &parent_uri { Some(parent_meta.clone()) }
-                else if uri == &helper_uri { Some(helper_meta.clone()) }
-                else if uri == &child_uri { Some(child_meta.clone()) }
-                else { None }
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &helper_uri {
+                    Some(helper_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
             };
 
             let base_exports = HashSet::new();
@@ -11708,7 +12195,9 @@ y <- filter(df)"#;
         #[test]
         fn test_auto_mode_explicit_directive_opts_out() {
             use crate::cross_file::dependency::DependencyGraph;
-            use crate::cross_file::types::{CrossFileMetadata, ForwardSource, BackwardDirective, CallSiteSpec};
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
 
             let parent_a_uri = Url::parse("file:///project/parent_a.R").unwrap();
             let parent_b_uri = Url::parse("file:///project/parent_b.R").unwrap();
@@ -11718,12 +12207,14 @@ y <- filter(df)"#;
             // Parent A defines var_a, sources child at line 1
             let parent_a_code = "var_a <- 1\nsource(\"child.R\")";
             let parent_a_tree = parse_r(parent_a_code);
-            let parent_a_artifacts = compute_artifacts(&parent_a_uri, &parent_a_tree, parent_a_code);
+            let parent_a_artifacts =
+                compute_artifacts(&parent_a_uri, &parent_a_tree, parent_a_code);
 
             // Parent B defines var_b, sources child at line 1
             let parent_b_code = "var_b <- 2\nsource(\"child.R\")";
             let parent_b_tree = parse_r(parent_b_code);
-            let parent_b_artifacts = compute_artifacts(&parent_b_uri, &parent_b_tree, parent_b_code);
+            let parent_b_artifacts =
+                compute_artifacts(&parent_b_uri, &parent_b_tree, parent_b_code);
 
             // Child explicitly declares only parent_a as its parent
             let child_code = "# @lsp-sourced-by parent_a.R\nchild_var <- 3";
@@ -11768,8 +12259,12 @@ y <- filter(df)"#;
                 }],
                 ..Default::default()
             };
-            graph.update_file(&parent_a_uri, &parent_a_meta, Some(&workspace_root), |_| None);
-            graph.update_file(&parent_b_uri, &parent_b_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&parent_a_uri, &parent_a_meta, Some(&workspace_root), |_| {
+                None
+            });
+            graph.update_file(&parent_b_uri, &parent_b_meta, Some(&workspace_root), |_| {
+                None
+            });
             graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
 
             let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {

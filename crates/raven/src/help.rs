@@ -170,7 +170,11 @@ impl HelpCache {
         let args = match help_text {
             Some(text) => {
                 let map = extract_arguments_from_help(&text);
-                if map.is_empty() { None } else { Some(map) }
+                if map.is_empty() {
+                    None
+                } else {
+                    Some(map)
+                }
             }
             // Transient R failure — don't cache so retries can succeed later
             None => return None,
@@ -1386,7 +1390,10 @@ Value:
 "#;
 
         let args = extract_arguments_from_help(help_text);
-        assert!(args.contains_key("na.rm"), "Should parse dotted param name na.rm");
+        assert!(
+            args.contains_key("na.rm"),
+            "Should parse dotted param name na.rm"
+        );
         assert!(args.get("na.rm").unwrap().contains("missing values"));
     }
 
@@ -1444,7 +1451,10 @@ Value:
         assert_eq!(args.len(), 2);
         assert!(args.contains_key("x"));
         assert!(args.contains_key("y"));
-        assert!(!args.contains_key("z"), "Should not parse entries from Value section");
+        assert!(
+            !args.contains_key("z"),
+            "Should not parse entries from Value section"
+        );
     }
 
     // --- Tests for HelpCache::get_arguments ---
@@ -1524,6 +1534,9 @@ Value:
         // Verify it's visible through original
         let key = cache_key("fn1", Some("pkg"));
         let guard = cache1.arguments.read().unwrap();
-        assert!(guard.peek(&key).is_some(), "Arguments cached via clone should be visible through original");
+        assert!(
+            guard.peek(&key).is_some(),
+            "Arguments cached via clone should be visible through original"
+        );
     }
 }

@@ -6,9 +6,9 @@
 // incomplete syntax (matching the official R language server's approach).
 //
 
+use crate::utf16::utf16_column_to_byte_offset;
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Point, Tree};
-use crate::utf16::utf16_column_to_byte_offset;
 
 /// Information about a detected function call at cursor position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,7 +296,11 @@ fn detect_via_bracket_heuristic(text: &str, position: Position) -> Option<Functi
                         if paren_depth <= 1 {
                             // Try to close the raw string: `)` + optional delimiter + quote
                             let closed = try_close_raw_string(
-                                line_bytes, i, scan_end, close_quote, delimiter,
+                                line_bytes,
+                                i,
+                                scan_end,
+                                close_quote,
+                                delimiter,
                             );
                             if let Some(advance_to) = closed {
                                 state = FsmState::Normal;
@@ -441,11 +445,7 @@ fn try_close_raw_string(
 /// Try to start a raw string from position `i` in the line.
 /// Returns `(FsmState, new_i)` where `new_i` is the position of the opening
 /// paren of the raw string, or `None` if this isn't a raw string start.
-fn try_start_raw_string(
-    line_bytes: &[u8],
-    i: usize,
-    scan_end: usize,
-) -> Option<(FsmState, usize)> {
+fn try_start_raw_string(line_bytes: &[u8], i: usize, scan_end: usize) -> Option<(FsmState, usize)> {
     // Pattern: r"(...)" or R'(...)' or r"-(..)-" etc.
     // At position i we have 'r' or 'R'.
     let mut j = i + 1;
@@ -489,10 +489,7 @@ fn try_start_raw_string(
 /// Scans backward from `paren_pos` in the line, skipping whitespace, then
 /// collecting identifier characters (alphanumeric, `.`, `_`) and namespace
 /// qualifiers (`::` or `:::`).
-fn extract_function_name_before_paren(
-    line: &str,
-    paren_pos: usize,
-) -> Option<FunctionCallContext> {
+fn extract_function_name_before_paren(line: &str, paren_pos: usize) -> Option<FunctionCallContext> {
     let bytes = line.as_bytes();
     if paren_pos == 0 {
         return None;
@@ -806,8 +803,12 @@ y <- second(a, )
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 7));
         assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("f")
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "f".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
         );
     }
 
@@ -817,8 +818,12 @@ y <- second(a, )
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 7));
         assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("g")
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "g".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
         );
     }
 
@@ -828,8 +833,12 @@ y <- second(a, )
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 7));
         assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("h")
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "h".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
         );
     }
 
@@ -839,8 +848,12 @@ y <- second(a, )
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 11));
         assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("f")
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "f".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
         );
     }
 
@@ -850,8 +863,12 @@ y <- second(a, )
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(1, 2));
         assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("f")
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "f".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
         );
     }
 
@@ -861,10 +878,7 @@ y <- second(a, )
         let code = "df[func(x, ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 11));
-        assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("func")
-        );
+        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("func"));
     }
 
     #[test]
@@ -872,10 +886,7 @@ y <- second(a, )
         let code = "f(r\"(hello(world))\", ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 21));
-        assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("f")
-        );
+        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("f"));
     }
 
     #[test]
@@ -883,10 +894,7 @@ y <- second(a, )
         let code = "f(r\"-(hello(world))-\", ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 23));
-        assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("f")
-        );
+        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("f"));
     }
 
     #[test]
@@ -896,10 +904,7 @@ y <- second(a, )
         let tree = parse_r(code);
         // Cursor at beginning of line 1
         let ctx = detect_function_call_context(&tree, code, Position::new(1, 0));
-        assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("func")
-        );
+        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("func"));
     }
 
     #[test]
@@ -961,10 +966,7 @@ y <- second(a, )
         let code = "func(\n  x,\n  y,\n  ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(3, 2));
-        assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("func")
-        );
+        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("func"));
     }
 
     #[test]
@@ -973,10 +975,7 @@ y <- second(a, )
         let code = "func(x, inner(y),\n  ";
         let tree = parse_r(code);
         let ctx = detect_function_call_context(&tree, code, Position::new(1, 2));
-        assert_eq!(
-            ctx.as_ref().map(|c| c.function_name.as_str()),
-            Some("func")
-        );
+        assert_eq!(ctx.as_ref().map(|c| c.function_name.as_str()), Some("func"));
     }
 
     // --- Helper function tests ---
@@ -1041,7 +1040,9 @@ y <- second(a, )
 
     #[test]
     fn test_is_rmarkdown_true() {
-        assert!(is_rmarkdown("---\ntitle: test\n---\n\n```{r}\nx <- 1\n```\n"));
+        assert!(is_rmarkdown(
+            "---\ntitle: test\n---\n\n```{r}\nx <- 1\n```\n"
+        ));
     }
 
     #[test]
@@ -1148,7 +1149,6 @@ mod property_tests {
     fn parse_r(code: &str) -> tree_sitter::Tree {
         with_parser(|parser| parser.parse(code, None).unwrap())
     }
-
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
