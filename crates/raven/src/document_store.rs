@@ -2353,10 +2353,10 @@ mod tests {
         let mut rope_wrong = Rope::from_str(original);
         DocumentStore::apply_change_to_rope(&mut rope_wrong, change_b);
         DocumentStore::apply_change_to_rope(&mut rope_wrong, change_a);
-        assert_ne!(
+        assert_eq!(
             rope_wrong.to_string(),
-            original,
-            "B then A should corrupt text (out-of-order application)"
+            "crfateWorkbook()\n",
+            "B then A should produce the expected corrupted text"
         );
     }
 }
