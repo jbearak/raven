@@ -1140,18 +1140,7 @@ pub fn compute_artifacts_with_metadata(
         })
         .collect();
     artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
-    for event in &mut artifacts.timeline {
-        if let ScopeEvent::Removal {
-            line,
-            column,
-            function_scope,
-            ..
-        } = event
-        {
-            *function_scope =
-                find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
-        }
-    }
+    annotate_event_function_scopes(&mut artifacts);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     for lib_call in library_calls {
@@ -4633,6 +4622,49 @@ outside_var <- 2"#;
         assert!(
             scope_inside.symbols.contains_key("local_var"),
             "Function-local variable should be available inside function"
+        );
+        assert!(
+            !scope_inside.symbols.contains_key("global_var"),
+            "Global variable defined after function should NOT be available inside function"
+        );
+    }
+
+    #[test]
+    fn test_function_local_variables_not_available_outside_metadata_path() {
+        use crate::cross_file::types::CrossFileMetadata;
+        // Regression test: compute_artifacts_with_metadata must annotate Def/Source events
+        // with function_scope (not just Removal events), otherwise function-local symbols
+        // leak into global scope.
+        let code = "my_func <- function() { local_var <- 42; local_var }\nglobal_var <- 100";
+        let tree = parse_r(&code);
+        let metadata = CrossFileMetadata::default();
+        let artifacts =
+            compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&metadata));
+
+        // Outside function, local variable should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 1, 10, false);
+        assert!(
+            scope_outside.symbols.contains_key("my_func"),
+            "Function name should be available outside function"
+        );
+        assert!(
+            scope_outside.symbols.contains_key("global_var"),
+            "Global variable should be available outside function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("local_var"),
+            "Function-local variable should NOT be available outside function (metadata path)"
+        );
+
+        // Inside function, local variable SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40, false);
+        assert!(
+            scope_inside.symbols.contains_key("my_func"),
+            "Function name should be available inside function"
+        );
+        assert!(
+            scope_inside.symbols.contains_key("local_var"),
+            "Function-local variable should be available inside function (metadata path)"
         );
         assert!(
             !scope_inside.symbols.contains_key("global_var"),
