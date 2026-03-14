@@ -81,8 +81,9 @@ struct ActiveDocumentsChangedParams {
 ///
 /// # Returns
 ///
-/// `Some(CrossFileConfig)` populated from `settings` when at least one of
-/// `crossFile`, `diagnostics`, or `packages` is present; `None` if all are missing.
+/// `Ok(Some(CrossFileConfig))` populated from `settings` when at least one of
+/// `crossFile`, `diagnostics`, or `packages` is present; `Ok(None)` if all are missing.
+/// Returns `Err(...)` when a known setting is present but has an invalid value.
 ///
 /// # Examples
 ///
@@ -104,7 +105,7 @@ struct ActiveDocumentsChangedParams {
 ///     "diagnostics": { "enabled": true, "undefinedVariables": false }
 /// });
 ///
-/// let cfg = raven::backend::parse_cross_file_config(&settings);
+/// let cfg = raven::backend::parse_cross_file_config(&settings).unwrap();
 /// assert!(cfg.is_some());
 /// let cfg = cfg.unwrap();
 /// assert_eq!(cfg.max_backward_depth, 5);
@@ -114,7 +115,7 @@ struct ActiveDocumentsChangedParams {
 /// ```
 pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
-) -> Option<crate::cross_file::CrossFileConfig> {
+) -> std::result::Result<Option<crate::cross_file::CrossFileConfig>, String> {
     use crate::cross_file::{CallSiteDefault, CrossFileConfig};
 
     // crossFile section is optional - we can still parse diagnostics and packages without it
@@ -123,7 +124,7 @@ pub(crate) fn parse_cross_file_config(
     let packages = settings.get("packages");
     // Return None only if no relevant settings are present at all
     if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
-        return None;
+        return Ok(None);
     }
 
     let mut config = CrossFileConfig::default();
@@ -220,9 +221,14 @@ pub(crate) fn parse_cross_file_config(
         {
             config.backward_dependencies = match v {
                 "explicit" => crate::cross_file::BackwardDependencyMode::Explicit,
-                "off" => crate::cross_file::BackwardDependencyMode::Off,
+                "auto" => crate::cross_file::BackwardDependencyMode::Auto,
                 _ => crate::cross_file::BackwardDependencyMode::Auto,
             };
+            if !matches!(v, "auto" | "explicit") {
+                return Err(format!(
+                    "Invalid crossFile.backwardDependencies value '{v}'. Expected 'auto' or 'explicit'."
+                ));
+            }
         }
 
         // Parse on-demand indexing settings
@@ -380,7 +386,7 @@ pub(crate) fn parse_cross_file_config(
         "    workspace_index_max_entries: {}",
         config.cache_workspace_index_max_entries
     );
-    Some(config)
+    Ok(Some(config))
 }
 
 /// Parse indentation configuration from LSP settings.
@@ -778,7 +784,9 @@ impl LanguageServer for Backend {
         // Requirement 11.2: Parse symbols.workspaceMaxResults from initialization options
         if let Some(ref init_options) = params.initialization_options {
             // Parse cross-file configuration
-            if let Some(config) = parse_cross_file_config(init_options) {
+            if let Some(config) = parse_cross_file_config(init_options)
+                .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
+            {
                 state.resize_caches(&config);
                 state.cross_file_config = config;
             }
@@ -2136,7 +2144,16 @@ impl LanguageServer for Backend {
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");
 
         // Parse new configuration if provided
-        let new_config = parse_cross_file_config(&params.settings);
+        let new_config = match parse_cross_file_config(&params.settings) {
+            Ok(config) => config,
+            Err(err) => {
+                log::warn!("Failed to parse cross-file configuration from settings: {}", err);
+                self.client
+                    .show_message(MessageType::ERROR, err)
+                    .await;
+                return;
+            }
+        };
 
         // Parse symbol configuration if provided
         // Requirement 11.2: Parse symbols.workspaceMaxResults from settings
@@ -2148,13 +2165,6 @@ impl LanguageServer for Backend {
         // Parse indentation configuration if provided
         let new_indentation_config = parse_indentation_config(&params.settings);
 
-        // Log if configuration parsing failed and defaults will be used
-        let has_cross_file_settings = params.settings.get("crossFile").is_some()
-            || params.settings.get("diagnostics").is_some()
-            || params.settings.get("packages").is_some();
-        if has_cross_file_settings && new_config.is_none() {
-            log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
-        }
 
         let (
             open_uris,
@@ -3795,7 +3805,7 @@ mod tests {
                 "crossFile": {}
             });
 
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_cross_file_config(&settings).unwrap();
 
             // Should successfully parse
             assert!(config.is_some(), "Configuration parsing should succeed");
@@ -3822,7 +3832,7 @@ mod tests {
                 }
             });
 
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_cross_file_config(&settings).unwrap();
 
             // Should successfully parse
             assert!(config.is_some(), "Configuration parsing should succeed");
@@ -3852,7 +3862,7 @@ mod tests {
                 }
             });
 
-            let config = crate::backend::parse_cross_file_config(&settings);
+            let config = crate::backend::parse_cross_file_config(&settings).unwrap();
 
             // Should successfully parse
             assert!(config.is_some(), "Configuration parsing should succeed");
@@ -3862,6 +3872,27 @@ mod tests {
             assert!(
                 config.diagnostics_enabled,
                 "diagnostics_enabled should default to true when diagnostics section is absent"
+            );
+        }
+
+        #[test]
+        fn test_invalid_backward_dependencies_returns_error() {
+            let settings = json!({
+                "crossFile": {
+                    "backwardDependencies": "invalid"
+                }
+            });
+
+            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
+            assert!(
+                err.contains("crossFile.backwardDependencies"),
+                "error should name the invalid setting, got: {}",
+                err
+            );
+            assert!(
+                err.contains("'auto' or 'explicit'"),
+                "error should name the accepted values, got: {}",
+                err
             );
         }
     }
@@ -4009,7 +4040,7 @@ mod tests {
                 });
 
                 // Parse the configuration
-                let config = crate::backend::parse_cross_file_config(&settings);
+                let config = crate::backend::parse_cross_file_config(&settings).unwrap();
 
                 // Should successfully parse
                 prop_assert!(config.is_some(), "Configuration parsing should succeed");

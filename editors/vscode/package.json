@@ -96,16 +96,14 @@
           "type": "string",
           "enum": [
             "auto",
-            "explicit",
-            "off"
+            "explicit"
           ],
           "enumDescriptions": [
             "Infer parent files by scanning the workspace for source() calls and forward directives",
-            "Only use explicit @lsp-sourced-by directives to resolve parent files",
-            "Disable backward dependency resolution and suppress related undefined-variable lookups"
+            "Only use explicit @lsp-sourced-by directives to resolve parent files"
           ],
           "default": "auto",
-          "description": "Controls how Raven discovers files that source the current file. 'auto' scans the workspace, 'explicit' requires @lsp-sourced-by directives, and 'off' disables backward dependency resolution."
+          "description": "Controls how Raven discovers files that source the current file. 'auto' scans the workspace, and 'explicit' requires @lsp-sourced-by directives."
         },
         "raven.crossFile.indexWorkspace": {
           "type": "boolean",

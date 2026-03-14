@@ -20,8 +20,6 @@ pub enum BackwardDependencyMode {
     /// completes. Files with explicit backward directives use only those directives.
     #[default]
     Auto,
-    /// Suppress all undefined variable diagnostics.
-    Off,
 }
 
 /// Default call site assumption when not specified
