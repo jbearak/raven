@@ -83,7 +83,8 @@ struct ActiveDocumentsChangedParams {
 ///
 /// `Ok(Some(CrossFileConfig))` populated from `settings` when at least one of
 /// `crossFile`, `diagnostics`, or `packages` is present; `Ok(None)` if all are missing.
-/// Returns `Err(...)` when a known setting is present but has an invalid value.
+/// Returns `Err(...)` when a validated setting is present but invalid (currently
+/// `crossFile.backwardDependencies`) or when a top-level section is not an object.
 ///
 /// # Examples
 ///
@@ -125,6 +126,23 @@ pub(crate) fn parse_cross_file_config(
     // Return None only if no relevant settings are present at all
     if cross_file.is_none() && diagnostics.is_none() && packages.is_none() {
         return Ok(None);
+    }
+
+    // Validate that present sections are objects (not scalars/arrays)
+    if let Some(v) = cross_file {
+        if !v.is_object() {
+            return Err("crossFile must be an object.".to_string());
+        }
+    }
+    if let Some(v) = diagnostics {
+        if !v.is_object() {
+            return Err("diagnostics must be an object.".to_string());
+        }
+    }
+    if let Some(v) = packages {
+        if !v.is_object() {
+            return Err("packages must be an object.".to_string());
+        }
     }
 
     let mut config = CrossFileConfig::default();
@@ -3883,6 +3901,27 @@ mod tests {
         }
 
         #[test]
+        fn test_non_string_backward_dependencies_returns_error() {
+            let settings = json!({
+                "crossFile": {
+                    "backwardDependencies": false
+                }
+            });
+
+            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
+            assert!(
+                err.contains("backwardDependencies"),
+                "error should name the invalid setting, got: {}",
+                err
+            );
+            assert!(
+                err.contains("must be a string"),
+                "error should mention type requirement, got: {}",
+                err
+            );
+        }
+
+        #[test]
         fn test_invalid_backward_dependencies_returns_error() {
             let settings = json!({
                 "crossFile": {
@@ -3899,6 +3938,39 @@ mod tests {
             assert!(
                 err.contains("'auto' or 'explicit'"),
                 "error should name the accepted values, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn test_non_object_cross_file_section_returns_error() {
+            let settings = json!({ "crossFile": true });
+            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
+            assert!(
+                err.contains("crossFile must be an object"),
+                "expected object validation error, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn test_non_object_diagnostics_section_returns_error() {
+            let settings = json!({ "diagnostics": "yes" });
+            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
+            assert!(
+                err.contains("diagnostics must be an object"),
+                "expected object validation error, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn test_non_object_packages_section_returns_error() {
+            let settings = json!({ "packages": 42 });
+            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
+            assert!(
+                err.contains("packages must be an object"),
+                "expected object validation error, got: {}",
                 err
             );
         }

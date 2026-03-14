@@ -394,7 +394,7 @@ suite('Settings Transmission Unit Tests', () => {
      * Unit test: Verify severity settings transmission.
      */
     test('severity settings transmit correctly', () => {
-        const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint'];
+        const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint', 'off'];
         
         for (const severity of severities) {
             const configuredSettings = new Map<string, unknown>([
