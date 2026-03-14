@@ -2156,9 +2156,9 @@ impl LanguageServer for Backend {
             Err(err) => {
                 log::warn!("Failed to parse cross-file configuration from settings: {}", err);
                 self.client
-                    .show_message(MessageType::ERROR, err)
+                    .show_message(MessageType::WARNING, err)
                     .await;
-                return;
+                None
             }
         };
 

@@ -99,8 +99,8 @@
             "explicit"
           ],
           "enumDescriptions": [
-            "Infer parent files by scanning the workspace for source() calls and forward directives",
-            "Only use explicit @lsp-sourced-by directives to resolve parent files"
+            "Infer parent files by scanning the workspace for source() calls and forward directives. Diagnostics are deferred until the workspace scan completes.",
+            "Only use explicit @lsp-sourced-by directives to resolve parent files. Diagnostics are shown immediately without waiting for a workspace scan."
           ],
           "default": "auto",
           "description": "Controls how Raven discovers files that source the current file. 'auto' scans the workspace, and 'explicit' requires @lsp-sourced-by directives."
