@@ -215,19 +215,26 @@ pub(crate) fn parse_cross_file_config(
             config.hoist_globals_in_functions = v;
         }
 
-        if let Some(v) = cross_file
-            .get("backwardDependencies")
-            .and_then(|v| v.as_str())
-        {
-            config.backward_dependencies = match v {
-                "explicit" => crate::cross_file::BackwardDependencyMode::Explicit,
-                "auto" => crate::cross_file::BackwardDependencyMode::Auto,
-                _ => crate::cross_file::BackwardDependencyMode::Auto,
-            };
-            if !matches!(v, "auto" | "explicit") {
-                return Err(format!(
-                    "Invalid crossFile.backwardDependencies value '{v}'. Expected 'auto' or 'explicit'."
-                ));
+        if let Some(raw) = cross_file.get("backwardDependencies") {
+            match raw.as_str() {
+                Some("auto") => {
+                    config.backward_dependencies = crate::cross_file::BackwardDependencyMode::Auto;
+                }
+                Some("explicit") => {
+                    config.backward_dependencies =
+                        crate::cross_file::BackwardDependencyMode::Explicit;
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "Invalid crossFile.backwardDependencies value '{other}'. Expected 'auto' or 'explicit'."
+                    ));
+                }
+                None => {
+                    return Err(
+                        "crossFile.backwardDependencies must be a string ('auto' or 'explicit')."
+                            .to_string(),
+                    );
+                }
             }
         }
 

@@ -2,7 +2,7 @@
  * Severity level for diagnostic messages.
  * Maps to LSP DiagnosticSeverity values.
  */
-export type SeverityLevel = "error" | "warning" | "information" | "hint";
+export type SeverityLevel = "error" | "warning" | "information" | "hint" | "off";
 
 /**
  * Subset of VS Code's configuration inspection result used when building
@@ -47,6 +47,7 @@ export interface RavenInitializationOptions {
         outOfScopeSeverity?: SeverityLevel;
         ambiguousParentSeverity?: SeverityLevel;
         maxChainDepthSeverity?: SeverityLevel;
+        redundantDirectiveSeverity?: SeverityLevel;
         onDemandIndexing?: {
             enabled?: boolean;
             maxTransitiveDepth?: number;
@@ -68,6 +69,15 @@ export interface RavenInitializationOptions {
         additionalLibraryPaths?: string[];
         rPath?: string;
         missingPackageSeverity?: SeverityLevel;
+    };
+    symbols?: {
+        workspaceMaxResults?: number;
+    };
+    completion?: {
+        triggerOnOpenParen?: boolean;
+    };
+    indentation?: {
+        style?: "rstudio" | "rstudio-minus" | "off";
     };
 }
 
@@ -113,6 +123,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     const outOfScopeSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.outOfScopeSeverity');
     const ambiguousParentSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.ambiguousParentSeverity');
     const maxChainDepthSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.maxChainDepthSeverity');
+    const redundantDirectiveSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.redundantDirectiveSeverity');
 
     const onDemandEnabled = getExplicitSetting<boolean>(config, 'crossFile.onDemandIndexing.enabled');
     const onDemandMaxTransitiveDepth = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxTransitiveDepth');
@@ -182,6 +193,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         outOfScopeSeverity !== undefined ||
         ambiguousParentSeverity !== undefined ||
         maxChainDepthSeverity !== undefined ||
+        redundantDirectiveSeverity !== undefined ||
         onDemandIndexing !== undefined ||
         cache !== undefined
     ) {
@@ -225,6 +237,9 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         if (maxChainDepthSeverity !== undefined) {
             options.crossFile.maxChainDepthSeverity = maxChainDepthSeverity;
         }
+        if (redundantDirectiveSeverity !== undefined) {
+            options.crossFile.redundantDirectiveSeverity = redundantDirectiveSeverity;
+        }
         if (onDemandIndexing !== undefined) {
             options.crossFile.onDemandIndexing = onDemandIndexing;
         }
@@ -267,6 +282,21 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         if (missingPackageSeverity !== undefined) {
             options.packages.missingPackageSeverity = missingPackageSeverity;
         }
+    }
+
+    const workspaceMaxResults = getExplicitSetting<number>(config, 'symbols.workspaceMaxResults');
+    if (workspaceMaxResults !== undefined) {
+        options.symbols = { workspaceMaxResults };
+    }
+
+    const triggerOnOpenParen = getExplicitSetting<boolean>(config, 'completion.triggerOnOpenParen');
+    if (triggerOnOpenParen !== undefined) {
+        options.completion = { triggerOnOpenParen };
+    }
+
+    const indentationStyle = getExplicitSetting<"rstudio" | "rstudio-minus" | "off">(config, 'indentation.style');
+    if (indentationStyle !== undefined) {
+        options.indentation = { style: indentationStyle };
     }
 
     return options;
