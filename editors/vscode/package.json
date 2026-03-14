@@ -92,6 +92,21 @@
           "default": "end",
           "description": "Default call site assumption when the actual source() call location cannot be determined. Controls symbol availability: 'start' makes symbols available from the beginning of the file, 'end' makes them available only after the presumed source() call at the end."
         },
+        "raven.crossFile.backwardDependencies": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "explicit",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Infer parent files by scanning the workspace for source() calls and forward directives",
+            "Only use explicit @lsp-sourced-by directives to resolve parent files",
+            "Disable backward dependency resolution and suppress related undefined-variable lookups"
+          ],
+          "default": "auto",
+          "description": "Controls how Raven discovers files that source the current file. 'auto' scans the workspace, 'explicit' requires @lsp-sourced-by directives, and 'off' disables backward dependency resolution."
+        },
         "raven.crossFile.indexWorkspace": {
           "type": "boolean",
           "default": true,

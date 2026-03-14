@@ -20,6 +20,7 @@ type SeverityLevel = "error" | "warning" | "information" | "hint";
  */
 interface RavenInitializationOptions {
     crossFile?: {
+        backwardDependencies?: "auto" | "explicit" | "off";
         maxBackwardDepth?: number;
         maxForwardDepth?: number;
         maxChainDepth?: number;
@@ -97,6 +98,7 @@ function getInitializationOptions(): RavenInitializationOptions {
     const options: RavenInitializationOptions = {};
 
     // Cross-file depth settings
+    const backwardDependencies = getExplicitSetting<"auto" | "explicit" | "off">(config, 'crossFile.backwardDependencies');
     const maxBackwardDepth = getExplicitSetting<number>(config, 'crossFile.maxBackwardDepth');
     const maxForwardDepth = getExplicitSetting<number>(config, 'crossFile.maxForwardDepth');
     const maxChainDepth = getExplicitSetting<number>(config, 'crossFile.maxChainDepth');
@@ -166,6 +168,7 @@ function getInitializationOptions(): RavenInitializationOptions {
 
     // Build crossFile object only if any setting is configured
     if (
+        backwardDependencies !== undefined ||
         maxBackwardDepth !== undefined ||
         maxForwardDepth !== undefined ||
         maxChainDepth !== undefined ||
@@ -182,6 +185,9 @@ function getInitializationOptions(): RavenInitializationOptions {
         cache !== undefined
     ) {
         options.crossFile = {};
+        if (backwardDependencies !== undefined) {
+            options.crossFile.backwardDependencies = backwardDependencies;
+        }
         if (maxBackwardDepth !== undefined) {
             options.crossFile.maxBackwardDepth = maxBackwardDepth;
         }

@@ -22,6 +22,7 @@ type SeverityLevel = "error" | "warning" | "information" | "hint";
 
 interface RavenInitializationOptions {
     crossFile?: {
+        backwardDependencies?: "auto" | "explicit" | "off";
         maxBackwardDepth?: number;
         maxForwardDepth?: number;
         maxChainDepth?: number;
@@ -62,6 +63,7 @@ const SETTINGS_MAPPING: Array<{
     enumValues?: readonly string[];
 }> = [
     // Cross-file depth settings
+    { vsCodeKey: 'crossFile.backwardDependencies', jsonPath: ['crossFile', 'backwardDependencies'], type: 'enum', enumValues: ['auto', 'explicit', 'off'] as const },
     { vsCodeKey: 'crossFile.maxBackwardDepth', jsonPath: ['crossFile', 'maxBackwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxForwardDepth', jsonPath: ['crossFile', 'maxForwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxChainDepth', jsonPath: ['crossFile', 'maxChainDepth'], type: 'number' },
@@ -190,6 +192,7 @@ function getInitializationOptions(config: ReturnType<typeof createMockConfig>): 
     const options: RavenInitializationOptions = {};
 
     // Cross-file depth settings
+    const backwardDependencies = getExplicitSetting<"auto" | "explicit" | "off">(config, 'crossFile.backwardDependencies');
     const maxBackwardDepth = getExplicitSetting<number>(config, 'crossFile.maxBackwardDepth');
     const maxForwardDepth = getExplicitSetting<number>(config, 'crossFile.maxForwardDepth');
     const maxChainDepth = getExplicitSetting<number>(config, 'crossFile.maxChainDepth');
@@ -229,6 +232,7 @@ function getInitializationOptions(config: ReturnType<typeof createMockConfig>): 
 
     // Build crossFile object only if any setting is configured
     if (
+        backwardDependencies !== undefined ||
         maxBackwardDepth !== undefined ||
         maxForwardDepth !== undefined ||
         maxChainDepth !== undefined ||
@@ -244,6 +248,9 @@ function getInitializationOptions(config: ReturnType<typeof createMockConfig>): 
         onDemandIndexing !== undefined
     ) {
         options.crossFile = {};
+        if (backwardDependencies !== undefined) {
+            options.crossFile.backwardDependencies = backwardDependencies;
+        }
         if (maxBackwardDepth !== undefined) {
             options.crossFile.maxBackwardDepth = maxBackwardDepth;
         }
@@ -545,6 +552,22 @@ suite('Settings Transmission Unit Tests', () => {
             const options = getInitializationOptions(mockConfig);
 
             assert.strictEqual(options.crossFile?.assumeCallSite, value);
+        }
+    });
+
+    /**
+     * Unit test: Verify backwardDependencies enum transmission.
+     */
+    test('backwardDependencies enum transmits correctly', () => {
+        for (const value of ['auto', 'explicit', 'off'] as const) {
+            const configuredSettings = new Map<string, unknown>([
+                ['crossFile.backwardDependencies', value],
+            ]);
+
+            const mockConfig = createMockConfig(configuredSettings);
+            const options = getInitializationOptions(mockConfig);
+
+            assert.strictEqual(options.crossFile?.backwardDependencies, value);
         }
     });
 
