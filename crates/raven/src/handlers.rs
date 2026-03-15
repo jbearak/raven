@@ -4371,7 +4371,6 @@ fn collect_undefined_variables_from_snapshot(
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     match snapshot.cross_file_config.backward_dependencies {
-        BackwardDependencyMode::Off => return,
         BackwardDependencyMode::Auto => {
             if snapshot.directive_meta.sourced_by.is_empty() && !snapshot.workspace_scan_complete {
                 return;
@@ -7040,10 +7039,9 @@ pub(crate) fn collect_undefined_variables_position_aware(
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     // Backward dependency mode gating:
-    // - Off: suppress all undefined variable diagnostics
     // - Auto + no backward directives + workspace scan incomplete: defer diagnostics
+    // - Explicit: proceed without waiting for workspace scan
     match state.cross_file_config.backward_dependencies {
-        BackwardDependencyMode::Off => return,
         BackwardDependencyMode::Auto => {
             if directive_meta.sourced_by.is_empty() && !state.workspace_scan_complete {
                 // Defer: the workspace scan hasn't finished building the dependency

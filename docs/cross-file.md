@@ -368,8 +368,3 @@ The LSP only uses backward relationships explicitly declared via `@lsp-sourced-b
 
 **Rationale:** Use this mode if you prefer full manual control over cross-file relationships, or if your workspace has complex sourcing patterns where automatic inference produces unwanted results (e.g., a file is sourced by multiple parents with conflicting scopes). Diagnostics are not deferred for the workspace scan.
 
-### `"off"`
-
-Suppresses all undefined variable diagnostics. Other cross-file features (completions, hover, go-to-definition) still work based on whatever dependency edges are available.
-
-**Rationale:** Use this when your project uses patterns that Raven's static analysis cannot resolve (e.g., heavy use of `eval`, `do.call`, or metaprogramming) and the resulting false positives are not helpful.

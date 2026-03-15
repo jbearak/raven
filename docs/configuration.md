@@ -15,7 +15,7 @@ All settings can be configured via VS Code settings or LSP initialization option
 | `raven.crossFile.revalidationDebounceMs` | 200 | Debounce delay for dependent file diagnostics (ms) |
 | `raven.crossFile.editedFileDebounceMs` | 50 | Debounce delay for the actively-edited file (ms) |
 | `raven.crossFile.hoistGlobalsInFunctions` | true | Hoist global definitions inside function bodies (see [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting)) |
-| `raven.crossFile.backwardDependencies` | "auto" | How backward dependencies are resolved: `"auto"` infers from workspace scan, `"explicit"` requires `@lsp-sourced-by` directives, `"off"` suppresses undefined variable diagnostics (see [Backward Dependency Modes](cross-file.md#backward-dependency-modes)) |
+| `raven.crossFile.backwardDependencies` | "auto" | How backward dependencies are resolved: `"auto"` infers from workspace scan, `"explicit"` disables workspace-scan inference and requires explicit backward-dependency declarations via `@lsp-sourced-by` directives (see [Backward Dependency Modes](cross-file.md#backward-dependency-modes)) |
 
 ## Diagnostic Severity Settings
 
