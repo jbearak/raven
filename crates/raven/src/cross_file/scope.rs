@@ -2621,7 +2621,6 @@ where
         //   the workspace scan are ignored.
         // - Auto: Use all backward edges, UNLESS the file has explicit backward
         //   directives — then only use those (per-file opt-out).
-        // - Off: No filtering here (diagnostics are suppressed at a higher level).
         match backward_dep_mode {
             super::config::BackwardDependencyMode::Explicit => {
                 parent_edges.retain(|e| e.is_backward_directive);
@@ -2633,7 +2632,6 @@ where
                     parent_edges.retain(|e| e.is_backward_directive);
                 }
             }
-            super::config::BackwardDependencyMode::Off => {}
         }
 
         for edge in parent_edges {

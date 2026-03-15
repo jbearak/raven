@@ -12,43 +12,59 @@
 
 import * as assert from 'assert';
 import * as fc from 'fast-check';
+import {
+    getInitializationOptions,
+    RavenConfigurationInspection,
+    RavenInitializationOptions,
+    RavenWorkspaceConfiguration,
+    SeverityLevel,
+} from '../initializationOptions';
 
 // Use mocha's describe/it which work in both standalone and VS Code test contexts
 declare const suite: Mocha.SuiteFunction;
 declare const test: Mocha.TestFunction;
 
-// Type definitions matching extension.ts
-type SeverityLevel = "error" | "warning" | "information" | "hint";
+/**
+ * Assert that each setting in SETTINGS_MAPPING has the expected value in the
+ * output options, given which settings were explicitly configured.
+ *
+ * - Configured settings must match their configured value.
+ * - Unconfigured settings with a runtime default must match that default.
+ * - Unconfigured settings without a default must be undefined.
+ */
+function assertSettingsValues(
+    options: Record<string, unknown>,
+    configuredSettings: Map<string, unknown>,
+    /** When true, only check unconfigured settings (Property 3). */
+    unconfiguredOnly = false,
+): void {
+    for (const setting of SETTINGS_MAPPING) {
+        const isConfigured = configuredSettings.has(setting.vsCodeKey);
+        if (unconfiguredOnly && isConfigured) continue;
 
-interface RavenInitializationOptions {
-    crossFile?: {
-        maxBackwardDepth?: number;
-        maxForwardDepth?: number;
-        maxChainDepth?: number;
-        assumeCallSite?: "start" | "end";
-        indexWorkspace?: boolean;
-        maxRevalidationsPerTrigger?: number;
-        revalidationDebounceMs?: number;
-        missingFileSeverity?: SeverityLevel;
-        circularDependencySeverity?: SeverityLevel;
-        outOfScopeSeverity?: SeverityLevel;
-        ambiguousParentSeverity?: SeverityLevel;
-        maxChainDepthSeverity?: SeverityLevel;
-        onDemandIndexing?: {
-            enabled?: boolean;
-            maxTransitiveDepth?: number;
-            maxQueueSize?: number;
-        };
-    };
-    diagnostics?: {
-        undefinedVariables?: boolean;
-    };
-    packages?: {
-        enabled?: boolean;
-        additionalLibraryPaths?: string[];
-        rPath?: string;
-        missingPackageSeverity?: SeverityLevel;
-    };
+        const outputValue = getNestedValue(options, setting.jsonPath);
+
+        if (isConfigured) {
+            const configuredValue = configuredSettings.get(setting.vsCodeKey);
+            assert.deepStrictEqual(
+                outputValue,
+                configuredValue,
+                `Setting ${setting.vsCodeKey} should appear at path ${setting.jsonPath.join('.')} with value ${JSON.stringify(configuredValue)}, but got ${JSON.stringify(outputValue)}`,
+            );
+        } else if (setting.defaultWhenUnconfigured !== undefined) {
+            assert.deepStrictEqual(
+                outputValue,
+                setting.defaultWhenUnconfigured,
+                `Setting ${setting.vsCodeKey} should use its runtime default at path ${setting.jsonPath.join('.')} when unconfigured`,
+            );
+        } else {
+            assert.strictEqual(
+                outputValue,
+                undefined,
+                `Unconfigured setting ${setting.vsCodeKey} should not appear in output, but found ${JSON.stringify(outputValue)}`,
+            );
+        }
+    }
 }
 
 /**
@@ -60,8 +76,10 @@ const SETTINGS_MAPPING: Array<{
     jsonPath: string[];
     type: 'number' | 'boolean' | 'string' | 'enum' | 'array';
     enumValues?: readonly string[];
+    defaultWhenUnconfigured?: unknown;
 }> = [
     // Cross-file depth settings
+    { vsCodeKey: 'crossFile.backwardDependencies', jsonPath: ['crossFile', 'backwardDependencies'], type: 'enum', enumValues: ['auto', 'explicit'] as const },
     { vsCodeKey: 'crossFile.maxBackwardDepth', jsonPath: ['crossFile', 'maxBackwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxForwardDepth', jsonPath: ['crossFile', 'maxForwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxChainDepth', jsonPath: ['crossFile', 'maxChainDepth'], type: 'number' },
@@ -70,22 +88,35 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.maxRevalidationsPerTrigger', jsonPath: ['crossFile', 'maxRevalidationsPerTrigger'], type: 'number' },
     { vsCodeKey: 'crossFile.revalidationDebounceMs', jsonPath: ['crossFile', 'revalidationDebounceMs'], type: 'number' },
     // Cross-file severity settings
-    { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint'] as const },
-    { vsCodeKey: 'crossFile.circularDependencySeverity', jsonPath: ['crossFile', 'circularDependencySeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint'] as const },
-    { vsCodeKey: 'crossFile.outOfScopeSeverity', jsonPath: ['crossFile', 'outOfScopeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint'] as const },
-    { vsCodeKey: 'crossFile.ambiguousParentSeverity', jsonPath: ['crossFile', 'ambiguousParentSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint'] as const },
-    { vsCodeKey: 'crossFile.maxChainDepthSeverity', jsonPath: ['crossFile', 'maxChainDepthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint'] as const },
+    { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.circularDependencySeverity', jsonPath: ['crossFile', 'circularDependencySeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.outOfScopeSeverity', jsonPath: ['crossFile', 'outOfScopeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.ambiguousParentSeverity', jsonPath: ['crossFile', 'ambiguousParentSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.maxChainDepthSeverity', jsonPath: ['crossFile', 'maxChainDepthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.redundantDirectiveSeverity', jsonPath: ['crossFile', 'redundantDirectiveSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     // On-demand indexing settings
     { vsCodeKey: 'crossFile.onDemandIndexing.enabled', jsonPath: ['crossFile', 'onDemandIndexing', 'enabled'], type: 'boolean' },
     { vsCodeKey: 'crossFile.onDemandIndexing.maxTransitiveDepth', jsonPath: ['crossFile', 'onDemandIndexing', 'maxTransitiveDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.onDemandIndexing.maxQueueSize', jsonPath: ['crossFile', 'onDemandIndexing', 'maxQueueSize'], type: 'number' },
+    // Cache settings
+    { vsCodeKey: 'crossFile.cache.metadataMaxEntries', jsonPath: ['crossFile', 'cache', 'metadataMaxEntries'], type: 'number' },
+    { vsCodeKey: 'crossFile.cache.fileContentMaxEntries', jsonPath: ['crossFile', 'cache', 'fileContentMaxEntries'], type: 'number' },
+    { vsCodeKey: 'crossFile.cache.existenceMaxEntries', jsonPath: ['crossFile', 'cache', 'existenceMaxEntries'], type: 'number' },
+    { vsCodeKey: 'crossFile.cache.workspaceIndexMaxEntries', jsonPath: ['crossFile', 'cache', 'workspaceIndexMaxEntries'], type: 'number' },
     // Diagnostics settings
+    { vsCodeKey: 'diagnostics.enabled', jsonPath: ['diagnostics', 'enabled'], type: 'boolean', defaultWhenUnconfigured: true },
     { vsCodeKey: 'diagnostics.undefinedVariables', jsonPath: ['diagnostics', 'undefinedVariables'], type: 'boolean' },
     // Package settings
     { vsCodeKey: 'packages.enabled', jsonPath: ['packages', 'enabled'], type: 'boolean' },
     { vsCodeKey: 'packages.additionalLibraryPaths', jsonPath: ['packages', 'additionalLibraryPaths'], type: 'array' },
     { vsCodeKey: 'packages.rPath', jsonPath: ['packages', 'rPath'], type: 'string' },
-    { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint'] as const },
+    { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    // Symbol settings
+    { vsCodeKey: 'symbols.workspaceMaxResults', jsonPath: ['symbols', 'workspaceMaxResults'], type: 'number' },
+    // Completion settings
+    { vsCodeKey: 'completion.triggerOnOpenParen', jsonPath: ['completion', 'triggerOnOpenParen'], type: 'boolean' },
+    // Indentation settings
+    { vsCodeKey: 'indentation.style', jsonPath: ['indentation', 'style'], type: 'enum', enumValues: ['rstudio', 'rstudio-minus', 'off'] as const },
 ];
 
 /**
@@ -112,28 +143,19 @@ function arbitraryForSetting(setting: typeof SETTINGS_MAPPING[number]): fc.Arbit
 /**
  * Interface for mock configuration inspection result.
  */
-interface MockInspection<T> {
+interface MockInspection<T> extends RavenConfigurationInspection<T> {
     key: string;
-    defaultValue?: T;
-    globalValue?: T;
-    workspaceValue?: T;
-    workspaceFolderValue?: T;
-    globalLanguageValue?: T;
-    workspaceLanguageValue?: T;
-    workspaceFolderLanguageValue?: T;
 }
 
 /**
  * Create a mock VS Code WorkspaceConfiguration.
  * This simulates the behavior of vscode.workspace.getConfiguration('raven').
  */
-function createMockConfig(configuredSettings: Map<string, unknown>): {
-    get<T>(key: string): T | undefined;
-    inspect<T>(key: string): MockInspection<T> | undefined;
-} {
+function createMockConfig(configuredSettings: Map<string, unknown>): RavenWorkspaceConfiguration {
     return {
-        get<T>(key: string): T | undefined {
-            return configuredSettings.get(key) as T | undefined;
+        get<T>(key: string, defaultValue?: T): T | undefined {
+            const value = configuredSettings.get(key) as T | undefined;
+            return value !== undefined ? value : defaultValue;
         },
         inspect<T>(key: string): MockInspection<T> | undefined {
             const value = configuredSettings.get(key);
@@ -150,177 +172,6 @@ function createMockConfig(configuredSettings: Map<string, unknown>): {
             };
         },
     };
-}
-
-/**
- * Check if a setting is explicitly configured (not using default).
- * Mirrors the logic in extension.ts.
- */
-function isExplicitlyConfigured<T>(config: ReturnType<typeof createMockConfig>, key: string): boolean {
-    const inspection = config.inspect<T>(key);
-    if (!inspection) {
-        return false;
-    }
-    return (
-        inspection.globalValue !== undefined ||
-        inspection.workspaceValue !== undefined ||
-        inspection.workspaceFolderValue !== undefined ||
-        inspection.globalLanguageValue !== undefined ||
-        inspection.workspaceLanguageValue !== undefined ||
-        inspection.workspaceFolderLanguageValue !== undefined
-    );
-}
-
-/**
- * Get a setting value only if it's explicitly configured.
- * Mirrors the logic in extension.ts.
- */
-function getExplicitSetting<T>(config: ReturnType<typeof createMockConfig>, key: string): T | undefined {
-    if (isExplicitlyConfigured<T>(config, key)) {
-        return config.get<T>(key);
-    }
-    return undefined;
-}
-
-/**
- * Implementation of getInitializationOptions for testing.
- * This mirrors the logic in extension.ts but uses our mock config.
- */
-function getInitializationOptions(config: ReturnType<typeof createMockConfig>): RavenInitializationOptions {
-    const options: RavenInitializationOptions = {};
-
-    // Cross-file depth settings
-    const maxBackwardDepth = getExplicitSetting<number>(config, 'crossFile.maxBackwardDepth');
-    const maxForwardDepth = getExplicitSetting<number>(config, 'crossFile.maxForwardDepth');
-    const maxChainDepth = getExplicitSetting<number>(config, 'crossFile.maxChainDepth');
-    const assumeCallSite = getExplicitSetting<"start" | "end">(config, 'crossFile.assumeCallSite');
-    const indexWorkspace = getExplicitSetting<boolean>(config, 'crossFile.indexWorkspace');
-    const maxRevalidationsPerTrigger = getExplicitSetting<number>(config, 'crossFile.maxRevalidationsPerTrigger');
-    const revalidationDebounceMs = getExplicitSetting<number>(config, 'crossFile.revalidationDebounceMs');
-    const missingFileSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.missingFileSeverity');
-    const circularDependencySeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.circularDependencySeverity');
-    const outOfScopeSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.outOfScopeSeverity');
-    const ambiguousParentSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.ambiguousParentSeverity');
-    const maxChainDepthSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.maxChainDepthSeverity');
-
-    // On-demand indexing settings
-    const onDemandEnabled = getExplicitSetting<boolean>(config, 'crossFile.onDemandIndexing.enabled');
-    const onDemandMaxTransitiveDepth = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxTransitiveDepth');
-    const onDemandMaxQueueSize = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxQueueSize');
-
-    // Build onDemandIndexing object only if any setting is configured
-    let onDemandIndexing: {
-        enabled?: boolean;
-        maxTransitiveDepth?: number;
-        maxQueueSize?: number;
-    } | undefined = undefined;
-    if (onDemandEnabled !== undefined || onDemandMaxTransitiveDepth !== undefined || onDemandMaxQueueSize !== undefined) {
-        onDemandIndexing = {};
-        if (onDemandEnabled !== undefined) {
-            onDemandIndexing.enabled = onDemandEnabled;
-        }
-        if (onDemandMaxTransitiveDepth !== undefined) {
-            onDemandIndexing.maxTransitiveDepth = onDemandMaxTransitiveDepth;
-        }
-        if (onDemandMaxQueueSize !== undefined) {
-            onDemandIndexing.maxQueueSize = onDemandMaxQueueSize;
-        }
-    }
-
-    // Build crossFile object only if any setting is configured
-    if (
-        maxBackwardDepth !== undefined ||
-        maxForwardDepth !== undefined ||
-        maxChainDepth !== undefined ||
-        assumeCallSite !== undefined ||
-        indexWorkspace !== undefined ||
-        maxRevalidationsPerTrigger !== undefined ||
-        revalidationDebounceMs !== undefined ||
-        missingFileSeverity !== undefined ||
-        circularDependencySeverity !== undefined ||
-        outOfScopeSeverity !== undefined ||
-        ambiguousParentSeverity !== undefined ||
-        maxChainDepthSeverity !== undefined ||
-        onDemandIndexing !== undefined
-    ) {
-        options.crossFile = {};
-        if (maxBackwardDepth !== undefined) {
-            options.crossFile.maxBackwardDepth = maxBackwardDepth;
-        }
-        if (maxForwardDepth !== undefined) {
-            options.crossFile.maxForwardDepth = maxForwardDepth;
-        }
-        if (maxChainDepth !== undefined) {
-            options.crossFile.maxChainDepth = maxChainDepth;
-        }
-        if (assumeCallSite !== undefined) {
-            options.crossFile.assumeCallSite = assumeCallSite;
-        }
-        if (indexWorkspace !== undefined) {
-            options.crossFile.indexWorkspace = indexWorkspace;
-        }
-        if (maxRevalidationsPerTrigger !== undefined) {
-            options.crossFile.maxRevalidationsPerTrigger = maxRevalidationsPerTrigger;
-        }
-        if (revalidationDebounceMs !== undefined) {
-            options.crossFile.revalidationDebounceMs = revalidationDebounceMs;
-        }
-        if (missingFileSeverity !== undefined) {
-            options.crossFile.missingFileSeverity = missingFileSeverity;
-        }
-        if (circularDependencySeverity !== undefined) {
-            options.crossFile.circularDependencySeverity = circularDependencySeverity;
-        }
-        if (outOfScopeSeverity !== undefined) {
-            options.crossFile.outOfScopeSeverity = outOfScopeSeverity;
-        }
-        if (ambiguousParentSeverity !== undefined) {
-            options.crossFile.ambiguousParentSeverity = ambiguousParentSeverity;
-        }
-        if (maxChainDepthSeverity !== undefined) {
-            options.crossFile.maxChainDepthSeverity = maxChainDepthSeverity;
-        }
-        if (onDemandIndexing !== undefined) {
-            options.crossFile.onDemandIndexing = onDemandIndexing;
-        }
-    }
-
-    // Diagnostics settings
-    const undefinedVariables = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariables');
-    if (undefinedVariables !== undefined) {
-        options.diagnostics = {
-            undefinedVariables: undefinedVariables,
-        };
-    }
-
-    // Package settings
-    const packagesEnabled = getExplicitSetting<boolean>(config, 'packages.enabled');
-    const additionalLibraryPaths = getExplicitSetting<string[]>(config, 'packages.additionalLibraryPaths');
-    const rPath = getExplicitSetting<string>(config, 'packages.rPath');
-    const missingPackageSeverity = getExplicitSetting<SeverityLevel>(config, 'packages.missingPackageSeverity');
-
-    if (
-        packagesEnabled !== undefined ||
-        additionalLibraryPaths !== undefined ||
-        rPath !== undefined ||
-        missingPackageSeverity !== undefined
-    ) {
-        options.packages = {};
-        if (packagesEnabled !== undefined) {
-            options.packages.enabled = packagesEnabled;
-        }
-        if (additionalLibraryPaths !== undefined) {
-            options.packages.additionalLibraryPaths = additionalLibraryPaths;
-        }
-        if (rPath !== undefined) {
-            options.packages.rPath = rPath;
-        }
-        if (missingPackageSeverity !== undefined) {
-            options.packages.missingPackageSeverity = missingPackageSeverity;
-        }
-    }
-
-    return options;
 }
 
 /**
@@ -378,27 +229,7 @@ suite('Settings Transmission Property Tests', () => {
                 const mockConfig = createMockConfig(configuredSettings);
                 const options = getInitializationOptions(mockConfig);
 
-                // For each configured setting, verify it appears at the correct JSON path
-                for (const setting of SETTINGS_MAPPING) {
-                    const configuredValue = configuredSettings.get(setting.vsCodeKey);
-                    const outputValue = getNestedValue(options as Record<string, unknown>, setting.jsonPath);
-
-                    if (configuredValue !== undefined) {
-                        // Setting was configured - it should appear in output at correct path
-                        assert.deepStrictEqual(
-                            outputValue,
-                            configuredValue,
-                            `Setting ${setting.vsCodeKey} should appear at path ${setting.jsonPath.join('.')} with value ${JSON.stringify(configuredValue)}, but got ${JSON.stringify(outputValue)}`
-                        );
-                    } else {
-                        // Setting was not configured - it should NOT appear in output
-                        assert.strictEqual(
-                            outputValue,
-                            undefined,
-                            `Setting ${setting.vsCodeKey} was not configured but appeared at path ${setting.jsonPath.join('.')} with value ${JSON.stringify(outputValue)}`
-                        );
-                    }
-                }
+                assertSettingsValues(options as Record<string, unknown>, configuredSettings);
             }),
             { numRuns: 100 }
         );
@@ -485,31 +316,25 @@ suite('Settings Transmission Property Tests', () => {
                 const mockConfig = createMockConfig(configuredSettings);
                 const options = getInitializationOptions(mockConfig);
 
-                // For each setting that was NOT configured, verify it does NOT appear in output
-                for (const setting of SETTINGS_MAPPING) {
-                    if (!configuredSettings.has(setting.vsCodeKey)) {
-                        const outputValue = getNestedValue(options as Record<string, unknown>, setting.jsonPath);
-                        assert.strictEqual(
-                            outputValue,
-                            undefined,
-                            `Unconfigured setting ${setting.vsCodeKey} should not appear in output, but found ${JSON.stringify(outputValue)}`
-                        );
-                    }
-                }
+                assertSettingsValues(options as Record<string, unknown>, configuredSettings, true);
             }),
             { numRuns: 100 }
         );
     });
 
     /**
-     * Empty configuration produces empty options object.
+     * Empty configuration produces only runtime-default settings.
      */
-    test('Empty configuration produces empty options', () => {
+    test('Empty configuration produces runtime defaults only', () => {
         const configuredSettings = new Map<string, unknown>();
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
+        assert.deepStrictEqual(options, {
+            diagnostics: {
+                enabled: true,
+            },
+        }, 'Empty configuration should produce only runtime defaults');
 
-        assert.deepStrictEqual(options, {}, 'Empty configuration should produce empty options object');
     });
 });
 
@@ -549,10 +374,26 @@ suite('Settings Transmission Unit Tests', () => {
     });
 
     /**
+     * Unit test: Verify backwardDependencies enum transmission.
+     */
+    test('backwardDependencies enum transmits correctly', () => {
+        for (const value of ['auto', 'explicit'] as const) {
+            const configuredSettings = new Map<string, unknown>([
+                ['crossFile.backwardDependencies', value],
+            ]);
+
+            const mockConfig = createMockConfig(configuredSettings);
+            const options = getInitializationOptions(mockConfig);
+
+            assert.strictEqual(options.crossFile?.backwardDependencies, value);
+        }
+    });
+
+    /**
      * Unit test: Verify severity settings transmission.
      */
     test('severity settings transmit correctly', () => {
-        const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint'];
+        const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint', 'off'];
         
         for (const severity of severities) {
             const configuredSettings = new Map<string, unknown>([
@@ -593,12 +434,14 @@ suite('Settings Transmission Unit Tests', () => {
      */
     test('diagnostics settings transmit correctly', () => {
         const configuredSettings = new Map<string, unknown>([
+            ['diagnostics.enabled', false],
             ['diagnostics.undefinedVariables', false],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
 
+        assert.strictEqual(options.diagnostics?.enabled, false);
         assert.strictEqual(options.diagnostics?.undefinedVariables, false);
     });
 
@@ -642,7 +485,7 @@ suite('Settings Transmission Unit Tests', () => {
         // Unconfigured settings should be absent
         assert.strictEqual(options.crossFile?.maxForwardDepth, undefined);
         assert.strictEqual(options.crossFile?.assumeCallSite, undefined);
-        assert.strictEqual(options.diagnostics, undefined);
+        assert.deepStrictEqual(options.diagnostics, { enabled: true });
         assert.strictEqual(options.packages?.rPath, undefined);
     });
 
@@ -674,7 +517,7 @@ suite('Settings Transmission Unit Tests', () => {
      * **Validates: Requirement 10.4**
      */
     test('parent objects not created when no child settings configured', () => {
-        // Configure only packages settings - crossFile and diagnostics should be absent
+        // Configure only packages settings - crossFile should be absent, diagnostics keep their master default
         const configuredSettings = new Map<string, unknown>([
             ['packages.enabled', true],
         ]);
@@ -683,9 +526,29 @@ suite('Settings Transmission Unit Tests', () => {
         const options = getInitializationOptions(mockConfig);
 
         assert.strictEqual(options.crossFile, undefined);
-        assert.strictEqual(options.diagnostics, undefined);
+        assert.deepStrictEqual(options.diagnostics, { enabled: true });
         assert.notStrictEqual(options.packages, undefined);
         assert.strictEqual(options.packages?.enabled, true);
+    });
+
+    /**
+     * Unit test: Verify nested cache settings transmission.
+     */
+    test('cache nested settings transmit correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.cache.metadataMaxEntries', 1001],
+            ['crossFile.cache.fileContentMaxEntries', 501],
+            ['crossFile.cache.existenceMaxEntries', 2001],
+            ['crossFile.cache.workspaceIndexMaxEntries', 5001],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.crossFile?.cache?.metadataMaxEntries, 1001);
+        assert.strictEqual(options.crossFile?.cache?.fileContentMaxEntries, 501);
+        assert.strictEqual(options.crossFile?.cache?.existenceMaxEntries, 2001);
+        assert.strictEqual(options.crossFile?.cache?.workspaceIndexMaxEntries, 5001);
     });
 
     /**
@@ -756,6 +619,7 @@ suite('Settings Transmission Unit Tests', () => {
         const configuredSettings = new Map<string, unknown>([
             ['crossFile.indexWorkspace', false],
             ['crossFile.onDemandIndexing.enabled', false],
+            ['diagnostics.enabled', false],
             ['diagnostics.undefinedVariables', false],
             ['packages.enabled', false],
         ]);
@@ -766,6 +630,7 @@ suite('Settings Transmission Unit Tests', () => {
         // All false values should be present (not omitted)
         assert.strictEqual(options.crossFile?.indexWorkspace, false);
         assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, false);
+        assert.strictEqual(options.diagnostics?.enabled, false);
         assert.strictEqual(options.diagnostics?.undefinedVariables, false);
         assert.strictEqual(options.packages?.enabled, false);
     });

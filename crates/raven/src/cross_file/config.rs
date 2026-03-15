@@ -10,9 +10,8 @@ use tower_lsp::lsp_types::DiagnosticSeverity;
 /// How backward dependencies (parent files that source this file) are resolved
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackwardDependencyMode {
-    /// Require explicit `@lsp-sourced-by` directives (current behavior).
-    /// Forward-created backward edges from the dependency graph are still used
-    /// when available, but diagnostics are not deferred for the workspace scan.
+    /// Only use backward relationships from explicit `@lsp-sourced-by` directives.
+    /// Diagnostics are not deferred for the workspace scan.
     Explicit,
     /// Automatically infer backward relationships from forward directives and
     /// `source()` calls in other workspace files. Files without explicit backward
@@ -20,8 +19,6 @@ pub enum BackwardDependencyMode {
     /// completes. Files with explicit backward directives use only those directives.
     #[default]
     Auto,
-    /// Suppress all undefined variable diagnostics.
-    Off,
 }
 
 /// Default call site assumption when not specified
