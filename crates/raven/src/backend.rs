@@ -129,21 +129,17 @@ pub(crate) fn parse_cross_file_config(
     }
 
     // Validate that present sections are objects (not scalars/arrays)
-    if let Some(v) = cross_file {
-        if !v.is_object() {
-            return Err("crossFile must be an object.".to_string());
+    fn ensure_object_section(value: Option<&serde_json::Value>, name: &str) -> std::result::Result<(), String> {
+        if let Some(v) = value {
+            if !v.is_object() {
+                return Err(format!("{name} must be an object."));
+            }
         }
+        Ok(())
     }
-    if let Some(v) = diagnostics {
-        if !v.is_object() {
-            return Err("diagnostics must be an object.".to_string());
-        }
-    }
-    if let Some(v) = packages {
-        if !v.is_object() {
-            return Err("packages must be an object.".to_string());
-        }
-    }
+    ensure_object_section(cross_file, "crossFile")?;
+    ensure_object_section(diagnostics, "diagnostics")?;
+    ensure_object_section(packages, "packages")?;
 
     let mut config = CrossFileConfig::default();
 
@@ -808,11 +804,15 @@ impl LanguageServer for Backend {
         // Requirement 11.2: Parse symbols.workspaceMaxResults from initialization options
         if let Some(ref init_options) = params.initialization_options {
             // Parse cross-file configuration
-            if let Some(config) = parse_cross_file_config(init_options)
-                .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
-            {
-                state.resize_caches(&config);
-                state.cross_file_config = config;
+            match parse_cross_file_config(init_options) {
+                Ok(Some(config)) => {
+                    state.resize_caches(&config);
+                    state.cross_file_config = config;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!("Failed to parse cross-file configuration: {err}");
+                }
             }
 
             // Parse symbol configuration

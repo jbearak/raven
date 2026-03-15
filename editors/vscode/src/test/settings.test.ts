@@ -24,6 +24,48 @@ import {
 declare const suite: Mocha.SuiteFunction;
 declare const test: Mocha.TestFunction;
 
+/**
+ * Assert that each setting in SETTINGS_MAPPING has the expected value in the
+ * output options, given which settings were explicitly configured.
+ *
+ * - Configured settings must match their configured value.
+ * - Unconfigured settings with a runtime default must match that default.
+ * - Unconfigured settings without a default must be undefined.
+ */
+function assertSettingsValues(
+    options: Record<string, unknown>,
+    configuredSettings: Map<string, unknown>,
+    /** When true, only check unconfigured settings (Property 3). */
+    unconfiguredOnly = false,
+): void {
+    for (const setting of SETTINGS_MAPPING) {
+        const isConfigured = configuredSettings.has(setting.vsCodeKey);
+        if (unconfiguredOnly && isConfigured) continue;
+
+        const outputValue = getNestedValue(options, setting.jsonPath);
+
+        if (isConfigured) {
+            const configuredValue = configuredSettings.get(setting.vsCodeKey);
+            assert.deepStrictEqual(
+                outputValue,
+                configuredValue,
+                `Setting ${setting.vsCodeKey} should appear at path ${setting.jsonPath.join('.')} with value ${JSON.stringify(configuredValue)}, but got ${JSON.stringify(outputValue)}`,
+            );
+        } else if (setting.defaultWhenUnconfigured !== undefined) {
+            assert.deepStrictEqual(
+                outputValue,
+                setting.defaultWhenUnconfigured,
+                `Setting ${setting.vsCodeKey} should use its runtime default at path ${setting.jsonPath.join('.')} when unconfigured`,
+            );
+        } else {
+            assert.strictEqual(
+                outputValue,
+                undefined,
+                `Unconfigured setting ${setting.vsCodeKey} should not appear in output, but found ${JSON.stringify(outputValue)}`,
+            );
+        }
+    }
+}
 
 /**
  * Settings mapping from VS Code configuration keys to JSON paths in initializationOptions.
@@ -187,32 +229,7 @@ suite('Settings Transmission Property Tests', () => {
                 const mockConfig = createMockConfig(configuredSettings);
                 const options = getInitializationOptions(mockConfig);
 
-                // For each configured setting, verify it appears at the correct JSON path
-                for (const setting of SETTINGS_MAPPING) {
-                    const isConfigured = configuredSettings.has(setting.vsCodeKey);
-                    const configuredValue = configuredSettings.get(setting.vsCodeKey);
-                    const outputValue = getNestedValue(options as Record<string, unknown>, setting.jsonPath);
-                    if (isConfigured) {
-                        // Setting was configured - it should appear in output at correct path
-                        assert.deepStrictEqual(
-                            outputValue,
-                            configuredValue,
-                            `Setting ${setting.vsCodeKey} should appear at path ${setting.jsonPath.join('.')} with value ${JSON.stringify(configuredValue)}, but got ${JSON.stringify(outputValue)}`
-                        );
-                    } else if (setting.defaultWhenUnconfigured !== undefined) {
-                        assert.deepStrictEqual(
-                            outputValue,
-                            setting.defaultWhenUnconfigured,
-                            `Setting ${setting.vsCodeKey} should use its runtime default at path ${setting.jsonPath.join('.')} when unconfigured`
-                        );
-                    } else {
-                        assert.strictEqual(
-                            outputValue,
-                            undefined,
-                            `Setting ${setting.vsCodeKey} was not configured but appeared at path ${setting.jsonPath.join('.')} with value ${JSON.stringify(outputValue)}`
-                        );
-                    }
-                }
+                assertSettingsValues(options as Record<string, unknown>, configuredSettings);
             }),
             { numRuns: 100 }
         );
@@ -299,25 +316,7 @@ suite('Settings Transmission Property Tests', () => {
                 const mockConfig = createMockConfig(configuredSettings);
                 const options = getInitializationOptions(mockConfig);
 
-                // For each setting that was NOT configured, verify it does NOT appear in output
-                for (const setting of SETTINGS_MAPPING) {
-                    if (!configuredSettings.has(setting.vsCodeKey)) {
-                        const outputValue = getNestedValue(options as Record<string, unknown>, setting.jsonPath);
-                        if (setting.defaultWhenUnconfigured !== undefined) {
-                            assert.deepStrictEqual(
-                                outputValue,
-                                setting.defaultWhenUnconfigured,
-                                `Unconfigured setting ${setting.vsCodeKey} should use its runtime default, but found ${JSON.stringify(outputValue)}`
-                            );
-                        } else {
-                            assert.strictEqual(
-                                outputValue,
-                                undefined,
-                                `Unconfigured setting ${setting.vsCodeKey} should not appear in output, but found ${JSON.stringify(outputValue)}`
-                            );
-                        }
-                    }
-                }
+                assertSettingsValues(options as Record<string, unknown>, configuredSettings, true);
             }),
             { numRuns: 100 }
         );
