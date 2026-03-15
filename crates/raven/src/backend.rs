@@ -83,8 +83,8 @@ struct ActiveDocumentsChangedParams {
 ///
 /// `Ok(Some(CrossFileConfig))` populated from `settings` when at least one of
 /// `crossFile`, `diagnostics`, or `packages` is present; `Ok(None)` if all are missing.
-/// Returns `Err(...)` when a validated setting is present but invalid (currently
-/// `crossFile.backwardDependencies`) or when a top-level section is not an object.
+/// Returns `Err(...)` when a top-level section (`crossFile`, `diagnostics`,
+/// or `packages`) is present but is not a JSON object.
 ///
 /// # Examples
 ///
@@ -243,15 +243,14 @@ pub(crate) fn parse_cross_file_config(
                         crate::cross_file::BackwardDependencyMode::Explicit;
                 }
                 Some(other) => {
-                    return Err(format!(
-                        "Invalid crossFile.backwardDependencies value '{other}'. Expected 'auto' or 'explicit'."
-                    ));
+                    log::warn!("Unrecognized crossFile.backwardDependencies value '{other}', defaulting to 'auto'.");
+                    config.backward_dependencies =
+                        crate::cross_file::BackwardDependencyMode::Auto;
                 }
                 None => {
-                    return Err(
-                        "crossFile.backwardDependencies must be a string ('auto' or 'explicit')."
-                            .to_string(),
-                    );
+                    log::warn!("crossFile.backwardDependencies must be a string, defaulting to 'auto'.");
+                    config.backward_dependencies =
+                        crate::cross_file::BackwardDependencyMode::Auto;
                 }
             }
         }
@@ -3901,44 +3900,38 @@ mod tests {
         }
 
         #[test]
-        fn test_non_string_backward_dependencies_returns_error() {
+        fn test_non_string_backward_dependencies_defaults_to_auto() {
             let settings = json!({
                 "crossFile": {
                     "backwardDependencies": false
                 }
             });
 
-            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
-            assert!(
-                err.contains("backwardDependencies"),
-                "error should name the invalid setting, got: {}",
-                err
-            );
-            assert!(
-                err.contains("must be a string"),
-                "error should mention type requirement, got: {}",
-                err
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .expect("non-string value should not cause an error")
+                .expect("should return Some config");
+            assert_eq!(
+                config.backward_dependencies,
+                crate::cross_file::BackwardDependencyMode::Auto,
+                "non-string value should default to Auto"
             );
         }
 
         #[test]
-        fn test_invalid_backward_dependencies_returns_error() {
+        fn test_invalid_backward_dependencies_defaults_to_auto() {
             let settings = json!({
                 "crossFile": {
                     "backwardDependencies": "invalid"
                 }
             });
 
-            let err = crate::backend::parse_cross_file_config(&settings).unwrap_err();
-            assert!(
-                err.contains("crossFile.backwardDependencies"),
-                "error should name the invalid setting, got: {}",
-                err
-            );
-            assert!(
-                err.contains("'auto' or 'explicit'"),
-                "error should name the accepted values, got: {}",
-                err
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .expect("invalid string value should not cause an error")
+                .expect("should return Some config");
+            assert_eq!(
+                config.backward_dependencies,
+                crate::cross_file::BackwardDependencyMode::Auto,
+                "unrecognized string value should default to Auto"
             );
         }
 
