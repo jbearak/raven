@@ -224,16 +224,26 @@ suite('Ark LSP Extension', () => {
             finalDiags = vscode.languages.getDiagnostics(doc.uri);
         }
 
-        // If we got diagnostics, verify ddply is NOT among them
-        if (finalDiags.length > 0) {
-            const messages = finalDiags.map(d => d.message);
-            assert.ok(
-                !messages.some(m => m.includes('ddply')),
-                `ddply should not be flagged as undefined (plyr inherited from sibling source chain). ` +
-                `Got diagnostics: ${messages.join('; ')}`
-            );
+        // If still no diagnostics after retry, workspace scan didn't complete and
+        // undefined variable checking was skipped — skip the test (no false positive possible).
+        if (finalDiags.length === 0) {
+            return;
         }
-        // If still no diagnostics (workspace scan didn't complete, undefined var check skipped),
-        // that's acceptable — the check was skipped, so no false positive occurred.
+
+        const messages = finalDiags.map(d => d.message);
+
+        // Assert the sentinel diagnostic IS present — proves undefined-variable checking ran.
+        assert.ok(
+            messages.some(m => m.includes('nonexistent_sentinel_var')),
+            `Expected sentinel diagnostic for nonexistent_sentinel_var to confirm ` +
+            `undefined-variable checking is active. Got diagnostics: ${messages.join('; ')}`
+        );
+
+        // Only then assert ddply is NOT among them.
+        assert.ok(
+            !messages.some(m => m.includes('ddply')),
+            `ddply should not be flagged as undefined (plyr inherited from sibling source chain). ` +
+            `Got diagnostics: ${messages.join('; ')}`
+        );
     });
 });
