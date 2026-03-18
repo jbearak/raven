@@ -4553,11 +4553,12 @@ fn collect_undefined_variables_from_snapshot(
                 &package_loader_call_end_offsets,
                 usage_node.start_byte(),
             );
+            let has_cross_file_packages = !scope.inherited_packages.is_empty();
             let package_cache_pending = position_aware_packages
                 .iter()
                 .any(|pkg| !snapshot.package_library.is_cached_sync(pkg));
-            if has_prior_library_call
-                && (position_aware_packages.is_empty() || package_cache_pending)
+            if (has_prior_library_call || has_cross_file_packages)
+                && package_cache_pending
                 && is_function_call_identifier_textually(usage_node, text)
             {
                 continue;
