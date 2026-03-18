@@ -2792,6 +2792,7 @@ where
             for pkg in &parent_scope.loaded_packages {
                 scope.inherited_packages.insert(pkg.clone());
             }
+
         }
     } // end if !is_revisit (STEP 1)
 
@@ -2872,9 +2873,11 @@ where
                             continue;
                         }
 
-                        // Requirements 5.1, 5.3: Collect packages loaded before this source() call
-                        // to pass to the child file. The child will have access to these packages
-                        // from position (0, 0).
+                        // Requirements 5.1, 5.3: Collect packages to pass to the child file.
+                        // The child will have access to these packages from position (0, 0).
+                        // Three sources: inherited_packages (from parent), extra_packages (this
+                        // file's own library() calls before the source()), and loaded_packages
+                        // (packages from previously-sourced sibling files).
                         // Get the function scope of the source() call for filtering function-scoped packages
                         let source_function_scope = *function_scope;
 
@@ -2914,16 +2917,19 @@ where
                         }
 
                         let owned_packages: HashSet<String>;
-                        let packages_for_child: &HashSet<String> = if extra_packages.is_empty() {
-                            &scope.inherited_packages
-                        } else {
-                            owned_packages = scope
-                                .inherited_packages
-                                .union(&extra_packages)
-                                .cloned()
-                                .collect();
-                            &owned_packages
-                        };
+                        let packages_for_child: &HashSet<String> =
+                            if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
+                                &scope.inherited_packages
+                            } else {
+                                owned_packages = scope
+                                    .inherited_packages
+                                    .iter()
+                                    .chain(extra_packages.iter())
+                                    .chain(scope.loaded_packages.iter())
+                                    .cloned()
+                                    .collect();
+                                &owned_packages
+                            };
 
                         // Build child PathContext, respecting chdir flag
                         let child_path = child_uri.to_file_path().ok();
@@ -9977,6 +9983,294 @@ x <- 1"#;
                 .loaded_packages
                 .contains(&"ggplot2".to_string()),
             "Parent should have ggplot2 from child (package propagation via loaded_packages)"
+        );
+    }
+
+    // ============================================================================
+    // Tests for sibling package propagation through source() chains
+    // ============================================================================
+
+    #[test]
+    fn test_sibling_package_propagation_to_deep_descendant() {
+        // Bug repro: main.r sources functions.r (which loads plyr) then sources data.r.
+        // data.r -> outcomes.r -> abortions.r chain should all see plyr.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let main_code = "source(\"functions.r\")\nsource(\"data.r\")\nz <- 1";
+        let main_tree = parse_r(main_code);
+        let main_uri = Url::parse("file:///project/main.r").unwrap();
+        let main_artifacts = compute_artifacts(&main_uri, &main_tree, main_code);
+
+        let functions_code = "library(plyr)\nhelper <- function() {}";
+        let functions_tree = parse_r(functions_code);
+        let functions_uri = Url::parse("file:///project/functions.r").unwrap();
+        let functions_artifacts = compute_artifacts(&functions_uri, &functions_tree, functions_code);
+
+        let data_code = "source(\"outcomes.r\")";
+        let data_tree = parse_r(data_code);
+        let data_uri = Url::parse("file:///project/data.r").unwrap();
+        let data_artifacts = compute_artifacts(&data_uri, &data_tree, data_code);
+
+        let outcomes_code = "source(\"abortions.r\")";
+        let outcomes_tree = parse_r(outcomes_code);
+        let outcomes_uri = Url::parse("file:///project/outcomes.r").unwrap();
+        let outcomes_artifacts = compute_artifacts(&outcomes_uri, &outcomes_tree, outcomes_code);
+
+        let abortions_code = "result <- 1";
+        let abortions_tree = parse_r(abortions_code);
+        let abortions_uri = Url::parse("file:///project/abortions.r").unwrap();
+        let abortions_artifacts =
+            compute_artifacts(&abortions_uri, &abortions_tree, abortions_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        let main_meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "functions.r".to_string(),
+                    line: 0,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "data.r".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+
+        let data_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "outcomes.r".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&data_uri, &data_meta, Some(&workspace_root), |_| None);
+
+        let outcomes_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "abortions.r".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(
+            &outcomes_uri,
+            &outcomes_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &main_uri {
+                Some(Arc::new(main_artifacts.clone()))
+            } else if uri == &functions_uri {
+                Some(Arc::new(functions_artifacts.clone()))
+            } else if uri == &data_uri {
+                Some(Arc::new(data_artifacts.clone()))
+            } else if uri == &outcomes_uri {
+                Some(Arc::new(outcomes_artifacts.clone()))
+            } else if uri == &abortions_uri {
+                Some(Arc::new(abortions_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &main_uri {
+                Some(main_meta.clone())
+            } else if uri == &data_uri {
+                Some(data_meta.clone())
+            } else if uri == &outcomes_uri {
+                Some(outcomes_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Query abortions.r - should inherit plyr through the full chain
+        let abortions_scope = scope_at_position_with_graph(
+            &abortions_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+
+        assert!(
+            abortions_scope
+                .inherited_packages
+                .contains(&"plyr".to_string()),
+            "abortions.r should inherit plyr from sibling functions.r via main.r chain. \
+             inherited_packages: {:?}",
+            abortions_scope.inherited_packages
+        );
+    }
+
+    #[test]
+    fn test_sibling_package_propagation_forward_only() {
+        // Tests the forward path in isolation (BackwardDependencyMode::Explicit, no directives).
+        // parent.r: source("a.r"); source("b.r"); z <- 1
+        // a.r: library(dplyr)
+        // b.r should receive dplyr via packages_for_child on the forward path.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_code = "source(\"a.r\")\nsource(\"b.r\")\nz <- 1";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.r").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        let a_code = "library(dplyr)";
+        let a_tree = parse_r(a_code);
+        let a_uri = Url::parse("file:///project/a.r").unwrap();
+        let a_artifacts = compute_artifacts(&a_uri, &a_tree, a_code);
+
+        let b_code = "x <- 1";
+        let b_tree = parse_r(b_code);
+        let b_uri = Url::parse("file:///project/b.r").unwrap();
+        let b_artifacts = compute_artifacts(&b_uri, &b_tree, b_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let mut graph = DependencyGraph::new();
+
+        let parent_meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "a.r".to_string(),
+                    line: 0,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "b.r".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &a_uri {
+                Some(Arc::new(a_artifacts.clone()))
+            } else if uri == &b_uri {
+                Some(Arc::new(b_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Query b.r with Auto mode - backward edge reaches parent, which now
+        // correctly passes loaded_packages (from sibling a.r) to b.r
+        let b_scope = scope_at_position_with_graph(
+            &b_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+
+        assert!(
+            b_scope.inherited_packages.contains(&"dplyr".to_string()),
+            "b.r should inherit dplyr from sibling a.r via parent's forward path. \
+             inherited_packages: {:?}",
+            b_scope.inherited_packages
+        );
+
+        // Also verify parent sees dplyr in loaded_packages after processing source("a.r")
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri,
+            2,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+        );
+
+        assert!(
+            parent_scope
+                .loaded_packages
+                .contains(&"dplyr".to_string()),
+            "Parent should have dplyr in loaded_packages after processing source(\"a.r\"). \
+             loaded_packages: {:?}",
+            parent_scope.loaded_packages
         );
     }
 
