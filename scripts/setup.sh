@@ -29,18 +29,35 @@ npm run compile
 echo "Packaging extension..."
 npm run package
 
-echo "Installing extension to VS Code..."
 VERSION=$(node -p "require('./package.json').version")
 VSIX_FILE="raven-${VERSION}.vsix"
-if [ -f "$VSIX_FILE" ]; then
-    code --install-extension "$VSIX_FILE"
-    echo "✓ Extension installed: $VSIX_FILE"
-else
+if [ ! -f "$VSIX_FILE" ]; then
     echo "✗ No .vsix file found"
+    exit 1
+fi
+
+echo "Installing extension to editors..."
+EDITORS=("code" "code-insiders" "codium" "kiro" "antigravity" "cursor" "windsurf")
+INSTALLED=0
+
+for editor in "${EDITORS[@]}"; do
+    if command -v "$editor" &> /dev/null; then
+        echo -n "  $editor: "
+        if "$editor" --install-extension "$VSIX_FILE" --force &> /dev/null; then
+            echo "✓"
+            INSTALLED=$((INSTALLED + 1))
+        else
+            echo "failed"
+        fi
+    fi
+done
+
+if [ $INSTALLED -eq 0 ]; then
+    echo "✗ Extension was not installed to any editor"
     exit 1
 fi
 
 echo ""
 echo "✅ Setup complete!"
 echo "   - Binary: ~/bin/raven"
-echo "   - Extension: $VSIX_FILE"
+echo "   - Extension: $VSIX_FILE ($INSTALLED editor(s))"
