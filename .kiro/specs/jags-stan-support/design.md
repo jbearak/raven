@@ -43,7 +43,7 @@ graph TD
 
 The key architectural decision is introducing a `FileType` enum (`R`, `Jags`, `Stan`) that is derived from the file URI extension. This enum is checked at two critical points:
 
-1. **Diagnostics pipeline** (`handlers::diagnostics`): Early return with empty `Vec<Diagnostic>` for non-R file types.
+1. **Diagnostics pipeline** (`handlers::diagnostics` and `handlers::diagnostics_from_snapshot`): Early return with empty `Vec<Diagnostic>` for non-R file types.
 2. **Completion handler** (`handlers::completion`): Branch to a language-specific completion path for JAGS/Stan files.
 
 All other LSP features (find references, go to definition, hover, document symbols) continue to use the R tree-sitter parser unchanged — they already work on a best-effort basis since the parser produces partial ASTs for non-R syntax.
@@ -64,9 +64,10 @@ pub enum FileType {
 
 pub fn file_type_from_uri(uri: &Url) -> FileType {
     let path = uri.path();
-    if path.ends_with(".jags") || path.ends_with(".bugs") {
+    let lower_path = path.to_ascii_lowercase();
+    if lower_path.ends_with(".jags") || lower_path.ends_with(".bugs") {
         FileType::Jags
-    } else if path.ends_with(".stan") {
+    } else if lower_path.ends_with(".stan") {
         FileType::Stan
     } else {
         FileType::R
@@ -78,24 +79,28 @@ This is intentionally simple — extension-based detection from the URI path. No
 
 ### 2. Diagnostics Suppression (Rust)
 
-In `handlers::diagnostics()`, add an early return after the master switch check:
+In `handlers::diagnostics_from_snapshot()`, add an early return:
 
 ```rust
-pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
-    if !state.cross_file_config.diagnostics_enabled {
-        return Vec::new();
+pub(crate) fn diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> Option<Vec<Diagnostic>> {
+    if !snapshot.cross_file_config.diagnostics_enabled {
+        return Some(Vec::new());
     }
 
     // Suppress diagnostics for non-R files (JAGS, Stan)
     if file_type_from_uri(uri) != FileType::R {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     // ... existing R diagnostics logic
 }
 ```
 
-This also applies to `diagnostics_from_snapshot()` if it exists as a separate entry point.
+This suppression must happen in `diagnostics_from_snapshot()` because that is the function invoked by the background diagnostic threads. The synchronous `handlers::diagnostics()` should also have this early return to remain consistent.
 
 ### 3. Completion Filtering (Rust)
 
@@ -390,7 +395,7 @@ Standard VS Code language configuration JSON files defining:
 
 Unit tests cover specific examples and edge cases:
 
-- File type detection: Verify `.jags`, `.bugs`, `.stan`, `.r`, `.R`, `.rmd`, `.Rmd`, `.qmd` extensions map to correct `FileType`.
+- File type detection: Verify case-insensitive combinations (e.g. `.JAGS`, `.Bugs`, `.stan`, `.r`, `.R`, `.rmd`, `.Rmd`, `.qmd`) map to correct `FileType`.
 - Diagnostics suppression: Open a JAGS file with intentionally invalid R syntax, verify empty diagnostics. Same for Stan.
 - R non-regression: Open an R file with a known syntax error, verify diagnostics are produced.
 - JAGS completion: Request completions in a JAGS file, verify JAGS keywords/distributions/functions are present and R keywords are absent.
@@ -402,7 +407,7 @@ Unit tests cover specific examples and edge cases:
 
 Property-based tests use the `proptest` crate (already a dependency in the project) with a minimum of 100 iterations per property. Each test is tagged with a comment referencing the design property.
 
-- **Feature: jags-stan-support, Property 1: File type detection is consistent with extension** — Generate random URI strings with known extensions, verify `file_type_from_uri` returns the correct variant.
+- **Feature: jags-stan-support, Property 1: File type detection is consistent with extension** — Generate random URI strings with known case-insensitive extensions, verify `file_type_from_uri` returns the correct variant.
 - **Feature: jags-stan-support, Property 2: JAGS files produce empty diagnostics** — Generate random text content, create a WorldState with a `.jags` URI document, call `diagnostics()`, assert empty.
 - **Feature: jags-stan-support, Property 3: Stan files produce empty diagnostics** — Same as Property 2 but with `.stan` URI.
 - **Feature: jags-stan-support, Property 4: R files with syntax errors still produce diagnostics** — Generate R code with injected syntax errors (e.g., `x <-` with no RHS), verify non-empty diagnostics.
