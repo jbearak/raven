@@ -1,5 +1,5 @@
 const DIRECTIVE_SPACE_TRIGGER_RE =
-    /^\s*#\s*@lsp-(?:source|run|include|sourced-by|run-by|included-by)\s+$/;
+    /^\s*#\s*@lsp-(?:source|run|include|sourced-by|run-by|included-by):?\s+$/;
 const DIRECTIVE_PATH_TRIGGER_RE =
     /^\s*#\s*@lsp-(?:source|run|include|sourced-by|run-by|included-by)(?::)?\s*(?:["'])?[^"'#]*\/$/;
 const SOURCE_PATH_TRIGGER_RE =

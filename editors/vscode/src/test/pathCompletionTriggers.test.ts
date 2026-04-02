@@ -35,6 +35,36 @@ suite('Path Completion Triggers', () => {
         );
     });
 
+    test('triggers after colon form of forward directives', () => {
+        assert.strictEqual(
+            shouldTriggerDirectivePathSuggest(' ', '# @lsp-source: '),
+            true,
+        );
+        assert.strictEqual(
+            shouldTriggerDirectivePathSuggest(' ', '    # @lsp-run: '),
+            true,
+        );
+        assert.strictEqual(
+            shouldTriggerDirectivePathSuggest(' ', '# @lsp-include: '),
+            true,
+        );
+    });
+
+    test('triggers after colon form of backward directives', () => {
+        assert.strictEqual(
+            shouldTriggerDirectivePathSuggest(' ', '# @lsp-sourced-by: '),
+            true,
+        );
+        assert.strictEqual(
+            shouldTriggerDirectivePathSuggest(' ', '# @lsp-run-by: '),
+            true,
+        );
+        assert.strictEqual(
+            shouldTriggerDirectivePathSuggest(' ', '# @lsp-included-by: '),
+            true,
+        );
+    });
+
     test('does not trigger for non-directive spaces or after path text', () => {
         assert.strictEqual(
             shouldTriggerDirectivePathSuggest(' ', '# regular comment '),

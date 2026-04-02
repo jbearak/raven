@@ -924,11 +924,19 @@ pub fn file_path_definition(
             let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
             resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
         }
-        FilePathContext::Directive { .. } => {
-            // For directives: always relative to file's directory (ignore @lsp-cd)
-            let path_context = PathContext::new(file_uri, workspace_root)?;
-            resolve_path(&normalized_path, &path_context)?
-        }
+        FilePathContext::Directive { directive_type, .. } => match directive_type {
+            DirectiveType::SourcedBy => {
+                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                let path_context = PathContext::new(file_uri, workspace_root)?;
+                resolve_path(&normalized_path, &path_context)?
+            }
+            DirectiveType::Source => {
+                // Forward directives: respect @lsp-cd, same as source() calls
+                let path_context =
+                    PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+                resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
+            }
+        },
         FilePathContext::None => {
             // Should not happen since extract_file_path_at_position returns None for this case
             return None;
@@ -1361,15 +1369,27 @@ pub fn resolve_base_directory(
                 resolve_path_with_workspace_fallback(resolution_path, &path_context)
             }
         }
-        FilePathContext::Directive { .. } => {
-            // For directives: always relative to file's directory (ignore @lsp-cd)
-            let path_context = PathContext::new(file_uri, workspace_root)?;
-            if partial_dir.is_empty() {
-                Some(path_context.effective_working_directory())
-            } else {
-                resolve_path(resolution_path, &path_context)
+        FilePathContext::Directive { directive_type, .. } => match directive_type {
+            DirectiveType::SourcedBy => {
+                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                let path_context = PathContext::new(file_uri, workspace_root)?;
+                if partial_dir.is_empty() {
+                    Some(path_context.effective_working_directory())
+                } else {
+                    resolve_path(resolution_path, &path_context)
+                }
             }
-        }
+            DirectiveType::Source => {
+                // Forward directives: respect @lsp-cd, same as source() calls
+                let path_context =
+                    PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+                if partial_dir.is_empty() {
+                    Some(path_context.effective_working_directory())
+                } else {
+                    resolve_path_with_workspace_fallback(resolution_path, &path_context)
+                }
+            }
+        },
         FilePathContext::None => None,
     }
 }
