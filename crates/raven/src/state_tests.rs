@@ -268,3 +268,216 @@ mod jags_stan_indexing_property_tests {
         }
     }
 }
+
+
+// ============================================================================
+// Bug Condition Exploration Test — JAGS/Stan files have None tree
+// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8**
+// ============================================================================
+
+#[cfg(test)]
+mod bug_condition_exploration {
+    use super::super::*;
+    use proptest::prelude::*;
+
+    /// Map a JAGS/Stan extension string to its FileType.
+    fn file_type_from_ext(ext: &str) -> FileType {
+        match ext.to_ascii_lowercase().as_str() {
+            "jags" | "bugs" => FileType::Jags,
+            "stan" => FileType::Stan,
+            _ => unreachable!("strategy only generates jags/bugs/stan extensions"),
+        }
+    }
+
+    /// Generate a JAGS/Stan extension (reuses the same set as jags_stan_extension_strategy)
+    fn jags_stan_extension_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("jags".to_string()),
+            Just("JAGS".to_string()),
+            Just("bugs".to_string()),
+            Just("BUGS".to_string()),
+            Just("stan".to_string()),
+            Just("STAN".to_string()),
+            Just("Jags".to_string()),
+            Just("Bugs".to_string()),
+            Just("Stan".to_string()),
+        ]
+    }
+
+    /// Generate arbitrary text content that could appear in a JAGS/Stan file
+    fn content_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("x <- 1".to_string()),
+            Just("model { x ~ dnorm(0, 1) }".to_string()),
+            Just("data { int N; }".to_string()),
+            Just("alpha <- dnorm(mu, tau)".to_string()),
+            Just("".to_string()),
+            "[a-zA-Z0-9 _<>~(){};.,\n]{1,100}",
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// **Property 1: Bug Condition — JAGS/Stan files have None tree**
+        ///
+        /// For any JAGS or Stan file type with arbitrary text content,
+        /// `parse_document` should return `Some(Tree)` so that tree-dependent
+        /// LSP features (find-references, go-to-definition, hover, document
+        /// symbols) can operate on a best-effort basis.
+        ///
+        /// On UNFIXED code this test is EXPECTED TO FAIL because
+        /// `parse_document` returns `None` for JAGS/Stan file types.
+        ///
+        /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8**
+        #[test]
+        fn bug_condition_jags_stan_tree_is_some(
+            content in content_strategy(),
+            ext in jags_stan_extension_strategy(),
+        ) {
+            let file_type = file_type_from_ext(&ext);
+            let doc = Document::new_with_file_type(&content, None, file_type);
+            prop_assert!(
+                doc.tree.is_some(),
+                "parse_document returned None for FileType::{:?} with content {:?} \
+                 (extension '{}') — tree-dependent LSP features will not work",
+                file_type, content, ext
+            );
+        }
+    }
+}
+
+
+// ============================================================================
+// Preservation Property Tests — R parsing, diagnostics suppression, completion filtering
+// **Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+// ============================================================================
+
+#[cfg(test)]
+mod preservation {
+    use super::super::*;
+    use proptest::prelude::*;
+
+    /// Generate simple R code patterns that tree-sitter-r can parse.
+    fn r_code_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Assignments
+            "[a-z]{1,6}".prop_map(|name| format!("{} <- 1", name)),
+            // Function calls
+            "[a-z]{1,6}".prop_map(|name| format!("{}()", name)),
+            // Function definitions
+            "[a-z]{1,6}".prop_map(|name| format!("{} <- function(x) x + 1", name)),
+            // Library calls
+            "[a-z]{1,6}".prop_map(|pkg| format!("library({})", pkg)),
+            // Simple expressions
+            Just("1 + 2".to_string()),
+            Just("x <- c(1, 2, 3)".to_string()),
+            Just("if (TRUE) 1 else 2".to_string()),
+            Just("for (i in 1:10) print(i)".to_string()),
+            // Empty content (still valid)
+            Just("".to_string()),
+        ]
+    }
+
+    /// Generate a JAGS/Stan file type.
+    fn jags_stan_file_type_strategy() -> impl Strategy<Value = FileType> {
+        prop_oneof![Just(FileType::Jags), Just(FileType::Stan),]
+    }
+
+    /// Generate arbitrary content for JAGS/Stan files.
+    fn jags_stan_content_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("model { x ~ dnorm(0, 1) }".to_string()),
+            Just("data { int N; }".to_string()),
+            Just("x <- 1".to_string()),
+            Just("".to_string()),
+            "[a-zA-Z0-9 _<>~(){};.,]{1,80}",
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// **Property 2a: R parsing preservation**
+        ///
+        /// For any R code string with `FileType::R`, `parse_document` returns
+        /// `Some(Tree)` with a valid root node. This behavior must be preserved
+        /// before and after the JAGS/Stan parse fix.
+        ///
+        /// **Validates: Requirements 3.1**
+        #[test]
+        fn prop_r_parsing_returns_tree(code in r_code_strategy()) {
+            let doc = Document::new_with_file_type(&code, None, FileType::R);
+            prop_assert!(
+                doc.tree.is_some(),
+                "parse_document returned None for FileType::R with code {:?}",
+                code
+            );
+            let tree = doc.tree.as_ref().unwrap();
+            let root = tree.root_node();
+            // Root node should always be "program" for R parser
+            prop_assert_eq!(
+                root.kind(),
+                "program",
+                "Root node should be 'program' for R code {:?}",
+                code
+            );
+        }
+
+        /// **Property 2b: Diagnostics suppression — JAGS/Stan file types are non-R**
+        ///
+        /// Diagnostics suppression depends on `file_type != FileType::R` in
+        /// `diagnostics_from_snapshot`. This test verifies that JAGS/Stan
+        /// `Document` instances have the correct non-R file type, ensuring
+        /// diagnostics suppression will work regardless of parse_document changes.
+        ///
+        /// **Validates: Requirements 3.2**
+        #[test]
+        fn prop_jags_stan_file_type_is_not_r(
+            content in jags_stan_content_strategy(),
+            file_type in jags_stan_file_type_strategy(),
+        ) {
+            let doc = Document::new_with_file_type(&content, None, file_type);
+            prop_assert_ne!(
+                doc.file_type,
+                FileType::R,
+                "JAGS/Stan document should not have FileType::R — \
+                 diagnostics suppression depends on file_type != R"
+            );
+            // Verify the file type is preserved exactly
+            prop_assert_eq!(
+                doc.file_type,
+                file_type,
+                "Document file_type should match the file_type passed to new_with_file_type"
+            );
+        }
+
+        /// **Property 2c: Completion filtering — file type preservation**
+        ///
+        /// Completion filtering depends on `doc.file_type` to route JAGS files
+        /// to JAGS-specific completions and Stan files to Stan-specific completions.
+        /// This test verifies that `Document::new_with_file_type` correctly
+        /// preserves the file type for all variants.
+        ///
+        /// **Validates: Requirements 3.3, 3.4**
+        #[test]
+        fn prop_file_type_preserved_in_document(
+            content in jags_stan_content_strategy(),
+            file_type in jags_stan_file_type_strategy(),
+        ) {
+            let doc = Document::new_with_file_type(&content, None, file_type);
+            prop_assert_eq!(
+                doc.file_type,
+                file_type,
+                "Document should preserve file_type {:?} for completion filtering",
+                file_type
+            );
+            // Verify JAGS stays JAGS and Stan stays Stan
+            match file_type {
+                FileType::Jags => prop_assert_eq!(doc.file_type, FileType::Jags),
+                FileType::Stan => prop_assert_eq!(doc.file_type, FileType::Stan),
+                FileType::R => unreachable!("strategy only generates Jags/Stan"),
+            }
+        }
+    }
+}

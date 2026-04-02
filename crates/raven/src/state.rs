@@ -251,10 +251,7 @@ fn parse_r(contents: &Rope) -> Option<Tree> {
 
 fn parse_document(contents: &Rope, file_type: FileType) -> Option<Tree> {
     match file_type {
-        FileType::R => parse_r(contents),
-        // Raven only ships an R parser today. Non-R documents use text-based
-        // completion/diagnostic routing instead of being forced through tree-sitter-r.
-        FileType::Jags | FileType::Stan => None,
+        FileType::R | FileType::Jags | FileType::Stan => parse_r(contents),
     }
 }
 
