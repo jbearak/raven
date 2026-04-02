@@ -432,7 +432,7 @@ model <- fit_model(processed_data)
 
 ### Outline view is empty
 
-1. Verify the file extension is `.R`
+1. Verify the file extension is `.R`, `.jags`, `.bugs`, or `.stan`
 2. Check that Raven is running (status bar shows "Raven")
 3. Reload VS Code: **Ctrl+Shift+P** → "Developer: Reload Window"
 
