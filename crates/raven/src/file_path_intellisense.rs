@@ -897,7 +897,7 @@ pub fn file_path_definition(
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> Option<Location> {
-    use crate::cross_file::path_resolve::resolve_path;
+    use crate::cross_file::path_resolve::{resolve_path, resolve_path_with_workspace_fallback};
 
     // 1. Extract file path at position
     let (path_string, context) = extract_file_path_at_position(tree, content, position)?;
@@ -914,24 +914,25 @@ pub fn file_path_definition(
     // Normalize path separators (convert backslashes to forward slashes)
     let normalized_path = normalize_path_separators(&path_string);
 
-    // 2. Create appropriate PathContext based on context type
-    let path_context = match &context {
+    // 2. Create appropriate PathContext based on context type and resolve the path.
+    let resolved_path = match &context {
         FilePathContext::SourceCall { .. } => {
-            // For source() calls: respect @lsp-cd working directory
-            PathContext::from_metadata(file_uri, metadata, workspace_root)?
+            // source() navigation should match dependency-graph and scope resolution:
+            // respect explicit/inherited working directories, then fall back to the workspace
+            // root only when neither is present.
+            let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+            resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
         }
         FilePathContext::Directive { .. } => {
             // For directives: always relative to file's directory (ignore @lsp-cd)
-            PathContext::new(file_uri, workspace_root)?
+            let path_context = PathContext::new(file_uri, workspace_root)?;
+            resolve_path(&normalized_path, &path_context)?
         }
         FilePathContext::None => {
             // Should not happen since extract_file_path_at_position returns None for this case
             return None;
         }
     };
-
-    // 3. Resolve the path using the appropriate context
-    let resolved_path = resolve_path(&normalized_path, &path_context)?;
 
     log::trace!(
         "file_path_definition: Resolved path '{}' to '{}'",
@@ -8857,6 +8858,196 @@ mod file_path_definition_tests {
         assert!(result.is_some());
         let location = result.unwrap();
         assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+    }
+
+    #[test]
+    fn test_file_path_definition_source_call_uses_workspace_root_fallback() {
+        // Create temp directory structure:
+        // temp_dir/
+        //   scripts/
+        //     data.r
+        //     data/
+        //       covariates.r
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let data_subdir = scripts_dir.join("data");
+        fs::create_dir(&data_subdir).unwrap();
+        let covariates_path = data_subdir.join("covariates.r");
+        fs::write(&covariates_path, "# covariates file").unwrap();
+
+        let data_path = scripts_dir.join("data.r");
+        let code = r#"source("scripts/data/covariates.r")"#;
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            result.is_some(),
+            "Workspace-root fallback should resolve scripts/data/covariates.r from scripts/data.r"
+        );
+        let location = result.unwrap();
+        assert_eq!(location.uri, Url::from_file_path(&covariates_path).unwrap());
+    }
+
+    #[test]
+    fn test_file_path_definition_source_call_inherited_working_directory_beats_fallback() {
+        // Create temp directory structure:
+        // temp_dir/
+        //   scripts/
+        //     data.r
+        //   from-parent/
+        //     scripts/
+        //       data/
+        //         covariates.r
+        //   scripts/
+        //     data/
+        //       covariates.r (workspace-root candidate that should be ignored)
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let workspace_data_subdir = scripts_dir.join("data");
+        fs::create_dir(&workspace_data_subdir).unwrap();
+        let workspace_covariates = workspace_data_subdir.join("covariates.r");
+        fs::write(&workspace_covariates, "# workspace fallback candidate").unwrap();
+
+        let inherited_root = temp_dir.path().join("from-parent");
+        fs::create_dir(&inherited_root).unwrap();
+        let inherited_scripts = inherited_root.join("scripts");
+        fs::create_dir(&inherited_scripts).unwrap();
+        let inherited_data_subdir = inherited_scripts.join("data");
+        fs::create_dir(&inherited_data_subdir).unwrap();
+        let inherited_covariates = inherited_data_subdir.join("covariates.r");
+        fs::write(
+            &inherited_covariates,
+            "# inherited working directory target",
+        )
+        .unwrap();
+
+        let data_path = scripts_dir.join("data.r");
+        let code = r#"source("scripts/data/covariates.r")"#;
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = CrossFileMetadata {
+            inherited_working_directory: Some(inherited_root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            result.is_some(),
+            "Inherited working directory should resolve before workspace-root fallback"
+        );
+        let location = result.unwrap();
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&inherited_covariates).unwrap()
+        );
+        assert_ne!(
+            location.uri,
+            Url::from_file_path(&workspace_covariates).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_path_definition_source_call_explicit_working_directory_beats_fallback() {
+        // Create temp directory structure:
+        // temp_dir/
+        //   scripts/
+        //     data.r
+        //     data/
+        //       covariates.r (workspace-root candidate that should be ignored)
+        //   configured/
+        //     scripts/
+        //       data/
+        //         covariates.r
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let workspace_data_subdir = scripts_dir.join("data");
+        fs::create_dir(&workspace_data_subdir).unwrap();
+        let workspace_covariates = workspace_data_subdir.join("covariates.r");
+        fs::write(&workspace_covariates, "# workspace fallback candidate").unwrap();
+
+        let configured_root = temp_dir.path().join("configured");
+        fs::create_dir(&configured_root).unwrap();
+        let configured_scripts = configured_root.join("scripts");
+        fs::create_dir(&configured_scripts).unwrap();
+        let configured_data_subdir = configured_scripts.join("data");
+        fs::create_dir(&configured_data_subdir).unwrap();
+        let configured_covariates = configured_data_subdir.join("covariates.r");
+        fs::write(
+            &configured_covariates,
+            "# explicit working directory target",
+        )
+        .unwrap();
+
+        let data_path = scripts_dir.join("data.r");
+        let code = r#"source("scripts/data/covariates.r")"#;
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(Some("/configured"));
+
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            result.is_some(),
+            "Explicit working directory should resolve before workspace-root fallback"
+        );
+        let location = result.unwrap();
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&configured_covariates).unwrap()
+        );
+        assert_ne!(
+            location.uri,
+            Url::from_file_path(&workspace_covariates).unwrap()
+        );
     }
 
     #[test]
