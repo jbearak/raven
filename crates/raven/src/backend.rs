@@ -2342,11 +2342,23 @@ impl LanguageServer for Backend {
             let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
             let registration_options = CompletionRegistrationOptions {
                 text_document_registration_options: TextDocumentRegistrationOptions {
-                    document_selector: Some(vec![DocumentFilter {
-                        language: Some(String::from("r")),
-                        scheme: None,
-                        pattern: None,
-                    }]),
+                    document_selector: Some(vec![
+                        DocumentFilter {
+                            language: Some(String::from("r")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("jags")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("stan")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                    ]),
                 },
                 completion_options: CompletionOptions {
                     trigger_characters: Some(trigger_chars),

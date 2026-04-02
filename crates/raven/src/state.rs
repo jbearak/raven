@@ -905,12 +905,24 @@ impl WorldState {
             let path = entry.path();
 
             if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if should_skip_directory(dir_name) {
+                        continue;
+                    }
+                }
                 self.index_directory(&path);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("R") {
-                if let Ok(text) = fs::read_to_string(&path) {
-                    if let Ok(uri) = Url::from_file_path(&path) {
-                        log::trace!("Indexing file: {}", uri);
-                        self.workspace_index.insert(uri, Document::new(&text, None));
+            } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                if ext.eq_ignore_ascii_case("r")
+                    || ext.eq_ignore_ascii_case("jags")
+                    || ext.eq_ignore_ascii_case("bugs")
+                    || ext.eq_ignore_ascii_case("stan")
+                {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Ok(uri) = Url::from_file_path(&path) {
+                            log::trace!("Indexing file: {}", uri);
+                            self.workspace_index
+                                .insert(uri.clone(), Document::new_with_uri(&text, None, &uri));
+                        }
                     }
                 }
             }

@@ -82,6 +82,9 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // Package library (Arc, cheap clone)
     pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
+
+    // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
+    pub file_type: FileType,
 }
 
 impl DiagnosticsSnapshot {
@@ -190,6 +193,7 @@ impl DiagnosticsSnapshot {
             metadata_map,
             cycle_detection,
             package_library: state.package_library.clone(),
+            file_type: doc.file_type,
         })
     }
 
@@ -244,7 +248,9 @@ pub(crate) fn diagnostics_from_snapshot(
     }
 
     // Suppress diagnostics for non-R files (JAGS, Stan)
-    if file_type_from_uri(uri) != FileType::R {
+    // Use snapshot.file_type (from document) instead of URI-based detection,
+    // so untitled buffers with languageId "jags"/"stan" are correctly identified.
+    if snapshot.file_type != FileType::R {
         return Some(Vec::new());
     }
 

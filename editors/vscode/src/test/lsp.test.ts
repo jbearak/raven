@@ -75,14 +75,20 @@ suite('Ark LSP Extension', () => {
             content: 'model {\n  theta ~ dnorm(0, 1)\n  the\n}',
         });
         await vscode.window.showTextDocument(doc);
-        await sleep(2000);
 
         const position = new vscode.Position(2, 5);
-        const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
-            'vscode.executeCompletionItemProvider',
-            doc.uri,
-            position
-        );
+        let completions: vscode.CompletionList | undefined;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+                'vscode.executeCompletionItemProvider',
+                doc.uri,
+                position
+            );
+            if (completions?.items?.length) {
+                break;
+            }
+            await sleep(100);
+        }
 
         assert.ok(completions && completions.items.length > 0, 'Expected JAGS completion items');
         const labels = completions.items.map(i => i.label);

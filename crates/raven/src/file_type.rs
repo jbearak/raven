@@ -21,7 +21,7 @@ pub fn file_type_from_uri(uri: &Url) -> FileType {
 }
 
 pub fn file_type_from_language_id(language_id: &str) -> Option<FileType> {
-    match language_id {
+    match language_id.to_ascii_lowercase().as_str() {
         "r" => Some(FileType::R),
         "jags" => Some(FileType::Jags),
         "stan" => Some(FileType::Stan),
@@ -50,6 +50,15 @@ mod tests {
             file_type_from_language_id_or_uri(Some("stan"), &uri),
             FileType::Stan
         );
+    }
+
+    #[test]
+    fn test_mixed_case_language_id() {
+        assert_eq!(file_type_from_language_id("Stan"), Some(FileType::Stan));
+        assert_eq!(file_type_from_language_id("JAGS"), Some(FileType::Jags));
+        assert_eq!(file_type_from_language_id("R"), Some(FileType::R));
+        assert_eq!(file_type_from_language_id("STAN"), Some(FileType::Stan));
+        assert_eq!(file_type_from_language_id("Jags"), Some(FileType::Jags));
     }
 
     #[test]

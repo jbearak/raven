@@ -120,6 +120,8 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 Raven provides lightweight language support for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files:
 
 - **Syntax highlighting** - Keyword, type, distribution, and comment highlighting
+- **Completions** - Language-specific keywords, types, distributions, and file-local symbols
+- **Hover** - Signature information for built-in functions and distributions
 - **Go-to-definition** - Jump to variable definitions within the file
 - **Find references** - Locate all usages of a variable within the file
 - **Document outline** - Navigate model structure with blocks, decorative headings, and loops (see [Document Outline](docs/document-outline.md#jags-and-stan-model-structure))

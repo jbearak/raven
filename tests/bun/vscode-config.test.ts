@@ -23,7 +23,7 @@ function createMockConfig(
           globalValue: value as T,
         };
       }
-      return {};
+      return undefined;
     },
   };
 }

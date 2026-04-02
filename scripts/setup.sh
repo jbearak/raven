@@ -43,11 +43,12 @@ INSTALLED=0
 for editor in "${EDITORS[@]}"; do
     if command -v "$editor" &> /dev/null; then
         echo -n "  $editor: "
-        if "$editor" --install-extension "$VSIX_FILE" --force &> /dev/null; then
+        if output=$("$editor" --install-extension "$VSIX_FILE" --force 2>&1); then
             echo "✓"
             INSTALLED=$((INSTALLED + 1))
         else
             echo "failed"
+            echo "    $output"
         fi
     fi
 done

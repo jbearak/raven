@@ -259,11 +259,12 @@ mod jags_stan_indexing_property_tests {
                 "File '{}' should have a new index entry", filename
             );
 
-            // Verify the indexed URI contains our filename
+            // Verify the indexed URI matches the exact file path
             let uri = index.keys().next().unwrap();
-            prop_assert!(
-                uri.path().contains(&stem),
-                "Indexed URI should contain the filename stem '{}'", stem
+            let expected_uri = Url::from_file_path(&file_path).unwrap();
+            prop_assert_eq!(
+                uri, &expected_uri,
+                "Indexed URI should match the exact file path"
             );
         }
     }
