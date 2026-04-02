@@ -14,7 +14,10 @@ import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
 } from './extensionHelpers';
-import { shouldTriggerDirectivePathSuggest } from './pathCompletionTriggers';
+import {
+    shouldTriggerDirectivePathSuggest,
+    shouldTriggerNestedPathSuggest,
+} from './pathCompletionTriggers';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -170,13 +173,13 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
             const change = event.contentChanges[0];
-            if (change.rangeLength !== 0) {
-                return;
-            }
-
             const lineText = event.document.lineAt(change.range.start.line).text;
             const linePrefix = lineText.slice(0, change.range.start.character + change.text.length);
-            if (shouldTriggerDirectivePathSuggest(change.text, linePrefix)) {
+            const shouldTriggerSuggest =
+                (change.rangeLength === 0 &&
+                    shouldTriggerDirectivePathSuggest(change.text, linePrefix)) ||
+                shouldTriggerNestedPathSuggest(change.text, linePrefix);
+            if (shouldTriggerSuggest) {
                 void vscode.commands.executeCommand('editor.action.triggerSuggest');
             }
         }),
