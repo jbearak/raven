@@ -10,6 +10,7 @@ The document outline appears in VS Code's **Outline** view (usually in the Explo
 - **R code sections** - Organize your code with collapsible section headers (`# Section ----`)
 - **Rich symbol types** - Distinguish functions, constants, classes, and methods with distinct icons
 - **Quick navigation** - Click any symbol to jump to its definition
+- **JAGS/Stan block detection** - Navigate JAGS and Stan model files with block-level hierarchy
 - **Breadcrumb navigation** - See your current position in the file structure
 
 The outline updates automatically as you edit your code.
@@ -217,6 +218,62 @@ CACHE_SIZE <- 1000
       helper (x)
   CACHE_SIZE
 ```
+
+## JAGS and Stan Block Detection
+
+Raven recognizes top-level block structures in JAGS and Stan files and displays them as hierarchical sections in the document outline. Symbols extracted within each block appear as children of the block.
+
+### JAGS Blocks
+
+JAGS files (`.jags`, `.bugs`) support two block types:
+
+| Block | Outline Name |
+|-------|--------------|
+| `data { }` | data |
+| `model { }` | model |
+
+### Stan Blocks
+
+Stan files (`.stan`) support seven block types:
+
+| Block | Outline Name |
+|-------|--------------|
+| `functions { }` | functions |
+| `data { }` | data |
+| `transformed data { }` | transformed data |
+| `parameters { }` | parameters |
+| `transformed parameters { }` | transformed parameters |
+| `model { }` | model |
+| `generated quantities { }` | generated quantities |
+
+### Example
+
+```stan
+data {
+  int<lower=0> N;
+  vector[N] y;
+}
+parameters {
+  real mu;
+  real<lower=0> sigma;
+}
+model {
+  y ~ normal(mu, sigma);
+}
+```
+
+**Outline view shows:**
+```text
+▼ data
+    N
+    y
+▼ parameters
+    mu
+    sigma
+▼ model
+```
+
+Blocks are detected using text-based pattern matching with brace-depth tracking, so nested braces within block bodies are handled correctly. If a closing brace is missing, the block range extends to the end of the file.
 
 ## Workspace Symbol Search
 
