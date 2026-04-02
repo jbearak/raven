@@ -29,8 +29,9 @@ npm run compile
 echo "Packaging extension..."
 npm run package
 
+NAME=$(node -p "require('./package.json').name")
 VERSION=$(node -p "require('./package.json').version")
-VSIX_FILE="raven-${VERSION}.vsix"
+VSIX_FILE="${NAME}-${VERSION}.vsix"
 if [ ! -f "$VSIX_FILE" ]; then
     echo "✗ No .vsix file found"
     exit 1
