@@ -1,8 +1,10 @@
 # Raven - R Language Server
 
-An R language server with cross-file awareness.
+A language server for R, JAGS, and Stan with cross-file awareness.
 
 ## Features
+
+### R
 
 - **Cross-file `source()` tracking** — Detects `source()` calls and LSP directives to resolve symbols across file boundaries
 - **Position-aware scope** — Symbols from sourced files are only available after the `source()` call
@@ -14,6 +16,15 @@ An R language server with cross-file awareness.
 - **Document symbols** — Hierarchical outline with R code section support (`# Section ----`)
 - **Workspace symbols** — Fast project-wide symbol search (Ctrl+T / Cmd+T)
 - **Package awareness** — Recognition of `library()` calls and package exports with static NAMESPACE parsing
+
+### JAGS (`.jags`, `.bugs`) and Stan (`.stan`)
+
+- **Syntax highlighting** — Keywords, types, distributions, and comments
+- **Completions** — Language keywords, distributions, and built-in functions
+- **Document symbols** — Hierarchical outline with structural blocks (e.g. `model`, `data`, `parameters`), loops, and comment sections
+- **Go-to-definition** — Navigate to variable and function definitions within a file
+- **Find references** — Locate all usages of a symbol within a file and across open documents
+- **Hover** — Symbol information including definition location
 
 ## Settings
 
