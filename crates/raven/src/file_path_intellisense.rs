@@ -345,7 +345,8 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// Check if cursor is after an LSP directive where a path is expected
 ///
 /// Uses regex patterns consistent with cross_file/directive.rs to detect
-/// @lsp-sourced-by, @lsp-run-by, @lsp-included-by, and @lsp-source directives.
+/// @lsp-sourced-by, @lsp-run-by, @lsp-included-by, and forward source directives
+/// (`@lsp-source`, `@lsp-run`, `@lsp-include`).
 /// Handles optional colon and quotes syntax variations.
 ///
 /// # Arguments
@@ -931,10 +932,10 @@ pub fn file_path_definition(
                 resolve_path(&normalized_path, &path_context)?
             }
             DirectiveType::Source => {
-                // Forward directives: respect @lsp-cd, same as source() calls
+                // Forward directives respect @lsp-cd but do not use workspace-root fallback.
                 let path_context =
                     PathContext::from_metadata(file_uri, metadata, workspace_root)?;
-                resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
+                resolve_path(&normalized_path, &path_context)?
             }
         },
         FilePathContext::None => {
@@ -1380,13 +1381,13 @@ pub fn resolve_base_directory(
                 }
             }
             DirectiveType::Source => {
-                // Forward directives: respect @lsp-cd, same as source() calls
+                // Forward directives respect @lsp-cd but do not use workspace-root fallback.
                 let path_context =
                     PathContext::from_metadata(file_uri, metadata, workspace_root)?;
                 if partial_dir.is_empty() {
                     Some(path_context.effective_working_directory())
                 } else {
-                    resolve_path_with_workspace_fallback(resolution_path, &path_context)
+                    resolve_path(resolution_path, &path_context)
                 }
             }
         },
@@ -1497,8 +1498,9 @@ struct DirectivePathPatterns {
     /// Pattern for backward directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
     /// Matches: `# @lsp-sourced-by:` or `# @lsp-run-by` etc. (with optional leading whitespace)
     backward: Regex,
-    /// Pattern for forward directive (@lsp-source)
-    /// Matches: `# @lsp-source:` or `# @lsp-source` etc. (with optional leading whitespace)
+    /// Pattern for forward directives (@lsp-source, @lsp-run, @lsp-include)
+    /// Matches: `# @lsp-source:`, `# @lsp-run`, `# @lsp-include`, etc.
+    /// (with optional leading whitespace)
     forward: Regex,
 }
 
@@ -1517,7 +1519,8 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
                 r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
             )
             .unwrap(),
-            forward: Regex::new(r#"^\s*#\s*@lsp-source(?:\s+:?\s*|:\s*)"#).unwrap(),
+            forward: Regex::new(r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#)
+                .unwrap(),
         }
     })
 }
@@ -2095,6 +2098,36 @@ mod tests {
         assert_eq!(directive_type, DirectiveType::Source);
         assert_eq!(partial, "util");
         assert_eq!(path_start.character, 16);
+    }
+
+    #[test]
+    fn test_directive_run_forward_synonym() {
+        let content = "# @lsp-run utils.R";
+        let position = Position {
+            line: 0,
+            character: 14,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::Source);
+        assert_eq!(partial, "uti");
+        assert_eq!(path_start.character, 11);
+    }
+
+    #[test]
+    fn test_directive_include_forward_synonym_with_quotes() {
+        let content = r#"# @lsp-include: "utils/helpers.R""#;
+        let position = Position {
+            line: 0,
+            character: 22,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::Source);
+        assert_eq!(partial, "utils");
+        assert_eq!(path_start.character, 17);
     }
 
     #[test]
@@ -2747,6 +2780,46 @@ mod tests {
         let position = Position {
             line: 0,
             character: 17,
+        };
+        let result = extract_file_path_at_position(&tree, content, position);
+        assert!(result.is_some());
+        let (full_path, context) = result.unwrap();
+        assert_eq!(full_path, "utils.R");
+        match context {
+            FilePathContext::Directive { directive_type, .. } => {
+                assert_eq!(directive_type, DirectiveType::Source);
+            }
+            _ => panic!("Expected Directive context, got {:?}", context),
+        }
+    }
+
+    #[test]
+    fn test_extract_file_path_directive_run_forward_synonym() {
+        let content = "# @lsp-run utils.R";
+        let tree = parse_r(content);
+        let position = Position {
+            line: 0,
+            character: 14,
+        };
+        let result = extract_file_path_at_position(&tree, content, position);
+        assert!(result.is_some());
+        let (full_path, context) = result.unwrap();
+        assert_eq!(full_path, "utils.R");
+        match context {
+            FilePathContext::Directive { directive_type, .. } => {
+                assert_eq!(directive_type, DirectiveType::Source);
+            }
+            _ => panic!("Expected Directive context, got {:?}", context),
+        }
+    }
+
+    #[test]
+    fn test_extract_file_path_directive_include_forward_synonym() {
+        let content = "# @lsp-include utils.R";
+        let tree = parse_r(content);
+        let position = Position {
+            line: 0,
+            character: 18,
         };
         let result = extract_file_path_at_position(&tree, content, position);
         assert!(result.is_some());
@@ -8396,6 +8469,33 @@ mod resolve_base_directory_tests {
     }
 
     #[test]
+    fn test_resolve_base_directory_forward_directive_does_not_use_workspace_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let child_dir = temp_dir.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let workspace_scripts = temp_dir.path().join("scripts");
+        fs::create_dir(&workspace_scripts).unwrap();
+
+        let file_uri = Url::from_file_path(child_dir.join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let context = FilePathContext::Directive {
+            directive_type: DirectiveType::Source,
+            partial_path: "scripts/".to_string(),
+            path_start: Position {
+                line: 0,
+                character: 14,
+            },
+        };
+
+        let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), child_dir.join("scripts"));
+    }
+
+    #[test]
     fn test_resolve_base_directory_none_context() {
         // FilePathContext::None should return None
         let file_uri = Url::parse("file:///project/src/main.R").unwrap();
@@ -8876,6 +8976,39 @@ mod file_path_definition_tests {
     }
 
     #[test]
+    fn test_file_path_definition_forward_directive_synonym_existing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let utils_path = temp_dir.path().join("utils.R");
+        fs::write(&utils_path, "# helper").unwrap();
+
+        let main_path = temp_dir.path().join("main.R");
+        let code = "# @lsp-run utils.R";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&main_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 14,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(result.is_some());
+        let location = result.unwrap();
+        assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+    }
+
+    #[test]
     fn test_file_path_definition_directive_nonexistent_file() {
         let temp_dir = TempDir::new().unwrap();
         let child_path = temp_dir.path().join("child.R");
@@ -8990,6 +9123,41 @@ mod file_path_definition_tests {
         );
         let location = result.unwrap();
         assert_eq!(location.uri, Url::from_file_path(&covariates_path).unwrap());
+    }
+
+    #[test]
+    fn test_file_path_definition_forward_directive_does_not_use_workspace_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let child_dir = temp_dir.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let workspace_scripts = temp_dir.path().join("scripts");
+        fs::create_dir(&workspace_scripts).unwrap();
+        let workspace_target = workspace_scripts.join("helpers.R");
+        fs::write(&workspace_target, "# workspace candidate").unwrap();
+
+        let main_path = child_dir.join("main.R");
+        let code = "# @lsp-source scripts/helpers.R";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&main_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 22,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(result.is_none());
     }
 
     #[test]

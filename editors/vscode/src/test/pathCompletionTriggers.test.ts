@@ -89,6 +89,14 @@ suite('Path Completion Triggers', () => {
             shouldTriggerNestedPathSuggest('models/', 'sys.source(file = "pkg/models/'),
             true,
         );
+        assert.strictEqual(
+            shouldTriggerNestedPathSuggest('helpers/', 'source(local = TRUE, file = "helpers/'),
+            true,
+        );
+        assert.strictEqual(
+            shouldTriggerNestedPathSuggest('models/', 'sys.source(envir = e, file = "pkg/models/'),
+            true,
+        );
     });
 
     test('triggers after selecting a directory completion in directives', () => {

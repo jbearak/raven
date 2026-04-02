@@ -2,8 +2,10 @@ const DIRECTIVE_SPACE_TRIGGER_RE =
     /^\s*#\s*@lsp-(?:source|run|include|sourced-by|run-by|included-by):?\s+$/;
 const DIRECTIVE_PATH_TRIGGER_RE =
     /^\s*#\s*@lsp-(?:source|run|include|sourced-by|run-by|included-by)(?::)?\s*(?:["'])?[^"'#]*\/$/;
-const SOURCE_PATH_TRIGGER_RE =
+const SOURCE_POSITIONAL_PATH_TRIGGER_RE =
     /\b(?:source|sys\.source)\s*\(\s*(?:file\s*=\s*)?["'][^"'\\]*(?:\\.[^"'\\]*)*\/$/;
+const SOURCE_NAMED_FILE_PATH_TRIGGER_RE =
+    /\b(?:source|sys\.source)\s*\([^)]*?\bfile\s*=\s*["'][^"'\\]*(?:\\.[^"'\\]*)*\/$/;
 
 export function shouldTriggerDirectivePathSuggest(
     insertedText: string,
@@ -26,6 +28,7 @@ export function shouldTriggerNestedPathSuggest(
 
     return (
         DIRECTIVE_PATH_TRIGGER_RE.test(linePrefix) ||
-        SOURCE_PATH_TRIGGER_RE.test(linePrefix)
+        SOURCE_POSITIONAL_PATH_TRIGGER_RE.test(linePrefix) ||
+        SOURCE_NAMED_FILE_PATH_TRIGGER_RE.test(linePrefix)
     );
 }

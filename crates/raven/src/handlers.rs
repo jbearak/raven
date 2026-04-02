@@ -22130,6 +22130,19 @@ mod proptests {
         parser.parse(code, None).unwrap()
     }
 
+    fn usage_contains_span<'a>(
+        used: &[(String, Node<'a>)],
+        expected_name: &str,
+        start_byte: usize,
+    ) -> bool {
+        let expected_end = start_byte.saturating_add(expected_name.len());
+        used.iter().any(|(name, node)| {
+            name == expected_name
+                && node.start_byte() == start_byte
+                && node.end_byte() == expected_end
+        })
+    }
+
     // Helper to filter out R reserved keywords from generated lowercase identifiers.
     // R reserved words are case-sensitive; only lowercase ones can collide with [a-z] generators.
     fn is_r_reserved(s: &str) -> bool {
@@ -23104,7 +23117,8 @@ mod proptests {
             let mut used = Vec::new();
             collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
 
-            let rhs_used = used.iter().any(|(name, _)| name == &rhs);
+            let rhs_start = lhs.len() + op.len();
+            let rhs_used = usage_contains_span(&used, &rhs, rhs_start);
             prop_assert!(!rhs_used, "RHS '{}' of extract operator should NOT be collected", rhs);
         }
 
@@ -23145,7 +23159,12 @@ mod proptests {
             let mut used = Vec::new();
             collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
 
-            let arg_used = used.iter().any(|(name, _)| name == &arg);
+            let arg_start = match call_type {
+                "call" | "subset" => func.len() + 1,
+                "subset2" => func.len() + 2,
+                _ => unreachable!(),
+            };
+            let arg_used = usage_contains_span(&used, &arg, arg_start);
             prop_assert!(!arg_used, "Argument '{}' inside {} should NOT be collected", arg, call_type);
         }
 
@@ -23201,8 +23220,10 @@ mod proptests {
             let mut used = Vec::new();
             collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
 
-            let lhs_used = used.iter().any(|(name, _)| name == &lhs);
-            let rhs_used = used.iter().any(|(name, _)| name == &rhs);
+            let lhs_start = func.len() + 1;
+            let rhs_start = lhs_start + lhs.len() + 3;
+            let lhs_used = usage_contains_span(&used, &lhs, lhs_start);
+            let rhs_used = usage_contains_span(&used, &rhs, rhs_start);
             prop_assert!(!lhs_used, "Formula LHS '{}' inside call should NOT be collected", lhs);
             prop_assert!(!rhs_used, "Formula RHS '{}' inside call should NOT be collected", rhs);
         }
