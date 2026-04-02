@@ -2792,7 +2792,6 @@ where
             for pkg in &parent_scope.loaded_packages {
                 scope.inherited_packages.insert(pkg.clone());
             }
-
         }
     } // end if !is_revisit (STEP 1)
 
@@ -10005,7 +10004,8 @@ x <- 1"#;
         let functions_code = "library(plyr)\nhelper <- function() {}";
         let functions_tree = parse_r(functions_code);
         let functions_uri = Url::parse("file:///project/functions.r").unwrap();
-        let functions_artifacts = compute_artifacts(&functions_uri, &functions_tree, functions_code);
+        let functions_artifacts =
+            compute_artifacts(&functions_uri, &functions_tree, functions_code);
 
         let data_code = "source(\"outcomes.r\")";
         let data_tree = parse_r(data_code);
@@ -10086,12 +10086,9 @@ x <- 1"#;
             }],
             ..Default::default()
         };
-        graph.update_file(
-            &outcomes_uri,
-            &outcomes_meta,
-            Some(&workspace_root),
-            |_| None,
-        );
+        graph.update_file(&outcomes_uri, &outcomes_meta, Some(&workspace_root), |_| {
+            None
+        });
 
         let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
             if uri == &main_uri {
@@ -10265,9 +10262,7 @@ x <- 1"#;
         );
 
         assert!(
-            parent_scope
-                .loaded_packages
-                .contains(&"dplyr".to_string()),
+            parent_scope.loaded_packages.contains(&"dplyr".to_string()),
             "Parent should have dplyr in loaded_packages after processing source(\"a.r\"). \
              loaded_packages: {:?}",
             parent_scope.loaded_packages

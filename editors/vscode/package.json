@@ -16,7 +16,9 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:r"
+    "onLanguage:r",
+    "onLanguage:jags",
+    "onLanguage:stan"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -35,6 +37,47 @@
           ".qmd"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "jags",
+        "aliases": [
+          "JAGS",
+          "jags"
+        ],
+        "extensions": [
+          ".jags",
+          ".Jags",
+          ".JAGS",
+          ".bugs",
+          ".Bugs",
+          ".BUGS"
+        ],
+        "configuration": "./jags-language-configuration.json"
+      },
+      {
+        "id": "stan",
+        "aliases": [
+          "Stan",
+          "stan"
+        ],
+        "extensions": [
+          ".stan",
+          ".Stan",
+          ".STAN"
+        ],
+        "configuration": "./stan-language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jags",
+        "scopeName": "source.jags",
+        "path": "./syntaxes/jags.tmLanguage.json"
+      },
+      {
+        "language": "stan",
+        "scopeName": "source.stan",
+        "path": "./syntaxes/stan.tmLanguage.json"
       }
     ],
     "configurationDefaults": {
@@ -59,7 +102,7 @@
             "no"
           ],
           "default": "ask",
-          "description": "Whether to exclude dots from word separators in R files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
+          "description": "Whether to exclude dots from word separators in R and JAGS files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
         },
         "raven.crossFile.maxBackwardDepth": {
           "type": "number",

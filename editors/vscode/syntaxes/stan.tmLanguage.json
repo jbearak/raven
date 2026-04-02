@@ -1,0 +1,68 @@
+{
+  "name": "Stan",
+  "scopeName": "source.stan",
+  "patterns": [
+    { "include": "#block-comment" },
+    { "include": "#line-comment" },
+    { "include": "#string" },
+    { "include": "#block-keyword" },
+    { "include": "#type-keyword" },
+    { "include": "#constraint-keyword" },
+    { "include": "#control-flow" },
+    { "include": "#distribution-suffix" },
+    { "include": "#numeric" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "line-comment": {
+      "name": "comment.line.double-slash.stan",
+      "match": "//.*$"
+    },
+    "block-comment": {
+      "name": "comment.block.stan",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "patterns": []
+    },
+    "string": {
+      "name": "string.quoted.double.stan",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.stan",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "block-keyword": {
+      "name": "keyword.control.block.stan",
+
+      "match": "\\b(functions|data|transformed\\s+data|parameters|transformed\\s+parameters|model|generated\\s+quantities)\\b"
+    },
+    "type-keyword": {
+      "name": "storage.type.stan",
+      "match": "\\b(int|real|vector|row_vector|matrix|simplex|unit_vector|ordered|positive_ordered|corr_matrix|cov_matrix|cholesky_factor_corr|cholesky_factor_cov|void|array|complex|complex_vector|complex_row_vector|complex_matrix|tuple)\\b"
+    },
+    "constraint-keyword": {
+      "name": "storage.modifier.stan",
+      "match": "\\b(lower|upper|offset|multiplier)\\b"
+    },
+    "control-flow": {
+      "name": "keyword.control.flow.stan",
+      "match": "\\b(for|in|while|if|else|return|break|continue|print|reject|profile)\\b"
+    },
+    "distribution-suffix": {
+      "name": "support.function.distribution.stan",
+      "match": "\\b\\w+(_lpdf|_lpmf|_lcdf|_lccdf|_rng)\\b"
+    },
+    "numeric": {
+      "name": "constant.numeric.stan",
+      "match": "\\b\\d+(\\.\\d+)?([eE][+-]?\\d+)?\\b"
+    },
+    "operator": {
+      "name": "keyword.operator.stan",
+      "match": "<-|~|&&|\\|\\||<=|>=|==|!=|[+\\-*/^%<>=!?:']"
+    }
+  }
+}

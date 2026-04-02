@@ -1,0 +1,55 @@
+{
+  "name": "JAGS",
+  "scopeName": "source.jags",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#block-keyword" },
+    { "include": "#control-flow" },
+    { "include": "#distribution" },
+    { "include": "#math-function" },
+    { "include": "#numeric" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.jags",
+      "match": "#.*$"
+    },
+    "string": {
+      "name": "string.quoted.double.jags",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.jags",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "block-keyword": {
+      "name": "keyword.control.jags",
+      "match": "\\b(model|data)\\b"
+    },
+    "control-flow": {
+      "name": "keyword.control.flow.jags",
+      "match": "\\b(for|in|if|else)\\b"
+    },
+    "distribution": {
+      "name": "support.function.distribution.jags",
+      "match": "\\b(dnorm|dbern|dgamma|dunif|dpois|dbin|dbeta|dexp|dt|dweib|dlnorm|dchisqr|dlogis|dmulti|ddirch|dwish|dmnorm|dmt|dinterval|dcat)\\b"
+    },
+    "math-function": {
+      "name": "support.function.math.jags",
+      "match": "(?<![a-zA-Z0-9_.])(abs|sqrt|log|exp|pow|sin|cos|sum|prod|min|max|mean|sd|inverse|logit|probit|cloglog|ilogit|phi|step|equals|round|trunc|inprod|interp\\.lin|logfact|loggam|rank|sort|ifelse|T)(?![a-zA-Z0-9_.])"
+    },
+    "numeric": {
+      "name": "constant.numeric.jags",
+      "match": "\\b\\d+(\\.\\d+)?([eE][+-]?\\d+)?\\b"
+    },
+    "operator": {
+      "name": "keyword.operator.jags",
+      "match": "<-|~|&&|\\|\\||<=|>=|==|!=|[+\\-*/^<>]"
+    }
+  }
+}

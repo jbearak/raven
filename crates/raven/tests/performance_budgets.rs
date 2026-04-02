@@ -513,7 +513,7 @@ fn budget_single_file_completion() {
         let path = entry.path();
         let content = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
-        state.documents.insert(uri, Document::new(&content, None));
+        state.documents.insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
     }
 
     // Run workspace scan and apply index (populates cross-file state)

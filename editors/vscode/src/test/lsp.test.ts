@@ -1,4 +1,6 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { activate, openDocument, waitForDiagnostics, getFixtureUri, sleep } from './helper';
 
@@ -65,6 +67,34 @@ suite('Ark LSP Extension', () => {
         const labels = completions.items.map(i => i.label);
         assert.ok(labels.some(l => typeof l === 'string' && l.startsWith('print')), 
             'Expected print in completions');
+    });
+
+    test('untitled JAGS buffers use JAGS completions', async () => {
+        const doc = await vscode.workspace.openTextDocument({
+            language: 'jags',
+            content: 'model {\n  theta ~ dnorm(0, 1)\n  the\n}',
+        });
+        await vscode.window.showTextDocument(doc);
+
+        const position = new vscode.Position(2, 5);
+        let completions: vscode.CompletionList | undefined;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+                'vscode.executeCompletionItemProvider',
+                doc.uri,
+                position
+            );
+            if (completions?.items?.length) {
+                break;
+            }
+            await sleep(100);
+        }
+
+        assert.ok(completions && completions.items.length > 0, 'Expected JAGS completion items');
+        const labels = completions.items.map(i => i.label);
+        assert.ok(labels.some(l => typeof l === 'string' && l === 'dnorm'), 'Expected dnorm in completions');
+        assert.ok(labels.some(l => typeof l === 'string' && l === 'theta'), 'Expected theta in completions');
+        assert.ok(!labels.some(l => typeof l === 'string' && l === 'library'), 'Did not expect R-only completions');
     });
 
     test('hover information is provided', async () => {
@@ -245,5 +275,50 @@ suite('Ark LSP Extension', () => {
             `ddply should not be flagged as undefined (plyr inherited from sibling source chain). ` +
             `Got diagnostics: ${messages.join('; ')}`
         );
+    });
+
+    test('package.json registers mixed-case JAGS and Stan extensions', async () => {
+        const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+        const languages = pkg.contributes.languages as Array<{ id: string; extensions: string[] }>;
+
+        const jags = languages.find(language => language.id === 'jags');
+        const stan = languages.find(language => language.id === 'stan');
+
+        assert.ok(jags, 'Expected JAGS language contribution');
+        assert.ok(stan, 'Expected Stan language contribution');
+        assert.deepStrictEqual(
+            jags?.extensions,
+            ['.jags', '.Jags', '.JAGS', '.bugs', '.Bugs', '.BUGS'],
+        );
+        assert.deepStrictEqual(
+            stan?.extensions,
+            ['.stan', '.Stan', '.STAN'],
+        );
+    });
+
+    test('JAGS language configuration treats dots as part of words', async () => {
+        const languageConfigPath = path.join(__dirname, '..', '..', 'jags-language-configuration.json');
+        const languageConfig = JSON.parse(fs.readFileSync(languageConfigPath, 'utf8')) as { wordPattern?: string };
+
+        assert.strictEqual(
+            languageConfig.wordPattern,
+            '([a-zA-Z_][a-zA-Z0-9_.]*)|(\\.[a-zA-Z_][a-zA-Z0-9_.]*)',
+        );
+    });
+
+    test('package.json describes dot-in-word separators for JAGS too', async () => {
+        const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
+            contributes: {
+                configuration: {
+                    properties: Record<string, { description?: string }>;
+                };
+            };
+        };
+
+        const description = pkg.contributes.configuration.properties['raven.editor.dotInWordSeparators']?.description;
+
+        assert.ok(description?.includes('R and JAGS files'));
     });
 });

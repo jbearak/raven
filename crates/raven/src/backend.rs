@@ -129,7 +129,10 @@ pub(crate) fn parse_cross_file_config(
     }
 
     // Validate that present sections are objects (not scalars/arrays)
-    fn ensure_object_section(value: Option<&serde_json::Value>, name: &str) -> std::result::Result<(), String> {
+    fn ensure_object_section(
+        value: Option<&serde_json::Value>,
+        name: &str,
+    ) -> std::result::Result<(), String> {
         if let Some(v) = value {
             if !v.is_object() {
                 return Err(format!("{name} must be an object."));
@@ -240,13 +243,13 @@ pub(crate) fn parse_cross_file_config(
                 }
                 Some(other) => {
                     log::warn!("Unrecognized crossFile.backwardDependencies value '{other}', defaulting to 'auto'.");
-                    config.backward_dependencies =
-                        crate::cross_file::BackwardDependencyMode::Auto;
+                    config.backward_dependencies = crate::cross_file::BackwardDependencyMode::Auto;
                 }
                 None => {
-                    log::warn!("crossFile.backwardDependencies must be a string, defaulting to 'auto'.");
-                    config.backward_dependencies =
-                        crate::cross_file::BackwardDependencyMode::Auto;
+                    log::warn!(
+                        "crossFile.backwardDependencies must be a string, defaulting to 'auto'."
+                    );
+                    config.backward_dependencies = crate::cross_file::BackwardDependencyMode::Auto;
                 }
             }
         }
@@ -1121,6 +1124,7 @@ impl LanguageServer for Backend {
     /// patterns (like the diagnostics_gate) that don't require exclusive access.
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
+        let language_id = params.text_document.language_id;
         let text = params.text_document.text;
         let version = params.text_document.version;
 
@@ -1175,7 +1179,12 @@ impl LanguageServer for Backend {
                 .await;
 
             // Update legacy documents HashMap (for migration compatibility)
-            state.open_document(uri.clone(), &text, Some(version));
+            state.open_document_with_language_id(
+                uri.clone(),
+                &text,
+                Some(version),
+                Some(language_id.as_str()),
+            );
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
@@ -1514,7 +1523,12 @@ impl LanguageServer for Backend {
                     .document_store
                     .open_with_metadata(uri.clone(), &text, version, meta.clone())
                     .await;
-                state.open_document(uri.clone(), &text, Some(version));
+                state.open_document_with_language_id(
+                    uri.clone(),
+                    &text,
+                    Some(version),
+                    Some(language_id.as_str()),
+                );
 
                 let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
                     &uri,
@@ -1651,7 +1665,12 @@ impl LanguageServer for Backend {
                 .document_store
                 .open_with_metadata(uri.clone(), &text, version, meta.clone())
                 .await;
-            state.open_document(uri.clone(), &text, Some(version));
+            state.open_document_with_language_id(
+                uri.clone(),
+                &text,
+                Some(version),
+                Some(language_id.as_str()),
+            );
 
             let backward_path_ctx =
                 crate::cross_file::path_resolve::PathContext::new(&uri, workspace_root.as_ref());
@@ -2171,10 +2190,11 @@ impl LanguageServer for Backend {
         let new_config = match parse_cross_file_config(&params.settings) {
             Ok(config) => config,
             Err(err) => {
-                log::warn!("Failed to parse cross-file configuration from settings: {}", err);
-                self.client
-                    .show_message(MessageType::WARNING, err)
-                    .await;
+                log::warn!(
+                    "Failed to parse cross-file configuration from settings: {}",
+                    err
+                );
+                self.client.show_message(MessageType::WARNING, err).await;
                 None
             }
         };
@@ -2188,7 +2208,6 @@ impl LanguageServer for Backend {
 
         // Parse indentation configuration if provided
         let new_indentation_config = parse_indentation_config(&params.settings);
-
 
         let (
             open_uris,
@@ -2323,11 +2342,23 @@ impl LanguageServer for Backend {
             let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
             let registration_options = CompletionRegistrationOptions {
                 text_document_registration_options: TextDocumentRegistrationOptions {
-                    document_selector: Some(vec![DocumentFilter {
-                        language: Some(String::from("r")),
-                        scheme: None,
-                        pattern: None,
-                    }]),
+                    document_selector: Some(vec![
+                        DocumentFilter {
+                            language: Some(String::from("r")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("jags")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("stan")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                    ]),
                 },
                 completion_options: CompletionOptions {
                     trigger_characters: Some(trigger_chars),

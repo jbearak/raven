@@ -10,6 +10,10 @@ import {
     getInitializationOptions as buildInitializationOptions,
     RavenInitializationOptions,
 } from './initializationOptions';
+import {
+    getUpdatedGlobalLanguageConfig,
+    isRDocument,
+} from './extensionHelpers';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -22,6 +26,14 @@ function getInitializationOptions(): RavenInitializationOptions {
 }
 
 let client: LanguageClient;
+const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
+const DOT_IN_WORD_LANGUAGE_IDS = ['r', 'jags'] as const;
+
+function hasWordSeparatorsOverride(configValue: unknown): boolean {
+    return typeof configValue === 'object'
+        && configValue !== null
+        && 'editor.wordSeparators' in configValue;
+}
 
 function getServerPath(context: vscode.ExtensionContext): string {
     const config = vscode.workspace.getConfiguration('raven');
@@ -48,19 +60,15 @@ function sendActivityNotification() {
     const activeEditor = vscode.window.activeTextEditor;
     const visibleEditors = vscode.window.visibleTextEditors;
 
-    // Only include R files
-    const isRFile = (uri: vscode.Uri) => {
-        const ext = path.extname(uri.fsPath).toLowerCase();
-        return ['.r', '.rmd', '.qmd'].includes(ext);
-    };
-
-    const activeUri = activeEditor?.document.uri;
-    const activeUriStr = activeUri && isRFile(activeUri) ? activeUri.toString() : null;
+    const activeDocument = activeEditor?.document;
+    const activeUriStr = activeDocument && isRDocument(activeDocument)
+        ? activeDocument.uri.toString()
+        : null;
 
     const visibleUris = visibleEditors
-        .map(e => e.document.uri)
-        .filter(isRFile)
-        .map(uri => uri.toString());
+        .map(editor => editor.document)
+        .filter(isRDocument)
+        .map(document => document.uri.toString());
 
     client.sendNotification('raven/activeDocumentsChanged', {
         activeUri: activeUriStr,
@@ -84,9 +92,13 @@ export function activate(context: vscode.ExtensionContext) {
         documentSelector: [
             { scheme: 'file', language: 'r' },
             { scheme: 'untitled', language: 'r' },
+            { scheme: 'file', language: 'jags' },
+            { scheme: 'untitled', language: 'jags' },
+            { scheme: 'file', language: 'stan' },
+            { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd}'),
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions(),
@@ -135,8 +147,6 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 async function promptWordSeparators(context: vscode.ExtensionContext) {
-    const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
-    
     const config = vscode.workspace.getConfiguration('raven');
     const setting = config.get<string>('editor.dotInWordSeparators', 'ask');
 
@@ -153,19 +163,20 @@ async function promptWordSeparators(context: vscode.ExtensionContext) {
 
     // If set to 'ask', check if we should prompt
     const wsConfig = vscode.workspace.getConfiguration();
-    const rConfig = wsConfig.inspect('[r]');
-    const hasWordSeparators = 
-        (rConfig?.globalValue as any)?.['editor.wordSeparators'] !== undefined ||
-        (rConfig?.workspaceValue as any)?.['editor.wordSeparators'] !== undefined ||
-        (rConfig?.workspaceFolderValue as any)?.['editor.wordSeparators'] !== undefined;
+    const missingWordSeparatorsLanguage = DOT_IN_WORD_LANGUAGE_IDS.find((languageId) => {
+        const languageConfig = wsConfig.inspect(`[${languageId}]`);
+        return !hasWordSeparatorsOverride(languageConfig?.globalValue)
+            && !hasWordSeparatorsOverride(languageConfig?.workspaceValue)
+            && !hasWordSeparatorsOverride(languageConfig?.workspaceFolderValue);
+    });
 
-    if (hasWordSeparators) {
+    if (missingWordSeparatorsLanguage === undefined) {
         return;
     }
 
     // Show prompt
     const choice = await vscode.window.showInformationMessage(
-        'This extension can treat dots as part of words in R files by updating editor.wordSeparators for [r]. Enable this behavior?',
+        'This extension can treat dots as part of words in R and JAGS files by updating editor.wordSeparators for [r] and [jags]. Enable this behavior?',
         'Enable',
         'No thanks'
     );
@@ -175,7 +186,7 @@ async function promptWordSeparators(context: vscode.ExtensionContext) {
         await ensureWordSeparators(WORD_SEPARATORS);
         
         const reload = await vscode.window.showInformationMessage(
-            'R word separators updated: dots will now be part of words in R files. Reload window to apply?',
+            'R and JAGS word separators updated: dots will now be part of words in R and JAGS files. Reload window to apply?',
             'Reload',
             'Later'
         );
@@ -189,15 +200,17 @@ async function promptWordSeparators(context: vscode.ExtensionContext) {
 
 async function ensureWordSeparators(wordSeparators: string) {
     const config = vscode.workspace.getConfiguration();
-    const currentRConfig = config.get('[r]', {}) as Record<string, any>;
     
-    // Only update if not already set correctly
-    if (currentRConfig['editor.wordSeparators'] !== wordSeparators) {
-        const updatedRConfig = {
-            ...currentRConfig,
-            'editor.wordSeparators': wordSeparators
-        };
-        await config.update('[r]', updatedRConfig, vscode.ConfigurationTarget.Global);
+    for (const languageId of DOT_IN_WORD_LANGUAGE_IDS) {
+        const updatedLanguageConfig = getUpdatedGlobalLanguageConfig(
+            config.inspect<Record<string, unknown>>(`[${languageId}]`),
+            wordSeparators,
+        );
+
+        // Only update if not already set correctly
+        if (updatedLanguageConfig !== null) {
+            await config.update(`[${languageId}]`, updatedLanguageConfig, vscode.ConfigurationTarget.Global);
+        }
     }
 }
 

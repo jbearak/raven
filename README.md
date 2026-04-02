@@ -109,11 +109,24 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 - **Completions** - Workspace-aware completion including symbols from sourced files and loaded packages
 - **Function signatures** - Parameter completion and richer function signature hovers
 - **Hover** - Symbol information on hover
-- **Document symbols** - Hierarchical outline view with R code section support (`# Section ----`), S4/R6 class detection, and nested function display
+- **Document symbols** - Hierarchical outline view with R sections, JAGS/Stan blocks plus decorative headings and loops, S4/R6 class detection, and nested function display
 - **Workspace symbols** - Fast project-wide symbol search (Ctrl+T) with configurable result limits
 - **Workspace indexing** - Background indexing of your entire project
 - **Smart indentation** - AST-aware auto-indentation with RStudio-style alignment on Enter
 - **Package awareness** - Recognition of `library()` calls and package exports
+
+### JAGS and Stan Support
+
+Raven provides lightweight language support for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files:
+
+- **Syntax highlighting** - Keyword, type, distribution, and comment highlighting
+- **Completions** - Language-specific keywords, types, distributions, and file-local symbols
+- **Hover** - Signature information for built-in functions and distributions
+- **Go-to-definition** - Jump to variable definitions within the file
+- **Find references** - Locate all usages of a variable within the file
+- **Document outline** - Navigate model structure with blocks, decorative headings, and loops (see [Document Outline](docs/document-outline.md#jags-and-stan-model-structure))
+
+Diagnostics are suppressed for JAGS and Stan files because Raven cannot statically determine what is in scope in these languages.
 
 ## Documentation
 
