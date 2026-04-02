@@ -8025,6 +8025,22 @@ struct StanDocumentSymbolMatch {
     name_end: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StanIdentifierOccurrence {
+    name: String,
+    line: u32,
+    start_col: u32,
+    end_col: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StanLexState {
+    Code,
+    LineComment,
+    BlockComment,
+    String,
+}
+
 fn stan_variable_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -8152,6 +8168,136 @@ fn collect_stan_document_symbols(text: &str) -> Vec<RawSymbol> {
             })
         })
         .collect()
+}
+
+fn is_stan_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_stan_identifier_continue(byte: u8) -> bool {
+    is_stan_identifier_start(byte) || byte.is_ascii_digit()
+}
+
+fn collect_stan_identifier_occurrences(text: &str) -> Vec<StanIdentifierOccurrence> {
+    let mut occurrences = Vec::new();
+    let mut state = StanLexState::Code;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut byte_col = 0;
+
+        if state == StanLexState::LineComment {
+            state = StanLexState::Code;
+        }
+
+        while byte_col < bytes.len() {
+            match state {
+                StanLexState::Code => {
+                    let byte = bytes[byte_col];
+
+                    if byte == b'/' && byte_col + 1 < bytes.len() && bytes[byte_col + 1] == b'/' {
+                        state = StanLexState::LineComment;
+                        break;
+                    }
+
+                    if byte == b'/' && byte_col + 1 < bytes.len() && bytes[byte_col + 1] == b'*' {
+                        state = StanLexState::BlockComment;
+                        byte_col += 2;
+                        continue;
+                    }
+
+                    if byte == b'"' {
+                        state = StanLexState::String;
+                        byte_col += 1;
+                        continue;
+                    }
+
+                    if is_stan_identifier_start(byte) {
+                        let start = byte_col;
+                        byte_col += 1;
+
+                        while byte_col < bytes.len() && is_stan_identifier_continue(bytes[byte_col])
+                        {
+                            byte_col += 1;
+                        }
+
+                        occurrences.push(StanIdentifierOccurrence {
+                            name: line[start..byte_col].to_string(),
+                            line: line_idx as u32,
+                            start_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                                line, start,
+                            ),
+                            end_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                                line, byte_col,
+                            ),
+                        });
+                        continue;
+                    }
+
+                    byte_col += 1;
+                }
+                StanLexState::LineComment => break,
+                StanLexState::BlockComment => {
+                    if bytes[byte_col] == b'*'
+                        && byte_col + 1 < bytes.len()
+                        && bytes[byte_col + 1] == b'/'
+                    {
+                        state = StanLexState::Code;
+                        byte_col += 2;
+                    } else {
+                        byte_col += 1;
+                    }
+                }
+                StanLexState::String => {
+                    if bytes[byte_col] == b'\\' && byte_col + 1 < bytes.len() {
+                        byte_col += 2;
+                    } else if bytes[byte_col] == b'"' {
+                        state = StanLexState::Code;
+                        byte_col += 1;
+                    } else {
+                        byte_col += 1;
+                    }
+                }
+            }
+        }
+
+        if state == StanLexState::LineComment {
+            state = StanLexState::Code;
+        }
+    }
+
+    occurrences
+}
+
+fn stan_identifier_at_position<'a>(
+    occurrences: &'a [StanIdentifierOccurrence],
+    position: Position,
+) -> Option<&'a StanIdentifierOccurrence> {
+    occurrences.iter().find(|occurrence| {
+        occurrence.line == position.line
+            && position.character >= occurrence.start_col
+            && position.character < occurrence.end_col
+    })
+}
+
+fn collect_stan_references(
+    occurrences: &[StanIdentifierOccurrence],
+    name: &str,
+    uri: &Url,
+    locations: &mut Vec<Location>,
+) {
+    locations.extend(
+        occurrences
+            .iter()
+            .filter(|occurrence| occurrence.name == name)
+            .map(|occurrence| Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position::new(occurrence.line, occurrence.start_col),
+                    end: Position::new(occurrence.line, occurrence.end_col),
+                },
+            }),
+    );
 }
 
 fn collect_jags_document_completions(
@@ -10748,8 +10894,79 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
-    let tree = doc.tree.as_ref()?;
     let text = doc.text();
+
+    if doc.file_type == FileType::Stan {
+        let occurrences = collect_stan_identifier_occurrences(&text);
+        let target = stan_identifier_at_position(&occurrences, position)?;
+        let name = target.name.as_str();
+        let mut locations = Vec::new();
+
+        collect_stan_references(&occurrences, name, uri, &mut locations);
+
+        // Search all open documents using new DocumentStore.
+        for file_uri in state.document_store.uris() {
+            if &file_uri == uri {
+                continue;
+            }
+
+            let file_type = state
+                .get_document(&file_uri)
+                .map(|doc| doc.file_type)
+                .unwrap_or_else(|| file_type_from_uri(&file_uri));
+            if file_type != FileType::Stan {
+                continue;
+            }
+
+            if let Some(content) = content_provider.get_content(&file_uri) {
+                let file_occurrences = collect_stan_identifier_occurrences(&content);
+                collect_stan_references(&file_occurrences, name, &file_uri, &mut locations);
+            }
+        }
+
+        // Search workspace index using new WorkspaceIndex.
+        for (file_uri, entry) in state.workspace_index_new.iter() {
+            if &file_uri == uri || file_type_from_uri(&file_uri) != FileType::Stan {
+                continue;
+            }
+
+            let file_text = entry.contents.to_string();
+            let file_occurrences = collect_stan_identifier_occurrences(&file_text);
+            collect_stan_references(&file_occurrences, name, &file_uri, &mut locations);
+        }
+
+        // Fallback: Search legacy open documents.
+        for (file_uri, doc) in &state.documents {
+            if file_uri == uri
+                || state.document_store.contains(file_uri)
+                || doc.file_type != FileType::Stan
+            {
+                continue;
+            }
+
+            let file_text = doc.text();
+            let file_occurrences = collect_stan_identifier_occurrences(&file_text);
+            collect_stan_references(&file_occurrences, name, file_uri, &mut locations);
+        }
+
+        // Fallback: Search legacy workspace index.
+        for (file_uri, doc) in &state.workspace_index {
+            if file_uri == uri
+                || state.workspace_index_new.contains(file_uri)
+                || doc.file_type != FileType::Stan
+            {
+                continue;
+            }
+
+            let file_text = doc.text();
+            let file_occurrences = collect_stan_identifier_occurrences(&file_text);
+            collect_stan_references(&file_occurrences, name, file_uri, &mut locations);
+        }
+
+        return Some(locations);
+    }
+
+    let tree = doc.tree.as_ref()?;
 
     let point = Point::new(position.line as usize, position.character as usize);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
@@ -34695,6 +34912,151 @@ result <- undefined_var
         );
 
         // If we reached here without panicking, the utility works correctly.
+    }
+}
+
+#[cfg(test)]
+mod stan_reference_tests {
+    use super::*;
+    use crate::state::{Document, WorldState};
+
+    fn make_state(code: &str) -> (WorldState, Url) {
+        let uri = Url::parse("file:///test/model.stan").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+        (state, uri)
+    }
+
+    fn nth_stan_occurrence(code: &str, name: &str, nth: usize) -> StanIdentifierOccurrence {
+        collect_stan_identifier_occurrences(code)
+            .into_iter()
+            .filter(|occurrence| occurrence.name == name)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("Missing occurrence {} for '{}'", nth, name))
+    }
+
+    fn reference_ranges(code: &str, name: &str, nth: usize) -> Vec<(u32, u32, u32)> {
+        let (state, uri) = make_state(code);
+        let occurrence = nth_stan_occurrence(code, name, nth);
+        let mut refs = references(
+            &state,
+            &uri,
+            Position::new(occurrence.line, occurrence.start_col),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|location| {
+            (
+                location.range.start.line,
+                location.range.start.character,
+                location.range.end.character,
+            )
+        })
+        .collect::<Vec<_>>();
+        refs.sort_unstable();
+        refs
+    }
+
+    #[test]
+    fn test_stan_references_from_data_declaration() {
+        let code = r#"data {
+  int C;
+  array[C] real x;
+}"#;
+
+        assert_eq!(reference_ranges(code, "C", 0), vec![(1, 6, 7), (2, 8, 9)]);
+    }
+
+    #[test]
+    fn test_stan_references_from_model_usage() {
+        let code = r#"data {
+  int n_p1;
+  array[3] int p0_p;
+  array[3] real mu;
+}
+model {
+  for (p_idx in 1:n_p1) {
+    int p = p0_p[p_idx];
+    target += normal_lpdf(mu[p] | 0, 1);
+  }
+}"#;
+
+        assert_eq!(reference_ranges(code, "p", 1), vec![(7, 8, 9), (8, 29, 30)]);
+    }
+
+    #[test]
+    fn test_stan_references_from_model_local_declaration() {
+        let code = r#"data {
+  int n_p1;
+  array[3] int p0_p;
+  array[3] real mu;
+}
+model {
+  for (p_idx in 1:n_p1) {
+    int p = p0_p[p_idx];
+    target += normal_lpdf(mu[p] | 0, 1);
+  }
+}"#;
+
+        assert_eq!(reference_ranges(code, "p", 0), vec![(7, 8, 9), (8, 29, 30)]);
+    }
+
+    #[test]
+    fn test_stan_references_from_generated_quantities_declaration() {
+        let code = r#"generated quantities {
+  array[3] real est_ab_p;
+  array[3] real foo;
+  for (p in 1:3) {
+    est_ab_p[p] = foo[p];
+  }
+}"#;
+
+        assert_eq!(
+            reference_ranges(code, "est_ab_p", 0),
+            vec![(1, 16, 24), (4, 4, 12)]
+        );
+    }
+
+    #[test]
+    fn test_stan_references_from_generated_quantities_usage() {
+        let code = r#"generated quantities {
+  array[3] real est_ab_p;
+  array[3] real foo;
+  for (p in 1:3) {
+    est_ab_p[p] = foo[p];
+  }
+}"#;
+
+        assert_eq!(
+            reference_ranges(code, "est_ab_p", 1),
+            vec![(1, 16, 24), (4, 4, 12)]
+        );
+    }
+
+    #[test]
+    fn test_stan_references_ignore_comments_and_strings() {
+        let code = r#"generated quantities {
+  real p;
+  string note = "p";
+  // p should be ignored
+  p = 1;
+}"#;
+
+        assert_eq!(reference_ranges(code, "p", 0), vec![(1, 7, 8), (4, 2, 3)]);
+    }
+
+    #[test]
+    fn test_stan_references_avoid_substring_collisions() {
+        let code = r#"generated quantities {
+  real p;
+  real pp;
+  real p0;
+  p = pp + p0;
+}"#;
+
+        assert_eq!(reference_ranges(code, "p", 0), vec![(1, 7, 8), (4, 2, 3)]);
     }
 }
 
