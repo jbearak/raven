@@ -80,9 +80,14 @@ function sendActivityNotification() {
 export function activate(context: vscode.ExtensionContext) {
     const serverPath = getServerPath(context);
 
+    const traceLevel = vscode.workspace.getConfiguration('raven').get<string>('trace.server', 'off');
+    const rustLog = traceLevel === 'verbose' ? 'raven=trace' :
+                    traceLevel === 'messages' ? 'raven=debug' : undefined;
+
     const serverOptions: ServerOptions = {
         command: serverPath,
         args: ['--stdio'],
+        options: rustLog ? { env: { ...process.env, RUST_LOG: rustLog } } : undefined,
     };
 
     // Create output channel for server logs
@@ -112,6 +117,13 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     client.start();
+
+    // Register restart command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.restart', async () => {
+            await client.restart();
+        })
+    );
 
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());

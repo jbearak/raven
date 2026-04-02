@@ -5102,7 +5102,15 @@ fn collect_undefined_variables_from_snapshot(
         let scope_0_0 = scope_cache
             .entry((0, 0))
             .or_insert_with(|| snapshot.get_scope(uri, 0, 0, cancel));
-        scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
+        // Only include symbols from OTHER files. When a parent sources this file,
+        // the file's own exports flow into the parent's scope and back here via
+        // backward edges. Including those would suppress forward-reference diagnostics.
+        scope_0_0
+            .symbols
+            .iter()
+            .filter(|(_, sym)| sym.source_uri != *uri)
+            .map(|(k, _)| k.to_string())
+            .collect()
     };
 
     let workspace_root = snapshot.workspace_folders.first();
@@ -5181,8 +5189,24 @@ fn collect_undefined_variables_from_snapshot(
                 .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col, cancel))
         };
 
-        if scope.symbols.contains_key(name.as_str()) {
-            continue;
+        if let Some(sym) = scope.symbols.get(name.as_str()) {
+            // When a parent sources this file, the file's own exports flow into the
+            // parent's scope and back here via backward edges. For same-file symbols,
+            // re-apply the position check so forward references are still caught.
+            if sym.source_uri == *uri {
+                let usage_col_for_check = byte_offset_to_utf16_column(
+                    get_line(usage_node.start_position().row),
+                    usage_node.start_position().column,
+                );
+                if (sym.defined_line, sym.defined_column)
+                    <= (usage_line, usage_col_for_check)
+                {
+                    continue;
+                }
+                // Forward reference — don't skip
+            } else {
+                continue;
+            }
         }
 
         let usage_col_utf16 = byte_offset_to_utf16_column(
@@ -7824,7 +7848,15 @@ pub(crate) fn collect_undefined_variables_position_aware(
         let scope_0_0 = scope_cache
             .entry((0, 0))
             .or_insert_with(|| get_cross_file_scope(state, uri, 0, 0, cancel));
-        scope_0_0.symbols.keys().map(|k| k.to_string()).collect()
+        // Only include symbols from OTHER files. When a parent sources this file,
+        // the file's own exports flow into the parent's scope and back here via
+        // backward edges. Including those would suppress forward-reference diagnostics.
+        scope_0_0
+            .symbols
+            .iter()
+            .filter(|(_, sym)| sym.source_uri != *uri)
+            .map(|(k, _)| k.to_string())
+            .collect()
     };
 
     // Report undefined variables with position-aware cross-file scope
@@ -7888,8 +7920,24 @@ pub(crate) fn collect_undefined_variables_position_aware(
         };
 
         // Check if symbol is in cross-file scope
-        if scope.symbols.contains_key(name.as_str()) {
-            continue;
+        if let Some(sym) = scope.symbols.get(name.as_str()) {
+            // When a parent sources this file, the file's own exports flow into the
+            // parent's scope and back here via backward edges. For same-file symbols,
+            // re-apply the position check so forward references are still caught.
+            if sym.source_uri == *uri {
+                let usage_col_for_check = byte_offset_to_utf16_column(
+                    get_line(usage_node.start_position().row),
+                    usage_node.start_position().column,
+                );
+                if (sym.defined_line, sym.defined_column)
+                    <= (usage_line, usage_col_for_check)
+                {
+                    continue;
+                }
+                // Forward reference — don't skip
+            } else {
+                continue;
+            }
         }
 
         let usage_col_utf16 = byte_offset_to_utf16_column(
@@ -33586,7 +33634,8 @@ y <- x"#;
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
     use crate::handlers::{
-        collect_undefined_variables_position_aware, goto_definition, DiagCancelToken,
+        collect_undefined_variables_position_aware, diagnostics_from_snapshot, goto_definition,
+        DiagCancelToken, DiagnosticsSnapshot,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{Position, Url};
@@ -33678,6 +33727,92 @@ x <- 1
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
         assert!(diagnostics[0].message.contains("Undefined variable: x"));
         assert_eq!(diagnostics[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn test_diagnostics_forward_reference_with_grandparent_chain() {
+        // Reproduces the real worldwide/scripts structure:
+        //   main.R         →  source("functions.R"), source("data.R")
+        //   data.R         →  source("covariates.R"), source("indices.R"), source("impute.R")
+        //   impute.R has a forward reference: apple <- food / food <- 1
+        let mut state = create_test_state();
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let functions_uri = Url::parse("file:///workspace/functions.R").unwrap();
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let covariates_uri = Url::parse("file:///workspace/covariates.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+        let impute_uri = Url::parse("file:///workspace/impute.R").unwrap();
+
+        // report.R also sources data.R (multiple parents for data.R)
+        let report_uri = Url::parse("file:///workspace/report.R").unwrap();
+
+        let main_code = "source(\"functions.R\")\nsource(\"data.R\")\nww$c.oos <- 1\n";
+        let functions_code = "helper <- function(x) x * 2\n";
+        let data_code = "ww <- list()\nsource(\"covariates.R\")\nsource(\"indices.R\")\nsource(\"impute.R\")\n";
+        let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
+        let indices_code = "idx_a <- 10\nidx_b <- 20\n";
+        let impute_code = "apple <- food\nbar <- food\nfood <- 1\nfoo <- 1\n";
+        let report_code = "source(\"data.R\")\nresult <- ww\n";
+
+        // Add all documents
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&functions_uri, functions_code),
+            (&data_uri, data_code),
+            (&covariates_uri, covariates_code),
+            (&indices_uri, indices_code),
+            (&impute_uri, impute_code),
+            (&report_uri, report_code),
+        ] {
+            state.documents.insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let tree = parse_r_code(impute_code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(impute_code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &impute_uri,
+            root,
+            impute_code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        // food is used on lines 0 and 1, defined on line 2 → 2 forward references
+        assert_eq!(diagnostics.len(), 2, "Should have 2 diagnostics for forward references (position_aware): {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(diagnostics[0].message.contains("Undefined variable: food"));
+        assert_eq!(diagnostics[0].range.start.line, 0);
+        assert!(diagnostics[1].message.contains("Undefined variable: food"));
+        assert_eq!(diagnostics[1].range.start.line, 1);
+
+        // Now test via the snapshot path (what the real LSP uses)
+        let snapshot = DiagnosticsSnapshot::build(&state, &impute_uri)
+            .expect("Should build snapshot for impute.R");
+        let snapshot_diags = diagnostics_from_snapshot(&snapshot, &impute_uri, &DiagCancelToken::never())
+            .expect("Should produce diagnostics");
+        let undef_diags: Vec<_> = snapshot_diags.iter()
+            .filter(|d| d.message.contains("Undefined variable"))
+            .collect();
+        assert_eq!(undef_diags.len(), 2, "Snapshot path should also have 2 undefined variable diagnostics: {:?}",
+            snapshot_diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(undef_diags[0].message.contains("food"));
+        assert!(undef_diags[1].message.contains("food"));
     }
 
     #[test]
