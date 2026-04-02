@@ -911,18 +911,12 @@ impl WorldState {
                     }
                 }
                 self.index_directory(&path);
-            } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if ext.eq_ignore_ascii_case("r")
-                    || ext.eq_ignore_ascii_case("jags")
-                    || ext.eq_ignore_ascii_case("bugs")
-                    || ext.eq_ignore_ascii_case("stan")
-                {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Ok(uri) = Url::from_file_path(&path) {
-                            log::trace!("Indexing file: {}", uri);
-                            self.workspace_index
-                                .insert(uri.clone(), Document::new_with_uri(&text, None, &uri));
-                        }
+            } else if is_stat_model_extension(&path) {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    if let Ok(uri) = Url::from_file_path(&path) {
+                        log::trace!("Indexing file: {}", uri);
+                        self.workspace_index
+                            .insert(uri.clone(), Document::new_with_uri(&text, None, &uri));
                     }
                 }
             }
@@ -1084,6 +1078,17 @@ pub(crate) fn should_skip_directory(dir_name: &str) -> bool {
         .any(|skip| dir_name.eq_ignore_ascii_case(skip))
 }
 
+fn is_stat_model_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("r")
+                || ext.eq_ignore_ascii_case("jags")
+                || ext.eq_ignore_ascii_case("bugs")
+                || ext.eq_ignore_ascii_case("stan")
+        })
+}
+
 fn scan_directory(
     dir: &std::path::Path,
     index: &mut HashMap<Url, Document>,
@@ -1106,72 +1111,65 @@ fn scan_directory(
                 }
             }
             scan_directory(&path, index, cross_file_entries, new_index_entries);
-        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            // Match R, JAGS, and Stan file extensions (case-insensitive)
-            if ext.eq_ignore_ascii_case("r")
-                || ext.eq_ignore_ascii_case("jags")
-                || ext.eq_ignore_ascii_case("bugs")
-                || ext.eq_ignore_ascii_case("stan")
-            {
-                if let Ok(text) = fs::read_to_string(&path) {
-                    if let Ok(uri) = Url::from_file_path(&path) {
-                        log::trace!("Scanning file: {}", uri);
-                        let doc = Document::new_with_uri(&text, None, &uri);
+        } else if is_stat_model_extension(&path) {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(uri) = Url::from_file_path(&path) {
+                    log::trace!("Scanning file: {}", uri);
+                    let doc = Document::new_with_uri(&text, None, &uri);
 
-                        // Also compute cross-file metadata and artifacts
-                        if let Ok(metadata_result) = fs::metadata(&path) {
-                            let cross_file_meta = crate::cross_file::extract_metadata(&text);
+                    // Also compute cross-file metadata and artifacts
+                    if let Ok(metadata_result) = fs::metadata(&path) {
+                        let cross_file_meta = crate::cross_file::extract_metadata(&text);
 
-                            // Compute artifacts if we have a tree
-                            // Use compute_artifacts_with_metadata to include declared symbols from directives
-                            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                            let artifacts =
-                                std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
-                                    crate::cross_file::scope::compute_artifacts_with_metadata(
-                                        &uri,
-                                        tree,
-                                        &text,
-                                        Some(&cross_file_meta),
-                                    )
-                                } else {
-                                    crate::cross_file::scope::ScopeArtifacts::default()
-                                });
-
-                            let snapshot =
-                                crate::cross_file::file_cache::FileSnapshot::with_content_hash(
-                                    &metadata_result,
+                        // Compute artifacts if we have a tree
+                        // Use compute_artifacts_with_metadata to include declared symbols from directives
+                        // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                        let artifacts =
+                            std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
+                                crate::cross_file::scope::compute_artifacts_with_metadata(
+                                    &uri,
+                                    tree,
                                     &text,
-                                );
+                                    Some(&cross_file_meta),
+                                )
+                            } else {
+                                crate::cross_file::scope::ScopeArtifacts::default()
+                            });
 
-                            // Create legacy cross-file entry
-                            cross_file_entries.insert(
-                                uri.clone(),
-                                crate::cross_file::workspace_index::IndexEntry {
-                                    snapshot: snapshot.clone(),
-                                    metadata: cross_file_meta.clone(),
-                                    artifacts: artifacts.clone(),
-                                    indexed_at_version: 0, // Initial version; not modified by insert()
-                                },
+                        let snapshot =
+                            crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                                &metadata_result,
+                                &text,
                             );
 
-                            // Create new unified IndexEntry with all derived data
-                            // **Validates: Requirements 11.1, 11.2, 11.3**
-                            new_index_entries.insert(
-                                uri.clone(),
-                                crate::workspace_index::IndexEntry {
-                                    contents: doc.contents.clone(),
-                                    tree: doc.tree.clone(),
-                                    loaded_packages: doc.loaded_packages.clone(),
-                                    snapshot,
-                                    metadata: cross_file_meta,
-                                    artifacts,
-                                    indexed_at_version: 0, // Initial version
-                                },
-                            );
-                        }
+                        // Create legacy cross-file entry
+                        cross_file_entries.insert(
+                            uri.clone(),
+                            crate::cross_file::workspace_index::IndexEntry {
+                                snapshot: snapshot.clone(),
+                                metadata: cross_file_meta.clone(),
+                                artifacts: artifacts.clone(),
+                                indexed_at_version: 0, // Initial version; not modified by insert()
+                            },
+                        );
 
-                        index.insert(uri, doc);
+                        // Create new unified IndexEntry with all derived data
+                        // **Validates: Requirements 11.1, 11.2, 11.3**
+                        new_index_entries.insert(
+                            uri.clone(),
+                            crate::workspace_index::IndexEntry {
+                                contents: doc.contents.clone(),
+                                tree: doc.tree.clone(),
+                                loaded_packages: doc.loaded_packages.clone(),
+                                snapshot,
+                                metadata: cross_file_meta,
+                                artifacts,
+                                indexed_at_version: 0, // Initial version
+                            },
+                        );
                     }
+
+                    index.insert(uri, doc);
                 }
             }
         }

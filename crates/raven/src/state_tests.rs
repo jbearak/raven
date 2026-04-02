@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod workspace_scan_tests {
     use super::super::*;
+    use std::path::Path;
     use std::fs;
     use tempfile::TempDir;
     use tower_lsp::lsp_types::Url;
@@ -127,6 +128,17 @@ my_func <- function(x) { x + 1 }
         assert!(entry.snapshot.size > 0, "Should have valid snapshot");
         assert!(entry.artifacts.exported_interface.contains_key("my_func"), 
             "Should have exported symbols in artifacts");
+    }
+
+    #[test]
+    fn test_is_stat_model_extension_matches_supported_extensions_case_insensitively() {
+        assert!(is_stat_model_extension(Path::new("script.R")));
+        assert!(is_stat_model_extension(Path::new("script.r")));
+        assert!(is_stat_model_extension(Path::new("model.JAGS")));
+        assert!(is_stat_model_extension(Path::new("model.Bugs")));
+        assert!(is_stat_model_extension(Path::new("model.STAN")));
+        assert!(!is_stat_model_extension(Path::new("notes.txt")));
+        assert!(!is_stat_model_extension(Path::new("README")));
     }
 }
 

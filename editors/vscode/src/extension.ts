@@ -10,6 +10,10 @@ import {
     getInitializationOptions as buildInitializationOptions,
     RavenInitializationOptions,
 } from './initializationOptions';
+import {
+    getUpdatedGlobalLanguageConfig,
+    isRDocument,
+} from './extensionHelpers';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -56,19 +60,15 @@ function sendActivityNotification() {
     const activeEditor = vscode.window.activeTextEditor;
     const visibleEditors = vscode.window.visibleTextEditors;
 
-    // Only include R files
-    const isRFile = (uri: vscode.Uri) => {
-        const ext = path.extname(uri.fsPath).toLowerCase();
-        return ['.r', '.rmd', '.qmd', '.jags', '.bugs', '.stan'].includes(ext);
-    };
-
-    const activeUri = activeEditor?.document.uri;
-    const activeUriStr = activeUri && isRFile(activeUri) ? activeUri.toString() : null;
+    const activeDocument = activeEditor?.document;
+    const activeUriStr = activeDocument && isRDocument(activeDocument)
+        ? activeDocument.uri.toString()
+        : null;
 
     const visibleUris = visibleEditors
-        .map(e => e.document.uri)
-        .filter(isRFile)
-        .map(uri => uri.toString());
+        .map(editor => editor.document)
+        .filter(isRDocument)
+        .map(document => document.uri.toString());
 
     client.sendNotification('raven/activeDocumentsChanged', {
         activeUri: activeUriStr,
@@ -202,14 +202,13 @@ async function ensureWordSeparators(wordSeparators: string) {
     const config = vscode.workspace.getConfiguration();
     
     for (const languageId of DOT_IN_WORD_LANGUAGE_IDS) {
-        const currentLanguageConfig = config.get(`[${languageId}]`, {}) as Record<string, unknown>;
+        const updatedLanguageConfig = getUpdatedGlobalLanguageConfig(
+            config.inspect<Record<string, unknown>>(`[${languageId}]`),
+            wordSeparators,
+        );
 
         // Only update if not already set correctly
-        if (currentLanguageConfig['editor.wordSeparators'] !== wordSeparators) {
-            const updatedLanguageConfig = {
-                ...currentLanguageConfig,
-                'editor.wordSeparators': wordSeparators
-            };
+        if (updatedLanguageConfig !== null) {
             await config.update(`[${languageId}]`, updatedLanguageConfig, vscode.ConfigurationTarget.Global);
         }
     }
