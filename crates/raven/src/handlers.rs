@@ -22,6 +22,25 @@ use crate::utf16::utf16_column_to_byte_offset;
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    R,
+    Jags,
+    Stan,
+}
+
+pub fn file_type_from_uri(uri: &Url) -> FileType {
+    let path = uri.path();
+    let lower_path = path.to_ascii_lowercase();
+    if lower_path.ends_with(".jags") || lower_path.ends_with(".bugs") {
+        FileType::Jags
+    } else if lower_path.ends_with(".stan") {
+        FileType::Stan
+    } else {
+        FileType::R
+    }
+}
+
 /// Lightweight cooperative cancellation handle for diagnostic computation.
 ///
 /// Wraps an optional `CancellationToken` so that diagnostic functions can
@@ -239,6 +258,11 @@ pub(crate) fn diagnostics_from_snapshot(
     let start = std::time::Instant::now();
 
     if !snapshot.cross_file_config.diagnostics_enabled {
+        return Some(Vec::new());
+    }
+
+    // Suppress diagnostics for non-R files (JAGS, Stan)
+    if file_type_from_uri(uri) != FileType::R {
         return Some(Vec::new());
     }
 
@@ -2856,6 +2880,11 @@ fn collect_workspace_symbols_from_artifacts(
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
+        return Vec::new();
+    }
+
+    // Suppress diagnostics for non-R files (JAGS, Stan)
+    if file_type_from_uri(uri) != FileType::R {
         return Vec::new();
     }
 
@@ -7711,6 +7740,125 @@ fn is_package_export(
 /// let resp = completion(&state, &uri, pos, None);
 /// assert!(resp.is_some());
 /// ```
+fn jags_completion(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    uri: &Url,
+    position: Position,
+) -> Option<CompletionResponse> {
+    let _ = position;
+    let mut items = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    // Add JAGS keywords
+    for kw in crate::jags_builtins::JAGS_KEYWORDS {
+        items.push(CompletionItem {
+            label: kw.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
+            ..Default::default()
+        });
+        seen_names.insert(kw.to_string());
+    }
+
+    // Add JAGS distributions
+    for dist in crate::jags_builtins::JAGS_DISTRIBUTIONS {
+        if !seen_names.contains(*dist) {
+            items.push(CompletionItem {
+                label: dist.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, dist)),
+                ..Default::default()
+            });
+            seen_names.insert(dist.to_string());
+        }
+    }
+
+    // Add JAGS functions
+    for func in crate::jags_builtins::JAGS_FUNCTIONS {
+        if !seen_names.contains(*func) {
+            items.push(CompletionItem {
+                label: func.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, func)),
+                ..Default::default()
+            });
+            seen_names.insert(func.to_string());
+        }
+    }
+
+    // Add file-local symbols
+    collect_document_completions(tree.root_node(), text, uri, &mut items, &mut seen_names);
+
+    Some(CompletionResponse::Array(items))
+}
+
+fn stan_completion(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    uri: &Url,
+    position: Position,
+) -> Option<CompletionResponse> {
+    let _ = position;
+    let mut items = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    // Add Stan types
+    for ty in crate::stan_builtins::STAN_TYPES {
+        items.push(CompletionItem {
+            label: ty.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, ty)),
+            ..Default::default()
+        });
+        seen_names.insert(ty.to_string());
+    }
+
+    // Add Stan block keywords
+    for kw in crate::stan_builtins::STAN_BLOCK_KEYWORDS {
+        if !seen_names.contains(*kw) {
+            items.push(CompletionItem {
+                label: kw.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
+                ..Default::default()
+            });
+            seen_names.insert(kw.to_string());
+        }
+    }
+
+    // Add Stan control flow
+    for cf in crate::stan_builtins::STAN_CONTROL_FLOW {
+        if !seen_names.contains(*cf) {
+            items.push(CompletionItem {
+                label: cf.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, cf)),
+                ..Default::default()
+            });
+            seen_names.insert(cf.to_string());
+        }
+    }
+
+    // Add Stan functions
+    for func in crate::stan_builtins::STAN_FUNCTIONS {
+        if !seen_names.contains(*func) {
+            items.push(CompletionItem {
+                label: func.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, func)),
+                ..Default::default()
+            });
+            seen_names.insert(func.to_string());
+        }
+    }
+
+    // Add file-local symbols
+    collect_document_completions(tree.root_node(), text, uri, &mut items, &mut seen_names);
+
+    Some(CompletionResponse::Array(items))
+}
+
 pub fn completion(
     state: &WorldState,
     uri: &Url,
@@ -7720,6 +7868,13 @@ pub fn completion(
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
+
+    // JAGS/Stan completion filtering
+    match file_type_from_uri(uri) {
+        FileType::Jags => return jags_completion(tree, &text, uri, position),
+        FileType::Stan => return stan_completion(tree, &text, uri, position),
+        FileType::R => { /* fall through to existing R logic */ }
+    }
 
     // Check for file path context first (source() calls and LSP directives)
     // Requirements 1.1-1.6, 2.1-2.7: Provide file path completions in appropriate contexts
@@ -34057,5 +34212,300 @@ result <- undefined_var
         );
 
         // If we reached here without panicking, the utility works correctly.
+    }
+}
+
+#[cfg(test)]
+mod file_type_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // **Validates: Requirements 1.1, 2.1, 10.1**
+    // Property 1: File type detection is consistent with extension
+
+    proptest! {
+        #[test]
+        fn prop_jags_extension_detected(
+            prefix in "[a-zA-Z][a-zA-Z0-9_]{0,20}",
+            ext in prop_oneof![
+                Just("jags"),
+                Just("JAGS"),
+                Just("Jags"),
+                Just("bugs"),
+                Just("BUGS"),
+                Just("Bugs")
+            ]
+        ) {
+            let uri_str = format!("file:///path/to/{}.{}", prefix, ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            assert_eq!(file_type_from_uri(&uri), FileType::Jags);
+        }
+
+        #[test]
+        fn prop_stan_extension_detected(
+            prefix in "[a-zA-Z][a-zA-Z0-9_]{0,20}",
+            ext in prop_oneof![
+                Just("stan"),
+                Just("STAN"),
+                Just("Stan")
+            ]
+        ) {
+            let uri_str = format!("file:///path/to/{}.{}", prefix, ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            assert_eq!(file_type_from_uri(&uri), FileType::Stan);
+        }
+
+        #[test]
+        fn prop_r_extension_detected(
+            prefix in "[a-zA-Z][a-zA-Z0-9_]{0,20}",
+            ext in prop_oneof![
+                Just("r"),
+                Just("R"),
+                Just("rmd"),
+                Just("Rmd"),
+                Just("qmd")
+            ]
+        ) {
+            let uri_str = format!("file:///path/to/{}.{}", prefix, ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            assert_eq!(file_type_from_uri(&uri), FileType::R);
+        }
+
+        #[test]
+        fn prop_unknown_extension_defaults_to_r(
+            prefix in "[a-zA-Z][a-zA-Z0-9_]{0,20}",
+            ext in prop_oneof![
+                Just("py"),
+                Just("js"),
+                Just("txt"),
+                Just("csv"),
+                Just("md"),
+                Just("rs")
+            ]
+        ) {
+            let uri_str = format!("file:///path/to/{}.{}", prefix, ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            assert_eq!(file_type_from_uri(&uri), FileType::R);
+        }
+
+        // **Validates: Requirements 1.1, 1.2**
+        // Property 2: JAGS files produce empty diagnostics
+        #[test]
+        fn prop_jags_files_produce_empty_diagnostics(
+            content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
+            ext in prop_oneof![Just("jags"), Just("bugs")]
+        ) {
+            let uri_str = format!("file:///test/model.{}", ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = diagnostics(&state, &uri, &DiagCancelToken::never());
+            assert!(result.is_empty(), "JAGS file should produce no diagnostics, got {:?}", result);
+        }
+
+        // **Validates: Requirements 2.1, 2.2**
+        // Property 3: Stan files produce empty diagnostics
+        #[test]
+        fn prop_stan_files_produce_empty_diagnostics(
+            content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}"
+        ) {
+            let uri_str = "file:///test/model.stan";
+            let uri = Url::parse(uri_str).unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = diagnostics(&state, &uri, &DiagCancelToken::never());
+            assert!(result.is_empty(), "Stan file should produce no diagnostics, got {:?}", result);
+        }
+
+        // **Validates: Requirements 10.1, 10.2**
+        // Property 4: R files with syntax errors still produce diagnostics
+        #[test]
+        fn prop_r_files_with_syntax_errors_produce_diagnostics(
+            ext in prop_oneof![Just("r"), Just("R")]
+        ) {
+            let uri_str = format!("file:///test/script.{}", ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            state.workspace_scan_complete = true;
+            // Incomplete assignment is a known syntax error in R
+            let code = "x <-";
+            let doc = crate::state::Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = diagnostics(&state, &uri, &DiagCancelToken::never());
+            assert!(!result.is_empty(), "R file with syntax error should produce diagnostics");
+        }
+
+        // **Validates: Requirements 12.1**
+        // Property 5: JAGS completions exclude R-specific items
+        #[test]
+        fn prop_jags_completions_exclude_r_items(
+            content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
+            ext in prop_oneof![Just("jags"), Just("bugs")]
+        ) {
+            let r_reserved = ["function", "library", "require", "next", "repeat",
+                              "while", "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN"];
+            let uri_str = format!("file:///test/model.{}", ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = completion(&state, &uri, Position::new(0, 0), None);
+            if let Some(CompletionResponse::Array(items)) = result {
+                let labels: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                for rw in &r_reserved {
+                    assert!(
+                        !labels.contains(*rw),
+                        "JAGS completions should not contain R reserved word '{}', but it was found",
+                        rw
+                    );
+                }
+            }
+        }
+
+        // **Validates: Requirements 12.2, 12.3, 12.4**
+        // Property 6: JAGS completions include all JAGS built-ins
+        #[test]
+        fn prop_jags_completions_include_all_builtins(
+            content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
+            ext in prop_oneof![Just("jags"), Just("bugs")]
+        ) {
+            let uri_str = format!("file:///test/model.{}", ext);
+            let uri = Url::parse(&uri_str).unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = completion(&state, &uri, Position::new(0, 0), None);
+            if let Some(CompletionResponse::Array(items)) = result {
+                let labels: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                for kw in crate::jags_builtins::JAGS_KEYWORDS {
+                    assert!(labels.contains(*kw), "JAGS completions missing keyword '{}'", kw);
+                }
+                for dist in crate::jags_builtins::JAGS_DISTRIBUTIONS {
+                    assert!(labels.contains(*dist), "JAGS completions missing distribution '{}'", dist);
+                }
+                for func in crate::jags_builtins::JAGS_FUNCTIONS {
+                    assert!(labels.contains(*func), "JAGS completions missing function '{}'", func);
+                }
+            } else {
+                panic!("Expected Some(CompletionResponse::Array) for JAGS file");
+            }
+        }
+
+        // **Validates: Requirements 12.5**
+        // Property 7: JAGS completions include file-local symbols
+        #[test]
+        fn prop_jags_completions_include_local_symbols(
+            varname in "[a-zA-Z][a-zA-Z0-9_]{0,10}"
+        ) {
+            let content = format!("{} <- 1\n", varname);
+            let uri = Url::parse("file:///test/model.jags").unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = completion(&state, &uri, Position::new(1, 0), None);
+            if let Some(CompletionResponse::Array(items)) = result {
+                let labels: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                assert!(
+                    labels.contains(&varname),
+                    "JAGS completions should include file-local symbol '{}', got: {:?}",
+                    varname,
+                    labels
+                );
+            } else {
+                panic!("Expected Some(CompletionResponse::Array) for JAGS file");
+            }
+        }
+
+        // **Validates: Requirements 13.1**
+        // Property 8: Stan completions exclude R-specific items
+        #[test]
+        fn prop_stan_completions_exclude_r_items(
+            content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}"
+        ) {
+            // Only check R reserved words that are NOT also Stan keywords.
+            // Stan legitimately includes "for", "in", "while", "if", "else", "break", "return".
+            let r_only_reserved = ["function", "library", "require", "next", "repeat",
+                                   "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN"];
+            let uri = Url::parse("file:///test/model.stan").unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = completion(&state, &uri, Position::new(0, 0), None);
+            if let Some(CompletionResponse::Array(items)) = result {
+                let labels: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                for rw in &r_only_reserved {
+                    assert!(
+                        !labels.contains(*rw),
+                        "Stan completions should not contain R reserved word '{}', but it was found",
+                        rw
+                    );
+                }
+            }
+        }
+
+        // **Validates: Requirements 13.2, 13.3, 13.4, 13.5**
+        // Property 9: Stan completions include all Stan built-ins
+        #[test]
+        fn prop_stan_completions_include_all_builtins(
+            content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}"
+        ) {
+            let uri = Url::parse("file:///test/model.stan").unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = completion(&state, &uri, Position::new(0, 0), None);
+            if let Some(CompletionResponse::Array(items)) = result {
+                let labels: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                for ty in crate::stan_builtins::STAN_TYPES {
+                    assert!(labels.contains(*ty), "Stan completions missing type '{}'", ty);
+                }
+                for kw in crate::stan_builtins::STAN_BLOCK_KEYWORDS {
+                    assert!(labels.contains(*kw), "Stan completions missing block keyword '{}'", kw);
+                }
+                for cf in crate::stan_builtins::STAN_CONTROL_FLOW {
+                    assert!(labels.contains(*cf), "Stan completions missing control flow '{}'", cf);
+                }
+                for func in crate::stan_builtins::STAN_FUNCTIONS {
+                    assert!(labels.contains(*func), "Stan completions missing function '{}'", func);
+                }
+            } else {
+                panic!("Expected Some(CompletionResponse::Array) for Stan file");
+            }
+        }
+
+        // **Validates: Requirements 13.6**
+        // Property 10: Stan completions include file-local symbols
+        #[test]
+        fn prop_stan_completions_include_local_symbols(
+            varname in "[a-zA-Z][a-zA-Z0-9_]{0,10}"
+        ) {
+            let content = format!("{} <- 1\n", varname);
+            let uri = Url::parse("file:///test/model.stan").unwrap();
+            let mut state = crate::state::WorldState::new(vec![]);
+            let doc = crate::state::Document::new(&content, None);
+            state.documents.insert(uri.clone(), doc);
+            let result = completion(&state, &uri, Position::new(1, 0), None);
+            if let Some(CompletionResponse::Array(items)) = result {
+                let labels: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                assert!(
+                    labels.contains(&varname),
+                    "Stan completions should include file-local symbol '{}', got: {:?}",
+                    varname,
+                    labels
+                );
+            } else {
+                panic!("Expected Some(CompletionResponse::Array) for Stan file");
+            }
+        }
     }
 }

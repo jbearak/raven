@@ -1050,8 +1050,12 @@ fn scan_directory(
             }
             scan_directory(&path, index, cross_file_entries, new_index_entries);
         } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            // Match both .R and .r extensions (case-insensitive)
-            if ext.eq_ignore_ascii_case("r") {
+            // Match R, JAGS, and Stan file extensions (case-insensitive)
+            if ext.eq_ignore_ascii_case("r")
+                || ext.eq_ignore_ascii_case("jags")
+                || ext.eq_ignore_ascii_case("bugs")
+                || ext.eq_ignore_ascii_case("stan")
+            {
                 if let Ok(text) = fs::read_to_string(&path) {
                     if let Ok(uri) = Url::from_file_path(&path) {
                         log::trace!("Scanning file: {}", uri);

@@ -20,6 +20,8 @@ pub mod test_utils;
 pub mod backend;
 pub mod builtins;
 pub mod completion_context;
+pub mod jags_builtins;
+pub mod stan_builtins;
 pub mod content_provider;
 pub mod document_store;
 pub mod file_path_intellisense;

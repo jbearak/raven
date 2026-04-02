@@ -8,6 +8,8 @@
 mod backend;
 mod builtins;
 mod cli;
+mod jags_builtins;
+mod stan_builtins;
 mod completion_context;
 mod content_provider;
 mod cross_file;

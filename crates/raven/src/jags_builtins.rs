@@ -1,0 +1,70 @@
+/// Built-in distributions, functions, and keywords for the JAGS language.
+///
+/// These lists are used by the completion handler to provide JAGS-specific
+/// suggestions when editing `.jags` and `.bugs` files.
+
+pub static JAGS_DISTRIBUTIONS: &[&str] = &[
+    "dnorm",
+    "dbern",
+    "dgamma",
+    "dunif",
+    "dpois",
+    "dbin",
+    "dbeta",
+    "dexp",
+    "dt",
+    "dweib",
+    "dlnorm",
+    "dchisqr",
+    "dlogis",
+    "dmulti",
+    "ddirch",
+    "dwish",
+    "dmnorm",
+    "dmt",
+    "dinterval",
+    "dcat",
+];
+
+pub static JAGS_FUNCTIONS: &[&str] = &[
+    "abs",
+    "sqrt",
+    "log",
+    "exp",
+    "pow",
+    "sin",
+    "cos",
+    "sum",
+    "prod",
+    "min",
+    "max",
+    "mean",
+    "sd",
+    "inverse",
+    "logit",
+    "probit",
+    "cloglog",
+    "ilogit",
+    "phi",
+    "step",
+    "equals",
+    "round",
+    "trunc",
+    "inprod",
+    "interp.lin",
+    "logfact",
+    "loggam",
+    "rank",
+    "sort",
+    "ifelse",
+    "T",
+];
+
+pub static JAGS_KEYWORDS: &[&str] = &[
+    "model",
+    "data",
+    "for",
+    "in",
+    "if",
+    "else",
+];

@@ -16,7 +16,9 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:r"
+    "onLanguage:r",
+    "onLanguage:jags",
+    "onLanguage:stan"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -35,6 +37,41 @@
           ".qmd"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "jags",
+        "aliases": [
+          "JAGS",
+          "jags"
+        ],
+        "extensions": [
+          ".jags",
+          ".bugs"
+        ],
+        "configuration": "./jags-language-configuration.json"
+      },
+      {
+        "id": "stan",
+        "aliases": [
+          "Stan",
+          "stan"
+        ],
+        "extensions": [
+          ".stan"
+        ],
+        "configuration": "./stan-language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jags",
+        "scopeName": "source.jags",
+        "path": "./syntaxes/jags.tmLanguage.json"
+      },
+      {
+        "language": "stan",
+        "scopeName": "source.stan",
+        "path": "./syntaxes/stan.tmLanguage.json"
       }
     ],
     "configurationDefaults": {

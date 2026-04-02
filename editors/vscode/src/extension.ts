@@ -51,7 +51,7 @@ function sendActivityNotification() {
     // Only include R files
     const isRFile = (uri: vscode.Uri) => {
         const ext = path.extname(uri.fsPath).toLowerCase();
-        return ['.r', '.rmd', '.qmd'].includes(ext);
+        return ['.r', '.rmd', '.qmd', '.jags', '.bugs', '.stan'].includes(ext);
     };
 
     const activeUri = activeEditor?.document.uri;
@@ -84,9 +84,13 @@ export function activate(context: vscode.ExtensionContext) {
         documentSelector: [
             { scheme: 'file', language: 'r' },
             { scheme: 'untitled', language: 'r' },
+            { scheme: 'file', language: 'jags' },
+            { scheme: 'untitled', language: 'jags' },
+            { scheme: 'file', language: 'stan' },
+            { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd}'),
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd,jags,bugs,stan}'),
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions(),
