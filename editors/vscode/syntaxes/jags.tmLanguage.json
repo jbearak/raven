@@ -41,7 +41,7 @@
     },
     "math-function": {
       "name": "support.function.math.jags",
-      "match": "\\b(abs|sqrt|log|exp|pow|sin|cos|sum|prod|min|max|mean|sd|inverse|logit|probit|cloglog|ilogit|phi|step|equals|round|trunc|inprod|interp\\.lin|logfact|loggam|rank|sort|ifelse|T)\\b"
+      "match": "(?<![a-zA-Z0-9_.])(abs|sqrt|log|exp|pow|sin|cos|sum|prod|min|max|mean|sd|inverse|logit|probit|cloglog|ilogit|phi|step|equals|round|trunc|inprod|interp\\.lin|logfact|loggam|rank|sort|ifelse|T)(?![a-zA-Z0-9_.])"
     },
     "numeric": {
       "name": "constant.numeric.jags",
