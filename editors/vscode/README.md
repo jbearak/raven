@@ -24,7 +24,6 @@ A language server for R, JAGS, and Stan with cross-file awareness.
 - **Document symbols** — Hierarchical outline with structural blocks (e.g. `model`, `data`, `parameters`), loops, and comment sections
 - **Go-to-definition** — Navigate to variable and function definitions within a file
 - **Find references** — Locate all usages of a symbol within a file and across open documents
-- **Hover** — Symbol information including definition location
 
 ## Settings
 

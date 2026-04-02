@@ -10303,6 +10303,9 @@ async fn get_help_cached(
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
+    if doc.file_type != FileType::R {
+        return None;
+    }
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
