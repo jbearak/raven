@@ -154,6 +154,7 @@ pub struct Document {
 }
 
 impl Document {
+    #[cfg(test)]
     pub fn new(text: &str, version: Option<i32>) -> Self {
         Self::new_with_file_type(text, version, FileType::R)
     }
