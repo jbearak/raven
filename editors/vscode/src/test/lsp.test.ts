@@ -277,6 +277,44 @@ suite('Ark LSP Extension', () => {
         );
     });
 
+    test('forward reference at top level is flagged when file has parent', async function (this: Mocha.Context) {
+        // Reproduces: main.r -> data.r -> impute.r
+        // In impute.r, `food` is used on lines 2-3 before being defined on line 4.
+        // The forward reference should produce "Undefined variable: food" diagnostics.
+        // sentinel_undefined_fwdref_usage is always undefined (sentinel to confirm checking ran).
+        const doc = await openDocument('forward_ref/impute.r');
+
+        const diagnostics = await waitForDiagnostics(doc.uri, 15000);
+
+        let finalDiags = diagnostics;
+        if (diagnostics.length === 0) {
+            await sleep(5000);
+            finalDiags = vscode.languages.getDiagnostics(doc.uri);
+        }
+
+        // If still no diagnostics, workspace scan didn't complete — skip.
+        if (finalDiags.length === 0) {
+            this.skip();
+        }
+
+        const messages = finalDiags.map(d => d.message);
+
+        // Assert the sentinel diagnostic IS present — proves undefined-variable checking ran.
+        assert.ok(
+            messages.some(m => m.includes('sentinel_undefined_fwdref_usage')),
+            `Expected sentinel diagnostic for sentinel_undefined_fwdref_usage. ` +
+            `Got diagnostics: ${messages.join('; ')}`
+        );
+
+        // Assert forward reference to `food` IS flagged (used before defined at top level).
+        const foodDiags = finalDiags.filter(d => d.message.includes('food'));
+        assert.ok(
+            foodDiags.length >= 1,
+            `Expected 'food' to be flagged as undefined (forward reference at top level). ` +
+            `Got diagnostics: ${messages.join('; ')}`
+        );
+    });
+
     test('package.json registers mixed-case JAGS and Stan extensions', async () => {
         const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
         const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));

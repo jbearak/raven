@@ -22,6 +22,12 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "raven.restart",
+        "title": "Raven: Restart Language Server"
+      }
+    ],
     "languages": [
       {
         "id": "r",
@@ -93,6 +99,12 @@
           "type": "string",
           "default": "",
           "description": "Path to raven binary. If empty, uses bundled binary."
+        },
+        "raven.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace level for the Raven language server. 'messages' shows debug output, 'verbose' shows full trace output including diagnostic decisions."
         },
         "raven.editor.dotInWordSeparators": {
           "type": "string",

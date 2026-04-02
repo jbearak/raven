@@ -80,9 +80,17 @@ function sendActivityNotification() {
 export function activate(context: vscode.ExtensionContext) {
     const serverPath = getServerPath(context);
 
+    function buildRustLogEnv(): Record<string, string> | undefined {
+        const traceLevel = vscode.workspace.getConfiguration('raven').get<string>('trace.server', 'off');
+        const rustLog = traceLevel === 'verbose' ? 'raven=trace' :
+                        traceLevel === 'messages' ? 'raven=debug' : undefined;
+        return rustLog ? { ...process.env as Record<string, string>, RUST_LOG: rustLog } : undefined;
+    }
+
     const serverOptions: ServerOptions = {
         command: serverPath,
         args: ['--stdio'],
+        options: { env: buildRustLogEnv() },
     };
 
     // Create output channel for server logs
@@ -101,7 +109,7 @@ export function activate(context: vscode.ExtensionContext) {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
         },
         outputChannel: outputChannel,
-        initializationOptions: getInitializationOptions(),
+        initializationOptions: getInitializationOptions,
     };
 
     client = new LanguageClient(
@@ -112,6 +120,14 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     client.start();
+
+    // Register restart command — re-reads trace config so changed settings take effect
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.restart', async () => {
+            (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
+            await client.restart();
+        })
+    );
 
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
