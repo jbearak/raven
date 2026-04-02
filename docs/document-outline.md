@@ -246,6 +246,8 @@ Stan files (`.stan`) support seven block types:
 | `model { }` | model |
 | `generated quantities { }` | generated quantities |
 
+Constrained declarations keep the declared identifier in the outline, so `real<lower=0, upper=1> foo;` appears as `foo`, not the constraint names.
+
 ### Example
 
 ```stan

@@ -2460,7 +2460,11 @@ impl BlockDetector {
             let keyword_col = keyword_start - line_start;
 
             // Normalize keyword name: collapse internal whitespace to single space
-            let keyword_name = keyword_match.as_str().split_whitespace().collect::<Vec<_>>().join(" ");
+            let keyword_name = keyword_match
+                .as_str()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             let keyword_len = keyword_name.len() as u32;
 
             // Find the opening brace: check if it's in the full match, otherwise scan forward
@@ -2499,7 +2503,10 @@ impl BlockDetector {
                             },
                             selection_range: Range {
                                 start: Position::new(keyword_line as u32, keyword_col as u32),
-                                end: Position::new(keyword_line as u32, keyword_col as u32 + keyword_len),
+                                end: Position::new(
+                                    keyword_line as u32,
+                                    keyword_col as u32 + keyword_len,
+                                ),
                             },
                             detail: None,
                             section_level: Some(1),
@@ -2669,16 +2676,26 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
-    // Use SymbolExtractor to extract symbols from the document
-    let extractor = SymbolExtractor::new(&text, tree.root_node());
-    let mut raw_symbols = extractor.extract_all();
+    let raw_symbols = match doc.file_type {
+        FileType::Stan => {
+            let extractor = SymbolExtractor::new(&text, tree.root_node());
+            let mut raw_symbols = extractor.extract_sections();
+            raw_symbols.extend(collect_stan_document_symbols(&text));
+            raw_symbols.extend(BlockDetector::detect_stan(&text));
+            raw_symbols
+        }
+        FileType::Jags | FileType::R => {
+            // Use SymbolExtractor to extract symbols from the document
+            let extractor = SymbolExtractor::new(&text, tree.root_node());
+            let mut raw_symbols = extractor.extract_all();
 
-    // Detect JAGS/Stan blocks based on file type
-    match doc.file_type {
-        FileType::Jags => raw_symbols.extend(BlockDetector::detect_jags(&text)),
-        FileType::Stan => raw_symbols.extend(BlockDetector::detect_stan(&text)),
-        FileType::R => {}
-    }
+            if matches!(doc.file_type, FileType::Jags) {
+                raw_symbols.extend(BlockDetector::detect_jags(&text));
+            }
+
+            raw_symbols
+        }
+    };
 
     // Calculate line count for HierarchyBuilder
     let line_count = text.lines().count() as u32;
@@ -7991,6 +8008,152 @@ fn push_local_symbol_completion(
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StanDocumentSymbolKind {
+    Variable,
+    Function,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StanDocumentSymbolMatch {
+    name: String,
+    line: u32,
+    kind: StanDocumentSymbolKind,
+    declaration_start: usize,
+    declaration_end: usize,
+    name_start: usize,
+    name_end: usize,
+}
+
+fn stan_variable_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:array\s*\[[^\]\r\n]+\]\s+)?(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?\s*(?:;|=|<-)",
+        )
+        .expect("valid Stan variable regex")
+    })
+}
+
+fn stan_function_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:array\s*\[[^\]\r\n]+\]\s+)?(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)\r\n]*\)\s*\{?",
+        )
+        .expect("valid Stan function regex")
+    })
+}
+
+fn stan_line_candidates(line: &str) -> Vec<(usize, &str)> {
+    let code = line.split("//").next().unwrap_or(line);
+    let mut candidates = vec![(0, code)];
+
+    if let Some((head, tail)) = code.rsplit_once('{') {
+        candidates.push((head.len() + 1, tail));
+    }
+
+    candidates
+}
+
+fn stan_match_from_captures(
+    captures: regex::Captures<'_>,
+    offset: usize,
+    line_idx: usize,
+    kind: StanDocumentSymbolKind,
+) -> Option<StanDocumentSymbolMatch> {
+    let declaration = captures.get(0)?;
+    let name = captures.get(1)?;
+
+    Some(StanDocumentSymbolMatch {
+        name: name.as_str().to_string(),
+        line: line_idx as u32,
+        kind,
+        declaration_start: offset + declaration.start(),
+        declaration_end: offset + declaration.end(),
+        name_start: offset + name.start(),
+        name_end: offset + name.end(),
+    })
+}
+
+fn collect_stan_declaration_matches(text: &str) -> Vec<StanDocumentSymbolMatch> {
+    let mut matches = Vec::new();
+    let var_re = stan_variable_pattern();
+    let fn_re = stan_function_pattern();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        for (offset, candidate) in stan_line_candidates(line) {
+            if let Some(captures) = var_re.captures(candidate) {
+                if let Some(symbol) = stan_match_from_captures(
+                    captures,
+                    offset,
+                    line_idx,
+                    StanDocumentSymbolKind::Variable,
+                ) {
+                    matches.push(symbol);
+                    break;
+                }
+            }
+
+            if let Some(captures) = fn_re.captures(candidate) {
+                if let Some(symbol) = stan_match_from_captures(
+                    captures,
+                    offset,
+                    line_idx,
+                    StanDocumentSymbolKind::Function,
+                ) {
+                    matches.push(symbol);
+                    break;
+                }
+            }
+        }
+    }
+
+    matches
+}
+
+fn collect_stan_document_symbols(text: &str) -> Vec<RawSymbol> {
+    let lines: Vec<&str> = text.lines().collect();
+
+    collect_stan_declaration_matches(text)
+        .into_iter()
+        .filter_map(|symbol| {
+            let line_text = lines.get(symbol.line as usize)?;
+            let declaration_start = crate::cross_file::types::byte_offset_to_utf16_column(
+                line_text,
+                symbol.declaration_start,
+            );
+            let declaration_end = crate::cross_file::types::byte_offset_to_utf16_column(
+                line_text,
+                symbol.declaration_end,
+            );
+            let name_start =
+                crate::cross_file::types::byte_offset_to_utf16_column(line_text, symbol.name_start);
+            let name_end =
+                crate::cross_file::types::byte_offset_to_utf16_column(line_text, symbol.name_end);
+
+            Some(RawSymbol {
+                name: symbol.name,
+                kind: match symbol.kind {
+                    StanDocumentSymbolKind::Variable => DocumentSymbolKind::Variable,
+                    StanDocumentSymbolKind::Function => DocumentSymbolKind::Function,
+                },
+                range: Range {
+                    start: Position::new(symbol.line, declaration_start),
+                    end: Position::new(symbol.line, declaration_end),
+                },
+                selection_range: Range {
+                    start: Position::new(symbol.line, name_start),
+                    end: Position::new(symbol.line, name_end),
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            })
+        })
+        .collect()
+}
+
 fn collect_jags_document_completions(
     text: &str,
     uri: &Url,
@@ -8029,54 +8192,19 @@ fn collect_stan_document_completions(
     items: &mut Vec<CompletionItem>,
     seen_names: &mut std::collections::HashSet<String>,
 ) {
-    static STAN_VAR_RE: OnceLock<Regex> = OnceLock::new();
-    static STAN_FN_RE: OnceLock<Regex> = OnceLock::new();
-
-    let var_re = STAN_VAR_RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*(?:array\s*\[[^\]\r\n]+\]\s+)?(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?\s*(?:;|=|<-)",
-        )
-        .expect("valid Stan variable regex")
-    });
-    let fn_re = STAN_FN_RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
-        )
-        .expect("valid Stan function regex")
-    });
-
-    for (line_idx, line) in text.lines().enumerate() {
-        let code = line.split("//").next().unwrap_or(line);
-
-        for candidate in std::iter::once(code).chain(code.rsplit_once('{').map(|(_, tail)| tail)) {
-            if let Some(captures) = var_re.captures(candidate) {
-                if let Some(name) = captures.get(1) {
-                    push_local_symbol_completion(
-                        items,
-                        seen_names,
-                        uri,
-                        name.as_str(),
-                        line_idx as u32,
-                        CompletionItemKind::FIELD,
-                    );
-                    break;
-                }
-            }
-
-            if let Some(captures) = fn_re.captures(candidate) {
-                if let Some(name) = captures.get(1) {
-                    push_local_symbol_completion(
-                        items,
-                        seen_names,
-                        uri,
-                        name.as_str(),
-                        line_idx as u32,
-                        CompletionItemKind::FUNCTION,
-                    );
-                    break;
-                }
-            }
-        }
+    for symbol in collect_stan_declaration_matches(text) {
+        let completion_kind = match symbol.kind {
+            StanDocumentSymbolKind::Variable => CompletionItemKind::FIELD,
+            StanDocumentSymbolKind::Function => CompletionItemKind::FUNCTION,
+        };
+        push_local_symbol_completion(
+            items,
+            seen_names,
+            uri,
+            &symbol.name,
+            symbol.line,
+            completion_kind,
+        );
     }
 }
 
@@ -34928,22 +35056,71 @@ mod block_detector_integration_tests {
         let code = "model {\n  y <- x\n}\n";
         let (state, uri) = make_state("file:///test/model.jags", code);
         let symbols = nested_symbols(&state, &uri);
-        let block = symbols.iter().find(|s| s.name == "model" && s.kind == SymbolKind::MODULE);
-        assert!(block.is_some(), "JAGS file should have a 'model' Module symbol");
+        let block = symbols
+            .iter()
+            .find(|s| s.name == "model" && s.kind == SymbolKind::MODULE);
+        assert!(
+            block.is_some(),
+            "JAGS file should have a 'model' Module symbol"
+        );
         let children = block.unwrap().children.as_ref().unwrap();
         assert!(!children.is_empty(), "model block should contain children");
     }
 
     #[test]
     fn test_stan_file_block_nesting() {
-        // Use R-compatible assignment syntax so SymbolExtractor can parse children
-        let code = "parameters {\n  mu <- 1\n}\n";
+        let code = "parameters {\n  real<lower=0> mu;\n}\n";
         let (state, uri) = make_state("file:///test/model.stan", code);
         let symbols = nested_symbols(&state, &uri);
-        let block = symbols.iter().find(|s| s.name == "parameters" && s.kind == SymbolKind::MODULE);
-        assert!(block.is_some(), "Stan file should have a 'parameters' Module symbol");
+        let block = symbols
+            .iter()
+            .find(|s| s.name == "parameters" && s.kind == SymbolKind::MODULE);
+        assert!(
+            block.is_some(),
+            "Stan file should have a 'parameters' Module symbol"
+        );
         let children = block.unwrap().children.as_ref().unwrap();
-        assert!(!children.is_empty(), "parameters block should contain children");
+        let child_names: Vec<&str> = children.iter().map(|child| child.name.as_str()).collect();
+        assert!(
+            child_names.contains(&"mu"),
+            "parameters block should contain mu"
+        );
+    }
+
+    #[test]
+    fn test_stan_outline_uses_declared_identifier_for_constrained_declaration() {
+        let code = "parameters {\n  real<lower=0, upper=1> foo;\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        let block = symbols
+            .iter()
+            .find(|s| s.name == "parameters" && s.kind == SymbolKind::MODULE);
+        assert!(
+            block.is_some(),
+            "Stan file should have a 'parameters' Module symbol"
+        );
+
+        let child_names: Vec<&str> = block
+            .unwrap()
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+
+        assert!(
+            child_names.contains(&"foo"),
+            "outline should contain declared identifier foo"
+        );
+        assert!(
+            !child_names.contains(&"lower"),
+            "outline should not contain Stan constraint argument lower"
+        );
+        assert!(
+            !child_names.contains(&"upper"),
+            "outline should not contain Stan constraint argument upper"
+        );
     }
 
     #[test]
@@ -34953,11 +35130,75 @@ mod block_detector_integration_tests {
         let symbols = nested_symbols(&state, &uri);
         let root_names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(root_names.contains(&"x"), "x should be at root level");
-        assert!(root_names.contains(&"model"), "model block should be at root level");
+        assert!(
+            root_names.contains(&"model"),
+            "model block should be at root level"
+        );
         // x is at root (before block), model is at root; y is nested inside model
         let model = symbols.iter().find(|s| s.name == "model").unwrap();
-        let child_names: Vec<&str> = model.children.as_ref().unwrap().iter().map(|c| c.name.as_str()).collect();
-        assert!(child_names.contains(&"y"), "y should be nested inside model block");
+        let child_names: Vec<&str> = model
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            child_names.contains(&"y"),
+            "y should be nested inside model block"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stan_symbol_parser_tests {
+    use super::*;
+
+    fn symbol_names(text: &str) -> Vec<String> {
+        collect_stan_declaration_matches(text)
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect()
+    }
+
+    #[test]
+    fn test_stan_parser_extracts_constrained_scalar_name() {
+        assert_eq!(
+            symbol_names("real<lower=0, upper=1> foo;\n"),
+            vec!["foo".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_stan_parser_extracts_constrained_vector_name() {
+        assert_eq!(
+            symbol_names("vector<lower=0>[N] y;\n"),
+            vec!["y".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_stan_parser_extracts_array_prefixed_name() {
+        assert_eq!(
+            symbol_names("array[N] real<lower=0> z;\n"),
+            vec!["z".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_stan_parser_extracts_function_name() {
+        let symbols = collect_stan_declaration_matches("real log_prob(real x) {\n");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "log_prob");
+        assert_eq!(symbols[0].kind, StanDocumentSymbolKind::Function);
+    }
+
+    #[test]
+    fn test_stan_parser_handles_same_line_block_header() {
+        assert_eq!(
+            symbol_names("parameters { real<lower=0> sigma; }\n"),
+            vec!["sigma".to_string()]
+        );
     }
 }
 
@@ -34977,7 +35218,15 @@ mod block_detector_proptests {
     fn is_r_reserved(s: &str) -> bool {
         matches!(
             s,
-            "for" | "if" | "in" | "else" | "while" | "repeat" | "next" | "break" | "function"
+            "for"
+                | "if"
+                | "in"
+                | "else"
+                | "while"
+                | "repeat"
+                | "next"
+                | "break"
+                | "function"
                 | "return"
         )
     }
@@ -35045,7 +35294,6 @@ mod block_detector_proptests {
             prop_assert_eq!(symbols.len(), 1);
             prop_assert_eq!(symbols[0].range.start.line, 0);
             // The closing brace should be on the last non-empty line
-            let last_line = lines.len() - 1; // trailing newline means last line with } is len-2 or len-1
             let end_line = symbols[0].range.end.line as usize;
             // end_line should point to a line containing '}'
             prop_assert!(end_line < lines.len(), "end_line {} out of bounds ({})", end_line, lines.len());
@@ -35156,7 +35404,10 @@ mod block_detector_tests {
     }
 
     fn rng(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
-        Range { start: pos(sl, sc), end: pos(el, ec) }
+        Range {
+            start: pos(sl, sc),
+            end: pos(el, ec),
+        }
     }
 
     // --- JAGS detection tests ---
@@ -35222,10 +35473,18 @@ generated quantities {
         let syms = BlockDetector::detect_stan(text);
         assert_eq!(syms.len(), 7);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec![
-            "functions", "data", "transformed data", "parameters",
-            "transformed parameters", "model", "generated quantities",
-        ]);
+        assert_eq!(
+            names,
+            vec![
+                "functions",
+                "data",
+                "transformed data",
+                "parameters",
+                "transformed parameters",
+                "model",
+                "generated quantities",
+            ]
+        );
     }
 
     #[test]
