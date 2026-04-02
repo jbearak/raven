@@ -11,6 +11,7 @@ A language server for R, JAGS, and Stan with cross-file awareness.
 - **Completions** — Intelligent completion for local symbols, cross-file symbols, and package exports (with `{package}` attribution)
 - **Diagnostics** — Undefined variable detection that understands sourced files and loaded packages
 - **Go-to-definition** — Navigate to symbol definitions across file boundaries
+- **File path intellisense** — Complete and cmd-click paths in `source()` calls and `@lsp-*source*` directives
 - **Find references** — Locate all symbol usages project-wide
 - **Hover** — Symbol information including source file and package origin
 - **Document symbols** — Hierarchical outline with R code section support (`# Section ----`)

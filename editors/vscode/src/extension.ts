@@ -14,6 +14,7 @@ import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
 } from './extensionHelpers';
+import { shouldTriggerDirectivePathSuggest } from './pathCompletionTriggers';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -156,6 +157,29 @@ export function activate(context: vscode.ExtensionContext) {
                 });
             }
         })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeTextDocument((event) => {
+            const activeEditor = vscode.window.activeTextEditor;
+            if (!activeEditor || activeEditor.document.uri.toString() !== event.document.uri.toString()) {
+                return;
+            }
+            if (!isRDocument(event.document) || event.contentChanges.length !== 1) {
+                return;
+            }
+
+            const change = event.contentChanges[0];
+            if (change.rangeLength !== 0) {
+                return;
+            }
+
+            const lineText = event.document.lineAt(change.range.start.line).text;
+            const linePrefix = lineText.slice(0, change.range.start.character + change.text.length);
+            if (shouldTriggerDirectivePathSuggest(change.text, linePrefix)) {
+                void vscode.commands.executeCommand('editor.action.triggerSuggest');
+            }
+        }),
     );
 
     // Prompt for word separators configuration

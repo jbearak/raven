@@ -556,6 +556,7 @@ fn build_completion_trigger_chars(trigger_on_open_paren: bool) -> Vec<String> {
         String::from("@"),
         String::from("/"),
         String::from("\""),
+        String::from("'"),
     ];
     if trigger_on_open_paren {
         chars.push(String::from("("));
@@ -4076,6 +4077,24 @@ mod tests {
                 config.trigger_on_open_paren,
                 "trigger_on_open_paren should default to true"
             );
+        }
+
+        #[test]
+        fn test_completion_trigger_chars_include_file_path_triggers() {
+            let trigger_chars = crate::backend::build_completion_trigger_chars(true);
+
+            assert!(trigger_chars.contains(&"\"".to_string()));
+            assert!(trigger_chars.contains(&"'".to_string()));
+            assert!(trigger_chars.contains(&"/".to_string()));
+        }
+
+        #[test]
+        fn test_completion_trigger_chars_optionally_include_open_paren() {
+            let with_paren = crate::backend::build_completion_trigger_chars(true);
+            let without_paren = crate::backend::build_completion_trigger_chars(false);
+
+            assert!(with_paren.contains(&"(".to_string()));
+            assert!(!without_paren.contains(&"(".to_string()));
         }
     }
 

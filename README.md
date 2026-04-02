@@ -105,6 +105,7 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 - **Declaration directives** - Suppress diagnostics for dynamically-created symbols (`@lsp-var`, `@lsp-func`) that cannot be statically detected
 - **Diagnostics** - Scope-aware undefined variable detection that understands sourced files
 - **Go-to-definition** - Navigate to symbol definitions across file boundaries
+- **File path intellisense** - Complete and cmd-click paths in `source()` calls and `@lsp-source` / `@lsp-sourced-by` directives
 - **Find references** - Locate all symbol usages project-wide
 - **Completions** - Workspace-aware completion including symbols from sourced files and loaded packages
 - **Function signatures** - Parameter completion and richer function signature hovers
