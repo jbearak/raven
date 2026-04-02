@@ -277,7 +277,7 @@ suite('Ark LSP Extension', () => {
         );
     });
 
-    test('forward reference at top level is flagged when file has parent', async () => {
+    test('forward reference at top level is flagged when file has parent', async function (this: Mocha.Context) {
         // Reproduces: main.r -> data.r -> impute.r
         // In impute.r, `food` is used on lines 2-3 before being defined on line 4.
         // The forward reference should produce "Undefined variable: food" diagnostics.
@@ -294,7 +294,7 @@ suite('Ark LSP Extension', () => {
 
         // If still no diagnostics, workspace scan didn't complete — skip.
         if (finalDiags.length === 0) {
-            return;
+            this.skip();
         }
 
         const messages = finalDiags.map(d => d.message);

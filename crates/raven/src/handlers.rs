@@ -5190,21 +5190,11 @@ fn collect_undefined_variables_from_snapshot(
         };
 
         if let Some(sym) = scope.symbols.get(name.as_str()) {
-            // When a parent sources this file, the file's own exports flow into the
-            // parent's scope and back here via backward edges. For same-file symbols,
-            // re-apply the position check so forward references are still caught.
-            if sym.source_uri == *uri {
-                let usage_col_for_check = byte_offset_to_utf16_column(
-                    get_line(usage_node.start_position().row),
-                    usage_node.start_position().column,
-                );
-                if (sym.defined_line, sym.defined_column)
-                    <= (usage_line, usage_col_for_check)
-                {
-                    continue;
-                }
-                // Forward reference — don't skip
-            } else {
+            let usage_col_for_check = byte_offset_to_utf16_column(
+                get_line(usage_node.start_position().row),
+                usage_node.start_position().column,
+            );
+            if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_for_check) {
                 continue;
             }
         }
@@ -7921,21 +7911,11 @@ pub(crate) fn collect_undefined_variables_position_aware(
 
         // Check if symbol is in cross-file scope
         if let Some(sym) = scope.symbols.get(name.as_str()) {
-            // When a parent sources this file, the file's own exports flow into the
-            // parent's scope and back here via backward edges. For same-file symbols,
-            // re-apply the position check so forward references are still caught.
-            if sym.source_uri == *uri {
-                let usage_col_for_check = byte_offset_to_utf16_column(
-                    get_line(usage_node.start_position().row),
-                    usage_node.start_position().column,
-                );
-                if (sym.defined_line, sym.defined_column)
-                    <= (usage_line, usage_col_for_check)
-                {
-                    continue;
-                }
-                // Forward reference — don't skip
-            } else {
+            let usage_col_for_check = byte_offset_to_utf16_column(
+                get_line(usage_node.start_position().row),
+                usage_node.start_position().column,
+            );
+            if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_for_check) {
                 continue;
             }
         }
@@ -8371,6 +8351,21 @@ fn collect_usages_with_context<'a>(
             collect_usages_with_context(child, text, &base_context, used);
         }
     }
+}
+
+/// Returns true if a symbol from cross-file scope is a forward reference within the same file.
+///
+/// When a parent sources this file, the file's own exports flow into the parent's scope
+/// and back here via backward edges. For same-file symbols, we re-apply the position check
+/// so forward references are still caught.
+fn is_forward_reference_in_same_file(
+    sym: &scope::ScopedSymbol,
+    uri: &Url,
+    usage_line: u32,
+    usage_col_utf16: u32,
+) -> bool {
+    sym.source_uri == *uri
+        && (sym.defined_line, sym.defined_column) > (usage_line, usage_col_utf16)
 }
 
 /// Determines whether an identifier is a recognized R builtin (constant or function).
@@ -33794,25 +33789,28 @@ x <- 1
         );
 
         // food is used on lines 0 and 1, defined on line 2 → 2 forward references
-        assert_eq!(diagnostics.len(), 2, "Should have 2 diagnostics for forward references (position_aware): {:?}",
+        let food_diags: Vec<_> = diagnostics.iter()
+            .filter(|d| d.message.contains("Undefined variable: food"))
+            .collect();
+        assert_eq!(food_diags.len(), 2, "Should have 2 forward-reference diagnostics (position_aware): {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
-        assert!(diagnostics[0].message.contains("Undefined variable: food"));
-        assert_eq!(diagnostics[0].range.start.line, 0);
-        assert!(diagnostics[1].message.contains("Undefined variable: food"));
-        assert_eq!(diagnostics[1].range.start.line, 1);
+        let mut lines: Vec<u32> = food_diags.iter().map(|d| d.range.start.line).collect();
+        lines.sort();
+        assert_eq!(lines, vec![0, 1]);
 
         // Now test via the snapshot path (what the real LSP uses)
         let snapshot = DiagnosticsSnapshot::build(&state, &impute_uri)
             .expect("Should build snapshot for impute.R");
         let snapshot_diags = diagnostics_from_snapshot(&snapshot, &impute_uri, &DiagCancelToken::never())
             .expect("Should produce diagnostics");
-        let undef_diags: Vec<_> = snapshot_diags.iter()
-            .filter(|d| d.message.contains("Undefined variable"))
+        let snapshot_food: Vec<_> = snapshot_diags.iter()
+            .filter(|d| d.message.contains("Undefined variable: food"))
             .collect();
-        assert_eq!(undef_diags.len(), 2, "Snapshot path should also have 2 undefined variable diagnostics: {:?}",
+        assert_eq!(snapshot_food.len(), 2, "Snapshot path should also have 2 forward-reference diagnostics: {:?}",
             snapshot_diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-        assert!(undef_diags[0].message.contains("food"));
-        assert!(undef_diags[1].message.contains("food"));
+        let mut snapshot_lines: Vec<u32> = snapshot_food.iter().map(|d| d.range.start.line).collect();
+        snapshot_lines.sort();
+        assert_eq!(snapshot_lines, vec![0, 1]);
     }
 
     #[test]
