@@ -1,5 +1,5 @@
 {
-  "name": "raven",
+  "name": "raven-r",
   "displayName": "Raven - R Language Server",
   "description": "Static R language server with cross-file awareness",
   "version": "0.3.0",
