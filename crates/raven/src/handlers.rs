@@ -8033,6 +8033,14 @@ struct StanIdentifierOccurrence {
     end_col: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StanDefinitionCandidate {
+    name: String,
+    line: u32,
+    start_col: u32,
+    end_col: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StanLexState {
     Code,
@@ -8058,6 +8066,14 @@ fn stan_function_pattern() -> &'static Regex {
             r"^\s*(?:array\s*\[[^\]\r\n]+\]\s+)?(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)\r\n]*\)\s*\{?",
         )
         .expect("valid Stan function regex")
+    })
+}
+
+fn stan_for_loop_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"\bfor\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+            .expect("valid Stan for-loop regex")
     })
 }
 
@@ -8126,6 +8142,155 @@ fn collect_stan_declaration_matches(text: &str) -> Vec<StanDocumentSymbolMatch> 
     }
 
     matches
+}
+
+fn mask_stan_non_code(text: &str) -> String {
+    let mut masked = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut idx = 0;
+    let mut state = StanLexState::Code;
+
+    while idx < bytes.len() {
+        match state {
+            StanLexState::Code => {
+                if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'/' {
+                    masked.push(' ');
+                    masked.push(' ');
+                    idx += 2;
+                    state = StanLexState::LineComment;
+                } else if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                    masked.push(' ');
+                    masked.push(' ');
+                    idx += 2;
+                    state = StanLexState::BlockComment;
+                } else if bytes[idx] == b'"' {
+                    masked.push(' ');
+                    idx += 1;
+                    state = StanLexState::String;
+                } else {
+                    masked.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            StanLexState::LineComment => {
+                if bytes[idx] == b'\n' {
+                    masked.push('\n');
+                    idx += 1;
+                    state = StanLexState::Code;
+                } else {
+                    masked.push(' ');
+                    idx += 1;
+                }
+            }
+            StanLexState::BlockComment => {
+                if bytes[idx] == b'\n' {
+                    masked.push('\n');
+                    idx += 1;
+                } else if bytes[idx] == b'*' && idx + 1 < bytes.len() && bytes[idx + 1] == b'/' {
+                    masked.push(' ');
+                    masked.push(' ');
+                    idx += 2;
+                    state = StanLexState::Code;
+                } else {
+                    masked.push(' ');
+                    idx += 1;
+                }
+            }
+            StanLexState::String => {
+                if bytes[idx] == b'\n' {
+                    masked.push('\n');
+                    idx += 1;
+                    state = StanLexState::Code;
+                } else if bytes[idx] == b'\\' && idx + 1 < bytes.len() {
+                    masked.push(' ');
+                    masked.push(' ');
+                    idx += 2;
+                } else if bytes[idx] == b'"' {
+                    masked.push(' ');
+                    idx += 1;
+                    state = StanLexState::Code;
+                } else {
+                    masked.push(' ');
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    masked
+}
+
+fn collect_stan_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate> {
+    let masked = mask_stan_non_code(text);
+    let lines: Vec<&str> = masked.lines().collect();
+    let mut candidates = Vec::new();
+    let var_re = stan_variable_pattern();
+    let fn_re = stan_function_pattern();
+    let for_re = stan_for_loop_pattern();
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        for (offset, candidate) in stan_line_candidates(line) {
+            if let Some(captures) = var_re
+                .captures(candidate)
+                .or_else(|| fn_re.captures(candidate))
+            {
+                if let Some(name) = captures.get(1) {
+                    let start = offset + name.start();
+                    let end = offset + name.end();
+                    candidates.push(StanDefinitionCandidate {
+                        name: name.as_str().to_string(),
+                        line: line_idx as u32,
+                        start_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                            line, start,
+                        ),
+                        end_col: crate::cross_file::types::byte_offset_to_utf16_column(line, end),
+                    });
+                }
+            }
+        }
+
+        for captures in for_re.captures_iter(line) {
+            if let Some(name) = captures.get(1) {
+                candidates.push(StanDefinitionCandidate {
+                    name: name.as_str().to_string(),
+                    line: line_idx as u32,
+                    start_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                        line,
+                        name.start(),
+                    ),
+                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                        line,
+                        name.end(),
+                    ),
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+fn find_stan_definition(
+    text: &str,
+    name: &str,
+    position: Position,
+) -> Option<StanDefinitionCandidate> {
+    let mut matching = collect_stan_definition_candidates(text)
+        .into_iter()
+        .filter(|candidate| candidate.name == name)
+        .collect::<Vec<_>>();
+
+    matching.sort_by_key(|candidate| (candidate.line, candidate.start_col));
+
+    matching
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.line < position.line
+                || (candidate.line == position.line && candidate.start_col <= position.character)
+        })
+        .cloned()
+        .or_else(|| matching.into_iter().next())
 }
 
 fn collect_stan_document_symbols(text: &str) -> Vec<RawSymbol> {
@@ -10662,6 +10827,20 @@ pub fn goto_definition(
         ) {
             return Some(GotoDefinitionResponse::Scalar(location));
         }
+    }
+
+    if doc.file_type == FileType::Stan {
+        let occurrences = collect_stan_identifier_occurrences(&text);
+        let target = stan_identifier_at_position(&occurrences, position)?;
+        let definition = find_stan_definition(&text, &target.name, position)?;
+
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position::new(definition.line, definition.start_col),
+                end: Position::new(definition.line, definition.end_col),
+            },
+        }));
     }
 
     // Continue with normal identifier-based go-to-definition
@@ -34920,6 +35099,34 @@ mod stan_reference_tests {
     use super::*;
     use crate::state::{Document, WorldState};
 
+    fn worldwide_style_snippet() -> &'static str {
+        r#"data {
+  int<lower=1> Q;
+  int<lower=1> P;
+  int<lower=1, upper=P> p0;
+  array[P] int<lower=1, upper=P> p0_p;
+  real log_max_rate;
+  array[Q, P, 3] real log_omega_qpw;
+  real log_omega_w_mum;
+  real sigmaQ_w_mum;
+}
+model {
+  for (q in 1:Q) {
+    {
+      real lo = log_omega_qpw[q, p0, 1];
+      real hi = log_max_rate;
+      target += normal_lpdf(log_omega_qpw[q, p0, 2] | log_omega_w_mum, sigmaQ_w_mum);
+    }
+  }
+}
+generated quantities {
+  array[P] real est_ab_p;
+  for (p in 1:P) {
+    est_ab_p[p] = log_omega_qpw[1, p, 1];
+  }
+}"#
+    }
+
     fn make_state(code: &str) -> (WorldState, Url) {
         let uri = Url::parse("file:///test/model.stan").unwrap();
         let mut state = WorldState::new(vec![]);
@@ -34937,12 +35144,38 @@ mod stan_reference_tests {
             .unwrap_or_else(|| panic!("Missing occurrence {} for '{}'", nth, name))
     }
 
+    fn stan_occurrence_on_line(
+        code: &str,
+        name: &str,
+        line: u32,
+        nth_on_line: usize,
+    ) -> StanIdentifierOccurrence {
+        collect_stan_identifier_occurrences(code)
+            .into_iter()
+            .filter(|occurrence| occurrence.name == name && occurrence.line == line)
+            .nth(nth_on_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing occurrence {} for '{}' on line {}",
+                    nth_on_line, name, line
+                )
+            })
+    }
+
     fn reference_ranges(code: &str, name: &str, nth: usize) -> Vec<(u32, u32, u32)> {
         let (state, uri) = make_state(code);
         let occurrence = nth_stan_occurrence(code, name, nth);
+        reference_ranges_for_occurrence(&state, &uri, occurrence)
+    }
+
+    fn reference_ranges_for_occurrence(
+        state: &WorldState,
+        uri: &Url,
+        occurrence: StanIdentifierOccurrence,
+    ) -> Vec<(u32, u32, u32)> {
         let mut refs = references(
-            &state,
-            &uri,
+            state,
+            uri,
             Position::new(occurrence.line, occurrence.start_col),
         )
         .unwrap_or_default()
@@ -35057,6 +35290,277 @@ model {
 }"#;
 
         assert_eq!(reference_ranges(code, "p", 0), vec![(1, 7, 8), (4, 2, 3)]);
+    }
+
+    #[test]
+    fn test_stan_references_worldwide_style_model_loop_symbol() {
+        let code = worldwide_style_snippet();
+        let (state, uri) = make_state(code);
+
+        assert_eq!(
+            reference_ranges_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "Q", 11, 0),
+            ),
+            vec![(1, 15, 16), (6, 8, 9), (11, 14, 15)]
+        );
+        assert_eq!(
+            reference_ranges_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "q", 11, 0),
+            ),
+            vec![(11, 7, 8), (13, 30, 31), (15, 42, 43)]
+        );
+    }
+
+    #[test]
+    fn test_stan_references_worldwide_style_generated_quantities_symbol() {
+        let code = worldwide_style_snippet();
+        let (state, uri) = make_state(code);
+
+        assert_eq!(
+            reference_ranges_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "est_ab_p", 22, 0),
+            ),
+            vec![(20, 16, 24), (22, 4, 12)]
+        );
+        assert_eq!(
+            reference_ranges_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "p", 22, 0),
+            ),
+            vec![(21, 7, 8), (22, 13, 14), (22, 35, 36)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod stan_goto_definition_tests {
+    use super::*;
+    use crate::state::{Document, WorldState};
+
+    fn worldwide_style_snippet() -> &'static str {
+        r#"data {
+  int<lower=1> Q;
+  int<lower=1> P;
+  int<lower=1, upper=P> p0;
+  array[P] int<lower=1, upper=P> p0_p;
+  real log_max_rate;
+  array[Q, P, 3] real log_omega_qpw;
+  real log_omega_w_mum;
+  real sigmaQ_w_mum;
+}
+model {
+  for (q in 1:Q) {
+    {
+      real lo = log_omega_qpw[q, p0, 1];
+      real hi = log_max_rate;
+      target += normal_lpdf(log_omega_qpw[q, p0, 2] | log_omega_w_mum, sigmaQ_w_mum);
+    }
+  }
+}
+generated quantities {
+  array[P] real est_ab_p;
+  for (p in 1:P) {
+    est_ab_p[p] = log_omega_qpw[1, p, 1];
+  }
+}"#
+    }
+
+    fn make_state(code: &str) -> (WorldState, Url) {
+        let uri = Url::parse("file:///test/model.stan").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+        (state, uri)
+    }
+
+    fn nth_stan_occurrence(code: &str, name: &str, nth: usize) -> StanIdentifierOccurrence {
+        collect_stan_identifier_occurrences(code)
+            .into_iter()
+            .filter(|occurrence| occurrence.name == name)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("Missing occurrence {} for '{}'", nth, name))
+    }
+
+    fn stan_occurrence_on_line(
+        code: &str,
+        name: &str,
+        line: u32,
+        nth_on_line: usize,
+    ) -> StanIdentifierOccurrence {
+        collect_stan_identifier_occurrences(code)
+            .into_iter()
+            .filter(|occurrence| occurrence.name == name && occurrence.line == line)
+            .nth(nth_on_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing occurrence {} for '{}' on line {}",
+                    nth_on_line, name, line
+                )
+            })
+    }
+
+    fn definition_range(code: &str, name: &str, nth: usize) -> (u32, u32, u32) {
+        let (state, uri) = make_state(code);
+        let occurrence = nth_stan_occurrence(code, name, nth);
+        definition_range_for_occurrence(&state, &uri, occurrence, name)
+    }
+
+    fn definition_range_for_occurrence(
+        state: &WorldState,
+        uri: &Url,
+        occurrence: StanIdentifierOccurrence,
+        name: &str,
+    ) -> (u32, u32, u32) {
+        let response = goto_definition(
+            state,
+            uri,
+            Position::new(occurrence.line, occurrence.start_col),
+        )
+        .unwrap_or_else(|| panic!("Missing definition for '{}'", name));
+
+        match response {
+            GotoDefinitionResponse::Scalar(location) => (
+                location.range.start.line,
+                location.range.start.character,
+                location.range.end.character,
+            ),
+            other => panic!("Expected scalar definition, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stan_goto_definition_from_data_usage() {
+        let code = r#"data {
+  int C;
+  array[C] real x;
+}"#;
+
+        assert_eq!(definition_range(code, "C", 1), (1, 6, 7));
+    }
+
+    #[test]
+    fn test_stan_goto_definition_from_model_local_usage() {
+        let code = r#"data {
+  int n_p1;
+  array[3] int p0_p;
+  array[3] real mu;
+}
+model {
+  for (p_idx in 1:n_p1) {
+    int p = p0_p[p_idx];
+    target += normal_lpdf(mu[p] | 0, 1);
+  }
+}"#;
+
+        assert_eq!(definition_range(code, "p", 1), (7, 8, 9));
+    }
+
+    #[test]
+    fn test_stan_goto_definition_from_model_loop_variable_usage() {
+        let code = r#"data {
+  int n_p1;
+  array[3] int p0_p;
+}
+model {
+  for (p_idx in 1:n_p1) {
+    int p = p0_p[p_idx];
+  }
+}"#;
+
+        assert_eq!(definition_range(code, "p_idx", 1), (5, 7, 12));
+    }
+
+    #[test]
+    fn test_stan_goto_definition_from_generated_quantities_usage() {
+        let code = r#"generated quantities {
+  array[3] real est_ab_p;
+  array[3] real foo;
+  for (p in 1:3) {
+    est_ab_p[p] = foo[p];
+  }
+}"#;
+
+        assert_eq!(definition_range(code, "est_ab_p", 1), (1, 16, 24));
+    }
+
+    #[test]
+    fn test_stan_goto_definition_on_loop_variable_usage_in_generated_quantities() {
+        let code = r#"generated quantities {
+  array[3] real est_ab_p;
+  for (p in 1:3) {
+    est_ab_p[p] = p;
+  }
+}"#;
+
+        assert_eq!(definition_range(code, "p", 1), (2, 7, 8));
+        assert_eq!(definition_range(code, "p", 2), (2, 7, 8));
+    }
+
+    #[test]
+    fn test_stan_goto_definition_worldwide_style_model_symbols() {
+        let code = worldwide_style_snippet();
+        let (state, uri) = make_state(code);
+
+        assert_eq!(
+            definition_range_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "Q", 11, 0),
+                "Q",
+            ),
+            (1, 15, 16)
+        );
+        assert_eq!(
+            definition_range_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "q", 13, 0),
+                "q",
+            ),
+            (11, 7, 8)
+        );
+        assert_eq!(
+            definition_range_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "p0", 13, 0),
+                "p0",
+            ),
+            (3, 24, 26)
+        );
+    }
+
+    #[test]
+    fn test_stan_goto_definition_worldwide_style_generated_quantities_symbols() {
+        let code = worldwide_style_snippet();
+        let (state, uri) = make_state(code);
+
+        assert_eq!(
+            definition_range_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "est_ab_p", 22, 0),
+                "est_ab_p",
+            ),
+            (20, 16, 24)
+        );
+        assert_eq!(
+            definition_range_for_occurrence(
+                &state,
+                &uri,
+                stan_occurrence_on_line(code, "p", 22, 0),
+                "p",
+            ),
+            (21, 7, 8)
+        );
     }
 }
 
