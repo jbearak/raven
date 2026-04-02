@@ -98,7 +98,7 @@ export function activate(context: vscode.ExtensionContext) {
             { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd,jags,bugs,stan}'),
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions(),
