@@ -102,7 +102,7 @@
             "no"
           ],
           "default": "ask",
-          "description": "Whether to exclude dots from word separators in R files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
+          "description": "Whether to exclude dots from word separators in R and JAGS files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
         },
         "raven.crossFile.maxBackwardDepth": {
           "type": "number",

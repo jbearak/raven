@@ -290,4 +290,29 @@ suite('Ark LSP Extension', () => {
             ['.stan', '.Stan', '.STAN'],
         );
     });
+
+    test('JAGS language configuration treats dots as part of words', async () => {
+        const languageConfigPath = path.join(__dirname, '..', '..', 'jags-language-configuration.json');
+        const languageConfig = JSON.parse(fs.readFileSync(languageConfigPath, 'utf8')) as { wordPattern?: string };
+
+        assert.strictEqual(
+            languageConfig.wordPattern,
+            '([a-zA-Z_][a-zA-Z0-9_.]*)|(\\.[a-zA-Z_][a-zA-Z0-9_.]*)',
+        );
+    });
+
+    test('package.json describes dot-in-word separators for JAGS too', async () => {
+        const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
+            contributes: {
+                configuration: {
+                    properties: Record<string, { description?: string }>;
+                };
+            };
+        };
+
+        const description = pkg.contributes.configuration.properties['raven.editor.dotInWordSeparators']?.description;
+
+        assert.ok(description?.includes('R and JAGS files'));
+    });
 });
