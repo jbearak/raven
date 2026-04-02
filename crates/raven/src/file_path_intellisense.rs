@@ -851,9 +851,10 @@ fn create_path_completion_item(
         } else {
             CompletionItemKind::FILE
         }),
-        // Don't set filter_text - let the client use text_edit range for filtering
-        // Setting filter_text can cause issues when the user types characters
-        // (like spaces) that don't match the filename
+        // Use the full replacement text for filtering so nested paths like
+        // `scripts/` still match child entries whose display labels are just
+        // the basename (for example `helpers.R`).
+        filter_text: Some(insert_text.clone()),
         text_edit: Some(text_edit),
         command,
         // Set sort_text to ensure consistent ordering
@@ -1545,8 +1546,7 @@ mod tests {
         let item = create_path_completion_item("utils.R", false, "", path_start, cursor_pos);
         assert_eq!(item.label, "utils.R");
         assert_eq!(item.kind, Some(CompletionItemKind::FILE));
-        // filter_text should not be set - we rely on text_edit for filtering
-        assert!(item.filter_text.is_none());
+        assert_eq!(item.filter_text.as_deref(), Some("utils.R"));
         // Check text_edit
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit {
             assert_eq!(edit.new_text, "utils.R");
@@ -1568,8 +1568,7 @@ mod tests {
         let item = create_path_completion_item("subdir", true, "", path_start, cursor_pos);
         assert_eq!(item.label, "subdir");
         assert_eq!(item.kind, Some(CompletionItemKind::FOLDER));
-        // filter_text should not be set - we rely on text_edit for filtering
-        assert!(item.filter_text.is_none());
+        assert_eq!(item.filter_text.as_deref(), Some("subdir/"));
         // Check text_edit inserts directory with trailing slash
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit {
             assert_eq!(edit.new_text, "subdir/");
@@ -1617,8 +1616,7 @@ mod tests {
         }; // After typing "../"
         let item = create_path_completion_item("utils.R", false, "../", path_start, cursor_pos);
         assert_eq!(item.label, "utils.R");
-        // filter_text should not be set
-        assert!(item.filter_text.is_none());
+        assert_eq!(item.filter_text.as_deref(), Some("../utils.R"));
         // Check text_edit range and content
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = item.text_edit {
             assert_eq!(edit.range.start, path_start);
@@ -9156,6 +9154,15 @@ mod file_path_definition_tests {
         let labels: Vec<_> = completions.iter().map(|item| item.label.as_str()).collect();
         assert!(labels.contains(&"covariates.R"));
         assert!(labels.contains(&"impute.r"));
+
+        let covariates = completions
+            .iter()
+            .find(|item| item.label == "covariates.R")
+            .expect("expected covariates.R completion");
+        assert_eq!(
+            covariates.filter_text.as_deref(),
+            Some("scripts/data/covariates.R")
+        );
     }
 
     #[test]
