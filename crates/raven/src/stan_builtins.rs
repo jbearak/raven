@@ -37,17 +37,7 @@ pub static STAN_BLOCK_KEYWORDS: &[&str] = &[
 ];
 
 pub static STAN_CONTROL_FLOW: &[&str] = &[
-    "for",
-    "in",
-    "while",
-    "if",
-    "else",
-    "return",
-    "break",
-    "continue",
-    "print",
-    "reject",
-    "profile",
+    "for", "in", "while", "if", "else", "return", "break", "continue", "print", "reject", "profile",
 ];
 
 pub static STAN_FUNCTIONS: &[&str] = &[

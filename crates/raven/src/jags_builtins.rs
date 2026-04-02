@@ -60,11 +60,4 @@ pub static JAGS_FUNCTIONS: &[&str] = &[
     "T",
 ];
 
-pub static JAGS_KEYWORDS: &[&str] = &[
-    "model",
-    "data",
-    "for",
-    "in",
-    "if",
-    "else",
-];
+pub static JAGS_KEYWORDS: &[&str] = &["model", "data", "for", "in", "if", "else"];

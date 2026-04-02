@@ -138,6 +138,7 @@ use crate::cross_file::{
     CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
 use crate::document_store::DocumentStore;
+use crate::file_type::{file_type_from_language_id_or_uri, file_type_from_uri, FileType};
 use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::WorkspaceIndex;
@@ -147,19 +148,42 @@ pub struct Document {
     pub contents: Rope,
     pub tree: Option<Tree>,
     pub loaded_packages: Vec<String>,
+    pub file_type: FileType,
     pub version: Option<i32>,
     pub revision: u64,
 }
 
 impl Document {
     pub fn new(text: &str, version: Option<i32>) -> Self {
+        Self::new_with_file_type(text, version, FileType::R)
+    }
+
+    pub fn new_with_uri(text: &str, version: Option<i32>, uri: &Url) -> Self {
+        Self::new_with_file_type(text, version, file_type_from_uri(uri))
+    }
+
+    pub fn new_with_language_id(
+        text: &str,
+        version: Option<i32>,
+        uri: &Url,
+        language_id: Option<&str>,
+    ) -> Self {
+        Self::new_with_file_type(
+            text,
+            version,
+            file_type_from_language_id_or_uri(language_id, uri),
+        )
+    }
+
+    pub fn new_with_file_type(text: &str, version: Option<i32>, file_type: FileType) -> Self {
         let contents = Rope::from_str(text);
-        let tree = parse_r(&contents);
+        let tree = parse_document(&contents, file_type);
         let loaded_packages = extract_loaded_packages(&tree, text);
         Self {
             contents,
             tree,
             loaded_packages,
+            file_type,
             version,
             revision: 0,
         }
@@ -189,7 +213,7 @@ impl Document {
         }
 
         self.revision += 1;
-        self.tree = parse_r(&self.contents);
+        self.tree = parse_document(&self.contents, self.file_type);
         let text = self.contents.to_string();
         self.loaded_packages = extract_loaded_packages(&self.tree, &text);
     }
@@ -223,6 +247,15 @@ fn parse_r(contents: &Rope) -> Option<Tree> {
     parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
     let text = contents.to_string();
     parser.parse(&text, None)
+}
+
+fn parse_document(contents: &Rope, file_type: FileType) -> Option<Tree> {
+    match file_type {
+        FileType::R => parse_r(contents),
+        // Raven only ships an R parser today. Non-R documents use text-based
+        // completion/diagnostic routing instead of being forced through tree-sitter-r.
+        FileType::Jags | FileType::Stan => None,
+    }
 }
 
 fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
@@ -685,8 +718,23 @@ impl WorldState {
             .resize(config.cache_workspace_index_max_entries);
     }
 
+    #[allow(dead_code)] // Retained for tests and compatibility with older call sites.
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
-        self.documents.insert(uri, Document::new(text, version));
+        self.documents
+            .insert(uri.clone(), Document::new_with_uri(text, version, &uri));
+    }
+
+    pub fn open_document_with_language_id(
+        &mut self,
+        uri: Url,
+        text: &str,
+        version: Option<i32>,
+        language_id: Option<&str>,
+    ) {
+        self.documents.insert(
+            uri.clone(),
+            Document::new_with_language_id(text, version, &uri, language_id),
+        );
     }
 
     pub fn close_document(&mut self, uri: &Url) {
@@ -1059,7 +1107,7 @@ fn scan_directory(
                 if let Ok(text) = fs::read_to_string(&path) {
                     if let Ok(uri) = Url::from_file_path(&path) {
                         log::trace!("Scanning file: {}", uri);
-                        let doc = Document::new(&text, None);
+                        let doc = Document::new_with_uri(&text, None, &uri);
 
                         // Also compute cross-file metadata and artifacts
                         if let Ok(metadata_result) = fs::metadata(&path) {

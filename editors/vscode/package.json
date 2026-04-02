@@ -46,7 +46,11 @@
         ],
         "extensions": [
           ".jags",
-          ".bugs"
+          ".Jags",
+          ".JAGS",
+          ".bugs",
+          ".Bugs",
+          ".BUGS"
         ],
         "configuration": "./jags-language-configuration.json"
       },
@@ -57,7 +61,9 @@
           "stan"
         ],
         "extensions": [
-          ".stan"
+          ".stan",
+          ".Stan",
+          ".STAN"
         ],
         "configuration": "./stan-language-configuration.json"
       }

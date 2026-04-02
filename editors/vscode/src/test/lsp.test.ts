@@ -1,4 +1,6 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { activate, openDocument, waitForDiagnostics, getFixtureUri, sleep } from './helper';
 
@@ -65,6 +67,28 @@ suite('Ark LSP Extension', () => {
         const labels = completions.items.map(i => i.label);
         assert.ok(labels.some(l => typeof l === 'string' && l.startsWith('print')), 
             'Expected print in completions');
+    });
+
+    test('untitled JAGS buffers use JAGS completions', async () => {
+        const doc = await vscode.workspace.openTextDocument({
+            language: 'jags',
+            content: 'model {\n  theta ~ dnorm(0, 1)\n  the\n}',
+        });
+        await vscode.window.showTextDocument(doc);
+        await sleep(2000);
+
+        const position = new vscode.Position(2, 5);
+        const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+            'vscode.executeCompletionItemProvider',
+            doc.uri,
+            position
+        );
+
+        assert.ok(completions && completions.items.length > 0, 'Expected JAGS completion items');
+        const labels = completions.items.map(i => i.label);
+        assert.ok(labels.some(l => typeof l === 'string' && l === 'dnorm'), 'Expected dnorm in completions');
+        assert.ok(labels.some(l => typeof l === 'string' && l === 'theta'), 'Expected theta in completions');
+        assert.ok(!labels.some(l => typeof l === 'string' && l === 'library'), 'Did not expect R-only completions');
     });
 
     test('hover information is provided', async () => {
@@ -244,6 +268,26 @@ suite('Ark LSP Extension', () => {
             !messages.some(m => m.includes('ddply')),
             `ddply should not be flagged as undefined (plyr inherited from sibling source chain). ` +
             `Got diagnostics: ${messages.join('; ')}`
+        );
+    });
+
+    test('package.json registers mixed-case JAGS and Stan extensions', async () => {
+        const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+        const languages = pkg.contributes.languages as Array<{ id: string; extensions: string[] }>;
+
+        const jags = languages.find(language => language.id === 'jags');
+        const stan = languages.find(language => language.id === 'stan');
+
+        assert.ok(jags, 'Expected JAGS language contribution');
+        assert.ok(stan, 'Expected Stan language contribution');
+        assert.deepStrictEqual(
+            jags?.extensions,
+            ['.jags', '.Jags', '.JAGS', '.bugs', '.Bugs', '.BUGS'],
+        );
+        assert.deepStrictEqual(
+            stan?.extensions,
+            ['.stan', '.Stan', '.STAN'],
         );
     });
 });

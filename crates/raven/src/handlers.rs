@@ -16,30 +16,12 @@ use tree_sitter::Point;
 use crate::content_provider::ContentProvider;
 use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::cross_file::{scope, ScopedSymbol};
+use crate::file_type::{file_type_from_uri, FileType};
 use crate::state::WorldState;
 use crate::utf16::utf16_column_to_byte_offset;
 
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileType {
-    R,
-    Jags,
-    Stan,
-}
-
-pub fn file_type_from_uri(uri: &Url) -> FileType {
-    let path = uri.path();
-    let lower_path = path.to_ascii_lowercase();
-    if lower_path.ends_with(".jags") || lower_path.ends_with(".bugs") {
-        FileType::Jags
-    } else if lower_path.ends_with(".stan") {
-        FileType::Stan
-    } else {
-        FileType::R
-    }
-}
 
 /// Lightweight cooperative cancellation handle for diagnostic computation.
 ///
@@ -2884,7 +2866,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     }
 
     // Suppress diagnostics for non-R files (JAGS, Stan)
-    if file_type_from_uri(uri) != FileType::R {
+    if document_file_type(state, uri) != FileType::R {
         return Vec::new();
     }
 
@@ -7714,6 +7696,135 @@ fn is_package_export(
     package_library.is_symbol_from_loaded_packages(name, loaded_packages)
 }
 
+fn document_file_type(state: &WorldState, uri: &Url) -> FileType {
+    state
+        .get_document(uri)
+        .map(|doc| doc.file_type)
+        .unwrap_or_else(|| file_type_from_uri(uri))
+}
+
+fn push_local_symbol_completion(
+    items: &mut Vec<CompletionItem>,
+    seen_names: &mut std::collections::HashSet<String>,
+    uri: &Url,
+    name: &str,
+    line: u32,
+    kind: CompletionItemKind,
+) {
+    if seen_names.contains(name) {
+        return;
+    }
+
+    let data = if kind == CompletionItemKind::FUNCTION {
+        Some(serde_json::json!({
+            "type": "user_function",
+            "function_name": name,
+            "uri": uri.to_string(),
+            "func_line": line,
+        }))
+    } else {
+        None
+    };
+
+    seen_names.insert(name.to_string());
+    items.push(CompletionItem {
+        label: name.to_string(),
+        kind: Some(kind),
+        sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
+        data,
+        ..Default::default()
+    });
+}
+
+fn collect_jags_document_completions(
+    text: &str,
+    uri: &Url,
+    items: &mut Vec<CompletionItem>,
+    seen_names: &mut std::collections::HashSet<String>,
+) {
+    static JAGS_SYMBOL_RE: OnceLock<Regex> = OnceLock::new();
+    let symbol_re = JAGS_SYMBOL_RE.get_or_init(|| {
+        Regex::new(r"^\s*([A-Za-z][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?\s*(?:~|<-|=)")
+            .expect("valid JAGS symbol regex")
+    });
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let code = line.split('#').next().unwrap_or(line);
+        for candidate in std::iter::once(code).chain(code.rsplit_once('{').map(|(_, tail)| tail)) {
+            if let Some(captures) = symbol_re.captures(candidate) {
+                if let Some(name) = captures.get(1) {
+                    push_local_symbol_completion(
+                        items,
+                        seen_names,
+                        uri,
+                        name.as_str(),
+                        line_idx as u32,
+                        CompletionItemKind::FIELD,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn collect_stan_document_completions(
+    text: &str,
+    uri: &Url,
+    items: &mut Vec<CompletionItem>,
+    seen_names: &mut std::collections::HashSet<String>,
+) {
+    static STAN_VAR_RE: OnceLock<Regex> = OnceLock::new();
+    static STAN_FN_RE: OnceLock<Regex> = OnceLock::new();
+
+    let var_re = STAN_VAR_RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:array\s*\[[^\]\r\n]+\]\s+)?(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?\s*(?:;|=|<-)",
+        )
+        .expect("valid Stan variable regex")
+    });
+    let fn_re = STAN_FN_RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?(?:\s*<[^>\r\n]+>)?(?:\s*\[[^\]\r\n]+\])?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        )
+        .expect("valid Stan function regex")
+    });
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or(line);
+
+        for candidate in std::iter::once(code).chain(code.rsplit_once('{').map(|(_, tail)| tail)) {
+            if let Some(captures) = var_re.captures(candidate) {
+                if let Some(name) = captures.get(1) {
+                    push_local_symbol_completion(
+                        items,
+                        seen_names,
+                        uri,
+                        name.as_str(),
+                        line_idx as u32,
+                        CompletionItemKind::FIELD,
+                    );
+                    break;
+                }
+            }
+
+            if let Some(captures) = fn_re.captures(candidate) {
+                if let Some(name) = captures.get(1) {
+                    push_local_symbol_completion(
+                        items,
+                        seen_names,
+                        uri,
+                        name.as_str(),
+                        line_idx as u32,
+                        CompletionItemKind::FUNCTION,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Completions
 // ============================================================================
@@ -7740,13 +7851,7 @@ fn is_package_export(
 /// let resp = completion(&state, &uri, pos, None);
 /// assert!(resp.is_some());
 /// ```
-fn jags_completion(
-    tree: &tree_sitter::Tree,
-    text: &str,
-    uri: &Url,
-    position: Position,
-) -> Option<CompletionResponse> {
-    let _ = position;
+fn jags_completion(text: &str, uri: &Url) -> CompletionResponse {
     let mut items = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
@@ -7788,18 +7893,12 @@ fn jags_completion(
     }
 
     // Add file-local symbols
-    collect_document_completions(tree.root_node(), text, uri, &mut items, &mut seen_names);
+    collect_jags_document_completions(text, uri, &mut items, &mut seen_names);
 
-    Some(CompletionResponse::Array(items))
+    CompletionResponse::Array(items)
 }
 
-fn stan_completion(
-    tree: &tree_sitter::Tree,
-    text: &str,
-    uri: &Url,
-    position: Position,
-) -> Option<CompletionResponse> {
-    let _ = position;
+fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
     let mut items = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
@@ -7854,9 +7953,9 @@ fn stan_completion(
     }
 
     // Add file-local symbols
-    collect_document_completions(tree.root_node(), text, uri, &mut items, &mut seen_names);
+    collect_stan_document_completions(text, uri, &mut items, &mut seen_names);
 
-    Some(CompletionResponse::Array(items))
+    CompletionResponse::Array(items)
 }
 
 pub fn completion(
@@ -7866,15 +7965,16 @@ pub fn completion(
     context: Option<CompletionContext>,
 ) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
-    let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
     // JAGS/Stan completion filtering
-    match file_type_from_uri(uri) {
-        FileType::Jags => return jags_completion(tree, &text, uri, position),
-        FileType::Stan => return stan_completion(tree, &text, uri, position),
+    match doc.file_type {
+        FileType::Jags => return Some(jags_completion(&text, uri)),
+        FileType::Stan => return Some(stan_completion(&text, uri)),
         FileType::R => { /* fall through to existing R logic */ }
     }
+
+    let tree = doc.tree.as_ref()?;
 
     // Check for file path context first (source() calls and LSP directives)
     // Requirements 1.1-1.6, 2.1-2.7: Provide file path completions in appropriate contexts
@@ -34299,7 +34399,7 @@ mod file_type_tests {
             let uri = Url::parse(&uri_str).unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
             assert!(result.is_empty(), "JAGS file should produce no diagnostics, got {:?}", result);
@@ -34315,7 +34415,7 @@ mod file_type_tests {
             let uri = Url::parse(uri_str).unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
             assert!(result.is_empty(), "Stan file should produce no diagnostics, got {:?}", result);
@@ -34351,7 +34451,7 @@ mod file_type_tests {
             let uri_str = format!("file:///test/model.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
             if let Some(CompletionResponse::Array(items)) = result {
@@ -34377,7 +34477,7 @@ mod file_type_tests {
             let uri_str = format!("file:///test/model.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
             if let Some(CompletionResponse::Array(items)) = result {
@@ -34403,10 +34503,10 @@ mod file_type_tests {
         fn prop_jags_completions_include_local_symbols(
             varname in "[a-zA-Z][a-zA-Z0-9_]{0,10}"
         ) {
-            let content = format!("{} <- 1\n", varname);
+            let content = format!("model {{ {} ~ dnorm(0, 1) }}\n", varname);
             let uri = Url::parse("file:///test/model.jags").unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(1, 0), None);
             if let Some(CompletionResponse::Array(items)) = result {
@@ -34435,7 +34535,7 @@ mod file_type_tests {
                                    "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN"];
             let uri = Url::parse("file:///test/model.stan").unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
             if let Some(CompletionResponse::Array(items)) = result {
@@ -34459,7 +34559,7 @@ mod file_type_tests {
         ) {
             let uri = Url::parse("file:///test/model.stan").unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
             if let Some(CompletionResponse::Array(items)) = result {
@@ -34488,10 +34588,10 @@ mod file_type_tests {
         fn prop_stan_completions_include_local_symbols(
             varname in "[a-zA-Z][a-zA-Z0-9_]{0,10}"
         ) {
-            let content = format!("{} <- 1\n", varname);
+            let content = format!("data {{ real {}; }}\n", varname);
             let uri = Url::parse("file:///test/model.stan").unwrap();
             let mut state = crate::state::WorldState::new(vec![]);
-            let doc = crate::state::Document::new(&content, None);
+            let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(1, 0), None);
             if let Some(CompletionResponse::Array(items)) = result {
@@ -34507,5 +34607,31 @@ mod file_type_tests {
                 panic!("Expected Some(CompletionResponse::Array) for Stan file");
             }
         }
+    }
+
+    #[test]
+    fn test_untitled_jags_completion_uses_document_language() {
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let mut state = crate::state::WorldState::new(vec![]);
+        state.documents.insert(
+            uri.clone(),
+            crate::state::Document::new_with_language_id(
+                "model { theta ~ dnorm(0, 1) }",
+                None,
+                &uri,
+                Some("jags"),
+            ),
+        );
+
+        let result = completion(&state, &uri, Position::new(0, 0), None);
+        let Some(CompletionResponse::Array(items)) = result else {
+            panic!("Expected completion items for untitled JAGS document");
+        };
+
+        let labels: std::collections::HashSet<String> =
+            items.into_iter().map(|item| item.label).collect();
+        assert!(labels.contains("dnorm"));
+        assert!(labels.contains("theta"));
+        assert!(!labels.contains("library"));
     }
 }
