@@ -1,6 +1,6 @@
 # Document Outline
 
-Raven provides a hierarchical document outline view that displays all symbols (functions, variables, classes, sections) in your R files. This feature helps you navigate large files and understand code structure at a glance.
+Raven provides a hierarchical document outline view that displays symbols such as functions, variables, classes, sections, and loops across R, JAGS, and Stan files. This feature helps you navigate large files and understand code structure at a glance.
 
 ## Overview
 
@@ -10,7 +10,7 @@ The document outline appears in VS Code's **Outline** view (usually in the Explo
 - **R code sections** - Organize your code with collapsible section headers (`# Section ----`)
 - **Rich symbol types** - Distinguish functions, constants, classes, and methods with distinct icons
 - **Quick navigation** - Click any symbol to jump to its definition
-- **JAGS/Stan block detection** - Navigate JAGS and Stan model files with block-level hierarchy
+- **JAGS/Stan model structure** - Navigate JAGS and Stan model files with blocks, decorative comment headings, and `for` loops
 - **Breadcrumb navigation** - See your current position in the file structure
 
 The outline updates automatically as you edit your code.
@@ -219,9 +219,9 @@ CACHE_SIZE <- 1000
   CACHE_SIZE
 ```
 
-## JAGS and Stan Block Detection
+## JAGS and Stan Model Structure
 
-Raven recognizes top-level block structures in JAGS and Stan files and displays them as hierarchical sections in the document outline. Symbols extracted within each block appear as children of the block.
+Raven recognizes top-level block structures in JAGS and Stan files and displays them as the top-level hierarchy in the document outline. Decorative comment headings nest beneath those blocks, and `for` loops appear as intermediate outline containers for symbols declared inside them.
 
 ### JAGS Blocks
 
@@ -248,10 +248,52 @@ Stan files (`.stan`) support seven block types:
 
 Constrained declarations keep the declared identifier in the outline, so `real<lower=0, upper=1> foo;` appears as `foo`, not the constraint names.
 
+### Decorative Comment Headings
+
+JAGS and Stan files recognize **decorative headings only**. Plain title comments such as `// DIMENSIONS` or `# levels:` are not added to the outline.
+
+Recognized patterns include banner fences:
+
+```stan
+// =====================================================================
+// DIMENSIONS
+// =====================================================================
+```
+
+and inline decorative headings:
+
+```stan
+// --- Incomplete official statistics (minima) ---
+```
+
+```jags
+# --- Priors ---
+```
+
+Banner headings default to top-level within their enclosing block, while inline decorative headings default to the next level down. Existing hash-decorated banner title lines such as `## NAME ##` in JAGS preserve their explicit depth.
+
+### Loops
+
+`for` loops in JAGS and Stan files appear in the outline as container nodes. This applies to both braced loops and brace-less loops:
+
+```stan
+for (p_idx in 1:n_p1) {
+  real foo = p_idx;
+}
+
+for (j in 1:M)
+  real bar = j;
+```
+
+Symbols declared inside those loops appear as children of the corresponding loop node, and nested loops appear recursively in the outline.
+
 ### Example
 
 ```stan
 data {
+  // =====================================================================
+  // DIMENSIONS
+  // =====================================================================
   int<lower=0> N;
   vector[N] y;
 }
@@ -260,22 +302,28 @@ parameters {
   real<lower=0> sigma;
 }
 model {
-  y ~ normal(mu, sigma);
+  // --- Likelihood ---
+  for (n in 1:N) {
+    y[n] ~ normal(mu, sigma);
+  }
 }
 ```
 
 **Outline view shows:**
 ```text
 ▼ data
-    N
-    y
+  ▼ DIMENSIONS
+      N
+      y
 ▼ parameters
     mu
     sigma
 ▼ model
+  ▼ Likelihood
+    ▼ for (n in 1:N)
 ```
 
-Blocks are detected using text-based pattern matching with brace-depth tracking, so nested braces within block bodies are handled correctly. If a closing brace is missing, the block range extends to the end of the file.
+Blocks are detected using text-based pattern matching with brace-depth tracking, so nested braces within block bodies are handled correctly. Decorative headings nest under their containing block instead of competing with block nodes at the top level. If a closing brace is missing, the block range extends to the end of the file.
 
 ## Workspace Symbol Search
 

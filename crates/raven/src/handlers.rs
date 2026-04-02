@@ -475,6 +475,12 @@ enum DelimiterKind {
     Plus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCommentStyle {
+    Hash,
+    DoubleSlash,
+}
+
 /// Classifies a line as a delimiter line for banner-style section detection.
 ///
 /// A delimiter line is a comment line consisting entirely of a single repeated
@@ -556,6 +562,141 @@ fn extract_banner_name(line: &str) -> Option<(String, u32)> {
     Some((name.to_string(), hash_count))
 }
 
+fn strip_model_comment_prefix(line: &str, style: ModelCommentStyle) -> Option<&str> {
+    let trimmed = line.trim_start();
+    match style {
+        ModelCommentStyle::Hash => trimmed.strip_prefix('#').map(str::trim_start),
+        ModelCommentStyle::DoubleSlash => trimmed.strip_prefix("//").map(str::trim_start),
+    }
+}
+
+fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option<DelimiterKind> {
+    let content = strip_model_comment_prefix(line, style)?.trim();
+    if content.len() < 4 {
+        return None;
+    }
+
+    let first_char = content.chars().next()?;
+    let kind = match first_char {
+        '#' => DelimiterKind::Hash,
+        '-' => DelimiterKind::Dash,
+        '=' => DelimiterKind::Equals,
+        '*' => DelimiterKind::Asterisk,
+        '+' => DelimiterKind::Plus,
+        _ => return None,
+    };
+
+    if content.chars().all(|c| c == first_char) {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+fn leading_delimiter_run(s: &str) -> Option<(char, usize, usize)> {
+    let mut chars = s.char_indices();
+    let (_, first_char) = chars.next()?;
+    if !matches!(first_char, '#' | '-' | '=' | '*' | '+') {
+        return None;
+    }
+
+    let mut count = 1usize;
+    let mut end = first_char.len_utf8();
+    for (idx, ch) in chars {
+        if ch != first_char {
+            break;
+        }
+        count += 1;
+        end = idx + ch.len_utf8();
+    }
+
+    if count < 3 {
+        return None;
+    }
+
+    Some((first_char, count, end))
+}
+
+fn trailing_delimiter_run(s: &str, delim: char) -> Option<(usize, usize)> {
+    let mut count = 0usize;
+    let mut start = s.len();
+
+    for (idx, ch) in s.char_indices().rev() {
+        if ch != delim {
+            break;
+        }
+        count += 1;
+        start = idx;
+    }
+
+    if count < 3 {
+        return None;
+    }
+
+    Some((start, count))
+}
+
+fn extract_model_banner_name(
+    line: &str,
+    style: ModelCommentStyle,
+) -> Option<(String, u32, String)> {
+    const DELIMITER_CHARS: &[char] = &['#', '-', '=', '*', '+'];
+
+    let content = strip_model_comment_prefix(line, style)?.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    if content.starts_with('#') {
+        let (name, mut level) = extract_banner_name(content)?;
+        if matches!(style, ModelCommentStyle::Hash) {
+            level += 1;
+        }
+        return Some((name, level, line.to_string()));
+    }
+
+    let name = content.trim_end_matches(DELIMITER_CHARS).trim();
+    if name.is_empty() || is_delimiter_only(name) {
+        return None;
+    }
+
+    Some((name.to_string(), 1, line.to_string()))
+}
+
+fn extract_model_inline_section(
+    line: &str,
+    style: ModelCommentStyle,
+) -> Option<(String, u32, String)> {
+    let content = strip_model_comment_prefix(line, style)?.trim();
+    let (delim, _, prefix_end) = leading_delimiter_run(content)?;
+    let (suffix_start, _) = trailing_delimiter_run(content, delim)?;
+
+    if suffix_start <= prefix_end {
+        return None;
+    }
+
+    let name = content[prefix_end..suffix_start].trim();
+    if name.is_empty() || is_delimiter_only(name) {
+        return None;
+    }
+
+    let heading_level = if delim == '#' {
+        extract_banner_name(content)
+            .map(|(_, level)| {
+                if matches!(style, ModelCommentStyle::Hash) {
+                    level + 1
+                } else {
+                    level
+                }
+            })
+            .unwrap_or(2)
+    } else {
+        2
+    };
+
+    Some((name.to_string(), heading_level, line.to_string()))
+}
+
 // ============================================================================
 // Document Symbol Types
 // ============================================================================
@@ -570,6 +711,8 @@ fn extract_banner_name(line: &str) -> Option<(String, u32)> {
 pub enum DocumentSymbolKind {
     /// Regular function definition (SymbolKind::FUNCTION)
     Function,
+    /// Loop container such as `for (...)` (SymbolKind::NAMESPACE)
+    Loop,
     /// Generic variable assignment, fallback case (SymbolKind::FIELD)
     Variable,
     /// ALL_CAPS constant pattern (SymbolKind::CONSTANT)
@@ -615,6 +758,7 @@ impl DocumentSymbolKind {
     pub fn to_lsp_kind(self) -> SymbolKind {
         match self {
             Self::Function => SymbolKind::FUNCTION,
+            Self::Loop => SymbolKind::NAMESPACE,
             Self::Variable => SymbolKind::FIELD, // Changed from VARIABLE to align with R-LS
             Self::Constant => SymbolKind::CONSTANT,
             Self::Boolean => SymbolKind::BOOLEAN,
@@ -761,6 +905,13 @@ impl<'a> SymbolExtractor<'a> {
         // Extract R code sections (text-based, not tree-sitter)
         let section_symbols = self.extract_sections();
         symbols.extend(section_symbols);
+        symbols
+    }
+
+    /// Extract assignments and S4 symbols without comment-derived sections.
+    fn extract_ast_symbols(&self) -> Vec<RawSymbol> {
+        let mut symbols = Vec::new();
+        self.extract_ast_symbols_recursive(self.root, &mut symbols);
         symbols
     }
 
@@ -1167,10 +1318,10 @@ impl<'a> SymbolExtractor<'a> {
     ///
     /// Converts tree-sitter byte positions to LSP positions with UTF-16 columns.
     fn compute_node_range(&self, node: tree_sitter::Node<'a>) -> Range {
-        let start_pos = node.start_position();
-        let end_pos = node.end_position();
+        self.compute_point_range(node.start_position(), node.end_position())
+    }
 
-        // Get line text for UTF-16 column conversion
+    fn compute_point_range(&self, start_pos: Point, end_pos: Point) -> Range {
         let start_line_text = self.text.lines().nth(start_pos.row).unwrap_or("");
         let end_line_text = self.text.lines().nth(end_pos.row).unwrap_or("");
 
@@ -1184,6 +1335,27 @@ impl<'a> SymbolExtractor<'a> {
         Range {
             start: Position::new(start_pos.row as u32, start_column),
             end: Position::new(end_pos.row as u32, end_column),
+        }
+    }
+
+    fn compute_loop_selection_range(
+        &self,
+        node: tree_sitter::Node<'a>,
+        raw_header: &str,
+        header: &str,
+    ) -> Range {
+        let start_pos = node.start_position();
+        let start_line_text = self.text.lines().nth(start_pos.row).unwrap_or("");
+        let raw_first_line = raw_header.lines().next().unwrap_or(raw_header);
+        let leading_ws = raw_first_line.len() - raw_first_line.trim_start().len();
+        let start_column = crate::cross_file::types::byte_offset_to_utf16_column(
+            start_line_text,
+            start_pos.column + leading_ws,
+        );
+
+        Range {
+            start: Position::new(start_pos.row as u32, start_column),
+            end: Position::new(start_pos.row as u32, start_column + utf16_len(header)),
         }
     }
 
@@ -1607,6 +1779,174 @@ impl<'a> SymbolExtractor<'a> {
 
         sections
     }
+
+    /// Extract decorative banner and inline headings for JAGS and Stan files.
+    fn extract_decorative_sections(&self, style: ModelCommentStyle) -> Vec<RawSymbol> {
+        let mut sections = Vec::new();
+        let mut consumed_lines: HashSet<usize> = HashSet::new();
+        let lines: Vec<&str> = self.text.lines().collect();
+
+        if lines.len() >= 3 {
+            for i in 1..lines.len() - 1 {
+                if consumed_lines.contains(&(i - 1))
+                    || consumed_lines.contains(&i)
+                    || consumed_lines.contains(&(i + 1))
+                {
+                    continue;
+                }
+
+                let kind_top = classify_model_delimiter_line(lines[i - 1], style);
+                let kind_bottom = classify_model_delimiter_line(lines[i + 1], style);
+
+                if let (Some(top), Some(bottom)) = (kind_top, kind_bottom) {
+                    if top != bottom {
+                        continue;
+                    }
+
+                    if let Some((name, heading_level, selection_text)) =
+                        extract_model_banner_name(lines[i], style)
+                    {
+                        let bottom_line_end_utf16 = utf16_len(lines[i + 1]);
+                        let selection_len = utf16_len(&selection_text);
+
+                        let range = Range {
+                            start: Position {
+                                line: (i - 1) as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: (i + 1) as u32,
+                                character: bottom_line_end_utf16,
+                            },
+                        };
+                        let selection_range = Range {
+                            start: Position {
+                                line: i as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: i as u32,
+                                character: selection_len,
+                            },
+                        };
+
+                        consumed_lines.insert(i - 1);
+                        consumed_lines.insert(i);
+                        consumed_lines.insert(i + 1);
+                        sections.push(RawSymbol {
+                            name,
+                            kind: DocumentSymbolKind::Module,
+                            range,
+                            selection_range,
+                            detail: None,
+                            section_level: Some(heading_level),
+                            children: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for (line_num, line) in lines.iter().enumerate() {
+            if consumed_lines.contains(&line_num) {
+                continue;
+            }
+
+            if let Some((name, heading_level, selection_text)) =
+                extract_model_inline_section(line, style)
+            {
+                let line_end_utf16 = utf16_len(line);
+                let selection_len = utf16_len(&selection_text);
+                let range = Range {
+                    start: Position {
+                        line: line_num as u32,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: line_num as u32,
+                        character: line_end_utf16,
+                    },
+                };
+                let selection_range = Range {
+                    start: Position {
+                        line: line_num as u32,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: line_num as u32,
+                        character: selection_len,
+                    },
+                };
+
+                sections.push(RawSymbol {
+                    name,
+                    kind: DocumentSymbolKind::Module,
+                    range,
+                    selection_range,
+                    detail: None,
+                    section_level: Some(heading_level),
+                    children: Vec::new(),
+                });
+            }
+        }
+
+        sections.sort_by_key(|s| s.range.start.line);
+        sections
+    }
+
+    /// Extract `for (...)` loop containers for JAGS and Stan files.
+    fn extract_loops(&self) -> Vec<RawSymbol> {
+        let mut loops = Vec::new();
+        self.extract_loops_recursive(self.root, &mut loops);
+        loops
+    }
+
+    fn extract_loops_recursive(&self, node: tree_sitter::Node<'a>, symbols: &mut Vec<RawSymbol>) {
+        if let Some(symbol) = self.extract_loop(node) {
+            symbols.push(symbol);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.extract_loops_recursive(child, symbols);
+        }
+    }
+
+    fn extract_loop(&self, node: tree_sitter::Node<'a>) -> Option<RawSymbol> {
+        if node.kind() != "for_statement" {
+            return None;
+        }
+
+        let body = node.child_by_field_name("body").or_else(|| {
+            node.children(&mut node.walk())
+                .filter(|child| child.is_named())
+                .last()
+        });
+        let body_end = body
+            .map(|body| body.end_position())
+            .unwrap_or_else(|| node.end_position());
+        let body_is_braced = body.is_some_and(|body| body.kind() == "brace_list");
+        let raw_header = extract_header(node, self.text);
+        let header = raw_header
+            .trim()
+            .trim_end_matches('{')
+            .trim_end()
+            .to_string();
+        let mut range = self.compute_point_range(node.start_position(), body_end);
+        if !body_is_braced && body_end.row > node.start_position().row {
+            range.end.character = LSP_EOL_CHARACTER;
+        }
+
+        Some(RawSymbol {
+            name: header.clone(),
+            kind: DocumentSymbolKind::Loop,
+            range,
+            selection_range: self.compute_loop_selection_range(node, &raw_header, &header),
+            detail: None,
+            section_level: None,
+            children: Vec::new(),
+        })
+    }
 }
 
 // ============================================================================
@@ -1639,6 +1979,29 @@ pub struct HierarchyBuilder {
 }
 
 impl HierarchyBuilder {
+    fn min_position(lhs: Position, rhs: Position) -> Position {
+        if lhs.line < rhs.line || (lhs.line == rhs.line && lhs.character <= rhs.character) {
+            lhs
+        } else {
+            rhs
+        }
+    }
+
+    fn position_leq(lhs: Position, rhs: Position) -> bool {
+        lhs.line < rhs.line || (lhs.line == rhs.line && lhs.character <= rhs.character)
+    }
+
+    fn range_contains_position(range: &Range, position: Position) -> bool {
+        Self::position_leq(range.start, position) && Self::position_leq(position, range.end)
+    }
+
+    fn is_section_container_boundary(symbol: &RawSymbol) -> bool {
+        matches!(
+            symbol.kind,
+            DocumentSymbolKind::Function | DocumentSymbolKind::Loop
+        ) || (matches!(symbol.kind, DocumentSymbolKind::Module) && symbol.section_level == Some(0))
+    }
+
     /// Creates a new HierarchyBuilder with the given symbols and line count.
     ///
     /// # Arguments
@@ -1711,46 +2074,100 @@ impl HierarchyBuilder {
         };
         let mut stack: Vec<usize> = Vec::new();
 
-        for i in 0..section_indices.len() {
-            let current_idx = section_indices[i];
+        for &current_idx in &section_indices {
             let current_level = self.symbols[current_idx]
                 .section_level
                 .expect("section_level must be Some for symbols in section_indices");
             let current_start = self.symbols[current_idx].range.start.line;
 
-            // Pop all stack entries with level >= current_level
-            // (they are siblings or children that end before this section)
-            while let Some(&top_i) = stack.last() {
-                let top_idx = section_indices[top_i];
+            if let Some(block_pos) = stack.iter().rposition(|&idx| {
+                self.symbols[idx]
+                    .section_level
+                    .expect("section_level must be Some for symbols in section_indices")
+                    == 0
+            }) {
+                let block_idx = stack[block_pos];
+                if current_start > self.symbols[block_idx].range.end.line {
+                    while stack.len() > block_pos {
+                        let top_idx = stack.pop().expect("stack entry exists");
+                        let top_level = self.symbols[top_idx]
+                            .section_level
+                            .expect("section_level must be Some for symbols in section_indices");
+                        if top_level > 0 {
+                            self.symbols[top_idx].range.end = self.symbols[block_idx].range.end;
+                        }
+                    }
+                }
+            }
+
+            while let Some(&top_idx) = stack.last() {
                 let top_level = self.symbols[top_idx]
                     .section_level
                     .expect("section_level must be Some for symbols in section_indices");
                 if top_level >= current_level {
-                    let end_line = if current_start > 0 {
-                        current_start - 1
-                    } else {
-                        0
-                    };
-                    self.symbols[top_idx].range.end = Position {
-                        line: end_line,
-                        character: LSP_EOL_CHARACTER,
-                    };
+                    if top_level > 0 {
+                        let end_line = if current_start > 0 {
+                            current_start - 1
+                        } else {
+                            0
+                        };
+                        self.symbols[top_idx].range.end = Position {
+                            line: end_line,
+                            character: LSP_EOL_CHARACTER,
+                        };
+                    }
                     stack.pop();
                 } else {
                     break;
                 }
             }
 
-            stack.push(i);
+            stack.push(current_idx);
         }
 
-        // Remaining stack entries extend to EOF
-        while let Some(top_i) = stack.pop() {
-            let top_idx = section_indices[top_i];
-            self.symbols[top_idx].range.end = Position {
-                line: eof_line,
-                character: LSP_EOL_CHARACTER,
-            };
+        let mut current_fixed_end = Position {
+            line: eof_line,
+            character: LSP_EOL_CHARACTER,
+        };
+        for &idx in &stack {
+            let level = self.symbols[idx]
+                .section_level
+                .expect("section_level must be Some for symbols in section_indices");
+            if level == 0 {
+                current_fixed_end =
+                    Self::min_position(current_fixed_end, self.symbols[idx].range.end);
+            } else {
+                self.symbols[idx].range.end = current_fixed_end;
+            }
+        }
+
+        let section_starts: Vec<(usize, Position)> = section_indices
+            .iter()
+            .map(|&idx| (idx, self.symbols[idx].range.start))
+            .collect();
+
+        for (idx, section_start) in section_starts {
+            if self.symbols[idx].section_level == Some(0) {
+                continue;
+            }
+
+            let container_end = self
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(other_idx, other)| {
+                    *other_idx != idx
+                        && Self::is_section_container_boundary(other)
+                        && Self::position_leq(other.range.start, section_start)
+                        && Self::range_contains_position(&other.range, section_start)
+                })
+                .map(|(_, other)| other.range.end)
+                .reduce(Self::min_position);
+
+            if let Some(container_end) = container_end {
+                self.symbols[idx].range.end =
+                    Self::min_position(self.symbols[idx].range.end, container_end);
+            }
         }
     }
 
@@ -1814,64 +2231,40 @@ impl HierarchyBuilder {
     ///
     /// Uses a stack-based approach where each stack entry is a mutable reference path
     /// to the current section in the hierarchy.
-    fn build_section_hierarchy(sections: Vec<RawSymbol>) -> Vec<RawSymbol> {
+    fn build_section_hierarchy(mut sections: Vec<RawSymbol>) -> Vec<RawSymbol> {
         if sections.is_empty() {
             return Vec::new();
         }
 
+        sections.sort_by_key(|section| section.range.start.line);
         let mut result: Vec<RawSymbol> = Vec::new();
-        // Stack tracks (level, path) where path is indices to navigate to the section
-        // path[0] is index in result, path[1..] are indices in children
-        let mut stack: Vec<(u32, Vec<usize>)> = Vec::new();
-
         for section in sections {
-            let level = section.section_level.unwrap(); // Safe because we filtered
-
-            // Pop sections from stack until we find a parent with lower level
-            while let Some((stack_level, _)) = stack.last() {
-                if *stack_level < level {
-                    break;
-                }
-                stack.pop();
-            }
-
-            if stack.is_empty() {
-                // Root-level section
-                let idx = result.len();
-                result.push(section);
-                stack.push((level, vec![idx]));
-            } else {
-                // Nested section - add to parent's children
-                let (_, parent_path) = stack.last().unwrap();
-                let parent_path = parent_path.clone();
-
-                // Navigate to parent and add child
-                let child_idx = Self::add_child_at_path(&mut result, &parent_path, section);
-
-                // Build path to this new section
-                let mut new_path = parent_path;
-                new_path.push(child_idx);
-                stack.push((level, new_path));
-            }
+            Self::insert_section_into_hierarchy(&mut result, section);
         }
 
         result
     }
 
-    /// Add a child symbol at the given path and return the child's index.
-    fn add_child_at_path(result: &mut [RawSymbol], path: &[usize], child: RawSymbol) -> usize {
-        if path.is_empty() {
-            panic!("Empty path in add_child_at_path");
+    fn insert_section_into_hierarchy(sections: &mut Vec<RawSymbol>, section: RawSymbol) {
+        let section_line = section.range.start.line;
+        let section_level = section
+            .section_level
+            .expect("section hierarchy only contains sections");
+
+        for parent in sections.iter_mut().rev() {
+            let parent_level = parent
+                .section_level
+                .expect("section hierarchy only contains sections");
+            if parent_level < section_level
+                && section_line >= parent.range.start.line
+                && section_line <= parent.range.end.line
+            {
+                Self::insert_section_into_hierarchy(&mut parent.children, section);
+                return;
+            }
         }
 
-        let mut current = &mut result[path[0]];
-        for &idx in &path[1..] {
-            current = &mut current.children[idx];
-        }
-
-        let child_idx = current.children.len();
-        current.children.push(child);
-        child_idx
+        sections.push(section);
     }
 
     /// Insert a non-section symbol into the appropriate section in the hierarchy.
@@ -1920,18 +2313,19 @@ impl HierarchyBuilder {
         true
     }
 
-    /// Nest symbols within function bodies based on position.
+    /// Nest symbols within container bodies based on position.
     ///
-    /// This method organizes symbols into a hierarchy based on function containment:
-    /// - Symbols whose start line falls within a function's range become children of that function
-    /// - Supports arbitrary nesting depth (functions inside functions inside functions...)
+    /// This method organizes symbols into a hierarchy based on container containment:
+    /// - Symbols whose start line falls within a function or loop range become children
+    ///   of that container
+    /// - Supports arbitrary nesting depth across functions and loops
     ///
     /// # Algorithm
     ///
     /// For each level of the hierarchy:
-    /// 1. Identify function symbols (kind == Function)
-    /// 2. For each non-function symbol, check if it falls within any function's range
-    /// 3. If so, move it to be a child of the innermost containing function
+    /// 1. Identify container symbols (functions and loops)
+    /// 2. For each non-container symbol, check if it falls within any container's range
+    /// 3. If so, move it to be a child of the innermost containing container
     /// 4. Recursively process children of each symbol
     ///
     /// # Requirements
@@ -1947,17 +2341,17 @@ impl HierarchyBuilder {
     ///
     /// This method should be called AFTER `nest_in_sections()` so that symbols are first
     /// organized by sections, then within each section (or at root level), they are further
-    /// organized by function containment.
+    /// organized by container containment.
     pub fn nest_in_functions(&mut self) {
-        // Process the root level symbols
-        self.symbols = Self::nest_symbols_in_functions_recursive(std::mem::take(&mut self.symbols));
+        self.symbols =
+            Self::nest_symbols_in_containers_recursive(std::mem::take(&mut self.symbols));
     }
 
-    /// Recursively nest symbols within functions at a given level of the hierarchy.
+    /// Recursively nest symbols within containers at a given level of the hierarchy.
     ///
     /// This function processes a list of symbols and:
-    /// 1. Identifies function symbols that can contain other symbols
-    /// 2. Moves symbols (including nested functions) into their containing functions
+    /// 1. Identifies container symbols that can contain other symbols
+    /// 2. Moves symbols (including nested containers) into their containing containers
     /// 3. Recursively processes children of all symbols
     ///
     /// # Arguments
@@ -1966,8 +2360,8 @@ impl HierarchyBuilder {
     ///
     /// # Returns
     ///
-    /// The reorganized list of symbols with proper function nesting
-    fn nest_symbols_in_functions_recursive(symbols: Vec<RawSymbol>) -> Vec<RawSymbol> {
+    /// The reorganized list of symbols with proper container nesting
+    fn nest_symbols_in_containers_recursive(symbols: Vec<RawSymbol>) -> Vec<RawSymbol> {
         if symbols.is_empty() {
             return symbols;
         }
@@ -1977,7 +2371,7 @@ impl HierarchyBuilder {
             .into_iter()
             .map(|mut sym| {
                 sym.children =
-                    Self::nest_symbols_in_functions_recursive(std::mem::take(&mut sym.children));
+                    Self::nest_symbols_in_containers_recursive(std::mem::take(&mut sym.children));
                 sym
             })
             .collect();
@@ -1985,33 +2379,27 @@ impl HierarchyBuilder {
         // Sort by start line for consistent processing
         symbols.sort_by_key(|s| s.range.start.line);
 
-        // Build the hierarchy by finding which symbols are contained by which functions
-        // A symbol is contained by a function if it starts after the function starts
+        // Build the hierarchy by finding which symbols are contained by which containers.
+        // A symbol is contained by a container if it starts after the container starts
         // and ends before or at the function's end line
 
-        // We'll use a simple approach: repeatedly find symbols that should be nested
-        // and move them into their containing functions
         loop {
-            // Find all functions at this level
-            let function_indices: Vec<usize> = symbols
+            let container_indices: Vec<usize> = symbols
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| matches!(s.kind, DocumentSymbolKind::Function))
+                .filter(|(_, s)| Self::is_container_symbol(s))
                 .map(|(i, _)| i)
                 .collect();
 
-            // For each symbol, check if it should be nested in a function
             let mut nested_indices: Vec<usize> = Vec::new();
 
             for (i, sym) in symbols.iter().enumerate() {
-                // Skip functions when checking if they should be nested
-                // (we handle function-in-function separately)
-                for &func_idx in &function_indices {
-                    if i == func_idx {
-                        continue; // Don't nest a function in itself
+                for &container_idx in &container_indices {
+                    if i == container_idx {
+                        continue;
                     }
-                    let func = &symbols[func_idx];
-                    if Self::symbol_is_inside_function(sym, func) {
+                    let container = &symbols[container_idx];
+                    if Self::symbol_is_inside_container(sym, container) {
                         nested_indices.push(i);
                         break;
                     }
@@ -2023,12 +2411,9 @@ impl HierarchyBuilder {
                 return symbols;
             }
 
-            // Move nested symbols into their containing functions
-            // We need to be careful about the order of operations
             let nested_set: std::collections::HashSet<usize> =
                 nested_indices.iter().cloned().collect();
 
-            // Collect symbols to nest
             let mut to_nest: Vec<RawSymbol> = Vec::new();
             let mut remaining: Vec<RawSymbol> = Vec::new();
 
@@ -2040,14 +2425,13 @@ impl HierarchyBuilder {
                 }
             }
 
-            // Insert nested symbols into their containing functions
             for sym in to_nest {
                 let mut inserted = false;
-                for func in remaining.iter_mut() {
-                    if matches!(func.kind, DocumentSymbolKind::Function)
-                        && Self::symbol_is_inside_function(&sym, func)
+                for container in remaining.iter_mut() {
+                    if Self::is_container_symbol(container)
+                        && Self::symbol_is_inside_container(&sym, container)
                     {
-                        Self::insert_into_innermost_function(&mut func.children, sym.clone());
+                        Self::insert_into_innermost_container(&mut container.children, sym.clone());
                         inserted = true;
                         break;
                     }
@@ -2063,38 +2447,39 @@ impl HierarchyBuilder {
         }
     }
 
-    /// Check if a symbol is inside a function's range.
+    fn is_container_symbol(symbol: &RawSymbol) -> bool {
+        matches!(
+            symbol.kind,
+            DocumentSymbolKind::Function | DocumentSymbolKind::Loop
+        )
+    }
+
+    /// Check if a symbol is inside a container's range.
     ///
     /// A symbol is considered inside a function if its start line is within
     /// the function's range (inclusive of start, exclusive of end line if
     /// the symbol starts at the same line as the function ends).
-    fn symbol_is_inside_function(symbol: &RawSymbol, func: &RawSymbol) -> bool {
+    fn symbol_is_inside_container(symbol: &RawSymbol, container: &RawSymbol) -> bool {
         let symbol_start = symbol.range.start.line;
-        let func_start = func.range.start.line;
-        let func_end = func.range.end.line;
+        let container_start = container.range.start.line;
+        let container_end = container.range.end.line;
 
-        // Symbol must start after the function starts (not on the same line as the function definition)
-        // and before or on the function's end line
-        symbol_start > func_start && symbol_start <= func_end
+        symbol_start > container_start && symbol_start <= container_end
     }
 
-    /// Insert a symbol into the innermost containing function within a list of children.
+    /// Insert a symbol into the innermost containing container within a list of children.
     ///
     /// This recursively checks if any function children contain the symbol,
     /// allowing for arbitrary nesting depth.
-    fn insert_into_innermost_function(children: &mut Vec<RawSymbol>, symbol: RawSymbol) {
-        // Check if any function child contains this symbol
+    fn insert_into_innermost_container(children: &mut Vec<RawSymbol>, symbol: RawSymbol) {
         for child in children.iter_mut() {
-            if matches!(child.kind, DocumentSymbolKind::Function)
-                && Self::symbol_is_inside_function(&symbol, child)
+            if Self::is_container_symbol(child) && Self::symbol_is_inside_container(&symbol, child)
             {
-                // Recursively try to insert into nested functions
-                Self::insert_into_innermost_function(&mut child.children, symbol);
+                Self::insert_into_innermost_container(&mut child.children, symbol);
                 return;
             }
         }
 
-        // No nested function contains it, add to this level
         children.push(symbol);
     }
 
@@ -2103,7 +2488,7 @@ impl HierarchyBuilder {
     /// This method orchestrates the hierarchy building process:
     /// 1. Computes section ranges (from section comment to next section or EOF)
     /// 2. Nests symbols within sections based on position
-    /// 3. Nests symbols within function bodies based on position
+    /// 3. Nests symbols within functions and loops based on position
     /// 4. Converts the `Vec<RawSymbol>` hierarchy to `Vec<DocumentSymbol>`
     ///
     /// # Returns
@@ -2410,7 +2795,7 @@ fn stan_block_pattern() -> &'static Regex {
 }
 
 /// Detects top-level block structures in JAGS and Stan files.
-/// Returns `RawSymbol` entries with `kind=Module` and `section_level=1`.
+/// Returns `RawSymbol` entries with `kind=Module` and `section_level=0`.
 pub struct BlockDetector;
 
 /// State machine states for brace matching that skips comments and strings.
@@ -2509,7 +2894,7 @@ impl BlockDetector {
                                 ),
                             },
                             detail: None,
-                            section_level: Some(1),
+                            section_level: Some(0),
                             children: Vec::new(),
                         });
                         continue;
@@ -2542,7 +2927,7 @@ impl BlockDetector {
                     end: Position::new(keyword_line as u32, keyword_col as u32 + keyword_len),
                 },
                 detail: None,
-                section_level: Some(1),
+                section_level: Some(0),
                 children: Vec::new(),
             });
         }
@@ -2679,20 +3064,24 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
     let raw_symbols = match doc.file_type {
         FileType::Stan => {
             let extractor = SymbolExtractor::new(&text, tree.root_node());
-            let mut raw_symbols = extractor.extract_sections();
+            let mut raw_symbols =
+                extractor.extract_decorative_sections(ModelCommentStyle::DoubleSlash);
             raw_symbols.extend(collect_stan_document_symbols(&text));
+            raw_symbols.extend(extractor.extract_loops());
             raw_symbols.extend(BlockDetector::detect_stan(&text));
             raw_symbols
         }
-        FileType::Jags | FileType::R => {
-            // Use SymbolExtractor to extract symbols from the document
+        FileType::Jags => {
             let extractor = SymbolExtractor::new(&text, tree.root_node());
-            let mut raw_symbols = extractor.extract_all();
-
-            if matches!(doc.file_type, FileType::Jags) {
-                raw_symbols.extend(BlockDetector::detect_jags(&text));
-            }
-
+            let mut raw_symbols = extractor.extract_ast_symbols();
+            raw_symbols.extend(extractor.extract_decorative_sections(ModelCommentStyle::Hash));
+            raw_symbols.extend(extractor.extract_loops());
+            raw_symbols.extend(BlockDetector::detect_jags(&text));
+            raw_symbols
+        }
+        FileType::R => {
+            let extractor = SymbolExtractor::new(&text, tree.root_node());
+            let raw_symbols = extractor.extract_all();
             raw_symbols
         }
     };
@@ -9707,41 +10096,31 @@ fn extract_header(node: tree_sitter::Node, content: &str) -> String {
 
     match node.kind() {
         "for_statement" => {
-            // For loop: extract "for (var in seq)"
-            // Find the body child and stop before it
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "brace_list"
-                    || child.kind() == "call"
-                    || (child.kind() != "identifier"
-                        && child.kind() != "("
-                        && child.kind() != ")"
-                        && child.kind() != "in"
-                        && child.start_position().row > start_line)
-                {
-                    // Body starts - extract up to before body
-                    let body_start = child.start_position();
-                    if body_start.row == start_line {
-                        // Body on same line - extract up to body start column
-                        let line = lines.get(start_line).unwrap_or(&"");
-                        return line[..body_start.column.min(line.len())]
-                            .trim_end()
-                            .to_string();
-                    } else {
-                        // Body on different line - extract header lines
-                        let mut result = String::new();
-                        for i in start_line..body_start.row {
-                            if i > start_line {
-                                result.push('\n');
-                            }
-                            if let Some(line) = lines.get(i) {
-                                result.push_str(line);
-                            }
-                        }
-                        return result;
+            if let Some(body) = node.child_by_field_name("body").or_else(|| {
+                node.children(&mut node.walk())
+                    .filter(|c| c.is_named())
+                    .last()
+            }) {
+                let body_start = body.start_position();
+                if body_start.row == start_line {
+                    let line = lines.get(start_line).unwrap_or(&"");
+                    return line[..body_start.column.min(line.len())]
+                        .trim_end()
+                        .to_string();
+                }
+
+                let mut result = String::new();
+                for i in start_line..body_start.row {
+                    if i > start_line {
+                        result.push('\n');
+                    }
+                    if let Some(line) = lines.get(i) {
+                        result.push_str(line);
                     }
                 }
+                return result;
             }
+
             // Fallback: just first line
             lines.get(start_line).unwrap_or(&"").to_string()
         }
@@ -35891,6 +36270,41 @@ mod block_detector_integration_tests {
     use tower_lsp::lsp_types::SymbolKind;
     use url::Url;
 
+    fn range_contains(parent: &Range, child: &Range) -> bool {
+        let starts_after_parent = child.start.line > parent.start.line
+            || (child.start.line == parent.start.line
+                && child.start.character >= parent.start.character);
+        let ends_before_parent = child.end.line < parent.end.line
+            || (child.end.line == parent.end.line && child.end.character <= parent.end.character);
+        starts_after_parent && ends_before_parent
+    }
+
+    fn assert_symbol_tree_contract(symbols: &[DocumentSymbol], parent: Option<&Range>) {
+        for symbol in symbols {
+            assert!(
+                range_contains(&symbol.range, &symbol.selection_range),
+                "selection_range must be contained within range for '{}': range={:?}, selection_range={:?}",
+                symbol.name,
+                symbol.range,
+                symbol.selection_range
+            );
+
+            if let Some(parent_range) = parent {
+                assert!(
+                    range_contains(parent_range, &symbol.range),
+                    "child range must be contained within parent for '{}': parent={:?}, child={:?}",
+                    symbol.name,
+                    parent_range,
+                    symbol.range
+                );
+            }
+
+            if let Some(children) = &symbol.children {
+                assert_symbol_tree_contract(children, Some(&symbol.range));
+            }
+        }
+    }
+
     fn nested_symbols(state: &crate::state::WorldState, uri: &Url) -> Vec<DocumentSymbol> {
         match document_symbol(state, uri) {
             Some(DocumentSymbolResponse::Nested(syms)) => syms,
@@ -35987,6 +36401,218 @@ mod block_detector_integration_tests {
             !child_names.contains(&"upper"),
             "outline should not contain Stan constraint argument upper"
         );
+    }
+
+    #[test]
+    fn test_stan_banner_section_nests_under_block() {
+        let code = "data {\n  // =====================================================================\n  // DIMENSIONS\n  // =====================================================================\n  int<lower=1> N;\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "data").unwrap();
+        let section = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "DIMENSIONS")
+            .unwrap();
+
+        assert_eq!(section.kind, SymbolKind::MODULE);
+        assert_eq!(section.range.end, block.range.end);
+        let child_names: Vec<&str> = section
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"N"));
+    }
+
+    #[test]
+    fn test_stan_inline_section_nests_under_block() {
+        let code = "data {\n  // --- Inputs ---\n  int<lower=1> N;\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "data").unwrap();
+        let section = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "Inputs")
+            .unwrap();
+
+        assert_eq!(section.kind, SymbolKind::MODULE);
+        assert_eq!(section.range.end, block.range.end);
+        let child_names: Vec<&str> = section
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"N"));
+    }
+
+    #[test]
+    fn test_jags_inline_section_nests_under_model() {
+        let code = "model {\n  # --- Priors ---\n  mu <- 0\n}\n";
+        let (state, uri) = make_state("file:///test/model.jags", code);
+        let symbols = nested_symbols(&state, &uri);
+        let block = symbols.iter().find(|s| s.name == "model").unwrap();
+        let section = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "Priors")
+            .unwrap();
+
+        assert_eq!(section.kind, SymbolKind::MODULE);
+        let child_names: Vec<&str> = section
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"mu"));
+    }
+
+    #[test]
+    fn test_stan_braced_loop_owns_symbols() {
+        let code = "model {\n  for (i in 1:N) {\n    real foo = i;\n  }\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "model").unwrap();
+        let loop_symbol = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "for (i in 1:N)")
+            .unwrap();
+
+        assert_eq!(loop_symbol.kind, SymbolKind::NAMESPACE);
+        let child_names: Vec<&str> = loop_symbol
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"foo"));
+    }
+
+    #[test]
+    fn test_stan_braceless_nested_loops_appear_in_outline() {
+        let code = "model {\n  for (i in 1:N)\n    for (j in 1:M)\n      real foo = i + j;\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "model").unwrap();
+        let outer_loop = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "for (i in 1:N)")
+            .unwrap();
+        let inner_loop = outer_loop
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "for (j in 1:M)")
+            .unwrap();
+
+        assert_eq!(outer_loop.kind, SymbolKind::NAMESPACE);
+        assert_eq!(inner_loop.kind, SymbolKind::NAMESPACE);
+        let child_names: Vec<&str> = inner_loop
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"foo"));
+    }
+
+    #[test]
+    fn test_stan_same_line_braceless_loop_uses_header_only() {
+        let code = "model {\n  for (r in 1:R) target += normal_lpdf(theta[r] | 0, 1);\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "model").unwrap();
+        let loop_symbol = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.kind == SymbolKind::NAMESPACE)
+            .unwrap();
+
+        assert_eq!(loop_symbol.name, "for (r in 1:R)");
+    }
+
+    #[test]
+    fn test_stan_section_inside_loop_is_clamped_to_loop_end() {
+        let code = "model {\n  for (q in 1:Q) {\n    // --- Trend periods ---\n    for (p_idx in 1:n_p1) {\n      real foo = p_idx;\n    }\n  }\n  // --- After loop ---\n  real bar = 0;\n}\n";
+        let (state, uri) = make_state("file:///test/model.stan", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "model").unwrap();
+        let outer_loop = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "for (q in 1:Q)")
+            .unwrap();
+        let trend_section = outer_loop
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "Trend periods")
+            .unwrap();
+
+        assert_eq!(trend_section.range.end, outer_loop.range.end);
+        let trend_children = trend_section.children.as_ref().unwrap();
+        assert!(trend_children
+            .iter()
+            .any(|s| s.name == "for (p_idx in 1:n_p1)"));
+    }
+
+    #[test]
+    fn test_jags_loop_owns_symbols() {
+        let code = "model {\n  for (i in 1:N) {\n    mu <- i\n  }\n}\n";
+        let (state, uri) = make_state("file:///test/model.jags", code);
+        let symbols = nested_symbols(&state, &uri);
+        assert_symbol_tree_contract(&symbols, None);
+        let block = symbols.iter().find(|s| s.name == "model").unwrap();
+        let loop_symbol = block
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "for (i in 1:N)")
+            .unwrap();
+
+        assert_eq!(loop_symbol.kind, SymbolKind::NAMESPACE);
+        let child_names: Vec<&str> = loop_symbol
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"mu"));
     }
 
     #[test]
@@ -36130,7 +36756,7 @@ mod block_detector_proptests {
             prop_assert_eq!(symbols.len(), 1);
             prop_assert_eq!(&symbols[0].name, kw);
             prop_assert_eq!(symbols[0].kind, DocumentSymbolKind::Module);
-            prop_assert_eq!(symbols[0].section_level, Some(1));
+            prop_assert_eq!(symbols[0].section_level, Some(0));
         }
 
         #[test]
@@ -36140,7 +36766,7 @@ mod block_detector_proptests {
             prop_assert_eq!(symbols.len(), 1);
             prop_assert_eq!(&symbols[0].name, kw);
             prop_assert_eq!(symbols[0].kind, DocumentSymbolKind::Module);
-            prop_assert_eq!(symbols[0].section_level, Some(1));
+            prop_assert_eq!(symbols[0].section_level, Some(0));
         }
 
         // Property 2: Block range correctness with nested braces
@@ -36287,7 +36913,7 @@ mod block_detector_tests {
         assert_eq!(s.kind, DocumentSymbolKind::Module);
         assert_eq!(s.range, rng(0, 0, 0, 15));
         assert_eq!(s.selection_range, rng(0, 0, 0, 4));
-        assert_eq!(s.section_level, Some(1));
+        assert_eq!(s.section_level, Some(0));
     }
 
     #[test]

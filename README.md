@@ -109,7 +109,7 @@ You may also want to push snippets below LSP completions to reduce duplicate ent
 - **Completions** - Workspace-aware completion including symbols from sourced files and loaded packages
 - **Function signatures** - Parameter completion and richer function signature hovers
 - **Hover** - Symbol information on hover
-- **Document symbols** - Hierarchical outline view with R code section support (`# Section ----`), S4/R6 class detection, and nested function display
+- **Document symbols** - Hierarchical outline view with R sections, JAGS/Stan blocks plus decorative headings and loops, S4/R6 class detection, and nested function display
 - **Workspace symbols** - Fast project-wide symbol search (Ctrl+T) with configurable result limits
 - **Workspace indexing** - Background indexing of your entire project
 - **Smart indentation** - AST-aware auto-indentation with RStudio-style alignment on Enter
