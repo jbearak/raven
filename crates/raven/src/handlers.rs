@@ -9006,9 +9006,9 @@ fn collect_jags_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate
     for (line_idx, line) in text.lines().enumerate() {
         let code = line.split('#').next().unwrap_or(line);
 
-        // Check each candidate position (full line, after '{')
+        // Check each candidate position (full line, then after each '{')
         for (offset, candidate) in
-            std::iter::once((0, code)).chain(code.rsplit_once('{').map(|(head, tail)| (head.len() + 1, tail)))
+            std::iter::once((0, code)).chain(code.match_indices('{').map(|(i, _)| (i + 1, &code[i + 1..])))
         {
             if let Some(captures) = def_re.captures(candidate) {
                 if let Some(name) = captures.get(1) {
