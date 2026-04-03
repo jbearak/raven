@@ -1365,6 +1365,15 @@ pub fn resolve_base_directory(
         FilePathContext::SourceCall { .. } => {
             let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
             if partial_dir.is_empty() {
+                // For unannotated files (no explicit or inherited working directory),
+                // use workspace-root fallback to match resolve_path_with_workspace_fallback behavior
+                let has_explicit_wd = path_context.working_directory.is_some();
+                let has_inherited_wd = path_context.inherited_working_directory.is_some();
+                if !has_explicit_wd && !has_inherited_wd {
+                    if let Some(ref workspace_root) = path_context.workspace_root {
+                        return Some(workspace_root.clone());
+                    }
+                }
                 Some(path_context.effective_working_directory())
             } else {
                 resolve_path_with_workspace_fallback(resolution_path, &path_context)
@@ -8286,7 +8295,7 @@ mod resolve_base_directory_tests {
 
     #[test]
     fn test_resolve_base_directory_source_call_no_partial() {
-        // source("") - empty partial path, should return file's directory
+        // source("") - empty partial path, unannotated file uses workspace-root fallback
         let file_uri = Url::parse("file:///project/src/main.R").unwrap();
         let workspace_root = Url::parse("file:///project").unwrap();
         let metadata = make_metadata(None);
@@ -8303,7 +8312,7 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), PathBuf::from("/project/src"));
+        assert_eq!(result.unwrap(), PathBuf::from("/project"));
     }
 
     #[test]
@@ -8528,8 +8537,8 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        // Should return file's directory since there's no directory component
-        assert_eq!(result.unwrap(), PathBuf::from("/project/src"));
+        // Unannotated file: workspace-root fallback applies
+        assert_eq!(result.unwrap(), PathBuf::from("/project"));
     }
 
     #[test]
