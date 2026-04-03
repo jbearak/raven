@@ -8909,11 +8909,7 @@ fn collect_jags_document_completions(
     items: &mut Vec<CompletionItem>,
     seen_names: &mut std::collections::HashSet<String>,
 ) {
-    static JAGS_SYMBOL_RE: OnceLock<Regex> = OnceLock::new();
-    let symbol_re = JAGS_SYMBOL_RE.get_or_init(|| {
-        Regex::new(r"^\s*([A-Za-z][A-Za-z0-9_.]*)\s*(?:\[[^\]\r\n]+\]\s*)?(?:~|<-|=)")
-            .expect("valid JAGS symbol regex")
-    });
+    let symbol_re = jags_definition_pattern();
 
     for (line_idx, line) in text.lines().enumerate() {
         let code = line.split('#').next().unwrap_or(line);
@@ -11444,9 +11440,16 @@ pub fn goto_definition(
 
         // Try definition candidates first, then fall back to first occurrence
         // (covers data inputs and constants that have no assignment in the JAGS file).
+        // Skip the fallback for builtins/keywords — they have no user definition.
+        let is_builtin = crate::jags_builtins::JAGS_KEYWORDS.contains(&target.name.as_str())
+            || crate::jags_builtins::JAGS_DISTRIBUTIONS.contains(&target.name.as_str())
+            || crate::jags_builtins::JAGS_FUNCTIONS.contains(&target.name.as_str());
         let location = find_jags_definition(&text, &target.name, position)
             .map(|def| (def.line, def.start_col, def.end_col))
             .or_else(|| {
+                if is_builtin {
+                    return None;
+                }
                 occurrences
                     .iter()
                     .find(|o| o.name == target.name)
@@ -11778,11 +11781,10 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
                 continue;
             }
 
-            let file_type = state
-                .get_document(&file_uri)
-                .map(|doc| doc.file_type)
-                .unwrap_or_else(|| file_type_from_uri(&file_uri));
-            if file_type != FileType::Jags {
+            // DocumentState doesn't track file_type; derive from URI.
+            // Untitled JAGS docs without .jags/.bugs extension are handled
+            // by the legacy documents fallback below.
+            if file_type_from_uri(&file_uri) != FileType::Jags {
                 continue;
             }
 
