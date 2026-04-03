@@ -10,6 +10,11 @@ The LSP automatically detects `source()` and `sys.source()` calls:
 - Detects `local = TRUE` and `chdir = TRUE` parameters
 - Skips dynamic paths (variables, expressions) gracefully
 
+Inside `source()` strings and path-taking directives, Raven also provides file path intellisense:
+- Completion for `.R` / `.r` files and directories
+- Cmd-click / go-to-definition on resolvable paths
+- Path resolution that matches cross-file analysis rules (`@lsp-cd`, inherited working directories, and workspace-root fallback for AST-detected `source()` calls only)
+
 ## LSP Directives
 
 All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The one exception is `@lsp-ignore`, which can be used as a trailing comment to suppress diagnostics on the same line (e.g., `x <- foo # @lsp-ignore`).
@@ -367,4 +372,3 @@ helper_func <- function(x) {
 The LSP only uses backward relationships explicitly declared via `@lsp-sourced-by` directives. Forward-created backward edges from workspace scanning are not used for scope resolution.
 
 **Rationale:** Use this mode if you prefer full manual control over cross-file relationships, or if your workspace has complex sourcing patterns where automatic inference produces unwanted results (e.g., a file is sourced by multiple parents with conflicting scopes). Diagnostics are not deferred for the workspace scan.
-
