@@ -8909,11 +8909,7 @@ fn collect_jags_document_completions(
     items: &mut Vec<CompletionItem>,
     seen_names: &mut std::collections::HashSet<String>,
 ) {
-    static JAGS_SYMBOL_RE: OnceLock<Regex> = OnceLock::new();
-    let symbol_re = JAGS_SYMBOL_RE.get_or_init(|| {
-        Regex::new(r"^\s*([A-Za-z][A-Za-z0-9_]*)(?:\s*\[[^\]\r\n]+\])?\s*(?:~|<-|=)")
-            .expect("valid JAGS symbol regex")
-    });
+    let symbol_re = jags_definition_pattern();
 
     for (line_idx, line) in text.lines().enumerate() {
         let code = line.split('#').next().unwrap_or(line);
@@ -8933,6 +8929,170 @@ fn collect_jags_document_completions(
             }
         }
     }
+}
+
+// JAGS text-based identifier scanning (analogous to Stan's text-based approach).
+// tree-sitter-r can't parse JAGS syntax, so we bypass the AST entirely.
+
+fn is_jags_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic()
+}
+
+fn is_jags_identifier_continue(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'.' || byte == b'_'
+}
+
+fn collect_jags_identifier_occurrences(text: &str) -> Vec<StanIdentifierOccurrence> {
+    let mut occurrences = Vec::new();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut byte_col = 0;
+
+        while byte_col < bytes.len() {
+            let byte = bytes[byte_col];
+
+            // # starts a line comment in JAGS
+            if byte == b'#' {
+                break;
+            }
+
+            if is_jags_identifier_start(byte) {
+                let start = byte_col;
+                byte_col += 1;
+
+                while byte_col < bytes.len() && is_jags_identifier_continue(bytes[byte_col]) {
+                    byte_col += 1;
+                }
+
+                occurrences.push(StanIdentifierOccurrence {
+                    name: line[start..byte_col].to_string(),
+                    line: line_idx as u32,
+                    start_col: crate::cross_file::types::byte_offset_to_utf16_column(line, start),
+                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(line, byte_col),
+                });
+                continue;
+            }
+
+            byte_col += 1;
+        }
+    }
+
+    occurrences
+}
+
+fn jags_definition_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        // Matches: identifier (optionally with subscripts) followed by ~, <-, or =
+        Regex::new(r"^\s*([A-Za-z][A-Za-z0-9_.]*)\s*(?:\[[^\]\r\n]+\]\s*)?(?:~|<-|=)")
+            .expect("valid JAGS definition regex")
+    })
+}
+
+fn jags_for_loop_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"\bfor\s*\(\s*([A-Za-z][A-Za-z0-9_.]*)\s+in\b")
+            .expect("valid JAGS for-loop regex")
+    })
+}
+
+fn collect_jags_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate> {
+    let mut candidates = Vec::new();
+    let def_re = jags_definition_pattern();
+    let for_re = jags_for_loop_pattern();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let code = line.split('#').next().unwrap_or(line);
+
+        // Check each candidate position (full line, then after each '{')
+        for (offset, candidate) in
+            std::iter::once((0, code)).chain(code.match_indices('{').map(|(i, _)| (i + 1, &code[i + 1..])))
+        {
+            if let Some(captures) = def_re.captures(candidate) {
+                if let Some(name) = captures.get(1) {
+                    let byte_start = offset + name.start();
+                    let byte_end = offset + name.end();
+                    candidates.push(StanDefinitionCandidate {
+                        name: name.as_str().to_string(),
+                        line: line_idx as u32,
+                        start_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                            line, byte_start,
+                        ),
+                        end_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                            line, byte_end,
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+
+        // Also pick up for-loop variables (captures_iter for nested loops on one line)
+        for captures in for_re.captures_iter(code) {
+            if let Some(name) = captures.get(1) {
+                let byte_start = name.start();
+                let byte_end = name.end();
+                candidates.push(StanDefinitionCandidate {
+                    name: name.as_str().to_string(),
+                    line: line_idx as u32,
+                    start_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                        line, byte_start,
+                    ),
+                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                        line, byte_end,
+                    ),
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+fn find_jags_definition(
+    text: &str,
+    name: &str,
+    position: Position,
+) -> Option<StanDefinitionCandidate> {
+    let mut matching = collect_jags_definition_candidates(text)
+        .into_iter()
+        .filter(|candidate| candidate.name == name)
+        .collect::<Vec<_>>();
+
+    matching.sort_by_key(|candidate| (candidate.line, candidate.start_col));
+
+    // Find the closest definition before (or at) the usage position
+    matching
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.line < position.line
+                || (candidate.line == position.line && candidate.start_col <= position.character)
+        })
+        .cloned()
+        .or_else(|| matching.into_iter().next())
+}
+
+fn collect_jags_references(
+    occurrences: &[StanIdentifierOccurrence],
+    name: &str,
+    uri: &Url,
+    locations: &mut Vec<Location>,
+) {
+    locations.extend(
+        occurrences
+            .iter()
+            .filter(|occurrence| occurrence.name == name)
+            .map(|occurrence| Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position::new(occurrence.line, occurrence.start_col),
+                    end: Position::new(occurrence.line, occurrence.end_col),
+                },
+            }),
+    );
 }
 
 fn collect_stan_document_completions(
@@ -11274,6 +11434,37 @@ pub fn goto_definition(
         }));
     }
 
+    if doc.file_type == FileType::Jags {
+        let occurrences = collect_jags_identifier_occurrences(&text);
+        let target = stan_identifier_at_position(&occurrences, position)?;
+
+        // Try definition candidates first, then fall back to first occurrence
+        // (covers data inputs and constants that have no assignment in the JAGS file).
+        // Skip the fallback for builtins/keywords — they have no user definition.
+        let is_builtin = crate::jags_builtins::JAGS_KEYWORDS.contains(&target.name.as_str())
+            || crate::jags_builtins::JAGS_DISTRIBUTIONS.contains(&target.name.as_str())
+            || crate::jags_builtins::JAGS_FUNCTIONS.contains(&target.name.as_str());
+        let location = find_jags_definition(&text, &target.name, position)
+            .map(|def| (def.line, def.start_col, def.end_col))
+            .or_else(|| {
+                if is_builtin {
+                    return None;
+                }
+                occurrences
+                    .iter()
+                    .find(|o| o.name == target.name)
+                    .map(|o| (o.line, o.start_col, o.end_col))
+            })?;
+
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position::new(location.0, location.1),
+                end: Position::new(location.0, location.2),
+            },
+        }));
+    }
+
     // Continue with normal identifier-based go-to-definition
     let point = Point::new(position.line as usize, position.character as usize);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
@@ -11536,7 +11727,10 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
         // Search workspace index using new WorkspaceIndex.
         for (file_uri, entry) in state.workspace_index_new.iter() {
-            if &file_uri == uri || file_type_from_uri(&file_uri) != FileType::Stan {
+            if &file_uri == uri
+                || state.document_store.contains(&file_uri)
+                || file_type_from_uri(&file_uri) != FileType::Stan
+            {
                 continue;
             }
 
@@ -11571,6 +11765,79 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             let file_text = doc.text();
             let file_occurrences = collect_stan_identifier_occurrences(&file_text);
             collect_stan_references(&file_occurrences, name, file_uri, &mut locations);
+        }
+
+        return Some(locations);
+    }
+
+    if doc.file_type == FileType::Jags {
+        let occurrences = collect_jags_identifier_occurrences(&text);
+        let target = stan_identifier_at_position(&occurrences, position)?;
+        let name = target.name.as_str();
+        let mut locations = Vec::new();
+
+        collect_jags_references(&occurrences, name, uri, &mut locations);
+
+        // Search all open JAGS documents.
+        for file_uri in state.document_store.uris() {
+            if &file_uri == uri {
+                continue;
+            }
+
+            let file_type = state
+                .get_document(&file_uri)
+                .map(|doc| doc.file_type)
+                .unwrap_or_else(|| file_type_from_uri(&file_uri));
+            if file_type != FileType::Jags {
+                continue;
+            }
+
+            if let Some(content) = content_provider.get_content(&file_uri) {
+                let file_occurrences = collect_jags_identifier_occurrences(&content);
+                collect_jags_references(&file_occurrences, name, &file_uri, &mut locations);
+            }
+        }
+
+        // Search workspace index.
+        for (file_uri, entry) in state.workspace_index_new.iter() {
+            if &file_uri == uri
+                || state.document_store.contains(&file_uri)
+                || file_type_from_uri(&file_uri) != FileType::Jags
+            {
+                continue;
+            }
+
+            let file_text = entry.contents.to_string();
+            let file_occurrences = collect_jags_identifier_occurrences(&file_text);
+            collect_jags_references(&file_occurrences, name, &file_uri, &mut locations);
+        }
+
+        // Fallback: Search legacy open documents.
+        for (file_uri, doc) in &state.documents {
+            if file_uri == uri
+                || state.document_store.contains(file_uri)
+                || doc.file_type != FileType::Jags
+            {
+                continue;
+            }
+
+            let file_text = doc.text();
+            let file_occurrences = collect_jags_identifier_occurrences(&file_text);
+            collect_jags_references(&file_occurrences, name, file_uri, &mut locations);
+        }
+
+        // Fallback: Search legacy workspace index.
+        for (file_uri, doc) in &state.workspace_index {
+            if file_uri == uri
+                || state.workspace_index_new.contains(file_uri)
+                || doc.file_type != FileType::Jags
+            {
+                continue;
+            }
+
+            let file_text = doc.text();
+            let file_occurrences = collect_jags_identifier_occurrences(&file_text);
+            collect_jags_references(&file_occurrences, name, file_uri, &mut locations);
         }
 
         return Some(locations);
@@ -11614,7 +11881,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
     // Search workspace index using new WorkspaceIndex
     for (file_uri, entry) in state.workspace_index_new.iter() {
-        if &file_uri == uri {
+        if &file_uri == uri || state.document_store.contains(&file_uri) {
             continue; // Already searched
         }
         if let Some(tree) = &entry.tree {
@@ -36103,6 +36370,182 @@ model {
             ),
             (21, 7, 8)
         );
+    }
+}
+
+#[cfg(test)]
+mod jags_goto_definition_tests {
+    use super::*;
+    use crate::state::{Document, WorldState};
+
+    fn make_state(code: &str) -> (WorldState, Url) {
+        let uri = Url::parse("file:///test/model.jags").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+        (state, uri)
+    }
+
+    fn nth_jags_occurrence(code: &str, name: &str, nth: usize) -> StanIdentifierOccurrence {
+        collect_jags_identifier_occurrences(code)
+            .into_iter()
+            .filter(|o| o.name == name)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("Missing occurrence {} for '{}'", nth, name))
+    }
+
+    fn jags_definition_range(state: &WorldState, uri: &Url, pos: Position) -> (u32, u32, u32) {
+        let response =
+            goto_definition(state, uri, pos).expect("Expected a definition");
+
+        match response {
+            GotoDefinitionResponse::Scalar(loc) => (
+                loc.range.start.line,
+                loc.range.start.character,
+                loc.range.end.character,
+            ),
+            other => panic!("Expected scalar, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jags_identifier_occurrences_dotted_names() {
+        let code = "log.omega.cpw[c, p, w] ~ dnorm(mu, tau)";
+        let occurrences = collect_jags_identifier_occurrences(code);
+        let names: Vec<&str> = occurrences.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"log.omega.cpw"));
+        assert!(names.contains(&"dnorm"));
+    }
+
+    #[test]
+    fn test_jags_identifier_occurrences_skips_comments() {
+        let code = "x <- 1 # this is y\nz <- 2";
+        let occurrences = collect_jags_identifier_occurrences(code);
+        let names: Vec<&str> = occurrences.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"z"));
+        assert!(!names.contains(&"y"));
+    }
+
+    #[test]
+    fn test_jags_definition_candidates_stochastic() {
+        let code = "x[i] ~ dnorm(mu, tau)\ny <- x + 1";
+        let candidates = collect_jags_definition_candidates(code);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"y"));
+    }
+
+    #[test]
+    fn test_jags_definition_candidates_dotted() {
+        let code = "log.omega.cpw[c, p, married.no.need] ~ dt(mu, tau, nu)";
+        let candidates = collect_jags_definition_candidates(code);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "log.omega.cpw");
+    }
+
+    #[test]
+    fn test_jags_definition_candidates_for_loop() {
+        let code = "for ( w in w.unintended ) {\n  x[w] <- 1\n}";
+        let candidates = collect_jags_definition_candidates(code);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"w"));
+        assert!(names.contains(&"x"));
+    }
+
+    #[test]
+    fn test_jags_definition_candidates_nested_for_loops_one_line() {
+        let code = "for (i in 1:I) { for (j in 1:J) { x[i,j] <- 1 } }";
+        let candidates = collect_jags_definition_candidates(code);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"i"));
+        assert!(names.contains(&"j"));
+        assert!(names.contains(&"x"));
+    }
+
+    #[test]
+    fn test_jags_goto_definition_stochastic_assignment() {
+        let code = "model {\n  x[1] ~ dnorm(0, 1)\n  y <- x[1] + 1\n}";
+        let (state, uri) = make_state(code);
+
+        // Navigate from `x` on line 2 (usage in `y <- x[1] + 1`) to definition on line 1
+        let occ = nth_jags_occurrence(code, "x", 1);
+        let (line, start, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        assert_eq!(line, 1); // definition is `x[1] ~ dnorm(...)`
+        assert_eq!(start, 2); // `x` starts at column 2 (after two spaces)
+    }
+
+    #[test]
+    fn test_jags_goto_definition_dotted_identifier() {
+        let code = "model {\n  log.omega[c] ~ dnorm(0, 1)\n  y <- log.omega[c] + 1\n}";
+        let (state, uri) = make_state(code);
+
+        // Navigate from `log.omega` on line 2 to definition on line 1
+        let occ = nth_jags_occurrence(code, "log.omega", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_for_loop_variable() {
+        let code = "model {\n  for (c in 1:C) {\n    x[c] <- 1\n  }\n}";
+        let (state, uri) = make_state(code);
+
+        // Navigate from `c` in `x[c]` to `c` in `for (c in ...)`
+        let occ = nth_jags_occurrence(code, "c", 1); // second occurrence of `c`
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        assert_eq!(line, 1); // for loop is on line 1
+    }
+
+    #[test]
+    fn test_jags_references_finds_all_occurrences() {
+        let code = "x ~ dnorm(0, 1)\ny <- x + 1\nz <- x * 2";
+        let occurrences = collect_jags_identifier_occurrences(code);
+        let uri = Url::parse("file:///test.jags").unwrap();
+        let mut locations = Vec::new();
+        collect_jags_references(&occurrences, "x", &uri, &mut locations);
+        assert_eq!(locations.len(), 3);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_data_input_fallback() {
+        // `married.unmet` is only used inside brackets — no definition candidate exists.
+        // Go-to-def should fall back to the first occurrence.
+        let code = "model {\n  x[c, married.unmet] ~ dnorm(0, 1)\n  y[married.unmet] <- x[c, married.unmet]\n}";
+        let (state, uri) = make_state(code);
+
+        // Click on `married.unmet` on line 2 (second occurrence)
+        let occ = nth_jags_occurrence(code, "married.unmet", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        // Falls back to first occurrence on line 1
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_inside_truncation() {
+        // Symbols inside T() truncation bounds should be navigable.
+        let code = "model {\n  logit.min.prob <- -10\n  x ~ dnorm(0, 1)T(logit.min.prob, 10)\n}";
+        let (state, uri) = make_state(code);
+
+        // Click on `logit.min.prob` inside T()
+        let occ = nth_jags_occurrence(code, "logit.min.prob", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        // Should navigate to the definition on line 1
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_subscript_symbol() {
+        // Symbols used only as subscripts should still be navigable (first occurrence fallback).
+        let code = "model {\n  for (c in 1:C) {\n    x[c, w.idx] ~ dnorm(y[c, w.idx], 1)\n  }\n}";
+        let (state, uri) = make_state(code);
+
+        // Click on `w.idx` on line 2 (second occurrence inside y[...])
+        let occ = nth_jags_occurrence(code, "w.idx", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        // Falls back to first occurrence (also line 2, in x[c, w.idx])
+        assert_eq!(line, 2);
     }
 }
 
