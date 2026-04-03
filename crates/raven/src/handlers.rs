@@ -11727,7 +11727,10 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
         // Search workspace index using new WorkspaceIndex.
         for (file_uri, entry) in state.workspace_index_new.iter() {
-            if &file_uri == uri || file_type_from_uri(&file_uri) != FileType::Stan {
+            if &file_uri == uri
+                || state.document_store.contains(&file_uri)
+                || file_type_from_uri(&file_uri) != FileType::Stan
+            {
                 continue;
             }
 
@@ -11796,7 +11799,10 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
         // Search workspace index.
         for (file_uri, entry) in state.workspace_index_new.iter() {
-            if &file_uri == uri || file_type_from_uri(&file_uri) != FileType::Jags {
+            if &file_uri == uri
+                || state.document_store.contains(&file_uri)
+                || file_type_from_uri(&file_uri) != FileType::Jags
+            {
                 continue;
             }
 
@@ -11874,7 +11880,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
     // Search workspace index using new WorkspaceIndex
     for (file_uri, entry) in state.workspace_index_new.iter() {
-        if &file_uri == uri {
+        if &file_uri == uri || state.document_store.contains(&file_uri) {
             continue; // Already searched
         }
         if let Some(tree) = &entry.tree {
