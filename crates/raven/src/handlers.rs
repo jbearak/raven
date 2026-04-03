@@ -11441,13 +11441,23 @@ pub fn goto_definition(
     if doc.file_type == FileType::Jags {
         let occurrences = collect_jags_identifier_occurrences(&text);
         let target = stan_identifier_at_position(&occurrences, position)?;
-        let definition = find_jags_definition(&text, &target.name, position)?;
+
+        // Try definition candidates first, then fall back to first occurrence
+        // (covers data inputs and constants that have no assignment in the JAGS file).
+        let location = find_jags_definition(&text, &target.name, position)
+            .map(|def| (def.line, def.start_col, def.end_col))
+            .or_else(|| {
+                occurrences
+                    .iter()
+                    .find(|o| o.name == target.name)
+                    .map(|o| (o.line, o.start_col, o.end_col))
+            })?;
 
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: Range {
-                start: Position::new(definition.line, definition.start_col),
-                end: Position::new(definition.line, definition.end_col),
+                start: Position::new(location.0, location.1),
+                end: Position::new(location.0, location.2),
             },
         }));
     }
@@ -36487,6 +36497,46 @@ mod jags_goto_definition_tests {
         let mut locations = Vec::new();
         collect_jags_references(&occurrences, "x", &uri, &mut locations);
         assert_eq!(locations.len(), 3);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_data_input_fallback() {
+        // `married.unmet` is only used inside brackets — no definition candidate exists.
+        // Go-to-def should fall back to the first occurrence.
+        let code = "model {\n  x[c, married.unmet] ~ dnorm(0, 1)\n  y[married.unmet] <- x[c, married.unmet]\n}";
+        let (state, uri) = make_state(code);
+
+        // Click on `married.unmet` on line 2 (second occurrence)
+        let occ = nth_jags_occurrence(code, "married.unmet", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        // Falls back to first occurrence on line 1
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_inside_truncation() {
+        // Symbols inside T() truncation bounds should be navigable.
+        let code = "model {\n  logit.min.prob <- -10\n  x ~ dnorm(0, 1)T(logit.min.prob, 10)\n}";
+        let (state, uri) = make_state(code);
+
+        // Click on `logit.min.prob` inside T()
+        let occ = nth_jags_occurrence(code, "logit.min.prob", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        // Should navigate to the definition on line 1
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn test_jags_goto_definition_subscript_symbol() {
+        // Symbols used only as subscripts should still be navigable (first occurrence fallback).
+        let code = "model {\n  for (c in 1:C) {\n    x[c, w.idx] ~ dnorm(y[c, w.idx], 1)\n  }\n}";
+        let (state, uri) = make_state(code);
+
+        // Click on `w.idx` on line 2 (second occurrence inside y[...])
+        let occ = nth_jags_occurrence(code, "w.idx", 1);
+        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        // Falls back to first occurrence (also line 2, in x[c, w.idx])
+        assert_eq!(line, 2);
     }
 }
 
