@@ -12,3 +12,4 @@ cc 2dedd5b15f894237256947bc7c1391c87277bd9351679cedb9c8e946685c5834 # shrinks to
 cc 2250c8f29bc61283775c429485d811bc470b61dc653492a4f3296a3aab75251d # shrinks to func_name = "a_a", params = []
 cc 983b057cd15b41227acf67a33b60f8aad42d25970dfa29401494b609f8d246fe # shrinks to reserved_word = "if", var_name = "ifa"
 cc d3a667aae8fefd13d4da291efa222936bb1f1f6806e9bf2c52529364e215c4de # shrinks to symbol_name = "bmp", is_function = false, lines_between = 0
+cc 45e6028c72f7d8b279bbde2cb156a3ac934a6cff2e4f83142171fa19e7706317 # shrinks to func = "i__", lhs = "aa0", rhs = "i__"

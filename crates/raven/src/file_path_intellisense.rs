@@ -345,7 +345,8 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// Check if cursor is after an LSP directive where a path is expected
 ///
 /// Uses regex patterns consistent with cross_file/directive.rs to detect
-/// @lsp-sourced-by, @lsp-run-by, @lsp-included-by, and @lsp-source directives.
+/// @lsp-sourced-by, @lsp-run-by, @lsp-included-by, and forward source directives
+/// (`@lsp-source`, `@lsp-run`, `@lsp-include`).
 /// Handles optional colon and quotes syntax variations.
 ///
 /// # Arguments
@@ -851,9 +852,10 @@ fn create_path_completion_item(
         } else {
             CompletionItemKind::FILE
         }),
-        // Don't set filter_text - let the client use text_edit range for filtering
-        // Setting filter_text can cause issues when the user types characters
-        // (like spaces) that don't match the filename
+        // Use the full replacement text for filtering so nested paths like
+        // `scripts/` still match child entries whose display labels are just
+        // the basename (for example `helpers.R`).
+        filter_text: Some(insert_text.clone()),
         text_edit: Some(text_edit),
         command,
         // Set sort_text to ensure consistent ordering
@@ -897,7 +899,7 @@ pub fn file_path_definition(
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> Option<Location> {
-    use crate::cross_file::path_resolve::resolve_path;
+    use crate::cross_file::path_resolve::{resolve_path, resolve_path_with_workspace_fallback};
 
     // 1. Extract file path at position
     let (path_string, context) = extract_file_path_at_position(tree, content, position)?;
@@ -914,24 +916,33 @@ pub fn file_path_definition(
     // Normalize path separators (convert backslashes to forward slashes)
     let normalized_path = normalize_path_separators(&path_string);
 
-    // 2. Create appropriate PathContext based on context type
-    let path_context = match &context {
+    // 2. Create appropriate PathContext based on context type and resolve the path.
+    let resolved_path = match &context {
         FilePathContext::SourceCall { .. } => {
-            // For source() calls: respect @lsp-cd working directory
-            PathContext::from_metadata(file_uri, metadata, workspace_root)?
+            // source() navigation should match dependency-graph and scope resolution:
+            // respect explicit/inherited working directories, then fall back to the workspace
+            // root only when neither is present.
+            let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+            resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
         }
-        FilePathContext::Directive { .. } => {
-            // For directives: always relative to file's directory (ignore @lsp-cd)
-            PathContext::new(file_uri, workspace_root)?
-        }
+        FilePathContext::Directive { directive_type, .. } => match directive_type {
+            DirectiveType::SourcedBy => {
+                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                let path_context = PathContext::new(file_uri, workspace_root)?;
+                resolve_path(&normalized_path, &path_context)?
+            }
+            DirectiveType::Source => {
+                // Forward directives respect @lsp-cd but do not use workspace-root fallback.
+                let path_context =
+                    PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+                resolve_path(&normalized_path, &path_context)?
+            }
+        },
         FilePathContext::None => {
             // Should not happen since extract_file_path_at_position returns None for this case
             return None;
         }
     };
-
-    // 3. Resolve the path using the appropriate context
-    let resolved_path = resolve_path(&normalized_path, &path_context)?;
 
     log::trace!(
         "file_path_definition: Resolved path '{}' to '{}'",
@@ -1310,6 +1321,8 @@ pub fn resolve_base_directory(
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> Option<PathBuf> {
+    use crate::cross_file::path_resolve::{resolve_path, resolve_path_with_workspace_fallback};
+
     // Extract partial path from context
     let partial_path = match context {
         FilePathContext::SourceCall { partial_path, .. } => partial_path,
@@ -1323,6 +1336,11 @@ pub fn resolve_base_directory(
     // Get the directory component of the partial path
     // e.g., "../data/file.R" -> "../data/", "file.R" -> "", "../" -> "../"
     let partial_dir = extract_directory_component(&normalized_partial);
+    let resolution_path = if partial_dir.len() > 1 {
+        partial_dir.trim_end_matches('/')
+    } else {
+        partial_dir.as_str()
+    };
 
     // Handle workspace-root-relative paths (paths starting with `/`)
     // For BOTH SourceCall and Directive contexts: `/path` resolves relative to workspace root
@@ -1343,32 +1361,47 @@ pub fn resolve_base_directory(
         return normalize_path_for_completion(&joined);
     }
 
-    // Create the appropriate PathContext based on context type
-    let path_context = match context {
+    match context {
         FilePathContext::SourceCall { .. } => {
-            // For source() calls: respect @lsp-cd working directory
-            PathContext::from_metadata(file_uri, metadata, workspace_root)?
+            let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+            if partial_dir.is_empty() {
+                // For unannotated files (no explicit or inherited working directory),
+                // use workspace-root fallback to match resolve_path_with_workspace_fallback behavior
+                let has_explicit_wd = path_context.working_directory.is_some();
+                let has_inherited_wd = path_context.inherited_working_directory.is_some();
+                if !has_explicit_wd && !has_inherited_wd {
+                    if let Some(ref workspace_root) = path_context.workspace_root {
+                        return Some(workspace_root.clone());
+                    }
+                }
+                Some(path_context.effective_working_directory())
+            } else {
+                resolve_path_with_workspace_fallback(resolution_path, &path_context)
+            }
         }
-        FilePathContext::Directive { .. } => {
-            // For directives: always relative to file's directory (ignore @lsp-cd)
-            PathContext::new(file_uri, workspace_root)?
-        }
-        FilePathContext::None => return None,
-    };
-
-    // Get the effective base directory
-    let base_dir = path_context.effective_working_directory();
-
-    // If partial_dir is empty, use the base directory directly
-    if partial_dir.is_empty() {
-        return Some(base_dir);
+        FilePathContext::Directive { directive_type, .. } => match directive_type {
+            DirectiveType::SourcedBy => {
+                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                let path_context = PathContext::new(file_uri, workspace_root)?;
+                if partial_dir.is_empty() {
+                    Some(path_context.effective_working_directory())
+                } else {
+                    resolve_path(resolution_path, &path_context)
+                }
+            }
+            DirectiveType::Source => {
+                // Forward directives respect @lsp-cd but do not use workspace-root fallback.
+                let path_context =
+                    PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+                if partial_dir.is_empty() {
+                    Some(path_context.effective_working_directory())
+                } else {
+                    resolve_path(resolution_path, &path_context)
+                }
+            }
+        },
+        FilePathContext::None => None,
     }
-
-    // Join the partial directory with the base directory
-    let joined = base_dir.join(&partial_dir);
-
-    // Normalize the path to resolve .. and . components
-    normalize_path_for_completion(&joined)
 }
 
 /// Extract the directory component from a partial path
@@ -1474,8 +1507,9 @@ struct DirectivePathPatterns {
     /// Pattern for backward directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
     /// Matches: `# @lsp-sourced-by:` or `# @lsp-run-by` etc. (with optional leading whitespace)
     backward: Regex,
-    /// Pattern for forward directive (@lsp-source)
-    /// Matches: `# @lsp-source:` or `# @lsp-source` etc. (with optional leading whitespace)
+    /// Pattern for forward directives (@lsp-source, @lsp-run, @lsp-include)
+    /// Matches: `# @lsp-source:`, `# @lsp-run`, `# @lsp-include`, etc.
+    /// (with optional leading whitespace)
     forward: Regex,
 }
 
@@ -1494,7 +1528,8 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
                 r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
             )
             .unwrap(),
-            forward: Regex::new(r#"^\s*#\s*@lsp-source(?:\s+:?\s*|:\s*)"#).unwrap(),
+            forward: Regex::new(r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#)
+                .unwrap(),
         }
     })
 }
@@ -1543,8 +1578,7 @@ mod tests {
         let item = create_path_completion_item("utils.R", false, "", path_start, cursor_pos);
         assert_eq!(item.label, "utils.R");
         assert_eq!(item.kind, Some(CompletionItemKind::FILE));
-        // filter_text should not be set - we rely on text_edit for filtering
-        assert!(item.filter_text.is_none());
+        assert_eq!(item.filter_text.as_deref(), Some("utils.R"));
         // Check text_edit
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit {
             assert_eq!(edit.new_text, "utils.R");
@@ -1566,8 +1600,7 @@ mod tests {
         let item = create_path_completion_item("subdir", true, "", path_start, cursor_pos);
         assert_eq!(item.label, "subdir");
         assert_eq!(item.kind, Some(CompletionItemKind::FOLDER));
-        // filter_text should not be set - we rely on text_edit for filtering
-        assert!(item.filter_text.is_none());
+        assert_eq!(item.filter_text.as_deref(), Some("subdir/"));
         // Check text_edit inserts directory with trailing slash
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit {
             assert_eq!(edit.new_text, "subdir/");
@@ -1615,8 +1648,7 @@ mod tests {
         }; // After typing "../"
         let item = create_path_completion_item("utils.R", false, "../", path_start, cursor_pos);
         assert_eq!(item.label, "utils.R");
-        // filter_text should not be set
-        assert!(item.filter_text.is_none());
+        assert_eq!(item.filter_text.as_deref(), Some("../utils.R"));
         // Check text_edit range and content
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = item.text_edit {
             assert_eq!(edit.range.start, path_start);
@@ -2075,6 +2107,36 @@ mod tests {
         assert_eq!(directive_type, DirectiveType::Source);
         assert_eq!(partial, "util");
         assert_eq!(path_start.character, 16);
+    }
+
+    #[test]
+    fn test_directive_run_forward_synonym() {
+        let content = "# @lsp-run utils.R";
+        let position = Position {
+            line: 0,
+            character: 14,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::Source);
+        assert_eq!(partial, "uti");
+        assert_eq!(path_start.character, 11);
+    }
+
+    #[test]
+    fn test_directive_include_forward_synonym_with_quotes() {
+        let content = r#"# @lsp-include: "utils/helpers.R""#;
+        let position = Position {
+            line: 0,
+            character: 22,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::Source);
+        assert_eq!(partial, "utils");
+        assert_eq!(path_start.character, 17);
     }
 
     #[test]
@@ -2727,6 +2789,46 @@ mod tests {
         let position = Position {
             line: 0,
             character: 17,
+        };
+        let result = extract_file_path_at_position(&tree, content, position);
+        assert!(result.is_some());
+        let (full_path, context) = result.unwrap();
+        assert_eq!(full_path, "utils.R");
+        match context {
+            FilePathContext::Directive { directive_type, .. } => {
+                assert_eq!(directive_type, DirectiveType::Source);
+            }
+            _ => panic!("Expected Directive context, got {:?}", context),
+        }
+    }
+
+    #[test]
+    fn test_extract_file_path_directive_run_forward_synonym() {
+        let content = "# @lsp-run utils.R";
+        let tree = parse_r(content);
+        let position = Position {
+            line: 0,
+            character: 14,
+        };
+        let result = extract_file_path_at_position(&tree, content, position);
+        assert!(result.is_some());
+        let (full_path, context) = result.unwrap();
+        assert_eq!(full_path, "utils.R");
+        match context {
+            FilePathContext::Directive { directive_type, .. } => {
+                assert_eq!(directive_type, DirectiveType::Source);
+            }
+            _ => panic!("Expected Directive context, got {:?}", context),
+        }
+    }
+
+    #[test]
+    fn test_extract_file_path_directive_include_forward_synonym() {
+        let content = "# @lsp-include utils.R";
+        let tree = parse_r(content);
+        let position = Position {
+            line: 0,
+            character: 18,
         };
         let result = extract_file_path_at_position(&tree, content, position);
         assert!(result.is_some());
@@ -8093,6 +8195,8 @@ mod tests {
 #[cfg(test)]
 mod resolve_base_directory_tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     // Helper to create a test metadata with optional working directory
     fn make_metadata(working_dir: Option<&str>) -> CrossFileMetadata {
@@ -8191,7 +8295,7 @@ mod resolve_base_directory_tests {
 
     #[test]
     fn test_resolve_base_directory_source_call_no_partial() {
-        // source("") - empty partial path, should return file's directory
+        // source("") - empty partial path, unannotated file uses workspace-root fallback
         let file_uri = Url::parse("file:///project/src/main.R").unwrap();
         let workspace_root = Url::parse("file:///project").unwrap();
         let metadata = make_metadata(None);
@@ -8208,7 +8312,7 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), PathBuf::from("/project/src"));
+        assert_eq!(result.unwrap(), PathBuf::from("/project"));
     }
 
     #[test]
@@ -8236,8 +8340,12 @@ mod resolve_base_directory_tests {
     #[test]
     fn test_resolve_base_directory_source_call_with_parent_dir() {
         // source("../") - partial path with parent directory
-        let file_uri = Url::parse("file:///project/src/main.R").unwrap();
-        let workspace_root = Url::parse("file:///project").unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir(&src_dir).unwrap();
+
+        let file_uri = Url::from_file_path(src_dir.join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
         let metadata = make_metadata(None);
 
         let context = FilePathContext::SourceCall {
@@ -8252,7 +8360,7 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), PathBuf::from("/project"));
+        assert_eq!(result.unwrap(), temp_dir.path().to_path_buf());
     }
 
     #[test]
@@ -8370,6 +8478,33 @@ mod resolve_base_directory_tests {
     }
 
     #[test]
+    fn test_resolve_base_directory_forward_directive_does_not_use_workspace_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let child_dir = temp_dir.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let workspace_scripts = temp_dir.path().join("scripts");
+        fs::create_dir(&workspace_scripts).unwrap();
+
+        let file_uri = Url::from_file_path(child_dir.join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let context = FilePathContext::Directive {
+            directive_type: DirectiveType::Source,
+            partial_path: "scripts/".to_string(),
+            path_start: Position {
+                line: 0,
+                character: 14,
+            },
+        };
+
+        let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), child_dir.join("scripts"));
+    }
+
+    #[test]
     fn test_resolve_base_directory_none_context() {
         // FilePathContext::None should return None
         let file_uri = Url::parse("file:///project/src/main.R").unwrap();
@@ -8402,8 +8537,8 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        // Should return file's directory since there's no directory component
-        assert_eq!(result.unwrap(), PathBuf::from("/project/src"));
+        // Unannotated file: workspace-root fallback applies
+        assert_eq!(result.unwrap(), PathBuf::from("/project"));
     }
 
     #[test]
@@ -8453,8 +8588,16 @@ mod resolve_base_directory_tests {
     #[test]
     fn test_resolve_base_directory_deep_parent_navigation() {
         // Multiple parent directories
-        let file_uri = Url::parse("file:///project/src/deep/nested/main.R").unwrap();
-        let workspace_root = Url::parse("file:///project").unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir(&src_dir).unwrap();
+        let deep_dir = src_dir.join("deep");
+        fs::create_dir(&deep_dir).unwrap();
+        let nested_dir = deep_dir.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+
+        let file_uri = Url::from_file_path(nested_dir.join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
         let metadata = make_metadata(None);
 
         let context = FilePathContext::SourceCall {
@@ -8469,8 +8612,7 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        // /project/src/deep/nested + ../../ = /project/src
-        assert_eq!(result.unwrap(), PathBuf::from("/project/src"));
+        assert_eq!(result.unwrap(), src_dir);
     }
 
     // ====================================================================
@@ -8615,6 +8757,60 @@ mod resolve_base_directory_tests {
         // For source() calls, "/" is now workspace-root-relative
         // Should resolve to /project/data
         assert_eq!(result.unwrap(), PathBuf::from("/project/data"));
+    }
+
+    #[test]
+    fn test_resolve_base_directory_source_call_workspace_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let workspace_data_dir = scripts_dir.join("data");
+        fs::create_dir(&workspace_data_dir).unwrap();
+
+        let file_uri = Url::from_file_path(scripts_dir.join("data.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let context = FilePathContext::SourceCall {
+            partial_path: "scripts/data/".to_string(),
+            content_start: Position {
+                line: 0,
+                character: 8,
+            },
+            is_sys_source: false,
+        };
+
+        let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), workspace_data_dir);
+    }
+
+    #[test]
+    fn test_resolve_base_directory_source_call_inherited_working_directory_beats_fallback() {
+        let file_uri = Url::parse("file:///project/scripts/data.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let metadata = CrossFileMetadata {
+            inherited_working_directory: Some("/project/from-parent".to_string()),
+            ..Default::default()
+        };
+
+        let context = FilePathContext::SourceCall {
+            partial_path: "scripts/data/".to_string(),
+            content_start: Position {
+                line: 0,
+                character: 8,
+            },
+            is_sys_source: false,
+        };
+
+        let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
+
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/project/from-parent/scripts/data")
+        );
     }
 
     #[test]
@@ -8789,6 +8985,39 @@ mod file_path_definition_tests {
     }
 
     #[test]
+    fn test_file_path_definition_forward_directive_synonym_existing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let utils_path = temp_dir.path().join("utils.R");
+        fs::write(&utils_path, "# helper").unwrap();
+
+        let main_path = temp_dir.path().join("main.R");
+        let code = "# @lsp-run utils.R";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&main_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 14,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(result.is_some());
+        let location = result.unwrap();
+        assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+    }
+
+    #[test]
     fn test_file_path_definition_directive_nonexistent_file() {
         let temp_dir = TempDir::new().unwrap();
         let child_path = temp_dir.path().join("child.R");
@@ -8857,6 +9086,280 @@ mod file_path_definition_tests {
         assert!(result.is_some());
         let location = result.unwrap();
         assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+    }
+
+    #[test]
+    fn test_file_path_definition_source_call_uses_workspace_root_fallback() {
+        // Create temp directory structure:
+        // temp_dir/
+        //   scripts/
+        //     data.r
+        //     data/
+        //       covariates.r
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let data_subdir = scripts_dir.join("data");
+        fs::create_dir(&data_subdir).unwrap();
+        let covariates_path = data_subdir.join("covariates.r");
+        fs::write(&covariates_path, "# covariates file").unwrap();
+
+        let data_path = scripts_dir.join("data.r");
+        let code = r#"source("scripts/data/covariates.r")"#;
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            result.is_some(),
+            "Workspace-root fallback should resolve scripts/data/covariates.r from scripts/data.r"
+        );
+        let location = result.unwrap();
+        assert_eq!(location.uri, Url::from_file_path(&covariates_path).unwrap());
+    }
+
+    #[test]
+    fn test_file_path_definition_forward_directive_does_not_use_workspace_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let child_dir = temp_dir.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let workspace_scripts = temp_dir.path().join("scripts");
+        fs::create_dir(&workspace_scripts).unwrap();
+        let workspace_target = workspace_scripts.join("helpers.R");
+        fs::write(&workspace_target, "# workspace candidate").unwrap();
+
+        let main_path = child_dir.join("main.R");
+        let code = "# @lsp-source scripts/helpers.R";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&main_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 22,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_file_path_definition_source_call_inherited_working_directory_beats_fallback() {
+        // Create temp directory structure:
+        // temp_dir/
+        //   scripts/
+        //     data.r
+        //   from-parent/
+        //     scripts/
+        //       data/
+        //         covariates.r
+        //   scripts/
+        //     data/
+        //       covariates.r (workspace-root candidate that should be ignored)
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let workspace_data_subdir = scripts_dir.join("data");
+        fs::create_dir(&workspace_data_subdir).unwrap();
+        let workspace_covariates = workspace_data_subdir.join("covariates.r");
+        fs::write(&workspace_covariates, "# workspace fallback candidate").unwrap();
+
+        let inherited_root = temp_dir.path().join("from-parent");
+        fs::create_dir(&inherited_root).unwrap();
+        let inherited_scripts = inherited_root.join("scripts");
+        fs::create_dir(&inherited_scripts).unwrap();
+        let inherited_data_subdir = inherited_scripts.join("data");
+        fs::create_dir(&inherited_data_subdir).unwrap();
+        let inherited_covariates = inherited_data_subdir.join("covariates.r");
+        fs::write(
+            &inherited_covariates,
+            "# inherited working directory target",
+        )
+        .unwrap();
+
+        let data_path = scripts_dir.join("data.r");
+        let code = r#"source("scripts/data/covariates.r")"#;
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = CrossFileMetadata {
+            inherited_working_directory: Some(inherited_root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            result.is_some(),
+            "Inherited working directory should resolve before workspace-root fallback"
+        );
+        let location = result.unwrap();
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&inherited_covariates).unwrap()
+        );
+        assert_ne!(
+            location.uri,
+            Url::from_file_path(&workspace_covariates).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_path_definition_source_call_explicit_working_directory_beats_fallback() {
+        // Create temp directory structure:
+        // temp_dir/
+        //   scripts/
+        //     data.r
+        //     data/
+        //       covariates.r (workspace-root candidate that should be ignored)
+        //   configured/
+        //     scripts/
+        //       data/
+        //         covariates.r
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let workspace_data_subdir = scripts_dir.join("data");
+        fs::create_dir(&workspace_data_subdir).unwrap();
+        let workspace_covariates = workspace_data_subdir.join("covariates.r");
+        fs::write(&workspace_covariates, "# workspace fallback candidate").unwrap();
+
+        let configured_root = temp_dir.path().join("configured");
+        fs::create_dir(&configured_root).unwrap();
+        let configured_scripts = configured_root.join("scripts");
+        fs::create_dir(&configured_scripts).unwrap();
+        let configured_data_subdir = configured_scripts.join("data");
+        fs::create_dir(&configured_data_subdir).unwrap();
+        let configured_covariates = configured_data_subdir.join("covariates.r");
+        fs::write(
+            &configured_covariates,
+            "# explicit working directory target",
+        )
+        .unwrap();
+
+        let data_path = scripts_dir.join("data.r");
+        let code = r#"source("scripts/data/covariates.r")"#;
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(Some("/configured"));
+
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            result.is_some(),
+            "Explicit working directory should resolve before workspace-root fallback"
+        );
+        let location = result.unwrap();
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&configured_covariates).unwrap()
+        );
+        assert_ne!(
+            location.uri,
+            Url::from_file_path(&workspace_covariates).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_path_completions_source_call_workspace_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let nested_data_dir = scripts_dir.join("data");
+        fs::create_dir(&nested_data_dir).unwrap();
+        fs::write(nested_data_dir.join("covariates.R"), "# covariates").unwrap();
+        fs::write(nested_data_dir.join("impute.r"), "# impute").unwrap();
+
+        let data_path = scripts_dir.join("data.R");
+        let file_uri = Url::from_file_path(&data_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let context = FilePathContext::SourceCall {
+            partial_path: "scripts/data/".to_string(),
+            content_start: Position {
+                line: 0,
+                character: 8,
+            },
+            is_sys_source: false,
+        };
+
+        let completions = file_path_completions(
+            &context,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+            Position {
+                line: 0,
+                character: 21,
+            },
+        );
+
+        let labels: Vec<_> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"covariates.R"));
+        assert!(labels.contains(&"impute.r"));
+
+        let covariates = completions
+            .iter()
+            .find(|item| item.label == "covariates.R")
+            .expect("expected covariates.R completion");
+        assert_eq!(
+            covariates.filter_text.as_deref(),
+            Some("scripts/data/covariates.R")
+        );
     }
 
     #[test]
