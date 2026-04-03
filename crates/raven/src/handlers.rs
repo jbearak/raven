@@ -11784,10 +11784,11 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
                 continue;
             }
 
-            // DocumentState doesn't track file_type; derive from URI.
-            // Untitled JAGS docs without .jags/.bugs extension are handled
-            // by the legacy documents fallback below.
-            if file_type_from_uri(&file_uri) != FileType::Jags {
+            let file_type = state
+                .get_document(&file_uri)
+                .map(|doc| doc.file_type)
+                .unwrap_or_else(|| file_type_from_uri(&file_uri));
+            if file_type != FileType::Jags {
                 continue;
             }
 
