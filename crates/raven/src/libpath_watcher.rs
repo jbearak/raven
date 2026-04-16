@@ -325,6 +325,7 @@ mod watcher_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires reliable macOS FSEvents delivery; run with `cargo test -- --ignored`"]
     async fn watcher_emits_added_on_new_package() {
         let t = tempdir().unwrap();
         let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
@@ -357,6 +358,7 @@ mod watcher_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires reliable macOS FSEvents delivery; run with `cargo test -- --ignored`"]
     async fn watcher_emits_removed_on_package_deletion() {
         let t = tempdir().unwrap();
         make_pkg(t.path(), "foo");

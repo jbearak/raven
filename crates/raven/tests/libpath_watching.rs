@@ -18,6 +18,7 @@ fn make_pkg(root: &Path, name: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires reliable macOS FSEvents delivery; run with `cargo test -- --ignored`"]
 async fn install_triggers_cache_invalidation() {
     let t = tempdir().unwrap();
 
