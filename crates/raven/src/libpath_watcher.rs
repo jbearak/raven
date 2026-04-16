@@ -44,6 +44,126 @@ impl LibpathEvent {
     }
 }
 
+use std::path::{Path, PathBuf};
+
+/// A snapshot of which package subdirectories exist under each libpath.
+/// Keyed by libpath root, each value is the set of immediate subdirectory
+/// names that look like an R package (DESCRIPTION or NAMESPACE present).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LibpathSnapshot {
+    entries: std::collections::BTreeMap<PathBuf, HashSet<String>>,
+}
+
+impl LibpathSnapshot {
+    pub(crate) fn capture(paths: &[PathBuf]) -> Self {
+        let mut entries = std::collections::BTreeMap::new();
+        for root in paths {
+            let names = read_package_dir(root);
+            entries.insert(root.clone(), names);
+        }
+        Self { entries }
+    }
+
+    pub(crate) fn diff(&self, other: &Self) -> (HashSet<String>, HashSet<String>) {
+        let mut prev: HashSet<String> = HashSet::new();
+        let mut next: HashSet<String> = HashSet::new();
+        for names in self.entries.values() {
+            prev.extend(names.iter().cloned());
+        }
+        for names in other.entries.values() {
+            next.extend(names.iter().cloned());
+        }
+        let added: HashSet<String> = next.difference(&prev).cloned().collect();
+        let removed: HashSet<String> = prev.difference(&next).cloned().collect();
+        (added, removed)
+    }
+}
+
+fn read_package_dir(root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(read_dir) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in read_dir.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // Skip in-progress install staging directories (leading "00LOCK-").
+        if name.starts_with("00LOCK-") {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("DESCRIPTION").exists() || path.join("NAMESPACE").exists() {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_pkg(root: &Path, name: &str) {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("DESCRIPTION"), "Package: x\n").unwrap();
+    }
+
+    #[test]
+    fn capture_lists_packages_with_description() {
+        let t = tempdir().unwrap();
+        make_pkg(t.path(), "foo");
+        make_pkg(t.path(), "bar");
+        // Non-package directory (no DESCRIPTION/NAMESPACE) is ignored.
+        std::fs::create_dir_all(t.path().join("not-a-pkg")).unwrap();
+
+        let snap = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
+        let names: HashSet<String> = snap.entries.values().flatten().cloned().collect();
+        assert_eq!(
+            names,
+            ["foo".to_string(), "bar".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn capture_skips_00lock_staging_dirs() {
+        let t = tempdir().unwrap();
+        let lock = t.path().join("00LOCK-foo");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("DESCRIPTION"), "").unwrap();
+
+        let snap = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
+        assert!(snap.entries.values().flatten().next().is_none());
+    }
+
+    #[test]
+    fn diff_reports_added_and_removed() {
+        let t = tempdir().unwrap();
+        make_pkg(t.path(), "foo");
+        let prev = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
+
+        make_pkg(t.path(), "bar");
+        std::fs::remove_dir_all(t.path().join("foo")).unwrap();
+        let next = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
+
+        let (added, removed) = prev.diff(&next);
+        assert_eq!(added, ["bar".to_string()].into_iter().collect());
+        assert_eq!(removed, ["foo".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn capture_handles_missing_directory() {
+        let snap = LibpathSnapshot::capture(&[PathBuf::from("/does/not/exist/raven")]);
+        assert!(snap.entries.values().flatten().next().is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
