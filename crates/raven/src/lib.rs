@@ -28,6 +28,7 @@ pub mod handlers;
 pub mod help;
 pub mod indentation;
 pub mod jags_builtins;
+pub mod libpath_watcher;
 pub mod namespace_parser;
 pub mod package_library;
 pub mod parameter_resolver;
