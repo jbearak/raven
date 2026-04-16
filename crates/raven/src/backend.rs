@@ -326,6 +326,18 @@ pub(crate) fn parse_cross_file_config(
         {
             config.packages_missing_package_severity = parse_severity(sev);
         }
+        if let Some(v) = packages
+            .get("watchLibraryPaths")
+            .and_then(|v| v.as_bool())
+        {
+            config.packages_watch_library_paths = v;
+        }
+        if let Some(v) = packages
+            .get("watchDebounceMs")
+            .and_then(|v| v.as_u64())
+        {
+            config.packages_watch_debounce_ms = v.clamp(100, 5000);
+        }
     }
 
     log::info!("Cross-file configuration loaded from LSP settings:");
@@ -2248,6 +2260,10 @@ impl LanguageServer for Backend {
                         || c.packages_r_path != state.cross_file_config.packages_r_path
                         || c.packages_additional_library_paths
                             != state.cross_file_config.packages_additional_library_paths
+                        || c.packages_watch_library_paths
+                            != state.cross_file_config.packages_watch_library_paths
+                        || c.packages_watch_debounce_ms
+                            != state.cross_file_config.packages_watch_debounce_ms
                 })
                 .unwrap_or(false);
 
@@ -3998,6 +4014,34 @@ mod tests {
                 "expected object validation error, got: {}",
                 err
             );
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_watch_fields() {
+            let settings = json!({
+                "packages": {
+                    "watchLibraryPaths": false,
+                    "watchDebounceMs": 250
+                }
+            });
+            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            assert!(!cfg.packages_watch_library_paths);
+            assert_eq!(cfg.packages_watch_debounce_ms, 250);
+        }
+
+        #[test]
+        fn parse_cross_file_config_clamps_watch_debounce_ms() {
+            let settings = json!({
+                "packages": { "watchDebounceMs": 50 }  // below floor
+            });
+            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            assert_eq!(cfg.packages_watch_debounce_ms, 100);
+
+            let settings = json!({
+                "packages": { "watchDebounceMs": 99999 } // above ceiling
+            });
+            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            assert_eq!(cfg.packages_watch_debounce_ms, 5000);
         }
     }
 
