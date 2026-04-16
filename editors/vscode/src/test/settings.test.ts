@@ -111,6 +111,8 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'packages.additionalLibraryPaths', jsonPath: ['packages', 'additionalLibraryPaths'], type: 'array' },
     { vsCodeKey: 'packages.rPath', jsonPath: ['packages', 'rPath'], type: 'string' },
     { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'packages.watchLibraryPaths', jsonPath: ['packages', 'watchLibraryPaths'], type: 'boolean' },
+    { vsCodeKey: 'packages.watchDebounceMs', jsonPath: ['packages', 'watchDebounceMs'], type: 'number' },
     // Symbol settings
     { vsCodeKey: 'symbols.workspaceMaxResults', jsonPath: ['symbols', 'workspaceMaxResults'], type: 'number' },
     // Completion settings
@@ -463,6 +465,47 @@ suite('Settings Transmission Unit Tests', () => {
         assert.deepStrictEqual(options.packages?.additionalLibraryPaths, ['/path/to/lib1', '/path/to/lib2']);
         assert.strictEqual(options.packages?.rPath, '/usr/bin/R');
         assert.strictEqual(options.packages?.missingPackageSeverity, 'error');
+    });
+
+    /**
+     * Unit test: packages.watchLibraryPaths forwards when explicitly configured false.
+     */
+    test('forwards packages.watchLibraryPaths when explicitly configured', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['packages.watchLibraryPaths', false],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.packages?.watchLibraryPaths, false);
+    });
+
+    /**
+     * Unit test: packages.watchDebounceMs forwards when explicitly configured.
+     */
+    test('forwards packages.watchDebounceMs when explicitly configured', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['packages.watchDebounceMs', 300],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.packages?.watchDebounceMs, 300);
+    });
+
+    /**
+     * Unit test: watchLibraryPaths and watchDebounceMs are undefined when not configured.
+     */
+    test('watchLibraryPaths and watchDebounceMs are undefined when not configured', () => {
+        const configuredSettings = new Map<string, unknown>();
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.packages?.watchLibraryPaths, undefined);
+        assert.strictEqual(options.packages?.watchDebounceMs, undefined);
     });
 
     /**

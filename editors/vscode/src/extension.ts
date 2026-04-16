@@ -133,6 +133,19 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.refreshPackages', async () => {
+            try {
+                await client.sendRequest('workspace/executeCommand', {
+                    command: 'raven.refreshPackages',
+                    arguments: []
+                });
+            } catch (err) {
+                vscode.window.showErrorMessage(`Raven refreshPackages failed: ${err}`);
+            }
+        })
+    );
+
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
 
