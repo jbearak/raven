@@ -896,6 +896,12 @@ impl LanguageServer for Backend {
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
                 ),
+                execute_command_provider: Some(
+                    tower_lsp::lsp_types::ExecuteCommandOptions {
+                        commands: vec!["raven.refreshPackages".to_string()],
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1135,6 +1141,54 @@ impl LanguageServer for Backend {
     async fn shutdown(&self) -> Result<()> {
         log::info!("ark-lsp shutting down");
         Ok(())
+    }
+
+    async fn execute_command(
+        &self,
+        params: tower_lsp::lsp_types::ExecuteCommandParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
+        match params.command.as_str() {
+            "raven.refreshPackages" => {
+                // Collect distinct packages referenced by open docs for warm prefetch.
+                let (pkg_lib, loaded_packages, open_uris) = {
+                    let state = self.state.read().await;
+                    let mut loaded: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for doc in state.documents.values() {
+                        for p in &doc.loaded_packages {
+                            loaded.insert(p.clone());
+                        }
+                    }
+                    let uris: Vec<tower_lsp::lsp_types::Url> =
+                        state.documents.keys().cloned().collect();
+                    (
+                        state.package_library.clone(),
+                        loaded.into_iter().collect::<Vec<_>>(),
+                        uris,
+                    )
+                };
+
+                let cleared =
+                    refresh_packages_command_body(&pkg_lib, &loaded_packages).await;
+                log::info!("raven.refreshPackages: cleared {cleared} cache entries");
+
+                // Force-republish diagnostics for all open documents.
+                {
+                    let state = self.state.read().await;
+                    for uri in &open_uris {
+                        state.diagnostics_gate.mark_force_republish(uri);
+                    }
+                }
+                for uri in open_uris {
+                    self.publish_diagnostics(&uri).await;
+                }
+                Ok(Some(serde_json::json!({ "cleared": cleared })))
+            }
+            other => {
+                log::warn!("execute_command: unknown command '{other}'");
+                Ok(None)
+            }
+        }
     }
 
     /// Handle textDocument/didOpen notification.
@@ -3882,6 +3936,21 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Core logic of the `raven.refreshPackages` command. Returns the number of cached
+/// package entries that were cleared. Takes an explicit loaded-package list so the
+/// caller can trigger prefetch of packages known to be in use.
+pub(crate) async fn refresh_packages_command_body(
+    pkg_lib: &std::sync::Arc<crate::package_library::PackageLibrary>,
+    loaded_packages_to_prefetch: &[String],
+) -> usize {
+    let before = pkg_lib.cached_count().await;
+    pkg_lib.clear_cache().await;
+    if !loaded_packages_to_prefetch.is_empty() {
+        pkg_lib.prefetch_packages(loaded_packages_to_prefetch).await;
+    }
+    before
+}
+
 /// Consumer for libpath change events. Invalidates the package cache for
 /// affected packages and schedules diagnostic revalidation for open documents
 /// whose loaded packages intersect the change set.
@@ -4935,5 +5004,27 @@ mod tests {
                 "Should parse 'RStudio-Minus' as RStudioMinus style"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_packages_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn refresh_clears_package_cache_and_returns_count() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        let lib = Arc::new(PackageLibrary::new_empty());
+        lib.insert_package(PackageInfo::new("foo".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("bar".into(), HashSet::new()))
+            .await;
+        assert_eq!(lib.cached_count().await, 2);
+
+        let cleared = refresh_packages_command_body(&lib, &[]).await;
+        assert_eq!(cleared, 2);
+        assert_eq!(lib.cached_count().await, 0);
     }
 }
