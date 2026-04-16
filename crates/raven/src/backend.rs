@@ -1094,6 +1094,34 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Start the libpath watcher if enabled and we have a real package library.
+        {
+            let state_read = self.state.read().await;
+            if state_read.cross_file_config.packages_enabled
+                && state_read.cross_file_config.packages_watch_library_paths
+                && state_read.package_library_ready
+            {
+                let lib_paths = state_read.package_library.lib_paths().to_vec();
+                let debounce = std::time::Duration::from_millis(
+                    state_read.cross_file_config.packages_watch_debounce_ms,
+                );
+                drop(state_read); // release read lock before write
+
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<crate::libpath_watcher::LibpathEvent>(64);
+                let handle_opt = crate::libpath_watcher::spawn_watcher(lib_paths, debounce, tx);
+
+                if let Some(handle) = handle_opt {
+                    let state_arc = Arc::clone(&self.state);
+                    let client = self.client.clone();
+                    tokio::spawn(run_libpath_consumer(state_arc, client, rx));
+
+                    let mut state_write = self.state.write().await;
+                    state_write.libpath_watcher_handle = Some(Arc::new(handle));
+                }
+            }
+        }
+
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
@@ -2445,6 +2473,39 @@ impl LanguageServer for Backend {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
             }
+
+            // Tear down the old libpath watcher; a new one is spawned below if still enabled.
+            {
+                let mut state = self.state.write().await;
+                state.libpath_watcher_handle = None;
+            }
+
+            let (restart, lib_paths, debounce) = {
+                let state = self.state.read().await;
+                let restart = state.cross_file_config.packages_enabled
+                    && state.cross_file_config.packages_watch_library_paths
+                    && state.package_library_ready;
+                (
+                    restart,
+                    state.package_library.lib_paths().to_vec(),
+                    std::time::Duration::from_millis(
+                        state.cross_file_config.packages_watch_debounce_ms,
+                    ),
+                )
+            };
+
+            if restart {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<crate::libpath_watcher::LibpathEvent>(64);
+                if let Some(handle) = crate::libpath_watcher::spawn_watcher(lib_paths, debounce, tx)
+                {
+                    let state_arc = Arc::clone(&self.state);
+                    let client = self.client.clone();
+                    tokio::spawn(run_libpath_consumer(state_arc, client, rx));
+                    let mut state = self.state.write().await;
+                    state.libpath_watcher_handle = Some(Arc::new(handle));
+                }
+            }
         }
 
         if scope_changed {
@@ -3657,6 +3718,30 @@ impl Backend {
         Some(cross_file_meta)
     }
 
+    /// Free-standing variant of `publish_diagnostics` usable from background tasks.
+    /// Delegates to the same debounced pipeline.
+    pub(crate) async fn publish_diagnostics_via_arc(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        uri: &Url,
+    ) {
+        let (debounce_ms, trigger_version, trigger_revision) = {
+            let state = state_arc.read().await;
+            let doc = state.documents.get(uri);
+            let v = doc.and_then(|d| d.version);
+            let r = doc.map(|d| d.revision);
+            (state.cross_file_config.revalidation_debounce_ms, v, r)
+        };
+        tokio::spawn(run_debounced_diagnostics(
+            state_arc,
+            client,
+            uri.clone(),
+            debounce_ms,
+            trigger_version,
+            trigger_revision,
+        ));
+    }
+
     async fn publish_diagnostics(&self, uri: &Url) {
         // Extract needed data while holding read lock briefly
         let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
@@ -3795,6 +3880,94 @@ pub async fn start_lsp() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+/// Consumer for libpath change events. Invalidates the package cache for
+/// affected packages and schedules diagnostic revalidation for open documents
+/// whose loaded packages intersect the change set.
+async fn run_libpath_consumer(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    mut rx: tokio::sync::mpsc::Receiver<crate::libpath_watcher::LibpathEvent>,
+) {
+    use crate::libpath_watcher::LibpathEvent;
+
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            LibpathEvent::Changed {
+                added,
+                removed,
+                touched,
+            } => {
+                let affected: std::collections::HashSet<String> = added
+                    .iter()
+                    .chain(removed.iter())
+                    .chain(touched.iter())
+                    .cloned()
+                    .collect();
+                if affected.is_empty() {
+                    continue;
+                }
+                log::info!(
+                    "LibpathWatcher: +{} -{} ~{} packages",
+                    added.len(),
+                    removed.len(),
+                    touched.len()
+                );
+
+                // Invalidate the package cache.
+                let pkg_lib = { state_arc.read().await.package_library.clone() };
+                pkg_lib.invalidate_many(&affected).await;
+
+                // Prefetch newly added packages so the next diagnostic pass is warm.
+                if !added.is_empty() {
+                    let pkg_lib = pkg_lib.clone();
+                    let added_vec: Vec<String> = added.iter().cloned().collect();
+                    tokio::spawn(async move {
+                        pkg_lib.prefetch_packages(&added_vec).await;
+                    });
+                }
+
+                // Collect URIs whose loaded_packages intersect `affected`.
+                let affected_uris: Vec<Url> = {
+                    let state = state_arc.read().await;
+                    state
+                        .documents
+                        .iter()
+                        .filter_map(|(uri, doc)| {
+                            let hit = doc.loaded_packages.iter().any(|p| affected.contains(p));
+                            if hit { Some(uri.clone()) } else { None }
+                        })
+                        .collect()
+                };
+
+                // Force republish is safe: the text hasn't changed but the
+                // underlying package set has, so we want to overwrite the last
+                // publish at the same version.
+                {
+                    let state = state_arc.read().await;
+                    for uri in &affected_uris {
+                        state.diagnostics_gate.mark_force_republish(uri);
+                    }
+                }
+
+                // Schedule diagnostics for each affected open URI.
+                for uri in affected_uris {
+                    let state_arc2 = Arc::clone(&state_arc);
+                    let client2 = client.clone();
+                    tokio::spawn(async move {
+                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri).await;
+                    });
+                }
+            }
+            LibpathEvent::Dropped => {
+                log::warn!("LibpathWatcher: dropped, clearing package cache");
+                let pkg_lib = { state_arc.read().await.package_library.clone() };
+                pkg_lib.clear_cache().await;
+            }
+        }
+    }
+    log::info!("LibpathWatcher consumer channel closed; exiting");
 }
 
 #[cfg(test)]
