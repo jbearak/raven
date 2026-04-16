@@ -18,6 +18,7 @@ mod handlers;
 mod help;
 mod indentation;
 mod jags_builtins;
+mod libpath_watcher;
 mod namespace_parser;
 mod package_library;
 mod parameter_resolver;

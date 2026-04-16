@@ -577,6 +577,8 @@ pub struct WorldState {
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+    /// Handle to the running libpath watcher, if any. Dropping it stops watching.
+    pub libpath_watcher_handle: Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
     pub package_library_ready: bool,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
@@ -676,6 +678,7 @@ impl WorldState {
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
+            libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_complete: false,
         }
