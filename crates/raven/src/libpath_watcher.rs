@@ -164,6 +164,242 @@ mod snapshot_tests {
     }
 }
 
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+/// Handle to a running libpath watcher. Drop the handle to stop watching.
+pub struct LibpathWatcherHandle {
+    /// Kept alive so the watcher thread keeps running; the task aborts when this drops.
+    _watcher: notify::RecommendedWatcher,
+    /// Abort handle for the debounce/diff task.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LibpathWatcherHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Start watching `paths`. Events are debounced by `debounce` and delivered on `tx`.
+///
+/// On fatal setup failure (all paths unwatchable), emits a single
+/// `LibpathEvent::Dropped` and returns `None`. On partial failure (some paths
+/// attached), proceeds with the paths that succeeded.
+pub fn spawn_watcher(
+    paths: Vec<PathBuf>,
+    debounce: Duration,
+    tx: mpsc::Sender<LibpathEvent>,
+) -> Option<LibpathWatcherHandle> {
+    use notify::{RecursiveMode, Watcher};
+
+    if paths.is_empty() {
+        log::info!("LibpathWatcher: no paths to watch, skipping");
+        return None;
+    }
+
+    // Internal channel: notify -> debounce task. Use a std::sync::mpsc because
+    // notify v6 only accepts a synchronous EventHandler closure.
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let raw_tx_cloned = raw_tx.clone();
+
+    let mut watcher = match notify::recommended_watcher(move |res| {
+        // Best-effort send; receiver may have gone away on shutdown.
+        let _ = raw_tx_cloned.send(res);
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            log::warn!("LibpathWatcher: failed to construct watcher: {e}");
+            let _ = tx.try_send(LibpathEvent::Dropped);
+            return None;
+        }
+    };
+
+    let mut attached: Vec<PathBuf> = Vec::new();
+    for p in &paths {
+        match watcher.watch(p, RecursiveMode::NonRecursive) {
+            Ok(()) => attached.push(p.clone()),
+            Err(e) => {
+                // A libpath directory may not exist yet (e.g. empty renv); log and continue.
+                log::warn!("LibpathWatcher: cannot watch {}: {e}", p.display());
+            }
+        }
+    }
+
+    if attached.is_empty() {
+        log::warn!("LibpathWatcher: no libpath directories could be attached");
+        let _ = tx.try_send(LibpathEvent::Dropped);
+        return None;
+    }
+
+    let raw_rx = Arc::new(StdMutex::new(raw_rx));
+    let snapshot = Arc::new(tokio::sync::Mutex::new(LibpathSnapshot::capture(&attached)));
+
+    let task = tokio::spawn(async move {
+        debounce_loop(raw_rx, snapshot, attached, debounce, tx).await;
+    });
+
+    Some(LibpathWatcherHandle {
+        _watcher: watcher,
+        task,
+    })
+}
+
+async fn debounce_loop(
+    raw_rx: Arc<StdMutex<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>>,
+    snapshot: Arc<tokio::sync::Mutex<LibpathSnapshot>>,
+    paths: Vec<PathBuf>,
+    debounce: Duration,
+    tx: mpsc::Sender<LibpathEvent>,
+) {
+    loop {
+        // Block on the next raw event. We move raw_rx across an await using
+        // spawn_blocking because std::sync::mpsc::Receiver::recv blocks.
+        let rx_arc = Arc::clone(&raw_rx);
+        let first = tokio::task::spawn_blocking(move || {
+            // Unwrap: StdMutex never poisons in normal operation.
+            let guard = rx_arc.lock().unwrap();
+            guard.recv()
+        })
+        .await;
+
+        match first {
+            Ok(Ok(_evt)) => {
+                // Got an event; now drain any further events within debounce window.
+                tokio::time::sleep(debounce).await;
+                let rx_arc = Arc::clone(&raw_rx);
+                let _drained = tokio::task::spawn_blocking(move || {
+                    let guard = rx_arc.lock().unwrap();
+                    while guard.try_recv().is_ok() {}
+                })
+                .await;
+
+                // Diff.
+                let next_snap = LibpathSnapshot::capture(&paths);
+                let (added, removed) = {
+                    let prev = snapshot.lock().await;
+                    prev.diff(&next_snap)
+                };
+                // Touched = packages that still exist but the snapshot saw
+                // events for. We don't track per-package event counts, so we
+                // conservatively mark everything that exists in both prev and next
+                // as NOT touched unless the notify event kind was a non-directory
+                // change. For v1, leave `touched` empty — diff-on-listings is
+                // cheap and sufficient for the common `install.packages` case.
+                let touched: HashSet<String> = HashSet::new();
+
+                *snapshot.lock().await = next_snap;
+
+                if !added.is_empty() || !removed.is_empty() || !touched.is_empty() {
+                    let _ = tx
+                        .send(LibpathEvent::Changed {
+                            added,
+                            removed,
+                            touched,
+                        })
+                        .await;
+                }
+            }
+            Ok(Err(_disconnect)) => {
+                log::warn!("LibpathWatcher: raw channel disconnected, exiting");
+                return;
+            }
+            Err(join_err) => {
+                log::warn!("LibpathWatcher: blocking task failed: {join_err}");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_pkg(root: &Path, name: &str) {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("DESCRIPTION"), "Package: x\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn watcher_emits_added_on_new_package() {
+        let t = tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
+
+        let _handle = spawn_watcher(
+            vec![t.path().to_path_buf()],
+            Duration::from_millis(300),
+            tx,
+        )
+        .expect("watcher attached");
+
+        // Give the watcher a moment to register.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Simulate install.
+        make_pkg(t.path(), "foo");
+
+        let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event arrived in time")
+            .expect("channel not closed");
+
+        match evt {
+            LibpathEvent::Changed { added, removed, .. } => {
+                assert_eq!(added, ["foo".to_string()].into_iter().collect());
+                assert!(removed.is_empty());
+            }
+            LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_emits_removed_on_package_deletion() {
+        let t = tempdir().unwrap();
+        make_pkg(t.path(), "foo");
+
+        let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
+        let _handle = spawn_watcher(
+            vec![t.path().to_path_buf()],
+            Duration::from_millis(300),
+            tx,
+        )
+        .expect("watcher attached");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        std::fs::remove_dir_all(t.path().join("foo")).unwrap();
+
+        let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event arrived in time")
+            .expect("channel not closed");
+
+        match evt {
+            LibpathEvent::Changed { added, removed, .. } => {
+                assert_eq!(removed, ["foo".to_string()].into_iter().collect());
+                assert!(added.is_empty());
+            }
+            LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_returns_none_when_no_paths_attach() {
+        let (tx, _rx) = mpsc::channel::<LibpathEvent>(16);
+        // Non-existent path should fail to attach on all platforms.
+        let handle = spawn_watcher(
+            vec![PathBuf::from("/raven/nonexistent/xyz-abc")],
+            Duration::from_millis(50),
+            tx,
+        );
+        assert!(handle.is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
