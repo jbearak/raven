@@ -59,6 +59,16 @@ pub const TIDYMODELS_PACKAGES: &[&str] = &[
     "yardstick",
 ];
 
+/// Return the set of child packages attached by a meta-package name.
+/// Empty for non-meta packages.
+fn meta_attached_packages(name: &str) -> &'static [&'static str] {
+    match name {
+        "tidyverse" => TIDYVERSE_PACKAGES,
+        "tidymodels" => TIDYMODELS_PACKAGES,
+        _ => &[],
+    }
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -416,6 +426,47 @@ impl PackageLibrary {
     pub async fn invalidate(&self, name: &str) {
         let mut cache = self.packages.write().await;
         cache.remove(name);
+    }
+
+    /// Invalidate a batch of packages, also dropping any `combined_exports`
+    /// entries whose key is in `names` or whose `attached_packages` intersect `names`.
+    ///
+    /// This matters for meta-packages like `tidyverse` whose combined export set
+    /// is derived from multiple children; invalidating `dplyr` must also drop the
+    /// cached `tidyverse` aggregate so the next lookup rebuilds it from fresh data.
+    pub async fn invalidate_many(&self, names: &HashSet<String>) {
+        if names.is_empty() {
+            return;
+        }
+        {
+            let mut cache = self.packages.write().await;
+            for n in names {
+                cache.remove(n);
+            }
+        }
+        {
+            let mut combined = self.combined_exports.write().await;
+            // Drop direct hits first.
+            combined.retain(|k, _| !names.contains(k));
+            // Drop meta-package aggregates whose attached set intersects `names`.
+            let meta_hits: Vec<String> = combined
+                .keys()
+                .filter(|k| {
+                    let attached = meta_attached_packages(k.as_str());
+                    attached.iter().any(|p| names.contains(*p))
+                })
+                .cloned()
+                .collect();
+            for m in meta_hits {
+                combined.remove(&m);
+            }
+        }
+    }
+
+    /// Snapshot of the keys currently in the per-package cache.
+    pub async fn cached_package_names(&self) -> HashSet<String> {
+        let cache = self.packages.read().await;
+        cache.keys().cloned().collect()
     }
 
     /// Clear all cached packages
@@ -3292,5 +3343,75 @@ mod tests {
         // The method should work even without async runtime
         let result = lib.get_exports_for_completions(&[]);
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_removes_all_listed_packages() {
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("dplyr".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("ggplot2".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("readr".into(), HashSet::new()))
+            .await;
+        assert_eq!(lib.cached_count().await, 3);
+
+        let to_invalidate: HashSet<String> =
+            ["dplyr".into(), "readr".into()].into_iter().collect();
+        lib.invalidate_many(&to_invalidate).await;
+
+        assert_eq!(lib.cached_count().await, 1);
+        assert!(lib.is_cached("ggplot2").await);
+        assert!(!lib.is_cached("dplyr").await);
+        assert!(!lib.is_cached("readr").await);
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_clears_combined_exports_for_meta_packages() {
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        // Seed combined_exports as though tidyverse had been loaded.
+        {
+            let mut combined = lib.combined_exports.write().await;
+            combined.insert(
+                "tidyverse".into(),
+                std::sync::Arc::new(
+                    ["mutate".to_string(), "ggplot".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+            );
+            combined.insert(
+                "dplyr".into(),
+                std::sync::Arc::new(["mutate".to_string()].into_iter().collect()),
+            );
+        }
+
+        // Invalidate a child (dplyr) — the meta-package combined entry must be dropped too.
+        let set: HashSet<String> = ["dplyr".to_string()].into_iter().collect();
+        lib.invalidate_many(&set).await;
+
+        let combined = lib.combined_exports.read().await;
+        assert!(!combined.contains_key("tidyverse"));
+        assert!(!combined.contains_key("dplyr"));
+    }
+
+    #[tokio::test]
+    async fn cached_package_names_returns_current_keys() {
+        use std::collections::HashSet;
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("a".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("b".into(), HashSet::new()))
+            .await;
+
+        let names = lib.cached_package_names().await;
+        assert_eq!(
+            names,
+            ["a".to_string(), "b".to_string()].into_iter().collect()
+        );
     }
 }
