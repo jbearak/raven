@@ -429,15 +429,31 @@ impl PackageLibrary {
     }
 
     /// Invalidate a batch of packages, also dropping any `combined_exports`
-    /// entries whose key is in `names` or whose `attached_packages` intersect `names`.
+    /// entries whose aggregate export set depends on `names` — including:
     ///
-    /// This matters for meta-packages like `tidyverse` whose combined export set
-    /// is derived from multiple children; invalidating `dplyr` must also drop the
-    /// cached `tidyverse` aggregate so the next lookup rebuilds it from fresh data.
+    /// - direct key matches (invalidating `dplyr` drops combined entry for `dplyr`),
+    /// - hardcoded meta-packages (`tidyverse`, `tidymodels`) whose `attached_packages`
+    ///   intersect `names` (invalidating `dplyr` drops the cached `tidyverse` aggregate),
+    /// - any package `A` whose `PackageInfo.depends` or `attached_packages` include
+    ///   any name in `names` (invalidating `B` drops combined entry for `A` when `A`
+    ///   Depends: B), since the aggregate rolled up a now-stale child.
     pub async fn invalidate_many(&self, names: &HashSet<String>) {
         if names.is_empty() {
             return;
         }
+        // Compute dependents from the per-package cache BEFORE mutating it so the
+        // dependent lookup sees the previous `depends`/`attached_packages` graph.
+        let dependent_combined_keys: HashSet<String> = {
+            let cache = self.packages.read().await;
+            cache
+                .iter()
+                .filter(|(_, info)| {
+                    info.depends.iter().any(|dep| names.contains(dep))
+                        || info.attached_packages.iter().any(|dep| names.contains(dep))
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
         {
             let mut cache = self.packages.write().await;
             for n in names {
@@ -446,9 +462,15 @@ impl PackageLibrary {
         }
         {
             let mut combined = self.combined_exports.write().await;
-            // Drop direct hits first.
+            // Drop direct hits.
             combined.retain(|k, _| !names.contains(k));
-            // Drop meta-package aggregates whose attached set intersects `names`.
+            // Drop entries for packages whose runtime Depends/attached set intersects `names`.
+            for k in &dependent_combined_keys {
+                combined.remove(k);
+            }
+            // Drop hardcoded meta-package aggregates whose attached set intersects `names`
+            // (covers the case where the aggregate was cached but the child PackageInfo
+            // was never loaded, so `dependent_combined_keys` above would miss it).
             let meta_hits: Vec<String> = combined
                 .keys()
                 .filter(|k| {
@@ -469,10 +491,12 @@ impl PackageLibrary {
         cache.keys().cloned().collect()
     }
 
-    /// Clear all cached packages
+    /// Clear all cached packages, including aggregated `combined_exports` entries.
     pub async fn clear_cache(&self) {
         let mut cache = self.packages.write().await;
         cache.clear();
+        let mut combined = self.combined_exports.write().await;
+        combined.clear();
     }
 
     /// Prefetch packages by loading their exports into cache
@@ -1529,12 +1553,22 @@ mod tests {
             .await;
         lib.insert_package(PackageInfo::new("pkg2".to_string(), HashSet::new()))
             .await;
+        // Seed a combined_exports entry to verify it is also cleared.
+        {
+            let mut combined = lib.combined_exports.write().await;
+            combined.insert(
+                "pkg1".into(),
+                std::sync::Arc::new(["foo".to_string()].into_iter().collect()),
+            );
+        }
 
         assert_eq!(lib.cached_count().await, 2);
+        assert!(lib.combined_exports.read().await.contains_key("pkg1"));
 
         lib.clear_cache().await;
 
         assert_eq!(lib.cached_count().await, 0);
+        assert!(lib.combined_exports.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -3397,6 +3431,45 @@ mod tests {
         let combined = lib.combined_exports.read().await;
         assert!(!combined.contains_key("tidyverse"));
         assert!(!combined.contains_key("dplyr"));
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_clears_combined_exports_for_transitive_depends() {
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        // Package `A` Depends on `B`. Its PackageInfo is cached, and its
+        // combined_exports aggregate has been built.
+        let a_info = PackageInfo::with_details(
+            "A".into(),
+            ["a_fn".to_string()].into_iter().collect(),
+            vec!["B".to_string()],
+            vec![],
+        );
+        lib.insert_package(a_info).await;
+        {
+            let mut combined = lib.combined_exports.write().await;
+            combined.insert(
+                "A".into(),
+                std::sync::Arc::new(
+                    ["a_fn".to_string(), "b_fn".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+            );
+        }
+
+        // Invalidate B — A's combined aggregate rolled up B's exports, so it
+        // must be dropped even though B is not a direct hit and A is not a
+        // hardcoded meta-package.
+        let set: HashSet<String> = ["B".to_string()].into_iter().collect();
+        lib.invalidate_many(&set).await;
+
+        let combined = lib.combined_exports.read().await;
+        assert!(
+            !combined.contains_key("A"),
+            "A's combined_exports aggregate should be cleared when its dependency B is invalidated"
+        );
     }
 
     #[tokio::test]
