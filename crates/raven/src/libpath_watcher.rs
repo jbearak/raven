@@ -44,39 +44,115 @@ impl LibpathEvent {
     }
 }
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A snapshot of which package subdirectories exist under each libpath.
-/// Keyed by libpath root, each value is the set of immediate subdirectory
-/// names that look like an R package (DESCRIPTION or NAMESPACE present).
+///
+/// `entries` preserves the original libpath order (earlier = higher priority,
+/// matching R's `.libPaths()`). Order matters because a package installed into
+/// multiple libpaths is resolved from the first one that contains it; if the
+/// "winning root" changes between snapshots, consumers must invalidate that
+/// package's cached exports even though the name is still present.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct LibpathSnapshot {
-    entries: std::collections::BTreeMap<PathBuf, HashSet<String>>,
+    entries: Vec<(PathBuf, HashSet<String>)>,
 }
 
 impl LibpathSnapshot {
     pub(crate) fn capture(paths: &[PathBuf]) -> Self {
-        let mut entries = std::collections::BTreeMap::new();
-        for root in paths {
-            let names = read_package_dir(root);
-            entries.insert(root.clone(), names);
-        }
+        let entries = paths
+            .iter()
+            .map(|root| (root.clone(), read_package_dir(root)))
+            .collect();
         Self { entries }
     }
 
-    pub(crate) fn diff(&self, other: &Self) -> (HashSet<String>, HashSet<String>) {
-        let mut prev: HashSet<String> = HashSet::new();
-        let mut next: HashSet<String> = HashSet::new();
-        for names in self.entries.values() {
-            prev.extend(names.iter().cloned());
+    /// For each package name present in any watched root, return the first root
+    /// (in libpath priority order) that contains it.
+    fn winning_roots(&self) -> HashMap<String, PathBuf> {
+        let mut winner: HashMap<String, PathBuf> = HashMap::new();
+        for (root, names) in &self.entries {
+            for name in names {
+                winner.entry(name.clone()).or_insert_with(|| root.clone());
+            }
         }
-        for names in other.entries.values() {
-            next.extend(names.iter().cloned());
-        }
-        let added: HashSet<String> = next.difference(&prev).cloned().collect();
-        let removed: HashSet<String> = prev.difference(&next).cloned().collect();
-        (added, removed)
+        winner
     }
+
+    /// Diff two snapshots by their effective `package -> winning-root` mapping.
+    ///
+    /// Returns three sets:
+    /// - `added`: names that were not present in `self` but are in `other`.
+    /// - `removed`: names that were in `self` but are not in `other`.
+    /// - `moved`: names present in both but whose winning root changed, so the
+    ///   effective on-disk package differs even though the name persists.
+    ///
+    /// Consumers should treat all three as invalidation triggers.
+    pub(crate) fn diff(
+        &self,
+        other: &Self,
+    ) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+        let prev = self.winning_roots();
+        let next = other.winning_roots();
+        let mut added = HashSet::new();
+        let mut removed = HashSet::new();
+        let mut moved = HashSet::new();
+        for name in prev.keys().chain(next.keys()) {
+            match (prev.get(name), next.get(name)) {
+                (None, Some(_)) => {
+                    added.insert(name.clone());
+                }
+                (Some(_), None) => {
+                    removed.insert(name.clone());
+                }
+                (Some(p), Some(n)) if p != n => {
+                    moved.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+        (added, removed, moved)
+    }
+
+    /// True if any watched root currently contains a package with this name.
+    fn contains(&self, name: &str) -> bool {
+        self.entries.iter().any(|(_, names)| names.contains(name))
+    }
+}
+
+/// Given raw `notify::Event` paths observed during a debounce window, derive
+/// the set of package names that were "touched" — present in both snapshots
+/// (so neither added nor removed) but whose contents were rewritten. This
+/// covers the common in-place upgrade/reinstall case that produces no
+/// directory-listing delta.
+fn touched_from_events(
+    event_paths: &[PathBuf],
+    watched_roots: &[PathBuf],
+    prev: &LibpathSnapshot,
+    next: &LibpathSnapshot,
+) -> HashSet<String> {
+    let mut touched = HashSet::new();
+    for path in event_paths {
+        for root in watched_roots {
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            // First component after the root is the package directory name.
+            let Some(std::path::Component::Normal(os)) = rel.components().next() else {
+                break;
+            };
+            let Some(name) = os.to_str() else { break };
+            if name.starts_with("00LOCK-") {
+                break;
+            }
+            if prev.contains(name) && next.contains(name) {
+                touched.insert(name.to_string());
+            }
+            break;
+        }
+    }
+    touched
 }
 
 fn read_package_dir(root: &Path) -> HashSet<String> {
@@ -124,7 +200,11 @@ mod snapshot_tests {
         std::fs::create_dir_all(t.path().join("not-a-pkg")).unwrap();
 
         let snap = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
-        let names: HashSet<String> = snap.entries.values().flatten().cloned().collect();
+        let names: HashSet<String> = snap
+            .entries
+            .iter()
+            .flat_map(|(_, n)| n.iter().cloned())
+            .collect();
         assert_eq!(
             names,
             ["foo".to_string(), "bar".to_string()].into_iter().collect()
@@ -139,7 +219,7 @@ mod snapshot_tests {
         std::fs::write(lock.join("DESCRIPTION"), "").unwrap();
 
         let snap = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
-        assert!(snap.entries.values().flatten().next().is_none());
+        assert!(snap.entries.iter().all(|(_, n)| n.is_empty()));
     }
 
     #[test]
@@ -152,16 +232,42 @@ mod snapshot_tests {
         std::fs::remove_dir_all(t.path().join("foo")).unwrap();
         let next = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
 
-        let (added, removed) = prev.diff(&next);
+        let (added, removed, moved) = prev.diff(&next);
         assert_eq!(added, ["bar".to_string()].into_iter().collect());
         assert_eq!(removed, ["foo".to_string()].into_iter().collect());
+        assert!(moved.is_empty());
+    }
+
+    #[test]
+    fn diff_reports_moved_when_winning_root_changes() {
+        // Two libpaths in priority order: high, low. Package `foo` initially
+        // lives only in `low`; it is then installed into `high`, shadowing the
+        // previous resolution even though the name persists in the union.
+        let t_high = tempdir().unwrap();
+        let t_low = tempdir().unwrap();
+        make_pkg(t_low.path(), "foo");
+        let prev = LibpathSnapshot::capture(&[
+            t_high.path().to_path_buf(),
+            t_low.path().to_path_buf(),
+        ]);
+        make_pkg(t_high.path(), "foo");
+        let next = LibpathSnapshot::capture(&[
+            t_high.path().to_path_buf(),
+            t_low.path().to_path_buf(),
+        ]);
+
+        let (added, removed, moved) = prev.diff(&next);
+        assert!(added.is_empty(), "name is in union both times");
+        assert!(removed.is_empty());
+        assert_eq!(moved, ["foo".to_string()].into_iter().collect());
     }
 
     #[test]
     fn capture_handles_missing_directory() {
         let snap = LibpathSnapshot::capture(&[PathBuf::from("/does/not/exist/raven")]);
-        assert!(snap.entries.values().flatten().next().is_none());
+        assert!(snap.entries.iter().all(|(_, n)| n.is_empty()));
     }
+
 }
 
 use std::sync::{Arc, Mutex as StdMutex};
@@ -265,31 +371,50 @@ async fn debounce_loop(
         .await;
 
         match first {
-            Ok(Ok(_evt)) => {
-                // Got an event; now drain any further events within debounce window.
+            Ok(Ok(notify_result)) => {
+                // Capture paths from the initial event and everything drained
+                // during the debounce window. We need these to reconstruct the
+                // `touched` set (in-place upgrades that produce no listing delta).
+                // An `Err` notify result at the head of the stream means notify
+                // surfaced an error for this callback — log and proceed with an
+                // empty starting path list so we still run the diff.
+                let mut event_paths: Vec<PathBuf> = match notify_result {
+                    Ok(evt) => evt.paths,
+                    Err(e) => {
+                        log::warn!("LibpathWatcher: notify error event: {e}");
+                        Vec::new()
+                    }
+                };
                 tokio::time::sleep(debounce).await;
                 let rx_arc = Arc::clone(&raw_rx);
-                let _drained = tokio::task::spawn_blocking(move || {
+                let drained_paths: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
+                    let mut paths = Vec::new();
                     let guard = rx_arc.lock().unwrap();
-                    while guard.try_recv().is_ok() {}
+                    while let Ok(res) = guard.try_recv() {
+                        if let Ok(evt) = res {
+                            paths.extend(evt.paths);
+                        }
+                    }
+                    paths
                 })
-                .await;
+                .await
+                .unwrap_or_default();
+                event_paths.extend(drained_paths);
 
-                // Diff.
+                // Diff and derive touched under a single snapshot-lock acquisition.
                 let next_snap = LibpathSnapshot::capture(&paths);
-                let (added, removed) = {
-                    let prev = snapshot.lock().await;
-                    prev.diff(&next_snap)
+                let (added, removed, touched) = {
+                    let mut snap_guard = snapshot.lock().await;
+                    let (added, removed, moved) = snap_guard.diff(&next_snap);
+                    let mut touched =
+                        touched_from_events(&event_paths, &paths, &snap_guard, &next_snap);
+                    // Packages whose winning libpath changed are also "touched"
+                    // from the consumer's perspective — the effective on-disk
+                    // version differs even though the name persists.
+                    touched.extend(moved);
+                    *snap_guard = next_snap;
+                    (added, removed, touched)
                 };
-                // Touched = packages that still exist but the snapshot saw
-                // events for. We don't track per-package event counts, so we
-                // conservatively mark everything that exists in both prev and next
-                // as NOT touched unless the notify event kind was a non-directory
-                // change. For v1, leave `touched` empty — diff-on-listings is
-                // cheap and sufficient for the common `install.packages` case.
-                let touched: HashSet<String> = HashSet::new();
-
-                *snapshot.lock().await = next_snap;
 
                 if !added.is_empty() || !removed.is_empty() || !touched.is_empty() {
                     let _ = tx
@@ -303,10 +428,14 @@ async fn debounce_loop(
             }
             Ok(Err(_disconnect)) => {
                 log::warn!("LibpathWatcher: raw channel disconnected, exiting");
+                // Notify consumer so the fallback (full cache clear) path runs;
+                // otherwise package invalidation silently stops for this session.
+                let _ = tx.send(LibpathEvent::Dropped).await;
                 return;
             }
             Err(join_err) => {
                 log::warn!("LibpathWatcher: blocking task failed: {join_err}");
+                let _ = tx.send(LibpathEvent::Dropped).await;
                 return;
             }
         }
