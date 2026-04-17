@@ -437,9 +437,15 @@ impl PackageLibrary {
     /// - any package `A` whose `PackageInfo.depends` or `attached_packages` include
     ///   any name in `names` (invalidating `B` drops combined entry for `A` when `A`
     ///   Depends: B), since the aggregate rolled up a now-stale child.
-    pub async fn invalidate_many(&self, names: &HashSet<String>) {
+    ///
+    /// Returns the set of `combined_exports` keys that were actually present and
+    /// dropped. Callers use this to identify documents whose loaded packages
+    /// include meta-aggregates that were invalidated even though the aggregate
+    /// name itself is not in `names` (e.g. a document using `library(tidyverse)`
+    /// when `dplyr` is installed).
+    pub async fn invalidate_many(&self, names: &HashSet<String>) -> HashSet<String> {
         if names.is_empty() {
-            return;
+            return HashSet::new();
         }
         // Compute dependents from the per-package cache BEFORE mutating it so the
         // dependent lookup sees the previous `depends`/`attached_packages` graph.
@@ -460,13 +466,20 @@ impl PackageLibrary {
                 cache.remove(n);
             }
         }
+        let mut invalidated_combined: HashSet<String> = HashSet::new();
         {
             let mut combined = self.combined_exports.write().await;
-            // Drop direct hits.
-            combined.retain(|k, _| !names.contains(k));
+            // Drop direct hits; record only the ones that were actually present.
+            for n in names {
+                if combined.remove(n).is_some() {
+                    invalidated_combined.insert(n.clone());
+                }
+            }
             // Drop entries for packages whose runtime Depends/attached set intersects `names`.
             for k in &dependent_combined_keys {
-                combined.remove(k);
+                if combined.remove(k).is_some() {
+                    invalidated_combined.insert(k.clone());
+                }
             }
             // Drop hardcoded meta-package aggregates whose attached set intersects `names`
             // (covers the case where the aggregate was cached but the child PackageInfo
@@ -481,8 +494,10 @@ impl PackageLibrary {
                 .collect();
             for m in meta_hits {
                 combined.remove(&m);
+                invalidated_combined.insert(m);
             }
         }
+        invalidated_combined
     }
 
     /// Snapshot of the keys currently in the per-package cache.
@@ -3426,11 +3441,31 @@ mod tests {
 
         // Invalidate a child (dplyr) — the meta-package combined entry must be dropped too.
         let set: HashSet<String> = ["dplyr".to_string()].into_iter().collect();
-        lib.invalidate_many(&set).await;
+        let invalidated = lib.invalidate_many(&set).await;
 
         let combined = lib.combined_exports.read().await;
         assert!(!combined.contains_key("tidyverse"));
         assert!(!combined.contains_key("dplyr"));
+
+        // Returned set surfaces which combined_exports keys were actually
+        // dropped so callers can revalidate documents that loaded tidyverse
+        // (not dplyr) directly.
+        assert!(invalidated.contains("tidyverse"));
+        assert!(invalidated.contains("dplyr"));
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_returns_empty_for_names_not_in_combined_exports() {
+        use std::collections::HashSet;
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("uncached_meta_child".into(), HashSet::new()))
+            .await;
+
+        // combined_exports is empty for this package name — invalidate_many
+        // must not claim it was dropped.
+        let set: HashSet<String> = ["uncached_meta_child".to_string()].into_iter().collect();
+        let invalidated = lib.invalidate_many(&set).await;
+        assert!(invalidated.is_empty());
     }
 
     #[tokio::test]
@@ -3463,13 +3498,15 @@ mod tests {
         // must be dropped even though B is not a direct hit and A is not a
         // hardcoded meta-package.
         let set: HashSet<String> = ["B".to_string()].into_iter().collect();
-        lib.invalidate_many(&set).await;
+        let invalidated = lib.invalidate_many(&set).await;
 
         let combined = lib.combined_exports.read().await;
         assert!(
             !combined.contains_key("A"),
             "A's combined_exports aggregate should be cleared when its dependency B is invalidated"
         );
+        // Returned set surfaces A so consumers know documents using A need revalidation.
+        assert!(invalidated.contains("A"));
     }
 
     #[tokio::test]

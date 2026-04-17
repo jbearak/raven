@@ -2325,6 +2325,7 @@ impl LanguageServer for Backend {
             scope_changed,
             package_settings_changed,
             watch_settings_changed,
+            only_watch_changed,
             diagnostics_enabled_changed,
             old_diagnostics_enabled,
             new_diagnostics_enabled,
@@ -2428,10 +2429,23 @@ impl LanguageServer for Backend {
             let trigger_on_open_paren_changed =
                 old_trigger_on_open_paren != new_trigger_on_open_paren;
 
-            // Mark all open documents for force republish
+            // If `watch_settings_changed` is the only thing that flipped, the
+            // change is purely watcher-lifecycle (debounce ms or enable flag
+            // for the filesystem watcher). Diagnostic content is unaffected,
+            // so don't force every open document to revalidate.
+            let only_watch_changed = watch_settings_changed
+                && !(scope_changed
+                    || diagnostics_enabled_changed
+                    || package_settings_changed
+                    || trigger_on_open_paren_changed);
+
+            // Mark all open documents for force republish (unless only the
+            // watcher-lifecycle settings changed).
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-            for uri in &open_uris {
-                state.diagnostics_gate.mark_force_republish(uri);
+            if !only_watch_changed {
+                for uri in &open_uris {
+                    state.diagnostics_gate.mark_force_republish(uri);
+                }
             }
 
             (
@@ -2439,6 +2453,7 @@ impl LanguageServer for Backend {
                 scope_changed,
                 package_settings_changed,
                 watch_settings_changed,
+                only_watch_changed,
                 diagnostics_enabled_changed,
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
@@ -2605,9 +2620,13 @@ impl LanguageServer for Backend {
             );
         }
 
-        // Schedule diagnostics for all open documents
-        for uri in open_uris {
-            self.publish_diagnostics(&uri).await;
+        // Schedule diagnostics for all open documents, but skip the workspace
+        // republish if only the watcher-lifecycle settings changed — nothing
+        // about diagnostic content moved.
+        if !only_watch_changed {
+            for uri in open_uris {
+                self.publish_diagnostics(&uri).await;
+            }
         }
     }
 
@@ -4026,27 +4045,42 @@ async fn run_libpath_consumer(
                     touched.len()
                 );
 
-                // Invalidate the package cache.
+                // Invalidate the package cache and learn which combined_exports
+                // aggregates were dropped as a side effect. A document loading
+                // a meta-package like `tidyverse` needs revalidation when
+                // `dplyr` changes — `tidyverse` is not in `affected` but its
+                // aggregate was invalidated, so it's in `invalidated_combined`.
                 let pkg_lib = { state_arc.read().await.package_library.clone() };
-                pkg_lib.invalidate_many(&affected).await;
+                let invalidated_combined = pkg_lib.invalidate_many(&affected).await;
 
-                // Prefetch newly added packages so the next diagnostic pass is warm.
+                // Union of names that mark a document as affected: either the
+                // direct disk-level change (`affected`) or a dropped aggregate
+                // (`invalidated_combined`). Documents whose `loaded_packages`
+                // intersect this union need diagnostic revalidation.
+                let trigger_set: std::collections::HashSet<String> = affected
+                    .iter()
+                    .chain(invalidated_combined.iter())
+                    .cloned()
+                    .collect();
+
+                // Await the warmup prefetch BEFORE republishing diagnostics so
+                // the next diagnostic pass sees a warmed cache; otherwise a
+                // raced prefetch can land just after diagnostics compute and
+                // leave the user looking at stale results.
                 if !added.is_empty() {
-                    let pkg_lib = pkg_lib.clone();
                     let added_vec: Vec<String> = added.iter().cloned().collect();
-                    tokio::spawn(async move {
-                        pkg_lib.prefetch_packages(&added_vec).await;
-                    });
+                    pkg_lib.prefetch_packages(&added_vec).await;
                 }
 
-                // Collect URIs whose loaded_packages intersect `affected`.
+                // Collect URIs whose loaded_packages intersect `trigger_set`.
                 let affected_uris: Vec<Url> = {
                     let state = state_arc.read().await;
                     state
                         .documents
                         .iter()
                         .filter_map(|(uri, doc)| {
-                            let hit = doc.loaded_packages.iter().any(|p| affected.contains(p));
+                            let hit =
+                                doc.loaded_packages.iter().any(|p| trigger_set.contains(p));
                             if hit { Some(uri.clone()) } else { None }
                         })
                         .collect()
