@@ -77,7 +77,8 @@ struct ActiveDocumentsChangedParams {
 /// Supported top-level keys read:
 /// - `crossFile`: core cross-file behavior and diagnostic severities.
 /// - `diagnostics.enabled` and `diagnostics.undefinedVariables`: diagnostics master switch and undefined variable diagnostics.
-/// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`, `missingPackageSeverity`).
+/// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`,
+///   `missingPackageSeverity`, `watchLibraryPaths`, `watchDebounceMs`).
 ///
 /// # Returns
 ///
@@ -1101,6 +1102,14 @@ impl LanguageServer for Backend {
         }
 
         // Start the libpath watcher if enabled and we have a real package library.
+        //
+        // `lib_paths` is captured here as a one-time snapshot. If the user
+        // changes `.libPaths()` mid-session (e.g. by editing `.Rprofile` or
+        // calling `.libPaths(new=...)` in their R console), this watcher will
+        // keep watching the originally-captured directories. The documented
+        // workaround is the manual `raven.refreshPackages` command, which
+        // clears the cache and lets `did_open`-triggered prefetch re-discover
+        // exports under the new libpaths. See `docs/packages.md`.
         {
             let state_read = self.state.read().await;
             if state_read.cross_file_config.packages_enabled
@@ -1179,8 +1188,15 @@ impl LanguageServer for Backend {
                         state.diagnostics_gate.mark_force_republish(uri);
                     }
                 }
+                // Route through the same debounced pipeline the watcher consumer
+                // uses, so refresh runs in parallel (not serial) and cooperates
+                // with revalidation cancellation/freshness gates.
                 for uri in open_uris {
-                    self.publish_diagnostics(&uri).await;
+                    let state_arc = Arc::clone(&self.state);
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        Backend::publish_diagnostics_via_arc(state_arc, client, &uri).await;
+                    });
                 }
                 Ok(Some(serde_json::json!({ "cleared": cleared })))
             }
@@ -2308,6 +2324,7 @@ impl LanguageServer for Backend {
             open_uris,
             scope_changed,
             package_settings_changed,
+            watch_settings_changed,
             diagnostics_enabled_changed,
             old_diagnostics_enabled,
             new_diagnostics_enabled,
@@ -2334,7 +2351,8 @@ impl LanguageServer for Backend {
                 .unwrap_or(old_diagnostics_enabled);
             let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
 
-            // Check if package settings changed
+            // Settings that require reinitializing `PackageLibrary` via an R
+            // subprocess call (~100ms). Keep this narrow.
             let package_settings_changed = new_config
                 .as_ref()
                 .map(|c| {
@@ -2342,8 +2360,18 @@ impl LanguageServer for Backend {
                         || c.packages_r_path != state.cross_file_config.packages_r_path
                         || c.packages_additional_library_paths
                             != state.cross_file_config.packages_additional_library_paths
-                        || c.packages_watch_library_paths
-                            != state.cross_file_config.packages_watch_library_paths
+                })
+                .unwrap_or(false);
+
+            // Watcher-only settings. Changing just these should restart the
+            // filesystem watcher but MUST NOT trigger an R subprocess roundtrip
+            // or wipe the package cache — toggling a debounce slider in the
+            // Settings UI should not force every open document to revalidate.
+            let watch_settings_changed = new_config
+                .as_ref()
+                .map(|c| {
+                    c.packages_watch_library_paths
+                        != state.cross_file_config.packages_watch_library_paths
                         || c.packages_watch_debounce_ms
                             != state.cross_file_config.packages_watch_debounce_ms
                 })
@@ -2410,6 +2438,7 @@ impl LanguageServer for Backend {
                 open_uris,
                 scope_changed,
                 package_settings_changed,
+                watch_settings_changed,
                 diagnostics_enabled_changed,
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
@@ -2494,7 +2523,8 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Reinitialize PackageLibrary if package settings changed
+        // Reinitialize PackageLibrary only if R-subprocess-affecting settings
+        // changed (enabled flag, R path, or additional library paths).
         if package_settings_changed {
             log::info!("Package settings changed, reinitializing PackageLibrary");
 
@@ -2527,8 +2557,14 @@ impl LanguageServer for Backend {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
             }
+        }
 
-            // Tear down the old libpath watcher; a new one is spawned below if still enabled.
+        // Restart the libpath watcher if any setting that affects it changed.
+        // This covers both the reinit path above (the lib_paths vector may have
+        // changed) and the pure watch-settings path (e.g. user flipped
+        // `watchLibraryPaths` or adjusted the debounce slider) — the latter
+        // must NOT pay the cost of an R subprocess roundtrip.
+        if package_settings_changed || watch_settings_changed {
             {
                 let mut state = self.state.write().await;
                 state.libpath_watcher_handle = None;
@@ -3936,9 +3972,14 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Core logic of the `raven.refreshPackages` command. Returns the number of cached
-/// package entries that were cleared. Takes an explicit loaded-package list so the
-/// caller can trigger prefetch of packages known to be in use.
+/// Core logic of the `raven.refreshPackages` command. Returns the number of
+/// cache entries that were net-evicted — `before_count - after_count` — which
+/// is the intuitive "how many stale entries got cleared and stayed cleared"
+/// number a user expects to see.
+///
+/// Because `prefetch_packages` is called after `clear_cache`, a workspace
+/// that had 8 cached packages and loads 6 of them across open documents will
+/// report `cleared = 2`, not `8`.
 pub(crate) async fn refresh_packages_command_body(
     pkg_lib: &std::sync::Arc<crate::package_library::PackageLibrary>,
     loaded_packages_to_prefetch: &[String],
@@ -3948,7 +3989,8 @@ pub(crate) async fn refresh_packages_command_body(
     if !loaded_packages_to_prefetch.is_empty() {
         pkg_lib.prefetch_packages(loaded_packages_to_prefetch).await;
     }
-    before
+    let after = pkg_lib.cached_count().await;
+    before.saturating_sub(after)
 }
 
 /// Consumer for libpath change events. Invalidates the package cache for
