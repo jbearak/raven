@@ -4,6 +4,24 @@
 //! debounces raw filesystem events, diffs the post-debounce directory listing
 //! against the previous snapshot, and emits a single `LibpathEvent::Changed`
 //! with the delta (added / removed / touched package names).
+//!
+//! # Recursive vs non-recursive watching
+//!
+//! Each libpath is attached with `RecursiveMode::Recursive`. Non-recursive
+//! watching misses the common in-place upgrade case: `install.packages("pkg")`
+//! for an already-installed package overwrites files inside
+//! `<libpath>/<pkg>/` without changing the libpath's directory listing, so the
+//! `added`/`removed` diff is empty and no directory-level events fire under
+//! `NonRecursive`. Recursive watching surfaces those file-level events so
+//! `touched_from_events` can mark the package's cached exports as stale.
+//!
+//! On Linux, `notify`'s recursive inotify implementation attaches one watch
+//! per descendant **directory** (not per file). A typical R package has ~10–20
+//! subdirectories (`R/`, `man/`, `help/`, `data/`, …), so 500 installed
+//! packages is ~5–10k inotify watches. This is comfortably under Debian/Ubuntu's
+//! modern default of `fs.inotify.max_user_watches = 524288`, but users on
+//! older distros capped at 8192 who install CRAN snapshots may want to raise
+//! the limit via `sysctl -w fs.inotify.max_user_watches=524288`.
 
 use std::collections::HashSet;
 
@@ -268,6 +286,56 @@ mod snapshot_tests {
         assert!(snap.entries.iter().all(|(_, n)| n.is_empty()));
     }
 
+    #[test]
+    fn touched_from_events_flags_in_place_upgrade() {
+        // An in-place `install.packages("foo")` rewrites files *inside*
+        // `<libpath>/foo/` without touching the libpath's listing. The diff
+        // alone reports added={}, removed={}, moved={} — the only signal is
+        // file-level events under `<libpath>/foo/`, which recursive watching
+        // surfaces. `touched_from_events` must turn those into `{"foo"}`.
+        let t = tempdir().unwrap();
+        make_pkg(t.path(), "foo");
+        let prev = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
+        let next = prev.clone();
+
+        let event_paths = vec![
+            t.path().join("foo").join("DESCRIPTION"),
+            t.path().join("foo").join("NAMESPACE"),
+            // A deep-nested path still resolves to the package name.
+            t.path().join("foo").join("help").join("aliases.rds"),
+        ];
+
+        let touched = touched_from_events(
+            &event_paths,
+            &[t.path().to_path_buf()],
+            &prev,
+            &next,
+        );
+        assert_eq!(touched, ["foo".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn touched_from_events_skips_00lock_staging() {
+        // Recursive watching fires events under `<libpath>/00LOCK-foo/` during
+        // install staging. Those must not be mis-attributed to the eventual
+        // real `foo` package.
+        let t = tempdir().unwrap();
+        make_pkg(t.path(), "foo");
+        let snap = LibpathSnapshot::capture(&[t.path().to_path_buf()]);
+
+        let event_paths = vec![
+            t.path().join("00LOCK-foo").join("DESCRIPTION"),
+            t.path().join("00LOCK-foo").join("foo").join("R").join("foo.R"),
+        ];
+
+        let touched = touched_from_events(
+            &event_paths,
+            &[t.path().to_path_buf()],
+            &snap,
+            &snap,
+        );
+        assert!(touched.is_empty(), "expected no touched, got {:?}", touched);
+    }
 }
 
 use std::sync::{Arc, Mutex as StdMutex};
@@ -324,7 +392,11 @@ pub fn spawn_watcher(
 
     let mut attached: Vec<PathBuf> = Vec::new();
     for p in &paths {
-        match watcher.watch(p, RecursiveMode::NonRecursive) {
+        // Recursive: needed so in-place package upgrades (which rewrite files
+        // inside an existing `<libpath>/<pkg>/` without touching the libpath's
+        // listing) fire events we can turn into `touched`. See the module-level
+        // docstring for the Linux inotify cost tradeoff.
+        match watcher.watch(p, RecursiveMode::Recursive) {
             Ok(()) => attached.push(p.clone()),
             Err(e) => {
                 // A libpath directory may not exist yet (e.g. empty renv); log and continue.
@@ -481,6 +553,60 @@ mod watcher_tests {
             LibpathEvent::Changed { added, removed, .. } => {
                 assert_eq!(added, ["foo".to_string()].into_iter().collect());
                 assert!(removed.is_empty());
+            }
+            LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires reliable FS notifications; run with `cargo test -- --ignored`"]
+    async fn watcher_emits_touched_on_in_place_upgrade() {
+        // Regression for the NonRecursive → Recursive switch: rewriting files
+        // inside an existing package directory must report it as `touched`.
+        let t = tempdir().unwrap();
+        make_pkg(t.path(), "foo");
+
+        let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
+        let _handle = spawn_watcher(
+            vec![t.path().to_path_buf()],
+            Duration::from_millis(300),
+            tx,
+        )
+        .expect("watcher attached");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Rewrite files inside the existing package directory — no listing
+        // delta, so only recursive watching surfaces this as a signal.
+        std::fs::write(
+            t.path().join("foo").join("DESCRIPTION"),
+            "Package: foo\nVersion: 2.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("foo").join("NAMESPACE"),
+            "export(new_fn)\n",
+        )
+        .unwrap();
+
+        let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event arrived in time")
+            .expect("channel not closed");
+
+        match evt {
+            LibpathEvent::Changed {
+                added,
+                removed,
+                touched,
+            } => {
+                assert!(added.is_empty(), "no dir was added: {:?}", added);
+                assert!(removed.is_empty(), "no dir was removed: {:?}", removed);
+                assert!(
+                    touched.contains("foo"),
+                    "expected 'foo' in touched, got {:?}",
+                    touched
+                );
             }
             LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
         }

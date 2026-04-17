@@ -105,3 +105,37 @@ Raven provides helpful diagnostics for package-related issues:
 | `library(get("pkg"))` | No (dynamic) |
 
 Dynamic package names (variables, expressions, `character.only = TRUE`) are skipped gracefully.
+
+## Keeping Packages in Sync
+
+Raven caches each package's exports in memory for the duration of the LSP session. To avoid stale results when you install, upgrade, or remove packages, Raven watches the directories returned by `.libPaths()` at startup and invalidates affected packages automatically:
+
+- **New install** (`install.packages("pkg")` for a package not yet installed): the new top-level directory fires a filesystem event; Raven prefetches the new exports and republishes diagnostics.
+- **In-place upgrade** (`install.packages("pkg")` for a package that already exists): only files inside the existing `<libpath>/pkg/` directory change. Raven watches libpaths recursively so these file-level events still arrive and the package is marked `touched`, dropping its cached exports.
+- **Removal**: the disappearing directory triggers the same invalidation path.
+- **Libpath priority change**: if the same package name starts resolving to a different libpath root, Raven treats it as touched.
+
+### Watcher settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on change. |
+| `packages.watchDebounceMs` | `300` | Coalesce rapid filesystem events into a single invalidation pass. |
+
+On Linux, recursive watching attaches one inotify watch per descendant directory (not per file). A typical R package has ~10–20 subdirectories; 500 installed packages is ~5–10k watches. If you work with very large CRAN snapshots on an older distro capped at the legacy default of 8192, raise the limit:
+
+```sh
+sudo sysctl -w fs.inotify.max_user_watches=524288
+```
+
+### Manual refresh: `raven.refreshPackages`
+
+If you change `.libPaths()` inside an active R session (e.g. `renv::activate()` switches to a different project, `.Rprofile` sets `R_LIBS_USER`, or `install.packages` succeeds but events are dropped by a transient FS issue), run the **Raven: Refresh Packages** command from the editor's command palette. It:
+
+1. Re-runs `.libPaths()` to discover the current library roots.
+2. Rebuilds Raven's package library over those roots.
+3. Restarts the filesystem watcher so future installs/removes in the new libpaths are observed.
+4. Clears the in-memory package cache and prefetches exports for packages loaded in open documents.
+5. Republishes diagnostics for all open documents.
+
+This command is always available, even if `packages.watchLibraryPaths` is `false`.
