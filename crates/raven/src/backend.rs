@@ -1132,19 +1132,10 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
         match params.command.as_str() {
             "raven.refreshPackages" => {
-                // Collect distinct packages referenced by open docs for warm prefetch.
-                let (loaded_packages, open_uris) = {
+                // Collect open URIs for force-republish (needed before rebuild).
+                let open_uris: Vec<tower_lsp::lsp_types::Url> = {
                     let state = self.state.read().await;
-                    let mut loaded: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    for doc in state.documents.values() {
-                        for p in &doc.loaded_packages {
-                            loaded.insert(p.clone());
-                        }
-                    }
-                    let uris: Vec<tower_lsp::lsp_types::Url> =
-                        state.documents.keys().cloned().collect();
-                    (loaded.into_iter().collect::<Vec<_>>(), uris)
+                    state.documents.keys().cloned().collect()
                 };
 
                 // Capture the cache size of the *current* library before any
@@ -1179,6 +1170,85 @@ impl LanguageServer for Backend {
                 // subsequent installs in the new libpaths are observed. A
                 // no-op if watching is disabled or the library is not ready.
                 restart_libpath_watcher(&self.state, &self.client, true).await;
+
+                // Collect effective packages for warm prefetch AFTER rebuild
+                // so scope resolution uses the fresh state. Includes both
+                // direct loads (including function-local) and inherited
+                // packages from parent source() chains.
+                //
+                // Snapshot inputs under the read lock, then release it before
+                // running per-document scope resolution (AGENTS.md: "Diagnostic
+                // computation must not hold the RwLock read lock during
+                // expensive scope resolution").
+                let loaded_packages = {
+                    let (
+                        doc_packages,
+                        docs,
+                        artifacts_map,
+                        metadata_map,
+                        graph,
+                        workspace_folder,
+                        max_chain_depth,
+                        backward_deps,
+                    ) = {
+                        let state = self.state.read().await;
+                        let mut doc_pkgs = std::collections::HashSet::new();
+                        let mut docs = Vec::new();
+                        for (uri, doc) in &state.documents {
+                            for p in &doc.loaded_packages {
+                                doc_pkgs.insert(p.clone());
+                            }
+                            let line = doc.text().lines().count().saturating_sub(1) as u32;
+                            docs.push((uri.clone(), line));
+                        }
+                        let content_provider = state.content_provider();
+                        let mut a_map = std::collections::HashMap::new();
+                        let mut m_map = std::collections::HashMap::new();
+                        for (uri, _) in &docs {
+                            if let Some(a) = content_provider.get_artifacts(uri) {
+                                a_map.insert(uri.clone(), a);
+                            }
+                            if let Some(m) = content_provider.get_metadata(uri) {
+                                m_map.insert(uri.clone(), m);
+                            }
+                        }
+                        (
+                            doc_pkgs,
+                            docs,
+                            a_map,
+                            m_map,
+                            state.cross_file_graph.clone(),
+                            state.workspace_folders.first().cloned(),
+                            state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.backward_dependencies,
+                        )
+                    }; // read lock released
+
+                    let mut all_pkgs = doc_packages;
+                    let empty_base_exports = std::collections::HashSet::new();
+                    let get_artifacts = |target_uri: &Url| artifacts_map.get(target_uri).cloned();
+                    let get_metadata = |target_uri: &Url| metadata_map.get(target_uri).cloned();
+                    for (uri, line) in &docs {
+                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                            uri,
+                            *line,
+                            u32::MAX,
+                            &get_artifacts,
+                            &get_metadata,
+                            &graph,
+                            workspace_folder.as_ref(),
+                            max_chain_depth,
+                            &empty_base_exports,
+                            false,
+                            backward_deps,
+                            &|| false,
+                        );
+                        for p in scope.inherited_packages {
+                            all_pkgs.insert(p);
+                        }
+                    }
+                    all_pkgs.into_iter().collect::<Vec<_>>()
+                };
 
                 let pkg_lib = self.state.read().await.package_library.clone();
                 // Run the standard refresh body so `loaded_packages` is
@@ -2385,6 +2455,27 @@ impl LanguageServer for Backend {
                 })
                 .unwrap_or(false);
 
+            // If `watch_settings_changed` is the only thing that flipped, the
+            // change is purely watcher-lifecycle (debounce ms or enable flag
+            // for the filesystem watcher). Diagnostic content is unaffected,
+            // so don't force every open document to revalidate.
+            //
+            // Future-proof: compare the entire config with watch fields
+            // reverted so any new diagnostic-affecting field is automatically
+            // covered without maintaining a manual exclusion list.
+            let only_watch_changed = watch_settings_changed
+                && new_config
+                    .as_ref()
+                    .map(|c| {
+                        let mut probe = c.clone();
+                        probe.packages_watch_library_paths =
+                            state.cross_file_config.packages_watch_library_paths;
+                        probe.packages_watch_debounce_ms =
+                            state.cross_file_config.packages_watch_debounce_ms;
+                        probe == state.cross_file_config
+                    })
+                    .unwrap_or(false);
+
             // Capture new package settings before applying config
             let packages_enabled = new_config
                 .as_ref()
@@ -2418,16 +2509,6 @@ impl LanguageServer for Backend {
             let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
             let trigger_on_open_paren_changed =
                 old_trigger_on_open_paren != new_trigger_on_open_paren;
-
-            // If `watch_settings_changed` is the only thing that flipped, the
-            // change is purely watcher-lifecycle (debounce ms or enable flag
-            // for the filesystem watcher). Diagnostic content is unaffected,
-            // so don't force every open document to revalidate.
-            let only_watch_changed = watch_settings_changed
-                && !(scope_changed
-                    || diagnostics_enabled_changed
-                    || package_settings_changed
-                    || trigger_on_open_paren_changed);
 
             // Mark all open documents for force republish (unless only the
             // watcher-lifecycle settings changed).
@@ -4084,6 +4165,9 @@ struct ScopeProbeSnapshot {
     artifacts_map:
         std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
     metadata_map: std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
+    /// Per-document `loaded_packages` from the document store (includes
+    /// function-local `library()` calls that the EOF scope probe misses).
+    doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
     graph: crate::cross_file::dependency::DependencyGraph,
     workspace_folder: Option<Url>,
     max_chain_depth: usize,
@@ -4254,6 +4338,11 @@ async fn run_libpath_consumer(
                         docs,
                         artifacts_map,
                         metadata_map,
+                        doc_loaded_packages: state
+                            .documents
+                            .iter()
+                            .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
+                            .collect(),
                         graph: state.cross_file_graph.extract_subgraph(&neighborhood),
                         workspace_folder: state.workspace_folders.first().cloned(),
                         max_chain_depth: state.cross_file_config.max_chain_depth,
@@ -4287,12 +4376,25 @@ async fn run_libpath_consumer(
                             probe.backward_dependencies,
                             &|| false,
                         );
-                        let hit = scope
+                        // Scope probe captures inherited + global-scope packages.
+                        // Also check the document's full loaded_packages which
+                        // includes function-local library() calls the EOF scope
+                        // probe misses.
+                        let scope_hit = scope
                             .inherited_packages
                             .iter()
                             .chain(scope.loaded_packages.iter())
                             .any(|p| trigger_set.contains(p));
-                        if hit { Some(uri.clone()) } else { None }
+                        let doc_hit = probe
+                            .doc_loaded_packages
+                            .get(uri)
+                            .map(|pkgs| pkgs.iter().any(|p| trigger_set.contains(p)))
+                            .unwrap_or(false);
+                        if scope_hit || doc_hit {
+                            Some(uri.clone())
+                        } else {
+                            None
+                        }
                     })
                     .collect();
 

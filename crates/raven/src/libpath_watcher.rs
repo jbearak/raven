@@ -469,8 +469,11 @@ async fn debounce_loop(
                     let mut paths = Vec::new();
                     let guard = rx_arc.lock().unwrap();
                     while let Ok(res) = guard.try_recv() {
-                        if let Ok(evt) = res {
-                            paths.extend(evt.paths);
+                        match res {
+                            Ok(evt) => paths.extend(evt.paths),
+                            Err(e) => {
+                                log::warn!("LibpathWatcher: notify error during drain: {e}")
+                            }
                         }
                     }
                     paths

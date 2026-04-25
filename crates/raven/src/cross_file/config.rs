@@ -32,7 +32,7 @@ pub enum CallSiteDefault {
 }
 
 /// Cross-file awareness configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CrossFileConfig {
     /// Master switch for all diagnostics
     /// When false, all diagnostics are suppressed regardless of individual severity settings

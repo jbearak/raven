@@ -71,18 +71,22 @@ The watcher does **not** invalidate the cache directly — it only reports delta
 Add to `PackageLibrary`:
 
 ```rust
-pub async fn invalidate_many(&self, names: &HashSet<String>);  // batch version of invalidate
-pub async fn cached_package_names(&self) -> HashSet<String>;   // snapshot of what's currently cached
+pub async fn invalidate_many(&self, names: &HashSet<String>) -> HashSet<String>;
+// Returns the set of `combined_exports` keys that were invalidated (for
+// downstream affected-URI computation).
+
+pub async fn cached_package_names(&self) -> HashSet<String>;
+// Snapshot of the keys currently in the per-package cache.
 ```
 
 When the backend receives a `LibpathEvent::Changed`:
 
 1. Combine `added ∪ removed ∪ touched` into one set.
-2. Call `invalidate_many` on the per-package cache.
-3. Also invalidate entries in `combined_exports` whose key is in the set — and invalidate any `combined_exports` entry whose `attached_packages` contain any affected name (meta-packages like `tidyverse`).
-4. If `added` is non-empty, schedule a best-effort `prefetch_packages` for the new names so the next diagnostic pass is warm.
+2. Call `invalidate_many` on the per-package cache. This also drops any `combined_exports` entry whose key is in the set, whose `PackageInfo.depends` or `attached_packages` intersect the set (Depends-based aggregates), or whose hardcoded meta-package attached set (e.g. `tidyverse`, `tidymodels`) intersects the set.
+3. Build a `trigger_set` from the union of the direct affected names and the `invalidated_combined` keys returned by `invalidate_many`.
+4. Prefetch the full non-removed trigger set (`touched ∪ added ∪ invalidated_combined \ removed`) and **await** completion before scheduling diagnostics, so the diagnostic pass sees a warmed cache.
 
-On `LibpathEvent::Dropped`, call `clear_cache()` and re-initialize libpaths (re-query `.libPaths()` via the R subprocess).
+On `LibpathEvent::Dropped`, the backend calls `clear_cache()`, force-republishes diagnostics for all open documents, and attempts a one-shot watcher restart with `allow_recovery = false` to prevent tight restart loops. Rebuilding `.libPaths()` is performed by the manual `raven.refreshPackages` command, not by the Dropped handler.
 
 ### Component 3: Backend lifecycle wiring
 
@@ -91,8 +95,8 @@ In `backend.rs`:
 1. After successful `PackageLibrary` init (around `backend.rs:1075`), spawn a `LibpathWatcher` over the list of paths the library was just initialized with.
 2. Spawn a consumer task that owns the `mpsc::Receiver<LibpathEvent>`. On each event it:
    - mutates `PackageLibrary` per Component 2,
-   - builds the set of open document URIs whose `Document.loaded_packages` intersect the affected names,
-   - schedules diagnostics revalidation for each of those URIs through the existing `CrossFileRevalidationState::schedule()` mechanism so we use the project's standard debounce and cancellation paths.
+   - builds the set of open document URIs whose effective package scope (inherited + global-scope + function-local loaded packages) intersects the trigger set,
+   - schedules diagnostics for each affected URI via `publish_diagnostics_via_arc` (spawned per-URI).
 3. On settings change (`backend.rs:2403`), if libpaths changed, tear down the old watcher and spawn a new one.
 4. On shutdown, the watcher's task is aborted cleanly; the `Drop` impl on `RecommendedWatcher` unregisters inotify/FSEvents handles.
 
