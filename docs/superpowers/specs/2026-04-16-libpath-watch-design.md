@@ -46,8 +46,8 @@ New module: `crates/raven/src/libpath_watcher.rs`.
 Owns a `notify::RecommendedWatcher` and a background tokio task. On construction:
 
 1. Take a list of libpath directories and a `mpsc::Sender<LibpathEvent>`.
-2. Register each directory with `RecursiveMode::NonRecursive` (we only care about which subdirectories — i.e. package names — exist; we don't need recursive watches, which would be expensive on Linux).
-3. Events from `notify` are forwarded into an internal channel, debounced for 500 ms (configurable), then aggregated into a single `LibpathEvent { added: HashSet<String>, removed: HashSet<String>, touched: HashSet<String> }` computed by diffing the post-debounce directory listing against a cached listing.
+2. Register each directory with `RecursiveMode::Recursive`. The pre-implementation draft used `NonRecursive`, but in-place upgrades (`install.packages("pkg")` on an already-installed `pkg`) rewrite files inside `<libpath>/pkg/` without changing the libpath's listing, so non-recursive watches miss the events entirely. Recursive watches attach one watch per descendant directory (≈10–20 per package on inotify), which is acceptable given libpath sizes; users on hosts with the legacy `fs.inotify.max_user_watches = 8192` may need to raise it for very large CRAN snapshots.
+3. Events from `notify` are forwarded into an internal channel, debounced for 500 ms (configurable), then aggregated into a single `LibpathEvent { added: HashSet<String>, removed: HashSet<String>, touched: HashSet<String> }`. `added`/`removed` come from diffing the post-debounce directory listing against a cached listing; `touched` is derived from the drained `notify` paths during the debounce window so in-place upgrades produce a `Changed` event even when the package set is unchanged.
 
 ```rust
 pub enum LibpathEvent {

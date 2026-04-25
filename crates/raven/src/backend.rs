@@ -1147,6 +1147,18 @@ impl LanguageServer for Backend {
                     (loaded.into_iter().collect::<Vec<_>>(), uris)
                 };
 
+                // Capture the cache size of the *current* library before any
+                // rebuild/refresh so the user-visible "cleared N entries"
+                // count is meaningful even when `packages_enabled` triggers a
+                // full library rebuild. After a rebuild, `pkg_lib` points at a
+                // fresh empty library, so `refresh_packages_command_body`'s
+                // own `before` would always be 0 and its return value would
+                // under-report — even after evicting hundreds of stale
+                // entries. We compute the user-visible delta against the
+                // pre-rebuild count instead.
+                let before_count =
+                    self.state.read().await.package_library.cached_count().await;
+
                 // Rebuild the PackageLibrary first — this re-runs `.libPaths()`
                 // so mid-session libpath changes (renv switched projects,
                 // `.Rprofile` edited, `.libPaths(new, ...)` called) are picked
@@ -1169,8 +1181,14 @@ impl LanguageServer for Backend {
                 restart_libpath_watcher(&self.state, &self.client, true).await;
 
                 let pkg_lib = self.state.read().await.package_library.clone();
-                let cleared =
-                    refresh_packages_command_body(&pkg_lib, &loaded_packages).await;
+                // Run the standard refresh body so `loaded_packages` is
+                // prefetched and the per-library `clear_cache` no-ops on the
+                // already-empty rebuilt library. Discard its return value: it
+                // is computed against the post-rebuild library and so is 0
+                // after a rebuild regardless of what was evicted.
+                let _ = refresh_packages_command_body(&pkg_lib, &loaded_packages).await;
+                let after_count = pkg_lib.cached_count().await;
+                let cleared = before_count.saturating_sub(after_count);
                 log::info!("raven.refreshPackages: cleared {cleared} cache entries");
 
                 // Force-republish diagnostics for all open documents.
@@ -4057,6 +4075,21 @@ pub(crate) fn restart_libpath_watcher<'a>(
     })
 }
 
+/// Pre-collected snapshot of the inputs `scope_at_position_with_graph` needs
+/// for filtering open documents by package scope. Captured under the read
+/// lock so the (potentially expensive) per-document scope traversal can run
+/// outside the lock — see the libpath consumer's `Changed` branch.
+struct ScopeProbeSnapshot {
+    docs: Vec<(Url, u32)>,
+    artifacts_map:
+        std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
+    metadata_map: std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
+    graph: crate::cross_file::dependency::DependencyGraph,
+    workspace_folder: Option<Url>,
+    max_chain_depth: usize,
+    backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+}
+
 /// State-side preparation for a `LibpathEvent::Dropped`: clears the package
 /// cache so stale entries can't leak into subsequent lookups, and marks every
 /// open document for force-republish so the scheduled diagnostic pass can
@@ -4159,46 +4192,109 @@ async fn run_libpath_consumer(
                     pkg_lib.prefetch_packages(&prefetch_vec).await;
                 }
 
-                // Collect URIs whose effective package scope intersects `trigger_set`.
-                let affected_uris: Vec<Url> = {
+                // Collect URIs whose effective package scope intersects
+                // `trigger_set`.
+                //
+                // Snapshot the inputs scope resolution needs under the read
+                // lock, then release it before doing the per-document
+                // traversal. AGENTS.md learning: "Diagnostic computation must
+                // not hold the RwLock read lock during expensive scope
+                // resolution. Build a [...] snapshot (captures artifacts,
+                // metadata, graph clone, config), release the lock, then
+                // compute [...] from the snapshot." Holding the lock across N
+                // cross-file scope resolutions can starve `did_change`
+                // writers in workspaces with many open files.
+                use std::collections::{HashMap, HashSet};
+                let probe = {
                     let state = state_arc.read().await;
-                    let content_provider = state.content_provider();
-                    let get_artifacts = |target_uri: &Url| -> Option<
-                        std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
-                    > { content_provider.get_artifacts(target_uri) };
-                    let get_metadata =
-                        |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-                            content_provider.get_metadata(target_uri)
-                        };
-                    let empty_base_exports = std::collections::HashSet::new();
-                    state
+                    let max_depth = state.cross_file_config.max_chain_depth;
+                    let max_visited =
+                        state.cross_file_config.max_transitive_dependents_visited;
+
+                    let docs: Vec<(Url, u32)> = state
                         .documents
                         .iter()
-                        .filter_map(|(uri, doc)| {
+                        .map(|(uri, doc)| {
                             let line = doc.text().lines().count().saturating_sub(1) as u32;
-                            let scope = crate::cross_file::scope::scope_at_position_with_graph(
-                                uri,
-                                line,
-                                u32::MAX,
-                                &get_artifacts,
-                                &get_metadata,
-                                &state.cross_file_graph,
-                                state.workspace_folders.first(),
-                                state.cross_file_config.max_chain_depth,
-                                &empty_base_exports,
-                                false,
-                                state.cross_file_config.backward_dependencies,
-                                &|| false,
-                            );
-                            let hit = scope
-                                .inherited_packages
-                                .iter()
-                                .chain(scope.loaded_packages.iter())
-                                .any(|p| trigger_set.contains(p));
-                            if hit { Some(uri.clone()) } else { None }
+                            (uri.clone(), line)
                         })
-                        .collect()
+                        .collect();
+
+                    // Pre-collect the URIs scope resolution may need to load:
+                    // every open doc plus its dependency neighborhood. Without
+                    // the neighborhood, source()-chain traversal would silently
+                    // fail to resolve cross-file packages.
+                    let mut neighborhood: HashSet<Url> = HashSet::new();
+                    for (uri, _) in &docs {
+                        for n in state
+                            .cross_file_graph
+                            .collect_neighborhood(uri, max_depth, max_visited)
+                        {
+                            neighborhood.insert(n);
+                        }
+                    }
+
+                    let content_provider = state.content_provider();
+                    let mut artifacts_map: HashMap<
+                        Url,
+                        Arc<crate::cross_file::scope::ScopeArtifacts>,
+                    > = HashMap::with_capacity(neighborhood.len());
+                    let mut metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> =
+                        HashMap::with_capacity(neighborhood.len());
+                    for u in &neighborhood {
+                        if let Some(a) = content_provider.get_artifacts(u) {
+                            artifacts_map.insert(u.clone(), a);
+                        }
+                        if let Some(m) = content_provider.get_metadata(u) {
+                            metadata_map.insert(u.clone(), m);
+                        }
+                    }
+
+                    ScopeProbeSnapshot {
+                        docs,
+                        artifacts_map,
+                        metadata_map,
+                        graph: state.cross_file_graph.extract_subgraph(&neighborhood),
+                        workspace_folder: state.workspace_folders.first().cloned(),
+                        max_chain_depth: state.cross_file_config.max_chain_depth,
+                        backward_dependencies: state.cross_file_config.backward_dependencies,
+                    }
                 };
+
+                let get_artifacts = |target_uri: &Url| -> Option<
+                    Arc<crate::cross_file::scope::ScopeArtifacts>,
+                > { probe.artifacts_map.get(target_uri).cloned() };
+                let get_metadata =
+                    |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                        probe.metadata_map.get(target_uri).cloned()
+                    };
+                let empty_base_exports: HashSet<String> = HashSet::new();
+                let affected_uris: Vec<Url> = probe
+                    .docs
+                    .iter()
+                    .filter_map(|(uri, line)| {
+                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                            uri,
+                            *line,
+                            u32::MAX,
+                            &get_artifacts,
+                            &get_metadata,
+                            &probe.graph,
+                            probe.workspace_folder.as_ref(),
+                            probe.max_chain_depth,
+                            &empty_base_exports,
+                            false,
+                            probe.backward_dependencies,
+                            &|| false,
+                        );
+                        let hit = scope
+                            .inherited_packages
+                            .iter()
+                            .chain(scope.loaded_packages.iter())
+                            .any(|p| trigger_set.contains(p));
+                        if hit { Some(uri.clone()) } else { None }
+                    })
+                    .collect();
 
                 // Force republish is safe: the text hasn't changed but the
                 // underlying package set has, so we want to overwrite the last
@@ -5292,6 +5388,52 @@ mod refresh_packages_tests {
             lib_v2.lib_paths().iter().any(|p| p == t_new.path()),
             "rebuilt library must include t_new after config change, got {:?}",
             lib_v2.lib_paths()
+        );
+    }
+
+    /// Regression: when `raven.refreshPackages` rebuilds the `PackageLibrary`,
+    /// the user-visible "cleared N entries" count must reflect the *old*
+    /// library's pre-rebuild size rather than `refresh_packages_command_body`'s
+    /// internal `before - after` (which is computed against the new empty
+    /// library and would always be 0). Mirrors the cleared-count math in
+    /// `Backend::execute_command("raven.refreshPackages")`.
+    #[tokio::test]
+    async fn cleared_count_reflects_pre_rebuild_library_size() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        // Old library populated with three entries — represents the cache
+        // state right before the user invokes "Raven: Refresh package cache".
+        let old_lib = Arc::new(PackageLibrary::new_empty());
+        for name in ["foo", "bar", "baz"] {
+            old_lib
+                .insert_package(PackageInfo::new(name.into(), HashSet::new()))
+                .await;
+        }
+        let before_count = old_lib.cached_count().await;
+        assert_eq!(before_count, 3);
+
+        // Simulate `rebuild_package_library` swapping in a fresh empty
+        // library: from this point the command operates on `new_lib`, which
+        // starts at 0 entries.
+        let new_lib = Arc::new(PackageLibrary::new_empty());
+
+        // Run the standard refresh body on the new library (no prefetch
+        // candidates because the test fixture has no documents). This is
+        // exactly what `execute_command` does after the swap.
+        let body_cleared = refresh_packages_command_body(&new_lib, &[]).await;
+        let after_count = new_lib.cached_count().await;
+        let cleared_user_visible = before_count.saturating_sub(after_count);
+
+        // The function's own return is meaningless after a rebuild — it
+        // sees an empty library and reports 0 evicted.
+        assert_eq!(
+            body_cleared, 0,
+            "refresh_packages_command_body operates on the post-rebuild library, so its return is 0",
+        );
+        // The user-visible delta must reflect the three entries that vanished
+        // when the library was replaced.
+        assert_eq!(
+            cleared_user_visible, 3,
+            "user-visible cleared count must reflect pre-rebuild size",
         );
     }
 

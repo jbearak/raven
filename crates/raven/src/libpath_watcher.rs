@@ -45,6 +45,12 @@ pub enum LibpathEvent {
 
 impl LibpathEvent {
     /// Union of `added ∪ removed ∪ touched` for a `Changed` event; empty otherwise.
+    ///
+    /// Used by the integration test suite (`crates/raven/tests/libpath_watching.rs`)
+    /// to assert post-event package deltas without re-implementing the union locally;
+    /// the production consumer destructures the event directly so it does not call
+    /// this from within the lib crate.
+    #[allow(dead_code)]
     pub fn affected_packages(&self) -> HashSet<String> {
         match self {
             LibpathEvent::Changed {
