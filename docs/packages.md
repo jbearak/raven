@@ -120,7 +120,7 @@ Raven caches each package's exports in memory for the duration of the LSP sessio
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on change. |
-| `packages.watchDebounceMs` | `300` | Coalesce rapid filesystem events into a single invalidation pass. |
+| `packages.watchDebounceMs` | `500` | Coalesce rapid filesystem events into a single invalidation pass. |
 
 On Linux, recursive watching attaches one inotify watch per descendant directory (not per file). A typical R package has ~10–20 subdirectories; 500 installed packages is ~5–10k watches. If you work with very large CRAN snapshots on an older distro capped at the legacy default of 8192, raise the limit:
 

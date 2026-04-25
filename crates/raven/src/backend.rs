@@ -2322,9 +2322,6 @@ impl LanguageServer for Backend {
             old_diagnostics_enabled,
             new_diagnostics_enabled,
             packages_enabled,
-            packages_r_path,
-            additional_paths,
-            workspace_root,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
         ) = {
@@ -2375,23 +2372,6 @@ impl LanguageServer for Backend {
                 .as_ref()
                 .map(|c| c.packages_enabled)
                 .unwrap_or(state.cross_file_config.packages_enabled);
-            let packages_r_path = new_config
-                .as_ref()
-                .and_then(|c| c.packages_r_path.clone())
-                .or_else(|| state.cross_file_config.packages_r_path.clone());
-            let additional_paths = new_config
-                .as_ref()
-                .map(|c| c.packages_additional_library_paths.clone())
-                .unwrap_or_else(|| {
-                    state
-                        .cross_file_config
-                        .packages_additional_library_paths
-                        .clone()
-                });
-            let workspace_root = state
-                .workspace_folders
-                .first()
-                .and_then(|url| url.to_file_path().ok());
 
             // Apply new config if parsed
             if let Some(config) = new_config {
@@ -2450,9 +2430,6 @@ impl LanguageServer for Backend {
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
                 packages_enabled,
-                packages_r_path,
-                additional_paths,
-                workspace_root,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
             )
@@ -2536,21 +2513,7 @@ impl LanguageServer for Backend {
             log::info!("Package settings changed, reinitializing PackageLibrary");
 
             let (new_package_library, package_library_ready) = if packages_enabled {
-                let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-                let r_subprocess = match (r_subprocess, workspace_root) {
-                    (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-                    (sub, _) => sub,
-                };
-                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-                let ready = match lib.initialize().await {
-                    Ok(()) => !lib.lib_paths().is_empty(),
-                    Err(e) => {
-                        log::warn!("Failed to reinitialize PackageLibrary: {}", e);
-                        false
-                    }
-                };
-                lib.add_library_paths(&additional_paths);
-                (std::sync::Arc::new(lib), ready)
+                rebuild_package_library(&self.state).await
             } else {
                 (
                     std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
@@ -4187,20 +4150,53 @@ async fn run_libpath_consumer(
                 // the next diagnostic pass sees a warmed cache; otherwise a
                 // raced prefetch can land just after diagnostics compute and
                 // leave the user looking at stale results.
-                if !added.is_empty() {
-                    let added_vec: Vec<String> = added.iter().cloned().collect();
-                    pkg_lib.prefetch_packages(&added_vec).await;
+                let non_removed_trigger_set: std::collections::HashSet<String> = touched
+                    .iter()
+                    .chain(added.iter())
+                    .filter(|name| !removed.contains(*name))
+                    .cloned()
+                    .collect();
+                if !non_removed_trigger_set.is_empty() {
+                    let prefetch_vec: Vec<String> = non_removed_trigger_set.into_iter().collect();
+                    pkg_lib.prefetch_packages(&prefetch_vec).await;
                 }
 
-                // Collect URIs whose loaded_packages intersect `trigger_set`.
+                // Collect URIs whose effective package scope intersects `trigger_set`.
                 let affected_uris: Vec<Url> = {
                     let state = state_arc.read().await;
+                    let content_provider = state.content_provider();
+                    let get_artifacts = |target_uri: &Url| -> Option<
+                        std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
+                    > { content_provider.get_artifacts(target_uri) };
+                    let get_metadata =
+                        |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                            content_provider.get_metadata(target_uri)
+                        };
+                    let empty_base_exports = std::collections::HashSet::new();
                     state
                         .documents
                         .iter()
                         .filter_map(|(uri, doc)| {
-                            let hit =
-                                doc.loaded_packages.iter().any(|p| trigger_set.contains(p));
+                            let line = doc.text().lines().count().saturating_sub(1) as u32;
+                            let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                                uri,
+                                line,
+                                u32::MAX,
+                                &get_artifacts,
+                                &get_metadata,
+                                &state.cross_file_graph,
+                                state.workspace_folders.first(),
+                                state.cross_file_config.max_chain_depth,
+                                &empty_base_exports,
+                                false,
+                                state.cross_file_config.backward_dependencies,
+                                &|| false,
+                            );
+                            let hit = scope
+                                .inherited_packages
+                                .iter()
+                                .chain(scope.loaded_packages.iter())
+                                .any(|p| trigger_set.contains(p));
                             if hit { Some(uri.clone()) } else { None }
                         })
                         .collect()

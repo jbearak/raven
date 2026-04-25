@@ -508,8 +508,10 @@ impl PackageLibrary {
 
     /// Clear all cached packages, including aggregated `combined_exports` entries.
     pub async fn clear_cache(&self) {
-        let mut cache = self.packages.write().await;
-        cache.clear();
+        {
+            let mut cache = self.packages.write().await;
+            cache.clear();
+        }
         let mut combined = self.combined_exports.write().await;
         combined.clear();
     }
@@ -3422,6 +3424,18 @@ mod tests {
         use std::collections::HashSet;
 
         let lib = PackageLibrary::new_empty();
+        // Seed packages cache too so invalidate_many can discover dependent
+        // combined keys from cached PackageInfo.attached_packages.
+        let tidyverse_info = PackageInfo::with_details(
+            "tidyverse".into(),
+            HashSet::new(),
+            vec![],
+            vec![],
+        );
+        {
+            let mut packages = lib.packages.write().await;
+            packages.insert("tidyverse".into(), std::sync::Arc::new(tidyverse_info));
+        }
         // Seed combined_exports as though tidyverse had been loaded.
         {
             let mut combined = lib.combined_exports.write().await;
