@@ -130,7 +130,7 @@ sudo sysctl -w fs.inotify.max_user_watches=524288
 
 ### Manual refresh: `raven.refreshPackages`
 
-If you change `.libPaths()` inside an active R session (e.g. `renv::activate()` switches to a different project, `.Rprofile` sets `R_LIBS_USER`, or `install.packages` succeeds but events are dropped by a transient FS issue), run the **Raven: Refresh Packages** command from the editor's command palette. It:
+If you change `.libPaths()` inside an active R session (e.g. `renv::activate()` switches to a different project, `.Rprofile` sets `R_LIBS_USER`, or `install.packages` succeeds but events are dropped by a transient FS issue), run the **Raven: Refresh package cache** command from the editor's command palette. It:
 
 1. Re-runs `.libPaths()` to discover the current library roots.
 2. Rebuilds Raven's package library over those roots.

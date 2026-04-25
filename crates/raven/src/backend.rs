@@ -3985,14 +3985,11 @@ pub(crate) async fn rebuild_package_library(
     .unwrap_or(None);
 
     let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-    let ready = match lib.initialize().await {
-        Ok(()) => !lib.lib_paths().is_empty(),
-        Err(e) => {
+    if let Err(e) = lib.initialize().await {
             log::warn!("rebuild_package_library: initialize failed: {e}");
-            false
-        }
-    };
+    }
     lib.add_library_paths(&additional_paths);
+    let ready = !lib.lib_paths().is_empty();
     (Arc::new(lib), ready)
 }
 
@@ -4153,6 +4150,7 @@ async fn run_libpath_consumer(
                 let non_removed_trigger_set: std::collections::HashSet<String> = touched
                     .iter()
                     .chain(added.iter())
+                    .chain(invalidated_combined.iter())
                     .filter(|name| !removed.contains(*name))
                     .cloned()
                     .collect();
