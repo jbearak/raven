@@ -434,9 +434,10 @@ impl PackageLibrary {
     /// - direct key matches (invalidating `dplyr` drops combined entry for `dplyr`),
     /// - hardcoded meta-packages (`tidyverse`, `tidymodels`) whose `attached_packages`
     ///   intersect `names` (invalidating `dplyr` drops the cached `tidyverse` aggregate),
-    /// - any package `A` whose `PackageInfo.depends` or `attached_packages` include
-    ///   any name in `names` (invalidating `B` drops combined entry for `A` when `A`
-    ///   Depends: B), since the aggregate rolled up a now-stale child.
+    /// - any package `A` whose transitive `depends`/`attached_packages` chain
+    ///   reaches any name in `names` (invalidating `C` drops combined entry for
+    ///   `A` when `A` Depends: `B` Depends: `C`), since the aggregate rolled up
+    ///   a now-stale transitive child.
     ///
     /// Returns the set of `combined_exports` keys that were actually present and
     /// dropped. Callers use this to identify documents whose loaded packages
@@ -447,18 +448,32 @@ impl PackageLibrary {
         if names.is_empty() {
             return HashSet::new();
         }
-        // Compute dependents from the per-package cache BEFORE mutating it so the
-        // dependent lookup sees the previous `depends`/`attached_packages` graph.
+        // Compute transitive dependents from the per-package cache BEFORE
+        // mutating it so the dependent lookup sees the previous
+        // `depends`/`attached_packages` graph.
         let dependent_combined_keys: HashSet<String> = {
             let cache = self.packages.read().await;
-            cache
-                .iter()
-                .filter(|(_, info)| {
-                    info.depends.iter().any(|dep| names.contains(dep))
-                        || info.attached_packages.iter().any(|dep| names.contains(dep))
-                })
-                .map(|(k, _)| k.clone())
-                .collect()
+            // Worklist: start with the directly invalidated names, then
+            // transitively find every cached package that depends on them.
+            let mut frontier: HashSet<String> = names.clone();
+            let mut dependents: HashSet<String> = HashSet::new();
+            loop {
+                let new_dependents: HashSet<String> = cache
+                    .iter()
+                    .filter(|(k, _)| !frontier.contains(k.as_str()) && !dependents.contains(k.as_str()))
+                    .filter(|(_, info)| {
+                        info.depends.iter().any(|dep| frontier.contains(dep))
+                            || info.attached_packages.iter().any(|dep| frontier.contains(dep))
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                if new_dependents.is_empty() {
+                    break;
+                }
+                frontier = new_dependents.clone();
+                dependents.extend(new_dependents);
+            }
+            dependents
         };
         {
             let mut cache = self.packages.write().await;

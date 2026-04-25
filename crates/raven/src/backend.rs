@@ -4135,10 +4135,12 @@ pub(crate) fn restart_libpath_watcher<'a>(
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::libpath_watcher::LibpathEvent>(64);
-        let Some(handle) = crate::libpath_watcher::spawn_watcher(lib_paths, debounce, tx) else {
-            return false;
-        };
 
+        // Spawn the consumer BEFORE the watcher so that if spawn_watcher
+        // sends LibpathEvent::Dropped (all watches failed) and returns None,
+        // the consumer is already listening and will run the recovery/cleanup
+        // path. When spawn_watcher returns None the tx is dropped, so the
+        // consumer will process the Dropped event then exit naturally.
         let state_for_consumer = Arc::clone(state_arc);
         let client_for_consumer = client.clone();
         tokio::spawn(run_libpath_consumer(
@@ -4147,6 +4149,10 @@ pub(crate) fn restart_libpath_watcher<'a>(
             rx,
             allow_recovery,
         ));
+
+        let Some(handle) = crate::libpath_watcher::spawn_watcher(lib_paths, debounce, tx) else {
+            return false;
+        };
 
         {
             let mut state = state_arc.write().await;
