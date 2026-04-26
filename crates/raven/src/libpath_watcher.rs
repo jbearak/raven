@@ -79,12 +79,12 @@ use std::path::{Path, PathBuf};
 /// "winning root" changes between snapshots, consumers must invalidate that
 /// package's cached exports even though the name is still present.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct LibpathSnapshot {
+pub struct LibpathSnapshot {
     entries: Vec<(PathBuf, HashSet<String>)>,
 }
 
 impl LibpathSnapshot {
-    pub(crate) fn capture(paths: &[PathBuf]) -> Self {
+    pub fn capture(paths: &[PathBuf]) -> Self {
         let entries = paths
             .iter()
             .map(|root| (root.clone(), read_package_dir(root)))
@@ -417,10 +417,15 @@ pub fn spawn_watcher(
         return None;
     }
 
-    let raw_rx = Arc::new(StdMutex::new(raw_rx));
-    let snapshot = Arc::new(tokio::sync::Mutex::new(LibpathSnapshot::capture(&attached)));
+    // Capture the initial snapshot synchronously before returning so that any
+    // filesystem events queued between watcher registration and task startup
+    // are correctly detected as deltas instead of being absorbed into a
+    // later-taken baseline.
+    let initial_snap = LibpathSnapshot::capture(&attached);
 
+    let raw_rx = Arc::new(StdMutex::new(raw_rx));
     let task = tokio::spawn(async move {
+        let snapshot = Arc::new(tokio::sync::Mutex::new(initial_snap));
         debounce_loop(raw_rx, snapshot, attached, debounce, tx).await;
     });
 
@@ -483,7 +488,19 @@ async fn debounce_loop(
                 event_paths.extend(drained_paths);
 
                 // Diff and derive touched under a single snapshot-lock acquisition.
-                let next_snap = LibpathSnapshot::capture(&paths);
+                let paths_for_capture = paths.clone();
+                let next_snap = match tokio::task::spawn_blocking(move || {
+                    LibpathSnapshot::capture(&paths_for_capture)
+                })
+                .await
+                {
+                    Ok(snap) => snap,
+                    Err(e) => {
+                        log::warn!("LibpathWatcher: capture task failed: {e}");
+                        let _ = tx.send(LibpathEvent::Dropped).await;
+                        return;
+                    }
+                };
                 let (added, removed, touched) = {
                     let mut snap_guard = snapshot.lock().await;
                     let (added, removed, moved) = snap_guard.diff(&next_snap);

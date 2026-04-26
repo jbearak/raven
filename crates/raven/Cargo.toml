@@ -62,3 +62,8 @@ required-features = ["test-support"]
 name = "cross_file"
 harness = false
 required-features = ["test-support"]
+
+[[bench]]
+name = "libpath_capture"
+harness = false
+required-features = ["test-support"]
