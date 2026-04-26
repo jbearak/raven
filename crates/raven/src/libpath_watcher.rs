@@ -471,7 +471,7 @@ async fn debounce_loop(
                 };
                 tokio::time::sleep(debounce).await;
                 let rx_arc = Arc::clone(&raw_rx);
-                let drained_paths: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
+                let drained_paths: Vec<PathBuf> = match tokio::task::spawn_blocking(move || {
                     let mut paths = Vec::new();
                     let guard = rx_arc.lock().unwrap();
                     while let Ok(res) = guard.try_recv() {
@@ -485,7 +485,13 @@ async fn debounce_loop(
                     paths
                 })
                 .await
-                .unwrap_or_default();
+                {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        log::warn!("LibpathWatcher: drain task failed: {e}");
+                        Vec::new()
+                    }
+                };
                 event_paths.extend(drained_paths);
 
                 // Diff and derive touched under a single snapshot-lock acquisition.
