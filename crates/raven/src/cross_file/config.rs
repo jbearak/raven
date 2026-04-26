@@ -32,7 +32,7 @@ pub enum CallSiteDefault {
 }
 
 /// Cross-file awareness configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CrossFileConfig {
     /// Master switch for all diagnostics
     /// When false, all diagnostics are suppressed regardless of individual severity settings
@@ -80,6 +80,13 @@ pub struct CrossFileConfig {
     pub packages_r_path: Option<PathBuf>,
     /// Severity for missing package diagnostics (None = disabled)
     pub packages_missing_package_severity: Option<DiagnosticSeverity>,
+    /// Watch R library paths (`.libPaths()`) for package install/remove events.
+    /// When true, Raven attaches a filesystem watcher and refreshes package
+    /// diagnostics automatically.
+    pub packages_watch_library_paths: bool,
+    /// Debounce window for libpath watcher events, in milliseconds.
+    /// Clamped to `[100, 5000]` by the parser.
+    pub packages_watch_debounce_ms: u64,
     /// Severity for redundant directive diagnostics (when @lsp-source without line= targets
     /// same file as earlier source() call)
     /// _Requirements: 6.2_
@@ -149,6 +156,8 @@ impl Default for CrossFileConfig {
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
             packages_missing_package_severity: Some(DiagnosticSeverity::WARNING),
+            packages_watch_library_paths: true,
+            packages_watch_debounce_ms: 500,
             redundant_directive_severity: Some(DiagnosticSeverity::HINT),
             cache_metadata_max_entries: 1000,
             cache_file_content_max_entries: 500,
@@ -211,6 +220,11 @@ mod tests {
         assert!(config.hoist_globals_in_functions);
         // Backward dependencies default
         assert_eq!(config.backward_dependencies, BackwardDependencyMode::Auto);
+        // Libpath watcher defaults — keep in sync with parse_cross_file_config
+        // (which clamps debounce to [100, 5000]) and the VS Code extension's
+        // initializationOptions.
+        assert!(config.packages_watch_library_paths);
+        assert_eq!(config.packages_watch_debounce_ms, 500);
     }
 
     #[test]

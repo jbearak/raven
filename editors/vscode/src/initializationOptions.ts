@@ -69,6 +69,8 @@ export interface RavenInitializationOptions {
         additionalLibraryPaths?: string[];
         rPath?: string;
         missingPackageSeverity?: SeverityLevel;
+        watchLibraryPaths?: boolean;
+        watchDebounceMs?: number;
     };
     symbols?: {
         workspaceMaxResults?: number;
@@ -262,12 +264,16 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     const additionalLibraryPaths = getExplicitSetting<string[]>(config, 'packages.additionalLibraryPaths');
     const rPath = getExplicitSetting<string>(config, 'packages.rPath');
     const missingPackageSeverity = getExplicitSetting<SeverityLevel>(config, 'packages.missingPackageSeverity');
+    const watchLibraryPaths = getExplicitSetting<boolean>(config, 'packages.watchLibraryPaths');
+    const watchDebounceMs = getExplicitSetting<number>(config, 'packages.watchDebounceMs');
 
     if (
         packagesEnabled !== undefined ||
         additionalLibraryPaths !== undefined ||
         rPath !== undefined ||
-        missingPackageSeverity !== undefined
+        missingPackageSeverity !== undefined ||
+        watchLibraryPaths !== undefined ||
+        watchDebounceMs !== undefined
     ) {
         options.packages = {};
         if (packagesEnabled !== undefined) {
@@ -281,6 +287,12 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         }
         if (missingPackageSeverity !== undefined) {
             options.packages.missingPackageSeverity = missingPackageSeverity;
+        }
+        if (watchLibraryPaths !== undefined) {
+            options.packages.watchLibraryPaths = watchLibraryPaths;
+        }
+        if (watchDebounceMs !== undefined) {
+            options.packages.watchDebounceMs = watchDebounceMs;
         }
     }
 

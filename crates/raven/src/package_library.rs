@@ -59,6 +59,16 @@ pub const TIDYMODELS_PACKAGES: &[&str] = &[
     "yardstick",
 ];
 
+/// Return the set of child packages attached by a meta-package name.
+/// Empty for non-meta packages.
+fn meta_attached_packages(name: &str) -> &'static [&'static str] {
+    match name {
+        "tidyverse" => TIDYVERSE_PACKAGES,
+        "tidymodels" => TIDYMODELS_PACKAGES,
+        _ => &[],
+    }
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -418,10 +428,107 @@ impl PackageLibrary {
         cache.remove(name);
     }
 
-    /// Clear all cached packages
+    /// Invalidate a batch of packages, also dropping any `combined_exports`
+    /// entries whose aggregate export set depends on `names` — including:
+    ///
+    /// - direct key matches (invalidating `dplyr` drops combined entry for `dplyr`),
+    /// - hardcoded meta-packages (`tidyverse`, `tidymodels`) whose `attached_packages`
+    ///   intersect `names` (invalidating `dplyr` drops the cached `tidyverse` aggregate),
+    /// - any package `A` whose transitive `depends`/`attached_packages` chain
+    ///   reaches any name in `names` (invalidating `C` drops combined entry for
+    ///   `A` when `A` Depends: `B` Depends: `C`), since the aggregate rolled up
+    ///   a now-stale transitive child.
+    ///
+    /// Returns the set of `combined_exports` keys that were actually present and
+    /// dropped. Callers use this to identify documents whose loaded packages
+    /// include meta-aggregates that were invalidated even though the aggregate
+    /// name itself is not in `names` (e.g. a document using `library(tidyverse)`
+    /// when `dplyr` is installed).
+    pub async fn invalidate_many(&self, names: &HashSet<String>) -> HashSet<String> {
+        if names.is_empty() {
+            return HashSet::new();
+        }
+        // Compute transitive dependents from the per-package cache BEFORE
+        // mutating it so the dependent lookup sees the previous
+        // `depends`/`attached_packages` graph.
+        let dependent_combined_keys: HashSet<String> = {
+            let cache = self.packages.read().await;
+            // Worklist: start with the directly invalidated names, then
+            // transitively find every cached package that depends on them.
+            let mut frontier: HashSet<String> = names.clone();
+            let mut dependents: HashSet<String> = HashSet::new();
+            loop {
+                let new_dependents: HashSet<String> = cache
+                    .iter()
+                    .filter(|(k, _)| !frontier.contains(k.as_str()) && !dependents.contains(k.as_str()))
+                    .filter(|(_, info)| {
+                        info.depends.iter().any(|dep| frontier.contains(dep))
+                            || info.attached_packages.iter().any(|dep| frontier.contains(dep))
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                if new_dependents.is_empty() {
+                    break;
+                }
+                frontier = new_dependents.clone();
+                dependents.extend(new_dependents);
+            }
+            dependents
+        };
+        {
+            let mut cache = self.packages.write().await;
+            for n in names {
+                cache.remove(n);
+            }
+        }
+        let mut invalidated_combined: HashSet<String> = HashSet::new();
+        {
+            let mut combined = self.combined_exports.write().await;
+            // Drop direct hits; record only the ones that were actually present.
+            for n in names {
+                if combined.remove(n).is_some() {
+                    invalidated_combined.insert(n.clone());
+                }
+            }
+            // Drop entries for packages whose runtime Depends/attached set intersects `names`.
+            for k in &dependent_combined_keys {
+                if combined.remove(k).is_some() {
+                    invalidated_combined.insert(k.clone());
+                }
+            }
+            // Drop hardcoded meta-package aggregates whose attached set intersects `names`
+            // (covers the case where the aggregate was cached but the child PackageInfo
+            // was never loaded, so `dependent_combined_keys` above would miss it).
+            let meta_hits: Vec<String> = combined
+                .keys()
+                .filter(|k| {
+                    let attached = meta_attached_packages(k.as_str());
+                    attached.iter().any(|p| names.contains(*p))
+                })
+                .cloned()
+                .collect();
+            for m in meta_hits {
+                combined.remove(&m);
+                invalidated_combined.insert(m);
+            }
+        }
+        invalidated_combined
+    }
+
+    /// Snapshot of the keys currently in the per-package cache.
+    pub async fn cached_package_names(&self) -> HashSet<String> {
+        let cache = self.packages.read().await;
+        cache.keys().cloned().collect()
+    }
+
+    /// Clear all cached packages, including aggregated `combined_exports` entries.
     pub async fn clear_cache(&self) {
-        let mut cache = self.packages.write().await;
-        cache.clear();
+        {
+            let mut cache = self.packages.write().await;
+            cache.clear();
+        }
+        let mut combined = self.combined_exports.write().await;
+        combined.clear();
     }
 
     /// Prefetch packages by loading their exports into cache
@@ -1478,12 +1585,22 @@ mod tests {
             .await;
         lib.insert_package(PackageInfo::new("pkg2".to_string(), HashSet::new()))
             .await;
+        // Seed a combined_exports entry to verify it is also cleared.
+        {
+            let mut combined = lib.combined_exports.write().await;
+            combined.insert(
+                "pkg1".into(),
+                std::sync::Arc::new(["foo".to_string()].into_iter().collect()),
+            );
+        }
 
         assert_eq!(lib.cached_count().await, 2);
+        assert!(lib.combined_exports.read().await.contains_key("pkg1"));
 
         lib.clear_cache().await;
 
         assert_eq!(lib.cached_count().await, 0);
+        assert!(lib.combined_exports.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -3292,5 +3409,159 @@ mod tests {
         // The method should work even without async runtime
         let result = lib.get_exports_for_completions(&[]);
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_removes_all_listed_packages() {
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("dplyr".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("ggplot2".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("readr".into(), HashSet::new()))
+            .await;
+        assert_eq!(lib.cached_count().await, 3);
+
+        let to_invalidate: HashSet<String> =
+            ["dplyr".into(), "readr".into()].into_iter().collect();
+        lib.invalidate_many(&to_invalidate).await;
+
+        assert_eq!(lib.cached_count().await, 1);
+        assert!(lib.is_cached("ggplot2").await);
+        assert!(!lib.is_cached("dplyr").await);
+        assert!(!lib.is_cached("readr").await);
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_clears_combined_exports_for_meta_packages() {
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        // Seed packages cache too so invalidate_many can discover dependent
+        // combined keys from cached PackageInfo.attached_packages.
+        let tidyverse_info = PackageInfo::with_details(
+            "tidyverse".into(),
+            HashSet::new(),
+            vec![],
+            vec![],
+        );
+        {
+            let mut packages = lib.packages.write().await;
+            packages.insert("tidyverse".into(), std::sync::Arc::new(tidyverse_info));
+        }
+        // Seed combined_exports as though tidyverse had been loaded.
+        {
+            let mut combined = lib.combined_exports.write().await;
+            combined.insert(
+                "tidyverse".into(),
+                std::sync::Arc::new(
+                    ["mutate".to_string(), "ggplot".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+            );
+            combined.insert(
+                "dplyr".into(),
+                std::sync::Arc::new(["mutate".to_string()].into_iter().collect()),
+            );
+        }
+
+        // Invalidate a child (dplyr) — the meta-package combined entry must be dropped too.
+        let set: HashSet<String> = ["dplyr".to_string()].into_iter().collect();
+        let invalidated = lib.invalidate_many(&set).await;
+
+        let combined = lib.combined_exports.read().await;
+        assert!(!combined.contains_key("tidyverse"));
+        assert!(!combined.contains_key("dplyr"));
+
+        // Returned set surfaces which combined_exports keys were actually
+        // dropped so callers can revalidate documents that loaded tidyverse
+        // (not dplyr) directly.
+        assert!(invalidated.contains("tidyverse"));
+        assert!(invalidated.contains("dplyr"));
+
+        // invalidate_many must drop combined_exports entries but preserve the
+        // per-package PackageInfo cache: the meta-package itself still exists
+        // on disk, so its individual entry should remain available for
+        // subsequent re-aggregation.
+        drop(combined);
+        let packages = lib.packages.read().await;
+        assert!(
+            packages.contains_key("tidyverse"),
+            "PackageInfo for tidyverse must survive invalidate_many"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_returns_empty_for_names_not_in_combined_exports() {
+        use std::collections::HashSet;
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("uncached_meta_child".into(), HashSet::new()))
+            .await;
+
+        // combined_exports is empty for this package name — invalidate_many
+        // must not claim it was dropped.
+        let set: HashSet<String> = ["uncached_meta_child".to_string()].into_iter().collect();
+        let invalidated = lib.invalidate_many(&set).await;
+        assert!(invalidated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidate_many_clears_combined_exports_for_transitive_depends() {
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        // Package `A` Depends on `B`. Its PackageInfo is cached, and its
+        // combined_exports aggregate has been built.
+        let a_info = PackageInfo::with_details(
+            "A".into(),
+            ["a_fn".to_string()].into_iter().collect(),
+            vec!["B".to_string()],
+            vec![],
+        );
+        lib.insert_package(a_info).await;
+        {
+            let mut combined = lib.combined_exports.write().await;
+            combined.insert(
+                "A".into(),
+                std::sync::Arc::new(
+                    ["a_fn".to_string(), "b_fn".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+            );
+        }
+
+        // Invalidate B — A's combined aggregate rolled up B's exports, so it
+        // must be dropped even though B is not a direct hit and A is not a
+        // hardcoded meta-package.
+        let set: HashSet<String> = ["B".to_string()].into_iter().collect();
+        let invalidated = lib.invalidate_many(&set).await;
+
+        let combined = lib.combined_exports.read().await;
+        assert!(
+            !combined.contains_key("A"),
+            "A's combined_exports aggregate should be cleared when its dependency B is invalidated"
+        );
+        // Returned set surfaces A so consumers know documents using A need revalidation.
+        assert!(invalidated.contains("A"));
+    }
+
+    #[tokio::test]
+    async fn cached_package_names_returns_current_keys() {
+        use std::collections::HashSet;
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("a".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("b".into(), HashSet::new()))
+            .await;
+
+        let names = lib.cached_package_names().await;
+        assert_eq!(
+            names,
+            ["a".to_string(), "b".to_string()].into_iter().collect()
+        );
     }
 }

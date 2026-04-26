@@ -26,6 +26,10 @@
       {
         "command": "raven.restart",
         "title": "Raven: Restart Language Server"
+      },
+      {
+        "command": "raven.refreshPackages",
+        "title": "Raven: Refresh package cache"
       }
     ],
     "languages": [
@@ -382,6 +386,18 @@
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when a package referenced in library() cannot be found. Controls how missing package references are reported in the editor."
+        },
+        "raven.packages.watchLibraryPaths": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch R library paths for package install/remove events and refresh diagnostics automatically. Disable if you see excessive filesystem activity or inotify watch-limit errors on Linux."
+        },
+        "raven.packages.watchDebounceMs": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 100,
+          "maximum": 5000,
+          "description": "Debounce window for batching library path filesystem events, in milliseconds. Larger values reduce redundant work during bulk installs (e.g. renv::restore); smaller values respond faster."
         },
         "raven.symbols.workspaceMaxResults": {
           "type": "number",

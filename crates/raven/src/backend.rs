@@ -77,7 +77,8 @@ struct ActiveDocumentsChangedParams {
 /// Supported top-level keys read:
 /// - `crossFile`: core cross-file behavior and diagnostic severities.
 /// - `diagnostics.enabled` and `diagnostics.undefinedVariables`: diagnostics master switch and undefined variable diagnostics.
-/// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`, `missingPackageSeverity`).
+/// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`,
+///   `missingPackageSeverity`, `watchLibraryPaths`, `watchDebounceMs`).
 ///
 /// # Returns
 ///
@@ -325,6 +326,18 @@ pub(crate) fn parse_cross_file_config(
             .and_then(|v| v.as_str())
         {
             config.packages_missing_package_severity = parse_severity(sev);
+        }
+        if let Some(v) = packages
+            .get("watchLibraryPaths")
+            .and_then(|v| v.as_bool())
+        {
+            config.packages_watch_library_paths = v;
+        }
+        if let Some(v) = packages
+            .get("watchDebounceMs")
+            .and_then(|v| v.as_u64())
+        {
+            config.packages_watch_debounce_ms = v.clamp(100, 5000);
         }
     }
 
@@ -884,6 +897,12 @@ impl LanguageServer for Backend {
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
                 ),
+                execute_command_provider: Some(
+                    tower_lsp::lsp_types::ExecuteCommandOptions {
+                        commands: vec!["raven.refreshPackages".to_string()],
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1082,6 +1101,16 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Start the libpath watcher if enabled and we have a real package
+        // library. `lib_paths` is captured here as a one-time snapshot — if the
+        // user later changes `.libPaths()` mid-session (e.g. `renv` switches
+        // projects, `.Rprofile` is edited, or `.libPaths(new=...)` is called),
+        // the watcher keeps watching the originally-captured directories. The
+        // documented workaround is the `raven.refreshPackages` command, which
+        // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
+        // watcher over the newly-discovered paths. See `docs/packages.md`.
+        restart_libpath_watcher(&self.state, &self.client, true).await;
+
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
@@ -1095,6 +1124,167 @@ impl LanguageServer for Backend {
     async fn shutdown(&self) -> Result<()> {
         log::info!("ark-lsp shutting down");
         Ok(())
+    }
+
+    async fn execute_command(
+        &self,
+        params: tower_lsp::lsp_types::ExecuteCommandParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
+        match params.command.as_str() {
+            "raven.refreshPackages" => {
+                // Collect open URIs for force-republish (needed before rebuild).
+                let open_uris: Vec<tower_lsp::lsp_types::Url> = {
+                    let state = self.state.read().await;
+                    state.documents.keys().cloned().collect()
+                };
+
+                // Capture the cache size of the *current* library before any
+                // rebuild/refresh so the user-visible "cleared N entries"
+                // count is meaningful even when `packages_enabled` triggers a
+                // full library rebuild. After a rebuild, `pkg_lib` points at a
+                // fresh empty library, so `refresh_packages_command_body`'s
+                // own `before` would always be 0 and its return value would
+                // under-report — even after evicting hundreds of stale
+                // entries. We compute the user-visible delta against the
+                // pre-rebuild count instead.
+                let before_count =
+                    self.state.read().await.package_library.cached_count().await;
+
+                // Rebuild the PackageLibrary first — this re-runs `.libPaths()`
+                // so mid-session libpath changes (renv switched projects,
+                // `.Rprofile` edited, `.libPaths(new, ...)` called) are picked
+                // up. `clear_cache` alone would leave the stale libpath
+                // snapshot in place and the refresh would re-populate with the
+                // same wrong paths.
+                let packages_enabled = {
+                    self.state.read().await.cross_file_config.packages_enabled
+                };
+                if packages_enabled {
+                    let (new_lib, ready) = rebuild_package_library(&self.state).await;
+                    let mut state = self.state.write().await;
+                    state.package_library = new_lib;
+                    state.package_library_ready = ready;
+                }
+
+                // Restart the watcher over the freshly-discovered libpaths so
+                // subsequent installs in the new libpaths are observed. A
+                // no-op if watching is disabled or the library is not ready.
+                restart_libpath_watcher(&self.state, &self.client, true).await;
+
+                // Collect effective packages for warm prefetch AFTER rebuild
+                // so scope resolution uses the fresh state. Includes both
+                // direct loads (including function-local) and inherited
+                // packages from parent source() chains.
+                //
+                // Snapshot inputs under the read lock, then release it before
+                // running per-document scope resolution (AGENTS.md: "Diagnostic
+                // computation must not hold the RwLock read lock during
+                // expensive scope resolution").
+                let loaded_packages = {
+                    let (
+                        doc_packages,
+                        docs,
+                        artifacts_map,
+                        metadata_map,
+                        graph,
+                        workspace_folder,
+                        max_chain_depth,
+                        backward_deps,
+                    ) = {
+                        let state = self.state.read().await;
+                        let mut doc_pkgs = std::collections::HashSet::new();
+                        let mut docs = Vec::new();
+                        for (uri, doc) in &state.documents {
+                            for p in &doc.loaded_packages {
+                                doc_pkgs.insert(p.clone());
+                            }
+                            let line = doc.text().lines().count().saturating_sub(1) as u32;
+                            docs.push((uri.clone(), line));
+                        }
+                        let content_provider = state.content_provider();
+                        let mut a_map = std::collections::HashMap::new();
+                        let mut m_map = std::collections::HashMap::new();
+                        for (uri, _) in &docs {
+                            if let Some(a) = content_provider.get_artifacts(uri) {
+                                a_map.insert(uri.clone(), a);
+                            }
+                            if let Some(m) = content_provider.get_metadata(uri) {
+                                m_map.insert(uri.clone(), m);
+                            }
+                        }
+                        (
+                            doc_pkgs,
+                            docs,
+                            a_map,
+                            m_map,
+                            state.cross_file_graph.clone(),
+                            state.workspace_folders.first().cloned(),
+                            state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.backward_dependencies,
+                        )
+                    }; // read lock released
+
+                    let mut all_pkgs = doc_packages;
+                    let empty_base_exports = std::collections::HashSet::new();
+                    let get_artifacts = |target_uri: &Url| artifacts_map.get(target_uri).cloned();
+                    let get_metadata = |target_uri: &Url| metadata_map.get(target_uri).cloned();
+                    for (uri, line) in &docs {
+                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                            uri,
+                            *line,
+                            u32::MAX,
+                            &get_artifacts,
+                            &get_metadata,
+                            &graph,
+                            workspace_folder.as_ref(),
+                            max_chain_depth,
+                            &empty_base_exports,
+                            false,
+                            backward_deps,
+                            &|| false,
+                        );
+                        for p in scope.inherited_packages {
+                            all_pkgs.insert(p);
+                        }
+                    }
+                    all_pkgs.into_iter().collect::<Vec<_>>()
+                };
+
+                let pkg_lib = self.state.read().await.package_library.clone();
+                // Run the standard refresh body so `loaded_packages` is
+                // prefetched and the per-library `clear_cache` no-ops on the
+                // already-empty rebuilt library. Discard its return value: it
+                // is computed against the post-rebuild library and so is 0
+                // after a rebuild regardless of what was evicted.
+                let _ = refresh_packages_command_body(&pkg_lib, &loaded_packages).await;
+                let after_count = pkg_lib.cached_count().await;
+                let cleared = before_count.saturating_sub(after_count);
+                log::info!("raven.refreshPackages: cleared {cleared} cache entries");
+
+                // Force-republish diagnostics for all open documents.
+                {
+                    let state = self.state.read().await;
+                    for uri in &open_uris {
+                        state.diagnostics_gate.mark_force_republish(uri);
+                    }
+                }
+                // Route through the same debounced pipeline the watcher consumer
+                // uses, so refresh runs in parallel (not serial) and cooperates
+                // with revalidation cancellation/freshness gates.
+                for uri in open_uris {
+                    let state_arc = Arc::clone(&self.state);
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        Backend::publish_diagnostics_via_arc(state_arc, client, &uri).await;
+                    });
+                }
+                Ok(Some(serde_json::json!({ "cleared": cleared })))
+            }
+            other => {
+                log::warn!("execute_command: unknown command '{other}'");
+                Ok(None)
+            }
+        }
     }
 
     /// Handle textDocument/didOpen notification.
@@ -2214,13 +2404,12 @@ impl LanguageServer for Backend {
             open_uris,
             scope_changed,
             package_settings_changed,
+            watch_settings_changed,
+            only_watch_changed,
             diagnostics_enabled_changed,
             old_diagnostics_enabled,
             new_diagnostics_enabled,
             packages_enabled,
-            packages_r_path,
-            additional_paths,
-            workspace_root,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
         ) = {
@@ -2240,7 +2429,8 @@ impl LanguageServer for Backend {
                 .unwrap_or(old_diagnostics_enabled);
             let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
 
-            // Check if package settings changed
+            // Settings that require reinitializing `PackageLibrary` via an R
+            // subprocess call (~100ms). Keep this narrow.
             let package_settings_changed = new_config
                 .as_ref()
                 .map(|c| {
@@ -2251,28 +2441,46 @@ impl LanguageServer for Backend {
                 })
                 .unwrap_or(false);
 
+            // Watcher-only settings. Changing just these should restart the
+            // filesystem watcher but MUST NOT trigger an R subprocess roundtrip
+            // or wipe the package cache — toggling a debounce slider in the
+            // Settings UI should not force every open document to revalidate.
+            let watch_settings_changed = new_config
+                .as_ref()
+                .map(|c| {
+                    c.packages_watch_library_paths
+                        != state.cross_file_config.packages_watch_library_paths
+                        || c.packages_watch_debounce_ms
+                            != state.cross_file_config.packages_watch_debounce_ms
+                })
+                .unwrap_or(false);
+
+            // If `watch_settings_changed` is the only thing that flipped, the
+            // change is purely watcher-lifecycle (debounce ms or enable flag
+            // for the filesystem watcher). Diagnostic content is unaffected,
+            // so don't force every open document to revalidate.
+            //
+            // Future-proof: compare the entire config with watch fields
+            // reverted so any new diagnostic-affecting field is automatically
+            // covered without maintaining a manual exclusion list.
+            let only_watch_changed = watch_settings_changed
+                && new_config
+                    .as_ref()
+                    .map(|c| {
+                        let mut probe = c.clone();
+                        probe.packages_watch_library_paths =
+                            state.cross_file_config.packages_watch_library_paths;
+                        probe.packages_watch_debounce_ms =
+                            state.cross_file_config.packages_watch_debounce_ms;
+                        probe == state.cross_file_config
+                    })
+                    .unwrap_or(false);
+
             // Capture new package settings before applying config
             let packages_enabled = new_config
                 .as_ref()
                 .map(|c| c.packages_enabled)
                 .unwrap_or(state.cross_file_config.packages_enabled);
-            let packages_r_path = new_config
-                .as_ref()
-                .and_then(|c| c.packages_r_path.clone())
-                .or_else(|| state.cross_file_config.packages_r_path.clone());
-            let additional_paths = new_config
-                .as_ref()
-                .map(|c| c.packages_additional_library_paths.clone())
-                .unwrap_or_else(|| {
-                    state
-                        .cross_file_config
-                        .packages_additional_library_paths
-                        .clone()
-                });
-            let workspace_root = state
-                .workspace_folders
-                .first()
-                .and_then(|url| url.to_file_path().ok());
 
             // Apply new config if parsed
             if let Some(config) = new_config {
@@ -2302,23 +2510,25 @@ impl LanguageServer for Backend {
             let trigger_on_open_paren_changed =
                 old_trigger_on_open_paren != new_trigger_on_open_paren;
 
-            // Mark all open documents for force republish
+            // Mark all open documents for force republish (unless only the
+            // watcher-lifecycle settings changed).
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-            for uri in &open_uris {
-                state.diagnostics_gate.mark_force_republish(uri);
+            if !only_watch_changed {
+                for uri in &open_uris {
+                    state.diagnostics_gate.mark_force_republish(uri);
+                }
             }
 
             (
                 open_uris,
                 scope_changed,
                 package_settings_changed,
+                watch_settings_changed,
+                only_watch_changed,
                 diagnostics_enabled_changed,
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
                 packages_enabled,
-                packages_r_path,
-                additional_paths,
-                workspace_root,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
             )
@@ -2396,26 +2606,13 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Reinitialize PackageLibrary if package settings changed
+        // Reinitialize PackageLibrary only if R-subprocess-affecting settings
+        // changed (enabled flag, R path, or additional library paths).
         if package_settings_changed {
             log::info!("Package settings changed, reinitializing PackageLibrary");
 
             let (new_package_library, package_library_ready) = if packages_enabled {
-                let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-                let r_subprocess = match (r_subprocess, workspace_root) {
-                    (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-                    (sub, _) => sub,
-                };
-                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-                let ready = match lib.initialize().await {
-                    Ok(()) => !lib.lib_paths().is_empty(),
-                    Err(e) => {
-                        log::warn!("Failed to reinitialize PackageLibrary: {}", e);
-                        false
-                    }
-                };
-                lib.add_library_paths(&additional_paths);
-                (std::sync::Arc::new(lib), ready)
+                rebuild_package_library(&self.state).await
             } else {
                 (
                     std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
@@ -2431,6 +2628,16 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Restart the libpath watcher if any setting that affects it changed.
+        // Covers both the reinit path above (the `lib_paths` vector may have
+        // changed) and the pure watch-settings path (e.g. user flipped
+        // `watchLibraryPaths` or adjusted the debounce slider) — the helper
+        // handles the teardown + respawn atomically and does NOT re-run the
+        // R subprocess.
+        if package_settings_changed || watch_settings_changed {
+            restart_libpath_watcher(&self.state, &self.client, true).await;
+        }
+
         if scope_changed {
             log::trace!(
                 "Scope-affecting settings changed, revalidating {} open documents",
@@ -2438,9 +2645,13 @@ impl LanguageServer for Backend {
             );
         }
 
-        // Schedule diagnostics for all open documents
-        for uri in open_uris {
-            self.publish_diagnostics(&uri).await;
+        // Schedule diagnostics for all open documents, but skip the workspace
+        // republish if only the watcher-lifecycle settings changed — nothing
+        // about diagnostic content moved.
+        if !only_watch_changed {
+            for uri in open_uris {
+                self.publish_diagnostics(&uri).await;
+            }
         }
     }
 
@@ -3641,6 +3852,30 @@ impl Backend {
         Some(cross_file_meta)
     }
 
+    /// Free-standing variant of `publish_diagnostics` usable from background tasks.
+    /// Delegates to the same debounced pipeline.
+    pub(crate) async fn publish_diagnostics_via_arc(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        uri: &Url,
+    ) {
+        let (debounce_ms, trigger_version, trigger_revision) = {
+            let state = state_arc.read().await;
+            let doc = state.documents.get(uri);
+            let v = doc.and_then(|d| d.version);
+            let r = doc.map(|d| d.revision);
+            (state.cross_file_config.revalidation_debounce_ms, v, r)
+        };
+        tokio::spawn(run_debounced_diagnostics(
+            state_arc,
+            client,
+            uri.clone(),
+            debounce_ms,
+            trigger_version,
+            trigger_revision,
+        ));
+    }
+
     async fn publish_diagnostics(&self, uri: &Url) {
         // Extract needed data while holding read lock briefly
         let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
@@ -3779,6 +4014,456 @@ pub async fn start_lsp() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+/// Core logic of the `raven.refreshPackages` command. Returns the number of
+/// cache entries that were net-evicted — `before_count - after_count` — which
+/// is the intuitive "how many stale entries got cleared and stayed cleared"
+/// number a user expects to see.
+///
+/// Because `prefetch_packages` is called after `clear_cache`, a workspace
+/// that had 8 cached packages and loads 6 of them across open documents will
+/// report `cleared = 2`, not `8`.
+pub(crate) async fn refresh_packages_command_body(
+    pkg_lib: &std::sync::Arc<crate::package_library::PackageLibrary>,
+    loaded_packages_to_prefetch: &[String],
+) -> usize {
+    let before = pkg_lib.cached_count().await;
+    pkg_lib.clear_cache().await;
+    if !loaded_packages_to_prefetch.is_empty() {
+        pkg_lib.prefetch_packages(loaded_packages_to_prefetch).await;
+    }
+    let after = pkg_lib.cached_count().await;
+    before.saturating_sub(after)
+}
+
+/// Build a fresh `PackageLibrary` from current configuration, re-querying R for
+/// `.libPaths()`. Returns the new library and whether it is considered ready
+/// (non-empty lib_paths). The caller decides when to swap it into `state`.
+///
+/// Used by `raven.refreshPackages` and by the settings-change / init paths so
+/// mid-session changes to `.libPaths()` (e.g. renv switching projects, the user
+/// editing `.Rprofile`, or a `.libPaths(new, ...)` call) are picked up without
+/// requiring an LSP restart.
+pub(crate) async fn rebuild_package_library(
+    state_arc: &Arc<RwLock<WorldState>>,
+) -> (Arc<crate::package_library::PackageLibrary>, bool) {
+    let (packages_enabled, packages_r_path, additional_paths, workspace_root) = {
+        let state = state_arc.read().await;
+        (
+            state.cross_file_config.packages_enabled,
+            state.cross_file_config.packages_r_path.clone(),
+            state
+                .cross_file_config
+                .packages_additional_library_paths
+                .clone(),
+            state
+                .workspace_folders
+                .first()
+                .and_then(|url| url.to_file_path().ok()),
+        )
+    };
+
+    if !packages_enabled {
+        return (
+            Arc::new(crate::package_library::PackageLibrary::new_empty()),
+            false,
+        );
+    }
+
+    // R discovery does synchronous IO (which/where/R --version); run it off
+    // the async runtime.
+    let r_subprocess = tokio::task::spawn_blocking(move || {
+        let subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+        match (subprocess, workspace_root) {
+            (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
+            (sub, _) => sub,
+        }
+    })
+    .await
+    .unwrap_or(None);
+
+    let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+    let initialized = match lib.initialize().await {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("rebuild_package_library: initialize failed: {e}");
+            false
+        }
+    };
+    lib.add_library_paths(&additional_paths);
+    // Readiness requires both a successful initialize() and non-empty
+    // lib_paths(): otherwise downstream code would treat a half-initialized
+    // library (e.g. R subprocess unavailable) as ready and emit false-positive
+    // missing-package diagnostics.
+    let ready = initialized && !lib.lib_paths().is_empty();
+    (Arc::new(lib), ready)
+}
+
+/// Tear down any running libpath watcher and, if watching is enabled and the
+/// package library is ready, spawn a fresh one over the current
+/// `state.package_library.lib_paths()`. Returns whether a new watcher was
+/// attached.
+///
+/// `allow_recovery` is propagated to the spawned consumer — primary spawns pass
+/// `true` so a later `Dropped` can attempt one recovery; the recovery spawn
+/// itself passes `false` to prevent a tight restart loop if the underlying
+/// failure is persistent (all libpaths unwatchable, inotify quota exhausted,
+/// etc.).
+///
+/// This returns a boxed future because `run_libpath_consumer`'s Dropped branch
+/// can call back into `restart_libpath_watcher`; boxing one side of that cycle
+/// lets rustc size and `Send`-check both futures.
+pub(crate) fn restart_libpath_watcher<'a>(
+    state_arc: &'a Arc<RwLock<WorldState>>,
+    client: &'a Client,
+    allow_recovery: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        {
+            let mut state = state_arc.write().await;
+            state.libpath_watcher_handle = None;
+        }
+
+        let (should_start, lib_paths, debounce) = {
+            let state = state_arc.read().await;
+            let should = state.cross_file_config.packages_enabled
+                && state.cross_file_config.packages_watch_library_paths
+                && state.package_library_ready;
+            (
+                should,
+                state.package_library.lib_paths().to_vec(),
+                std::time::Duration::from_millis(
+                    state.cross_file_config.packages_watch_debounce_ms,
+                ),
+            )
+        };
+        if !should_start {
+            return false;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::libpath_watcher::LibpathEvent>(64);
+
+        // Spawn the consumer BEFORE the watcher so that if spawn_watcher
+        // sends LibpathEvent::Dropped (all watches failed) and returns None,
+        // the consumer is already listening and will run the recovery/cleanup
+        // path. When spawn_watcher returns None the tx is dropped, so the
+        // consumer will process the Dropped event then exit naturally.
+        let state_for_consumer = Arc::clone(state_arc);
+        let client_for_consumer = client.clone();
+        tokio::spawn(run_libpath_consumer(
+            state_for_consumer,
+            client_for_consumer,
+            rx,
+            allow_recovery,
+        ));
+
+        let Some(handle) = crate::libpath_watcher::spawn_watcher(lib_paths, debounce, tx) else {
+            return false;
+        };
+
+        {
+            let mut state = state_arc.write().await;
+            state.libpath_watcher_handle = Some(Arc::new(handle));
+        }
+        true
+    })
+}
+
+/// Pre-collected snapshot of the inputs `scope_at_position_with_graph` needs
+/// for filtering open documents by package scope. Captured under the read
+/// lock so the (potentially expensive) per-document scope traversal can run
+/// outside the lock — see the libpath consumer's `Changed` branch.
+struct ScopeProbeSnapshot {
+    docs: Vec<(Url, u32)>,
+    artifacts_map:
+        std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
+    metadata_map: std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
+    /// Per-document `loaded_packages` from the document store (includes
+    /// function-local `library()` calls that the EOF scope probe misses).
+    doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
+    graph: crate::cross_file::dependency::DependencyGraph,
+    workspace_folder: Option<Url>,
+    max_chain_depth: usize,
+    backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+}
+
+/// State-side preparation for a `LibpathEvent::Dropped`: clears the package
+/// cache so stale entries can't leak into subsequent lookups, and marks every
+/// open document for force-republish so the scheduled diagnostic pass can
+/// overwrite the last publish at the same document version. Returns the list
+/// of open URIs so the caller can schedule the actual publishing.
+///
+/// Split out of the consumer body to keep the state invariants unit-testable
+/// without needing a tower-lsp `Client`.
+pub(crate) async fn prepare_dropped_recovery(
+    state_arc: &Arc<RwLock<WorldState>>,
+) -> Vec<Url> {
+    let pkg_lib = { state_arc.read().await.package_library.clone() };
+    pkg_lib.clear_cache().await;
+
+    let open_uris: Vec<Url> = {
+        let state = state_arc.read().await;
+        state.documents.keys().cloned().collect()
+    };
+    {
+        let state = state_arc.read().await;
+        for uri in &open_uris {
+            state.diagnostics_gate.mark_force_republish(uri);
+        }
+    }
+    open_uris
+}
+
+/// Consumer for libpath change events. Invalidates the package cache for
+/// affected packages and schedules diagnostic revalidation for open documents
+/// whose loaded packages intersect the change set.
+///
+/// `allow_recovery` controls what happens on `LibpathEvent::Dropped`: if `true`
+/// (primary watcher), the consumer clears the cache, republishes diagnostics
+/// for all open docs, and spawns a replacement watcher with
+/// `allow_recovery = false`; if `false` (recovery watcher), it still clears +
+/// republishes but does not attempt another restart, so a persistent failure
+/// cannot loop.
+async fn run_libpath_consumer(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    mut rx: tokio::sync::mpsc::Receiver<crate::libpath_watcher::LibpathEvent>,
+    allow_recovery: bool,
+) {
+    use crate::libpath_watcher::LibpathEvent;
+
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            LibpathEvent::Changed {
+                added,
+                removed,
+                touched,
+            } => {
+                let affected: std::collections::HashSet<String> = added
+                    .iter()
+                    .chain(removed.iter())
+                    .chain(touched.iter())
+                    .cloned()
+                    .collect();
+                if affected.is_empty() {
+                    continue;
+                }
+                log::info!(
+                    "LibpathWatcher: +{} -{} ~{} packages",
+                    added.len(),
+                    removed.len(),
+                    touched.len()
+                );
+
+                // Invalidate the package cache and learn which combined_exports
+                // aggregates were dropped as a side effect. A document loading
+                // a meta-package like `tidyverse` needs revalidation when
+                // `dplyr` changes — `tidyverse` is not in `affected` but its
+                // aggregate was invalidated, so it's in `invalidated_combined`.
+                let pkg_lib = { state_arc.read().await.package_library.clone() };
+                let invalidated_combined = pkg_lib.invalidate_many(&affected).await;
+
+                // Union of names that mark a document as affected: either the
+                // direct disk-level change (`affected`) or a dropped aggregate
+                // (`invalidated_combined`). Documents whose `loaded_packages`
+                // intersect this union need diagnostic revalidation.
+                let trigger_set: std::collections::HashSet<String> = affected
+                    .iter()
+                    .chain(invalidated_combined.iter())
+                    .cloned()
+                    .collect();
+
+                // Await the warmup prefetch BEFORE republishing diagnostics so
+                // the next diagnostic pass sees a warmed cache; otherwise a
+                // raced prefetch can land just after diagnostics compute and
+                // leave the user looking at stale results.
+                let non_removed_trigger_set: std::collections::HashSet<String> = touched
+                    .iter()
+                    .chain(added.iter())
+                    .chain(invalidated_combined.iter())
+                    .filter(|name| !removed.contains(*name))
+                    .cloned()
+                    .collect();
+                if !non_removed_trigger_set.is_empty() {
+                    let prefetch_vec: Vec<String> = non_removed_trigger_set.into_iter().collect();
+                    pkg_lib.prefetch_packages(&prefetch_vec).await;
+                }
+
+                // Collect URIs whose effective package scope intersects
+                // `trigger_set`.
+                //
+                // Snapshot the inputs scope resolution needs under the read
+                // lock, then release it before doing the per-document
+                // traversal. AGENTS.md learning: "Diagnostic computation must
+                // not hold the RwLock read lock during expensive scope
+                // resolution. Build a [...] snapshot (captures artifacts,
+                // metadata, graph clone, config), release the lock, then
+                // compute [...] from the snapshot." Holding the lock across N
+                // cross-file scope resolutions can starve `did_change`
+                // writers in workspaces with many open files.
+                use std::collections::{HashMap, HashSet};
+                let probe = {
+                    let state = state_arc.read().await;
+                    let max_depth = state.cross_file_config.max_chain_depth;
+                    let max_visited =
+                        state.cross_file_config.max_transitive_dependents_visited;
+
+                    let docs: Vec<(Url, u32)> = state
+                        .documents
+                        .iter()
+                        .map(|(uri, doc)| {
+                            let line = doc.text().lines().count().saturating_sub(1) as u32;
+                            (uri.clone(), line)
+                        })
+                        .collect();
+
+                    // Pre-collect the URIs scope resolution may need to load:
+                    // every open doc plus its dependency neighborhood. Without
+                    // the neighborhood, source()-chain traversal would silently
+                    // fail to resolve cross-file packages.
+                    let mut neighborhood: HashSet<Url> = HashSet::new();
+                    for (uri, _) in &docs {
+                        for n in state
+                            .cross_file_graph
+                            .collect_neighborhood(uri, max_depth, max_visited)
+                        {
+                            neighborhood.insert(n);
+                        }
+                    }
+
+                    let content_provider = state.content_provider();
+                    let mut artifacts_map: HashMap<
+                        Url,
+                        Arc<crate::cross_file::scope::ScopeArtifacts>,
+                    > = HashMap::with_capacity(neighborhood.len());
+                    let mut metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> =
+                        HashMap::with_capacity(neighborhood.len());
+                    for u in &neighborhood {
+                        if let Some(a) = content_provider.get_artifacts(u) {
+                            artifacts_map.insert(u.clone(), a);
+                        }
+                        if let Some(m) = content_provider.get_metadata(u) {
+                            metadata_map.insert(u.clone(), m);
+                        }
+                    }
+
+                    ScopeProbeSnapshot {
+                        docs,
+                        artifacts_map,
+                        metadata_map,
+                        doc_loaded_packages: state
+                            .documents
+                            .iter()
+                            .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
+                            .collect(),
+                        graph: state.cross_file_graph.extract_subgraph(&neighborhood),
+                        workspace_folder: state.workspace_folders.first().cloned(),
+                        max_chain_depth: state.cross_file_config.max_chain_depth,
+                        backward_dependencies: state.cross_file_config.backward_dependencies,
+                    }
+                };
+
+                let get_artifacts = |target_uri: &Url| -> Option<
+                    Arc<crate::cross_file::scope::ScopeArtifacts>,
+                > { probe.artifacts_map.get(target_uri).cloned() };
+                let get_metadata =
+                    |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                        probe.metadata_map.get(target_uri).cloned()
+                    };
+                let empty_base_exports: HashSet<String> = HashSet::new();
+                let affected_uris: Vec<Url> = probe
+                    .docs
+                    .iter()
+                    .filter_map(|(uri, line)| {
+                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                            uri,
+                            *line,
+                            u32::MAX,
+                            &get_artifacts,
+                            &get_metadata,
+                            &probe.graph,
+                            probe.workspace_folder.as_ref(),
+                            probe.max_chain_depth,
+                            &empty_base_exports,
+                            false,
+                            probe.backward_dependencies,
+                            &|| false,
+                        );
+                        // Scope probe captures inherited + global-scope packages.
+                        // Also check the document's full loaded_packages which
+                        // includes function-local library() calls the EOF scope
+                        // probe misses.
+                        let scope_hit = scope
+                            .inherited_packages
+                            .iter()
+                            .chain(scope.loaded_packages.iter())
+                            .any(|p| trigger_set.contains(p));
+                        let doc_hit = probe
+                            .doc_loaded_packages
+                            .get(uri)
+                            .map(|pkgs| pkgs.iter().any(|p| trigger_set.contains(p)))
+                            .unwrap_or(false);
+                        if scope_hit || doc_hit {
+                            Some(uri.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Force republish is safe: the text hasn't changed but the
+                // underlying package set has, so we want to overwrite the last
+                // publish at the same version.
+                {
+                    let state = state_arc.read().await;
+                    for uri in &affected_uris {
+                        state.diagnostics_gate.mark_force_republish(uri);
+                    }
+                }
+
+                // Schedule diagnostics for each affected open URI.
+                for uri in affected_uris {
+                    let state_arc2 = Arc::clone(&state_arc);
+                    let client2 = client.clone();
+                    tokio::spawn(async move {
+                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri).await;
+                    });
+                }
+            }
+            LibpathEvent::Dropped => {
+                log::warn!(
+                    "LibpathWatcher: dropped (allow_recovery={}); clearing package cache and \
+                     force-republishing diagnostics",
+                    allow_recovery
+                );
+
+                let open_uris = prepare_dropped_recovery(&state_arc).await;
+                for uri in open_uris {
+                    let state_arc2 = Arc::clone(&state_arc);
+                    let client2 = client.clone();
+                    tokio::spawn(async move {
+                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri).await;
+                    });
+                }
+
+                // Attempt a one-shot recovery. The replacement consumer runs
+                // with `allow_recovery = false` so a persistent failure cannot
+                // loop. Users can still force a full re-discovery via
+                // `raven.refreshPackages`, which additionally rebuilds the
+                // PackageLibrary (picking up `.libPaths()` changes).
+                if allow_recovery {
+                    let attached = restart_libpath_watcher(&state_arc, &client, false).await;
+                    log::info!(
+                        "LibpathWatcher: recovery attempted, new watcher attached = {}",
+                        attached
+                    );
+                }
+                return;
+            }
+        }
+    }
+    log::info!("LibpathWatcher consumer channel closed; exiting");
 }
 
 #[cfg(test)]
@@ -3998,6 +4683,34 @@ mod tests {
                 "expected object validation error, got: {}",
                 err
             );
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_watch_fields() {
+            let settings = json!({
+                "packages": {
+                    "watchLibraryPaths": false,
+                    "watchDebounceMs": 250
+                }
+            });
+            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            assert!(!cfg.packages_watch_library_paths);
+            assert_eq!(cfg.packages_watch_debounce_ms, 250);
+        }
+
+        #[test]
+        fn parse_cross_file_config_clamps_watch_debounce_ms() {
+            let settings = json!({
+                "packages": { "watchDebounceMs": 50 }  // below floor
+            });
+            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            assert_eq!(cfg.packages_watch_debounce_ms, 100);
+
+            let settings = json!({
+                "packages": { "watchDebounceMs": 99999 } // above ceiling
+            });
+            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            assert_eq!(cfg.packages_watch_debounce_ms, 5000);
         }
     }
 
@@ -4718,5 +5431,198 @@ mod tests {
                 "Should parse 'RStudio-Minus' as RStudioMinus style"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_packages_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn refresh_clears_package_cache_and_returns_count() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        let lib = Arc::new(PackageLibrary::new_empty());
+        lib.insert_package(PackageInfo::new("foo".into(), HashSet::new()))
+            .await;
+        lib.insert_package(PackageInfo::new("bar".into(), HashSet::new()))
+            .await;
+        assert_eq!(lib.cached_count().await, 2);
+
+        let cleared = refresh_packages_command_body(&lib, &[]).await;
+        assert_eq!(cleared, 2);
+        assert_eq!(lib.cached_count().await, 0);
+    }
+
+    /// Regression for review finding #1: `raven.refreshPackages` must
+    /// re-discover `.libPaths()`. `rebuild_package_library` reads
+    /// `cross_file_config.packages_additional_library_paths` from state, so
+    /// mutating those paths between calls must produce a PackageLibrary
+    /// whose `lib_paths()` reflects the new configuration.
+    #[tokio::test]
+    async fn rebuild_picks_up_additional_library_paths_change() {
+        use crate::state::WorldState;
+        use tempfile::tempdir;
+        use tokio::sync::RwLock;
+
+        let t_old = tempdir().unwrap();
+        let t_new = tempdir().unwrap();
+
+        let state = Arc::new(RwLock::new(WorldState::new(vec![])));
+
+        // Pretend the user started with only `t_old` on the path, then
+        // changed `.libPaths()` mid-session so `t_new` is now also present.
+        {
+            let mut s = state.write().await;
+            s.cross_file_config.packages_enabled = true;
+            s.cross_file_config.packages_additional_library_paths =
+                vec![t_old.path().to_path_buf()];
+        }
+        let (lib_v1, _ready_v1) = rebuild_package_library(&state).await;
+        assert!(
+            lib_v1.lib_paths().iter().any(|p| p == t_old.path()),
+            "initial library should include t_old ({}), got {:?}",
+            t_old.path().display(),
+            lib_v1.lib_paths()
+        );
+        assert!(
+            !lib_v1.lib_paths().iter().any(|p| p == t_new.path()),
+            "initial library must not contain t_new yet, got {:?}",
+            lib_v1.lib_paths()
+        );
+
+        {
+            let mut s = state.write().await;
+            s.cross_file_config.packages_additional_library_paths = vec![
+                t_old.path().to_path_buf(),
+                t_new.path().to_path_buf(),
+            ];
+        }
+        let (lib_v2, _ready_v2) = rebuild_package_library(&state).await;
+        assert!(
+            lib_v2.lib_paths().iter().any(|p| p == t_new.path()),
+            "rebuilt library must include t_new after config change, got {:?}",
+            lib_v2.lib_paths()
+        );
+    }
+
+    /// Regression: when `raven.refreshPackages` rebuilds the `PackageLibrary`,
+    /// the user-visible "cleared N entries" count must reflect the *old*
+    /// library's pre-rebuild size rather than `refresh_packages_command_body`'s
+    /// internal `before - after` (which is computed against the new empty
+    /// library and would always be 0). Mirrors the cleared-count math in
+    /// `Backend::execute_command("raven.refreshPackages")`.
+    #[tokio::test]
+    async fn cleared_count_reflects_pre_rebuild_library_size() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        // Old library populated with three entries — represents the cache
+        // state right before the user invokes "Raven: Refresh package cache".
+        let old_lib = Arc::new(PackageLibrary::new_empty());
+        for name in ["foo", "bar", "baz"] {
+            old_lib
+                .insert_package(PackageInfo::new(name.into(), HashSet::new()))
+                .await;
+        }
+        let before_count = old_lib.cached_count().await;
+        assert_eq!(before_count, 3);
+
+        // Simulate `rebuild_package_library` swapping in a fresh empty
+        // library: from this point the command operates on `new_lib`, which
+        // starts at 0 entries.
+        let new_lib = Arc::new(PackageLibrary::new_empty());
+
+        // Run the standard refresh body on the new library (no prefetch
+        // candidates because the test fixture has no documents). This is
+        // exactly what `execute_command` does after the swap.
+        let body_cleared = refresh_packages_command_body(&new_lib, &[]).await;
+        let after_count = new_lib.cached_count().await;
+        let cleared_user_visible = before_count.saturating_sub(after_count);
+
+        // The function's own return is meaningless after a rebuild — it
+        // sees an empty library and reports 0 evicted.
+        assert_eq!(
+            body_cleared, 0,
+            "refresh_packages_command_body operates on the post-rebuild library, so its return is 0",
+        );
+        // The user-visible delta must reflect the three entries that vanished
+        // when the library was replaced.
+        assert_eq!(
+            cleared_user_visible, 3,
+            "user-visible cleared count must reflect pre-rebuild size",
+        );
+    }
+
+    /// Regression for review finding #1: when packages are disabled, rebuild
+    /// yields an empty library and does not attempt R discovery.
+    #[tokio::test]
+    async fn rebuild_returns_empty_library_when_packages_disabled() {
+        use crate::state::WorldState;
+        use tokio::sync::RwLock;
+
+        let state = Arc::new(RwLock::new(WorldState::new(vec![])));
+        {
+            let mut s = state.write().await;
+            s.cross_file_config.packages_enabled = false;
+        }
+        let (lib, ready) = rebuild_package_library(&state).await;
+        assert!(!ready);
+        assert!(lib.lib_paths().is_empty());
+    }
+
+    /// Regression for review finding #3: a `Dropped` event must leave open
+    /// documents in a state where the next diagnostic run can republish at
+    /// the same document version (force-republish bypasses the monotonic
+    /// gate) and must clear the package cache.
+    #[tokio::test]
+    async fn prepare_dropped_recovery_clears_cache_and_marks_open_docs() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use crate::state::{Document, WorldState};
+        use tokio::sync::RwLock;
+
+        let mut world = WorldState::new(vec![]);
+        let uri_a = Url::parse("file:///workspace/a.R").unwrap();
+        let uri_b = Url::parse("file:///workspace/b.R").unwrap();
+        world
+            .documents
+            .insert(uri_a.clone(), Document::new("x <- 1", Some(1)));
+        world
+            .documents
+            .insert(uri_b.clone(), Document::new("y <- 2", Some(1)));
+
+        // Simulate prior publishes at version 1 for both docs.
+        world.diagnostics_gate.record_publish(&uri_a, 1);
+        world.diagnostics_gate.record_publish(&uri_b, 1);
+        // Without force-republish, the gate blocks same-version republishes.
+        assert!(!world.diagnostics_gate.can_publish(&uri_a, 1));
+        assert!(!world.diagnostics_gate.can_publish(&uri_b, 1));
+
+        // Seed the package cache so we can observe it being cleared.
+        let lib = Arc::new(PackageLibrary::new_empty());
+        lib.insert_package(PackageInfo::new("foo".into(), HashSet::new()))
+            .await;
+        world.package_library = lib.clone();
+
+        let state = Arc::new(RwLock::new(world));
+        let open = prepare_dropped_recovery(&state).await;
+
+        // Cache cleared.
+        assert_eq!(lib.cached_count().await, 0);
+
+        // All open URIs returned.
+        let open_set: HashSet<Url> = open.into_iter().collect();
+        assert!(open_set.contains(&uri_a));
+        assert!(open_set.contains(&uri_b));
+
+        // Same-version republish is now allowed for both documents.
+        let state_guard = state.read().await;
+        assert!(
+            state_guard.diagnostics_gate.can_publish(&uri_a, 1),
+            "force-republish must allow the same-version republish for uri_a"
+        );
+        assert!(
+            state_guard.diagnostics_gate.can_publish(&uri_b, 1),
+            "force-republish must allow the same-version republish for uri_b"
+        );
     }
 }

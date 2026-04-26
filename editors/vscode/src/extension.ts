@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+    ExecuteCommandRequest,
     LanguageClient,
     LanguageClientOptions,
     ServerOptions,
@@ -130,6 +131,31 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('raven.restart', async () => {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
             await client.restart();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.refreshPackages', async () => {
+            try {
+                const response = await client.sendRequest(ExecuteCommandRequest.type, {
+                    command: 'raven.refreshPackages',
+                    arguments: []
+                });
+                // Server returns `{ cleared: N }` — surface it so users get
+                // feedback that the command actually did something.
+                const cleared =
+                    response && typeof (response as { cleared?: unknown }).cleared === 'number'
+                        ? (response as { cleared: number }).cleared
+                        : undefined;
+                if (cleared !== undefined) {
+                    vscode.window.setStatusBarMessage(
+                        `Raven: refreshed ${cleared} package cache ${cleared === 1 ? 'entry' : 'entries'}`,
+                        3000,
+                    );
+                }
+            } catch (err) {
+                vscode.window.showErrorMessage(`Raven refreshPackages failed: ${err}`);
+            }
         })
     );
 
