@@ -212,10 +212,10 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     // Prompt for word separators configuration
-    promptWordSeparators(context);
+    promptWordSeparators();
 }
 
-async function promptWordSeparators(context: vscode.ExtensionContext) {
+async function promptWordSeparators() {
     const config = vscode.workspace.getConfiguration('raven');
     const setting = config.get<string>('editor.dotInWordSeparators', 'ask');
 
