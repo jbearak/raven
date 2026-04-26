@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::content_provider::ContentProvider;
 use crate::indentation::IndentationStyle;
 use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
@@ -704,6 +705,55 @@ impl WorldState {
             &self.workspace_index,
             &self.cross_file_workspace_index,
         )
+    }
+
+    /// Build a snapshot of the dependency neighborhood for package scope
+    /// resolution. The snapshot includes artifacts/metadata for all files
+    /// reachable from `docs` via the cross-file dependency graph (not just
+    /// open documents), so inherited packages from closed parent files are
+    /// discovered.
+    ///
+    /// Call this under the read lock, then drop the lock before running
+    /// `scope_at_position_with_graph` against the returned snapshot.
+    pub(crate) fn build_package_scope_snapshot(
+        &self,
+        docs: &[(Url, u32)],
+    ) -> crate::backend::ScopeProbeSnapshot {
+        let max_depth = self.cross_file_config.max_chain_depth;
+        let max_visited = self.cross_file_config.max_transitive_dependents_visited;
+
+        let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
+            docs.iter().map(|(uri, _)| uri.clone()),
+            max_depth,
+            max_visited,
+        );
+
+        let content_provider = self.content_provider();
+        let mut artifacts_map = HashMap::with_capacity(neighborhood.len());
+        let mut metadata_map = HashMap::with_capacity(neighborhood.len());
+        for u in &neighborhood {
+            if let Some(a) = content_provider.get_artifacts(u) {
+                artifacts_map.insert(u.clone(), a);
+            }
+            if let Some(m) = content_provider.get_metadata(u) {
+                metadata_map.insert(u.clone(), m);
+            }
+        }
+
+        crate::backend::ScopeProbeSnapshot {
+            docs: docs.to_vec(),
+            artifacts_map,
+            metadata_map,
+            doc_loaded_packages: self
+                .documents
+                .iter()
+                .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
+                .collect(),
+            graph: self.cross_file_graph.extract_subgraph(&neighborhood),
+            workspace_folder: self.workspace_folders.first().cloned(),
+            max_chain_depth: self.cross_file_config.max_chain_depth,
+            backward_dependencies: self.cross_file_config.backward_dependencies,
+        }
     }
 
     /// Resize all LRU caches based on configuration.

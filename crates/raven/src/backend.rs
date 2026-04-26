@@ -16,7 +16,6 @@ use tower_lsp::LanguageServer;
 use tower_lsp::LspService;
 use tower_lsp::Server;
 
-use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::r_env;
@@ -1181,16 +1180,7 @@ impl LanguageServer for Backend {
                 // computation must not hold the RwLock read lock during
                 // expensive scope resolution").
                 let loaded_packages = {
-                    let (
-                        doc_packages,
-                        docs,
-                        artifacts_map,
-                        metadata_map,
-                        graph,
-                        workspace_folder,
-                        max_chain_depth,
-                        backward_deps,
-                    ) = {
+                    let (doc_packages, probe) = {
                         let state = self.state.read().await;
                         let mut doc_pkgs = std::collections::HashSet::new();
                         let mut docs = Vec::new();
@@ -1201,49 +1191,33 @@ impl LanguageServer for Backend {
                             let line = doc.text().lines().count().saturating_sub(1) as u32;
                             docs.push((uri.clone(), line));
                         }
-                        let content_provider = state.content_provider();
-                        let mut a_map = std::collections::HashMap::new();
-                        let mut m_map = std::collections::HashMap::new();
-                        for (uri, _) in &docs {
-                            if let Some(a) = content_provider.get_artifacts(uri) {
-                                a_map.insert(uri.clone(), a);
-                            }
-                            if let Some(m) = content_provider.get_metadata(uri) {
-                                m_map.insert(uri.clone(), m);
-                            }
-                        }
-                        (
-                            doc_pkgs,
-                            docs,
-                            a_map,
-                            m_map,
-                            state.cross_file_graph.clone(),
-                            state.workspace_folders.first().cloned(),
-                            state.cross_file_config.max_chain_depth,
-                            state.cross_file_config.backward_dependencies,
-                        )
+                        let snapshot = state.build_package_scope_snapshot(&docs);
+                        (doc_pkgs, snapshot)
                     }; // read lock released
 
                     let mut all_pkgs = doc_packages;
                     let empty_base_exports = std::collections::HashSet::new();
-                    let get_artifacts = |target_uri: &Url| artifacts_map.get(target_uri).cloned();
-                    let get_metadata = |target_uri: &Url| metadata_map.get(target_uri).cloned();
-                    for (uri, line) in &docs {
+                    let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
+                    let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
+                    for (uri, line) in &probe.docs {
                         let scope = crate::cross_file::scope::scope_at_position_with_graph(
                             uri,
                             *line,
                             u32::MAX,
                             &get_artifacts,
                             &get_metadata,
-                            &graph,
-                            workspace_folder.as_ref(),
-                            max_chain_depth,
+                            &probe.graph,
+                            probe.workspace_folder.as_ref(),
+                            probe.max_chain_depth,
                             &empty_base_exports,
                             false,
-                            backward_deps,
+                            probe.backward_dependencies,
                             &|| false,
                         );
                         for p in scope.inherited_packages {
+                            all_pkgs.insert(p);
+                        }
+                        for p in scope.loaded_packages {
                             all_pkgs.insert(p);
                         }
                     }
@@ -1908,45 +1882,48 @@ impl LanguageServer for Backend {
         }
 
         // Prefetch packages for inherited scope to avoid transient undefined diagnostics.
+        // Snapshot under the lock, release it, then run scope resolution outside the lock
+        // (AGENTS.md: must not hold RwLock read lock during expensive scope resolution).
         if packages_enabled {
             let _ = self.ensure_package_library_initialized().await;
 
-            let (package_library, scope_packages) = {
-                let state = self.state.read().await;
-                let content_provider = state.content_provider();
-                let get_artifacts = |target_uri: &Url| -> Option<
-                    std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
-                > {
-                    content_provider.get_artifacts(target_uri)
-                };
-                let get_metadata =
-                    |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-                        content_provider.get_metadata(target_uri)
-                    };
+            let (package_library, package_library_ready, scope_packages) = {
+                let (probe, pkg_lib, ready) = {
+                    let state = self.state.read().await;
+                    let last_line = state
+                        .documents
+                        .get(&uri)
+                        .map(|d| d.text().lines().count().saturating_sub(1) as u32)
+                        .unwrap_or(0);
+                    let snapshot =
+                        state.build_package_scope_snapshot(&[(uri.clone(), last_line)]);
+                    (snapshot, state.package_library.clone(), state.package_library_ready)
+                }; // read lock released
 
-                // For package prefetching, we only need the package lists, not base symbols.
-                // Pass empty base_exports since we're only collecting package names.
                 let empty_base_exports = std::collections::HashSet::new();
+                let get_artifacts = |u: &Url| probe.artifacts_map.get(u).cloned();
+                let get_metadata = |u: &Url| probe.metadata_map.get(u).cloned();
+                let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
                 let scope = crate::cross_file::scope::scope_at_position_with_graph(
                     &uri,
-                    0,
-                    0,
+                    probe_line,
+                    u32::MAX,
                     &get_artifacts,
                     &get_metadata,
-                    &state.cross_file_graph,
-                    state.workspace_folders.first(),
-                    state.cross_file_config.max_chain_depth,
+                    &probe.graph,
+                    probe.workspace_folder.as_ref(),
+                    probe.max_chain_depth,
                     &empty_base_exports,
-                    false, // package prefetching doesn't need hoisting
-                    state.cross_file_config.backward_dependencies,
-                    &|| false, // package prefetching, no cancellation
+                    false,
+                    probe.backward_dependencies,
+                    &|| false,
                 );
 
                 let mut pkgs = scope.inherited_packages;
                 pkgs.extend(scope.loaded_packages);
                 let pkgs: Vec<String> = pkgs.into_iter().collect();
 
-                (state.package_library.clone(), pkgs)
+                (pkg_lib, ready, pkgs)
             };
 
             if !scope_packages.is_empty() {
@@ -1955,7 +1932,7 @@ impl LanguageServer for Backend {
                     uri,
                     scope_packages
                 );
-                if self.state.read().await.package_library_ready {
+                if package_library_ready {
                     package_library.prefetch_packages(&scope_packages).await;
                 } else {
                     log::trace!("did_open prefetch: package library not ready, skipping");
@@ -2268,17 +2245,65 @@ impl LanguageServer for Backend {
         // Background prefetch package exports (without holding WorldState lock)
         // After prefetch completes, schedule diagnostic revalidation so newly
         // cached exports clear false-positive "undefined variable" diagnostics.
-        if packages_enabled && !packages_to_prefetch.is_empty() {
+        if packages_enabled {
             let pkg_lib = package_library;
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let revalidation_uri = uri.clone();
+            let direct_packages = packages_to_prefetch;
             tokio::spawn(async move {
+                // Extend direct library_calls with inherited packages from
+                // parent source() chains. Snapshot under the lock, release it,
+                // then run scope resolution outside the lock.
+                let mut all_packages: std::collections::HashSet<String> =
+                    direct_packages.into_iter().collect();
+
+                {
+                    let probe = {
+                        let state = state_arc.read().await;
+                        if !state.documents.contains_key(&revalidation_uri) {
+                            return; // Document was closed
+                        }
+                        let last_line = state
+                            .documents
+                            .get(&revalidation_uri)
+                            .map(|d| d.text().lines().count().saturating_sub(1) as u32)
+                            .unwrap_or(0);
+                        state.build_package_scope_snapshot(&[(revalidation_uri.clone(), last_line)])
+                    }; // read lock released
+
+                    let empty_base = std::collections::HashSet::new();
+                    let get_artifacts = |u: &Url| probe.artifacts_map.get(u).cloned();
+                    let get_metadata = |u: &Url| probe.metadata_map.get(u).cloned();
+                    let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
+                    let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                        &revalidation_uri,
+                        probe_line,
+                        u32::MAX,
+                        &get_artifacts,
+                        &get_metadata,
+                        &probe.graph,
+                        probe.workspace_folder.as_ref(),
+                        probe.max_chain_depth,
+                        &empty_base,
+                        false,
+                        probe.backward_dependencies,
+                        &|| false,
+                    );
+                    all_packages.extend(scope.inherited_packages);
+                    all_packages.extend(scope.loaded_packages);
+                }
+
+                if all_packages.is_empty() {
+                    return;
+                }
+
+                let packages_vec: Vec<String> = all_packages.into_iter().collect();
                 log::trace!(
                     "Background prefetching {} packages",
-                    packages_to_prefetch.len()
+                    packages_vec.len()
                 );
-                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+                pkg_lib.prefetch_packages(&packages_vec).await;
 
                 // After prefetch completes, trigger diagnostic revalidation
                 let (debounce_ms, trigger_version, trigger_revision) = {
@@ -4174,18 +4199,22 @@ pub(crate) fn restart_libpath_watcher<'a>(
 /// for filtering open documents by package scope. Captured under the read
 /// lock so the (potentially expensive) per-document scope traversal can run
 /// outside the lock — see the libpath consumer's `Changed` branch.
-struct ScopeProbeSnapshot {
-    docs: Vec<(Url, u32)>,
-    artifacts_map:
+///
+/// Built via `WorldState::build_package_scope_snapshot` to ensure the full
+/// dependency neighborhood (including closed parent files) is included.
+pub(crate) struct ScopeProbeSnapshot {
+    pub(crate) docs: Vec<(Url, u32)>,
+    pub(crate) artifacts_map:
         std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
-    metadata_map: std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
+    pub(crate) metadata_map:
+        std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
     /// Per-document `loaded_packages` from the document store (includes
     /// function-local `library()` calls that the EOF scope probe misses).
-    doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
-    graph: crate::cross_file::dependency::DependencyGraph,
-    workspace_folder: Option<Url>,
-    max_chain_depth: usize,
-    backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+    pub(crate) doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
+    pub(crate) graph: crate::cross_file::dependency::DependencyGraph,
+    pub(crate) workspace_folder: Option<Url>,
+    pub(crate) max_chain_depth: usize,
+    pub(crate) backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
 }
 
 /// State-side preparation for a `LibpathEvent::Dropped`: clears the package
@@ -4302,12 +4331,9 @@ async fn run_libpath_consumer(
                 // compute [...] from the snapshot." Holding the lock across N
                 // cross-file scope resolutions can starve `did_change`
                 // writers in workspaces with many open files.
-                use std::collections::{HashMap, HashSet};
+                use std::collections::HashSet;
                 let probe = {
                     let state = state_arc.read().await;
-                    let max_depth = state.cross_file_config.max_chain_depth;
-                    let max_visited =
-                        state.cross_file_config.max_transitive_dependents_visited;
 
                     let docs: Vec<(Url, u32)> = state
                         .documents
@@ -4318,50 +4344,7 @@ async fn run_libpath_consumer(
                         })
                         .collect();
 
-                    // Pre-collect the URIs scope resolution may need to load:
-                    // every open doc plus its dependency neighborhood. Without
-                    // the neighborhood, source()-chain traversal would silently
-                    // fail to resolve cross-file packages.
-                    let mut neighborhood: HashSet<Url> = HashSet::new();
-                    for (uri, _) in &docs {
-                        for n in state
-                            .cross_file_graph
-                            .collect_neighborhood(uri, max_depth, max_visited)
-                        {
-                            neighborhood.insert(n);
-                        }
-                    }
-
-                    let content_provider = state.content_provider();
-                    let mut artifacts_map: HashMap<
-                        Url,
-                        Arc<crate::cross_file::scope::ScopeArtifacts>,
-                    > = HashMap::with_capacity(neighborhood.len());
-                    let mut metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> =
-                        HashMap::with_capacity(neighborhood.len());
-                    for u in &neighborhood {
-                        if let Some(a) = content_provider.get_artifacts(u) {
-                            artifacts_map.insert(u.clone(), a);
-                        }
-                        if let Some(m) = content_provider.get_metadata(u) {
-                            metadata_map.insert(u.clone(), m);
-                        }
-                    }
-
-                    ScopeProbeSnapshot {
-                        docs,
-                        artifacts_map,
-                        metadata_map,
-                        doc_loaded_packages: state
-                            .documents
-                            .iter()
-                            .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
-                            .collect(),
-                        graph: state.cross_file_graph.extract_subgraph(&neighborhood),
-                        workspace_folder: state.workspace_folders.first().cloned(),
-                        max_chain_depth: state.cross_file_config.max_chain_depth,
-                        backward_dependencies: state.cross_file_config.backward_dependencies,
-                    }
+                    state.build_package_scope_snapshot(&docs)
                 };
 
                 let get_artifacts = |target_uri: &Url| -> Option<
@@ -5623,6 +5606,159 @@ mod refresh_packages_tests {
         assert!(
             state_guard.diagnostics_gate.can_publish(&uri_b, 1),
             "force-republish must allow the same-version republish for uri_b"
+        );
+    }
+
+    /// Regression for issue #107: `build_package_scope_snapshot` must include
+    /// closed parent files (reachable via the dependency graph) in the
+    /// artifacts/metadata maps, not just open documents. Otherwise inherited
+    /// packages from parent `source()` chains are missed during prefetch.
+    #[tokio::test]
+    async fn snapshot_includes_closed_parent_in_neighborhood() {
+        use crate::state::{Document, WorldState};
+        use crate::workspace_index::IndexEntry;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let parent_path = temp_dir.path().join("parent.R");
+        let child_path = temp_dir.path().join("child.R");
+        let parent_code = "library(dplyr)\nhelper <- function(x) x";
+        let child_code = "source('parent.R')\nx <- 1";
+        std::fs::write(&parent_path, parent_code).unwrap();
+        std::fs::write(&child_path, child_code).unwrap();
+
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let child_uri = Url::from_file_path(&child_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+
+        let mut world = WorldState::new(vec![]);
+        world.workspace_folders.push(workspace_root.clone());
+
+        // Parent is a CLOSED file in the workspace index with library(dplyr)
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        let parent_tree = parser.parse(parent_code, None).unwrap();
+        let parent_artifacts = Arc::new(
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                &parent_uri,
+                &parent_tree,
+                parent_code,
+                Some(&parent_meta),
+            ),
+        );
+        let parent_entry = IndexEntry {
+            contents: ropey::Rope::from_str(parent_code),
+            tree: Some(parent_tree),
+            loaded_packages: vec!["dplyr".into()],
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: None,
+            },
+            metadata: parent_meta,
+            artifacts: parent_artifacts,
+            indexed_at_version: 0,
+        };
+        world
+            .workspace_index_new
+            .insert(parent_uri.clone(), parent_entry);
+
+        // Child is an OPEN document that sources the parent
+        let child_meta = crate::cross_file::extract_metadata(child_code);
+        world.documents.insert(
+            child_uri.clone(),
+            Document::new(child_code, Some(1)),
+        );
+
+        // Add forward edge: child -> parent
+        world.cross_file_graph.update_file(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+
+        // Build snapshot for the child only
+        let docs = vec![(child_uri.clone(), 1u32)];
+        let snapshot = world.build_package_scope_snapshot(&docs);
+
+        // The parent must be in the snapshot's artifacts_map even though
+        // it's not an open document — it's reachable via the dependency graph.
+        assert!(
+            snapshot.artifacts_map.contains_key(&parent_uri),
+            "closed parent must be included in snapshot artifacts_map; \
+             keys: {:?}",
+            snapshot.artifacts_map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            snapshot.metadata_map.contains_key(&parent_uri),
+            "closed parent must be included in snapshot metadata_map"
+        );
+
+        // Verify scope resolution using the snapshot discovers inherited packages.
+        let get_artifacts = |u: &Url| snapshot.artifacts_map.get(u).cloned();
+        let get_metadata = |u: &Url| snapshot.metadata_map.get(u).cloned();
+
+        // Debug: check child artifacts have source() in timeline
+        let child_arts = snapshot.artifacts_map.get(&child_uri);
+        assert!(child_arts.is_some(), "child must have artifacts in snapshot");
+        let child_arts = child_arts.unwrap();
+        let has_source_event = child_arts.timeline.iter().any(|e| {
+            matches!(e, crate::cross_file::scope::ScopeEvent::Source { .. })
+        });
+        assert!(has_source_event, "child artifacts must have Source event in timeline; timeline has {} events", child_arts.timeline.len());
+
+        // Debug: check graph has forward edge from child to parent
+        let child_deps = snapshot.graph.get_dependencies(&child_uri);
+        assert!(
+            !child_deps.is_empty(),
+            "child must have forward dependencies in snapshot graph"
+        );
+        // Debug: check edge call_site matches source event
+        for dep in &child_deps {
+            assert_eq!(dep.to, parent_uri, "edge must point to parent");
+        }
+
+        let empty_base: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Debug: check parent artifacts have PackageLoad event
+        let parent_arts = snapshot.artifacts_map.get(&parent_uri).unwrap();
+        assert!(
+            parent_arts.timeline.iter().any(|e| {
+                matches!(e, crate::cross_file::scope::ScopeEvent::PackageLoad { .. })
+            }),
+            "parent must have PackageLoad event"
+        );
+        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+            &child_uri,
+            1,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.graph,
+            snapshot.workspace_folder.as_ref(),
+            snapshot.max_chain_depth,
+            &empty_base,
+            false,
+            snapshot.backward_dependencies,
+            &|| false,
+        );
+        // dplyr appears in loaded_packages (from forward source() chain),
+        // not inherited_packages (which come from backward/parent edges).
+        let all_packages: std::collections::HashSet<&String> = scope
+            .inherited_packages
+            .iter()
+            .chain(scope.loaded_packages.iter())
+            .collect();
+        assert!(
+            all_packages.contains(&"dplyr".to_string()),
+            "scope must include 'dplyr' from closed parent; \
+             inherited={:?}, loaded={:?}",
+            scope.inherited_packages,
+            scope.loaded_packages
         );
     }
 }

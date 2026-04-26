@@ -1301,6 +1301,51 @@ impl DependencyGraph {
         visited
     }
 
+    /// Multi-seed variant of `collect_neighborhood`. Performs a single BFS
+    /// from all seeds sharing one visited set and one global `max_visited`
+    /// budget, avoiding redundant traversal of shared ancestors.
+    pub fn collect_neighborhood_multi(
+        &self,
+        seeds: impl IntoIterator<Item = Url>,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> HashSet<Url> {
+        let mut visited = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        for seed in seeds {
+            if visited.insert(seed.clone()) {
+                queue.push_back((seed, 0usize));
+            }
+        }
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_depth || visited.len() >= max_visited {
+                continue;
+            }
+            if let Some(edges) = self.forward.get(&current) {
+                for edge in edges {
+                    if visited.len() >= max_visited {
+                        break;
+                    }
+                    if visited.insert(edge.to.clone()) {
+                        queue.push_back((edge.to.clone(), depth + 1));
+                    }
+                }
+            }
+            if let Some(edges) = self.backward.get(&current) {
+                for edge in edges {
+                    if visited.len() >= max_visited {
+                        break;
+                    }
+                    if visited.insert(edge.from.clone()) {
+                        queue.push_back((edge.from.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+        visited
+    }
+
     pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
         let mut visited = HashSet::new();
         let mut path = Vec::new();
