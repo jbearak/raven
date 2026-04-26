@@ -1141,11 +1141,9 @@ impl LanguageServer for Backend {
                 // rebuild/refresh so the user-visible "cleared N entries"
                 // count is meaningful even when `packages_enabled` triggers a
                 // full library rebuild. After a rebuild, `pkg_lib` points at a
-                // fresh empty library, so `refresh_packages_command_body`'s
-                // own `before` would always be 0 and its return value would
-                // under-report — even after evicting hundreds of stale
-                // entries. We compute the user-visible delta against the
-                // pre-rebuild count instead.
+                // fresh empty library whose `cached_count()` starts at 0.
+                // We compute the user-visible delta against the pre-rebuild
+                // count instead.
                 let before_count =
                     self.state.read().await.package_library.cached_count().await;
 
@@ -1170,69 +1168,14 @@ impl LanguageServer for Backend {
                 // no-op if watching is disabled or the library is not ready.
                 restart_libpath_watcher(&self.state, &self.client, true).await;
 
-                // Collect effective packages for warm prefetch AFTER rebuild
-                // so scope resolution uses the fresh state. Includes both
-                // direct loads (including function-local) and inherited
-                // packages from parent source() chains.
-                //
-                // Snapshot inputs under the read lock, then release it before
-                // running per-document scope resolution (AGENTS.md: "Diagnostic
-                // computation must not hold the RwLock read lock during
-                // expensive scope resolution").
-                let loaded_packages = {
-                    let (doc_packages, probe) = {
-                        let state = self.state.read().await;
-                        let mut doc_pkgs = std::collections::HashSet::new();
-                        let mut docs = Vec::new();
-                        for (uri, doc) in &state.documents {
-                            for p in &doc.loaded_packages {
-                                doc_pkgs.insert(p.clone());
-                            }
-                            let line = doc.text().lines().count().saturating_sub(1) as u32;
-                            docs.push((uri.clone(), line));
-                        }
-                        let snapshot = state.build_package_scope_snapshot(&docs);
-                        (doc_pkgs, snapshot)
-                    }; // read lock released
-
-                    let mut all_pkgs = doc_packages;
-                    let empty_base_exports = std::collections::HashSet::new();
-                    let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
-                    let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
-                    for (uri, line) in &probe.docs {
-                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
-                            uri,
-                            *line,
-                            u32::MAX,
-                            &get_artifacts,
-                            &get_metadata,
-                            &probe.graph,
-                            probe.workspace_folder.as_ref(),
-                            probe.max_chain_depth,
-                            &empty_base_exports,
-                            false,
-                            probe.backward_dependencies,
-                            &|| false,
-                        );
-                        for p in scope.inherited_packages {
-                            all_pkgs.insert(p);
-                        }
-                        for p in scope.loaded_packages {
-                            all_pkgs.insert(p);
-                        }
-                    }
-                    all_pkgs.into_iter().collect::<Vec<_>>()
-                };
-
+                // Clear the cache then compute the eviction count before
+                // warm-prefetching, so prefetched entries don't reduce the
+                // reported cleared count.
                 let pkg_lib = self.state.read().await.package_library.clone();
-                // Run the standard refresh body so `loaded_packages` is
-                // prefetched and the per-library `clear_cache` no-ops on the
-                // already-empty rebuilt library. Discard its return value: it
-                // is computed against the post-rebuild library and so is 0
-                // after a rebuild regardless of what was evicted.
-                let _ = refresh_packages_command_body(&pkg_lib, &loaded_packages).await;
+                pkg_lib.clear_cache().await;
                 let after_count = pkg_lib.cached_count().await;
                 let cleared = before_count.saturating_sub(after_count);
+                prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
                 log::info!("raven.refreshPackages: cleared {cleared} cache entries");
 
                 // Force-republish diagnostics for all open documents.
@@ -2663,6 +2606,14 @@ impl LanguageServer for Backend {
             restart_libpath_watcher(&self.state, &self.client, true).await;
         }
 
+        // Warm the package export cache before republishing diagnostics so
+        // the fresh (empty) library doesn't cause transient false-positive
+        // "unknown function" diagnostics for package exports.
+        if package_settings_changed && packages_enabled {
+            let pkg_lib = self.state.read().await.package_library.clone();
+            prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
+        }
+
         if scope_changed {
             log::trace!(
                 "Scope-affecting settings changed, revalidating {} open documents",
@@ -4041,14 +3992,73 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Core logic of the `raven.refreshPackages` command. Returns the number of
-/// cache entries that were net-evicted — `before_count - after_count` — which
-/// is the intuitive "how many stale entries got cleared and stayed cleared"
-/// number a user expects to see.
-///
-/// Because `prefetch_packages` is called after `clear_cache`, a workspace
-/// that had 8 cached packages and loads 6 of them across open documents will
-/// report `cleared = 2`, not `8`.
+/// Collect effective packages for all open documents (direct `library()` calls
+/// plus inherited packages from parent `source()` chains) and prefetch their
+/// exports into `pkg_lib`. Snapshots state under the read lock, releases it
+/// before running scope resolution (per AGENTS.md lock-hold invariant).
+pub(crate) async fn prefetch_packages_for_open_documents(
+    state_arc: &Arc<RwLock<WorldState>>,
+    pkg_lib: &Arc<crate::package_library::PackageLibrary>,
+) {
+    let (doc_packages, probe) = {
+        let state = state_arc.read().await;
+        let mut doc_pkgs = std::collections::HashSet::new();
+        let mut docs = Vec::new();
+        for (uri, doc) in &state.documents {
+            for p in &doc.loaded_packages {
+                doc_pkgs.insert(p.clone());
+            }
+            let line = doc.text().lines().count().saturating_sub(1) as u32;
+            docs.push((uri.clone(), line));
+        }
+        let snapshot = state.build_package_scope_snapshot(&docs);
+        (doc_pkgs, snapshot)
+    }; // read lock released
+
+    let mut all_pkgs = doc_packages;
+    let empty_base_exports = std::collections::HashSet::new();
+    let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
+    let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
+    for (uri, line) in &probe.docs {
+        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+            uri,
+            *line,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &probe.graph,
+            probe.workspace_folder.as_ref(),
+            probe.max_chain_depth,
+            &empty_base_exports,
+            false,
+            probe.backward_dependencies,
+            &|| false,
+        );
+        for p in scope.inherited_packages {
+            all_pkgs.insert(p);
+        }
+        for p in scope.loaded_packages {
+            all_pkgs.insert(p);
+        }
+    }
+
+    let packages: Vec<String> = all_pkgs
+        .into_iter()
+        .filter(|p| is_valid_package_name(p))
+        .collect();
+    if !packages.is_empty() {
+        log::trace!(
+            "Prefetching {} packages for {} open documents",
+            packages.len(),
+            probe.docs.len()
+        );
+        pkg_lib.prefetch_packages(&packages).await;
+    }
+}
+
+/// Core logic of the old `raven.refreshPackages` inline path. Retained for
+/// tests that verify the cleared-count accounting.
+#[cfg(test)]
 pub(crate) async fn refresh_packages_command_body(
     pkg_lib: &std::sync::Arc<crate::package_library::PackageLibrary>,
     loaded_packages_to_prefetch: &[String],
@@ -5759,6 +5769,131 @@ mod refresh_packages_tests {
              inherited={:?}, loaded={:?}",
             scope.inherited_packages,
             scope.loaded_packages
+        );
+    }
+
+    /// Regression for issue #106: after `rebuild_package_library` swaps in a
+    /// fresh (empty-cache) `PackageLibrary`, calling
+    /// `prefetch_packages_for_open_documents` must warm the cache so
+    /// diagnostics don't flash false-positive "unknown function" errors.
+    #[tokio::test]
+    async fn prefetch_warms_cache_after_rebuild() {
+        use crate::r_subprocess::RSubprocess;
+        use crate::state::{Document, WorldState};
+        use tokio::sync::RwLock;
+
+        // Skip if R is not available on this machine.
+        let Some(r_subprocess) = RSubprocess::new(None) else {
+            return;
+        };
+
+        // Build a real PackageLibrary with R subprocess.
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess));
+        if lib.initialize().await.is_err() || lib.lib_paths().is_empty() {
+            return; // R available but initialization failed
+        }
+        let pkg_lib = Arc::new(lib);
+
+        // Set up a WorldState with an open document that uses `library(stats)`.
+        let mut world = WorldState::new(vec![]);
+        world.package_library = pkg_lib.clone();
+        world.package_library_ready = true;
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        world.documents.insert(
+            uri.clone(),
+            Document::new("library(stats)\nmean(c(1,2,3))", Some(1)),
+        );
+        let state = Arc::new(RwLock::new(world));
+
+        // Prefetch should warm the cache for "stats".
+        prefetch_packages_for_open_documents(&state, &pkg_lib).await;
+        assert!(
+            pkg_lib.is_cached("stats").await,
+            "stats must be cached after prefetch"
+        );
+
+        // Simulate a rebuild: clear the cache, confirm it's empty, then
+        // re-prefetch and confirm it's warm again.
+        pkg_lib.clear_cache().await;
+        assert!(
+            !pkg_lib.is_cached("stats").await,
+            "stats must not be cached after clear"
+        );
+        prefetch_packages_for_open_documents(&state, &pkg_lib).await;
+        assert!(
+            pkg_lib.is_cached("stats").await,
+            "stats must be re-cached after second prefetch"
+        );
+    }
+
+    /// Integration test for issue #106: exercises the same sequence as
+    /// `did_change_configuration`'s `package_settings_changed` branch:
+    ///   rebuild_package_library → swap into state → prefetch → verify warm.
+    /// Uses MASS (a recommended package that ships with R but is NOT a base
+    /// package) so it starts uncached after rebuild — exactly the scenario
+    /// that caused transient false-positive diagnostics.
+    #[tokio::test]
+    async fn settings_change_rebuild_then_prefetch_warms_cache() {
+        use crate::r_subprocess::RSubprocess;
+        use crate::state::{Document, WorldState};
+        use tokio::sync::RwLock;
+
+        let Some(_) = RSubprocess::new(None) else {
+            return;
+        };
+
+        // 1. Set up state with an open document using library(MASS).
+        let mut world = WorldState::new(vec![]);
+        world.cross_file_config.packages_enabled = true;
+        let uri = Url::parse("file:///workspace/analysis.R").unwrap();
+        world.documents.insert(
+            uri.clone(),
+            Document::new("library(MASS)\nstepAIC(model)", Some(1)),
+        );
+        let state = Arc::new(RwLock::new(world));
+
+        // 2. Initial rebuild (simulates initialization).
+        let (lib_v1, ready_v1) = rebuild_package_library(&state).await;
+        if !ready_v1 {
+            return; // R available but lib_paths empty
+        }
+        // MASS is recommended (ships with R) but not base — skip if missing.
+        if lib_v1.find_package_directory("MASS").is_none() {
+            return;
+        }
+        {
+            let mut s = state.write().await;
+            s.package_library = lib_v1.clone();
+            s.package_library_ready = true;
+        }
+        prefetch_packages_for_open_documents(&state, &lib_v1).await;
+        assert!(
+            lib_v1.is_cached("MASS").await,
+            "MASS must be cached after initial prefetch"
+        );
+
+        // 3. Simulate did_change_configuration: rebuild swaps in a fresh library.
+        //    Base packages are pre-cached by initialize(), but MASS is NOT base,
+        //    so it starts uncached — this is the false-positive window.
+        let (lib_v2, ready_v2) = rebuild_package_library(&state).await;
+        assert!(ready_v2);
+        assert!(
+            !lib_v2.is_cached("MASS").await,
+            "MASS (non-base) must NOT be cached in fresh library"
+        );
+        {
+            let mut s = state.write().await;
+            s.package_library = lib_v2.clone();
+            s.package_library_ready = true;
+        }
+
+        // 4. Prefetch (the fix from issue #106).
+        prefetch_packages_for_open_documents(&state, &lib_v2).await;
+
+        // 5. Cache must be warm BEFORE diagnostics would run.
+        assert!(
+            lib_v2.is_cached("MASS").await,
+            "MASS must be cached after settings-change rebuild + prefetch"
         );
     }
 }
