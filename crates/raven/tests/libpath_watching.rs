@@ -17,7 +17,7 @@ fn make_pkg(root: &Path, name: &str) {
     std::fs::write(d.join("DESCRIPTION"), "Package: x\n").unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires reliable macOS FSEvents delivery; run with `cargo test -- --ignored`"]
 async fn install_triggers_cache_invalidation() {
     let t = tempdir().unwrap();
@@ -51,7 +51,7 @@ async fn install_triggers_cache_invalidation() {
     assert!(!lib.is_cached("foo").await);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires reliable FS notifications; run with `cargo test -- --ignored`"]
 async fn in_place_upgrade_triggers_cache_invalidation() {
     // Regression: under `NonRecursive` this case silently did nothing because
