@@ -898,7 +898,7 @@ impl LanguageServer for Backend {
                 ),
                 execute_command_provider: Some(
                     tower_lsp::lsp_types::ExecuteCommandOptions {
-                        commands: vec!["raven.refreshPackages".to_string()],
+                        commands: vec![],
                         ..Default::default()
                     },
                 ),
