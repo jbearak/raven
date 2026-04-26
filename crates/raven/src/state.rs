@@ -721,11 +721,17 @@ impl WorldState {
     ) -> crate::backend::ScopeProbeSnapshot {
         let max_depth = self.cross_file_config.max_chain_depth;
         let max_visited = self.cross_file_config.max_transitive_dependents_visited;
+        // Scale the shared visited budget with seed count so workspaces with many
+        // open files retain coverage equivalent to the old per-seed loop, capped to
+        // bound lock-hold time when the user has hundreds of files open.
+        let effective_max_visited = max_visited
+            .saturating_mul(docs.len().max(1))
+            .min(max_visited.saturating_mul(50));
 
         let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
             docs.iter().map(|(uri, _)| uri.clone()),
             max_depth,
-            max_visited,
+            effective_max_visited,
         );
 
         let content_provider = self.content_provider();
@@ -1535,5 +1541,80 @@ mod tests {
 
         config.hierarchical_document_symbol_support = false;
         assert!(!config.hierarchical_document_symbol_support);
+    }
+
+    #[test]
+    fn test_build_package_scope_snapshot_scales_budget_with_seed_count() {
+        // Regression test for the multi-seed BFS budget scaling in
+        // build_package_scope_snapshot. Without scaling, the shared
+        // max_transitive_dependents_visited budget would truncate the BFS
+        // before reaching every chain's deepest ancestor in workspaces with
+        // many open files — defeating the PR's goal of finding inherited
+        // packages from closed parents.
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use std::path::PathBuf;
+
+        const NUM_CHAINS: usize = 30;
+        const CHAIN_LEN: usize = 10;
+
+        let mut state = WorldState::new(vec![PathBuf::from("/tmp/raven-test-libpath")]);
+        assert_eq!(
+            state.cross_file_config.max_transitive_dependents_visited, 200,
+            "test assumes default per-seed budget of 200"
+        );
+        // 30 × 10 = 300 nodes total; with an unscaled shared budget of 200
+        // the BFS would truncate.
+        assert!(NUM_CHAINS * CHAIN_LEN > state.cross_file_config.max_transitive_dependents_visited);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let chain_url = |chain: usize, level: usize| -> Url {
+            Url::parse(&format!("file:///project/c{}_l{}.R", chain, level)).unwrap()
+        };
+
+        let mut seeds: Vec<(Url, u32)> = Vec::with_capacity(NUM_CHAINS);
+        for chain in 0..NUM_CHAINS {
+            for level in 0..CHAIN_LEN - 1 {
+                let parent = chain_url(chain, level);
+                let child_path = format!("c{}_l{}.R", chain, level + 1);
+                let meta = CrossFileMetadata {
+                    sources: vec![ForwardSource {
+                        path: child_path,
+                        line: 1,
+                        column: 0,
+                        is_directive: false,
+                        local: false,
+                        chdir: false,
+                        is_sys_source: false,
+                        sys_source_global_env: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                state
+                    .cross_file_graph
+                    .update_file(&parent, &meta, Some(&workspace_root), |_| None);
+            }
+            seeds.push((chain_url(chain, 0), 0));
+        }
+
+        let snapshot = state.build_package_scope_snapshot(&seeds);
+
+        // Walk each chain root → leaf via the snapshot's subgraph.
+        // If the budget truncated, get_dependencies returns empty mid-walk.
+        for chain in 0..NUM_CHAINS {
+            let mut current = chain_url(chain, 0);
+            for level in 0..CHAIN_LEN - 1 {
+                let deps = snapshot.graph.get_dependencies(&current);
+                assert!(
+                    !deps.is_empty(),
+                    "chain {} truncated at level {}: node {} missing from snapshot subgraph",
+                    chain,
+                    level,
+                    current
+                );
+                current = deps[0].to.clone();
+            }
+            assert_eq!(current, chain_url(chain, CHAIN_LEN - 1));
+        }
     }
 }
