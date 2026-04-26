@@ -92,12 +92,12 @@ On `LibpathEvent::Dropped`, the backend calls `clear_cache()`, force-republishes
 
 In `backend.rs`:
 
-1. After successful `PackageLibrary` init (around `backend.rs:1075`), spawn a `LibpathWatcher` over the list of paths the library was just initialized with.
-2. Spawn a consumer task that owns the `mpsc::Receiver<LibpathEvent>`. On each event it:
+1. After successful `PackageLibrary` init (around `backend.rs:1075`), spawn the consumer task **first** — it owns the `mpsc::Receiver<LibpathEvent>`. On each event it:
    - mutates `PackageLibrary` per Component 2,
    - builds the set of open document URIs whose effective package scope (inherited + global-scope + function-local loaded packages) intersects the trigger set,
    - schedules diagnostics for each affected URI via `publish_diagnostics_via_arc` (spawned per-URI).
-3. On settings change (`backend.rs:2403`), if libpaths changed, tear down the old watcher and spawn a new one.
+2. **Then** call `spawn_watcher` over the list of paths the library was just initialized with. Order matters: `spawn_watcher` may immediately send `LibpathEvent::Dropped` (e.g. if no libpath directories can be attached), so the consumer must already be listening on `rx` to execute the recovery path. Otherwise the `Dropped` event is lost and open documents keep stale diagnostics.
+3. On settings change (`backend.rs:2403`), if libpaths changed, tear down the old watcher and spawn a new one — same ordering: consumer first, then watcher.
 4. On shutdown, the watcher's task is aborted cleanly; the `Drop` impl on `RecommendedWatcher` unregisters inotify/FSEvents handles.
 
 ### Component 4: Manual refresh command
@@ -168,10 +168,10 @@ Integration tests (`crates/raven/tests/`):
 Non-goals for testing:
 - We do not run real `install.packages()` in CI. Tests simulate installs by creating the directory layout that `install.packages` would produce (`foo/DESCRIPTION`, `foo/NAMESPACE`).
 
-## Open questions
+## Resolved decisions
 
-- Should `packages.watchLibraryPaths = false` also disable the manual `raven.refreshPackages` command? Proposal: no — the command remains available as an escape hatch regardless.
-- Should we diff on directory listings only (cheap), or also stat `DESCRIPTION`/`NAMESPACE` mtimes to detect in-place updates? Proposal: directory listing only for v1 — package updates typically recreate the directory or at least rewrite `DESCRIPTION`, which triggers a notify event anyway.
+- `packages.watchLibraryPaths = false` does **not** disable the manual `raven.refreshPackages` command. The command remains unconditionally available as an escape hatch regardless of the watch setting.
+- v1 detects changes via directory-listing diffs plus the `touched` set derived from the drained `notify` event paths during the debounce window. We do **not** stat `DESCRIPTION`/`NAMESPACE` mtimes — recursive watching catches in-place rewrites as touch events, and full reinstalls always produce a listing delta or a directory-content event.
 
 ## Build order
 

@@ -220,6 +220,11 @@ mod tests {
         assert!(config.hoist_globals_in_functions);
         // Backward dependencies default
         assert_eq!(config.backward_dependencies, BackwardDependencyMode::Auto);
+        // Libpath watcher defaults — keep in sync with parse_cross_file_config
+        // (which clamps debounce to [100, 5000]) and the VS Code extension's
+        // initializationOptions.
+        assert!(config.packages_watch_library_paths);
+        assert_eq!(config.packages_watch_debounce_ms, 500);
     }
 
     #[test]

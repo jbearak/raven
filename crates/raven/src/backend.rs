@@ -4084,11 +4084,19 @@ pub(crate) async fn rebuild_package_library(
     .unwrap_or(None);
 
     let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-    if let Err(e) = lib.initialize().await {
+    let initialized = match lib.initialize().await {
+        Ok(()) => true,
+        Err(e) => {
             log::warn!("rebuild_package_library: initialize failed: {e}");
-    }
+            false
+        }
+    };
     lib.add_library_paths(&additional_paths);
-    let ready = !lib.lib_paths().is_empty();
+    // Readiness requires both a successful initialize() and non-empty
+    // lib_paths(): otherwise downstream code would treat a half-initialized
+    // library (e.g. R subprocess unavailable) as ready and emit false-positive
+    // missing-package diagnostics.
+    let ready = initialized && !lib.lib_paths().is_empty();
     (Arc::new(lib), ready)
 }
 

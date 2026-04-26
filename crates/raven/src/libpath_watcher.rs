@@ -655,7 +655,7 @@ mod watcher_tests {
 
     #[tokio::test]
     async fn watcher_returns_none_when_no_paths_attach() {
-        let (tx, _rx) = mpsc::channel::<LibpathEvent>(16);
+        let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
         // Non-existent path should fail to attach on all platforms.
         let handle = spawn_watcher(
             vec![PathBuf::from("/raven/nonexistent/xyz-abc")],
@@ -663,6 +663,15 @@ mod watcher_tests {
             tx,
         );
         assert!(handle.is_none());
+        // Contract: when no paths attach, spawn_watcher must emit Dropped on the
+        // provided sender so the backend's consumer can run its recovery path
+        // (clear cache, force-republish diagnostics) instead of silently going
+        // dark.
+        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("Dropped delivered before timeout")
+            .expect("channel still open");
+        assert!(matches!(evt, LibpathEvent::Dropped));
     }
 }
 

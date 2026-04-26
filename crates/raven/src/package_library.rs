@@ -3481,6 +3481,17 @@ mod tests {
         // (not dplyr) directly.
         assert!(invalidated.contains("tidyverse"));
         assert!(invalidated.contains("dplyr"));
+
+        // invalidate_many must drop combined_exports entries but preserve the
+        // per-package PackageInfo cache: the meta-package itself still exists
+        // on disk, so its individual entry should remain available for
+        // subsequent re-aggregation.
+        drop(combined);
+        let packages = lib.packages.read().await;
+        assert!(
+            packages.contains_key("tidyverse"),
+            "PackageInfo for tidyverse must survive invalidate_many"
+        );
     }
 
     #[tokio::test]
