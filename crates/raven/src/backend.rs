@@ -1168,14 +1168,14 @@ impl LanguageServer for Backend {
                 // no-op if watching is disabled or the library is not ready.
                 restart_libpath_watcher(&self.state, &self.client, true).await;
 
-                // Clear the cache (no-ops on the already-empty rebuilt
-                // library) then warm-prefetch exports for all open documents
-                // so diagnostics don't flash false positives.
+                // Clear the cache then compute the eviction count before
+                // warm-prefetching, so prefetched entries don't reduce the
+                // reported cleared count.
                 let pkg_lib = self.state.read().await.package_library.clone();
                 pkg_lib.clear_cache().await;
-                prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
                 let after_count = pkg_lib.cached_count().await;
                 let cleared = before_count.saturating_sub(after_count);
+                prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
                 log::info!("raven.refreshPackages: cleared {cleared} cache entries");
 
                 // Force-republish diagnostics for all open documents.
@@ -4042,7 +4042,10 @@ pub(crate) async fn prefetch_packages_for_open_documents(
         }
     }
 
-    let packages: Vec<String> = all_pkgs.into_iter().collect();
+    let packages: Vec<String> = all_pkgs
+        .into_iter()
+        .filter(|p| is_valid_package_name(p))
+        .collect();
     if !packages.is_empty() {
         log::trace!(
             "Prefetching {} packages for {} open documents",
