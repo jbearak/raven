@@ -427,7 +427,7 @@ pub fn spawn_watcher(
     let raw_rx = Arc::new(StdMutex::new(raw_rx));
     let task = tokio::spawn(async move {
         let snapshot = Arc::new(tokio::sync::Mutex::new(initial_snap));
-        debounce_loop(raw_rx, snapshot, attached, debounce, tx).await;
+        debounce_loop(raw_rx, snapshot, Arc::new(attached), debounce, tx).await;
     });
 
     Some(LibpathWatcherHandle {
@@ -439,7 +439,7 @@ pub fn spawn_watcher(
 async fn debounce_loop(
     raw_rx: Arc<StdMutex<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>>,
     snapshot: Arc<tokio::sync::Mutex<LibpathSnapshot>>,
-    paths: Vec<PathBuf>,
+    paths: Arc<Vec<PathBuf>>,
     debounce: Duration,
     tx: mpsc::Sender<LibpathEvent>,
 ) {
