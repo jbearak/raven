@@ -417,11 +417,12 @@ pub fn spawn_watcher(
         return None;
     }
 
-    // Capture the initial snapshot synchronously before returning so that any
-    // filesystem events queued between watcher registration and task startup
-    // are correctly detected as deltas instead of being absorbed into a
-    // later-taken baseline.
-    let initial_snap = LibpathSnapshot::capture(&attached);
+    // Capture the initial snapshot before returning so that any filesystem
+    // events queued between watcher.watch() and task startup are correctly
+    // detected as deltas. block_in_place signals tokio that this thread is
+    // about to block, allowing it to move other tasks off this worker.
+    let initial_snap =
+        tokio::task::block_in_place(|| LibpathSnapshot::capture(&attached));
 
     let raw_rx = Arc::new(StdMutex::new(raw_rx));
     let task = tokio::spawn(async move {
