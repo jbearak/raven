@@ -552,7 +552,7 @@ mod watcher_tests {
         std::fs::write(d.join("DESCRIPTION"), "Package: x\n").unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires reliable macOS FSEvents delivery; run with `cargo test -- --ignored`"]
     async fn watcher_emits_added_on_new_package() {
         let t = tempdir().unwrap();
@@ -585,7 +585,7 @@ mod watcher_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires reliable FS notifications; run with `cargo test -- --ignored`"]
     async fn watcher_emits_touched_on_in_place_upgrade() {
         // Regression for the NonRecursive → Recursive switch: rewriting files
@@ -639,7 +639,7 @@ mod watcher_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires reliable macOS FSEvents delivery; run with `cargo test -- --ignored`"]
     async fn watcher_emits_removed_on_package_deletion() {
         let t = tempdir().unwrap();
@@ -671,7 +671,7 @@ mod watcher_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn watcher_returns_none_when_no_paths_attach() {
         let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
         // Non-existent path should fail to attach on all platforms.
