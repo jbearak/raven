@@ -4527,9 +4527,13 @@ fn collect_missing_package_diagnostics(
     if !state.package_library_ready {
         return;
     }
-    // If R subprocess is unavailable, package existence checks are filesystem-only
-    // and can be unreliable across environments; avoid false positives.
-    if state.package_library.r_subprocess().is_none() {
+    // Suppress only when we have no information about installed packages — both
+    // an empty lib_paths and a missing r_subprocess. With non-empty lib_paths
+    // (even from get_fallback_lib_paths()) `package_exists()` is reliable, so
+    // emit regardless of whether an R subprocess is currently attached.
+    if state.package_library.lib_paths().is_empty()
+        && state.package_library.r_subprocess().is_none()
+    {
         return;
     }
     let severity = match state.cross_file_config.packages_missing_package_severity {
@@ -4846,7 +4850,13 @@ fn collect_missing_package_diagnostics_from_snapshot(
     if !snapshot.package_library_ready {
         return;
     }
-    if snapshot.package_library.r_subprocess().is_none() {
+    // Suppress only when we have no information about installed packages — both
+    // an empty lib_paths and a missing r_subprocess. With non-empty lib_paths
+    // (even from get_fallback_lib_paths()) `package_exists()` is reliable, so
+    // emit regardless of whether an R subprocess is currently attached.
+    if snapshot.package_library.lib_paths().is_empty()
+        && snapshot.package_library.r_subprocess().is_none()
+    {
         return;
     }
     let Some(severity) = snapshot.cross_file_config.packages_missing_package_severity else {
@@ -32650,6 +32660,50 @@ result <- helper_with_spaces(42)"#;
             0,
             "Should suppress missing-package diagnostics when R subprocess is unavailable"
         );
+    }
+
+    #[test]
+    fn test_missing_package_diagnostic_emitted_with_lib_paths_but_no_r_subprocess() {
+        // Cold-start scenario: ensure_package_library_initialized() runs
+        // RSubprocess::new() synchronously on the async thread and can fail to
+        // discover R (where `initialized()` via spawn_blocking would succeed).
+        // When that happens, lib.initialize() still populates lib_paths from
+        // get_fallback_lib_paths(), so package_library_ready is set to true with
+        // r_subprocess = None. The "Package not installed" diagnostic must still
+        // emit because package existence is determined by lib_paths, not by
+        // whether an R subprocess is available.
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("raven_test_no_subprocess_lib_paths");
+        fs::create_dir_all(&tmp).expect("create tmp lib_path");
+
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls
+            .push(crate::cross_file::source_detect::LibraryCall {
+                package: "__raven_not_installed__".to_string(),
+                line: 0,
+                column: 30,
+                function_scope: None,
+            });
+
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.clone()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit missing-package diagnostic when lib_paths are populated even if r_subprocess is None"
+        );
+        assert!(diagnostics[0].message.contains("__raven_not_installed__"));
+        assert!(diagnostics[0].message.contains("not installed"));
     }
 
     // ============================================================================
