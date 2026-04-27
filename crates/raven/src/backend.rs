@@ -3952,7 +3952,8 @@ impl Backend {
         )
         .await;
 
-        // Re-check freshness after async work to avoid publishing stale diagnostics
+        // Re-check freshness after async work, atomically commit gate state, before publishing.
+        // try_consume_publish replaces the racy can_publish + record_publish pair.
         {
             let state = self.state.read().await;
             if let Some(ver) = version {
@@ -3966,7 +3967,7 @@ impl Backend {
                     );
                     return;
                 }
-                if !state.diagnostics_gate.can_publish(uri, ver) {
+                if !state.diagnostics_gate.try_consume_publish(uri, ver) {
                     log::trace!(
                         "Skipping diagnostics for {}: monotonic gate after async (version={})",
                         uri,
@@ -3974,14 +3975,6 @@ impl Backend {
                     );
                     return;
                 }
-            }
-        }
-
-        // Record the publish (uses interior mutability, no write lock needed)
-        {
-            let state = self.state.read().await;
-            if let Some(ver) = version {
-                state.diagnostics_gate.record_publish(uri, ver);
             }
         }
 
