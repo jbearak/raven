@@ -643,6 +643,50 @@ mod tests {
     }
 
     #[test]
+    fn test_gate_try_consume_publish_atomic_under_concurrency() {
+        // Contract test: each thread marks once, then races on
+        // try_consume_publish at the same version. Asserts successes == N
+        // (one publish per mark). Documents the per-marker contract under
+        // contention.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let gate = Arc::new(CrossFileDiagnosticsGate::new());
+        let uri = test_uri("test.R");
+
+        gate.record_publish(&uri, 1);
+
+        const N_THREADS: usize = 32;
+        let barrier = Arc::new(Barrier::new(N_THREADS));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(N_THREADS);
+
+        for _ in 0..N_THREADS {
+            let gate = gate.clone();
+            let uri = uri.clone();
+            let barrier = barrier.clone();
+            let successes = successes.clone();
+            handles.push(thread::spawn(move || {
+                gate.mark_force_republish(&uri);
+                barrier.wait();
+                if gate.try_consume_publish(&uri, 1) {
+                    successes.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Relaxed),
+            N_THREADS,
+            "Each of N marks should permit exactly one publish"
+        );
+    }
+
+    #[test]
     fn test_gate_clear_resets_state() {
         let gate = CrossFileDiagnosticsGate::new();
         let uri = test_uri("test.R");
