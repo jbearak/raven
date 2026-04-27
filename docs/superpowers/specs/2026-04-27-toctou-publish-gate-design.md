@@ -107,7 +107,7 @@ These advisory checks take cheap concurrent read locks. They exist to bail out b
 
 - `cross_file/property_tests.rs` — `record_publish` / `can_publish` used as setup primitives that exercise the gate's predicate semantics directly.
 - `backend.rs:5629-5659` — test fixtures.
-- `revalidation.rs` `mod tests` — existing 17 gate tests.
+- `revalidation.rs` `mod tests` — existing gate tests (including `test_gate_clear_resets_state` and the rest of the pre-existing `test_gate_*` suite). Test A and Test B below are added alongside them.
 
 ## Test plan
 

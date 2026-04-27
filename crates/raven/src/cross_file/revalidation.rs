@@ -655,10 +655,16 @@ mod tests {
 
     #[test]
     fn test_gate_try_consume_publish_atomic_under_concurrency() {
-        // Contract test: each thread marks once, then races on
-        // try_consume_publish at the same version. Asserts successes == N
-        // (one publish per mark). Documents the per-marker contract under
-        // contention.
+        // Contract test: each thread marks once via mark_force_republish, then
+        // races on try_consume_publish at the same version. Asserts
+        // successes == N (one publish per mark). Documents the per-mark
+        // contract under contention.
+        //
+        // Contrast with test_gate_try_consume_publish_no_excess_with_pre_marked_state,
+        // which asserts the inverse: with one pre-set marker and N racing
+        // try_consume_publish callers, exactly one publish must succeed
+        // (no excess). Together they pin both directions of the per-marker
+        // invariant: marks and successful consumes are 1:1.
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
         use std::thread;
