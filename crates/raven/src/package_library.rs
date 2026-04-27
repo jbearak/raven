@@ -1304,29 +1304,28 @@ impl PackageLibrary {
 
     /// Check if a package exists (is installed)
     ///
-    /// This is a synchronous method that checks if a package is installed by:
+    /// This is a synchronous method that checks installation by:
     /// 1. Checking if it's a base package (always available)
-    /// 2. Checking if it's already in the cache
-    /// 3. Checking if it exists on the filesystem in any lib_path
+    /// 2. Calling `find_package_directory()` to check for the package on the
+    ///    filesystem in any `lib_path`.
     ///
-    /// This method does NOT load the package into cache - it only checks existence.
-    /// Use `get_package()` to load and cache package information.
+    /// Existence is determined by the filesystem only — this method NEVER
+    /// consults the in-memory cache. `prefetch_packages()` inserts an empty-
+    /// exports entry for any package whose namespace fails to load (the R
+    /// query swallows `asNamespace()` errors via `tryCatch`), so a cached
+    /// entry does NOT prove the package is installed. Trusting the cache here
+    /// would permanently suppress "Package 'X' is not installed" diagnostics
+    /// for any uninstalled package mentioned in a `library()` call after the
+    /// first prefetch pass.
+    ///
+    /// This method does NOT load the package into cache — it only checks
+    /// existence. Use `get_package()` to load and cache package information.
     ///
     /// **Validates: Requirement 15.1** - Used to detect non-installed packages for diagnostics
     pub fn package_exists(&self, name: &str) -> bool {
-        // Base packages are always available
         if self.base_packages.contains(name) {
             return true;
         }
-
-        // Existence is determined by the filesystem only — never the cache.
-        // `prefetch_packages()` will insert an empty-exports entry for any
-        // package that R fails to load (the R query swallows
-        // `asNamespace()` errors via `tryCatch`), so a cached entry does
-        // NOT prove the package is installed. Trusting the cache here would
-        // permanently suppress "Package 'X' is not installed" diagnostics
-        // for any uninstalled package mentioned in a `library()` call after
-        // the first prefetch pass.
         self.find_package_directory(name).is_some()
     }
 

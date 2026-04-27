@@ -1016,8 +1016,28 @@ impl LanguageServer for Backend {
                         // undefined-variable diagnostics for genuinely-uninstalled
                         // packages — e.g. `library(lme4); lmer()` is silenced if the
                         // parent chain loads other (installed but uncached) packages.
-                        if packages_enabled {
-                            prefetch_packages_for_open_documents(&state_clone, &pkg_lib).await;
+                        //
+                        // If `packages_enabled` was false at capture time the scan
+                        // raced ahead of Task B (PackageLibrary init); the captured
+                        // `pkg_lib` is the empty default Arc and Task B has since
+                        // swapped `state.package_library` with a fresh Arc. Re-read
+                        // the live library so prefetch warms the right cache instead
+                        // of an orphaned one.
+                        let (effective_pkg_lib, effective_packages_enabled) = if packages_enabled
+                        {
+                            (pkg_lib, true)
+                        } else {
+                            let state = state_clone.read().await;
+                            let enabled = state.cross_file_config.packages_enabled
+                                && state.package_library_ready;
+                            (state.package_library.clone(), enabled)
+                        };
+                        if effective_packages_enabled {
+                            prefetch_packages_for_open_documents(
+                                &state_clone,
+                                &effective_pkg_lib,
+                            )
+                            .await;
                         }
 
                         // Revalidate all open documents to pick up auto-detected backward edges

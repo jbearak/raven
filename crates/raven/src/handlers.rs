@@ -5187,10 +5187,11 @@ fn collect_undefined_variables_from_snapshot(
         // package mentioned in importFrom() is not on disk) must NOT silence
         // the diagnostic — the symbol won't actually be loadable at runtime.
         if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
-            if pkgs
-                .iter()
-                .any(|p| snapshot.package_library.package_exists(p))
-            {
+            if pkgs.iter().any(|p| {
+                *package_exists_memo
+                    .entry((*p).to_string())
+                    .or_insert_with(|| snapshot.package_library.package_exists(p))
+            }) {
                 continue;
             }
         }
@@ -7930,7 +7931,11 @@ pub(crate) fn collect_undefined_variables_position_aware(
         // package mentioned in importFrom() is not on disk) must NOT silence
         // the diagnostic — the symbol won't actually be loadable at runtime.
         if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
-            if pkgs.iter().any(|p| package_library.package_exists(p)) {
+            if pkgs.iter().any(|p| {
+                *package_exists_memo
+                    .entry((*p).to_string())
+                    .or_insert_with(|| package_library.package_exists(p))
+            }) {
                 continue;
             }
         }
