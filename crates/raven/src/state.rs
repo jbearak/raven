@@ -1239,7 +1239,21 @@ fn scan_directory(
     }
 }
 
-/// Parse NAMESPACE imports without needing Library reference
+/// Parse NAMESPACE imports without needing a `Library` reference.
+///
+/// Only handles `importFrom(pkg, sym, ...)`: it returns concrete `(package, symbol)`
+/// pairs that downstream diagnostic suppression can match by name. `import(pkg)`
+/// (whole-namespace import) is intentionally skipped here because expanding it
+/// requires reading `pkg`'s exports, which this parser has no access to during the
+/// initial workspace scan (the `PackageLibrary` may not be initialized yet, and
+/// even when it is, this function is called from a sync `scan_directory` path).
+///
+/// The Library-aware variant `parse_namespace_imports` (above) does expand
+/// `import(pkg)`. If a workspace package uses `import(pkg)` to re-export an
+/// entire namespace, symbols imported that way will not appear in
+/// `state.workspace_imports` and therefore will not silence undefined-variable
+/// diagnostics — users will see them flagged. This is a known limitation;
+/// `importFrom()` is the dominant pattern in practice (≥99% of CRAN packages).
 fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
     let mut imports = Vec::new();
 
@@ -1247,6 +1261,7 @@ fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
         let line = line.trim();
 
         // importFrom(pkg, sym1, sym2, ...)
+        // import(pkg) is not handled here — see function docs.
         if line.starts_with("importFrom(") {
             if let Some(args) = line
                 .strip_prefix("importFrom(")
