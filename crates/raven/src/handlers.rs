@@ -5058,14 +5058,17 @@ fn collect_undefined_variables_from_snapshot(
     use crate::cross_file::config::BackwardDependencyMode;
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    match snapshot.cross_file_config.backward_dependencies {
-        BackwardDependencyMode::Auto => {
-            if snapshot.directive_meta.sourced_by.is_empty() && !snapshot.workspace_scan_complete {
-                return;
-            }
-        }
-        BackwardDependencyMode::Explicit => {}
-    }
+    // Auto + no @lsp-sourced-by + scan-in-progress: backward-dependency edges
+    // may not be visible yet, so symbols that could be inherited from a parent
+    // file must wait for the scan to finish. Per-identifier deferral happens
+    // just before emission (search for `defer_pending_workspace_scan`) — the
+    // collector still runs because package-related function calls are
+    // determined by the local file alone and can be emitted immediately.
+    let defer_pending_workspace_scan = matches!(
+        snapshot.cross_file_config.backward_dependencies,
+        BackwardDependencyMode::Auto
+    ) && snapshot.directive_meta.sourced_by.is_empty()
+        && !snapshot.workspace_scan_complete;
 
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
@@ -5294,6 +5297,23 @@ fn collect_undefined_variables_from_snapshot(
                     || !scope.inherited_packages.is_empty()
                     || has_prior_library_call)
             {
+                continue;
+            }
+        }
+
+        // Per-identifier deferral when the workspace scan is still running.
+        // Function calls clearly tied to a local library()/require()/loadNamespace()
+        // are package-related and don't depend on backward-dependency resolution,
+        // so we emit them immediately. Other symbols may be inherited from a
+        // parent file we haven't indexed yet — defer those until the scan
+        // finishes and the post-scan republish kicks in.
+        if defer_pending_workspace_scan {
+            let is_package_call = is_function_call_identifier_textually(usage_node, text)
+                && has_prior_package_loader_call(
+                    &package_loader_call_end_offsets,
+                    usage_node.start_byte(),
+                );
+            if !is_package_call {
                 continue;
             }
         }
@@ -7753,19 +7773,17 @@ pub(crate) fn collect_undefined_variables_position_aware(
     };
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    // Backward dependency mode gating:
-    // - Auto + no backward directives + workspace scan incomplete: defer diagnostics
-    // - Explicit: proceed without waiting for workspace scan
-    match state.cross_file_config.backward_dependencies {
-        BackwardDependencyMode::Auto => {
-            if directive_meta.sourced_by.is_empty() && !state.workspace_scan_complete {
-                // Defer: the workspace scan hasn't finished building the dependency
-                // graph yet, so auto-inferred backward edges may not be available.
-                return;
-            }
-        }
-        BackwardDependencyMode::Explicit => {} // proceed normally
-    }
+    // Auto + no @lsp-sourced-by + scan-in-progress: backward-dependency edges
+    // may not be visible yet, so symbols that could be inherited from a parent
+    // file must wait for the scan to finish. Per-identifier deferral happens
+    // just before emission (search for `defer_pending_workspace_scan`) — the
+    // collector still runs because package-related function calls are
+    // determined by the local file alone and can be emitted immediately.
+    let defer_pending_workspace_scan = matches!(
+        state.cross_file_config.backward_dependencies,
+        BackwardDependencyMode::Auto
+    ) && directive_meta.sourced_by.is_empty()
+        && !state.workspace_scan_complete;
 
     let mut used: Vec<(String, Node)> = Vec::new();
 
@@ -8082,6 +8100,23 @@ pub(crate) fn collect_undefined_variables_position_aware(
                     || !scope.inherited_packages.is_empty()
                     || has_prior_library_call)
             {
+                continue;
+            }
+        }
+
+        // Per-identifier deferral when the workspace scan is still running.
+        // Function calls clearly tied to a local library()/require()/loadNamespace()
+        // are package-related and don't depend on backward-dependency resolution,
+        // so we emit them immediately. Other symbols may be inherited from a
+        // parent file we haven't indexed yet — defer those until the scan
+        // finishes and the post-scan republish kicks in.
+        if defer_pending_workspace_scan {
+            let is_package_call = is_function_call_identifier_textually(usage_node, text)
+                && has_prior_package_loader_call(
+                    &package_loader_call_end_offsets,
+                    usage_node.start_byte(),
+                );
+            if !is_package_call {
                 continue;
             }
         }
@@ -35343,6 +35378,69 @@ my_func <- function(a = default_value) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: __pending_fn__"),
             "Package call target should be suppressed while package cache is pending: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_lmer_flagged_after_prefetch_caches_empty_exports() {
+        // Cold-start reproduction: did_open fires while the background workspace
+        // scan is still running, so workspace_scan_complete = false. The file
+        // has no @lsp-sourced-by directive, so backward dependencies (Auto mode)
+        // can't be resolved yet. The undefined-variable collector must still
+        // flag package function calls — they don't depend on backward-dependency
+        // resolution, only on the local library() call and the package cache.
+        //
+        // Additionally: prefetch_packages() inserts an empty-exports cache
+        // entry for any package R can't load (asNamespace error swallowed by
+        // tryCatch). is_cached_sync("lme4") = true → package_cache_pending =
+        // false (good, no false-pending suppression). is_package_export("lmer",
+        // ["lme4"]) = false because the cached entry has empty exports.
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        // Reproduce the actual cold-start state: scan still running.
+        state.workspace_scan_complete = false;
+
+        let pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        // Simulate prefetch caching lme4 with empty exports (R returned nothing
+        // for it because asNamespace("lme4") threw and tryCatch swallowed).
+        pkg_lib
+            .insert_package(crate::package_library::PackageInfo::new(
+                "lme4".to_string(),
+                std::collections::HashSet::new(),
+            ))
+            .await;
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(lme4)\nlmer()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: lmer"),
+            "lmer must be flagged as undefined even when its package is cached with empty exports: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
