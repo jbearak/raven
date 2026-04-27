@@ -753,7 +753,11 @@ async fn run_debounced_diagnostics(
         return;
     }
 
-    // Second freshness check before publishing
+    // Second freshness check + atomic gate commit before publishing.
+    // try_consume_publish takes write locks on the gate's maps, evaluates the
+    // same predicate as can_publish, and on success updates last_published
+    // and consumes one force-republish marker — closing the race where
+    // two same-version publishes could share one marker.
     let can_publish = {
         let state = state_arc.read().await;
         let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
@@ -762,7 +766,9 @@ async fn run_debounced_diagnostics(
         if current_version != trigger_version || current_revision != trigger_revision {
             false
         } else if let Some(ver) = current_version {
-            state.diagnostics_gate.can_publish(&affected_uri, ver)
+            state
+                .diagnostics_gate
+                .try_consume_publish(&affected_uri, ver)
         } else {
             true
         }
@@ -774,9 +780,6 @@ async fn run_debounced_diagnostics(
             .await;
 
         let state = state_arc.read().await;
-        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
-            state.diagnostics_gate.record_publish(&affected_uri, ver);
-        }
         state.cross_file_revalidation.complete(&affected_uri);
     }
 }
