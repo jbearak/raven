@@ -5139,6 +5139,9 @@ fn collect_undefined_variables_from_snapshot(
         })
         .collect();
     let mut source_exports_cache: HashMap<Url, HashSet<String>> = HashMap::new();
+    // Memoize package_exists() — it does filesystem I/O — so each unique package
+    // name is checked at most once across all identifiers in this diagnostic pass.
+    let mut package_exists_memo: HashMap<String, bool> = HashMap::new();
 
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
@@ -5246,9 +5249,18 @@ fn collect_undefined_variables_from_snapshot(
                 usage_node.start_byte(),
             );
             let has_cross_file_packages = !scope.inherited_packages.is_empty();
-            let package_cache_pending = position_aware_packages
-                .iter()
-                .any(|pkg| !snapshot.package_library.is_cached_sync(pkg));
+            // A package is "pending" only when it is installed but its exports have
+            // not yet been loaded into cache — not when it is simply not installed.
+            // Using package_exists() guards against treating a permanently-missing
+            // package as one that will eventually be cached.
+            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
+                if snapshot.package_library.is_cached_sync(pkg) {
+                    return false;
+                }
+                *package_exists_memo
+                    .entry(pkg.clone())
+                    .or_insert_with(|| snapshot.package_library.package_exists(pkg))
+            });
             if (has_prior_library_call || has_cross_file_packages)
                 && package_cache_pending
                 && is_function_call_identifier_textually(usage_node, text)
@@ -7829,6 +7841,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
         Url,
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
+    let mut package_exists_memo: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
 
     // Pre-compute parent scope at (0, 0) to avoid per-position graph traversal
     // for symbols inherited from parent files. At position (0, 0), scope resolution
@@ -8003,9 +8017,16 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 &package_loader_call_end_offsets,
                 usage_node.start_byte(),
             );
-            let package_cache_pending = position_aware_packages
-                .iter()
-                .any(|pkg| !package_library.is_cached_sync(pkg));
+            // A package is "pending" only when it is installed but its exports
+            // have not yet been cached — not when it is simply not installed.
+            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
+                if package_library.is_cached_sync(pkg) {
+                    return false;
+                }
+                *package_exists_memo
+                    .entry(pkg.clone())
+                    .or_insert_with(|| package_library.package_exists(pkg))
+            });
             if has_prior_library_call
                 && (position_aware_packages.is_empty() || package_cache_pending)
                 && is_function_call_identifier_textually(usage_node, text)
@@ -35222,11 +35243,73 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn test_package_function_call_not_flagged_while_package_cache_pending() {
+        // When a package is installed (exists on the filesystem) but its exports
+        // have not been loaded into cache yet, function calls from that package
+        // must be suppressed to avoid false positives during async cache loading.
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("raven_test_cache_pending");
+        let pkg_dir = tmp.join("__raven_pending_pkg__");
+        fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
+        fs::write(pkg_dir.join("DESCRIPTION"), "Package: __raven_pending_pkg__\n")
+            .expect("write DESCRIPTION");
+
         let mut state = create_test_state();
         state.package_library_ready = true;
         state.cross_file_config.packages_enabled = true;
 
-        let code = "library(openxlsx)\nwb <- createWorkbook()\n";
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.clone()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(__raven_pending_pkg__)\n__pending_fn__()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: __pending_fn__"),
+            "Package call target should be suppressed while package cache is pending: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_uninstalled_package_function_flagged_as_undefined() {
+        // When a package is not installed (no lib_path contains it), functions from
+        // that package must be flagged as undefined — the pending-load suppression
+        // must not fire for packages that simply don't exist.
+        // Regression: previously is_cached_sync() alone was used to detect "pending",
+        // so a never-installed package (also never cached) was silently suppressed.
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        // Default PackageLibrary (new_empty) has no lib_paths, so package_exists()
+        // returns false for any package — simulates uninstalled package.
+
+        let code = "library(__raven_fake_pkg__)\n__raven_fake_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let directive_meta = parse_directives(code);
@@ -35247,10 +35330,65 @@ my_func <- function(a = default_value) {
         );
 
         assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: __raven_fake_fn__"),
+            "Functions from not-installed packages must be flagged as undefined: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_installed_but_uncached_package_function_not_flagged() {
+        // When a package IS installed (directory present in a lib_path) but its
+        // exports have not been loaded into cache yet, functions from that package
+        // must NOT be flagged as undefined — the pending-load suppression should fire.
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("raven_test_installed_pkg");
+        let pkg_dir = tmp.join("__raven_installed_pkg__");
+        fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
+        fs::write(pkg_dir.join("DESCRIPTION"), "Package: __raven_installed_pkg__\n")
+            .expect("write DESCRIPTION");
+
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.clone()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(__raven_installed_pkg__)\n__installed_fn__()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: createWorkbook"),
-            "Package call target should be suppressed while package cache is pending: {:?}",
+                .any(|d| d.message == "Undefined variable: __installed_fn__"),
+            "Functions from installed-but-uncached packages must be suppressed while pending: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
