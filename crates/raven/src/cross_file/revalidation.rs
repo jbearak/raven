@@ -61,14 +61,26 @@ impl CrossFileRevalidationState {
     }
 }
 
+/// Upper bound on outstanding force-republish markers per URI.
+///
+/// The counter exists so that N concurrent marks each get one matching publish
+/// through the gate (see `CrossFileDiagnosticsGate`). In pathological cases a
+/// document could accumulate marks faster than they are consumed (e.g. a
+/// publish that bails before `record_publish` after the document version
+/// changes). Past this cap further marks are coalesced — beyond 64 outstanding
+/// republishes the document is being thrashed and "republish at least once
+/// more" is enough.
+const MAX_FORCE_REPUBLISH: u32 = 64;
+
 /// Diagnostics publish gating to enforce monotonic publishing
 ///
 /// `force_republish` is a counter, not a set: each `mark_force_republish` adds
-/// one to the count, and each `record_publish` decrements it (saturating at 0).
-/// Force is "active" while count > 0. The counter avoids a race where a single
-/// publish can swallow multiple concurrent forced-republish requests, leaving
-/// later publishes blocked at the same version. Each marker reliably gets one
-/// matching publish through the gate.
+/// one to the count (clamped to `MAX_FORCE_REPUBLISH`), and each
+/// `record_publish` decrements it (saturating at 0). Force is "active" while
+/// count > 0. The counter avoids a race where a single publish can swallow
+/// multiple concurrent forced-republish requests, leaving later publishes
+/// blocked at the same version. Each marker reliably gets one matching publish
+/// through the gate.
 #[derive(Debug, Default)]
 pub struct CrossFileDiagnosticsGate {
     /// Last published document version per URI
@@ -121,11 +133,20 @@ impl CrossFileDiagnosticsGate {
         }
     }
 
-    /// Mark a URI for forced republish (increments the outstanding marker count)
+    /// Mark a URI for forced republish (increments the outstanding marker count
+    /// up to `MAX_FORCE_REPUBLISH`).
     pub fn mark_force_republish(&self, uri: &Url) {
         let mut force = self.force_republish.write().unwrap();
         let count = force.entry(uri.clone()).or_insert(0);
-        *count = count.saturating_add(1);
+        if *count >= MAX_FORCE_REPUBLISH {
+            log::debug!(
+                "force_republish counter saturated at {} for {} — coalescing further marks",
+                MAX_FORCE_REPUBLISH,
+                uri
+            );
+            return;
+        }
+        *count += 1;
         log::trace!("Marking {} for force republish (count={})", uri, count);
     }
 
@@ -507,6 +528,27 @@ mod tests {
         gate.record_publish(&uri, 1);
 
         // Both markers consumed: same-version publish blocked again.
+        assert!(!gate.can_publish(&uri, 1));
+    }
+
+    #[test]
+    fn test_gate_force_republish_counter_capped() {
+        // Marks beyond MAX_FORCE_REPUBLISH must be coalesced so a thrashing
+        // document cannot accumulate an unbounded counter.
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        for _ in 0..(MAX_FORCE_REPUBLISH + 50) {
+            gate.mark_force_republish(&uri);
+        }
+
+        // Drain MAX_FORCE_REPUBLISH publishes through the gate at the same version.
+        gate.record_publish(&uri, 1);
+        for _ in 0..(MAX_FORCE_REPUBLISH - 1) {
+            assert!(gate.can_publish(&uri, 1));
+            gate.record_publish(&uri, 1);
+        }
+        // Counter is saturated, not unbounded — same-version publish blocked again.
         assert!(!gate.can_publish(&uri, 1));
     }
 

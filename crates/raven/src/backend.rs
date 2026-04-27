@@ -1030,7 +1030,14 @@ impl LanguageServer for Backend {
                             let state = state_clone.read().await;
                             let enabled = state.cross_file_config.packages_enabled
                                 && state.package_library_ready;
-                            (state.package_library.clone(), enabled)
+                            let live = state.package_library.clone();
+                            if !std::sync::Arc::ptr_eq(&pkg_lib, &live) {
+                                log::trace!(
+                                    "Post-scan prefetch: package_library swapped between scan capture and prefetch (packages_enabled now {})",
+                                    enabled
+                                );
+                            }
+                            (live, enabled)
                         };
                         if effective_packages_enabled {
                             prefetch_packages_for_open_documents(
