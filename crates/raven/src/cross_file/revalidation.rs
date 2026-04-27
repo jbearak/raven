@@ -100,6 +100,13 @@ impl CrossFileDiagnosticsGate {
     /// - Normal: publish if `version > last_published_version`
     /// - Forced (count > 0): publish if `version >= last_published_version` (same version allowed)
     /// - Never: publish if `version < last_published_version`
+    ///
+    /// Production commit paths MUST use [`Self::try_consume_publish`] instead.
+    /// Pairing `can_publish` with `record_publish` is racy: two concurrent
+    /// same-version callers can both observe `force_active = true` and proceed
+    /// off a single marker. This method is retained for cheap advisory
+    /// pre-flight checks (e.g. early-skip before computing diagnostics) and
+    /// for test fixtures.
     pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
         let last_published = self.last_published_version.read().unwrap();
         let force = self.force_republish.read().unwrap();
@@ -121,6 +128,10 @@ impl CrossFileDiagnosticsGate {
 
     /// Record that diagnostics were published for this version. Consumes one
     /// outstanding force-republish marker (if any) for this URI.
+    ///
+    /// Production commit paths MUST use [`Self::try_consume_publish`] instead.
+    /// Pairing `can_publish` with `record_publish` is racy under contention.
+    /// This method is retained for test fixtures.
     pub fn record_publish(&self, uri: &Url, version: i32) {
         let mut last_published = self.last_published_version.write().unwrap();
         let mut force = self.force_republish.write().unwrap();
