@@ -100,6 +100,13 @@ impl CrossFileDiagnosticsGate {
     /// - Normal: publish if `version > last_published_version`
     /// - Forced (count > 0): publish if `version >= last_published_version` (same version allowed)
     /// - Never: publish if `version < last_published_version`
+    ///
+    /// Production commit paths MUST use [`Self::try_consume_publish`] instead.
+    /// Pairing `can_publish` with `record_publish` is racy: two concurrent
+    /// same-version callers can both observe `force_active = true` and proceed
+    /// off a single marker. This method is retained for cheap advisory
+    /// pre-flight checks (e.g. early-skip before computing diagnostics) and
+    /// for test fixtures.
     pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
         let last_published = self.last_published_version.read().unwrap();
         let force = self.force_republish.read().unwrap();
@@ -121,6 +128,10 @@ impl CrossFileDiagnosticsGate {
 
     /// Record that diagnostics were published for this version. Consumes one
     /// outstanding force-republish marker (if any) for this URI.
+    ///
+    /// Production commit paths MUST use [`Self::try_consume_publish`] instead.
+    /// Pairing `can_publish` with `record_publish` is racy under contention.
+    /// This method is retained for test fixtures.
     pub fn record_publish(&self, uri: &Url, version: i32) {
         let mut last_published = self.last_published_version.write().unwrap();
         let mut force = self.force_republish.write().unwrap();
@@ -131,6 +142,51 @@ impl CrossFileDiagnosticsGate {
                 force.remove(uri);
             }
         }
+    }
+
+    /// Atomically check the publish gate and, if it would allow the publish,
+    /// commit it: update `last_published_version` to `version` and consume
+    /// one outstanding force-republish marker (saturating).
+    ///
+    /// Returns `true` iff the caller should proceed to publish. Production
+    /// commit paths MUST use this method, not the
+    /// `can_publish` / `record_publish` pair, to avoid a TOCTOU race where
+    /// two concurrent same-version publishes each observe
+    /// `force_active = true` and both proceed off a single marker.
+    ///
+    /// Predicate matches `can_publish`:
+    ///   - if `version < last_published`: false (never publish older)
+    ///   - if force counter > 0: `version >= last_published` (same OK)
+    ///   - else: `version > last_published` (strictly newer)
+    pub fn try_consume_publish(&self, uri: &Url, version: i32) -> bool {
+        let mut last_published = self.last_published_version.write().unwrap();
+        let mut force = self.force_republish.write().unwrap();
+
+        let allowed = match last_published.get(uri) {
+            Some(&last) => {
+                if version < last {
+                    false
+                } else if force.get(uri).copied().unwrap_or(0) > 0 {
+                    version >= last
+                } else {
+                    version > last
+                }
+            }
+            None => true,
+        };
+
+        if !allowed {
+            return false;
+        }
+
+        last_published.insert(uri.clone(), version);
+        if let Some(count) = force.get_mut(uri) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                force.remove(uri);
+            }
+        }
+        true
     }
 
     /// Mark a URI for forced republish (increments the outstanding marker count
@@ -550,6 +606,101 @@ mod tests {
         }
         // Counter is saturated, not unbounded — same-version publish blocked again.
         assert!(!gate.can_publish(&uri, 1));
+    }
+
+    #[test]
+    fn test_gate_try_consume_publish_no_excess_with_pre_marked_state() {
+        // Race reproducer: with one outstanding force marker and N concurrent
+        // try_consume_publish callers (no further marks), exactly ONE publish
+        // must succeed. With the legacy can_publish + record_publish pair, two
+        // racing callers both observe force_active = true and both proceed off
+        // a single marker — this assertion would fail on that buggy code path.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let gate = Arc::new(CrossFileDiagnosticsGate::new());
+        let uri = test_uri("test.R");
+
+        gate.record_publish(&uri, 1);
+        gate.mark_force_republish(&uri);
+
+        const N_THREADS: usize = 32;
+        let barrier = Arc::new(Barrier::new(N_THREADS));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(N_THREADS);
+
+        for _ in 0..N_THREADS {
+            let gate = gate.clone();
+            let uri = uri.clone();
+            let barrier = barrier.clone();
+            let successes = successes.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                if gate.try_consume_publish(&uri, 1) {
+                    successes.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Relaxed),
+            1,
+            "One marker must permit exactly one publish, even under N racing consumers"
+        );
+    }
+
+    #[test]
+    fn test_gate_try_consume_publish_atomic_under_concurrency() {
+        // Contract test: each thread marks once via mark_force_republish, then
+        // races on try_consume_publish at the same version. Asserts
+        // successes == N (one publish per mark). Documents the per-mark
+        // contract under contention.
+        //
+        // Contrast with test_gate_try_consume_publish_no_excess_with_pre_marked_state,
+        // which asserts the inverse: with one pre-set marker and N racing
+        // try_consume_publish callers, exactly one publish must succeed
+        // (no excess). Together they pin both directions of the per-marker
+        // invariant: marks and successful consumes are 1:1.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let gate = Arc::new(CrossFileDiagnosticsGate::new());
+        let uri = test_uri("test.R");
+
+        gate.record_publish(&uri, 1);
+
+        const N_THREADS: usize = 32;
+        let barrier = Arc::new(Barrier::new(N_THREADS));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(N_THREADS);
+
+        for _ in 0..N_THREADS {
+            let gate = gate.clone();
+            let uri = uri.clone();
+            let barrier = barrier.clone();
+            let successes = successes.clone();
+            handles.push(thread::spawn(move || {
+                gate.mark_force_republish(&uri);
+                barrier.wait();
+                if gate.try_consume_publish(&uri, 1) {
+                    successes.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Relaxed),
+            N_THREADS,
+            "Each of N marks should permit exactly one publish"
+        );
     }
 
     #[test]

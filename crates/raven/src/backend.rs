@@ -753,7 +753,11 @@ async fn run_debounced_diagnostics(
         return;
     }
 
-    // Second freshness check before publishing
+    // Second freshness check + atomic gate commit before publishing.
+    // try_consume_publish takes write locks on the gate's maps, evaluates the
+    // same predicate as can_publish, and on success updates last_published
+    // and consumes one force-republish marker — closing the race where
+    // two same-version publishes could share one marker.
     let can_publish = {
         let state = state_arc.read().await;
         let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
@@ -762,7 +766,9 @@ async fn run_debounced_diagnostics(
         if current_version != trigger_version || current_revision != trigger_revision {
             false
         } else if let Some(ver) = current_version {
-            state.diagnostics_gate.can_publish(&affected_uri, ver)
+            state
+                .diagnostics_gate
+                .try_consume_publish(&affected_uri, ver)
         } else {
             true
         }
@@ -774,9 +780,6 @@ async fn run_debounced_diagnostics(
             .await;
 
         let state = state_arc.read().await;
-        if let Some(ver) = state.documents.get(&affected_uri).and_then(|d| d.version) {
-            state.diagnostics_gate.record_publish(&affected_uri, ver);
-        }
         state.cross_file_revalidation.complete(&affected_uri);
     }
 }
@@ -2972,7 +2975,9 @@ impl LanguageServer for Backend {
                         if current_version != version || current_revision != revision {
                             false
                         } else if let Some(ver) = current_version {
-                            state.diagnostics_gate.can_publish(&child_uri, ver)
+                            state
+                                .diagnostics_gate
+                                .try_consume_publish(&child_uri, ver)
                         } else {
                             true
                         }
@@ -2981,11 +2986,6 @@ impl LanguageServer for Backend {
                         client
                             .publish_diagnostics(child_uri.clone(), diagnostics, None)
                             .await;
-
-                        let state = state_arc.read().await;
-                        if let Some(ver) = state.documents.get(&child_uri).and_then(|d| d.version) {
-                            state.diagnostics_gate.record_publish(&child_uri, ver);
-                        }
                     }
                 }
             });
@@ -3952,7 +3952,8 @@ impl Backend {
         )
         .await;
 
-        // Re-check freshness after async work to avoid publishing stale diagnostics
+        // Re-check freshness after async work, atomically commit gate state, before publishing.
+        // try_consume_publish replaces the racy can_publish + record_publish pair.
         {
             let state = self.state.read().await;
             if let Some(ver) = version {
@@ -3966,7 +3967,7 @@ impl Backend {
                     );
                     return;
                 }
-                if !state.diagnostics_gate.can_publish(uri, ver) {
+                if !state.diagnostics_gate.try_consume_publish(uri, ver) {
                     log::trace!(
                         "Skipping diagnostics for {}: monotonic gate after async (version={})",
                         uri,
@@ -3974,14 +3975,6 @@ impl Backend {
                     );
                     return;
                 }
-            }
-        }
-
-        // Record the publish (uses interior mutability, no write lock needed)
-        {
-            let state = self.state.read().await;
-            if let Some(ver) = version {
-                state.diagnostics_gate.record_publish(uri, ver);
             }
         }
 
