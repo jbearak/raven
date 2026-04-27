@@ -5188,9 +5188,7 @@ fn collect_undefined_variables_from_snapshot(
         // the diagnostic — the symbol won't actually be loadable at runtime.
         if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
             if pkgs.iter().any(|p| {
-                *package_exists_memo
-                    .entry((*p).to_string())
-                    .or_insert_with(|| snapshot.package_library.package_exists(p))
+                package_exists_memoized(p, &snapshot.package_library, &mut package_exists_memo)
             }) {
                 continue;
             }
@@ -5291,9 +5289,11 @@ fn collect_undefined_variables_from_snapshot(
                 if snapshot.package_library.is_cached_sync(pkg) {
                     return false;
                 }
-                *package_exists_memo
-                    .entry(pkg.clone())
-                    .or_insert_with(|| snapshot.package_library.package_exists(pkg))
+                package_exists_memoized(
+                    pkg,
+                    &snapshot.package_library,
+                    &mut package_exists_memo,
+                )
             });
             if (has_prior_library_call || has_cross_file_packages)
                 && package_cache_pending
@@ -7931,11 +7931,10 @@ pub(crate) fn collect_undefined_variables_position_aware(
         // package mentioned in importFrom() is not on disk) must NOT silence
         // the diagnostic — the symbol won't actually be loadable at runtime.
         if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
-            if pkgs.iter().any(|p| {
-                *package_exists_memo
-                    .entry((*p).to_string())
-                    .or_insert_with(|| package_library.package_exists(p))
-            }) {
+            if pkgs
+                .iter()
+                .any(|p| package_exists_memoized(p, package_library, &mut package_exists_memo))
+            {
                 continue;
             }
         }
@@ -8078,9 +8077,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 if package_library.is_cached_sync(pkg) {
                     return false;
                 }
-                *package_exists_memo
-                    .entry(pkg.clone())
-                    .or_insert_with(|| package_library.package_exists(pkg))
+                package_exists_memoized(pkg, package_library, &mut package_exists_memo)
             });
             if has_prior_library_call
                 && (position_aware_packages.is_empty() || package_cache_pending)
@@ -8181,6 +8178,21 @@ fn has_prior_package_loader_call(call_end_offsets: &[usize], byte_limit: usize) 
     // Match original semantics of `&text[..byte_limit].contains(...)`:
     // a match counts only when the full token is inside the prefix.
     call_end_offsets.partition_point(|&end| end <= byte_limit) > 0
+}
+
+/// Memoized `package_exists()` lookup. `HashMap::entry` would force an
+/// allocation of the key on every call; this only allocates on a miss.
+fn package_exists_memoized(
+    name: &str,
+    lib: &crate::package_library::PackageLibrary,
+    memo: &mut HashMap<String, bool>,
+) -> bool {
+    if let Some(&v) = memo.get(name) {
+        return v;
+    }
+    let v = lib.package_exists(name);
+    memo.insert(name.to_string(), v);
+    v
 }
 
 /// Context for tracking NSE-related state during AST traversal
