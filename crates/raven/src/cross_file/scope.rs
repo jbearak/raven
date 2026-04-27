@@ -619,10 +619,27 @@ impl Hash for ScopedSymbol {
 /// A scope-introducing event within a file
 #[derive(Debug, Clone)]
 pub enum ScopeEvent {
-    /// A symbol definition at a specific position
+    /// A symbol definition at a specific position.
+    ///
+    /// `line/column` is where the definition is anchored in the document
+    /// (typically the LHS identifier of an assignment, the iterator of a `for`,
+    /// or the `assign()` call). This drives timeline sort order, the
+    /// containing-function-scope lookup in `annotate_event_function_scopes`,
+    /// and any UI affordance that wants to point at the definition site.
+    ///
+    /// `visible_from_line/visible_from_column` is the position at which the
+    /// new binding becomes visible in scope. For most definitions this is the
+    /// same as `line/column`, but for `<-`/`=`/`<<-` assignments and
+    /// `assign()` calls it is the end position of the *whole* defining
+    /// expression — R evaluates the RHS *before* installing the LHS binding,
+    /// so the binding is not in scope inside its own defining expression. This
+    /// is what makes `merp <- merp` correctly flag the RHS reference as an
+    /// undefined variable when no outer `merp` exists.
     Def {
         line: u32,
         column: u32,
+        visible_from_line: u32,
+        visible_from_column: u32,
         symbol: ScopedSymbol,
         function_scope: Option<FunctionScopeInterval>,
     },
@@ -754,6 +771,36 @@ fn active_function_scopes_at(
         tree.query_point(Position::new(line, column))
             .into_iter()
             .collect()
+    }
+}
+
+/// Position at which a `ScopeEvent` *takes effect* in document order.
+///
+/// For most events this is the anchor position (`line`/`column`). For
+/// `ScopeEvent::Def` it is `visible_from_line/visible_from_column`, because
+/// the binding is observable only after the defining expression has been
+/// evaluated (R installs `<-`/`=`/`<<-` bindings *after* the RHS, and the
+/// `assign()` call is treated the same way). Sorting the timeline by this
+/// position is what guarantees the resolver applies events in execution
+/// order — for example, the `rm(x)` inside `x <- { rm(x); 1 }` is processed
+/// *before* the `Def x` it sits inside, so the new binding is not silently
+/// dropped at positions past the assignment.
+fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
+    match event {
+        ScopeEvent::Def {
+            visible_from_line,
+            visible_from_column,
+            ..
+        } => (*visible_from_line, *visible_from_column),
+        ScopeEvent::Source { line, column, .. } => (*line, *column),
+        ScopeEvent::FunctionScope {
+            start_line,
+            start_column,
+            ..
+        } => (*start_line, *start_column),
+        ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     }
 }
 
@@ -930,19 +977,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // (Requirements 14.2, 14.4)
     let library_calls = detect_library_calls(tree, content);
 
-    // Sort timeline by position for correct ordering
-    artifacts.timeline.sort_by_key(|event| match event {
-        ScopeEvent::Def { line, column, .. } => (*line, *column),
-        ScopeEvent::Source { line, column, .. } => (*line, *column),
-        ScopeEvent::FunctionScope {
-            start_line,
-            start_column,
-            ..
-        } => (*start_line, *start_column),
-        ScopeEvent::Removal { line, column, .. } => (*line, *column),
-        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-    });
+    // Sort timeline by *effect* position so the resolver iterates events in
+    // execution order. `event_effect_position` uses `visible_from` for Def
+    // events, so the binding from `x <- { rm(x); 1 }` is processed after the
+    // inner `rm(x)` instead of before it.
+    artifacts.timeline.sort_by_key(event_effect_position);
 
     // Build interval tree from function scopes for O(log n) queries
     let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts
@@ -983,19 +1022,8 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         });
     }
 
-    // Re-sort timeline to include PackageLoad events in correct position
-    artifacts.timeline.sort_by_key(|event| match event {
-        ScopeEvent::Def { line, column, .. } => (*line, *column),
-        ScopeEvent::Source { line, column, .. } => (*line, *column),
-        ScopeEvent::FunctionScope {
-            start_line,
-            start_column,
-            ..
-        } => (*start_line, *start_column),
-        ScopeEvent::Removal { line, column, .. } => (*line, *column),
-        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-    });
+    // Re-sort timeline to include PackageLoad events in effect-position order.
+    artifacts.timeline.sort_by_key(event_effect_position);
 
     // Extract package names from PackageLoad events for interface hash computation
     // (Requirement 14.5: interface hash must include loaded packages for cache invalidation)
@@ -1163,19 +1191,10 @@ pub fn compute_artifacts_with_metadata(
     // Collect library()/require()/loadNamespace() calls for later processing.
     let library_calls = detect_library_calls(tree, content);
 
-    // Sort timeline by position for correct ordering
-    artifacts.timeline.sort_by_key(|event| match event {
-        ScopeEvent::Def { line, column, .. } => (*line, *column),
-        ScopeEvent::Source { line, column, .. } => (*line, *column),
-        ScopeEvent::FunctionScope {
-            start_line,
-            start_column,
-            ..
-        } => (*start_line, *start_column),
-        ScopeEvent::Removal { line, column, .. } => (*line, *column),
-        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-    });
+    // Sort timeline by *effect* position so the resolver iterates events in
+    // execution order. See `event_effect_position` for why this differs from
+    // the LHS anchor for Def events.
+    artifacts.timeline.sort_by_key(event_effect_position);
 
     // Build interval tree from function scopes for O(log n) queries
     let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts
@@ -1215,19 +1234,8 @@ pub fn compute_artifacts_with_metadata(
         });
     }
 
-    // Re-sort timeline to include PackageLoad events in correct position
-    artifacts.timeline.sort_by_key(|event| match event {
-        ScopeEvent::Def { line, column, .. } => (*line, *column),
-        ScopeEvent::Source { line, column, .. } => (*line, *column),
-        ScopeEvent::FunctionScope {
-            start_line,
-            start_column,
-            ..
-        } => (*start_line, *start_column),
-        ScopeEvent::Removal { line, column, .. } => (*line, *column),
-        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-    });
+    // Re-sort timeline (now includes PackageLoad events) by effect position.
+    artifacts.timeline.sort_by_key(event_effect_position);
 
     // Add declared symbols to exported interface in timeline order
     // Only insert if no real (non-declared) definition exists, so that real definitions
@@ -1315,18 +1323,22 @@ pub fn scope_at_position(
     // are visible regardless of position (R has late-binding semantics).
     let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
 
-    // Process events and apply function scope filtering
+    // Process events and apply function scope filtering.
+    // Use the def event's `visible_from` position for visibility checks; the
+    // `line/column` anchor is only used for function-scope annotation and is
+    // irrelevant once the timeline has been built.
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
-                line: def_line,
-                column: def_col,
+                visible_from_line,
+                visible_from_column,
                 symbol,
                 function_scope,
+                ..
             } => {
                 if is_symbol_visible(
-                    *def_line,
-                    *def_col,
+                    *visible_from_line,
+                    *visible_from_column,
                     *function_scope,
                     &active_function_scopes,
                     line,
@@ -1499,21 +1511,23 @@ where
     // are visible regardless of position (R has late-binding semantics).
     let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
 
-    // Process events and apply function scope filtering
+    // Process events and apply function scope filtering.
+    // Use the def event's `visible_from` position for visibility checks.
     // Note: Local definitions and explicit package loads will override base exports
     // because we use insert() for definitions (which overwrites) and entry().or_insert_with()
     // for package loads (which preserves existing entries including local definitions).
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
-                line: def_line,
-                column: def_col,
+                visible_from_line,
+                visible_from_column,
                 symbol,
                 function_scope,
+                ..
             } => {
                 if is_symbol_visible(
-                    *def_line,
-                    *def_col,
+                    *visible_from_line,
+                    *visible_from_column,
                     *function_scope,
                     &active_function_scopes,
                     line,
@@ -1757,16 +1771,19 @@ where
     let active_function_scopes =
         active_function_scopes_at(&artifacts.function_scope_tree, line, column);
 
-    // Process timeline events up to the requested position
+    // Process timeline events up to the requested position.
+    // Use the def event's `visible_from` position so that the binding from
+    // `x <- expr` is not in scope inside its own RHS.
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
-                line: def_line,
-                column: def_col,
+                visible_from_line,
+                visible_from_column,
                 symbol,
                 function_scope,
+                ..
             } => {
-                if (*def_line, *def_col) <= (line, column) {
+                if (*visible_from_line, *visible_from_column) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
 
                     // Skip function-local definitions not in our scope
@@ -1927,12 +1944,43 @@ fn collect_definitions(
     uri: &Url,
     artifacts: &mut ScopeArtifacts,
 ) {
-    // Check for assignment expressions
+    // Check for assignment expressions.
+    //
+    // We track two distinct positions on the Def event:
+    //
+    //   * `line/column` — where the assignment is *anchored* in the document,
+    //     i.e. the LHS identifier. This drives timeline ordering and the
+    //     containing-function-scope lookup in `annotate_event_function_scopes`.
+    //
+    //   * `visible_from_line/visible_from_column` — where the new binding
+    //     actually becomes visible.
+    //
+    // For assignments whose RHS is a *function definition* (`f <- function() ...`)
+    // the binding is visible from the LHS position. The function body is
+    // evaluated only when the function is *called*, by which point the binding
+    // exists, so references to `f` inside its own body (recursive calls, mutual
+    // recursion via `g <- function() f()`, etc.) must resolve. Same applies to
+    // function-scoped local definitions like `inner <- function() inner()` that
+    // need to be reachable inside their own bodies.
+    //
+    // For all *other* RHSs (literals, identifiers, calls, expressions), R
+    // evaluates the RHS *before* installing the LHS binding. The binding is
+    // therefore not in scope inside its own RHS — we set `visible_from` to the
+    // end position of the whole assignment so that `merp <- merp` (and similar)
+    // correctly diagnose the RHS as undefined when no outer `merp` exists.
+    //
+    // The symbol's own `defined_line/defined_column` (used for hover and
+    // go-to-definition) remains at the LHS identifier, so navigation is
+    // unaffected.
     if node.kind() == "binary_operator" {
         if let Some(symbol) = try_extract_assignment(node, line_index, uri) {
+            let (visible_line, visible_column) =
+                assignment_visible_from_position(node, line_index, &symbol);
             let event = ScopeEvent::Def {
                 line: symbol.defined_line,
                 column: symbol.defined_column,
+                visible_from_line: visible_line,
+                visible_from_column: visible_column,
                 symbol: symbol.clone(),
                 function_scope: None,
             };
@@ -1943,12 +1991,18 @@ fn collect_definitions(
         }
     }
 
-    // Check for assign() calls (Requirement 17.4)
+    // Check for assign() calls (Requirement 17.4). The value argument is always
+    // an immediately-evaluated expression (R does not introspect strings here),
+    // so the RHS-before-binding rule always applies — the new binding becomes
+    // visible at the end of the call.
     if node.kind() == "call" {
         if let Some(symbol) = try_extract_assign_call(node, line_index, uri) {
+            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
             let event = ScopeEvent::Def {
                 line: symbol.defined_line,
                 column: symbol.defined_column,
+                visible_from_line: visible_line,
+                visible_from_column: visible_column,
                 symbol: symbol.clone(),
                 function_scope: None,
             };
@@ -1959,12 +2013,22 @@ fn collect_definitions(
         }
     }
 
-    // Check for for loop iterators
+    // Check for for loop iterators.
+    //
+    // For-loop iterators are bound *before* the body executes, and the
+    // standard convention is that the iterator name is also visible at and
+    // after the `for (i in ...)` header. We therefore use the iterator
+    // identifier's own position for both the anchor and the visible-from
+    // position. (Whether `for (i in expr_referencing_i)` should resolve to an
+    // outer `i` is a separate question with the same answer R itself gives;
+    // this fix targets `<-`/`=`/`<<-`/`assign()` only.)
     if node.kind() == "for_statement" {
         if let Some(symbol) = try_extract_for_loop_iterator(node, line_index, uri) {
             let event = ScopeEvent::Def {
                 line: symbol.defined_line,
                 column: symbol.defined_column,
+                visible_from_line: symbol.defined_line,
+                visible_from_column: symbol.defined_column,
                 symbol: symbol.clone(),
                 function_scope: None,
             };
@@ -2346,6 +2410,99 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
 /// ```
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
+}
+
+/// Convert a tree-sitter `Node`'s end position to a UTF-16 (line, column) pair.
+///
+/// Tree-sitter reports `end_position` as a one-past-the-end byte position; the column is the
+/// byte offset within the end row. This helper converts that byte column to a UTF-16 column
+/// suitable for ScopeEvent positions, which compare against UTF-16 query positions.
+fn node_end_position_utf16(node: Node, line_index: &LineIndex) -> (u32, u32) {
+    let end = node.end_position();
+    let line_text = line_index.get_line(end.row);
+    let column = byte_offset_to_utf16_column(line_text, end.column);
+    (end.row as u32, column)
+}
+
+/// Determine the `visible_from` (line, column) for an assignment Def event.
+///
+/// For `<-`/`=`/`<<-` assignments whose RHS is a function definition, the
+/// binding becomes visible at the LHS identifier — recursive calls inside the
+/// function body must resolve, since the body is evaluated only when the
+/// function is called (by which point the binding exists). Same for
+/// `function_definition -> name` and `function_definition ->> name`.
+///
+/// For every other RHS shape (literals, identifiers, calls, arithmetic, etc.)
+/// R evaluates the RHS *before* installing the LHS binding, so the binding is
+/// not in scope inside its own RHS. We use the end position of the whole
+/// assignment node, after which the binding is observable.
+///
+/// `symbol.defined_line/defined_column` is the LHS identifier in UTF-16. We
+/// return that for the function-RHS case to keep timeline ordering consistent
+/// with the anchor; for the non-function case we compute end-of-node fresh.
+fn assignment_visible_from_position(
+    node: Node,
+    line_index: &LineIndex,
+    symbol: &ScopedSymbol,
+) -> (u32, u32) {
+    if assignment_rhs_is_function_definition(node, line_index) {
+        (symbol.defined_line, symbol.defined_column)
+    } else {
+        node_end_position_utf16(node, line_index)
+    }
+}
+
+/// Returns true when `node` is a `<-`/`=`/`<<-`/`->`/`->>` assignment whose
+/// value side is a `function_definition`. The "value side" is the RHS for
+/// left-assignments and the LHS for right-assignments.
+///
+/// Parenthesized wrappers around the function definition (e.g.
+/// `f <- (function() f())`) count as function definitions: the parentheses
+/// are syntactic noise and the function body is still delayed-evaluation, so
+/// recursive references inside the body must resolve.
+fn assignment_rhs_is_function_definition(node: Node, line_index: &LineIndex) -> bool {
+    if node.kind() != "binary_operator" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+    if children.len() != 3 {
+        return false;
+    }
+    let lhs = children[0];
+    let op = children[1];
+    let rhs = children[2];
+    let op_text = node_text(op, line_index.text);
+    match op_text {
+        "<-" | "=" | "<<-" => is_function_definition_after_parens(rhs),
+        "->" | "->>" => is_function_definition_after_parens(lhs),
+        _ => false,
+    }
+}
+
+/// Returns true if `node` is (or transparently wraps via parentheses) a
+/// `function_definition`. Parentheses around an expression are pure syntax
+/// in R — `(function() body)` and `function() body` produce the same value
+/// — so for the purpose of "does the RHS install the binding immediately or
+/// is the body delayed?" we strip them.
+fn is_function_definition_after_parens(node: Node) -> bool {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "function_definition" => return true,
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let inner = current
+                    .children(&mut cursor)
+                    .find(|c| c.is_named() && c.kind() != "comment");
+                match inner {
+                    Some(child) => current = child,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Compute a deterministic hash of the exported interface and loaded packages.
@@ -2796,18 +2953,21 @@ where
     } // end if !is_revisit (STEP 1)
 
     // STEP 2: Process timeline events (local definitions and forward sources)
-    // Second pass: process events and apply function scope filtering
+    // Second pass: process events and apply function scope filtering.
+    // Use the def event's `visible_from` position so that the binding from
+    // `x <- expr` is not in scope inside its own RHS.
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
-                line: def_line,
-                column: def_col,
+                visible_from_line,
+                visible_from_column,
                 symbol,
                 function_scope,
+                ..
             } => {
                 if is_symbol_visible(
-                    *def_line,
-                    *def_col,
+                    *visible_from_line,
+                    *visible_from_column,
                     *function_scope,
                     &active_function_scopes,
                     line,
@@ -3609,10 +3769,13 @@ outside_var <- 2"#;
             "local_only should stay visible inside the containing function"
         );
 
+        // Query at end of `outside_var <- 2` so the binding is visible (R only
+        // installs the LHS binding after the RHS finishes evaluating, so a
+        // mid-assignment query position would correctly not yet see it).
         let scope_after_function = scope_at_position_with_graph(
             &parent_uri,
             5,
-            12,
+            16,
             &get_artifacts,
             &get_metadata,
             &graph,
@@ -3708,10 +3871,13 @@ outside_var <- 2"#;
 
         // Outside the function: child_var should still be visible (non-local source
         // evaluates in .GlobalEnv, so its symbols are globally available)
+        // Query at end of `outside_var <- 2` so the binding is visible (R only
+        // installs the LHS binding after the RHS finishes evaluating, so a
+        // mid-assignment query position would correctly not yet see it).
         let scope_after_function = scope_at_position_with_graph(
             &parent_uri,
             5,
-            12,
+            16,
             &get_artifacts,
             &get_metadata,
             &graph,
@@ -4643,7 +4809,10 @@ outside_var <- 2"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        // Inside function body, parameters should be available
+        // Inside function body, parameters should be available. The function
+        // name itself is also reachable here because its RHS is a function
+        // definition (the body is delayed-evaluation, so the LHS binding is
+        // visible from the LHS position to support recursion).
         let scope_inside = scope_at_position(&artifacts, 0, 30, false); // Position within function body
         assert!(
             scope_inside.symbols.contains_key("x"),
@@ -4665,8 +4834,11 @@ outside_var <- 2"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        // Outside function, parameters should NOT be available
-        let scope_outside = scope_at_position(&artifacts, 1, 10, false); // Position on second line
+        // Outside function, parameters should NOT be available.
+        // Query past the end of `result <- 42` so both `my_func` and `result`
+        // bindings have become visible — querying mid-assignment would (correctly)
+        // not yet have either binding installed.
+        let scope_outside = scope_at_position(&artifacts, 1, 12, false);
         assert!(
             scope_outside.symbols.contains_key("my_func"),
             "Function name should be available outside function"
@@ -4691,8 +4863,11 @@ outside_var <- 2"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        // Outside function, local variable should NOT be available
-        let scope_outside = scope_at_position(&artifacts, 1, 10, false);
+        // Outside function, local variable should NOT be available.
+        // Query at end of `global_var <- 100` so both `my_func` and
+        // `global_var` bindings are visible (R installs the LHS binding only
+        // after the RHS is evaluated).
+        let scope_outside = scope_at_position(&artifacts, 1, 17, false);
         assert!(
             scope_outside.symbols.contains_key("my_func"),
             "Function name should be available outside function"
@@ -4706,8 +4881,12 @@ outside_var <- 2"#;
             "Function-local variable should NOT be available outside function"
         );
 
-        // Inside function, local variable SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 40, false);
+        // Inside function, the function-local variable should be available.
+        // The function name itself is reachable here because its RHS is a
+        // function definition (visible from the LHS to support recursion).
+        // Without hoisting, a global defined *after* the function is not yet
+        // bound at this position — strict positional semantics.
+        let scope_inside = scope_at_position(&artifacts, 0, 41, false);
         assert!(
             scope_inside.symbols.contains_key("my_func"),
             "Function name should be available inside function"
@@ -4733,8 +4912,10 @@ outside_var <- 2"#;
         let metadata = CrossFileMetadata::default();
         let artifacts = compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&metadata));
 
-        // Outside function, local variable should NOT be available
-        let scope_outside = scope_at_position(&artifacts, 1, 10, false);
+        // Outside function, local variable should NOT be available.
+        // See the sibling non-metadata test for why we query at the end of
+        // `global_var <- 100`.
+        let scope_outside = scope_at_position(&artifacts, 1, 17, false);
         assert!(
             scope_outside.symbols.contains_key("my_func"),
             "Function name should be available outside function"
@@ -4748,8 +4929,10 @@ outside_var <- 2"#;
             "Function-local variable should NOT be available outside function (metadata path)"
         );
 
-        // Inside function, local variable SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 40, false);
+        // Inside function, local variable SHOULD be available. The function
+        // name is reachable because its RHS is a function definition; a global
+        // defined later is not yet bound at this position.
+        let scope_inside = scope_at_position(&artifacts, 0, 41, false);
         assert!(
             scope_inside.symbols.contains_key("my_func"),
             "Function name should be available inside function"
@@ -4789,7 +4972,9 @@ outside_var <- 2"#;
             "Inner function variable should NOT be available outside"
         );
 
-        // Inside outer function but outside inner function
+        // Inside outer function but outside inner function. Both `outer` and
+        // `inner` are RHS-of-function-definition assignments, so their bindings
+        // are visible from their LHS positions (recursion-friendly).
         let inner_def_needle = "inner <- function";
         let col_in_outer_after_inner_def = code
             .find(inner_def_needle)
@@ -4814,12 +4999,14 @@ outside_var <- 2"#;
             "Inner function variable should NOT be available outside inner function"
         );
 
-        // Inside inner function
-        let inner_var_def_needle = "inner_var <-";
+        // Inside inner function, after `inner_var <- 2` ends so the local
+        // binding is in scope. We query at the column right after the literal
+        // `2`, which is still inside the inner function body but past the end
+        // of the local assignment.
+        let inner_var_assignment = "inner_var <- 2";
         let col_in_inner_after_inner_var_def = code
-            .rfind(inner_var_def_needle)
-            .or_else(|| code.rfind("inner_var"))
-            .map(|i| (i + 1) as u32)
+            .rfind(inner_var_assignment)
+            .map(|i| (i + inner_var_assignment.len()) as u32)
             .unwrap_or(0);
         let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def, false);
         assert!(
@@ -4846,8 +5033,11 @@ outside_var <- 2"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        // Inside first function
-        let scope_func1 = scope_at_position(&artifacts, 0, 25, false);
+        // Inside first function, after `var1 <- a` ends so that the local
+        // binding is in scope. The enclosing `func1` is itself a
+        // function-definition assignment, so its binding is visible from its
+        // LHS for recursion support.
+        let scope_func1 = scope_at_position(&artifacts, 0, 32, false);
         assert!(
             scope_func1.symbols.contains_key("func1"),
             "Function 1 should be available inside itself"
@@ -4873,8 +5063,8 @@ outside_var <- 2"#;
             "Variable 2 should NOT be available inside function 1"
         );
 
-        // Inside second function
-        let scope_func2 = scope_at_position(&artifacts, 1, 25, false);
+        // Inside second function, after `var2 <- b` ends.
+        let scope_func2 = scope_at_position(&artifacts, 1, 32, false);
         assert!(
             scope_func2.symbols.contains_key("func1"),
             "Function 1 should be available inside function 2"
@@ -4997,9 +5187,67 @@ outside_var <- 2"#;
             assert_eq!(parameters.len(), 0);
         }
 
-        // Function name should still be available within body
+        // Function name should still be available within body — the RHS is a
+        // function definition, so the binding is visible from the LHS to
+        // support recursion.
         let scope_in_body = scope_at_position(&artifacts, 0, 25, false);
         assert!(scope_in_body.symbols.contains_key("my_func"));
+    }
+
+    #[test]
+    fn test_assignment_def_processed_after_internal_rm() {
+        // `x <- { rm(x); 1 }` — R semantics evaluate the RHS first (`rm(x)`
+        // runs in the enclosing scope, the block returns 1) and *then* install
+        // the LHS binding. So at any position past the assignment, `x` must
+        // be in scope.
+        //
+        // This exercises the timeline-ordering corollary of `visible_from`:
+        // the Def event's effect must be ordered against other events by its
+        // visibility position, not the LHS anchor. With anchor-ordering the
+        // resolver inserted `x` first, then applied the inner `rm(x)`,
+        // dropping the binding.
+        let code = "x <- { rm(x); 1 }\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 1, 0, false);
+        assert!(
+            scope.symbols.contains_key("x"),
+            "`x` must be in scope after `x <- {{ rm(x); 1 }}` — the new binding \
+             is installed after the RHS (and its `rm(x)`) finishes evaluating. \
+             Got symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parenthesized_function_rhs_visible_from_lhs() {
+        // `f <- (function() f())` — the parenthesized RHS still wraps a
+        // function definition, whose body is delayed-evaluation. Recursive
+        // calls inside the body must therefore see `f`, just like the
+        // unwrapped form `f <- function() f()`. We assert this by querying
+        // scope inside the function body (without hoisting) and checking that
+        // `f` is visible.
+        let code = "f <- (function() f())\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Query inside the function body. The body is at roughly columns
+        // 16..=21 in `f <- (function() f())`. Use the position of the inner
+        // `f()` call.
+        let needle = "f()";
+        let inner_call_col = code.rfind(needle).map(|i| i as u32).unwrap_or(0);
+        assert!(
+            inner_call_col > 0,
+            "Test setup error: failed to locate inner `f()` call"
+        );
+        let scope = scope_at_position(&artifacts, 0, inner_call_col, false);
+        assert!(
+            scope.symbols.contains_key("f"),
+            "`f` must be visible inside `(function() f())` body so the recursive \
+             call resolves. Got symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -5250,6 +5498,8 @@ outside_var <- 2"#;
             ScopeEvent::Def {
                 line: 1,
                 column: 0,
+                visible_from_line: 1,
+                visible_from_column: 0,
                 symbol: ScopedSymbol {
                     name: Arc::from("x"),
                     kind: SymbolKind::Variable,
@@ -5264,6 +5514,8 @@ outside_var <- 2"#;
             ScopeEvent::Def {
                 line: 5,
                 column: 0,
+                visible_from_line: 5,
+                visible_from_column: 0,
                 symbol: ScopedSymbol {
                     name: Arc::from("y"),
                     kind: SymbolKind::Variable,
@@ -5393,6 +5645,8 @@ outside_var <- 2"#;
             ScopeEvent::Def {
                 line: 1,
                 column: 0,
+                visible_from_line: 1,
+                visible_from_column: 0,
                 symbol: ScopedSymbol {
                     name: Arc::from("x"),
                     kind: SymbolKind::Variable,
@@ -5497,6 +5751,8 @@ outside_var <- 2"#;
             ScopeEvent::Def {
                 line: 2,
                 column: 0,
+                visible_from_line: 2,
+                visible_from_column: 0,
                 symbol: ScopedSymbol {
                     name: Arc::from("y"),
                     kind: SymbolKind::Variable,

@@ -2153,9 +2153,11 @@ proptest! {
         prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function");
 
-        // Inside function body, local variable SHOULD be available
-        // Use a position derived from the generated code so it is always within the braces.
-        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        // Inside function body, local variable SHOULD be available.
+        // Query at the closing `}` of the body so the local assignment has
+        // ended and its binding is visible (R installs the LHS binding only
+        // after the RHS finishes evaluating).
+        let col_in_body = code.find('}').map(|i| i as u32).unwrap_or(0);
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body, false);
         prop_assert!(scope_inside.symbols.contains_key(func_name.as_str()),
             "Function name should be available inside function");
@@ -2221,13 +2223,13 @@ proptest! {
         prop_assert!(!scope_outer.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should NOT be available outside inner function");
 
-        // Inside inner function
-        // Choose a position inside the inner body after the inner_var definition.
-        let inner_var_def_needle = format!("{} <-", inner_var);
+        // Inside inner function. Query at the position immediately after
+        // `{inner_var} <- 2` ends so the local binding is in scope (R only
+        // installs the LHS binding once the RHS finishes evaluating).
+        let inner_var_assignment = format!("{} <- 2", inner_var);
         let col_in_inner_after_inner_var_def = code
-            .rfind(&inner_var_def_needle)
-            .or_else(|| code.rfind(&inner_var))
-            .map(|i| (i + 1) as u32)
+            .rfind(&inner_var_assignment)
+            .map(|i| (i + inner_var_assignment.len()) as u32)
             .unwrap_or(0);
         let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def, false);
         prop_assert!(scope_inner.symbols.contains_key(outer_func.as_str()),
@@ -2660,9 +2662,13 @@ proptest! {
         prop_assert!(!scope_at_start.symbols.contains_key(sibling_symbol.as_str()),
             "Sibling symbol should NOT be available at start (before source() call)");
 
-        // At line 1 (after child_symbol definition, before source() call)
+        // At line 1 (after child_symbol definition, before source() call).
+        // Query at the column immediately after `{child_symbol} <- 3` ends so
+        // the binding is installed; querying mid-assignment would correctly
+        // not yet show the symbol (RHS-before-binding semantics).
+        let line1_end = format!("{} <- 3", child_symbol).len() as u32;
         let scope_at_middle = scope_at_position_with_graph(
-            &child_uri, 1, 10, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+            &child_uri, 1, line1_end, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
