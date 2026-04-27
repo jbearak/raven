@@ -8182,6 +8182,14 @@ fn has_prior_package_loader_call(call_end_offsets: &[usize], byte_limit: usize) 
 
 /// Memoized `package_exists()` lookup. `HashMap::entry` would force an
 /// allocation of the key on every call; this only allocates on a miss.
+///
+/// The `memo` is intentionally scoped to a single diagnostic pass — callers
+/// allocate a fresh `HashMap` at the top of each pass and let it drop at the
+/// end. Filesystem changes between passes (package install/uninstall events
+/// from the libpath watcher, `raven.refreshPackages`) reach us via cache
+/// invalidation + force-republish, which trigger the next pass with a new
+/// memo. Sharing a memo across passes would let stale `false` (or `true`)
+/// entries survive an install/uninstall.
 fn package_exists_memoized(
     name: &str,
     lib: &crate::package_library::PackageLibrary,
