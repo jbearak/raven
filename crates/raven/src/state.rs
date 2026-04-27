@@ -429,7 +429,7 @@ fn parse_index(path: &PathBuf) -> Option<Vec<String>> {
 }
 
 #[allow(dead_code)]
-fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<String> {
+fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<(String, String)> {
     let mut imports = Vec::new();
 
     let text = match fs::read_to_string(path) {
@@ -449,7 +449,9 @@ fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<String> {
                 for pkg_name in args.split(',') {
                     let pkg_name = pkg_name.trim().trim_matches('"');
                     if let Some(pkg) = library.get(pkg_name) {
-                        imports.extend(pkg.exports.clone());
+                        for sym in &pkg.exports {
+                            imports.push((pkg_name.to_string(), sym.clone()));
+                        }
                     }
                 }
             }
@@ -463,9 +465,10 @@ fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<String> {
                 let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
                 if parts.len() >= 2 {
                     // First arg is package name, rest are symbols
+                    let pkg = parts[0].trim_matches('"').to_string();
                     for sym in &parts[1..] {
                         let sym = sym.trim_matches('"');
-                        imports.push(sym.to_string());
+                        imports.push((pkg.clone(), sym.to_string()));
                     }
                 }
             }
@@ -546,7 +549,7 @@ pub struct WorldState {
     // Legacy fields (kept for migration compatibility)
     pub documents: HashMap<Url, Document>,
     pub workspace_index: HashMap<Url, Document>,
-    pub workspace_imports: Vec<String>, // Symbols imported via workspace NAMESPACE
+    pub workspace_imports: Vec<(String, String)>, // (package, symbol) pairs from workspace NAMESPACE importFrom() entries
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
@@ -856,7 +859,7 @@ impl WorldState {
     pub fn apply_workspace_index(
         &mut self,
         index: HashMap<Url, Document>,
-        imports: Vec<String>,
+        imports: Vec<(String, String)>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
@@ -995,7 +998,7 @@ impl WorldState {
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
 pub type WorkspaceScanResult = (
     HashMap<Url, Document>,
-    Vec<String>,
+    Vec<(String, String)>,
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
 );
@@ -1237,7 +1240,7 @@ fn scan_directory(
 }
 
 /// Parse NAMESPACE imports without needing Library reference
-fn parse_namespace_imports_from_text(text: &str) -> Vec<String> {
+fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
     let mut imports = Vec::new();
 
     for line in text.lines() {
@@ -1251,9 +1254,10 @@ fn parse_namespace_imports_from_text(text: &str) -> Vec<String> {
             {
                 let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
                 if parts.len() >= 2 {
+                    let pkg = parts[0].trim_matches('"').to_string();
                     for sym in &parts[1..] {
                         let sym = sym.trim_matches('"');
-                        imports.push(sym.to_string());
+                        imports.push((pkg.clone(), sym.to_string()));
                     }
                 }
             }

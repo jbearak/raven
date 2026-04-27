@@ -70,7 +70,7 @@ pub(crate) struct DiagnosticsSnapshot {
     pub base_exports: HashSet<String>,
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
-    pub workspace_imports: Vec<String>,
+    pub workspace_imports: Vec<(String, String)>,
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
@@ -5093,11 +5093,17 @@ fn collect_undefined_variables_from_snapshot(
         &text[start..end]
     };
 
-    let workspace_imports_set: HashSet<&str> = snapshot
-        .workspace_imports
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    // Map each NAMESPACE-imported symbol to the packages that export it. The
+    // suppression below only fires when at least one source package is actually
+    // installed — otherwise the import declaration is broken and the symbol
+    // should still be flagged as undefined.
+    let workspace_imports_map: HashMap<&str, Vec<&str>> = {
+        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (pkg, sym) in &snapshot.workspace_imports {
+            map.entry(sym.as_str()).or_default().push(pkg.as_str());
+        }
+        map
+    };
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
@@ -5171,8 +5177,20 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
 
-        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
+        if is_builtin(&name) {
             continue;
+        }
+        // Workspace NAMESPACE-imported symbols are suppressed only if at least
+        // one source package is actually installed. A broken import (the
+        // package mentioned in importFrom() is not on disk) must NOT silence
+        // the diagnostic — the symbol won't actually be loadable at runtime.
+        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
+            if pkgs
+                .iter()
+                .any(|p| snapshot.package_library.package_exists(p))
+            {
+                continue;
+            }
         }
 
         if hoist_globals {
@@ -7759,7 +7777,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
     node: Node,
     text: &str,
     _loaded_packages: &[String], // Deprecated: now using position-aware packages from scope resolution
-    workspace_imports: &[String],
+    workspace_imports: &[(String, String)],
     package_library: &crate::package_library::PackageLibrary,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
@@ -7817,9 +7835,18 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // scope_cache is shared with collect_out_of_scope_diagnostics — entries populated
     // there are reused here, avoiding redundant cross-file scope resolution.
 
-    // Pre-compute workspace_imports as a HashSet for O(1) lookups
-    let workspace_imports_set: std::collections::HashSet<&str> =
-        workspace_imports.iter().map(|s| s.as_str()).collect();
+    // Map each NAMESPACE-imported symbol to the packages that export it. The
+    // suppression below only fires when at least one source package is actually
+    // installed — otherwise the import declaration is broken and the symbol
+    // should still be flagged as undefined.
+    let workspace_imports_map: std::collections::HashMap<&str, Vec<&str>> = {
+        let mut map: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for (pkg, sym) in workspace_imports {
+            map.entry(sym.as_str()).or_default().push(pkg.as_str());
+        }
+        map
+    };
 
     // Pre-compute package loader call locations once for O(log n) lookups in
     // the usage loop instead of rescanning text prefixes (O(n) per usage).
@@ -7908,9 +7935,17 @@ pub(crate) fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Skip if builtin or workspace import
-        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
+        if is_builtin(&name) {
             continue;
+        }
+        // Workspace NAMESPACE-imported symbols are suppressed only if at least
+        // one source package is actually installed. A broken import (the
+        // package mentioned in importFrom() is not on disk) must NOT silence
+        // the diagnostic — the symbol won't actually be loadable at runtime.
+        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
+            if pkgs.iter().any(|p| package_library.package_exists(p)) {
+                continue;
+            }
         }
 
         // Local-first fast path: if the symbol is in this file's exported_interface,
@@ -35378,6 +35413,76 @@ my_func <- function(a = default_value) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: __pending_fn__"),
             "Package call target should be suppressed while package cache is pending: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_namespace_import_does_not_suppress_when_source_package_uninstalled() {
+        // Post-workspace-scan reproduction of "diagnostic appears then clears".
+        //
+        // If the workspace contains an R package with NAMESPACE that contains
+        // `importFrom(lme4, lmer)`, then `parse_namespace_imports_from_text`
+        // populates `state.workspace_imports` with `["lmer"]` after the scan
+        // completes. The undefined-variable check then suppresses `lmer` via
+        // `workspace_imports_set.contains(name)` — even though lme4 is not
+        // installed and the import is therefore broken.
+        //
+        // Cold-start sequence with this workspace:
+        // - 200ms publish: workspace_imports is empty (scan still running),
+        //   `lmer` is flagged → user sees diagnostic
+        // - apply_workspace_index runs, populates workspace_imports = ["lmer"]
+        // - post-scan republish: workspace_imports check fires → diagnostic
+        //   disappears
+        //
+        // Fix: the workspace_imports suppression must verify the import's
+        // source package is installed before suppressing.
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        state.workspace_scan_complete = true;
+        // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
+        state.workspace_imports = vec![("lme4".to_string(), "lmer".to_string())];
+
+        let pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        // lme4 cached with empty exports (prefetch saw R fail to load it).
+        pkg_lib
+            .insert_package(crate::package_library::PackageInfo::new(
+                "lme4".to_string(),
+                std::collections::HashSet::new(),
+            ))
+            .await;
+        // No lib_paths → package_exists("lme4") = false (not installed).
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(lme4)\nlmer()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &state.workspace_imports,
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: lmer"),
+            "NAMESPACE-imported symbols must still be flagged when the source package is not installed: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
