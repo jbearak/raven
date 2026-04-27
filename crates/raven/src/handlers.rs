@@ -70,7 +70,7 @@ pub(crate) struct DiagnosticsSnapshot {
     pub base_exports: HashSet<String>,
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
-    pub workspace_imports: Vec<String>,
+    pub workspace_imports: Vec<(String, String)>,
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
@@ -4527,9 +4527,13 @@ fn collect_missing_package_diagnostics(
     if !state.package_library_ready {
         return;
     }
-    // If R subprocess is unavailable, package existence checks are filesystem-only
-    // and can be unreliable across environments; avoid false positives.
-    if state.package_library.r_subprocess().is_none() {
+    // Suppress only when we have no information about installed packages — both
+    // an empty lib_paths and a missing r_subprocess. With non-empty lib_paths
+    // (even from get_fallback_lib_paths()) `package_exists()` is reliable, so
+    // emit regardless of whether an R subprocess is currently attached.
+    if state.package_library.lib_paths().is_empty()
+        && state.package_library.r_subprocess().is_none()
+    {
         return;
     }
     let severity = match state.cross_file_config.packages_missing_package_severity {
@@ -4846,7 +4850,13 @@ fn collect_missing_package_diagnostics_from_snapshot(
     if !snapshot.package_library_ready {
         return;
     }
-    if snapshot.package_library.r_subprocess().is_none() {
+    // Suppress only when we have no information about installed packages — both
+    // an empty lib_paths and a missing r_subprocess. With non-empty lib_paths
+    // (even from get_fallback_lib_paths()) `package_exists()` is reliable, so
+    // emit regardless of whether an R subprocess is currently attached.
+    if snapshot.package_library.lib_paths().is_empty()
+        && snapshot.package_library.r_subprocess().is_none()
+    {
         return;
     }
     let Some(severity) = snapshot.cross_file_config.packages_missing_package_severity else {
@@ -5048,13 +5058,18 @@ fn collect_undefined_variables_from_snapshot(
     use crate::cross_file::config::BackwardDependencyMode;
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    match snapshot.cross_file_config.backward_dependencies {
-        BackwardDependencyMode::Auto => {
-            if snapshot.directive_meta.sourced_by.is_empty() && !snapshot.workspace_scan_complete {
-                return;
-            }
-        }
-        BackwardDependencyMode::Explicit => {}
+    // Auto + no @lsp-sourced-by + scan-in-progress: backward-dependency edges
+    // may not be visible yet, so any symbol could be inherited from a parent
+    // file we haven't indexed. Defer all undefined-variable diagnostics until
+    // the workspace scan completes; the post-scan force-republish will then
+    // re-run this collector with the full dep graph in place.
+    let defer_pending_workspace_scan = matches!(
+        snapshot.cross_file_config.backward_dependencies,
+        BackwardDependencyMode::Auto
+    ) && snapshot.directive_meta.sourced_by.is_empty()
+        && !snapshot.workspace_scan_complete;
+    if defer_pending_workspace_scan {
+        return;
     }
 
     let mut used: Vec<(String, Node)> = Vec::new();
@@ -5080,11 +5095,17 @@ fn collect_undefined_variables_from_snapshot(
         &text[start..end]
     };
 
-    let workspace_imports_set: HashSet<&str> = snapshot
-        .workspace_imports
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    // Map each NAMESPACE-imported symbol to the packages that export it. The
+    // suppression below only fires when at least one source package is actually
+    // installed — otherwise the import declaration is broken and the symbol
+    // should still be flagged as undefined.
+    let workspace_imports_map: HashMap<&str, Vec<&str>> = {
+        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (pkg, sym) in &snapshot.workspace_imports {
+            map.entry(sym.as_str()).or_default().push(pkg.as_str());
+        }
+        map
+    };
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
@@ -5139,6 +5160,9 @@ fn collect_undefined_variables_from_snapshot(
         })
         .collect();
     let mut source_exports_cache: HashMap<Url, HashSet<String>> = HashMap::new();
+    // Memoize package_exists() — it does filesystem I/O — so each unique package
+    // name is checked at most once across all identifiers in this diagnostic pass.
+    let mut package_exists_memo: HashMap<String, bool> = HashMap::new();
 
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
@@ -5155,8 +5179,21 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
 
-        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
+        if is_builtin(&name) {
             continue;
+        }
+        // Workspace NAMESPACE-imported symbols are suppressed only if at least
+        // one source package is actually installed. A broken import (the
+        // package mentioned in importFrom() is not on disk) must NOT silence
+        // the diagnostic — the symbol won't actually be loadable at runtime.
+        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
+            if pkgs.iter().any(|p| {
+                *package_exists_memo
+                    .entry((*p).to_string())
+                    .or_insert_with(|| snapshot.package_library.package_exists(p))
+            }) {
+                continue;
+            }
         }
 
         if hoist_globals {
@@ -5246,9 +5283,18 @@ fn collect_undefined_variables_from_snapshot(
                 usage_node.start_byte(),
             );
             let has_cross_file_packages = !scope.inherited_packages.is_empty();
-            let package_cache_pending = position_aware_packages
-                .iter()
-                .any(|pkg| !snapshot.package_library.is_cached_sync(pkg));
+            // A package is "pending" only when it is installed but its exports have
+            // not yet been loaded into cache — not when it is simply not installed.
+            // Using package_exists() guards against treating a permanently-missing
+            // package as one that will eventually be cached.
+            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
+                if snapshot.package_library.is_cached_sync(pkg) {
+                    return false;
+                }
+                *package_exists_memo
+                    .entry(pkg.clone())
+                    .or_insert_with(|| snapshot.package_library.package_exists(pkg))
+            });
             if (has_prior_library_call || has_cross_file_packages)
                 && package_cache_pending
                 && is_function_call_identifier_textually(usage_node, text)
@@ -7717,7 +7763,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
     node: Node,
     text: &str,
     _loaded_packages: &[String], // Deprecated: now using position-aware packages from scope resolution
-    workspace_imports: &[String],
+    workspace_imports: &[(String, String)],
     package_library: &crate::package_library::PackageLibrary,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
@@ -7731,18 +7777,18 @@ pub(crate) fn collect_undefined_variables_position_aware(
     };
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    // Backward dependency mode gating:
-    // - Auto + no backward directives + workspace scan incomplete: defer diagnostics
-    // - Explicit: proceed without waiting for workspace scan
-    match state.cross_file_config.backward_dependencies {
-        BackwardDependencyMode::Auto => {
-            if directive_meta.sourced_by.is_empty() && !state.workspace_scan_complete {
-                // Defer: the workspace scan hasn't finished building the dependency
-                // graph yet, so auto-inferred backward edges may not be available.
-                return;
-            }
-        }
-        BackwardDependencyMode::Explicit => {} // proceed normally
+    // Auto + no @lsp-sourced-by + scan-in-progress: backward-dependency edges
+    // may not be visible yet, so any symbol could be inherited from a parent
+    // file we haven't indexed. Defer all undefined-variable diagnostics until
+    // the workspace scan completes; the post-scan force-republish will then
+    // re-run this collector with the full dep graph in place.
+    let defer_pending_workspace_scan = matches!(
+        state.cross_file_config.backward_dependencies,
+        BackwardDependencyMode::Auto
+    ) && directive_meta.sourced_by.is_empty()
+        && !state.workspace_scan_complete;
+    if defer_pending_workspace_scan {
+        return;
     }
 
     let mut used: Vec<(String, Node)> = Vec::new();
@@ -7777,9 +7823,18 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // scope_cache is shared with collect_out_of_scope_diagnostics — entries populated
     // there are reused here, avoiding redundant cross-file scope resolution.
 
-    // Pre-compute workspace_imports as a HashSet for O(1) lookups
-    let workspace_imports_set: std::collections::HashSet<&str> =
-        workspace_imports.iter().map(|s| s.as_str()).collect();
+    // Map each NAMESPACE-imported symbol to the packages that export it. The
+    // suppression below only fires when at least one source package is actually
+    // installed — otherwise the import declaration is broken and the symbol
+    // should still be flagged as undefined.
+    let workspace_imports_map: std::collections::HashMap<&str, Vec<&str>> = {
+        let mut map: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for (pkg, sym) in workspace_imports {
+            map.entry(sym.as_str()).or_default().push(pkg.as_str());
+        }
+        map
+    };
 
     // Pre-compute package loader call locations once for O(log n) lookups in
     // the usage loop instead of rescanning text prefixes (O(n) per usage).
@@ -7829,6 +7884,8 @@ pub(crate) fn collect_undefined_variables_position_aware(
         Url,
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
+    let mut package_exists_memo: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
 
     // Pre-compute parent scope at (0, 0) to avoid per-position graph traversal
     // for symbols inherited from parent files. At position (0, 0), scope resolution
@@ -7866,9 +7923,21 @@ pub(crate) fn collect_undefined_variables_position_aware(
             continue;
         }
 
-        // Skip if builtin or workspace import
-        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
+        if is_builtin(&name) {
             continue;
+        }
+        // Workspace NAMESPACE-imported symbols are suppressed only if at least
+        // one source package is actually installed. A broken import (the
+        // package mentioned in importFrom() is not on disk) must NOT silence
+        // the diagnostic — the symbol won't actually be loadable at runtime.
+        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
+            if pkgs.iter().any(|p| {
+                *package_exists_memo
+                    .entry((*p).to_string())
+                    .or_insert_with(|| package_library.package_exists(p))
+            }) {
+                continue;
+            }
         }
 
         // Local-first fast path: if the symbol is in this file's exported_interface,
@@ -8003,9 +8072,16 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 &package_loader_call_end_offsets,
                 usage_node.start_byte(),
             );
-            let package_cache_pending = position_aware_packages
-                .iter()
-                .any(|pkg| !package_library.is_cached_sync(pkg));
+            // A package is "pending" only when it is installed but its exports
+            // have not yet been cached — not when it is simply not installed.
+            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
+                if package_library.is_cached_sync(pkg) {
+                    return false;
+                }
+                *package_exists_memo
+                    .entry(pkg.clone())
+                    .or_insert_with(|| package_library.package_exists(pkg))
+            });
             if has_prior_library_call
                 && (position_aware_packages.is_empty() || package_cache_pending)
                 && is_function_call_identifier_textually(usage_node, text)
@@ -32631,6 +32707,50 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
+    #[test]
+    fn test_missing_package_diagnostic_emitted_with_lib_paths_but_no_r_subprocess() {
+        // Cold-start scenario: ensure_package_library_initialized() runs
+        // RSubprocess::new() synchronously on the async thread and can fail to
+        // discover R (where `initialized()` via spawn_blocking would succeed).
+        // When that happens, lib.initialize() still populates lib_paths from
+        // get_fallback_lib_paths(), so package_library_ready is set to true with
+        // r_subprocess = None. The "Package not installed" diagnostic must still
+        // emit because package existence is determined by lib_paths, not by
+        // whether an R subprocess is available.
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("raven_test_no_subprocess_lib_paths");
+        fs::create_dir_all(&tmp).expect("create tmp lib_path");
+
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls
+            .push(crate::cross_file::source_detect::LibraryCall {
+                package: "__raven_not_installed__".to_string(),
+                line: 0,
+                column: 30,
+                function_scope: None,
+            });
+
+        let mut state = WorldState::new(Vec::new());
+        state.package_library_ready = true;
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.clone()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Should emit missing-package diagnostic when lib_paths are populated even if r_subprocess is None"
+        );
+        assert!(diagnostics[0].message.contains("__raven_not_installed__"));
+        assert!(diagnostics[0].message.contains("not installed"));
+    }
+
     // ============================================================================
     // Tests for redundant directive diagnostics - Task 7.2
     // ============================================================================
@@ -35222,11 +35342,234 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn test_package_function_call_not_flagged_while_package_cache_pending() {
+        // When a package is installed (exists on the filesystem) but its exports
+        // have not been loaded into cache yet, function calls from that package
+        // must be suppressed to avoid false positives during async cache loading.
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("raven_test_cache_pending");
+        let pkg_dir = tmp.join("__raven_pending_pkg__");
+        fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
+        fs::write(pkg_dir.join("DESCRIPTION"), "Package: __raven_pending_pkg__\n")
+            .expect("write DESCRIPTION");
+
         let mut state = create_test_state();
         state.package_library_ready = true;
         state.cross_file_config.packages_enabled = true;
 
-        let code = "library(openxlsx)\nwb <- createWorkbook()\n";
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.clone()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(__raven_pending_pkg__)\n__pending_fn__()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: __pending_fn__"),
+            "Package call target should be suppressed while package cache is pending: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_namespace_import_does_not_suppress_when_source_package_uninstalled() {
+        // Post-workspace-scan reproduction of "diagnostic appears then clears".
+        //
+        // If the workspace contains an R package with NAMESPACE that contains
+        // `importFrom(lme4, lmer)`, then `parse_namespace_imports_from_text`
+        // populates `state.workspace_imports` with `["lmer"]` after the scan
+        // completes. The undefined-variable check then suppresses `lmer` via
+        // `workspace_imports_set.contains(name)` — even though lme4 is not
+        // installed and the import is therefore broken.
+        //
+        // Cold-start sequence with this workspace:
+        // - 200ms publish: workspace_imports is empty (scan still running),
+        //   `lmer` is flagged → user sees diagnostic
+        // - apply_workspace_index runs, populates workspace_imports = ["lmer"]
+        // - post-scan republish: workspace_imports check fires → diagnostic
+        //   disappears
+        //
+        // Fix: the workspace_imports suppression must verify the import's
+        // source package is installed before suppressing.
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        state.workspace_scan_complete = true;
+        // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
+        state.workspace_imports = vec![("lme4".to_string(), "lmer".to_string())];
+
+        let pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        // lme4 cached with empty exports (prefetch saw R fail to load it).
+        pkg_lib
+            .insert_package(crate::package_library::PackageInfo::new(
+                "lme4".to_string(),
+                std::collections::HashSet::new(),
+            ))
+            .await;
+        // No lib_paths → package_exists("lme4") = false (not installed).
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(lme4)\nlmer()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &state.workspace_imports,
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: lmer"),
+            "NAMESPACE-imported symbols must still be flagged when the source package is not installed: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_defers_undefined_variable_diagnostics() {
+        // During the cold-start window, before the background workspace scan
+        // completes, any symbol could be inherited from a parent file we
+        // haven't indexed yet. The undefined-variable collector defers ALL
+        // diagnostics in this window (no per-identifier carve-out for
+        // package-related calls — that heuristic produced false positives for
+        // parent-defined helpers like `library(dplyr); helper_fn()` where
+        // helper_fn was actually defined in a sibling file). The post-scan
+        // force-republish then re-runs the collector with the full dep graph.
+        //
+        // Verifies both halves:
+        //  - workspace_scan_complete = false → no diagnostics emitted
+        //  - workspace_scan_complete = true  → lmer is flagged as undefined
+        //    (lme4 cached with empty exports per fix 39e90a5)
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        state.workspace_scan_complete = false;
+
+        let pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        // Simulate prefetch caching lme4 with empty exports (R returned nothing
+        // for it because asNamespace("lme4") threw and tryCatch swallowed).
+        pkg_lib
+            .insert_package(crate::package_library::PackageInfo::new(
+                "lme4".to_string(),
+                std::collections::HashSet::new(),
+            ))
+            .await;
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(lme4)\nlmer()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        // Cold-start: scan in progress, all undefined-variable diagnostics deferred.
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: lmer"),
+            "lmer must be deferred while workspace scan is incomplete: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Post-scan: full dep graph available, deferral lifts.
+        state.workspace_scan_complete = true;
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: lmer"),
+            "lmer must be flagged after the workspace scan completes (lme4 cached \
+             with empty exports, no parent file defines lmer): {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_uninstalled_package_function_flagged_as_undefined() {
+        // When a package is not installed (no lib_path contains it), functions from
+        // that package must be flagged as undefined — the pending-load suppression
+        // must not fire for packages that simply don't exist.
+        // Regression: previously is_cached_sync() alone was used to detect "pending",
+        // so a never-installed package (also never cached) was silently suppressed.
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+        // Default PackageLibrary (new_empty) has no lib_paths, so package_exists()
+        // returns false for any package — simulates uninstalled package.
+
+        let code = "library(__raven_fake_pkg__)\n__raven_fake_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let directive_meta = parse_directives(code);
@@ -35247,10 +35590,65 @@ my_func <- function(a = default_value) {
         );
 
         assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: __raven_fake_fn__"),
+            "Functions from not-installed packages must be flagged as undefined: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_installed_but_uncached_package_function_not_flagged() {
+        // When a package IS installed (directory present in a lib_path) but its
+        // exports have not been loaded into cache yet, functions from that package
+        // must NOT be flagged as undefined — the pending-load suppression should fire.
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("raven_test_installed_pkg");
+        let pkg_dir = tmp.join("__raven_installed_pkg__");
+        fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
+        fs::write(pkg_dir.join("DESCRIPTION"), "Package: __raven_installed_pkg__\n")
+            .expect("write DESCRIPTION");
+
+        let mut state = create_test_state();
+        state.package_library_ready = true;
+        state.cross_file_config.packages_enabled = true;
+
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.clone()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let code = "library(__raven_installed_pkg__)\n__installed_fn__()\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            tree.root_node(),
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: createWorkbook"),
-            "Package call target should be suppressed while package cache is pending: {:?}",
+                .any(|d| d.message == "Undefined variable: __installed_fn__"),
+            "Functions from installed-but-uncached packages must be suppressed while pending: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())

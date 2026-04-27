@@ -4,7 +4,7 @@
 // Real-time update system for cross-file awareness
 //
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use tokio_util::sync::CancellationToken;
@@ -62,12 +62,19 @@ impl CrossFileRevalidationState {
 }
 
 /// Diagnostics publish gating to enforce monotonic publishing
+///
+/// `force_republish` is a counter, not a set: each `mark_force_republish` adds
+/// one to the count, and each `record_publish` decrements it (saturating at 0).
+/// Force is "active" while count > 0. The counter avoids a race where a single
+/// publish can swallow multiple concurrent forced-republish requests, leaving
+/// later publishes blocked at the same version. Each marker reliably gets one
+/// matching publish through the gate.
 #[derive(Debug, Default)]
 pub struct CrossFileDiagnosticsGate {
     /// Last published document version per URI
     last_published_version: RwLock<HashMap<Url, i32>>,
-    /// URIs that need forced republish (dependency-triggered, version unchanged)
-    force_republish: RwLock<HashSet<Url>>,
+    /// Outstanding forced-republish markers per URI (dependency-triggered, version unchanged)
+    force_republish: RwLock<HashMap<Url, u32>>,
 }
 
 impl CrossFileDiagnosticsGate {
@@ -79,18 +86,19 @@ impl CrossFileDiagnosticsGate {
     ///
     /// Force republish allows same-version republish but NEVER older versions:
     /// - Normal: publish if `version > last_published_version`
-    /// - Forced: publish if `version >= last_published_version` (same version allowed)
+    /// - Forced (count > 0): publish if `version >= last_published_version` (same version allowed)
     /// - Never: publish if `version < last_published_version`
     pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
         let last_published = self.last_published_version.read().unwrap();
         let force = self.force_republish.read().unwrap();
+        let force_active = force.get(uri).copied().unwrap_or(0) > 0;
 
         match last_published.get(uri) {
             Some(&last) => {
                 if version < last {
                     return false; // NEVER publish older versions
                 }
-                if force.contains(uri) {
+                if force_active {
                     return version >= last; // Force allows same version
                 }
                 version > last // Normal requires strictly newer
@@ -99,22 +107,29 @@ impl CrossFileDiagnosticsGate {
         }
     }
 
-    /// Record that diagnostics were published for this version
+    /// Record that diagnostics were published for this version. Consumes one
+    /// outstanding force-republish marker (if any) for this URI.
     pub fn record_publish(&self, uri: &Url, version: i32) {
         let mut last_published = self.last_published_version.write().unwrap();
         let mut force = self.force_republish.write().unwrap();
         last_published.insert(uri.clone(), version);
-        force.remove(uri);
+        if let Some(count) = force.get_mut(uri) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                force.remove(uri);
+            }
+        }
     }
 
-    /// Mark a URI for forced republish
+    /// Mark a URI for forced republish (increments the outstanding marker count)
     pub fn mark_force_republish(&self, uri: &Url) {
-        log::trace!("Marking {} for force republish", uri);
         let mut force = self.force_republish.write().unwrap();
-        force.insert(uri.clone());
+        let count = force.entry(uri.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        log::trace!("Marking {} for force republish (count={})", uri, count);
     }
 
-    /// Clear force republish flag
+    /// Clear all outstanding force-republish markers for this URI
     pub fn clear_force_republish(&self, uri: &Url) {
         let mut force = self.force_republish.write().unwrap();
         force.remove(uri);
@@ -466,6 +481,32 @@ mod tests {
         gate.record_publish(&uri, 1); // Same version with force
 
         // Force should be cleared now
+        assert!(!gate.can_publish(&uri, 1));
+    }
+
+    #[test]
+    fn test_gate_multi_mark_each_consumed_independently() {
+        // Regression: with a HashSet-based force_republish, two concurrent
+        // mark_force_republish calls were collapsed into one — so the FIRST
+        // matching publish cleared the flag and the SECOND publish was blocked
+        // at the same version. The counter-based gate gives each marker its
+        // own publish through the gate.
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        gate.record_publish(&uri, 1);
+        gate.mark_force_republish(&uri);
+        gate.mark_force_republish(&uri);
+
+        // First forced publish at the same version: allowed.
+        assert!(gate.can_publish(&uri, 1));
+        gate.record_publish(&uri, 1);
+
+        // Second forced publish at the same version: still allowed (count was 2).
+        assert!(gate.can_publish(&uri, 1));
+        gate.record_publish(&uri, 1);
+
+        // Both markers consumed: same-version publish blocked again.
         assert!(!gate.can_publish(&uri, 1));
     }
 

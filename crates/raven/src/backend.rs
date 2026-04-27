@@ -979,7 +979,7 @@ impl LanguageServer for Backend {
                 match scan_result {
                     Ok((index, imports, cross_file_entries, new_index_entries)) => {
                         // Apply index and snapshot trigger versions under a single write lock
-                        let (work_items, debounce_ms) = {
+                        let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
                             let mut state = state_clone.write().await;
                             state.apply_workspace_index(
                                 index,
@@ -1001,9 +1001,44 @@ impl LanguageServer for Backend {
                                 })
                                 .collect();
                             let debounce = state.cross_file_config.revalidation_debounce_ms;
-                            (items, debounce)
+                            let pkg_lib = state.package_library.clone();
+                            let pkgs_enabled = state.cross_file_config.packages_enabled
+                                && state.package_library_ready;
+                            (items, debounce, pkg_lib, pkgs_enabled)
                         };
                         log::info!("[Background] Workspace index applied");
+
+                        // Warm the package cache for inherited packages newly visible
+                        // via backward edges discovered by the workspace scan. Without
+                        // this, open documents whose scope inherits packages from
+                        // now-indexed parent files see those packages as
+                        // installed-but-uncached, and `package_cache_pending` suppresses
+                        // undefined-variable diagnostics for genuinely-uninstalled
+                        // packages — e.g. `library(lme4); lmer()` is silenced if the
+                        // parent chain loads other (installed but uncached) packages.
+                        //
+                        // If `packages_enabled` was false at capture time the scan
+                        // raced ahead of Task B (PackageLibrary init); the captured
+                        // `pkg_lib` is the empty default Arc and Task B has since
+                        // swapped `state.package_library` with a fresh Arc. Re-read
+                        // the live library so prefetch warms the right cache instead
+                        // of an orphaned one.
+                        let (effective_pkg_lib, effective_packages_enabled) = if packages_enabled
+                        {
+                            (pkg_lib, true)
+                        } else {
+                            let state = state_clone.read().await;
+                            let enabled = state.cross_file_config.packages_enabled
+                                && state.package_library_ready;
+                            (state.package_library.clone(), enabled)
+                        };
+                        if effective_packages_enabled {
+                            prefetch_packages_for_open_documents(
+                                &state_clone,
+                                &effective_pkg_lib,
+                            )
+                            .await;
+                        }
 
                         // Revalidate all open documents to pick up auto-detected backward edges
                         for (uri, trigger_version, trigger_revision) in work_items {
@@ -5894,6 +5929,135 @@ mod refresh_packages_tests {
         assert!(
             lib_v2.is_cached("MASS").await,
             "MASS must be cached after settings-change rebuild + prefetch"
+        );
+    }
+
+    /// Regression: when the background workspace scan completes and applies
+    /// the dependency graph, the post-scan path must call
+    /// `prefetch_packages_for_open_documents` BEFORE force-republishing
+    /// open documents. Otherwise packages newly visible via inherited scope
+    /// from now-indexed parent files stay uncached forever (no later trigger
+    /// caches them), and `package_cache_pending` permanently silences
+    /// undefined-variable diagnostics for unrelated uninstalled packages.
+    ///
+    /// Real-world reproduction (worldwide repo): `data.r` has
+    /// `library(lme4); lmer()` (lme4 not installed). It is sourced by
+    /// `main.r`, which sources `functions.r`, which loads ~20 packages.
+    /// After workspace scan, those 20 packages flow into `data.r`'s
+    /// inherited scope. Pre-fix, did_open prefetched only `lme4` (no
+    /// backward edges yet); apply_workspace_index then ran a republish
+    /// without re-prefetching, so the 20 inherited packages were
+    /// `is_cached_sync = false` AND `package_exists = true` → pending →
+    /// `lmer()` was suppressed permanently.
+    #[tokio::test]
+    async fn workspace_scan_completion_prefetches_packages_from_closed_parent_chain() {
+        use crate::r_subprocess::RSubprocess;
+        use crate::state::{Document, WorldState};
+        use crate::workspace_index::IndexEntry;
+        use tempfile::TempDir;
+        use tokio::sync::RwLock;
+
+        // Skip if R is not available.
+        let Some(r_subprocess) = RSubprocess::new(None) else {
+            return;
+        };
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess));
+        if lib.initialize().await.is_err() || lib.lib_paths().is_empty() {
+            return;
+        }
+        // MASS ships with R but is NOT base, so it starts uncached after
+        // initialize() — exactly mirroring the user's inherited-package state.
+        if lib.find_package_directory("MASS").is_none() {
+            return;
+        }
+        let pkg_lib = Arc::new(lib);
+
+        // parent.R is CLOSED (only in workspace_index_new); it loads MASS and
+        // then sources child.R. child.R is the OPEN document.
+        let temp_dir = TempDir::new().unwrap();
+        let parent_path = temp_dir.path().join("parent.R");
+        let child_path = temp_dir.path().join("child.R");
+        let parent_code = "library(MASS)\nsource('child.R')\n";
+        let child_code = "x <- 1\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+        std::fs::write(&child_path, child_code).unwrap();
+
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let child_uri = Url::from_file_path(&child_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+
+        let mut world = WorldState::new(vec![]);
+        world.workspace_folders.push(workspace_root);
+        world.package_library = pkg_lib.clone();
+        world.package_library_ready = true;
+        world.cross_file_config.packages_enabled = true;
+
+        // Open child.R only.
+        world
+            .documents
+            .insert(child_uri.clone(), Document::new(child_code, Some(1)));
+
+        // Build the closed parent IndexEntry.
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        let parent_tree = parser.parse(parent_code, None).unwrap();
+        let parent_artifacts = Arc::new(
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                &parent_uri,
+                &parent_tree,
+                parent_code,
+                Some(&parent_meta),
+            ),
+        );
+        let parent_entry = IndexEntry {
+            contents: ropey::Rope::from_str(parent_code),
+            tree: Some(parent_tree),
+            loaded_packages: vec!["MASS".into()],
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: None,
+            },
+            metadata: parent_meta,
+            artifacts: parent_artifacts,
+            indexed_at_version: 0,
+        };
+
+        // Simulate workspace scan completion: insert closed parent and build
+        // the dependency graph. This auto-detects the backward edge from the
+        // perspective of child.R (parent.R sources it).
+        let mut new_entries = std::collections::HashMap::new();
+        new_entries.insert(parent_uri.clone(), parent_entry);
+        world.apply_workspace_index(
+            std::collections::HashMap::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            new_entries,
+        );
+
+        // Sanity: MASS uncached before any prefetch.
+        assert!(
+            !pkg_lib.is_cached("MASS").await,
+            "MASS must NOT be cached before post-scan prefetch"
+        );
+
+        let state = Arc::new(RwLock::new(world));
+
+        // The fix: post-workspace-scan prefetch picks up MASS via the
+        // newly-built backward edge (parent.R sources child.R, parent.R has
+        // `library(MASS)` before that source() call, so MASS is inherited
+        // into child.R's scope).
+        prefetch_packages_for_open_documents(&state, &pkg_lib).await;
+
+        assert!(
+            pkg_lib.is_cached("MASS").await,
+            "MASS must be cached after post-workspace-scan prefetch — \
+             without this, package_cache_pending would permanently silence \
+             undefined-variable diagnostics in child.R for unrelated \
+             uninstalled packages"
         );
     }
 }

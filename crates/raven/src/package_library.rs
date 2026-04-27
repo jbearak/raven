@@ -1304,29 +1304,28 @@ impl PackageLibrary {
 
     /// Check if a package exists (is installed)
     ///
-    /// This is a synchronous method that checks if a package is installed by:
+    /// This is a synchronous method that checks installation by:
     /// 1. Checking if it's a base package (always available)
-    /// 2. Checking if it's already in the cache
-    /// 3. Checking if it exists on the filesystem in any lib_path
+    /// 2. Calling `find_package_directory()` to check for the package on the
+    ///    filesystem in any `lib_path`.
     ///
-    /// This method does NOT load the package into cache - it only checks existence.
-    /// Use `get_package()` to load and cache package information.
+    /// Existence is determined by the filesystem only — this method NEVER
+    /// consults the in-memory cache. `prefetch_packages()` inserts an empty-
+    /// exports entry for any package whose namespace fails to load (the R
+    /// query swallows `asNamespace()` errors via `tryCatch`), so a cached
+    /// entry does NOT prove the package is installed. Trusting the cache here
+    /// would permanently suppress "Package 'X' is not installed" diagnostics
+    /// for any uninstalled package mentioned in a `library()` call after the
+    /// first prefetch pass.
+    ///
+    /// This method does NOT load the package into cache — it only checks
+    /// existence. Use `get_package()` to load and cache package information.
     ///
     /// **Validates: Requirement 15.1** - Used to detect non-installed packages for diagnostics
     pub fn package_exists(&self, name: &str) -> bool {
-        // Base packages are always available
         if self.base_packages.contains(name) {
             return true;
         }
-
-        // Check if already in cache (try_read to avoid blocking)
-        if let Ok(cache) = self.packages.try_read() {
-            if cache.contains_key(name) {
-                return true;
-            }
-        }
-
-        // Check if package directory exists on filesystem
         self.find_package_directory(name).is_some()
     }
 
@@ -1575,6 +1574,42 @@ mod tests {
         lib.invalidate("testpkg").await;
 
         assert!(!lib.is_cached("testpkg").await);
+    }
+
+    #[tokio::test]
+    async fn test_package_exists_ignores_cache() {
+        // prefetch_packages() inserts a cache entry even for packages that R
+        // can't find: the R query wraps `asNamespace()` in `tryCatch(...,
+        // error = function(e) {})`, so a not-installed package emits its
+        // `__PKG:name__` marker followed by zero export lines, and the
+        // resulting empty-exports entry gets inserted into the cache. If
+        // `package_exists()` trusts that cache, it returns true for a package
+        // that isn't actually installed — and "Package not installed"
+        // diagnostics get permanently suppressed. Existence must be determined
+        // from base_packages and the filesystem only.
+        let lib = PackageLibrary::new_empty();
+
+        // Empty lib_paths means find_package_directory() returns None for any
+        // name. Cache-only "existence" is the bug we're guarding against.
+        assert!(
+            lib.lib_paths().is_empty(),
+            "test precondition: lib_paths must be empty"
+        );
+
+        lib.insert_package(PackageInfo::new(
+            "__raven_not_installed__".to_string(),
+            HashSet::new(),
+        ))
+        .await;
+
+        assert!(
+            lib.is_cached("__raven_not_installed__").await,
+            "test precondition: package must be cached"
+        );
+        assert!(
+            !lib.package_exists("__raven_not_installed__"),
+            "package_exists must return false for cached-but-not-on-disk packages"
+        );
     }
 
     #[tokio::test]
@@ -3213,16 +3248,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_package_exists_cached_package() {
-        // Test that cached packages are reported as existing
-        // Validates: Requirement 15.1 (cached packages should not trigger missing package diagnostic)
+    async fn test_package_exists_cached_package_not_on_disk() {
+        // Cache presence does NOT prove installation. prefetch_packages()
+        // inserts an empty-exports cache entry for any package the R query
+        // fails to load (asNamespace error swallowed by tryCatch), so trusting
+        // the cache here would suppress "Package not installed" diagnostics
+        // for never-installed packages that happen to be cached.
         let lib = PackageLibrary::new_empty();
 
-        // Insert a package into cache
         let info = PackageInfo::new("dplyr".to_string(), HashSet::new());
         lib.insert_package(info).await;
 
-        assert!(lib.package_exists("dplyr"), "cached package should exist");
+        assert!(
+            !lib.package_exists("dplyr"),
+            "cached-but-not-on-disk package must not be reported as installed"
+        );
     }
 
     #[test]
