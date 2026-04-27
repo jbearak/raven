@@ -2975,7 +2975,9 @@ impl LanguageServer for Backend {
                         if current_version != version || current_revision != revision {
                             false
                         } else if let Some(ver) = current_version {
-                            state.diagnostics_gate.can_publish(&child_uri, ver)
+                            state
+                                .diagnostics_gate
+                                .try_consume_publish(&child_uri, ver)
                         } else {
                             true
                         }
@@ -2984,11 +2986,6 @@ impl LanguageServer for Backend {
                         client
                             .publish_diagnostics(child_uri.clone(), diagnostics, None)
                             .await;
-
-                        let state = state_arc.read().await;
-                        if let Some(ver) = state.documents.get(&child_uri).and_then(|d| d.version) {
-                            state.diagnostics_gate.record_publish(&child_uri, ver);
-                        }
                     }
                 }
             });
