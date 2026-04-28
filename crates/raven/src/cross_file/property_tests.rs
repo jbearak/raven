@@ -2204,17 +2204,23 @@ proptest! {
         prop_assert!(!scope_outside.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should NOT be available outside");
 
-        // Inside outer function but outside inner function
-        // Choose a position inside the outer body *after* the inner function definition begins.
-        // Be careful: `"{inner_func} <- function"` can match inside other identifiers (e.g. outer_func="ab", inner_func="b").
-        // Prefer a delimiter-aware search and use rfind to bias towards the inner definition.
+        // Inside outer function but outside inner function.
+        // Choose a position inside the outer body *after* the inner function
+        // definition begins. The generated code template always contains
+        // `; {inner_func} <- function` (with the leading `; `) or — once the
+        // first needle has been ruled out — ` {inner_func} <- function` with
+        // a leading space, so both needles are delimiter-aware and cannot
+        // match a substring of another identifier (`r_identifier` allows only
+        // `[a-z0-9_]`, so neither `;` nor ` ` can occur inside it). Avoid a
+        // bare-name `rfind(&inner_func)` fallback: with no surrounding
+        // delimiters it could match `inner_func` inside a longer identifier
+        // such as `outer_func`.
         let inner_def_needle = format!("; {} <- function", inner_func);
         let inner_def_needle2 = format!(" {} <- function", inner_func);
         let col_in_outer_after_inner_def = code
             .rfind(&inner_def_needle)
             .map(|i| (i + 3) as u32) // skip "; " then move inside identifier
             .or_else(|| code.rfind(&inner_def_needle2).map(|i| (i + 2) as u32))
-            .or_else(|| code.rfind(&inner_func).map(|i| (i + 1) as u32))
             .expect("expected inner-function-definition locator in generated code");
         let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def, false);
         prop_assert!(scope_outer.symbols.contains_key(outer_func.as_str()),
