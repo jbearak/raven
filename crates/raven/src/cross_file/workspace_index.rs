@@ -185,6 +185,9 @@ impl CrossFileWorkspaceIndex {
     /// entries from accumulating.
     ///
     /// Lock order: caller holds `inner`; this acquires `pinned` for read.
+    /// The `pinned` read guard is held across both the LRU search and
+    /// the `pop` so a racing `set_pinned_uris` cannot install a pin on
+    /// the chosen victim between selection and removal.
     fn pin_aware_push(
         &self,
         guard: &mut LruCache<Url, IndexEntry>,
@@ -194,23 +197,23 @@ impl CrossFileWorkspaceIndex {
         let already_present = guard.contains(&uri);
         let cap = guard.cap().get();
         if !already_present && guard.len() >= cap {
-            let lru_unpinned = if let Ok(pinned) = self.pinned.read() {
-                guard
+            if let Ok(pinned) = self.pinned.read() {
+                let lru_unpinned = guard
                     .iter()
                     .rev()
                     .find(|(k, _)| !pinned.contains(*k))
-                    .map(|(k, _)| k.clone())
-            } else {
-                None
-            };
+                    .map(|(k, _)| k.clone());
 
-            if let Some(victim) = lru_unpinned {
-                guard.pop(&victim);
-            } else {
-                let new_cap = std::num::NonZeroUsize::new(guard.len() + 1)
-                    .expect("len() + 1 is always non-zero");
-                guard.resize(new_cap);
+                if let Some(victim) = lru_unpinned {
+                    guard.pop(&victim);
+                } else {
+                    let new_cap = std::num::NonZeroUsize::new(guard.len() + 1)
+                        .expect("len() + 1 is always non-zero");
+                    guard.resize(new_cap);
+                }
             }
+            // Pin lock poisoned: fall through to push(), which may evict
+            // a pinned entry. Acceptable poison-recovery behavior.
         }
 
         guard.push(uri, entry);

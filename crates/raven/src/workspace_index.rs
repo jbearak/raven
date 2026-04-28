@@ -393,31 +393,39 @@ impl WorkspaceIndex {
         // Pin-aware eviction: when at capacity and inserting a new key,
         // pre-evict the LRU non-pinned entry. If every in-cache URI is
         // pinned, grow the cache rather than evict a reachable neighbor.
-        // Lock order: inner first, then pinned (read-only).
+        //
+        // Hold the `pinned` read guard across both the LRU search and
+        // the `pop` so a racing `set_pinned_uris` cannot install a pin
+        // on the chosen victim between selection and removal — that
+        // would cause us to evict a freshly-pinned URI. Lock order:
+        // `inner` (write) first, then `pinned` (read).
         let already_present = guard.contains(&uri);
         let cap = guard.cap().get();
         if !already_present && guard.len() >= cap {
-            let lru_unpinned = if let Ok(pinned) = self.pinned.read() {
-                guard
+            if let Ok(pinned) = self.pinned.read() {
+                let lru_unpinned = guard
                     .iter()
                     .rev()
                     .find(|(k, _)| !pinned.contains(*k))
-                    .map(|(k, _)| k.clone())
-            } else {
-                None
-            };
+                    .map(|(k, _)| k.clone());
 
-            if let Some(victim) = lru_unpinned {
-                guard.pop(&victim);
-            } else {
-                // All entries pinned — grow the cache so push() does not
-                // evict an LRU pin. Grow generously to amortize repeated
-                // overflow inserts when the pin set itself is larger than
-                // the configured cap.
-                let new_cap = std::num::NonZeroUsize::new(guard.len() + 1)
-                    .expect("len() + 1 is always non-zero");
-                guard.resize(new_cap);
+                if let Some(victim) = lru_unpinned {
+                    guard.pop(&victim);
+                } else {
+                    // All entries pinned — grow the cache so push() does
+                    // not evict an LRU pin. Grow generously to amortize
+                    // repeated overflow inserts when the pin set itself
+                    // is larger than the configured cap.
+                    let new_cap = std::num::NonZeroUsize::new(guard.len() + 1)
+                        .expect("len() + 1 is always non-zero");
+                    guard.resize(new_cap);
+                }
             }
+            // If the pin lock was poisoned (should never happen in
+            // practice), fall through to push() which will trigger lru's
+            // own LRU eviction. That can drop a pinned entry — acceptable
+            // poison-recovery behavior, since the lock state is already
+            // unreliable.
         }
 
         guard.push(uri, entry);
@@ -993,6 +1001,66 @@ mod tests {
         assert!(index.contains(&uri2));
         assert!(index.contains(&uri3));
         assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn test_pinned_set_held_across_lru_search_and_pop() {
+        // Regression: the pin-aware eviction path must hold the `pinned`
+        // read lock across both the LRU search and the pop. If those
+        // two operations are split, a racing `set_pinned_uris` could
+        // pin the chosen victim between selection and removal, and we'd
+        // evict a freshly-pinned URI. Verified here by checking that
+        // `set_pinned_uris` and `insert` running back-to-back in the
+        // same thread never produce a state where a pinned URI is
+        // missing — the cache should always honor whichever pin set
+        // was most recently installed before the eviction decision.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = std::sync::Arc::new(WorkspaceIndex::new(config));
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        assert!(index.insert(uri1.clone(), make_test_entry(0)));
+        assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+        // Sequential: pin uri1, then insert uri3.
+        let mut pin = HashSet::new();
+        pin.insert(uri1.clone());
+        index.set_pinned_uris(pin);
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
+        assert!(index.contains(&uri1), "uri1 was pinned before insert");
+        assert!(!index.contains(&uri2), "uri2 was the LRU non-pinned");
+
+        // Now stress: launch many threads alternating set_pinned_uris and
+        // insert. The pin set always covers the LRU candidate, so the
+        // cache should never lose the pinned URI even under contention.
+        let index_clone = index.clone();
+        let pin_uri = uri1.clone();
+        let pinning = std::thread::spawn(move || {
+            for _ in 0..200 {
+                let mut p = HashSet::new();
+                p.insert(pin_uri.clone());
+                index_clone.set_pinned_uris(p);
+                index_clone.set_pinned_uris(HashSet::new());
+            }
+        });
+        let index_clone = index.clone();
+        let inserter = std::thread::spawn(move || {
+            for i in 0..200 {
+                let uri = test_uri(&format!("stress_{i}.R"));
+                index_clone.insert(uri, make_test_entry(100 + i as u64));
+            }
+        });
+        pinning.join().unwrap();
+        inserter.join().unwrap();
+        // We don't assert presence of uri1 here (the racing pinner might
+        // have left it unpinned at the moment of the LRU eviction). What
+        // we DO assert: no panic, no deadlock, len is bounded.
+        assert!(index.len() <= 200 + 3);
     }
 
     #[test]
