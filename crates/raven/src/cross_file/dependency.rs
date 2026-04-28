@@ -617,6 +617,13 @@ pub struct UpdateResult {
     pub edges_changed: bool,
 }
 
+/// Cached `(neighborhood, subgraph)` payload for a `(root, depth, visited)`
+/// query. Wrapped in `Arc` so cache reads are refcount bumps.
+pub struct NeighborhoodSubgraph {
+    pub neighborhood: HashSet<Url>,
+    pub subgraph: DependencyGraph,
+}
+
 /// Dependency graph tracking source relationships between files
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
@@ -633,6 +640,15 @@ pub struct DependencyGraph {
     cycle_cache: std::sync::RwLock<HashMap<Url, (u64, Option<CycleDetection>)>>,
     /// Counter of cache hits — exposed for tests; not used in production.
     cycle_cache_hits: std::sync::atomic::AtomicU64,
+    /// Cache of `(neighborhood, extract_subgraph)` results keyed by
+    /// `(root_uri, max_depth, max_visited)`. Stored as `Arc` so cache reads
+    /// in the snapshot path do refcount bumps rather than re-walking the
+    /// graph and cloning edges.
+    subgraph_cache: std::sync::RwLock<
+        HashMap<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
+    >,
+    /// Counter of subgraph cache hits — exposed for tests.
+    subgraph_cache_hits: std::sync::atomic::AtomicU64,
 }
 
 impl Default for DependencyGraph {
@@ -643,22 +659,26 @@ impl Default for DependencyGraph {
             edge_revision: std::sync::atomic::AtomicU64::new(0),
             cycle_cache: std::sync::RwLock::new(HashMap::new()),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            subgraph_cache: std::sync::RwLock::new(HashMap::new()),
+            subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
 impl Clone for DependencyGraph {
     fn clone(&self) -> Self {
-        // Cache is intentionally NOT cloned: clones (e.g. via
+        // Caches are intentionally NOT cloned: clones (e.g. via
         // `extract_subgraph`) typically have different edges, so any cached
-        // cycle results are not portable. The new graph starts at edge
-        // revision 0 with an empty cache.
+        // results from the parent graph are not portable. The new graph
+        // starts at edge revision 0 with empty caches.
         Self {
             forward: self.forward.clone(),
             backward: self.backward.clone(),
             edge_revision: std::sync::atomic::AtomicU64::new(0),
             cycle_cache: std::sync::RwLock::new(HashMap::new()),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            subgraph_cache: std::sync::RwLock::new(HashMap::new()),
+            subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -1050,14 +1070,16 @@ impl DependencyGraph {
             }
         }
 
-        // Subgraphs start with a fresh cache; their edges are pruned, so
-        // any cached cycle results from the parent graph would be wrong.
+        // Subgraphs start with fresh caches; their edges are pruned, so
+        // any cached results from the parent graph would be wrong.
         Self {
             forward,
             backward,
             edge_revision: std::sync::atomic::AtomicU64::new(0),
             cycle_cache: std::sync::RwLock::new(HashMap::new()),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            subgraph_cache: std::sync::RwLock::new(HashMap::new()),
+            subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1443,6 +1465,56 @@ impl DependencyGraph {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Return the `(neighborhood, subgraph)` pair for `uri`, sharing the
+    /// computation across callers via a graph-edge-revisioned cache.
+    ///
+    /// Diagnostic snapshots fan out to many dependents; each dependent's
+    /// snapshot computes the neighborhood and trims the graph the same way.
+    /// Caching that result by `(uri, max_depth, max_visited, edge_revision)`
+    /// turns repeat calls (within a stable graph) into refcount bumps.
+    pub fn cached_neighborhood_subgraph(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> std::sync::Arc<NeighborhoodSubgraph> {
+        use std::sync::atomic::Ordering;
+        let revision = self.edge_revision.load(Ordering::Acquire);
+
+        if let Ok(guard) = self.subgraph_cache.read() {
+            if let Some((cached_rev, cached)) =
+                guard.get(&(uri.clone(), max_depth, max_visited))
+            {
+                if *cached_rev == revision {
+                    self.subgraph_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return std::sync::Arc::clone(cached);
+                }
+            }
+        }
+
+        let neighborhood = self.collect_neighborhood(uri, max_depth, max_visited);
+        let subgraph = self.extract_subgraph(&neighborhood);
+        let payload = std::sync::Arc::new(NeighborhoodSubgraph {
+            neighborhood,
+            subgraph,
+        });
+
+        if let Ok(mut guard) = self.subgraph_cache.write() {
+            guard.insert(
+                (uri.clone(), max_depth, max_visited),
+                (revision, std::sync::Arc::clone(&payload)),
+            );
+        }
+        payload
+    }
+
+    /// Number of `cached_neighborhood_subgraph` calls served from the cache.
+    /// Exposed for tests; not used in production code.
+    pub fn subgraph_cache_hits(&self) -> u64 {
+        self.subgraph_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Dump the current state of the dependency graph for debugging.
     /// Returns a human-readable string representation of all edges.
     pub fn dump_state(&self) -> String {
@@ -1542,6 +1614,7 @@ mod tests {
     use super::super::types::BackwardDirective;
     use super::*;
     use std::fs::File;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn url(s: &str) -> Url {
@@ -1790,6 +1863,50 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_neighborhood_subgraph_caches_until_edges_change() {
+        // S1: cache (neighborhood, subgraph) by (root, depth budget,
+        // edge revision). Repeated calls with no edge change must hit
+        // cache; an edge change must invalidate.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        let meta_b = CrossFileMetadata::default();
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        let max_depth = 10;
+        let max_visited = 100;
+
+        let result1 = graph.cached_neighborhood_subgraph(&a, max_depth, max_visited);
+        let hits_after_first = graph.subgraph_cache_hits();
+
+        let result2 = graph.cached_neighborhood_subgraph(&a, max_depth, max_visited);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_after_first + 1,
+            "second call at same edge revision must hit cache"
+        );
+        assert!(
+            Arc::ptr_eq(&result1, &result2),
+            "cache must return the same Arc allocation"
+        );
+
+        let meta_a_no_source = CrossFileMetadata::default();
+        let result = graph.update_file(&a, &meta_a_no_source, Some(&workspace_root()), |_| None);
+        assert!(result.edges_changed);
+
+        let hits_before_third = graph.subgraph_cache_hits();
+        let _ = graph.cached_neighborhood_subgraph(&a, max_depth, max_visited);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_before_third,
+            "edges_changed must invalidate the subgraph cache and force recompute"
+        );
     }
 
     #[test]

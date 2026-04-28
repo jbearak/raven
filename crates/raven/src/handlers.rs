@@ -141,20 +141,23 @@ impl DiagnosticsSnapshot {
             );
         }
 
-        // Pre-collect artifacts and metadata for all files in the dependency neighborhood
+        // Pre-collect artifacts and metadata for all files in the dependency
+        // neighborhood. The (neighborhood, trimmed-subgraph) pair is cached by
+        // `(uri, max_depth, max_visited, edge_revision)` so concurrent fan-out
+        // revalidations share BFS + edge-cloning work.
         let neighborhood_start = std::time::Instant::now();
         let max_depth = state.cross_file_config.max_chain_depth;
         let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-        let neighborhood = state
+        let payload = state
             .cross_file_graph
-            .collect_neighborhood(uri, max_depth, max_visited);
+            .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider();
 
         let precollect_start = std::time::Instant::now();
         let mut artifacts_map = HashMap::new();
         let mut metadata_map = HashMap::new();
-        for neighbor_uri in &neighborhood {
+        for neighbor_uri in &payload.neighborhood {
             if let Some(artifacts) = content_provider.get_artifacts(neighbor_uri) {
                 artifacts_map.insert(neighbor_uri.clone(), artifacts);
             }
@@ -174,10 +177,11 @@ impl DiagnosticsSnapshot {
         // cycles longer than max_chain_depth are still detected.
         let cycle_detection = state.cross_file_graph.detect_cycle(uri);
 
-        // Build a trimmed graph containing only the neighborhood edges
-        // instead of cloning the entire workspace graph.
+        // Take an owned copy of the trimmed subgraph for the snapshot. The
+        // BFS/edge-cloning work is amortized via the cache; this clone copies
+        // only the small neighborhood-scoped HashMaps.
         let subgraph_start = std::time::Instant::now();
-        let trimmed_graph = state.cross_file_graph.extract_subgraph(&neighborhood);
+        let trimmed_graph = payload.subgraph.clone();
         let subgraph_elapsed = subgraph_start.elapsed();
 
         let total_elapsed = build_start.elapsed();
@@ -186,7 +190,7 @@ impl DiagnosticsSnapshot {
             uri.path(),
             metadata_elapsed,
             neighborhood_elapsed,
-            neighborhood.len(),
+            payload.neighborhood.len(),
             precollect_elapsed,
             artifacts_map.len(),
             metadata_map.len(),

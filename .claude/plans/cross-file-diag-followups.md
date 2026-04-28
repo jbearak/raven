@@ -31,7 +31,7 @@ Use `--save-baseline before` / `--baseline before` to compare runs.
 
 - [x] **S0: Wrap `CrossFileMetadata` in `Arc`.** `content_provider::get_metadata` deep-clones a struct of `Vec`/`HashSet`/`String` fields per neighbor, per snapshot, per dependent. Mirrors the existing `Arc<ScopeArtifacts>` pattern. Touch points: `DocumentState.metadata`, `Document.metadata` (if added), `DiagnosticsSnapshot::metadata_map`, the `G: Fn(&Url) -> Option<CrossFileMetadata>` closure type in `scope_at_position_with_graph`.
 
-- [ ] **S1: Share neighborhood / artifact pre-collection across dependent revalidations.** Today, when one edit fans out to N dependents, each dependent's `run_debounced_diagnostics` builds its own `DiagnosticsSnapshot` with overlapping neighborhoods. A workspace-level cache keyed by graph revision would let dependents share most of the pre-collected data.
+- [x] **S1: Share neighborhood / artifact pre-collection across dependent revalidations.** Today, when one edit fans out to N dependents, each dependent's `run_debounced_diagnostics` builds its own `DiagnosticsSnapshot` with overlapping neighborhoods. A workspace-level cache keyed by graph revision would let dependents share most of the pre-collected data.
 
 - [ ] **S2: Move `detect_cycle` / `extract_subgraph` / `workspace_imports.clone()` out from under the read lock.** `DiagnosticsSnapshot::build` runs all of these while holding `WorldState`'s read lock. Lock-hold is now ≤0.12 ms after the eviction fix, so this is more about hygiene than perf. Could be done lazily (compute on first use, not in `build`).
 
