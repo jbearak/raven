@@ -36,11 +36,19 @@ fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
         .collect();
     entries.sort_by_key(|e| e.path());
 
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
     for entry in &entries {
         let path = entry.path();
         let content = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
-        state.documents.insert(uri, Document::new(&content, None));
+        // Populate both stores to mirror production's `did_open`.
+        rt.block_on(state.document_store.open(uri.clone(), &content, 1));
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
     }
 
     // Run workspace scan and apply index (populates cross-file state)
@@ -242,15 +250,17 @@ fn bench_diagnostics(c: &mut Criterion) {
         let workspace = create_fixture_workspace(config);
         let state = build_state_from_fixture(workspace.path());
         let uri = file_0_uri(workspace.path());
+        let cancel = raven::handlers::DiagCancelToken::never();
 
         group.bench_with_input(
             BenchmarkId::new("diagnostics", *label),
-            &(&state, &uri),
-            |b, &(state, uri)| {
+            &(&state, &uri, &cancel),
+            |b, &(state, uri, cancel)| {
                 b.iter(|| {
                     black_box(raven::handlers::diagnostics(
                         black_box(state),
                         black_box(uri),
+                        black_box(cancel),
                     ))
                 })
             },

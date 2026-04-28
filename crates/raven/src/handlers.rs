@@ -3526,6 +3526,43 @@ fn collect_workspace_symbols_from_artifacts(
 /// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
+/// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
+/// pipeline — exposed under the `test-support` feature so benchmarks can
+/// measure the same path used by `run_debounced_diagnostics` in production.
+#[cfg(feature = "test-support")]
+#[allow(dead_code)]
+pub fn diagnostics_via_snapshot(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
+    match DiagnosticsSnapshot::build(state, uri) {
+        Some(snapshot) => diagnostics_from_snapshot(&snapshot, uri, cancel).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Profile each phase of the snapshot-based diagnostic pipeline. Returns
+/// a tuple of (snapshot_build, diagnostics_from_snapshot, diagnostic_count).
+#[cfg(feature = "test-support")]
+#[allow(dead_code)]
+pub fn diagnostics_via_snapshot_profile(
+    state: &WorldState,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> (
+    std::time::Duration, // snapshot build
+    std::time::Duration, // diagnostics_from_snapshot total
+    usize,               // diagnostic count
+) {
+    let t0 = std::time::Instant::now();
+    let snapshot = match DiagnosticsSnapshot::build(state, uri) {
+        Some(s) => s,
+        None => return (t0.elapsed(), std::time::Duration::ZERO, 0),
+    };
+    let t_build = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let diags = diagnostics_from_snapshot(&snapshot, uri, cancel).unwrap_or_default();
+    let t_diag = t1.elapsed();
+    (t_build, t_diag, diags.len())
+}
+
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {

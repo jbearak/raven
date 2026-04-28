@@ -67,3 +67,12 @@ required-features = ["test-support"]
 name = "libpath_capture"
 harness = false
 required-features = ["test-support"]
+
+[[bench]]
+name = "edit_to_publish"
+harness = false
+required-features = ["test-support"]
+
+[[example]]
+name = "profile_diagnostics"
+required-features = ["test-support"]

@@ -39,9 +39,16 @@ pub struct DocumentStoreConfig {
 
 impl Default for DocumentStoreConfig {
     fn default() -> Self {
+        // Keep all open documents resident: each evicted-but-still-open file
+        // forces the diagnostic snapshot path to recompute scope artifacts and
+        // metadata from scratch on every keystroke (≈100µs per neighbor file).
+        // In a workspace with many open R scripts that source/are-sourced-by
+        // each other, that recomputation dominates edit-to-publish latency.
+        // 4096 covers realistic R workspaces; the memory cap below remains a
+        // safety net.
         Self {
-            max_documents: 50,
-            max_memory_bytes: 100 * 1024 * 1024, // 100MB
+            max_documents: 4096,
+            max_memory_bytes: 512 * 1024 * 1024, // 512MB
         }
     }
 }
@@ -1089,8 +1096,8 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = DocumentStoreConfig::default();
-        assert_eq!(config.max_documents, 50);
-        assert_eq!(config.max_memory_bytes, 100 * 1024 * 1024);
+        assert_eq!(config.max_documents, 4096);
+        assert_eq!(config.max_memory_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
