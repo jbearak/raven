@@ -58,7 +58,7 @@ impl DiagCancelToken {
 /// snapshot or fallback path needs an "empty base_exports" stand-in so we
 /// don't allocate a fresh Arc per snapshot when the package library isn't
 /// ready (e.g. cold start or `WorldState::new` without an R subprocess).
-fn empty_base_exports() -> &'static Arc<HashSet<String>> {
+pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
     static EMPTY: OnceLock<Arc<HashSet<String>>> = OnceLock::new();
     EMPTY.get_or_init(|| Arc::new(HashSet::new()))
 }
@@ -118,29 +118,11 @@ impl DiagnosticsSnapshot {
         // Compute inherited working directory if needed
         if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
             let workspace_root = state.workspace_folders.first();
-            let content_provider = state.content_provider();
-            let get_metadata_for_uri =
-                |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-                    if let Some(doc) = state.documents.get(target_uri) {
-                        return Some(std::sync::Arc::new(
-                            crate::cross_file::directive::parse_directives(&doc.text()),
-                        ));
-                    }
-                    if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
-                        return Some(meta);
-                    }
-                    if let Some(content) = content_provider.get_content(target_uri) {
-                        return Some(std::sync::Arc::new(
-                            crate::cross_file::extract_metadata(&content),
-                        ));
-                    }
-                    None
-                };
             directive_meta.inherited_working_directory = compute_inherited_working_directory(
                 uri,
                 &directive_meta,
                 workspace_root,
-                get_metadata_for_uri,
+                |target_uri: &Url| state.get_or_parse_metadata(target_uri),
             );
         }
 
@@ -3629,36 +3611,11 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     // _Requirements: 5.1, 5.2, 6.1_
     if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
         let workspace_root = state.workspace_folders.first();
-        let content_provider = state.content_provider();
-
-        // Create a metadata getter that retrieves metadata from open documents,
-        // workspace index, or by parsing content from the file cache
-        let get_metadata_for_uri =
-            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-                // First check open documents
-                if let Some(doc) = state.documents.get(target_uri) {
-                    return Some(std::sync::Arc::new(
-                        crate::cross_file::directive::parse_directives(&doc.text()),
-                    ));
-                }
-                // Then try workspace index
-                if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
-                    return Some(meta);
-                }
-                // Finally try to read from file cache
-                if let Some(content) = content_provider.get_content(target_uri) {
-                    return Some(std::sync::Arc::new(
-                        crate::cross_file::extract_metadata(&content),
-                    ));
-                }
-                None
-            };
-
         directive_meta.inherited_working_directory = compute_inherited_working_directory(
             uri,
             &directive_meta,
             workspace_root,
-            get_metadata_for_uri,
+            |target_uri: &Url| state.get_or_parse_metadata(target_uri),
         );
 
         if directive_meta.inherited_working_directory.is_some() {

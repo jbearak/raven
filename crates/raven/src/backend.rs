@@ -1778,6 +1778,9 @@ impl LanguageServer for Backend {
                     state
                         .diagnostics_gate
                         .mark_force_republish_many(to_force_republish.iter());
+                    // Re-enrichment moved edges; refresh pins so the open-doc
+                    // neighborhood matches the post-update graph.
+                    state.recompute_open_neighborhood_pins();
                 }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
@@ -1887,6 +1890,9 @@ impl LanguageServer for Backend {
                 state
                     .diagnostics_gate
                     .mark_force_republish_many(to_force_republish.iter());
+                // Re-enrichment moved edges; refresh pins so the open-doc
+                // neighborhood matches the post-update graph.
+                state.recompute_open_neighborhood_pins();
             }
         }
 
@@ -2735,7 +2741,11 @@ impl LanguageServer for Backend {
         let (uris_to_update, affected_open_docs): (Vec<Url>, Vec<Url>) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
-            let mut affected = Vec::new();
+            let mut affected: Vec<Url> = Vec::new();
+            // O(1) dedupe set companion for `affected` — large bursts of
+            // watched-file changes can otherwise spend the lock-hold time
+            // doing Vec::contains scans per dependent.
+            let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
             // Collect every URI we will force-republish so we can bulk-mark
             // them at the end of the lock under one write-lock acquisition.
             let mut newly_affected: Vec<Url> = Vec::new();
@@ -2768,7 +2778,7 @@ impl LanguageServer for Backend {
                             state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
-                            if state.documents.contains_key(&dep) && !affected.contains(&dep) {
+                            if state.documents.contains_key(&dep) && affected_set.insert(dep.clone()) {
                                 newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
@@ -2783,7 +2793,7 @@ impl LanguageServer for Backend {
                             state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
-                            if state.documents.contains_key(&dep) && !affected.contains(&dep) {
+                            if state.documents.contains_key(&dep) && affected_set.insert(dep.clone()) {
                                 newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
@@ -2817,8 +2827,12 @@ impl LanguageServer for Backend {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             tokio::spawn(async move {
-                // Collect children affected by WD changes for diagnostics
+                // Collect children affected by WD changes for diagnostics.
+                // The set tracks dedupe in O(1) so a watched-files burst
+                // doesn't spend O(n) Vec::contains scans per child.
                 let mut wd_affected_children: Vec<Url> = Vec::new();
+                let mut wd_affected_children_set: std::collections::HashSet<Url> =
+                    std::collections::HashSet::new();
 
                 for uri in uris_to_update {
                     // Read file content asynchronously
@@ -2894,7 +2908,7 @@ impl LanguageServer for Backend {
                     }
 
                     // Update dependency graph
-                    {
+                    let edges_mutated = {
                         let mut state = state_arc.write().await;
                         let uri_clone = uri.clone();
                         let workspace_root = state.workspace_folders.first().cloned();
@@ -2925,7 +2939,7 @@ impl LanguageServer for Backend {
                                 })
                                 .collect();
 
-                        state.cross_file_graph.update_file(
+                        let graph_result = state.cross_file_graph.update_file(
                             &uri,
                             &cross_file_meta,
                             workspace_root.as_ref(),
@@ -2946,7 +2960,7 @@ impl LanguageServer for Backend {
                         let mut newly_affected: Vec<Url> = Vec::new();
                         for child in wd_children {
                             if state.documents.contains_key(&child)
-                                && !wd_affected_children.contains(&child)
+                                && wd_affected_children_set.insert(child.clone())
                             {
                                 newly_affected.push(child.clone());
                                 wd_affected_children.push(child);
@@ -2955,6 +2969,16 @@ impl LanguageServer for Backend {
                         state
                             .diagnostics_gate
                             .mark_force_republish_many(newly_affected.iter());
+                        graph_result.edges_changed
+                    };
+
+                    // The sync watched-files pass refreshed pins for DELETED
+                    // files only. CREATED/CHANGED files have their edges
+                    // mutated here in the async pass, so refresh again now
+                    // that the graph reflects the disk update.
+                    if edges_mutated {
+                        let mut state = state_arc.write().await;
+                        state.recompute_open_neighborhood_pins();
                     }
 
                     log::trace!("Updated workspace index for: {}", uri);

@@ -1070,6 +1070,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pinned_uris_can_exceed_max_memory_bytes() {
+        // Symmetric to test_pinned_uris_can_exceed_max_documents but for the
+        // memory cap: pin two existing entries first, then drop
+        // `max_memory_bytes` below the existing footprint so opening a third
+        // document would normally trigger memory eviction. With pins set,
+        // `evict_lru_excluding` finds no candidates and the store grows past
+        // the cap — pinning beats both count and memory caps so
+        // closed-but-reachable neighbors stay resident under cross-file
+        // workloads.
+        let mut store = DocumentStore::new(DocumentStoreConfig {
+            max_documents: 4096,
+            max_memory_bytes: 100 * 1024 * 1024,
+        });
+
+        let uri1 = Url::parse("file:///mem_a.R").unwrap();
+        let uri2 = Url::parse("file:///mem_b.R").unwrap();
+        let uri3 = Url::parse("file:///mem_c.R").unwrap();
+
+        store.open(uri1.clone(), "x <- 1", 1).await;
+        store.open(uri2.clone(), "y <- 2", 1).await;
+
+        let mut pinned = std::collections::HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        store.set_pinned_uris(pinned);
+
+        // Now squeeze the memory cap below current usage so opening a third
+        // doc forces the eviction loop to run and find every entry pinned.
+        store.config.max_memory_bytes = 1;
+
+        store.open(uri3.clone(), "z <- 3", 1).await;
+
+        assert!(store.contains(&uri1));
+        assert!(store.contains(&uri2));
+        assert!(store.contains(&uri3));
+        assert_eq!(store.len(), 3);
+    }
+
+    #[tokio::test]
     async fn test_lru_access_order() {
         let config = DocumentStoreConfig {
             max_documents: 2,

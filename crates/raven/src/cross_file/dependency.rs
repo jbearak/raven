@@ -627,6 +627,13 @@ pub struct NeighborhoodSubgraph {
     pub subgraph: std::sync::Arc<DependencyGraph>,
 }
 
+/// Cap for the per-`DependencyGraph` cycle/subgraph caches. Sized to match
+/// the document_store default (4096) so workspaces large enough to fill
+/// `DocumentStore` get the same coverage; in long-lived sessions LRU
+/// eviction prevents unbounded growth as files come and go.
+const CYCLE_CACHE_CAPACITY: usize = 4096;
+const SUBGRAPH_CACHE_CAPACITY: usize = 4096;
+
 /// Dependency graph tracking source relationships between files
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
@@ -637,18 +644,20 @@ pub struct DependencyGraph {
     /// `edges_changed`. Cached `detect_cycle` results are keyed on this so
     /// they are invalidated as soon as forward edges change.
     edge_revision: std::sync::atomic::AtomicU64,
-    /// Cache of `detect_cycle` results keyed by `(uri, edge_revision)`.
-    /// `RwLock` interior mutability lets `detect_cycle(&self, ...)` populate
-    /// the cache without forcing every caller to take `&mut`.
-    cycle_cache: std::sync::RwLock<HashMap<Url, (u64, Option<CycleDetection>)>>,
+    /// Cache of `detect_cycle` results keyed by `uri` (and gated by
+    /// `edge_revision` per slot). Bounded LRU so long-lived sessions
+    /// don't accumulate entries for files that never get queried again.
+    cycle_cache:
+        std::sync::RwLock<lru::LruCache<Url, (u64, Option<CycleDetection>)>>,
     /// Counter of cache hits — exposed for tests; not used in production.
     cycle_cache_hits: std::sync::atomic::AtomicU64,
     /// Cache of `(neighborhood, extract_subgraph)` results keyed by
     /// `(root_uri, max_depth, max_visited)`. Stored as `Arc` so cache reads
     /// in the snapshot path do refcount bumps rather than re-walking the
-    /// graph and cloning edges.
+    /// graph and cloning edges. Bounded LRU for the same reason as
+    /// `cycle_cache`.
     subgraph_cache: std::sync::RwLock<
-        HashMap<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
+        lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
     >,
     /// Counter of subgraph cache hits — exposed for tests.
     subgraph_cache_hits: std::sync::atomic::AtomicU64,
@@ -660,9 +669,13 @@ impl Default for DependencyGraph {
             forward: HashMap::new(),
             backward: HashMap::new(),
             edge_revision: std::sync::atomic::AtomicU64::new(0),
-            cycle_cache: std::sync::RwLock::new(HashMap::new()),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
+            )),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
-            subgraph_cache: std::sync::RwLock::new(HashMap::new()),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
+            )),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -678,9 +691,13 @@ impl Clone for DependencyGraph {
             forward: self.forward.clone(),
             backward: self.backward.clone(),
             edge_revision: std::sync::atomic::AtomicU64::new(0),
-            cycle_cache: std::sync::RwLock::new(HashMap::new()),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
+            )),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
-            subgraph_cache: std::sync::RwLock::new(HashMap::new()),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
+            )),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -774,26 +791,31 @@ impl DependencyGraph {
             path_to_uri(&resolved)
         };
 
-        // Snapshot forward edge targets before removal for change detection
-        let old_targets: HashSet<Url> = self
+        // Snapshot forward edges (full DependencyEdge, not just .to URIs).
+        // The cached subgraph in `subgraph_cache` holds full edge values
+        // (call_site_line/column, flags, …) which diagnostics use for cycle
+        // and source positioning, so a metadata-only change (e.g. moving
+        // the source() call to a different line) must invalidate the cache
+        // even when the target URI set is unchanged. `edges_changed` and
+        // `edge_revision` then both track full-edge equality.
+        let old_forward: HashSet<DependencyEdge> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .map(|edges| edges.iter().cloned().collect())
             .unwrap_or_default();
-        // Snapshot backward parents (incoming `is_backward_directive` edges)
+        // Snapshot backward edges (incoming `is_backward_directive` edges)
         // before removal: a `@lsp-sourced-by` directive change rewires the
         // backward map for `uri` and the forward map for each parent, but
         // leaves `forward[uri]` (this file's outgoing edges) untouched.
-        // Tracking the parent set lets us bump `edge_revision` and invalidate
-        // `cycle_cache` / `subgraph_cache` when a backward directive changes.
-        let old_backward_parents: HashSet<Url> = self
+        // Same full-edge equality applies here.
+        let old_backward: HashSet<DependencyEdge> = self
             .backward
             .get(uri)
             .map(|edges| {
                 edges
                     .iter()
                     .filter(|e| e.is_backward_directive)
-                    .map(|e| e.from.clone())
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default();
@@ -1030,25 +1052,27 @@ impl DependencyGraph {
         // Backward changes (added/removed `@lsp-sourced-by`) don't touch
         // `forward[uri]`, but they DO change the dependency graph that
         // `collect_neighborhood` and `detect_cycle` traverse — so the caches
-        // keyed on `edge_revision` must be invalidated for those too.
-        let new_targets: HashSet<Url> = self
+        // keyed on `edge_revision` must be invalidated for those too. We
+        // compare full DependencyEdge values (not just URIs), so a
+        // metadata-only change (e.g. moved call site) also bumps the
+        // revision and refreshes diagnostic positioning.
+        let new_forward: HashSet<DependencyEdge> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .map(|edges| edges.iter().cloned().collect())
             .unwrap_or_default();
-        let new_backward_parents: HashSet<Url> = self
+        let new_backward: HashSet<DependencyEdge> = self
             .backward
             .get(uri)
             .map(|edges| {
                 edges
                     .iter()
                     .filter(|e| e.is_backward_directive)
-                    .map(|e| e.from.clone())
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default();
-        result.edges_changed =
-            old_targets != new_targets || old_backward_parents != new_backward_parents;
+        result.edges_changed = old_forward != new_forward || old_backward != new_backward;
 
         // Bump edge_revision so cycle/subgraph caches become stale for every
         // URI. detect_cycle and cached_neighborhood_subgraph then either
@@ -1112,9 +1136,13 @@ impl DependencyGraph {
             forward,
             backward,
             edge_revision: std::sync::atomic::AtomicU64::new(0),
-            cycle_cache: std::sync::RwLock::new(HashMap::new()),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
+            )),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
-            subgraph_cache: std::sync::RwLock::new(HashMap::new()),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
+            )),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1482,9 +1510,10 @@ impl DependencyGraph {
         use std::sync::atomic::Ordering;
         let revision = self.edge_revision.load(Ordering::Acquire);
 
-        // Fast path: cache hit at the current edge revision.
+        // Fast path: cache hit at the current edge revision. `peek` to keep
+        // the read lock concurrent (no LRU promotion under shared access).
         if let Ok(guard) = self.cycle_cache.read() {
-            if let Some((cached_rev, cached_result)) = guard.get(uri) {
+            if let Some((cached_rev, cached_result)) = guard.peek(uri) {
                 if *cached_rev == revision {
                     self.cycle_cache_hits.fetch_add(1, Ordering::Relaxed);
                     return cached_result.clone();
@@ -1497,7 +1526,8 @@ impl DependencyGraph {
         let computed = self.detect_cycle_recursive(uri, uri, &mut visited, &mut path);
 
         if let Ok(mut guard) = self.cycle_cache.write() {
-            guard.insert(uri.clone(), (revision, computed.clone()));
+            // `push` promotes/evicts under exclusive access.
+            guard.push(uri.clone(), (revision, computed.clone()));
         }
         computed
     }
@@ -1527,7 +1557,7 @@ impl DependencyGraph {
 
         if let Ok(guard) = self.subgraph_cache.read() {
             if let Some((cached_rev, cached)) =
-                guard.get(&(uri.clone(), max_depth, max_visited))
+                guard.peek(&(uri.clone(), max_depth, max_visited))
             {
                 if *cached_rev == revision {
                     self.subgraph_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -1544,7 +1574,7 @@ impl DependencyGraph {
         });
 
         if let Ok(mut guard) = self.subgraph_cache.write() {
-            guard.insert(
+            guard.push(
                 (uri.clone(), max_depth, max_visited),
                 (revision, std::sync::Arc::clone(&payload)),
             );
@@ -1907,6 +1937,40 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_subgraph_cache_invalidates_on_call_site_change() {
+        // Codex follow-up: metadata-only edge changes (e.g. moving a
+        // `source()` call to a different line) leave the .to URI set
+        // unchanged but mutate `call_site_line` on the edge. The cached
+        // subgraph holds full DependencyEdge values that diagnostics
+        // consume for positioning, so this must invalidate the caches.
+        let mut graph = DependencyGraph::new();
+        let parent = url("parent.R");
+        let child = url("child.R");
+
+        let meta_v1 = make_meta_with_source("child.R", 5);
+        graph.update_file(&parent, &meta_v1, Some(&workspace_root()), |_| None);
+        graph.update_file(&child, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        let hits_before = graph.subgraph_cache_hits();
+
+        // Same target URI (child.R), different call_site line — must bump.
+        let meta_v2 = make_meta_with_source("child.R", 12);
+        let result = graph.update_file(&parent, &meta_v2, Some(&workspace_root()), |_| None);
+        assert!(
+            result.edges_changed,
+            "moving source() call to a new line must mark edges_changed"
+        );
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_before,
+            "call-site change must invalidate the subgraph cache"
+        );
     }
 
     #[test]
