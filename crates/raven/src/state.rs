@@ -1080,7 +1080,86 @@ pub type WorkspaceScanResult = (
     HashMap<Url, crate::workspace_index::IndexEntry>,
 );
 
+/// Result of processing a single workspace file (used by parallel scan).
+struct ProcessedFile {
+    uri: Url,
+    document: Document,
+    cross_file_entry: crate::cross_file::workspace_index::IndexEntry,
+    new_index_entry: crate::workspace_index::IndexEntry,
+}
+
+/// Recursively collect file paths from a directory (serial walk, fast).
+fn collect_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                if should_skip_directory(dir_name) {
+                    log::trace!("Skipping directory: {}", path.display());
+                    continue;
+                }
+            }
+            collect_file_paths(&path, out);
+        } else if is_stat_model_extension(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// Process a single file: read, parse, compute metadata and artifacts.
+/// Returns `None` if the file can't be read or converted to a URI.
+fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
+    let text = fs::read_to_string(path).ok()?;
+    let uri = Url::from_file_path(path).ok()?;
+    let metadata_result = fs::metadata(path).ok()?;
+
+    log::trace!("Scanning file: {}", uri);
+    let doc = Document::new_with_uri(&text, None, &uri);
+
+    let cross_file_meta = crate::cross_file::extract_metadata(&text);
+
+    let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
+        crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, &text, Some(&cross_file_meta))
+    } else {
+        crate::cross_file::scope::ScopeArtifacts::default()
+    });
+
+    let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata_result, &text);
+    let cross_file_meta = Arc::new(cross_file_meta);
+
+    let cross_file_entry = crate::cross_file::workspace_index::IndexEntry {
+        snapshot: snapshot.clone(),
+        metadata: cross_file_meta.clone(),
+        artifacts: artifacts.clone(),
+        indexed_at_version: 0,
+    };
+
+    let new_index_entry = crate::workspace_index::IndexEntry {
+        contents: doc.contents.clone(),
+        tree: doc.tree.clone(),
+        loaded_packages: doc.loaded_packages.clone(),
+        snapshot,
+        metadata: cross_file_meta,
+        artifacts,
+        indexed_at_version: 0,
+    };
+
+    Some(ProcessedFile {
+        uri,
+        document: doc,
+        cross_file_entry,
+        new_index_entry,
+    })
+}
+
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
+    use rayon::prelude::*;
+
     let mut index = HashMap::new();
     let mut imports = Vec::new();
     let mut cross_file_entries = HashMap::new();
@@ -1089,15 +1168,12 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     // Get workspace root for path resolution
     let workspace_root = folders.first().cloned();
 
+    // Phase 1: Collect file paths (serial directory walk — fast, I/O-bound)
+    let mut file_paths: Vec<PathBuf> = Vec::new();
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            scan_directory(
-                &path,
-                &mut index,
-                &mut cross_file_entries,
-                &mut new_index_entries,
-            );
+            collect_file_paths(&path, &mut file_paths);
 
             // Check for NAMESPACE file
             let namespace_path = path.join("NAMESPACE");
@@ -1108,6 +1184,30 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
                 }
             }
         }
+    }
+
+    log::info!(
+        "Collected {} file paths for parallel processing",
+        file_paths.len()
+    );
+
+    // Phase 2: Process files in parallel (CPU-bound: read + parse + artifacts)
+    let processed: Vec<_> = file_paths
+        .par_iter()
+        .filter_map(|path| process_workspace_file(path))
+        .collect();
+
+    // Phase 3: Merge results (serial — HashMap inserts are fast)
+    for item in processed {
+        cross_file_entries.insert(
+            item.uri.clone(),
+            item.cross_file_entry,
+        );
+        new_index_entries.insert(
+            item.uri.clone(),
+            item.new_index_entry,
+        );
+        index.insert(item.uri, item.document);
     }
 
     // Second pass: iteratively enrich metadata with inherited_working_directory
@@ -1232,93 +1332,8 @@ fn is_stat_model_extension(path: &Path) -> bool {
         })
 }
 
-fn scan_directory(
-    dir: &std::path::Path,
-    index: &mut HashMap<Url, Document>,
-    cross_file_entries: &mut HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
-    new_index_entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        if path.is_dir() {
-            // Skip common non-R directories to improve scan performance
-            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if should_skip_directory(dir_name) {
-                    log::trace!("Skipping directory: {}", path.display());
-                    continue;
-                }
-            }
-            scan_directory(&path, index, cross_file_entries, new_index_entries);
-        } else if is_stat_model_extension(&path) {
-            if let Ok(text) = fs::read_to_string(&path) {
-                if let Ok(uri) = Url::from_file_path(&path) {
-                    log::trace!("Scanning file: {}", uri);
-                    let doc = Document::new_with_uri(&text, None, &uri);
-
-                    // Also compute cross-file metadata and artifacts
-                    if let Ok(metadata_result) = fs::metadata(&path) {
-                        let cross_file_meta = crate::cross_file::extract_metadata(&text);
-
-                        // Compute artifacts if we have a tree
-                        // Use compute_artifacts_with_metadata to include declared symbols from directives
-                        // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                        let artifacts =
-                            std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
-                                crate::cross_file::scope::compute_artifacts_with_metadata(
-                                    &uri,
-                                    tree,
-                                    &text,
-                                    Some(&cross_file_meta),
-                                )
-                            } else {
-                                crate::cross_file::scope::ScopeArtifacts::default()
-                            });
-
-                        let snapshot =
-                            crate::cross_file::file_cache::FileSnapshot::with_content_hash(
-                                &metadata_result,
-                                &text,
-                            );
-
-                        // Create legacy cross-file entry
-                        let cross_file_meta = Arc::new(cross_file_meta);
-                        cross_file_entries.insert(
-                            uri.clone(),
-                            crate::cross_file::workspace_index::IndexEntry {
-                                snapshot: snapshot.clone(),
-                                metadata: cross_file_meta.clone(),
-                                artifacts: artifacts.clone(),
-                                indexed_at_version: 0, // Initial version; not modified by insert()
-                            },
-                        );
-
-                        // Create new unified IndexEntry with all derived data
-                        // **Validates: Requirements 11.1, 11.2, 11.3**
-                        new_index_entries.insert(
-                            uri.clone(),
-                            crate::workspace_index::IndexEntry {
-                                contents: doc.contents.clone(),
-                                tree: doc.tree.clone(),
-                                loaded_packages: doc.loaded_packages.clone(),
-                                snapshot,
-                                metadata: cross_file_meta,
-                                artifacts,
-                                indexed_at_version: 0, // Initial version
-                            },
-                        );
-                    }
-
-                    index.insert(uri, doc);
-                }
-            }
-        }
-    }
-}
+// `scan_directory` was replaced by `collect_file_paths` + `process_workspace_file`
+// for parallel scanning via rayon. See `scan_workspace`.
 
 /// Parse NAMESPACE imports without needing a `Library` reference.
 ///
