@@ -3538,8 +3538,15 @@ pub fn diagnostics_via_snapshot(state: &WorldState, uri: &Url, cancel: &DiagCanc
     }
 }
 
-/// Profile each phase of the snapshot-based diagnostic pipeline. Returns
-/// a tuple of (snapshot_build, diagnostics_from_snapshot, diagnostic_count).
+/// Profile each phase of the snapshot-based diagnostic pipeline.
+///
+/// Returns `(snapshot_build, diag_phase, outcome)` where `outcome` is
+/// `Some(count)` when `diagnostics_from_snapshot` ran to completion (so a
+/// successful zero-diagnostic run is `Some(0)`) and `None` when the diagnostic
+/// phase short-circuited (master switch off, file is non-R, or the cancel
+/// token tripped). `snapshot_build` is `Duration::ZERO` when
+/// `DiagnosticsSnapshot::build` returns `None` — i.e. the document is missing
+/// or its tree failed to parse — and the outcome is `None` in that case too.
 #[cfg(feature = "test-support")]
 #[allow(dead_code)]
 pub fn diagnostics_via_snapshot_profile(
@@ -3549,18 +3556,18 @@ pub fn diagnostics_via_snapshot_profile(
 ) -> (
     std::time::Duration, // snapshot build
     std::time::Duration, // diagnostics_from_snapshot total
-    usize,               // diagnostic count
+    Option<usize>,       // diagnostic count, or None if the phase short-circuited
 ) {
     let t0 = std::time::Instant::now();
     let snapshot = match DiagnosticsSnapshot::build(state, uri) {
         Some(s) => s,
-        None => return (t0.elapsed(), std::time::Duration::ZERO, 0),
+        None => return (std::time::Duration::ZERO, std::time::Duration::ZERO, None),
     };
     let t_build = t0.elapsed();
     let t1 = std::time::Instant::now();
-    let diags = diagnostics_from_snapshot(&snapshot, uri, cancel).unwrap_or_default();
+    let outcome = diagnostics_from_snapshot(&snapshot, uri, cancel).map(|d| d.len());
     let t_diag = t1.elapsed();
-    (t_build, t_diag, diags.len())
+    (t_build, t_diag, outcome)
 }
 
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {

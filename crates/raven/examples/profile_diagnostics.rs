@@ -126,25 +126,29 @@ fn measure(label: &str, state: &WorldState, uri: &Url) {
     }
     let mut builds = Vec::new();
     let mut diags = Vec::new();
-    let mut count = 0;
+    let mut last_outcome: Option<usize> = None;
     for _ in 0..10 {
-        let (b, d, c) = diagnostics_via_snapshot_profile(state, uri, &cancel);
+        let (b, d, outcome) = diagnostics_via_snapshot_profile(state, uri, &cancel);
         builds.push(b);
         diags.push(d);
-        count = c;
+        last_outcome = outcome;
     }
     builds.sort();
     diags.sort();
     let median_build = builds[builds.len() / 2];
     let median_diag = diags[diags.len() / 2];
     let total = median_build + median_diag;
+    let count_str = match last_outcome {
+        Some(n) => n.to_string(),
+        None => "<short-circuited>".to_string(),
+    };
     println!(
         "{:50} build={:>6.2}ms  diag={:>6.2}ms  total={:>6.2}ms  diags={}",
         label,
         median_build.as_secs_f64() * 1000.0,
         median_diag.as_secs_f64() * 1000.0,
         total.as_secs_f64() * 1000.0,
-        count,
+        count_str,
     );
 }
 

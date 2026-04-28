@@ -14,7 +14,7 @@
 // since that bounds the worst-case edit-to-publish latency when the runtime
 // or the lock serializes the dependent revalidations.
 //
-// Run with: cargo bench --bench edit_to_publish
+// Run with: cargo bench --features test-support --bench edit_to_publish
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
