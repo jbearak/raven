@@ -765,6 +765,41 @@ impl WorldState {
         }
     }
 
+    /// Recompute the document_store's pinned URI set.
+    ///
+    /// The pinned set is the transitive dependency neighborhood of every open
+    /// document — closed-but-reachable files included. Pinned entries are
+    /// protected from LRU eviction in `DocumentStore`, so closed-but-reachable
+    /// documents that have been opened (e.g. via `did_open` in a deeply
+    /// connected workspace) survive across edits to other files and avoid the
+    /// `compute_artifacts_with_metadata` recomputation fallback.
+    ///
+    /// Call after the open set changes (`did_open` / `did_close`) or after a
+    /// dependency-graph edge change touches an open file.
+    pub fn recompute_open_neighborhood_pins(&mut self) {
+        let open_uris: Vec<Url> = self.document_store.uris();
+        if open_uris.is_empty() {
+            self.document_store.set_pinned_uris(HashSet::new());
+            return;
+        }
+
+        let max_depth = self.cross_file_config.max_chain_depth;
+        let max_visited = self.cross_file_config.max_transitive_dependents_visited;
+        // Same scaling as build_package_scope_snapshot: bound lock-hold time
+        // while preserving coverage equivalent to the per-seed loop.
+        let effective_max_visited = max_visited
+            .saturating_mul(open_uris.len().max(1))
+            .min(max_visited.saturating_mul(50));
+
+        let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
+            open_uris.iter().cloned(),
+            max_depth,
+            effective_max_visited,
+        );
+
+        self.document_store.set_pinned_uris(neighborhood);
+    }
+
     /// Resize all LRU caches based on configuration.
     /// Called after parsing initialization options.
     pub fn resize_caches(&self, config: &crate::cross_file::config::CrossFileConfig) {
@@ -899,6 +934,11 @@ impl WorldState {
         self.build_dependency_graph_from_workspace();
         self.workspace_scan_complete = true;
         log::info!("[Background] Dependency graph built from workspace entries, workspace_scan_complete = true");
+
+        // Now that the graph reflects the workspace, refresh the document_store
+        // pin set so any file opened before the scan completes picks up its
+        // neighborhood.
+        self.recompute_open_neighborhood_pins();
     }
 
     /// Build the dependency graph from all entries in the workspace index.

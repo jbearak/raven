@@ -7,7 +7,7 @@
 // Allow dead code for infrastructure that's implemented for future use
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -219,6 +219,15 @@ pub struct DocumentStore {
     config: DocumentStoreConfig,
     /// Metrics
     metrics: DocumentStoreMetrics,
+    /// URIs protected from LRU eviction.
+    ///
+    /// The pinned set is the transitive dependency neighborhood of every open
+    /// document — closed-but-reachable files included. Reachability is
+    /// recomputed when the open set changes (`did_open`/`did_close`) or when
+    /// the cross-file dependency graph's edges change. Pinned URIs are skipped
+    /// during eviction; if every in-store URI is pinned, the document count
+    /// cap is allowed to grow rather than evict a pinned entry.
+    pinned_uris: HashSet<Url>,
 }
 
 impl DocumentStore {
@@ -236,7 +245,27 @@ impl DocumentStore {
             update_trackers: HashMap::new(),
             config,
             metrics: DocumentStoreMetrics::default(),
+            pinned_uris: HashSet::new(),
         }
+    }
+
+    /// Replace the pinned set.
+    ///
+    /// Callers (typically the LSP backend) recompute the open-document
+    /// neighborhood when the open set or the dependency graph's edges change,
+    /// then call this to keep the store from evicting reachable documents.
+    pub fn set_pinned_uris(&mut self, uris: HashSet<Url>) {
+        self.pinned_uris = uris;
+    }
+
+    /// Returns true if the URI is currently pinned.
+    pub fn is_pinned(&self, uri: &Url) -> bool {
+        self.pinned_uris.contains(uri)
+    }
+
+    /// Number of currently pinned URIs.
+    pub fn pinned_len(&self) -> usize {
+        self.pinned_uris.len()
     }
 
     /// Open a document (evicts if needed)
@@ -683,13 +712,18 @@ impl DocumentStore {
         }
     }
 
-    /// Evict the least recently used document
+    /// Evict the least recently used unpinned document
     ///
     /// # Returns
-    /// true if a document was evicted, false if store is empty
+    /// true if a document was evicted, false if no eligible (unpinned) documents
     fn evict_lru(&mut self) -> bool {
-        // Get the least recently accessed URI (first in access_order)
-        if let Some(uri) = self.access_order.first().cloned() {
+        let uri_to_evict = self
+            .access_order
+            .iter()
+            .find(|uri| !self.pinned_uris.contains(*uri))
+            .cloned();
+
+        if let Some(uri) = uri_to_evict {
             log::trace!("Evicting LRU document: {}", uri);
             self.documents.remove(&uri);
             self.access_order.shift_remove(&uri);
@@ -701,22 +735,23 @@ impl DocumentStore {
         }
     }
 
-    /// Evict the least recently used document, excluding a specific URI
+    /// Evict the least recently used document, excluding a specific URI and
+    /// any URI in the pinned set.
     ///
     /// This is used when updating an existing document - we don't want to evict
-    /// the document we're about to update.
+    /// the document we're about to update, nor any reachable neighbor of an
+    /// open document.
     ///
     /// # Arguments
     /// * `exclude_uri` - URI to exclude from eviction
     ///
     /// # Returns
-    /// true if a document was evicted, false if no eligible documents
+    /// true if a document was evicted, false if no eligible (unpinned) documents
     fn evict_lru_excluding(&mut self, exclude_uri: &Url) -> bool {
-        // Find the least recently accessed URI that isn't the excluded one
         let uri_to_evict = self
             .access_order
             .iter()
-            .find(|uri| *uri != exclude_uri)
+            .find(|uri| *uri != exclude_uri && !self.pinned_uris.contains(*uri))
             .cloned();
 
         if let Some(uri) = uri_to_evict {
@@ -951,6 +986,68 @@ mod tests {
         assert!(!store.contains(&uri1)); // Evicted
         assert!(store.contains(&uri2));
         assert!(store.contains(&uri3));
+    }
+
+    #[tokio::test]
+    async fn test_pinned_uris_are_protected_from_eviction() {
+        // RED: Pinned URIs (open-document neighborhoods) must survive eviction
+        // even when they are LRU. Without pinning, uri1 (LRU) would be evicted
+        // when uri3 is opened.
+        let config = DocumentStoreConfig {
+            max_documents: 2,
+            max_memory_bytes: 100 * 1024 * 1024,
+        };
+        let mut store = DocumentStore::new(config);
+
+        let uri1 = Url::parse("file:///pinned.R").unwrap();
+        let uri2 = Url::parse("file:///lru_unpinned.R").unwrap();
+        let uri3 = Url::parse("file:///mru.R").unwrap();
+
+        store.open(uri1.clone(), "x <- 1", 1).await;
+        store.open(uri2.clone(), "y <- 2", 1).await;
+
+        let mut pinned = std::collections::HashSet::new();
+        pinned.insert(uri1.clone());
+        store.set_pinned_uris(pinned);
+
+        store.open(uri3.clone(), "z <- 3", 1).await;
+
+        assert!(store.contains(&uri1), "pinned uri must not be evicted");
+        assert!(
+            !store.contains(&uri2),
+            "least-recently-used unpinned uri must be evicted"
+        );
+        assert!(store.contains(&uri3));
+    }
+
+    #[tokio::test]
+    async fn test_pinned_uris_can_exceed_max_documents() {
+        // When all in-store URIs are pinned, eviction is skipped and capacity
+        // is exceeded — the cap stops being a tuning knob for pinned sets.
+        let config = DocumentStoreConfig {
+            max_documents: 2,
+            max_memory_bytes: 100 * 1024 * 1024,
+        };
+        let mut store = DocumentStore::new(config);
+
+        let uri1 = Url::parse("file:///a.R").unwrap();
+        let uri2 = Url::parse("file:///b.R").unwrap();
+        let uri3 = Url::parse("file:///c.R").unwrap();
+
+        store.open(uri1.clone(), "x <- 1", 1).await;
+        store.open(uri2.clone(), "y <- 2", 1).await;
+
+        let mut pinned = std::collections::HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        store.set_pinned_uris(pinned);
+
+        store.open(uri3.clone(), "z <- 3", 1).await;
+
+        assert!(store.contains(&uri1));
+        assert!(store.contains(&uri2));
+        assert!(store.contains(&uri3));
+        assert_eq!(store.len(), 3);
     }
 
     #[tokio::test]

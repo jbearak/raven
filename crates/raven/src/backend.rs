@@ -1557,6 +1557,10 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
+            // Refresh the document_store pin set: the open set just changed
+            // and the dependency graph may have new edges from the new file.
+            state.recompute_open_neighborhood_pins();
+
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (
                 work_items,
@@ -2218,6 +2222,13 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
+            // Refresh pins when graph edges shift: a removed `source()` may
+            // pull a closed file out of the open neighborhood (let it become
+            // LRU-evictable), and a newly added one may pull one in.
+            if edges_changed {
+                state.recompute_open_neighborhood_pins();
+            }
+
             let edited_file_debounce_ms = state.cross_file_config.edited_file_debounce_ms;
             let dependent_debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (
@@ -2367,6 +2378,10 @@ impl LanguageServer for Backend {
 
         // Close the document (legacy)
         state.close_document(uri);
+
+        // Refresh the pin set now that the open set has shrunk; URIs reachable
+        // only from the closed file are no longer protected from eviction.
+        state.recompute_open_neighborhood_pins();
     }
 
     /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
