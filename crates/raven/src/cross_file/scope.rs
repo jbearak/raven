@@ -621,20 +621,34 @@ impl Hash for ScopedSymbol {
 pub enum ScopeEvent {
     /// A symbol definition at a specific position.
     ///
-    /// `line/column` is where the definition is anchored in the document
-    /// (typically the LHS identifier of an assignment, the iterator of a `for`,
-    /// or the `assign()` call). This drives timeline sort order, the
-    /// containing-function-scope lookup in `annotate_event_function_scopes`,
-    /// and any UI affordance that wants to point at the definition site.
+    /// `line/column` is the *anchor* — typically the LHS identifier of an
+    /// assignment, the iterator of a `for`, or the call site of `assign()`.
+    /// It is used by `annotate_event_function_scopes` to look up the
+    /// containing function scope and by any UI affordance that wants to point
+    /// at the declaration site. It is **not** the timeline sort key.
     ///
-    /// `visible_from_line/visible_from_column` is the position at which the
-    /// new binding becomes visible in scope. For most definitions this is the
-    /// same as `line/column`, but for `<-`/`=`/`<<-` assignments and
-    /// `assign()` calls it is the end position of the *whole* defining
-    /// expression — R evaluates the RHS *before* installing the LHS binding,
-    /// so the binding is not in scope inside its own defining expression. This
-    /// is what makes `merp <- merp` correctly flag the RHS reference as an
-    /// undefined variable when no outer `merp` exists.
+    /// `visible_from_line/visible_from_column` is the *effect position* —
+    /// when the new binding actually enters scope. It is what
+    /// `is_symbol_visible` (and the inline check in
+    /// `scope_at_position_with_packages`) compares against, **and it is the
+    /// key the timeline is sorted by** (see `event_effect_position`).
+    ///
+    /// For most definitions the two positions are identical (e.g. `for`
+    /// iterators, function parameters, `@lsp-var` declarations). For
+    /// `<-`/`=`/`<<-` (and `->`/`->>`) assignments whose value side is
+    /// **not** a function definition (after stripping `parenthesized_expression`
+    /// wrappers via `unwrap_function_definition`) and for `assign()` calls,
+    /// `visible_from` is the end position of the *whole* defining expression
+    /// — R evaluates the RHS *before* installing the LHS binding, so the
+    /// binding is not in scope inside its own defining expression. This is
+    /// what makes `merp <- merp` correctly flag the RHS reference as an
+    /// undefined variable when no outer `merp` exists, while still letting
+    /// recursive `f <- function() f()` (and the paren-wrapped variant
+    /// `f <- (function() f())`) resolve.
+    ///
+    /// `ScopedSymbol.defined_line/defined_column` (carried in the inner
+    /// `symbol`) is always the LHS and is what hover and go-to-definition
+    /// follow.
     Def {
         line: u32,
         column: u32,
@@ -2317,8 +2331,12 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
             return None;
         }
 
-        let (kind, signature) = if lhs.kind() == "function_definition" {
-            let sig = extract_function_signature(lhs, name_str, line_index.text);
+        // Treat paren-wrapped function definitions the same as unwrapped ones
+        // (`(function() ...) -> g` is `function() ...` semantically) so the
+        // symbol is indexed as Function with a signature, matching the
+        // delayed-evaluation `visible_from` carve-out in `collect_definitions`.
+        let (kind, signature) = if let Some(func_node) = unwrap_function_definition(lhs) {
+            let sig = extract_function_signature(func_node, name_str, line_index.text);
             (SymbolKind::Function, Some(sig))
         } else {
             (SymbolKind::Variable, None)
@@ -2356,9 +2374,13 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         return None;
     }
 
-    // Get the right-hand side to determine kind
-    let (kind, signature) = if rhs.kind() == "function_definition" {
-        let sig = extract_function_signature(rhs, name_str, line_index.text);
+    // Get the right-hand side to determine kind. Paren-wrapped function
+    // definitions (`f <- (function(...) ...)`) are still function definitions
+    // — the parens are pure syntax — so the symbol is indexed as Function
+    // with a signature, matching the delayed-evaluation `visible_from`
+    // carve-out in `collect_definitions`.
+    let (kind, signature) = if let Some(func_node) = unwrap_function_definition(rhs) {
+        let sig = extract_function_signature(func_node, name_str, line_index.text);
         (SymbolKind::Function, Some(sig))
     } else {
         (SymbolKind::Variable, None)
@@ -2473,36 +2495,43 @@ fn assignment_rhs_is_function_definition(node: Node, line_index: &LineIndex) -> 
     let op = children[1];
     let rhs = children[2];
     let op_text = node_text(op, line_index.text);
-    match op_text {
-        "<-" | "=" | "<<-" => is_function_definition_after_parens(rhs),
-        "->" | "->>" => is_function_definition_after_parens(lhs),
-        _ => false,
-    }
+    let value_node = match op_text {
+        "<-" | "=" | "<<-" => rhs,
+        "->" | "->>" => lhs,
+        _ => return false,
+    };
+    is_function_definition_after_parens(value_node)
 }
 
-/// Returns true if `node` is (or transparently wraps via parentheses) a
-/// `function_definition`. Parentheses around an expression are pure syntax
-/// in R — `(function() body)` and `function() body` produce the same value
-/// — so for the purpose of "does the RHS install the binding immediately or
-/// is the body delayed?" we strip them.
-fn is_function_definition_after_parens(node: Node) -> bool {
+/// If `node` is a `function_definition` (possibly wrapped in one or more
+/// `parenthesized_expression` layers), return the inner `function_definition`
+/// node. Parentheses around an expression are pure syntax in R —
+/// `(function() body)` and `function() body` produce the same value — so for
+/// any consumer that wants to know "is this a function definition?" or "give
+/// me the function node so I can extract its signature", we strip them.
+///
+/// Returns `None` for non-function nodes.
+fn unwrap_function_definition(node: Node) -> Option<Node> {
     let mut current = node;
     loop {
         match current.kind() {
-            "function_definition" => return true,
+            "function_definition" => return Some(current),
             "parenthesized_expression" => {
                 let mut cursor = current.walk();
                 let inner = current
                     .children(&mut cursor)
-                    .find(|c| c.is_named() && c.kind() != "comment");
-                match inner {
-                    Some(child) => current = child,
-                    None => return false,
-                }
+                    .find(|c| c.is_named() && c.kind() != "comment")?;
+                current = inner;
             }
-            _ => return false,
+            _ => return None,
         }
     }
+}
+
+/// Returns true if `node` is (or transparently wraps via parentheses) a
+/// `function_definition`. Convenience wrapper around `unwrap_function_definition`.
+fn is_function_definition_after_parens(node: Node) -> bool {
+    unwrap_function_definition(node).is_some()
 }
 
 /// Compute a deterministic hash of the exported interface and loaded packages.
@@ -5221,33 +5250,123 @@ outside_var <- 2"#;
     }
 
     #[test]
+    fn test_parenthesized_function_rhs_indexed_as_function_with_signature() {
+        // `f <- (function(x, y) f(x))` and its right-assignment counterpart
+        // are still function definitions — the parens are pure syntax. The
+        // exported-interface entry must therefore be `SymbolKind::Function`
+        // with a non-empty signature, so document outline / hover / completion
+        // surface them as functions just like the unwrapped form.
+        let cases: &[(&str, &str)] = &[
+            ("f <- (function(x, y) f(x))\n", "f"),
+            ("(function(a) g(a)) -> g\n", "g"),
+        ];
+
+        for &(code, name) in cases {
+            let tree = parse_r(code);
+            let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+            let symbol = artifacts
+                .exported_interface
+                .get(name)
+                .unwrap_or_else(|| panic!("{:?}: expected `{}` in exported_interface", code, name));
+
+            assert_eq!(
+                symbol.kind,
+                SymbolKind::Function,
+                "{:?}: paren-wrapped function RHS must be indexed as Function, got {:?}",
+                code,
+                symbol.kind,
+            );
+            let signature = symbol
+                .signature
+                .as_deref()
+                .unwrap_or_else(|| panic!("{:?}: expected a signature for `{}`", code, name));
+            assert!(
+                signature.starts_with(name),
+                "{:?}: signature should start with the function name, got {:?}",
+                code,
+                signature,
+            );
+            assert!(
+                signature.contains('('),
+                "{:?}: signature should include parameter list, got {:?}",
+                code,
+                signature,
+            );
+        }
+    }
+
+    #[test]
     fn test_parenthesized_function_rhs_visible_from_lhs() {
         // `f <- (function() f())` — the parenthesized RHS still wraps a
         // function definition, whose body is delayed-evaluation. Recursive
         // calls inside the body must therefore see `f`, just like the
         // unwrapped form `f <- function() f()`. We assert this by querying
-        // scope inside the function body (without hoisting) and checking that
-        // `f` is visible.
+        // scope at the position of the inner recursive `f()` call (located
+        // via AST traversal so the locator is delimiter-aware and robust to
+        // additional `f` occurrences in future fixtures).
         let code = "f <- (function() f())\n";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        // Query inside the function body. The body is at roughly columns
-        // 16..=21 in `f <- (function() f())`. Use the position of the inner
-        // `f()` call.
-        let needle = "f()";
-        let inner_call_col = code.rfind(needle).map(|i| i as u32).unwrap_or(0);
-        assert!(
-            inner_call_col > 0,
-            "Test setup error: failed to locate inner `f()` call"
+        let inner_call =
+            find_recursive_self_call(tree.root_node(), code, "f").unwrap_or_else(|| {
+                panic!("Test setup error: could not find inner `f()` call via AST")
+            });
+        let inner_call_pos = inner_call.start_position();
+        let scope = scope_at_position(
+            &artifacts,
+            inner_call_pos.row as u32,
+            inner_call_pos.column as u32,
+            false,
         );
-        let scope = scope_at_position(&artifacts, 0, inner_call_col, false);
         assert!(
             scope.symbols.contains_key("f"),
             "`f` must be visible inside `(function() f())` body so the recursive \
              call resolves. Got symbols: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// Walk the AST under `node` and return the first `call` node whose
+    /// callee is the identifier `name` and that lives inside a
+    /// `function_definition` body. Used by tests to locate a *recursive*
+    /// self-call (e.g. the inner `f()` in `f <- (function() f())`) without
+    /// resorting to substring matches that break when the same identifier
+    /// appears multiple times.
+    fn find_recursive_self_call<'a>(
+        node: tree_sitter::Node<'a>,
+        content: &str,
+        name: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        find_recursive_self_call_inner(node, content, name, false)
+    }
+
+    fn find_recursive_self_call_inner<'a>(
+        node: tree_sitter::Node<'a>,
+        content: &str,
+        name: &str,
+        inside_function: bool,
+    ) -> Option<tree_sitter::Node<'a>> {
+        let now_inside_function = inside_function || node.kind() == "function_definition";
+        if now_inside_function && node.kind() == "call" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                if func_node.kind() == "identifier"
+                    && &content[func_node.byte_range()] == name
+                {
+                    return Some(node);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) =
+                find_recursive_self_call_inner(child, content, name, now_inside_function)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[test]
