@@ -967,20 +967,22 @@ mod tests {
 
     #[test]
     fn test_pinned_set_held_across_lru_search_and_pop() {
-        // Regression coverage for codex-flagged TOCTOU: the pin-aware
-        // eviction path must hold the `pinned` read lock across both
-        // the LRU search and the `pop`. If they're split, a racing
-        // `set_pinned_uris` could install a pin on the chosen victim
-        // between selection and removal, and we'd evict a freshly-pinned
-        // URI.
+        // Concurrency guard for the pin-aware eviction path: under
+        // contended `set_pinned_uris` + `insert`, no panic, no deadlock,
+        // and a URI that was pinned before the race began must still
+        // be present after.
         //
-        // Strict deterministic reproduction of the race window requires
-        // test hooks in production code (which we don't add). Instead,
-        // this test uses a `Barrier` to release two threads at the same
-        // moment for many iterations, asserting on every iteration that
-        // the URI which was pinned BEFORE the race is still present
-        // after. With the fix, the eviction always sees `uri1` pinned
-        // at the moment of the find, so `uri1` is never the victim.
+        // This test does NOT deterministically distinguish the buggy
+        // (read dropped before pop) version from the fixed (read held
+        // across pop) version: in both, the eviction's victim selection
+        // is based on the pin-set snapshot at A's read time, and once
+        // A picks a victim it pops that victim regardless. The
+        // OBSERVABLE end-state — which URIs are in the cache vs the
+        // pin set — is identical in both versions across all race
+        // outcomes. The fix's contribution is consistency of A's view
+        // (a future composability property), not a different cache
+        // outcome. Strict TOCTOU reproduction would require test hooks
+        // in the production helper, which we don't add.
         for _ in 0..200 {
             let config = WorkspaceIndexConfig {
                 debounce_ms: 50,
