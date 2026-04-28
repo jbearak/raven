@@ -769,14 +769,17 @@ impl WorldState {
         }
     }
 
-    /// Recompute the document_store's pinned URI set.
+    /// Recompute the pinned URI set across all caches that hold open-document
+    /// neighborhood entries.
     ///
     /// The pinned set is the transitive dependency neighborhood of every open
     /// document — closed-but-reachable files included. Pinned entries are
-    /// protected from LRU eviction in `DocumentStore`, so closed-but-reachable
-    /// documents that have been opened (e.g. via `did_open` in a deeply
-    /// connected workspace) survive across edits to other files and avoid the
-    /// `compute_artifacts_with_metadata` recomputation fallback.
+    /// protected from LRU eviction in `DocumentStore`, `WorkspaceIndex`, and
+    /// `CrossFileWorkspaceIndex`, so closed-but-reachable documents survive
+    /// across edits to other files and avoid the `compute_artifacts_with_metadata`
+    /// recomputation fallback. `DocumentStore` only physically holds open
+    /// documents; closed neighbors live in the two workspace indexes, so all
+    /// three caches must share the same pin set to fully cover the contract.
     ///
     /// Call after the open set changes (`did_open` / `did_close`) or after a
     /// dependency-graph edge change touches an open file.
@@ -784,6 +787,9 @@ impl WorldState {
         let open_uris: Vec<Url> = self.document_store.uris();
         if open_uris.is_empty() {
             self.document_store.set_pinned_uris(HashSet::new());
+            self.workspace_index_new.set_pinned_uris(HashSet::new());
+            self.cross_file_workspace_index
+                .set_pinned_uris(HashSet::new());
             return;
         }
 
@@ -801,6 +807,13 @@ impl WorldState {
             effective_max_visited,
         );
 
+        // Mirror the same neighborhood across all three caches. Cloning is
+        // cheap relative to the neighborhood traversal and avoids needing
+        // `Arc<HashSet<Url>>` plumbing through the existing setter signature.
+        self.workspace_index_new
+            .set_pinned_uris(neighborhood.clone());
+        self.cross_file_workspace_index
+            .set_pinned_uris(neighborhood.clone());
         self.document_store.set_pinned_uris(neighborhood);
     }
 

@@ -41,6 +41,13 @@ pub struct CrossFileWorkspaceIndex {
     inner: RwLock<LruCache<Url, IndexEntry>>,
     /// Monotonic version counter
     version: AtomicU64,
+    /// URIs protected from LRU eviction.
+    ///
+    /// Mirrors `DocumentStore::pinned_uris` so closed-but-reachable
+    /// neighbors of open documents are not silently dropped under cache
+    /// pressure. Lock order: acquire `inner` before `pinned` when both
+    /// are needed.
+    pinned: RwLock<HashSet<Url>>,
 }
 
 impl std::fmt::Debug for CrossFileWorkspaceIndex {
@@ -66,7 +73,28 @@ impl CrossFileWorkspaceIndex {
         Self {
             inner: RwLock::new(LruCache::new(cap)),
             version: AtomicU64::new(0),
+            pinned: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the set of URIs protected from LRU eviction.
+    ///
+    /// Pinned URIs are skipped during eviction; if every in-cache URI is
+    /// pinned, the cache is allowed to grow past its configured capacity.
+    /// Explicit `invalidate` and `update_from_disk` still work for pinned
+    /// URIs (the open-document gate in `update_from_disk` is unchanged).
+    pub fn set_pinned_uris(&self, uris: HashSet<Url>) {
+        if let Ok(mut pinned) = self.pinned.write() {
+            *pinned = uris;
+        }
+    }
+
+    /// Returns true if the URI is currently pinned.
+    pub fn is_pinned(&self, uri: &Url) -> bool {
+        self.pinned
+            .read()
+            .map(|p| p.contains(uri))
+            .unwrap_or(false)
     }
 
     /// Get current version
@@ -135,7 +163,7 @@ impl CrossFileWorkspaceIndex {
         };
 
         if let Ok(mut guard) = self.inner.write() {
-            guard.push(uri.clone(), entry);
+            super::cache::pin_aware_push(&mut guard, &self.pinned, uri.clone(), entry);
         }
     }
 
@@ -143,7 +171,7 @@ impl CrossFileWorkspaceIndex {
     pub fn insert(&self, uri: Url, entry: IndexEntry) {
         self.increment_version();
         if let Ok(mut guard) = self.inner.write() {
-            guard.push(uri, entry);
+            super::cache::pin_aware_push(&mut guard, &self.pinned, uri, entry);
         }
     }
 
@@ -347,6 +375,86 @@ mod tests {
         assert!(!index.contains(&uri1), "LRU entry should be evicted");
         assert!(index.contains(&uri2));
         assert!(index.contains(&uri3));
+    }
+
+    #[test]
+    fn test_pinned_uris_are_protected_from_eviction() {
+        // Cache at capacity, pinned URI is the LRU candidate.
+        // Insert of a new entry must evict an unpinned LRU instead of the pin.
+        let index = CrossFileWorkspaceIndex::with_capacity(2);
+        let uri1 = test_uri("pinned.R");
+        let uri2 = test_uri("lru_unpinned.R");
+        let uri3 = test_uri("mru.R");
+
+        index.insert(uri1.clone(), test_entry(1));
+        index.insert(uri2.clone(), test_entry(2));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        index.set_pinned_uris(pinned);
+
+        index.insert(uri3.clone(), test_entry(3));
+
+        assert!(index.contains(&uri1), "pinned URI must not be evicted");
+        assert!(
+            !index.contains(&uri2),
+            "least-recently-used unpinned URI must be evicted"
+        );
+        assert!(index.contains(&uri3));
+    }
+
+    #[test]
+    fn test_pinned_uris_can_exceed_capacity() {
+        // When every in-cache entry is pinned, eviction is skipped and the
+        // cache is allowed to grow past its configured capacity rather than
+        // evict a reachable neighbor of an open document.
+        let index = CrossFileWorkspaceIndex::with_capacity(2);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        index.insert(uri1.clone(), test_entry(1));
+        index.insert(uri2.clone(), test_entry(2));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+
+        index.insert(uri3.clone(), test_entry(3));
+
+        assert!(index.contains(&uri1));
+        assert!(index.contains(&uri2));
+        assert!(index.contains(&uri3));
+        assert_eq!(index.uris().len(), 3);
+    }
+
+    #[test]
+    fn test_update_from_disk_skips_pinned_open_check() {
+        // Pinning does not change the open-document contract: a URI that is
+        // both pinned and open is still skipped by update_from_disk, because
+        // the open document is authoritative on disk reads.
+        let index = CrossFileWorkspaceIndex::with_capacity(4);
+        let uri = test_uri("open_and_pinned.R");
+
+        let mut open_docs = HashSet::new();
+        open_docs.insert(uri.clone());
+        let mut pinned = HashSet::new();
+        pinned.insert(uri.clone());
+        index.set_pinned_uris(pinned);
+
+        index.update_from_disk(
+            &uri,
+            &open_docs,
+            test_snapshot(),
+            CrossFileMetadata::default(),
+            Arc::new(ScopeArtifacts::default()),
+        );
+
+        assert!(
+            !index.contains(&uri),
+            "open document must remain authoritative even when pinned"
+        );
     }
 
     #[test]

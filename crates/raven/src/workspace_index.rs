@@ -138,6 +138,14 @@ pub struct WorkspaceIndex {
     update_queue: RwLock<HashSet<Url>>,
     /// Metrics
     metrics: RwLock<WorkspaceIndexMetrics>,
+    /// URIs protected from LRU eviction.
+    ///
+    /// Mirrors `DocumentStore::pinned_uris` so closed-but-reachable
+    /// neighbors of open documents are not silently dropped under cache
+    /// pressure, which would force `compute_artifacts_with_metadata`
+    /// recomputation on the fallback path. Lock order: when both `inner`
+    /// and `pinned` need to be held simultaneously, acquire `inner` first.
+    pinned: RwLock<HashSet<Url>>,
 }
 
 impl WorkspaceIndex {
@@ -157,7 +165,29 @@ impl WorkspaceIndex {
             pending_updates: RwLock::new(std::collections::HashMap::new()),
             update_queue: RwLock::new(HashSet::new()),
             metrics: RwLock::new(WorkspaceIndexMetrics::default()),
+            pinned: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the set of URIs protected from LRU eviction.
+    ///
+    /// Pinned URIs are skipped during eviction; if every in-cache URI is
+    /// pinned, the cache is allowed to grow past `max_files` rather than
+    /// drop a reachable neighbor. Oversized files remain rejected by
+    /// `insert`, and explicit `invalidate` / disk-update replacement still
+    /// work for pinned URIs.
+    pub fn set_pinned_uris(&self, uris: HashSet<Url>) {
+        if let Ok(mut pinned) = self.pinned.write() {
+            *pinned = uris;
+        }
+    }
+
+    /// Returns true if the URI is currently pinned.
+    pub fn is_pinned(&self, uri: &Url) -> bool {
+        self.pinned
+            .read()
+            .map(|p| p.contains(uri))
+            .unwrap_or(false)
     }
 
     // ========================================================================
@@ -342,11 +372,8 @@ impl WorkspaceIndex {
     /// # Returns
     /// true if inserted, false if rejected due to file size limit
     pub fn insert(&self, uri: Url, entry: IndexEntry) -> bool {
-        let Ok(mut guard) = self.inner.write() else {
-            return false;
-        };
-
-        // Check max_file_size_bytes limit for all entries
+        // Check max_file_size_bytes limit for all entries (cheap; no need
+        // to acquire the inner lock for an oversized rejection).
         if self.config.max_file_size_bytes > 0
             && entry.snapshot.size > self.config.max_file_size_bytes as u64
         {
@@ -359,7 +386,11 @@ impl WorkspaceIndex {
             return false;
         }
 
-        guard.push(uri, entry);
+        let Ok(mut guard) = self.inner.write() else {
+            return false;
+        };
+
+        crate::cross_file::cache::pin_aware_push(&mut guard, &self.pinned, uri, entry);
         drop(guard);
 
         // Increment version counter
@@ -867,6 +898,185 @@ mod tests {
         assert!(!index.contains(&uri1), "LRU entry should be evicted");
         assert!(index.contains(&uri2));
         assert!(index.contains(&uri3));
+    }
+
+    #[test]
+    fn test_pinned_uris_are_protected_from_eviction() {
+        // Cache at capacity, pinned URI is the LRU candidate.
+        // Inserting a new entry must evict an unpinned LRU instead of the pin.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+
+        let uri1 = test_uri("pinned.R");
+        let uri2 = test_uri("lru_unpinned.R");
+        let uri3 = test_uri("mru.R");
+
+        assert!(index.insert(uri1.clone(), make_test_entry(0)));
+        assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        index.set_pinned_uris(pinned);
+
+        // uri1 is LRU but pinned, uri2 is MRU but unpinned.
+        // Inserting uri3 should evict uri2 (LRU non-pinned), not uri1.
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
+        assert_eq!(index.len(), 2);
+        assert!(index.contains(&uri1), "pinned URI must not be evicted");
+        assert!(
+            !index.contains(&uri2),
+            "least-recently-used unpinned URI must be evicted"
+        );
+        assert!(index.contains(&uri3));
+    }
+
+    #[test]
+    fn test_pinned_uris_can_exceed_max_files() {
+        // When every in-cache entry is pinned, eviction is skipped and the
+        // cache is allowed to grow past its configured capacity rather than
+        // evict a reachable neighbor of an open document.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        assert!(index.insert(uri1.clone(), make_test_entry(0)));
+        assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
+        assert!(index.contains(&uri1));
+        assert!(index.contains(&uri2));
+        assert!(index.contains(&uri3));
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn test_pinned_set_held_across_lru_search_and_pop() {
+        // Concurrency guard for the pin-aware eviction path: under
+        // contended `set_pinned_uris` + `insert`, no panic, no deadlock,
+        // no data corruption, and a URI that was pinned before the race
+        // began must still be present after.
+        //
+        // This test does NOT deterministically distinguish a buggy
+        // (read dropped before pop) implementation from a correct
+        // (read held across pop) one. Verified empirically by running
+        // an `assert!(index.contains(&uri2))` variant against both: in
+        // five 200-iteration runs of each, eviction rates of `uri2`
+        // ranged 0–31/200 (buggy) vs 4–53/200 (fixed) — overlapping
+        // ranges, no clean statistical signal. The fix's contribution
+        // is consistency of A's pin-set view across find+pop (a
+        // composability property for any future concurrent reader of
+        // `pinned`), not a different cache outcome. Strict TOCTOU
+        // reproduction would require test hooks in the production
+        // helper, which we don't add.
+        for _ in 0..200 {
+            let config = WorkspaceIndexConfig {
+                debounce_ms: 50,
+                max_files: 2,
+                max_file_size_bytes: 1024,
+            };
+            let index = std::sync::Arc::new(WorkspaceIndex::new(config));
+            let uri1 = test_uri("pinned.R");
+            let uri2 = test_uri("unpinned.R");
+            let uri3 = test_uri("new.R");
+
+            assert!(index.insert(uri1.clone(), make_test_entry(0)));
+            assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+            // Pre-state: uri1 pinned, uri2 unpinned (LRU non-pinned).
+            let mut pin = HashSet::new();
+            pin.insert(uri1.clone());
+            index.set_pinned_uris(pin);
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let index_a = index.clone();
+            let barrier_a = barrier.clone();
+            let uri3_a = uri3.clone();
+            let a = std::thread::spawn(move || {
+                barrier_a.wait();
+                index_a.insert(uri3_a, make_test_entry(2));
+            });
+
+            let index_b = index.clone();
+            let barrier_b = barrier.clone();
+            let uri1_b = uri1.clone();
+            let uri2_b = uri2.clone();
+            let b = std::thread::spawn(move || {
+                barrier_b.wait();
+                let mut p = HashSet::new();
+                p.insert(uri1_b);
+                p.insert(uri2_b);
+                index_b.set_pinned_uris(p);
+            });
+
+            a.join().unwrap();
+            b.join().unwrap();
+
+            // uri1 was pinned before the race began; whichever order the
+            // racing operations resolve in, the eviction's view of the
+            // pin set always includes uri1, so uri1 must still be present.
+            assert!(
+                index.contains(&uri1),
+                "uri1 was pinned before the race; eviction must never select it"
+            );
+        }
+    }
+
+
+    #[test]
+    fn test_unpinning_restores_normal_eviction() {
+        // After clearing the pin set, the cache should evict normally on the
+        // next insert that exceeds the configured capacity. This documents
+        // that overflow is transient — once entries are no longer pinned,
+        // the cache shrinks back toward its cap on subsequent inserts.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+        let uri4 = test_uri("d.R");
+
+        assert!(index.insert(uri1.clone(), make_test_entry(0)));
+        assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+        // Pin both, then exceed cap.
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
+        assert_eq!(index.len(), 3);
+
+        // Clear pins; next insert must evict an unpinned LRU.
+        index.set_pinned_uris(HashSet::new());
+        assert!(index.insert(uri4.clone(), make_test_entry(3)));
+        // uri1 is the LRU after the prior overflow (uri3 was MRU,
+        // then we touched no entries before insert of uri4).
+        assert!(!index.contains(&uri1), "LRU non-pinned entry should evict");
+        assert!(index.contains(&uri2));
+        assert!(index.contains(&uri3));
+        assert!(index.contains(&uri4));
     }
 
     #[test]
