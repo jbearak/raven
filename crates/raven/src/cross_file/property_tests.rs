@@ -2157,7 +2157,10 @@ proptest! {
         // Query at the closing `}` of the body so the local assignment has
         // ended and its binding is visible (R installs the LHS binding only
         // after the RHS finishes evaluating).
-        let col_in_body = code.find('}').map(|i| i as u32).unwrap_or(0);
+        let col_in_body = code
+            .find('}')
+            .map(|i| i as u32)
+            .expect("expected '}' in generated function-body code");
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body, false);
         prop_assert!(scope_inside.symbols.contains_key(func_name.as_str()),
             "Function name should be available inside function");
@@ -2212,7 +2215,7 @@ proptest! {
             .map(|i| (i + 3) as u32) // skip "; " then move inside identifier
             .or_else(|| code.rfind(&inner_def_needle2).map(|i| (i + 2) as u32))
             .or_else(|| code.rfind(&inner_func).map(|i| (i + 1) as u32))
-            .unwrap_or(0);
+            .expect("expected inner-function-definition locator in generated code");
         let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def, false);
         prop_assert!(scope_outer.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside itself");
@@ -2230,7 +2233,7 @@ proptest! {
         let col_in_inner_after_inner_var_def = code
             .rfind(&inner_var_assignment)
             .map(|i| (i + inner_var_assignment.len()) as u32)
-            .unwrap_or(0);
+            .expect("expected inner-variable-assignment locator in generated code");
         let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def, false);
         prop_assert!(scope_inner.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside inner function");

@@ -2453,32 +2453,65 @@ fn node_end_position_utf16(node: Node, line_index: &LineIndex) -> (u32, u32) {
     (end.row as u32, column)
 }
 
+/// Convert a tree-sitter `Node`'s start position to a UTF-16 (line, column) pair.
+///
+/// Tree-sitter reports `start_position` with a byte column within the start row.
+/// This helper converts that byte column to a UTF-16 column suitable for
+/// ScopeEvent positions, which compare against UTF-16 query positions.
+fn node_start_position_utf16(node: Node, line_index: &LineIndex) -> (u32, u32) {
+    let start = node.start_position();
+    let line_text = line_index.get_line(start.row);
+    let column = byte_offset_to_utf16_column(line_text, start.column);
+    (start.row as u32, column)
+}
+
 /// Determine the `visible_from` (line, column) for an assignment Def event.
 ///
 /// For `<-`/`=`/`<<-` assignments whose RHS is a function definition, the
 /// binding becomes visible at the LHS identifier — recursive calls inside the
 /// function body must resolve, since the body is evaluated only when the
-/// function is called (by which point the binding exists). Same for
-/// `function_definition -> name` and `function_definition ->> name`.
+/// function is called (by which point the binding exists).
 ///
-/// For every other RHS shape (literals, identifiers, calls, arithmetic, etc.)
-/// R evaluates the RHS *before* installing the LHS binding, so the binding is
-/// not in scope inside its own RHS. We use the end position of the whole
-/// assignment node, after which the binding is observable.
+/// For `function_definition -> name` and `function_definition ->> name`, the
+/// symbol identifier (`name`) sits *after* the function body, so
+/// `symbol.defined_*` would place the binding past the body and prevent
+/// recursive references inside the body from resolving. Instead, anchor the
+/// binding at the start of the function-definition node (the value side of a
+/// right-assignment), so recursion works the same as for `<-` left-assignments.
 ///
-/// `symbol.defined_line/defined_column` is the LHS identifier in UTF-16. We
-/// return that for the function-RHS case to keep timeline ordering consistent
-/// with the anchor; for the non-function case we compute end-of-node fresh.
+/// For every other value-side shape (literals, identifiers, calls, arithmetic,
+/// etc.) R evaluates the value *before* installing the binding, so the binding
+/// is not in scope inside its own defining expression. We use the end position
+/// of the whole assignment node, after which the binding is observable.
+///
+/// `symbol.defined_line/defined_column` is the identifier (LHS for left-assigns,
+/// RHS for right-assigns) in UTF-16.
 fn assignment_visible_from_position(
     node: Node,
     line_index: &LineIndex,
     symbol: &ScopedSymbol,
 ) -> (u32, u32) {
-    if assignment_rhs_is_function_definition(node, line_index) {
-        (symbol.defined_line, symbol.defined_column)
-    } else {
-        node_end_position_utf16(node, line_index)
+    if !assignment_rhs_is_function_definition(node, line_index) {
+        return node_end_position_utf16(node, line_index);
     }
+
+    // Function-definition value: detect the operator so right-assignments use
+    // the function-def's start position instead of the trailing RHS identifier.
+    let mut cursor = node.walk();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+    if children.len() == 3 {
+        let op = children[1];
+        let op_text = node_text(op, line_index.text);
+        if matches!(op_text, "->" | "->>") {
+            // Right-assignment: value is the LHS (function definition).
+            let value_node = children[0];
+            return node_start_position_utf16(value_node, line_index);
+        }
+    }
+
+    // Left-assignment with function value: anchor at the LHS identifier so the
+    // binding is visible everywhere including inside its own body.
+    (symbol.defined_line, symbol.defined_column)
 }
 
 /// Returns true when `node` is a `<-`/`=`/`<<-`/`->`/`->>` assignment whose
@@ -5321,16 +5354,54 @@ outside_var <- 2"#;
                 panic!("Test setup error: could not find inner `f()` call via AST")
             });
         let inner_call_pos = inner_call.start_position();
+        // `start_position().column` is a byte column; `scope_at_position`
+        // expects a UTF-16 column. Convert via the line text so this test
+        // stays correct if the fixture is ever extended with non-ASCII.
+        let line_text = code.lines().nth(inner_call_pos.row).unwrap_or("");
+        let inner_call_utf16_col = byte_offset_to_utf16_column(line_text, inner_call_pos.column);
         let scope = scope_at_position(
             &artifacts,
             inner_call_pos.row as u32,
-            inner_call_pos.column as u32,
+            inner_call_utf16_col,
             false,
         );
         assert!(
             scope.symbols.contains_key("f"),
             "`f` must be visible inside `(function() f())` body so the recursive \
              call resolves. Got symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_right_assignment_function_rhs_visible_inside_body() {
+        // `(function() g()) -> g` — right-assignment whose value side (the LHS
+        // in the AST) is a function definition. The symbol identifier `g` sits
+        // *after* the function body, so naively using `symbol.defined_*` as the
+        // `visible_from` would place the binding past the body and prevent the
+        // recursive `g()` call from resolving. The binding must instead be
+        // anchored at the start of the function-definition node (mirroring how
+        // `g <- function() g()` makes `g` visible from its LHS) so recursion
+        // works for both assignment directions.
+        let code = "(function() g()) -> g\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let inner_call = find_recursive_self_call(tree.root_node(), code, "g")
+            .unwrap_or_else(|| panic!("Test setup error: could not find inner `g()` call via AST"));
+        let inner_call_pos = inner_call.start_position();
+        let line_text = code.lines().nth(inner_call_pos.row).unwrap_or("");
+        let inner_call_utf16_col = byte_offset_to_utf16_column(line_text, inner_call_pos.column);
+        let scope = scope_at_position(
+            &artifacts,
+            inner_call_pos.row as u32,
+            inner_call_utf16_col,
+            false,
+        );
+        assert!(
+            scope.symbols.contains_key("g"),
+            "`g` must be visible inside `(function() g()) -> g` body so the \
+             recursive call resolves. Got symbols: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
         );
     }
@@ -5536,18 +5607,10 @@ outside_var <- 2"#;
         ];
 
         // Sort using the same key as compute_artifacts
-        events.sort_by_key(|event| match event {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
+        // Sort by each event's *effect* position so test ordering matches the
+        // production timeline sort (Def events use `visible_from_*`, all others
+        // use their own anchor). See `event_effect_position`.
+        events.sort_by_key(event_effect_position);
 
         // Verify order: (2,0), (5,5), (5,10), (10,0)
         let positions: Vec<(u32, u32)> = events
@@ -5585,18 +5648,10 @@ outside_var <- 2"#;
             },
         ];
 
-        events.sort_by_key(|event| match event {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
+        // Sort by each event's *effect* position so test ordering matches the
+        // production timeline sort (Def events use `visible_from_*`, all others
+        // use their own anchor). See `event_effect_position`.
+        events.sort_by_key(event_effect_position);
 
         // Verify order by column: 5, 10, 20
         let columns: Vec<u32> = events
@@ -5655,18 +5710,10 @@ outside_var <- 2"#;
             },
         ];
 
-        events.sort_by_key(|event| match event {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
+        // Sort by each event's *effect* position so test ordering matches the
+        // production timeline sort (Def events use `visible_from_*`, all others
+        // use their own anchor). See `event_effect_position`.
+        events.sort_by_key(event_effect_position);
 
         // Verify order: Def(1,0), Removal(3,0), Def(5,0)
         let event_types: Vec<&str> = events
@@ -5729,18 +5776,10 @@ outside_var <- 2"#;
             },
         ];
 
-        events.sort_by_key(|event| match event {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
+        // Sort by each event's *effect* position so test ordering matches the
+        // production timeline sort (Def events use `visible_from_*`, all others
+        // use their own anchor). See `event_effect_position`.
+        events.sort_by_key(event_effect_position);
 
         // Verify order: Source(1,0), Removal(2,0), Removal(4,0)
         let event_types: Vec<&str> = events
@@ -5815,18 +5854,10 @@ outside_var <- 2"#;
             },
         ];
 
-        events.sort_by_key(|event| match event {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
+        // Sort by each event's *effect* position so test ordering matches the
+        // production timeline sort (Def events use `visible_from_*`, all others
+        // use their own anchor). See `event_effect_position`.
+        events.sort_by_key(event_effect_position);
 
         // Verify order: Def(1,0), Source(3,0), Removal(5,0), FunctionScope(7,0), Removal(9,0)
         let event_types: Vec<&str> = events
@@ -5892,18 +5923,10 @@ outside_var <- 2"#;
             },
         ];
 
-        events.sort_by_key(|event| match event {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
+        // Sort by each event's *effect* position so test ordering matches the
+        // production timeline sort (Def events use `visible_from_*`, all others
+        // use their own anchor). See `event_effect_position`.
+        events.sort_by_key(event_effect_position);
 
         // Both events should be at position (2, 0) - order between them is stable but not guaranteed
         // The important thing is that both are present and at the same position
