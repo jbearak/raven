@@ -753,6 +753,62 @@ pub struct ScopeAtPosition {
     /// Combined with inherited_packages, this gives all packages available at the position.
     /// Requirements 8.1, 8.3: Position-aware package loading for diagnostics
     pub loaded_packages: HashSet<String>,
+    /// Per-package origin tracking: maps each package name to the set of file
+    /// URIs that loaded the package. Populated whenever a package is added to
+    /// `inherited_packages` or `loaded_packages`. Used at cross-file merge
+    /// points to detect and filter same-file leaks: a recursion path that
+    /// revisits the queried file at a wider position would otherwise import
+    /// the queried file's own later `library()` calls back into a narrow
+    /// query scope. The leak's signature is "this package's only known
+    /// origin is the queried URI". Mirrors the same-file symbol filter on
+    /// `ScopedSymbol.source_uri`.
+    pub package_origins: HashMap<String, HashSet<Url>>,
+}
+
+/// Record that `package` was loaded by `origin_uri`. Idempotent.
+fn record_package_origin(
+    package_origins: &mut HashMap<String, HashSet<Url>>,
+    package: &str,
+    origin_uri: &Url,
+) {
+    package_origins
+        .entry(package.to_string())
+        .or_default()
+        .insert(origin_uri.clone());
+}
+
+/// Returns `true` when the only known origin for `package` is `uri` — i.e.
+/// the package would only appear in scope because a cross-file recursion
+/// revisited the queried file (`uri`) at a wider position. With no recorded
+/// origins we conservatively return `false` (don't filter): packages that
+/// flow through the `inherited_packages` parameter (e.g. `packages_for_child`
+/// in forward-source dispatch) carry no origin metadata and must remain
+/// trustworthy inherited content.
+fn package_only_origin_is_uri(
+    package_origins: &HashMap<String, HashSet<Url>>,
+    package: &str,
+    uri: &Url,
+) -> bool {
+    match package_origins.get(package) {
+        Some(origins) if !origins.is_empty() => origins.iter().all(|o| o == uri),
+        _ => false,
+    }
+}
+
+/// Copy the origin set for `package` from `src` to `dst`, unioning into any
+/// existing entry. Used when a package crosses a file boundary so that
+/// downstream merge sites can run the same-file leak filter.
+fn propagate_package_origins(
+    src: &HashMap<String, HashSet<Url>>,
+    package: &str,
+    dst: &mut HashMap<String, HashSet<Url>>,
+) {
+    if let Some(origins) = src.get(package) {
+        let entry = dst.entry(package.to_string()).or_default();
+        for origin in origins {
+            entry.insert(origin.clone());
+        }
+    }
 }
 
 /// Determine whether a `source()` call should use local scoping rules.
@@ -1431,6 +1487,9 @@ pub fn scope_at_position(
                     };
 
                     if should_include {
+                        // No URI to record as origin in this single-file path —
+                        // there is no cross-file recursion in `scope_at_position`,
+                        // so origin tracking is not needed for leak detection.
                         scope.loaded_packages.insert(package.clone());
                     }
                 }
@@ -1867,7 +1926,15 @@ where
                             visited,
                         );
                         // Merge child symbols (local definitions take precedence)
+                        //
+                        // Skip same-file leak: symbols whose `source_uri` is
+                        // the current file must not flow back into our scope
+                        // through a forward source() chain (see graph variant
+                        // for the full rationale).
                         for (name, symbol) in child_scope.symbols {
+                            if symbol.source_uri == *uri {
+                                continue;
+                            }
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
@@ -2941,7 +3008,21 @@ where
             // Merge parent symbols (they are available at the START of this file)
             // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
             // (declarations describe symbol existence, not export behavior)
+            //
+            // Filter out symbols whose `source_uri` is the current file: those
+            // are *our own* bindings and their visibility at the query position
+            // is owned by the local timeline (with proper `visible_from`
+            // semantics). A cross-file path that revisits this file at a wider
+            // position (e.g. data.R → main.R → shrinkage.R → main.R@MAX → data.R@MAX)
+            // would otherwise leak our own later definitions back into our scope
+            // at the original narrow query position, suppressing legitimate
+            // "Undefined variable" diagnostics on self-referential assignments
+            // like `xyz <- xyz`. Same-file symbols always re-enter via STEP 2's
+            // visible_from-aware Def event, so filtering here is safe.
             for (name, symbol) in parent_scope.symbols {
+                if symbol.source_uri == *uri {
+                    continue;
+                }
                 if is_local_scoped {
                     // For local-scoped edges, only inherit declared symbols
                     if symbol.is_declared {
@@ -3001,22 +3082,44 @@ where
 
                             if should_propagate {
                                 scope.inherited_packages.insert(package.clone());
+                                // Record the parent file as origin so downstream
+                                // merge sites can apply the same-file leak filter.
+                                record_package_origin(
+                                    &mut scope.package_origins,
+                                    package,
+                                    &edge.from,
+                                );
                             }
                         }
                     }
                 }
             }
 
-            // Also propagate packages that the parent inherited from its parents
-            // Requirement 5.2: Inherit loaded packages from parent up to call site
+            // Also propagate packages that the parent inherited from its parents.
+            // Requirement 5.2: Inherit loaded packages from parent up to call site.
+            //
+            // Same-file leak filter: skip packages whose only known origin is
+            // the queried file (`*uri`). A recursive cross-file path that
+            // revisits the queried file at a wider position would otherwise
+            // import the queried file's own later `library()` calls back into
+            // a narrow query scope. The local-timeline PackageLoad pass below
+            // handles same-file packages with proper position semantics.
             for pkg in &parent_scope.inherited_packages {
+                if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                    continue;
+                }
                 scope.inherited_packages.insert(pkg.clone());
+                propagate_package_origins(&parent_scope.package_origins, pkg, &mut scope.package_origins);
             }
 
             // Also propagate packages that are loaded in the parent at the call site.
             // This includes packages loaded in sourced files before the call site.
             for pkg in &parent_scope.loaded_packages {
+                if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                    continue;
+                }
                 scope.inherited_packages.insert(pkg.clone());
+                propagate_package_origins(&parent_scope.package_origins, pkg, &mut scope.package_origins);
             }
         }
     } // end if !is_revisit (STEP 1)
@@ -3212,19 +3315,48 @@ where
                             is_cancelled,
                         );
                         // Merge child symbols (local definitions take precedence)
+                        //
+                        // Filter out symbols whose `source_uri` is the current
+                        // file: same rationale as the backward-edge merge
+                        // above. A forward source() may transitively revisit
+                        // this file at (MAX, MAX), and that revisit would
+                        // otherwise leak our own future definitions back into
+                        // our scope at the narrower original query position.
+                        // Self-file symbols are always re-entered by STEP 2
+                        // with proper `visible_from` filtering.
                         for (name, symbol) in child_scope.symbols {
+                            if symbol.source_uri == *uri {
+                                continue;
+                            }
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
 
                         // Packages loaded in the sourced file become available after the source() call.
+                        //
+                        // Same-file leak filter: skip packages whose only known
+                        // origin is the queried file (`*uri`). A child whose
+                        // own cross-file recursion brought packages back from a
+                        // path through `*uri` would otherwise re-import them.
                         for pkg in child_scope
                             .loaded_packages
                             .iter()
                             .chain(child_scope.inherited_packages.iter())
                         {
+                            if package_only_origin_is_uri(
+                                &child_scope.package_origins,
+                                pkg,
+                                uri,
+                            ) {
+                                continue;
+                            }
                             scope.loaded_packages.insert(pkg.clone());
+                            propagate_package_origins(
+                                &child_scope.package_origins,
+                                pkg,
+                                &mut scope.package_origins,
+                            );
                         }
                     }
                 }
@@ -3291,6 +3423,7 @@ where
 
                     if should_include {
                         scope.loaded_packages.insert(package.clone());
+                        record_package_origin(&mut scope.package_origins, package, uri);
                     }
                 }
             }

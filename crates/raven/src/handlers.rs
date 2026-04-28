@@ -5050,7 +5050,20 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 .entry((source.line, source.column))
                 .or_insert_with(|| snapshot.get_scope(uri, source.line, source.column, cancel));
 
-            if source_scope.symbols.contains_key(name.as_str()) {
+            // Only fire if the symbol is actually inherited from another file
+            // at the source() position. A symbol that is in scope only because
+            // of a local assignment between the usage and the source() call
+            // (e.g. `xyz = xyz` followed by `source("indices.r")`) carries
+            // `source_uri == *uri` and must NOT be misattributed to the
+            // source() call. This mirrors the legacy
+            // `collect_out_of_scope_diagnostics`, which only fires for names
+            // that appear in the sourced file's `exported_interface`.
+            let inherited = source_scope
+                .symbols
+                .get(name.as_str())
+                .map(|sym| sym.source_uri != *uri)
+                .unwrap_or(false);
+            if inherited {
                 let line_text = get_line(usage_node.start_position().row);
                 let start_col =
                     byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
@@ -34947,6 +34960,694 @@ x
         assert_eq!(
             location.range.start.line, 2,
             "Should resolve to latest definition (line 2)"
+        );
+    }
+
+    /// Regression test for the false-positive "used before it's available
+    /// (sourced on line N)" diagnostic produced by the snapshot
+    /// out-of-scope collector.
+    ///
+    /// Repro from worldwide/scripts/data.r: `xyz = xyz` on a line, followed
+    /// by a later `source("indices.R")` call. xyz is not exported by
+    /// indices.R, so the out-of-scope collector must NOT attribute the
+    /// symbol to the source() call. The RHS xyz is genuinely undefined
+    /// (visible_from for the LHS binding is end-of-assignment), so the
+    /// undefined-variable collector should fire instead.
+    #[test]
+    fn test_self_referential_assignment_does_not_emit_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+
+        let data_code = "xyz = xyz\nsource(\"indices.R\")\n";
+        let indices_code = "idx_a <- 10\n"; // does NOT define xyz
+
+        for (uri, code) in [(&data_uri, data_code), (&indices_uri, indices_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri)
+            .expect("Should build snapshot for data.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        // The snapshot out-of-scope collector must NOT mistake the
+        // locally-bound `xyz` for a symbol exported by indices.R.
+        let used_before: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("is used before it's available"))
+            .collect();
+        assert!(
+            used_before.is_empty(),
+            "Snapshot path emitted false-positive 'used before it's available' for a \
+             locally-defined symbol. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // The RHS `xyz` is genuinely undefined; we expect exactly one
+        // "Undefined variable: xyz" diagnostic on line 0 (0-indexed).
+        let undefined: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .collect();
+        assert_eq!(
+            undefined.len(),
+            1,
+            "Expected exactly one 'Undefined variable: xyz' diagnostic for the RHS \
+             of `xyz = xyz`, got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(undefined[0].range.start.line, 0);
+    }
+
+    /// Reproduces the worldwide/scripts/data.r structure end-to-end: a parent
+    /// `main.R` sources `data.R`, which itself has a `source()` BEFORE the
+    /// `xyz = xyz` line and another `source()` AFTER it. Verifies that the
+    /// false-positive "used before it's available" diagnostic is suppressed
+    /// in BOTH the pre-workspace-scan and the post-workspace-scan states —
+    /// the latter is what runs in `Backend::initialized`'s force-republish
+    /// path. Pre-fix this test would emit the buggy diagnostic in both
+    /// states (the snapshot collector's check is deterministic on text).
+    #[test]
+    fn test_self_referential_xyz_in_multifile_workspace_both_scan_states() {
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let covariates_uri = Url::parse("file:///workspace/covariates.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+
+        let main_code = "source(\"data.R\")\n";
+        let data_code = "source(\"covariates.R\")\nxyz = xyz\nsource(\"indices.R\")\n";
+        let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
+        let indices_code = "idx_a <- 10\n"; // does NOT define xyz
+
+        for &workspace_scan_complete in &[false, true] {
+            let mut state = WorldState::new(vec![]);
+            state.workspace_scan_complete = workspace_scan_complete;
+            state.cross_file_config.out_of_scope_severity =
+                Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+            state.cross_file_config.undefined_variables_enabled = true;
+
+            for (uri, code) in [
+                (&main_uri, main_code),
+                (&data_uri, data_code),
+                (&covariates_uri, covariates_code),
+                (&indices_uri, indices_code),
+            ] {
+                state
+                    .documents
+                    .insert(uri.clone(), Document::new(code, None));
+                state.cross_file_graph.update_file(
+                    uri,
+                    &crate::cross_file::extract_metadata(code),
+                    None,
+                    |_| None,
+                );
+            }
+
+            let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect(&format!(
+                "Should build snapshot for data.R (scan_complete={})",
+                workspace_scan_complete
+            ));
+            let diagnostics =
+                diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
+                    .expect("Should produce diagnostics");
+
+            let used_before: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains("is used before it's available"))
+                .collect();
+            assert!(
+                used_before.is_empty(),
+                "Snapshot path emitted false-positive 'used before it's available' \
+                 (workspace_scan_complete={}). Diagnostics: {:?}",
+                workspace_scan_complete,
+                diagnostics
+                    .iter()
+                    .map(|d| (d.message.clone(), d.range))
+                    .collect::<Vec<_>>()
+            );
+
+            // Once the workspace scan completes, the deferral in
+            // `collect_undefined_variables_from_snapshot` must lift and the
+            // RHS `xyz` should be flagged as undefined (no parent in this
+            // workspace defines `xyz` — `main.R` only sources `data.R`).
+            // Pre-scan we expect deferral, so no undefined diagnostic.
+            let undefined: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains("Undefined variable: xyz"))
+                .collect();
+            if workspace_scan_complete {
+                assert_eq!(
+                    undefined.len(),
+                    1,
+                    "Expected 'Undefined variable: xyz' post-scan, got: {:?}",
+                    diagnostics
+                        .iter()
+                        .map(|d| d.message.clone())
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                assert!(
+                    undefined.is_empty(),
+                    "Expected NO undefined diagnostic during scan deferral, got: {:?}",
+                    diagnostics
+                        .iter()
+                        .map(|d| d.message.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// Closer-to-worldwide repro: `main.R` sources `functions.R` (which calls
+    /// many `library()`s and sources child helpers), then `data.R` (which has
+    /// `xyz = xyz` followed by another `source()`). With the workspace scan
+    /// complete, the RHS `xyz` should still be flagged as undefined — the
+    /// loaded packages don't export `xyz`, and no helper file defines it.
+    #[test]
+    fn test_undefined_xyz_fires_in_worldwide_like_workspace_post_scan() {
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let functions_uri = Url::parse("file:///workspace/functions.R").unwrap();
+        let folders_uri = Url::parse("file:///workspace/folders.R").unwrap();
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let covariates_uri = Url::parse("file:///workspace/covariates.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+        let fitmodel_uri = Url::parse("file:///workspace/fitModel.R").unwrap();
+
+        let main_code = "source(\"functions.R\")\nsource(\"folders.R\")\nsource(\"data.R\")\n";
+        let functions_code = "library(dplyr)\nlibrary(ggplot2)\nlibrary(plyr)\nlibrary(scales)\nlibrary(R2jags)\nsource(\"fitModel.R\")\nhelper <- function(x) x\n";
+        let folders_code = "# folder setup\noutput_dir <- \"output\"\n";
+        let data_code = "source(\"covariates.R\")\nxyz = xyz\nsource(\"indices.R\")\n";
+        let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
+        let indices_code = "idx_a <- 10\n";
+        let fitmodel_code = "fit_model <- function(data) NULL\n";
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&functions_uri, functions_code),
+            (&folders_uri, folders_code),
+            (&data_uri, data_code),
+            (&covariates_uri, covariates_code),
+            (&indices_uri, indices_code),
+            (&fitmodel_uri, fitmodel_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri)
+            .expect("Should build snapshot for data.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let undefined: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .collect();
+        assert_eq!(
+            undefined.len(),
+            1,
+            "Expected 'Undefined variable: xyz' for the RHS of `xyz = xyz` in a \
+             worldwide-shaped workspace. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // No false-positive either.
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("is used before it's available")),
+            "False-positive 'used before it's available' fired in worldwide-like setup. \
+             Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Reproduce against the user's real worldwide files. Inserts every
+    /// .r/.R file under ~/repos/worldwide into state, simulates the user
+    /// editing data.r to add `xyz = xyz`, and prints the diagnostics for
+    /// data.r. Skips silently if the worldwide repo isn't available (CI).
+    #[test]
+    #[ignore] // Requires ~/repos/worldwide checked out; run manually with --ignored
+    fn debug_real_worldwide_data_r() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let home = match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h),
+            None => return,
+        };
+        let workspace = home.join("repos/worldwide");
+        if !workspace.exists() {
+            eprintln!("Skipping: {} doesn't exist", workspace.display());
+            return;
+        }
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![Url::from_file_path(&workspace).unwrap()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        // Walk all .r/.R files
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            if let Ok(read_dir) = std::fs::read_dir(dir) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        // Skip .git, node_modules, output, etc.
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if name.starts_with(".")
+                                || name == "node_modules"
+                                || name == "output"
+                                || name == "abortion_data"
+                                || name == "fertility_surveys"
+                            {
+                                continue;
+                            }
+                        }
+                        walk(&path, out);
+                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if matches!(ext, "r" | "R") {
+                            out.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut paths = Vec::new();
+        walk(&workspace, &mut paths);
+        eprintln!("Found {} R files", paths.len());
+
+        // The key file - data.r with xyz = xyz on line 18 (1-indexed) = line 17 (0-indexed)
+        let data_path = workspace.join("scripts/data.r");
+        let data_uri = Url::from_file_path(&data_path).unwrap();
+
+        for path in &paths {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let uri = Url::from_file_path(path).unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(&content, None));
+            state.cross_file_graph.update_file(
+                &uri,
+                &crate::cross_file::extract_metadata(&content),
+                Some(&Url::from_file_path(&workspace).unwrap()),
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
+        eprintln!(
+            "snapshot.workspace_scan_complete = {}",
+            snapshot.workspace_scan_complete
+        );
+        eprintln!(
+            "snapshot.directive_meta.sourced_by = {:?}",
+            snapshot.directive_meta.sourced_by
+        );
+        eprintln!(
+            "snapshot.cross_file_config.backward_dependencies = {:?}",
+            snapshot.cross_file_config.backward_dependencies
+        );
+
+        let diags = diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
+            .expect("diags");
+        eprintln!("Total diagnostics for data.r: {}", diags.len());
+        for d in diags.iter().take(20) {
+            eprintln!("  {:?}: {}", d.range, d.message);
+        }
+
+        let xyz_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("xyz"))
+            .collect();
+        eprintln!("xyz-related diagnostics:");
+        for d in &xyz_diags {
+            eprintln!("  {:?}: {}", d.range, d.message);
+        }
+
+        // Now also dump scope.symbols at data.r line 17 (0-indexed) col 6 (RHS xyz).
+        let line: u32 = 17;
+        let col: u32 = 6;
+        let scope_at = snapshot.get_scope(&data_uri, line, col, &DiagCancelToken::never());
+        eprintln!(
+            "scope.symbols at data.r ({}, {}) — {} entries",
+            line,
+            col,
+            scope_at.symbols.len()
+        );
+        if let Some(sym) = scope_at.symbols.get("xyz") {
+            eprintln!("  xyz IS in scope: {:?}", sym);
+        } else {
+            eprintln!("  xyz is NOT in scope at this position");
+        }
+        eprintln!("scope.chain length: {}", scope_at.chain.len());
+        let chain_count = scope_at.chain.len();
+        eprintln!("scope.chain (first 30 of {}):", chain_count);
+        for (i, u) in scope_at.chain.iter().take(30).enumerate() {
+            eprintln!("  [{}] {}", i, u.path());
+        }
+        eprintln!(
+            "scope.inherited_packages: {} pkgs",
+            scope_at.inherited_packages.len()
+        );
+        eprintln!(
+            "scope.loaded_packages: {} pkgs",
+            scope_at.loaded_packages.len()
+        );
+
+        // Now query at (17, 0) - LHS position, BEFORE assignment.
+        let lhs_scope =
+            snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never());
+        eprintln!(
+            "scope.symbols at LHS (17, 0): xyz in scope? {}",
+            lhs_scope.symbols.contains_key("xyz")
+        );
+
+        // And at (16, 0) - the line BEFORE xyz = xyz, no assignment yet.
+        let prev_scope =
+            snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never());
+        eprintln!(
+            "scope.symbols at (16, 0): xyz in scope? {}",
+            prev_scope.symbols.contains_key("xyz")
+        );
+
+        // Print the data.r artifacts timeline events around xyz.
+        if let Some(artifacts) = snapshot.artifacts_map.get(&data_uri) {
+            eprintln!("data.r timeline (events around line 17):");
+            for ev in artifacts.timeline.iter() {
+                let line = match ev {
+                    crate::cross_file::scope::ScopeEvent::Def { line, .. } => *line,
+                    crate::cross_file::scope::ScopeEvent::Source { line, .. } => *line,
+                    crate::cross_file::scope::ScopeEvent::Removal { line, .. } => *line,
+                    crate::cross_file::scope::ScopeEvent::PackageLoad { line, .. } => *line,
+                    crate::cross_file::scope::ScopeEvent::FunctionScope { start_line, .. } => {
+                        *start_line
+                    }
+                    crate::cross_file::scope::ScopeEvent::Declaration { line, .. } => *line,
+                };
+                if line >= 14 && line <= 25 {
+                    eprintln!("  line={}: {:?}", line, ev);
+                }
+            }
+        }
+
+        // Lock in the fix: with the cross-file scope leak fixed, xyz must NOT
+        // be in scope at the RHS of `xyz = xyz`, and the undefined-variable
+        // diagnostic must fire on data.r.
+        let scope_rhs = snapshot.get_scope(&data_uri, 17, 6, &DiagCancelToken::never());
+        assert!(
+            !scope_rhs.symbols.contains_key("xyz"),
+            "xyz must NOT leak back into data.r's scope at the RHS of its own assignment"
+        );
+        assert!(
+            xyz_diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: xyz")),
+            "Expected 'Undefined variable: xyz' in real worldwide data.r, got: {:?}",
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        );
+
+        let _ = (Arc::new(()), data_uri);
+    }
+
+    /// Regression: cross-file scope resolution must not let a file's own
+    /// symbols leak back into its own scope at narrow positions through a
+    /// recursive cross-file path.
+    ///
+    /// Topology (mirrors the worldwide path that revealed the bug):
+    ///
+    ///   data.R: `xyz <- xyz` (the query target)
+    ///   main.R: sources data.R
+    ///   shrinkage.R: sources main.R, then sources validate.R
+    ///   validate.R: sources main.R
+    ///
+    /// Walk performed by `scope_at_position_with_graph` for data.R at the RHS
+    /// of `xyz <- xyz`:
+    ///   data.R(1,7) → main.R(0,0) [parent]
+    ///                   → validate.R(0,0) [parent of main.R via shrinkage]
+    ///                       → shrinkage.R(0,0) [parent of validate.R]
+    ///                           → forward source("main.R") at line 0 — but at
+    ///                             query position (0,0) `passes_position` is
+    ///                             false; the bug originally arose because the
+    ///                             nested chain *did* re-enter via a wider
+    ///                             query upstream. The fix filters same-file
+    ///                             symbols at every cross-file merge so that a
+    ///                             revisit of data.R at (MAX,MAX) cannot
+    ///                             contribute its own LHS binding back to the
+    ///                             original (1,7) query.
+    ///
+    /// Pre-fix this test would observe `xyz` in scope at (1, 7) with
+    /// `source_uri = data.R` and the snapshot path would silently suppress
+    /// the "Undefined variable: xyz" diagnostic.
+    #[test]
+    fn test_self_file_symbol_does_not_leak_through_cross_file_recursion() {
+        use crate::cross_file::scope::scope_at_position_with_graph;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let shrinkage_uri = Url::parse("file:///workspace/shrinkage.R").unwrap();
+        let validate_uri = Url::parse("file:///workspace/validate.R").unwrap();
+
+        let data_code = "ww <- list()\nxyz <- xyz\n";
+        let main_code = "source(\"data.R\")\n";
+        let shrinkage_code = "source(\"main.R\")\nsource(\"validate.R\")\n";
+        let validate_code = "source(\"main.R\")\n";
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&data_uri, data_code),
+            (&main_uri, main_code),
+            (&shrinkage_uri, shrinkage_code),
+            (&validate_uri, validate_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // Direct scope check: xyz must NOT be in scope at the RHS.
+        let mut artifacts_map: std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>> =
+            std::collections::HashMap::new();
+        let mut metadata_map: std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
+            std::collections::HashMap::new();
+        for (uri, code) in [
+            (&data_uri, data_code),
+            (&main_uri, main_code),
+            (&shrinkage_uri, shrinkage_code),
+            (&validate_uri, validate_code),
+        ] {
+            let tree = parse_r_code(code);
+            let metadata = crate::cross_file::extract_metadata(code);
+            let artifacts = crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri, &tree, code, Some(&metadata),
+            );
+            artifacts_map.insert(uri.clone(), Arc::new(artifacts));
+            metadata_map.insert(uri.clone(), Arc::new(metadata));
+        }
+        let scope_at = scope_at_position_with_graph(
+            &data_uri,
+            1,
+            7,
+            &|u: &Url| artifacts_map.get(u).cloned(),
+            &|u: &Url| metadata_map.get(u).cloned(),
+            &state.cross_file_graph,
+            None,
+            8,
+            &HashSet::new(),
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            !scope_at.symbols.contains_key("xyz"),
+            "xyz must not be in scope at RHS of `xyz <- xyz`. Found: {:?}",
+            scope_at.symbols.get("xyz").map(|s| (s.source_uri.path().to_string(), s.defined_line))
+        );
+
+        // Snapshot diagnostic check: the production path must emit
+        // "Undefined variable: xyz" instead of silently suppressing it.
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
+        let diags = diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
+            .expect("diags");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: xyz")),
+            "Expected 'Undefined variable: xyz' on the RHS, got: {:?}",
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: cross-file scope resolution must not let a file's own
+    /// `library()` calls leak back into the file's own scope at narrow
+    /// positions through a recursive cross-file path.
+    ///
+    /// Topology mirrors the symbol-leak repro: data.R has `library(somepkg)`
+    /// at line 5; main.R sources data.R; shrinkage.R sources main.R then
+    /// validate.R; validate.R sources main.R. Querying data.R at line 1
+    /// (before the library call) must NOT see `somepkg` in scope, even
+    /// though a recursion path would carry data.R's MAX-MAX state (which
+    /// includes the line-5 PackageLoad) back into the original query.
+    #[test]
+    fn test_self_file_package_does_not_leak_through_cross_file_recursion() {
+        use crate::cross_file::scope::scope_at_position_with_graph;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let shrinkage_uri = Url::parse("file:///workspace/shrinkage.R").unwrap();
+        let validate_uri = Url::parse("file:///workspace/validate.R").unwrap();
+
+        // data.R loads somepkg at line 5 (0-indexed). Querying at line 1
+        // (before the library call) must NOT see somepkg.
+        let data_code = "ww <- list()\nx <- 1\ny <- 2\nz <- 3\nhelper <- function() x\nlibrary(somepkg)\n";
+        let main_code = "source(\"data.R\")\n";
+        let shrinkage_code = "source(\"main.R\")\nsource(\"validate.R\")\n";
+        let validate_code = "source(\"main.R\")\n";
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+
+        for (uri, code) in [
+            (&data_uri, data_code),
+            (&main_uri, main_code),
+            (&shrinkage_uri, shrinkage_code),
+            (&validate_uri, validate_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let mut artifacts_map: std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>> =
+            std::collections::HashMap::new();
+        let mut metadata_map: std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
+            std::collections::HashMap::new();
+        for (uri, code) in [
+            (&data_uri, data_code),
+            (&main_uri, main_code),
+            (&shrinkage_uri, shrinkage_code),
+            (&validate_uri, validate_code),
+        ] {
+            let tree = parse_r_code(code);
+            let metadata = crate::cross_file::extract_metadata(code);
+            let artifacts = crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri, &tree, code, Some(&metadata),
+            );
+            artifacts_map.insert(uri.clone(), Arc::new(artifacts));
+            metadata_map.insert(uri.clone(), Arc::new(metadata));
+        }
+
+        // Query data.R at line 1 col 0 — well before `library(somepkg)` on line 5.
+        let scope_at = scope_at_position_with_graph(
+            &data_uri,
+            1,
+            0,
+            &|u: &Url| artifacts_map.get(u).cloned(),
+            &|u: &Url| metadata_map.get(u).cloned(),
+            &state.cross_file_graph,
+            None,
+            8,
+            &HashSet::new(),
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        let in_loaded = scope_at.loaded_packages.contains("somepkg");
+        let in_inherited = scope_at.inherited_packages.contains("somepkg");
+        assert!(
+            !in_loaded && !in_inherited,
+            "BUG: somepkg leaked back into data.R's scope at line 1 (before its \
+             `library(somepkg)` on line 5). loaded_packages={:?}, inherited_packages={:?}",
+            scope_at.loaded_packages,
+            scope_at.inherited_packages,
+        );
+
+        // Sanity: somepkg IS in scope at the very end of data.R (after the
+        // library call). This verifies the local PackageLoad event is still
+        // installed correctly when the position covers it.
+        let scope_at_end = scope_at_position_with_graph(
+            &data_uri,
+            6,
+            0,
+            &|u: &Url| artifacts_map.get(u).cloned(),
+            &|u: &Url| metadata_map.get(u).cloned(),
+            &state.cross_file_graph,
+            None,
+            8,
+            &HashSet::new(),
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+        );
+        assert!(
+            scope_at_end.loaded_packages.contains("somepkg"),
+            "Sanity check failed: somepkg must be in scope at line 6 (after \
+             `library(somepkg)`). loaded_packages={:?}",
+            scope_at_end.loaded_packages
         );
     }
 }
