@@ -382,7 +382,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
     let folder_url = Url::from_file_path(workspace_path).unwrap();
 
     let mut artifacts_map: HashMap<Url, Arc<raven::cross_file::ScopeArtifacts>> = HashMap::new();
-    let mut metadata_map: HashMap<Url, raven::cross_file::types::CrossFileMetadata> =
+    let mut metadata_map: HashMap<Url, Arc<raven::cross_file::types::CrossFileMetadata>> =
         HashMap::new();
 
     let mut entries: Vec<_> = std::fs::read_dir(workspace_path)
@@ -403,7 +403,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
             let arts = raven::cross_file::compute_artifacts(&uri, &tree, &content);
             artifacts_map.insert(uri.clone(), Arc::new(arts));
         }
-        metadata_map.insert(uri, meta);
+        metadata_map.insert(uri, Arc::new(meta));
     }
 
     // Build dependency graph — graph construction is the same regardless of mode.
