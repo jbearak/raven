@@ -2647,7 +2647,7 @@ pub fn scope_at_position_with_graph<F, G>(
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
-    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
     let mut visited = HashMap::new();
 
@@ -2712,7 +2712,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
-    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
     // Initialize scope with inherited_packages from parameter
     // Requirements 5.1, 5.2: Packages inherited from parent files are available from position (0, 0)
@@ -3608,9 +3608,9 @@ mod tests {
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &child_uri {
-                Some(child_metadata.clone())
+                Some(std::sync::Arc::new(child_metadata.clone()))
             } else {
                 None
             }
@@ -3807,9 +3807,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -3906,9 +3906,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -4046,9 +4046,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -4124,9 +4124,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -4243,9 +4243,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -4385,9 +4385,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -4554,11 +4554,11 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &uri_a {
-                Some(meta_a.clone())
+                Some(std::sync::Arc::new(meta_a.clone()))
             } else if uri == &uri_b {
-                Some(meta_b.clone())
+                Some(std::sync::Arc::new(meta_b.clone()))
             } else {
                 None
             }
@@ -4747,11 +4747,11 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &main_uri {
-                Some(main_meta.clone())
+                Some(std::sync::Arc::new(main_meta.clone()))
             } else if uri == &loader_uri {
-                Some(loader_meta.clone())
+                Some(std::sync::Arc::new(loader_meta.clone()))
             } else {
                 None
             }
@@ -4840,9 +4840,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &main_uri {
-                Some(main_meta.clone())
+                Some(std::sync::Arc::new(main_meta.clone()))
             } else {
                 None
             }
@@ -7031,9 +7031,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -7150,9 +7150,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -7273,9 +7273,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &child_uri {
-                Some(child_metadata.clone())
+                Some(std::sync::Arc::new(child_metadata.clone()))
             } else {
                 None
             }
@@ -7365,9 +7365,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &child_uri {
-                Some(child_metadata.clone())
+                Some(std::sync::Arc::new(child_metadata.clone()))
             } else {
                 None
             }
@@ -7449,9 +7449,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -7575,9 +7575,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -7661,9 +7661,9 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -7782,11 +7782,11 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &uri_a {
-                Some(meta_a.clone())
+                Some(std::sync::Arc::new(meta_a.clone()))
             } else if uri == &uri_b {
-                Some(meta_b.clone())
+                Some(std::sync::Arc::new(meta_b.clone()))
             } else {
                 None
             }
@@ -7915,11 +7915,11 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }
@@ -9627,9 +9627,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -9706,9 +9706,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -9785,9 +9785,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -9869,9 +9869,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -9944,9 +9944,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -10026,9 +10026,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -10108,9 +10108,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -10225,11 +10225,11 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &grandparent_uri {
-                Some(grandparent_meta.clone())
+                Some(std::sync::Arc::new(grandparent_meta.clone()))
             } else if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -10333,9 +10333,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -10511,13 +10511,13 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &main_uri {
-                Some(main_meta.clone())
+                Some(std::sync::Arc::new(main_meta.clone()))
             } else if uri == &data_uri {
-                Some(data_meta.clone())
+                Some(std::sync::Arc::new(data_meta.clone()))
             } else if uri == &outcomes_uri {
-                Some(outcomes_meta.clone())
+                Some(std::sync::Arc::new(outcomes_meta.clone()))
             } else {
                 None
             }
@@ -10618,9 +10618,9 @@ x <- 1"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
             }
@@ -11180,7 +11180,7 @@ y <- filter(df)"#;
                 }
             };
             let get_metadata =
-                |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+                |_u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
             let base_exports = HashSet::new();
 
@@ -11251,7 +11251,7 @@ y <- filter(df)"#;
                 }
             };
             let get_metadata =
-                |_u: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+                |_u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
             let base_exports = HashSet::new();
 
@@ -11371,11 +11371,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -11466,7 +11466,7 @@ y <- filter(df)"#;
                 }
             };
             let get_metadata =
-                |_uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> { None };
+                |_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> { None };
 
             let base_exports = HashSet::new();
 
@@ -11602,13 +11602,13 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &middle_uri {
-                    Some(middle_meta.clone())
+                    Some(std::sync::Arc::new(middle_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -11742,11 +11742,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -11870,11 +11870,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else {
                     None
                 }
@@ -12005,13 +12005,13 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &sibling_uri {
-                    Some(sibling_meta.clone())
+                    Some(std::sync::Arc::new(sibling_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12121,11 +12121,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12253,11 +12253,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12357,11 +12357,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12469,11 +12469,11 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12617,13 +12617,13 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &grandparent_uri {
-                    Some(grandparent_meta.clone())
+                    Some(std::sync::Arc::new(grandparent_meta.clone()))
                 } else if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12754,13 +12754,13 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<crate::cross_file::types::CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &helper_uri {
-                    Some(helper_meta.clone())
+                    Some(std::sync::Arc::new(helper_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12849,11 +12849,11 @@ y <- filter(df)"#;
                 }
             };
 
-            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -12971,13 +12971,13 @@ y <- filter(df)"#;
                 }
             };
 
-            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
                 if uri == &parent_a_uri {
-                    Some(parent_a_meta.clone())
+                    Some(std::sync::Arc::new(parent_a_meta.clone()))
                 } else if uri == &parent_b_uri {
-                    Some(parent_b_meta.clone())
+                    Some(std::sync::Arc::new(parent_b_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -13058,11 +13058,11 @@ y <- filter(df)"#;
                 }
             };
 
-            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }
@@ -13190,13 +13190,13 @@ y <- filter(df)"#;
                 }
             };
 
-            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
                 if uri == &main_uri {
-                    Some(main_meta.clone())
+                    Some(std::sync::Arc::new(main_meta.clone()))
                 } else if uri == &runner_uri {
-                    Some(runner_meta.clone())
+                    Some(std::sync::Arc::new(runner_meta.clone()))
                 } else if uri == &format_uri {
-                    Some(format_meta.clone())
+                    Some(std::sync::Arc::new(format_meta.clone()))
                 } else {
                     None
                 }
@@ -13305,11 +13305,11 @@ y <- filter(df)"#;
                 }
             };
 
-            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
-                    Some(child_meta.clone())
+                    Some(std::sync::Arc::new(child_meta.clone()))
                 } else {
                     None
                 }

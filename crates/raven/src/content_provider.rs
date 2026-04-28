@@ -41,7 +41,11 @@ pub trait ContentProvider: Send + Sync {
     ///
     /// Returns the cross-file metadata (source() calls, directives, etc.)
     /// for the given URI, or None if not available.
-    fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata>;
+    ///
+    /// Wrapped in `Arc` so callers (especially `DiagnosticsSnapshot::build`,
+    /// which clones once per neighbor per dependent) avoid deep-cloning the
+    /// `Vec`/`HashSet`/`String` fields on every snapshot.
+    fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>>;
 
     /// Get artifacts for a URI
     ///
@@ -225,7 +229,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// 5. Legacy workspace_index (for migration compatibility)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
-    fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
+    fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
         // 1. Check DocumentStore
         if let Some(doc) = self.document_store.get_without_touch(uri) {
             return Some(doc.metadata.clone());
@@ -235,7 +239,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         if let Some(legacy_docs) = self.legacy_documents {
             if let Some(doc) = legacy_docs.get(uri) {
                 let text = doc.text();
-                return Some(crate::cross_file::extract_metadata(&text));
+                return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
             }
         }
 
@@ -255,7 +259,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         if let Some(legacy_ws) = self.legacy_workspace_index {
             if let Some(doc) = legacy_ws.get(uri) {
                 let text = doc.text();
-                return Some(crate::cross_file::extract_metadata(&text));
+                return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
             }
         }
 
@@ -433,7 +437,7 @@ mod tests {
     /// Mock content provider for testing
     struct MockContentProvider {
         content: HashMap<Url, String>,
-        metadata: HashMap<Url, CrossFileMetadata>,
+        metadata: HashMap<Url, Arc<CrossFileMetadata>>,
         artifacts: HashMap<Url, Arc<ScopeArtifacts>>,
         open_uris: std::collections::HashSet<Url>,
     }
@@ -464,7 +468,7 @@ mod tests {
             self.content.get(uri).cloned()
         }
 
-        fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
+        fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
             self.metadata.get(uri).cloned()
         }
 
@@ -604,7 +608,7 @@ mod tests {
                 size: 17,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -639,7 +643,7 @@ mod tests {
                 size: 17,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -693,7 +697,7 @@ mod tests {
                 size: 7,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -738,7 +742,7 @@ mod tests {
                 size: 7,
                 content_hash: None,
             },
-            metadata: index_metadata,
+            metadata: Arc::new(index_metadata),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -787,7 +791,7 @@ mod tests {
                 size: 31,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(index_artifacts),
             indexed_at_version: 0,
         };
@@ -828,7 +832,7 @@ mod tests {
                 size: 7,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -954,7 +958,7 @@ mod tests {
                 size: content.len() as u64,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         }
@@ -1053,7 +1057,7 @@ mod tests {
                         size: 6,
                         content_hash: None,
                     },
-                    metadata: index_metadata,
+                    metadata: Arc::new(index_metadata),
                     artifacts: Arc::new(ScopeArtifacts::default()),
                     indexed_at_version: 0,
                 };
@@ -1126,7 +1130,7 @@ mod tests {
                         size: index_content.len() as u64,
                         content_hash: None,
                     },
-                    metadata: CrossFileMetadata::default(),
+                    metadata: std::sync::Arc::new(CrossFileMetadata::default()),
                     artifacts: Arc::new(index_artifacts),
                     indexed_at_version: 0,
                 };
@@ -1208,7 +1212,7 @@ mod tests {
                         size: index_content.len() as u64,
                         content_hash: None,
                     },
-                    metadata: index_metadata,
+                    metadata: Arc::new(index_metadata),
                     artifacts: Arc::new(index_artifacts),
                     indexed_at_version: 0,
                 };
@@ -1419,7 +1423,7 @@ mod tests {
                         size: content.len() as u64,
                         content_hash: None,
                     },
-                    metadata,
+                    metadata: Arc::new(metadata),
                     artifacts: Arc::new(artifacts),
                     indexed_at_version: 0,
                 };
@@ -1566,7 +1570,7 @@ mod tests {
                         size: index_content.len() as u64,
                         content_hash: None,
                     },
-                    metadata: index_metadata,
+                    metadata: Arc::new(index_metadata),
                     artifacts: Arc::new(index_artifacts),
                     indexed_at_version: 0,
                 };
@@ -1727,7 +1731,7 @@ mod integration_tests {
                 size: 31,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -1777,7 +1781,7 @@ mod integration_tests {
                 size: 28,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(utils_artifacts.clone()),
             indexed_at_version: 0,
         };
@@ -1827,7 +1831,7 @@ mod integration_tests {
                 size: 6,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -1866,7 +1870,7 @@ mod integration_tests {
                 size: 11,
                 content_hash: None,
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: 0,
         };
@@ -1978,7 +1982,7 @@ mod integration_tests {
                 size: 50,
                 content_hash: None,
             },
-            metadata,
+            metadata: Arc::new(metadata),
             artifacts: Arc::new(artifacts),
             indexed_at_version: 0,
         };
@@ -2086,7 +2090,7 @@ mod integration_tests {
                 size: 30,
                 content_hash: None,
             },
-            metadata: old_metadata,
+            metadata: Arc::new(old_metadata),
             artifacts: Arc::new(old_artifacts),
             indexed_at_version: 0,
         };
@@ -2208,7 +2212,7 @@ mod integration_tests {
                 size: 35,
                 content_hash: None,
             },
-            metadata: child_metadata.clone(),
+            metadata: Arc::new(child_metadata.clone()),
             artifacts: Arc::new(child_artifacts.clone()),
             indexed_at_version: 0,
         };
@@ -2244,7 +2248,7 @@ mod integration_tests {
         // Create closures for scope resolution
         let get_artifacts =
             |uri: &Url| -> Option<Arc<ScopeArtifacts>> { provider.get_artifacts(uri) };
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> { provider.get_metadata(uri) };
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> { provider.get_metadata(uri) };
 
         // Query scope at end of parent file
         let scope = scope_at_position_with_graph(

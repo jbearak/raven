@@ -26,7 +26,7 @@ const DEFAULT_METADATA_CACHE_CAPACITY: usize = 1000;
 /// `push()` for writes (promotes/evicts under write lock). This makes eviction
 /// "LRU by insertion/update time" which keeps the read path fully concurrent.
 pub struct MetadataCache {
-    inner: RwLock<LruCache<Url, CrossFileMetadata>>,
+    inner: RwLock<LruCache<Url, std::sync::Arc<CrossFileMetadata>>>,
 }
 
 impl std::fmt::Debug for MetadataCache {
@@ -53,13 +53,13 @@ impl MetadataCache {
         }
     }
 
-    pub fn get(&self, uri: &Url) -> Option<CrossFileMetadata> {
+    pub fn get(&self, uri: &Url) -> Option<std::sync::Arc<CrossFileMetadata>> {
         self.inner.read().ok()?.peek(uri).cloned()
     }
 
     pub fn insert(&self, uri: Url, meta: CrossFileMetadata) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.push(uri, meta);
+            guard.push(uri, std::sync::Arc::new(meta));
         }
     }
 

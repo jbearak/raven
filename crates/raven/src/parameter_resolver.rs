@@ -755,7 +755,7 @@ fn get_scope(
         content_provider.get_artifacts(target_uri)
     };
 
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         content_provider.get_metadata(target_uri)
     };
 

@@ -3245,11 +3245,11 @@ child_function <- function() {
         println!("\nStep 2: Compute initial inherited working directory for child");
 
         // Create metadata getter that returns parent's metadata
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }
@@ -3348,11 +3348,11 @@ child_function <- function() {
         );
 
         // Create updated metadata getter with new parent metadata
-        let get_updated_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_updated_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(new_parent_meta.clone())
+                Some(std::sync::Arc::new(new_parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }
@@ -3964,11 +3964,11 @@ child_function <- function() {
         println!("\nStep 3: Compute inherited working directory for child");
 
         // Create metadata getter that returns parent's metadata
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }
@@ -4218,11 +4218,11 @@ helper_func <- function() { 42 }
         println!("\nStep 3: Compute inherited working directory for child");
 
         // Create metadata getter that returns parent's metadata
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }
@@ -4480,11 +4480,11 @@ child_function <- function() {
         println!("\nStep 3: Verify compute_inherited_working_directory returns None");
 
         // Create metadata getter that returns parent's metadata
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }
@@ -4795,9 +4795,9 @@ child_var <- 100
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_metadata.clone())
+                Some(std::sync::Arc::new(parent_metadata.clone()))
             } else {
                 None
             }
@@ -4982,9 +4982,9 @@ x <- 1
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_metadata.clone())
+                Some(std::sync::Arc::new(parent_metadata.clone()))
             } else {
                 None
             }
@@ -5128,9 +5128,9 @@ x <- 1
                 }
             };
 
-            let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
                 if uri == &parent_uri {
-                    Some(parent_metadata.clone())
+                    Some(std::sync::Arc::new(parent_metadata.clone()))
                 } else {
                     None
                 }
@@ -5622,9 +5622,9 @@ x <- 1
             }
         };
 
-        let get_metadata_v1 = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata_v1 = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_metadata_v1.clone())
+                Some(std::sync::Arc::new(parent_metadata_v1.clone()))
             } else {
                 None
             }
@@ -5700,9 +5700,9 @@ x <- 1
             }
         };
 
-        let get_metadata_v2 = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata_v2 = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_metadata_v2.clone())
+                Some(std::sync::Arc::new(parent_metadata_v2.clone()))
             } else {
                 None
             }
@@ -5803,9 +5803,9 @@ x <- 1
             }
         };
 
-        let get_metadata_v1 = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata_v1 = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_metadata_v1.clone())
+                Some(std::sync::Arc::new(parent_metadata_v1.clone()))
             } else {
                 None
             }
@@ -5881,9 +5881,9 @@ x <- 1
             }
         };
 
-        let get_metadata_v2 = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata_v2 = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_metadata_v2.clone())
+                Some(std::sync::Arc::new(parent_metadata_v2.clone()))
             } else {
                 None
             }
@@ -6081,11 +6081,11 @@ mod cross_directory_hoisting_tests {
                 None
             }
         };
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
             if uri == &parent_uri {
-                Some(parent_meta.clone())
+                Some(std::sync::Arc::new(parent_meta.clone()))
             } else if uri == &child_uri {
-                Some(child_meta.clone())
+                Some(std::sync::Arc::new(child_meta.clone()))
             } else {
                 None
             }

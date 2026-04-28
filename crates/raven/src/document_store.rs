@@ -96,7 +96,7 @@ pub struct DocumentState {
     /// Packages loaded via library() calls
     pub loaded_packages: Vec<String>,
     /// Cross-file metadata (source() calls, directives)
-    pub metadata: CrossFileMetadata,
+    pub metadata: Arc<CrossFileMetadata>,
     /// Scope artifacts (exported symbols, timeline)
     pub artifacts: Arc<ScopeArtifacts>,
     /// Internal revision counter for change detection
@@ -285,7 +285,7 @@ impl DocumentStore {
         let contents = Rope::from_str(content);
         let tree = Self::parse_content(content);
         let loaded_packages = Self::extract_packages(&tree, content);
-        let metadata = crate::cross_file::extract_metadata(content);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(content));
         let artifacts = Arc::new(if let Some(ref tree) = tree {
             // Use compute_artifacts_with_metadata to include declared symbols from directives
             // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
@@ -294,7 +294,7 @@ impl DocumentStore {
                 &uri,
                 tree,
                 content,
-                Some(&metadata),
+                Some(metadata.as_ref()),
             )
         } else {
             ScopeArtifacts::default()
@@ -373,6 +373,7 @@ impl DocumentStore {
         let contents = Rope::from_str(content);
         let tree = Self::parse_content(content);
         let loaded_packages = Self::extract_packages(&tree, content);
+        let metadata = Arc::new(metadata);
         let artifacts = Arc::new(if let Some(ref tree) = tree {
             // Use compute_artifacts_with_metadata to include declared symbols from directives
             // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
@@ -381,7 +382,7 @@ impl DocumentStore {
                 &uri,
                 tree,
                 content,
-                Some(&metadata),
+                Some(metadata.as_ref()),
             )
         } else {
             ScopeArtifacts::default()
@@ -462,7 +463,7 @@ impl DocumentStore {
             let content = state.contents.to_string();
             state.tree = Self::parse_content(&content);
             state.loaded_packages = Self::extract_packages(&state.tree, &content);
-            state.metadata = crate::cross_file::extract_metadata(&content);
+            state.metadata = Arc::new(crate::cross_file::extract_metadata(&content));
             state.artifacts = Arc::new(if let Some(ref tree) = state.tree {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
@@ -471,7 +472,7 @@ impl DocumentStore {
                     uri,
                     tree,
                     &content,
-                    Some(&state.metadata),
+                    Some(state.metadata.as_ref()),
                 )
             } else {
                 ScopeArtifacts::default()
@@ -508,7 +509,7 @@ impl DocumentStore {
             let content = state.contents.to_string();
             state.tree = Self::parse_content(&content);
             state.loaded_packages = Self::extract_packages(&state.tree, &content);
-            state.metadata = metadata;
+            state.metadata = Arc::new(metadata);
             state.artifacts = Arc::new(if let Some(ref tree) = state.tree {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
@@ -517,7 +518,7 @@ impl DocumentStore {
                     uri,
                     tree,
                     &content,
-                    Some(&state.metadata),
+                    Some(state.metadata.as_ref()),
                 )
             } else {
                 ScopeArtifacts::default()
@@ -986,6 +987,24 @@ mod tests {
         assert!(!store.contains(&uri1)); // Evicted
         assert!(store.contains(&uri2));
         assert!(store.contains(&uri3));
+    }
+
+    #[tokio::test]
+    async fn test_document_state_metadata_is_arc_wrapped() {
+        // Locks in S0: DocumentState.metadata must be Arc<CrossFileMetadata>
+        // so cloning into snapshots / closures is a refcount bump rather
+        // than a deep clone of Vec/HashSet/String fields.
+        let mut store = DocumentStore::new(make_test_config());
+        let uri = Url::parse("file:///t.R").unwrap();
+        store.open(uri.clone(), "x <- 1", 1).await;
+
+        let doc = store.get_without_touch(&uri).unwrap();
+        let arc1: Arc<CrossFileMetadata> = doc.metadata.clone();
+        let arc2 = arc1.clone();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "Arc clones must share storage"
+        );
     }
 
     #[tokio::test]

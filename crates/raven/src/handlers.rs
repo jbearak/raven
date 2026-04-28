@@ -74,7 +74,7 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
-    pub metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata>,
+    pub metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
 
     // Cycle detection result (pre-computed from the full graph, not the trimmed subgraph,
     // so cycles longer than max_chain_depth are still detected)
@@ -94,9 +94,12 @@ impl DiagnosticsSnapshot {
         let doc = state.get_document(uri)?;
         let tree = doc.tree.as_ref()?.clone();
         let text = doc.text();
-        // Get enriched metadata
+        // Get enriched metadata. The snapshot owns its `directive_meta` so it
+        // can mutate `inherited_working_directory` in place; we deep-clone
+        // only this single entry, while neighbors stay Arc-wrapped.
         let mut directive_meta = state
             .get_enriched_metadata(uri)
+            .map(std::sync::Arc::unwrap_or_clone)
             .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
         let metadata_elapsed = build_start.elapsed();
 
@@ -105,15 +108,19 @@ impl DiagnosticsSnapshot {
             let workspace_root = state.workspace_folders.first();
             let content_provider = state.content_provider();
             let get_metadata_for_uri =
-                |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                     if let Some(doc) = state.documents.get(target_uri) {
-                        return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+                        return Some(std::sync::Arc::new(
+                            crate::cross_file::directive::parse_directives(&doc.text()),
+                        ));
                     }
                     if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
                         return Some(meta);
                     }
                     if let Some(content) = content_provider.get_content(target_uri) {
-                        return Some(crate::cross_file::extract_metadata(&content));
+                        return Some(std::sync::Arc::new(
+                            crate::cross_file::extract_metadata(&content),
+                        ));
                     }
                     None
                 };
@@ -208,7 +215,7 @@ impl DiagnosticsSnapshot {
         let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
         };
-        let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+        let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
             self.metadata_map.get(target_uri).cloned()
         };
 
@@ -2640,7 +2647,7 @@ fn get_cross_file_scope(
     };
 
     // Closure to get metadata for a URI
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         content_provider.get_metadata(target_uri)
     };
 
@@ -3597,6 +3604,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     // Fall back to extraction from current text+tree when metadata is unavailable.
     let mut directive_meta = state
         .get_enriched_metadata(uri)
+        .map(std::sync::Arc::unwrap_or_clone)
         .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(tree)));
 
     // Compute inherited working directory for files with backward directives
@@ -3610,10 +3618,12 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
         // Create a metadata getter that retrieves metadata from open documents,
         // workspace index, or by parsing content from the file cache
         let get_metadata_for_uri =
-            |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                 // First check open documents
                 if let Some(doc) = state.documents.get(target_uri) {
-                    return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+                    return Some(std::sync::Arc::new(
+                        crate::cross_file::directive::parse_directives(&doc.text()),
+                    ));
                 }
                 // Then try workspace index
                 if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
@@ -3621,7 +3631,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
                 }
                 // Finally try to read from file cache
                 if let Some(content) = content_provider.get_content(target_uri) {
-                    return Some(crate::cross_file::extract_metadata(&content));
+                    return Some(std::sync::Arc::new(
+                        crate::cross_file::extract_metadata(&content),
+                    ));
                 }
                 None
             };
@@ -4491,9 +4503,11 @@ fn collect_max_depth_diagnostics(
         None
     };
 
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         if let Some(doc) = state.documents.get(target_uri) {
-            return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+            return Some(std::sync::Arc::new(
+                crate::cross_file::directive::parse_directives(&doc.text()),
+            ));
         }
         state.cross_file_workspace_index.get_metadata(target_uri)
     };
@@ -4773,7 +4787,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         snapshot.metadata_map.get(target_uri).cloned()
     };
 
@@ -8069,6 +8083,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
 
                         let source_meta = content_provider
                             .get_metadata(source_uri)
+                            .map(std::sync::Arc::unwrap_or_clone)
                             .unwrap_or_else(|| crate::cross_file::extract_metadata(&source_text));
 
                         let Some(source_tree) = crate::parser_pool::with_parser(|parser| {

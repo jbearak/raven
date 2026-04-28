@@ -24,7 +24,7 @@ pub trait ContentProvider {
     fn get_content(&self, uri: &Url) -> Option<String>;
 
     /// Get metadata for a URI, preferring open documents over index.
-    fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata>;
+    fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>>;
 
     /// Get scope artifacts for a URI, preferring open documents over cache.
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>>;
@@ -82,7 +82,7 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
         self.file_cache.get(uri)
     }
 
-    fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
+    fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
         // 1. Open document - would need to extract metadata
         // For now, we don't store extracted metadata for open docs in this provider
         // The caller should handle open docs separately

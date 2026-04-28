@@ -196,7 +196,7 @@ pub fn enrich_metadata_with_inherited_wd<F>(
     get_metadata: F,
     max_depth: usize,
 ) where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     if meta.sourced_by.is_empty() || meta.working_directory.is_some() {
         return;

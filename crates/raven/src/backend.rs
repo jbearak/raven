@@ -1452,7 +1452,7 @@ impl LanguageServer for Backend {
             let wd_affected =
                 crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                     &uri,
-                    old_meta.as_ref(),
+                    old_meta.as_deref(),
                     &meta,
                     &state.cross_file_graph,
                     &state.cross_file_meta,
@@ -2107,7 +2107,7 @@ impl LanguageServer for Backend {
                     let wd_children =
                         crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                             &uri,
-                            old_meta.as_ref(),
+                            old_meta.as_deref(),
                             &meta,
                             &state.cross_file_graph,
                             &state.cross_file_meta,
@@ -2904,7 +2904,7 @@ impl LanguageServer for Backend {
                         // Invalidate children affected by working directory change (Requirement 8)
                         let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                             &uri,
-                            old_meta.as_ref(),
+                            old_meta.as_deref(),
                             &cross_file_meta,
                             &state.cross_file_graph,
                             &state.cross_file_meta,
@@ -3417,7 +3417,7 @@ impl Backend {
     async fn index_file_on_demand(
         &self,
         file_uri: &Url,
-    ) -> Option<crate::cross_file::CrossFileMetadata> {
+    ) -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         log::trace!("On-demand indexing: {}", file_uri);
 
         // Read file content
@@ -3515,6 +3515,7 @@ impl Backend {
             Vec::new()
         };
 
+        let cross_file_meta = std::sync::Arc::new(cross_file_meta);
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str(&content),
             tree,
@@ -3537,7 +3538,7 @@ impl Backend {
                 file_uri,
                 &open_docs,
                 snapshot,
-                cross_file_meta.clone(),
+                (*cross_file_meta).clone(),
                 artifacts.clone(),
             );
             state.cross_file_graph.update_file(
@@ -3714,7 +3715,7 @@ impl Backend {
                                 && (!state.cross_file_workspace_index.contains(&child_uri)
                                     || state
                                         .get_enriched_metadata(&child_uri)
-                                        .and_then(|m| m.inherited_working_directory)
+                                        .and_then(|m| m.inherited_working_directory.clone())
                                         .is_none())
                         };
                         if should_index {
@@ -3733,7 +3734,7 @@ impl Backend {
         &self,
         file_uri: &Url,
         inherited_wd: &std::path::Path,
-    ) -> Option<crate::cross_file::CrossFileMetadata> {
+    ) -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         log::trace!(
             "On-demand indexing (inherited wd={}): {}",
             inherited_wd.display(),
@@ -3831,6 +3832,7 @@ impl Backend {
             Vec::new()
         };
 
+        let cross_file_meta = std::sync::Arc::new(cross_file_meta);
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str(&content),
             tree,
@@ -3853,7 +3855,7 @@ impl Backend {
                 file_uri,
                 &open_docs,
                 snapshot,
-                cross_file_meta.clone(),
+                (*cross_file_meta).clone(),
                 artifacts.clone(),
             );
             state.cross_file_graph.update_file(
@@ -4267,7 +4269,7 @@ pub(crate) struct ScopeProbeSnapshot {
     pub(crate) artifacts_map:
         std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
     pub(crate) metadata_map:
-        std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
+        std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     /// Per-document `loaded_packages` from the document store (includes
     /// function-local `library()` calls that the EOF scope probe misses).
     pub(crate) doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
@@ -4411,7 +4413,7 @@ async fn run_libpath_consumer(
                     Arc<crate::cross_file::scope::ScopeArtifacts>,
                 > { probe.artifacts_map.get(target_uri).cloned() };
                 let get_metadata =
-                    |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                    |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                         probe.metadata_map.get(target_uri).cloned()
                     };
                 let empty_base_exports: HashSet<String> = HashSet::new();
@@ -5718,7 +5720,7 @@ mod refresh_packages_tests {
                 size: 0,
                 content_hash: None,
             },
-            metadata: parent_meta,
+            metadata: Arc::new(parent_meta),
             artifacts: parent_artifacts,
             indexed_at_version: 0,
         };
@@ -6036,7 +6038,7 @@ mod refresh_packages_tests {
                 size: 0,
                 content_hash: None,
             },
-            metadata: parent_meta,
+            metadata: Arc::new(parent_meta),
             artifacts: parent_artifacts,
             indexed_at_version: 0,
         };

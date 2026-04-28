@@ -854,7 +854,10 @@ impl WorldState {
     /// 3. Legacy cross_file_workspace_index
     /// 4. Legacy documents HashMap (re-extract metadata)
     /// 5. File cache (re-extract metadata)
-    pub fn get_enriched_metadata(&self, uri: &Url) -> Option<crate::cross_file::CrossFileMetadata> {
+    pub fn get_enriched_metadata(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
         self.document_store
             .get_without_touch(uri)
             .map(|doc| doc.metadata.clone())
@@ -863,12 +866,12 @@ impl WorldState {
             .or_else(|| {
                 self.documents
                     .get(uri)
-                    .map(|doc| crate::cross_file::extract_metadata(&doc.text()))
+                    .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.text())))
             })
             .or_else(|| {
                 self.cross_file_file_cache
                     .get(uri)
-                    .map(|content| crate::cross_file::extract_metadata(&content))
+                    .map(|content| Arc::new(crate::cross_file::extract_metadata(&content)))
             })
     }
 
@@ -951,7 +954,9 @@ impl WorldState {
         let workspace_root = self.workspace_folders.first().cloned();
 
         // Collect URIs and metadata to avoid borrow conflicts with self.
-        let mut entries: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
+        // `entry.metadata` is `Arc<CrossFileMetadata>`, so the clone is a
+        // refcount bump rather than a deep clone of Vec/HashSet/String fields.
+        let mut entries: Vec<(Url, Arc<crate::cross_file::CrossFileMetadata>)> = Vec::new();
         for (uri, entry) in self.workspace_index_new.iter() {
             entries.push((uri.clone(), entry.metadata.clone()));
         }
@@ -970,8 +975,12 @@ impl WorldState {
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
             };
-            let _result =
-                cross_file_graph.update_file(uri, meta, workspace_root.as_ref(), get_content);
+            let _result = cross_file_graph.update_file(
+                uri,
+                meta.as_ref(),
+                workspace_root.as_ref(),
+                get_content,
+            );
         }
 
         log::info!(
@@ -1095,10 +1104,11 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         }
 
         // Build metadata map from current state
-        let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
-            .iter()
-            .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
-            .collect();
+        let metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
+            new_index_entries
+                .iter()
+                .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+                .collect();
 
         let mut newly_enriched = Vec::new();
 
@@ -1106,8 +1116,9 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         for uri in &files_needing_enrichment {
             if let Some(entry) = new_index_entries.get_mut(uri) {
                 let old_inherited = entry.metadata.inherited_working_directory.clone();
+                let meta = Arc::make_mut(&mut entry.metadata);
                 crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut entry.metadata,
+                    meta,
                     uri,
                     workspace_root.as_ref(),
                     |parent_uri| metadata_map.get(parent_uri).cloned(),
@@ -1119,8 +1130,9 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
             }
             // Also update legacy cross_file_entries
             if let Some(entry) = cross_file_entries.get_mut(uri) {
+                let meta = Arc::make_mut(&mut entry.metadata);
                 crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut entry.metadata,
+                    meta,
                     uri,
                     workspace_root.as_ref(),
                     |parent_uri| metadata_map.get(parent_uri).cloned(),
@@ -1246,6 +1258,7 @@ fn scan_directory(
                             );
 
                         // Create legacy cross-file entry
+                        let cross_file_meta = Arc::new(cross_file_meta);
                         cross_file_entries.insert(
                             uri.clone(),
                             crate::cross_file::workspace_index::IndexEntry {

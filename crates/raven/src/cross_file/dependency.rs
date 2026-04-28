@@ -41,7 +41,7 @@ pub fn resolve_parent_working_directory<F>(
     workspace_root: Option<&Url>,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     resolve_parent_working_directory_with_depth(
         parent_uri,
@@ -85,7 +85,7 @@ pub fn resolve_parent_working_directory_with_depth<F>(
     remaining_depth: usize,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     let mut visited = HashSet::new();
     resolve_parent_working_directory_with_visited(
@@ -138,7 +138,7 @@ pub fn resolve_parent_working_directory_with_visited<F>(
     visited: &mut HashSet<Url>,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     // Check for cycle: if we've already visited this URI, stop and use file's directory
     // (Requirement 9.3)
@@ -259,7 +259,7 @@ pub fn compute_inherited_working_directory<F>(
     get_metadata: F,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     compute_inherited_working_directory_with_depth(
         uri,
@@ -311,7 +311,7 @@ pub fn compute_inherited_working_directory_with_depth<F>(
     max_depth: usize,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     let mut visited = HashSet::new();
     compute_inherited_working_directory_with_visited(
@@ -373,7 +373,7 @@ pub fn compute_inherited_working_directory_with_visited<F>(
     visited: &mut HashSet<Url>,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     // Check for cycle: if we've already visited this URI, stop inheritance
     // (Requirement 9.3)
@@ -2289,7 +2289,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2319,7 +2319,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2373,7 +2373,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2405,7 +2405,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2435,7 +2435,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2463,7 +2463,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2505,7 +2505,7 @@ z <- 3
         let result =
             compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2601,9 +2601,9 @@ z <- 3
         let result =
             compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent1_uri {
-                    Some(parent1_meta.clone())
+                    Some(std::sync::Arc::new(parent1_meta.clone()))
                 } else if uri == &parent2_uri {
-                    Some(parent2_meta.clone())
+                    Some(std::sync::Arc::new(parent2_meta.clone()))
                 } else {
                     None
                 }
@@ -2641,7 +2641,7 @@ z <- 3
         let result =
             compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2748,7 +2748,7 @@ z <- 3
             Some(&workspace),
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2807,9 +2807,9 @@ z <- 3
         let result =
             compute_inherited_working_directory(&c_uri, &c_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else {
                     None
                 }
@@ -2857,7 +2857,7 @@ z <- 3
             Some(&workspace),
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2936,9 +2936,9 @@ z <- 3
         let result =
             compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else {
                     None
                 }
@@ -2974,7 +2974,7 @@ z <- 3
         let result =
             compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else {
                     None
                 }
@@ -3033,11 +3033,11 @@ z <- 3
         let result =
             compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else if uri == &c_uri {
-                    Some(c_meta.clone())
+                    Some(std::sync::Arc::new(c_meta.clone()))
                 } else {
                     None
                 }
@@ -3067,7 +3067,7 @@ z <- 3
             &a_uri,
             &|uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else {
                     None
                 }
