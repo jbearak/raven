@@ -618,10 +618,13 @@ pub struct UpdateResult {
 }
 
 /// Cached `(neighborhood, subgraph)` payload for a `(root, depth, visited)`
-/// query. Wrapped in `Arc` so cache reads are refcount bumps.
+/// query. Wrapped in `Arc` so cache reads are refcount bumps; the inner
+/// `subgraph` is also held as `Arc` so consumers (e.g. `DiagnosticsSnapshot`)
+/// can keep a refcount-bumped reference instead of cloning the trimmed
+/// graph per snapshot.
 pub struct NeighborhoodSubgraph {
     pub neighborhood: HashSet<Url>,
-    pub subgraph: DependencyGraph,
+    pub subgraph: std::sync::Arc<DependencyGraph>,
 }
 
 /// Dependency graph tracking source relationships between files
@@ -1493,7 +1496,7 @@ impl DependencyGraph {
         }
 
         let neighborhood = self.collect_neighborhood(uri, max_depth, max_visited);
-        let subgraph = self.extract_subgraph(&neighborhood);
+        let subgraph = std::sync::Arc::new(self.extract_subgraph(&neighborhood));
         let payload = std::sync::Arc::new(NeighborhoodSubgraph {
             neighborhood,
             subgraph,
@@ -1863,6 +1866,25 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_neighborhood_subgraph_subgraph_is_arc_wrapped() {
+        // S2: the cached subgraph must be exposed as an Arc so the
+        // diagnostic snapshot can hold a refcount-bumped reference instead
+        // of cloning the trimmed DependencyGraph per snapshot.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+
+        let payload = graph.cached_neighborhood_subgraph(&a, 10, 100);
+        let arc1: Arc<DependencyGraph> = payload.subgraph.clone();
+        let arc2 = arc1.clone();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "Arc subgraph clones must share storage"
+        );
     }
 
     #[test]

@@ -74,7 +74,10 @@ pub(crate) struct DiagnosticsSnapshot {
     // Cross-file state (pre-collected)
     pub directive_meta: crate::cross_file::CrossFileMetadata,
     pub cross_file_config: crate::cross_file::config::CrossFileConfig,
-    pub cross_file_graph: crate::cross_file::dependency::DependencyGraph,
+    /// Trimmed dependency subgraph for the queried URI's neighborhood.
+    /// Stored as `Arc` so concurrent fan-out revalidations share allocation
+    /// instead of each cloning the trimmed graph from the cache payload.
+    pub cross_file_graph: Arc<crate::cross_file::dependency::DependencyGraph>,
     pub workspace_folders: Vec<Url>,
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
@@ -177,9 +180,9 @@ impl DiagnosticsSnapshot {
         // cycles longer than max_chain_depth are still detected.
         let cycle_detection = state.cross_file_graph.detect_cycle(uri);
 
-        // Take an owned copy of the trimmed subgraph for the snapshot. The
-        // BFS/edge-cloning work is amortized via the cache; this clone copies
-        // only the small neighborhood-scoped HashMaps.
+        // Hold the trimmed subgraph as an Arc clone of the cached payload.
+        // The cache returns an `Arc<DependencyGraph>`, so this is a refcount
+        // bump rather than a deep clone of the trimmed forward/backward maps.
         let subgraph_start = std::time::Instant::now();
         let trimmed_graph = payload.subgraph.clone();
         let subgraph_elapsed = subgraph_start.elapsed();

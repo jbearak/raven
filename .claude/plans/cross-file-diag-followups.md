@@ -33,7 +33,7 @@ Use `--save-baseline before` / `--baseline before` to compare runs.
 
 - [x] **S1: Share neighborhood / artifact pre-collection across dependent revalidations.** Today, when one edit fans out to N dependents, each dependent's `run_debounced_diagnostics` builds its own `DiagnosticsSnapshot` with overlapping neighborhoods. A workspace-level cache keyed by graph revision would let dependents share most of the pre-collected data.
 
-- [ ] **S2: Move `detect_cycle` / `extract_subgraph` / `workspace_imports.clone()` out from under the read lock.** `DiagnosticsSnapshot::build` runs all of these while holding `WorldState`'s read lock. Lock-hold is now ≤0.12 ms after the eviction fix, so this is more about hygiene than perf. Could be done lazily (compute on first use, not in `build`).
+- [x] **S2: Move `detect_cycle` / `extract_subgraph` / `workspace_imports.clone()` out from under the read lock.** `DiagnosticsSnapshot::build` runs all of these while holding `WorldState`'s read lock. Lock-hold is now ≤0.12 ms after the eviction fix, so this is more about hygiene than perf. Could be done lazily (compute on first use, not in `build`).
 
 - [x] **S3: Batch `mark_force_republish` over transitive dependents.** `did_change` (`backend.rs:2168`) loops over dependents and calls `mark_force_republish` per URI; each call takes write locks on `last_published_version` and `force_republish` maps. A bulk `mark_force_republish_many(&[Url])` would do one lock-acquire pair total. Microseconds today, but cleaner.
 
