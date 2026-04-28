@@ -15772,13 +15772,18 @@ proptest! {
             }
         }
 
+        // Pre-build a `Url -> Arc<CrossFileMetadata>` map so the recursive
+        // working-directory walk does O(1) HashMap lookups + Arc-clone on
+        // every call instead of an O(n) linear scan + deep-clone per call.
+        // proptest runs 256 cases × up-to-`max_depth` recursive lookups, so
+        // this matters for test latency.
+        let metadata_map: std::collections::HashMap<Url, std::sync::Arc<CrossFileMetadata>> = uris
+            .iter()
+            .zip(metadatas.iter())
+            .map(|(u, m)| (u.clone(), std::sync::Arc::new(m.clone())))
+            .collect();
         let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            for (i, u) in uris.iter().enumerate() {
-                if uri == u {
-                    return Some(std::sync::Arc::new(metadatas[i].clone()));
-                }
-            }
-            None
+            metadata_map.get(uri).cloned()
         };
 
         // Test inheritance from the last file in the chain
@@ -15984,13 +15989,14 @@ proptest! {
             }
         }
 
+        // Same O(1) lookup map as the depth-tracking case above.
+        let metadata_map: std::collections::HashMap<Url, std::sync::Arc<CrossFileMetadata>> = uris
+            .iter()
+            .zip(metadatas.iter())
+            .map(|(u, m)| (u.clone(), std::sync::Arc::new(m.clone())))
+            .collect();
         let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            for (i, u) in uris.iter().enumerate() {
-                if uri == u {
-                    return Some(std::sync::Arc::new(metadatas[i].clone()));
-                }
-            }
-            None
+            metadata_map.get(uri).cloned()
         };
 
         // With default depth, typical chains should work
