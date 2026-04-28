@@ -170,8 +170,12 @@ pub struct PackageLibrary {
     combined_exports: RwLock<HashMap<String, Arc<HashSet<String>>>>,
     /// Base packages (always available)
     base_packages: HashSet<String>,
-    /// Base package exports (combined from all base packages)
-    base_exports: HashSet<String>,
+    /// Base package exports (combined from all base packages).
+    ///
+    /// Wrapped in `Arc` so consumers (e.g. `DiagnosticsSnapshot::build`) can
+    /// share the set across snapshots without deep-cloning every published
+    /// diagnostic batch.
+    base_exports: Arc<HashSet<String>>,
     /// R subprocess interface (None if R is unavailable)
     #[allow(dead_code)] // Will be used in task 3.3
     r_subprocess: Option<RSubprocess>,
@@ -190,7 +194,7 @@ impl PackageLibrary {
             packages: RwLock::new(HashMap::new()),
             combined_exports: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
-            base_exports: HashSet::new(),
+            base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
         }
     }
@@ -209,7 +213,7 @@ impl PackageLibrary {
             packages: RwLock::new(HashMap::new()),
             combined_exports: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
-            base_exports: HashSet::new(),
+            base_exports: Arc::new(HashSet::new()),
             r_subprocess,
         }
     }
@@ -225,7 +229,7 @@ impl PackageLibrary {
     }
 
     /// Get the base exports
-    pub fn base_exports(&self) -> &HashSet<String> {
+    pub fn base_exports(&self) -> &Arc<HashSet<String>> {
         &self.base_exports
     }
 
@@ -780,7 +784,7 @@ impl PackageLibrary {
     /// This is used during initialization to set the combined exports
     /// from all base packages.
     pub fn set_base_exports(&mut self, exports: HashSet<String>) {
-        self.base_exports = exports;
+        self.base_exports = Arc::new(exports);
     }
 
     /// Parse a package's NAMESPACE and DESCRIPTION files statically.
@@ -1023,7 +1027,7 @@ impl PackageLibrary {
             all_base_exports.len()
         );
 
-        self.base_exports = all_base_exports;
+        self.base_exports = Arc::new(all_base_exports);
         Ok(())
     }
 

@@ -992,15 +992,19 @@ impl LanguageServer for Backend {
                             );
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
-                            // and snapshot trigger versions while we hold the lock
-                            let items: Vec<(Url, Option<i32>, Option<u64>)> = state
-                                .documents
-                                .keys()
+                            // and snapshot trigger versions while we hold the lock.
+                            // Bulk-mark first to avoid per-URI lock churn on large
+                            // workspaces.
+                            let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
+                            state
+                                .diagnostics_gate
+                                .mark_force_republish_many(open_keys.iter());
+                            let items: Vec<(Url, Option<i32>, Option<u64>)> = open_keys
+                                .into_iter()
                                 .map(|uri| {
-                                    state.diagnostics_gate.mark_force_republish(uri);
-                                    let v = state.documents.get(uri).and_then(|d| d.version);
-                                    let r = state.documents.get(uri).map(|d| d.revision);
-                                    (uri.clone(), v, r)
+                                    let v = state.documents.get(&uri).and_then(|d| d.version);
+                                    let r = state.documents.get(&uri).map(|d| d.revision);
+                                    (uri, v, r)
                                 })
                                 .collect();
                             let debounce = state.cross_file_config.revalidation_debounce_ms;
@@ -1226,9 +1230,9 @@ impl LanguageServer for Backend {
                 // Force-republish diagnostics for all open documents.
                 {
                     let state = self.state.read().await;
-                    for uri in &open_uris {
-                        state.diagnostics_gate.mark_force_republish(uri);
-                    }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(open_uris.iter());
                 }
                 // Route through the same debounced pipeline the watcher consumer
                 // uses, so refresh runs in parallel (not serial) and cooperates
@@ -1452,7 +1456,7 @@ impl LanguageServer for Backend {
             let wd_affected =
                 crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                     &uri,
-                    old_meta.as_ref(),
+                    old_meta.as_deref(),
                     &meta,
                     &state.cross_file_graph,
                     &state.cross_file_meta,
@@ -1499,16 +1503,18 @@ impl LanguageServer for Backend {
             // Invalidate dependents if interface changed OR dependency edges changed.
             // Interface changes affect symbol resolution in dependent files.
             // Edge changes affect cycle detection diagnostics in dependent files.
+            // Filter open dependents/children once, then bulk-mark them under a
+            // single write-lock acquisition.
+            let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || result.edges_changed {
                 let dependents = state.cross_file_graph.get_transitive_dependents(
                     &uri,
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
-                        state.diagnostics_gate.mark_force_republish(&dep);
+                        to_force_republish.push(dep.clone());
                         affected.insert(dep);
                     }
                 }
@@ -1516,10 +1522,13 @@ impl LanguageServer for Backend {
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
-                    state.diagnostics_gate.mark_force_republish(&child);
+                    to_force_republish.push(child.clone());
                     affected.insert(child);
                 }
             }
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(to_force_republish.iter());
 
             // Convert to Vec for sorting
             let mut affected: Vec<Url> = affected.into_iter().collect();
@@ -1556,6 +1565,10 @@ impl LanguageServer for Backend {
                     (affected_uri, trigger_version, trigger_revision)
                 })
                 .collect();
+
+            // Refresh the document_store pin set: the open set just changed
+            // and the dependency graph may have new edges from the new file.
+            state.recompute_open_neighborhood_pins();
 
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (
@@ -1753,14 +1766,21 @@ impl LanguageServer for Backend {
                         max_chain_depth,
                         max_visited,
                     );
+                    let mut to_force_republish: Vec<Url> = Vec::new();
                     for dep in dependents {
                         if state.documents.contains_key(&dep) {
-                            state.diagnostics_gate.mark_force_republish(&dep);
+                            to_force_republish.push(dep.clone());
                             let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
                             let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                             work_items.push((dep, trigger_version, trigger_revision));
                         }
                     }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(to_force_republish.iter());
+                    // Re-enrichment moved edges; refresh pins so the open-doc
+                    // neighborhood matches the post-update graph.
+                    state.recompute_open_neighborhood_pins();
                 }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
@@ -1858,14 +1878,21 @@ impl LanguageServer for Backend {
                     max_chain_depth,
                     max_visited,
                 );
+                let mut to_force_republish: Vec<Url> = Vec::new();
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
-                        state.diagnostics_gate.mark_force_republish(&dep);
+                        to_force_republish.push(dep.clone());
                         let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
                         let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                         work_items.push((dep, trigger_version, trigger_revision));
                     }
                 }
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(to_force_republish.iter());
+                // Re-enrichment moved edges; refresh pins so the open-doc
+                // neighborhood matches the post-update graph.
+                state.recompute_open_neighborhood_pins();
             }
         }
 
@@ -2103,7 +2130,7 @@ impl LanguageServer for Backend {
                     let wd_children =
                         crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                             &uri,
-                            old_meta.as_ref(),
+                            old_meta.as_deref(),
                             &meta,
                             &state.cross_file_graph,
                             &state.cross_file_meta,
@@ -2158,18 +2185,18 @@ impl LanguageServer for Backend {
             // Interface changes affect symbol resolution in dependent files.
             // Edge changes affect cycle detection diagnostics in dependent files
             // (e.g., commenting out a source() call breaks a cycle).
+            // Bulk-mark all dependents/children under a single write-lock to
+            // skip per-URI lock churn on large fan-outs (Requirement 0.8).
+            let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || edges_changed {
                 let dependents = state.cross_file_graph.get_transitive_dependents(
                     &uri,
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
-                        // Mark dependent files for force republish (Requirement 0.8)
-                        // This allows same-version republish when dependency changes
-                        state.diagnostics_gate.mark_force_republish(&dep);
+                        to_force_republish.push(dep.clone());
                         affected.insert(dep);
                     }
                 }
@@ -2177,10 +2204,13 @@ impl LanguageServer for Backend {
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
-                    state.diagnostics_gate.mark_force_republish(&child);
+                    to_force_republish.push(child.clone());
                     affected.insert(child);
                 }
             }
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(to_force_republish.iter());
 
             // Convert to Vec for sorting
             let mut affected: Vec<Url> = affected.into_iter().collect();
@@ -2217,6 +2247,13 @@ impl LanguageServer for Backend {
                     (affected_uri, trigger_version, trigger_revision)
                 })
                 .collect();
+
+            // Refresh pins when graph edges shift: a removed `source()` may
+            // pull a closed file out of the open neighborhood (let it become
+            // LRU-evictable), and a newly added one may pull one in.
+            if edges_changed {
+                state.recompute_open_neighborhood_pins();
+            }
 
             let edited_file_debounce_ms = state.cross_file_config.edited_file_debounce_ms;
             let dependent_debounce_ms = state.cross_file_config.revalidation_debounce_ms;
@@ -2367,6 +2404,10 @@ impl LanguageServer for Backend {
 
         // Close the document (legacy)
         state.close_document(uri);
+
+        // Refresh the pin set now that the open set has shrunk; URIs reachable
+        // only from the closed file are no longer protected from eviction.
+        state.recompute_open_neighborhood_pins();
     }
 
     /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
@@ -2524,12 +2565,13 @@ impl LanguageServer for Backend {
                 old_trigger_on_open_paren != new_trigger_on_open_paren;
 
             // Mark all open documents for force republish (unless only the
-            // watcher-lifecycle settings changed).
+            // watcher-lifecycle settings changed). Bulk-mark to avoid per-URI
+            // lock churn on workspaces with many open files.
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
             if !only_watch_changed {
-                for uri in &open_uris {
-                    state.diagnostics_gate.mark_force_republish(uri);
-                }
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(open_uris.iter());
             }
 
             (
@@ -2699,7 +2741,14 @@ impl LanguageServer for Backend {
         let (uris_to_update, affected_open_docs): (Vec<Url>, Vec<Url>) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
-            let mut affected = Vec::new();
+            let mut affected: Vec<Url> = Vec::new();
+            // O(1) dedupe set companion for `affected` — large bursts of
+            // watched-file changes can otherwise spend the lock-hold time
+            // doing Vec::contains scans per dependent.
+            let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+            // Collect every URI we will force-republish so we can bulk-mark
+            // them at the end of the lock under one write-lock acquisition.
+            let mut newly_affected: Vec<Url> = Vec::new();
 
             for change in &params.changes {
                 let uri = &change.uri;
@@ -2729,8 +2778,8 @@ impl LanguageServer for Backend {
                             state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
-                            if state.documents.contains_key(&dep) && !affected.contains(&dep) {
-                                state.diagnostics_gate.mark_force_republish(&dep);
+                            if state.documents.contains_key(&dep) && affected_set.insert(dep.clone()) {
+                                newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
                         }
@@ -2744,8 +2793,8 @@ impl LanguageServer for Backend {
                             state.cross_file_config.max_transitive_dependents_visited,
                         );
                         for dep in dependents {
-                            if state.documents.contains_key(&dep) && !affected.contains(&dep) {
-                                state.diagnostics_gate.mark_force_republish(&dep);
+                            if state.documents.contains_key(&dep) && affected_set.insert(dep.clone()) {
+                                newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
                         }
@@ -2763,16 +2812,33 @@ impl LanguageServer for Backend {
                     _ => {}
                 }
             }
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(newly_affected.iter());
+            // Watched-file deletions can drop edges that put a closed neighbor
+            // outside the open-document neighborhood; refresh the pin set so
+            // newly unreachable URIs become LRU-evictable again.
+            state.recompute_open_neighborhood_pins();
             (to_update, affected)
         };
 
-        // Schedule async disk reads to update workspace index for changed files
+        // Schedule async disk reads to update workspace index for changed files.
+        // CREATED/CHANGED graph mutations happen inside the spawned task, so
+        // diagnostic publishes for `affected_open_docs` must be deferred to
+        // run *after* the graph is up to date — otherwise the debounced
+        // diagnostic pass can race the async update and emit results from
+        // the pre-update graph (Codex review #2).
         if !uris_to_update.is_empty() {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let affected_for_async = affected_open_docs.clone();
             tokio::spawn(async move {
-                // Collect children affected by WD changes for diagnostics
+                // Collect children affected by WD changes for diagnostics.
+                // The set tracks dedupe in O(1) so a watched-files burst
+                // doesn't spend O(n) Vec::contains scans per child.
                 let mut wd_affected_children: Vec<Url> = Vec::new();
+                let mut wd_affected_children_set: std::collections::HashSet<Url> =
+                    std::collections::HashSet::new();
 
                 for uri in uris_to_update {
                     // Read file content asynchronously
@@ -2848,7 +2914,7 @@ impl LanguageServer for Backend {
                     }
 
                     // Update dependency graph
-                    {
+                    let edges_mutated = {
                         let mut state = state_arc.write().await;
                         let uri_clone = uri.clone();
                         let workspace_root = state.workspace_folders.first().cloned();
@@ -2879,7 +2945,7 @@ impl LanguageServer for Backend {
                                 })
                                 .collect();
 
-                        state.cross_file_graph.update_file(
+                        let graph_result = state.cross_file_graph.update_file(
                             &uri,
                             &cross_file_meta,
                             workspace_root.as_ref(),
@@ -2889,20 +2955,36 @@ impl LanguageServer for Backend {
                         // Invalidate children affected by working directory change (Requirement 8)
                         let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                             &uri,
-                            old_meta.as_ref(),
+                            old_meta.as_deref(),
                             &cross_file_meta,
                             &state.cross_file_graph,
                             &state.cross_file_meta,
                         );
-                        // Collect open children for diagnostics
+                        // Collect open children for diagnostics; bulk-mark
+                        // them so the watched-files burst doesn't acquire the
+                        // gate's write lock once per affected child.
+                        let mut newly_affected: Vec<Url> = Vec::new();
                         for child in wd_children {
                             if state.documents.contains_key(&child)
-                                && !wd_affected_children.contains(&child)
+                                && wd_affected_children_set.insert(child.clone())
                             {
-                                state.diagnostics_gate.mark_force_republish(&child);
+                                newly_affected.push(child.clone());
                                 wd_affected_children.push(child);
                             }
                         }
+                        state
+                            .diagnostics_gate
+                            .mark_force_republish_many(newly_affected.iter());
+                        graph_result.edges_changed
+                    };
+
+                    // The sync watched-files pass refreshed pins for DELETED
+                    // files only. CREATED/CHANGED files have their edges
+                    // mutated here in the async pass, so refresh again now
+                    // that the graph reflects the disk update.
+                    if edges_mutated {
+                        let mut state = state_arc.write().await;
+                        state.recompute_open_neighborhood_pins();
                     }
 
                     log::trace!("Updated workspace index for: {}", uri);
@@ -2988,12 +3070,28 @@ impl LanguageServer for Backend {
                             .await;
                     }
                 }
-            });
-        }
 
-        // Schedule diagnostics for affected open documents (Requirement 13.4)
-        for uri in affected_open_docs {
-            self.publish_diagnostics(&uri).await;
+                // Now that the graph reflects every CREATED/CHANGED file in
+                // this batch, schedule diagnostics for the dependent open
+                // documents collected synchronously. Running this here (not
+                // before the spawn) guarantees the debounced diagnostic pass
+                // builds its snapshot from the post-update graph.
+                for uri in affected_for_async {
+                    Backend::publish_diagnostics_via_arc(
+                        state_arc.clone(),
+                        client.clone(),
+                        &uri,
+                    )
+                    .await;
+                }
+            });
+        } else {
+            // DELETED-only path: the sync block already mutated the graph
+            // (`remove_file` + `recompute_open_neighborhood_pins`), so
+            // publishing synchronously sees the post-update state.
+            for uri in affected_open_docs {
+                self.publish_diagnostics(&uri).await;
+            }
         }
     }
 
@@ -3402,7 +3500,7 @@ impl Backend {
     async fn index_file_on_demand(
         &self,
         file_uri: &Url,
-    ) -> Option<crate::cross_file::CrossFileMetadata> {
+    ) -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         log::trace!("On-demand indexing: {}", file_uri);
 
         // Read file content
@@ -3500,6 +3598,7 @@ impl Backend {
             Vec::new()
         };
 
+        let cross_file_meta = std::sync::Arc::new(cross_file_meta);
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str(&content),
             tree,
@@ -3522,7 +3621,7 @@ impl Backend {
                 file_uri,
                 &open_docs,
                 snapshot,
-                cross_file_meta.clone(),
+                (*cross_file_meta).clone(),
                 artifacts.clone(),
             );
             state.cross_file_graph.update_file(
@@ -3531,6 +3630,11 @@ impl Backend {
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
+            // The graph just got new edges for `file_uri`; refresh pins so
+            // callers reached via index_backward_chain / index_forward_chain
+            // (which don't run their own pin recompute) see the updated
+            // open-doc neighborhood.
+            state.recompute_open_neighborhood_pins();
         }
 
         if !packages_to_prefetch.is_empty() {
@@ -3699,7 +3803,7 @@ impl Backend {
                                 && (!state.cross_file_workspace_index.contains(&child_uri)
                                     || state
                                         .get_enriched_metadata(&child_uri)
-                                        .and_then(|m| m.inherited_working_directory)
+                                        .and_then(|m| m.inherited_working_directory.clone())
                                         .is_none())
                         };
                         if should_index {
@@ -3718,7 +3822,7 @@ impl Backend {
         &self,
         file_uri: &Url,
         inherited_wd: &std::path::Path,
-    ) -> Option<crate::cross_file::CrossFileMetadata> {
+    ) -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         log::trace!(
             "On-demand indexing (inherited wd={}): {}",
             inherited_wd.display(),
@@ -3816,6 +3920,7 @@ impl Backend {
             Vec::new()
         };
 
+        let cross_file_meta = std::sync::Arc::new(cross_file_meta);
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str(&content),
             tree,
@@ -3838,7 +3943,7 @@ impl Backend {
                 file_uri,
                 &open_docs,
                 snapshot,
-                cross_file_meta.clone(),
+                (*cross_file_meta).clone(),
                 artifacts.clone(),
             );
             state.cross_file_graph.update_file(
@@ -3847,6 +3952,10 @@ impl Backend {
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
+            // Same rationale as `index_file_on_demand`: refresh pins after
+            // graph mutation so callers without their own recompute see the
+            // post-update open-doc neighborhood.
+            state.recompute_open_neighborhood_pins();
         }
 
         if !packages_to_prefetch.is_empty() {
@@ -4252,7 +4361,7 @@ pub(crate) struct ScopeProbeSnapshot {
     pub(crate) artifacts_map:
         std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
     pub(crate) metadata_map:
-        std::collections::HashMap<Url, crate::cross_file::CrossFileMetadata>,
+        std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     /// Per-document `loaded_packages` from the document store (includes
     /// function-local `library()` calls that the EOF scope probe misses).
     pub(crate) doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
@@ -4282,9 +4391,9 @@ pub(crate) async fn prepare_dropped_recovery(
     };
     {
         let state = state_arc.read().await;
-        for uri in &open_uris {
-            state.diagnostics_gate.mark_force_republish(uri);
-        }
+        state
+            .diagnostics_gate
+            .mark_force_republish_many(open_uris.iter());
     }
     open_uris
 }
@@ -4396,7 +4505,7 @@ async fn run_libpath_consumer(
                     Arc<crate::cross_file::scope::ScopeArtifacts>,
                 > { probe.artifacts_map.get(target_uri).cloned() };
                 let get_metadata =
-                    |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+                    |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                         probe.metadata_map.get(target_uri).cloned()
                     };
                 let empty_base_exports: HashSet<String> = HashSet::new();
@@ -4445,9 +4554,9 @@ async fn run_libpath_consumer(
                 // publish at the same version.
                 {
                     let state = state_arc.read().await;
-                    for uri in &affected_uris {
-                        state.diagnostics_gate.mark_force_republish(uri);
-                    }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(affected_uris.iter());
                 }
 
                 // Schedule diagnostics for each affected open URI.
@@ -5703,7 +5812,7 @@ mod refresh_packages_tests {
                 size: 0,
                 content_hash: None,
             },
-            metadata: parent_meta,
+            metadata: Arc::new(parent_meta),
             artifacts: parent_artifacts,
             indexed_at_version: 0,
         };
@@ -6021,7 +6130,7 @@ mod refresh_packages_tests {
                 size: 0,
                 content_hash: None,
             },
-            metadata: parent_meta,
+            metadata: Arc::new(parent_meta),
             artifacts: parent_artifacts,
             indexed_at_version: 0,
         };

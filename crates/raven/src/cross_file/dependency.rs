@@ -41,7 +41,7 @@ pub fn resolve_parent_working_directory<F>(
     workspace_root: Option<&Url>,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     resolve_parent_working_directory_with_depth(
         parent_uri,
@@ -85,7 +85,7 @@ pub fn resolve_parent_working_directory_with_depth<F>(
     remaining_depth: usize,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     let mut visited = HashSet::new();
     resolve_parent_working_directory_with_visited(
@@ -138,7 +138,7 @@ pub fn resolve_parent_working_directory_with_visited<F>(
     visited: &mut HashSet<Url>,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     // Check for cycle: if we've already visited this URI, stop and use file's directory
     // (Requirement 9.3)
@@ -259,7 +259,7 @@ pub fn compute_inherited_working_directory<F>(
     get_metadata: F,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     compute_inherited_working_directory_with_depth(
         uri,
@@ -311,7 +311,7 @@ pub fn compute_inherited_working_directory_with_depth<F>(
     max_depth: usize,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     let mut visited = HashSet::new();
     compute_inherited_working_directory_with_visited(
@@ -373,7 +373,7 @@ pub fn compute_inherited_working_directory_with_visited<F>(
     visited: &mut HashSet<Url>,
 ) -> Option<String>
 where
-    F: Fn(&Url) -> Option<CrossFileMetadata>,
+    F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
     // Check for cycle: if we've already visited this URI, stop inheritance
     // (Requirement 9.3)
@@ -617,13 +617,103 @@ pub struct UpdateResult {
     pub edges_changed: bool,
 }
 
+/// Cached `(neighborhood, subgraph)` payload for a `(root, depth, visited)`
+/// query. Wrapped in `Arc` so cache reads are refcount bumps; the inner
+/// `subgraph` is also held as `Arc` so consumers (e.g. `DiagnosticsSnapshot`)
+/// can keep a refcount-bumped reference instead of cloning the trimmed
+/// graph per snapshot.
+pub struct NeighborhoodSubgraph {
+    pub neighborhood: HashSet<Url>,
+    pub subgraph: std::sync::Arc<DependencyGraph>,
+}
+
+/// Cap for the per-`DependencyGraph` cycle/subgraph caches. Sized to match
+/// the document_store default (4096) so workspaces large enough to fill
+/// `DocumentStore` get the same coverage; in long-lived sessions LRU
+/// eviction prevents unbounded growth as files come and go.
+const CYCLE_CACHE_CAPACITY: usize = 4096;
+const SUBGRAPH_CACHE_CAPACITY: usize = 4096;
+
 /// Dependency graph tracking source relationships between files
-#[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,
     /// Reverse lookup: child URI -> edges from parents
     backward: HashMap<Url, Vec<DependencyEdge>>,
+    /// Monotonic counter bumped whenever `update_file` reports
+    /// `edges_changed`. Cached `detect_cycle` results are keyed on this so
+    /// they are invalidated as soon as forward edges change.
+    edge_revision: std::sync::atomic::AtomicU64,
+    /// Cache of `detect_cycle` results keyed by `uri` (and gated by
+    /// `edge_revision` per slot). Bounded LRU so long-lived sessions
+    /// don't accumulate entries for files that never get queried again.
+    cycle_cache:
+        std::sync::RwLock<lru::LruCache<Url, (u64, Option<CycleDetection>)>>,
+    /// Counter of cache hits — exposed for tests; not used in production.
+    cycle_cache_hits: std::sync::atomic::AtomicU64,
+    /// Cache of `(neighborhood, extract_subgraph)` results keyed by
+    /// `(root_uri, max_depth, max_visited)`. Stored as `Arc` so cache reads
+    /// in the snapshot path do refcount bumps rather than re-walking the
+    /// graph and cloning edges. Bounded LRU for the same reason as
+    /// `cycle_cache`.
+    subgraph_cache: std::sync::RwLock<
+        lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
+    >,
+    /// Counter of subgraph cache hits — exposed for tests.
+    subgraph_cache_hits: std::sync::atomic::AtomicU64,
+}
+
+impl Default for DependencyGraph {
+    fn default() -> Self {
+        Self {
+            forward: HashMap::new(),
+            backward: HashMap::new(),
+            edge_revision: std::sync::atomic::AtomicU64::new(0),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
+            )),
+            cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
+            )),
+            subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Clone for DependencyGraph {
+    fn clone(&self) -> Self {
+        // Caches are intentionally NOT cloned: clones (e.g. via
+        // `extract_subgraph`) typically have different edges, so any cached
+        // results from the parent graph are not portable. The new graph
+        // starts at edge revision 0 with empty caches.
+        Self {
+            forward: self.forward.clone(),
+            backward: self.backward.clone(),
+            edge_revision: std::sync::atomic::AtomicU64::new(0),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
+            )),
+            cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
+            )),
+            subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for DependencyGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DependencyGraph")
+            .field("forward", &self.forward)
+            .field("backward", &self.backward)
+            .field(
+                "edge_revision",
+                &self.edge_revision.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl DependencyGraph {
@@ -701,11 +791,33 @@ impl DependencyGraph {
             path_to_uri(&resolved)
         };
 
-        // Snapshot forward edge targets before removal for change detection
-        let old_targets: HashSet<Url> = self
+        // Snapshot forward edges (full DependencyEdge, not just .to URIs).
+        // The cached subgraph in `subgraph_cache` holds full edge values
+        // (call_site_line/column, flags, …) which diagnostics use for cycle
+        // and source positioning, so a metadata-only change (e.g. moving
+        // the source() call to a different line) must invalidate the cache
+        // even when the target URI set is unchanged. `edges_changed` and
+        // `edge_revision` then both track full-edge equality.
+        let old_forward: HashSet<DependencyEdge> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .map(|edges| edges.iter().cloned().collect())
+            .unwrap_or_default();
+        // Snapshot backward edges (incoming `is_backward_directive` edges)
+        // before removal: a `@lsp-sourced-by` directive change rewires the
+        // backward map for `uri` and the forward map for each parent, but
+        // leaves `forward[uri]` (this file's outgoing edges) untouched.
+        // Same full-edge equality applies here.
+        let old_backward: HashSet<DependencyEdge> = self
+            .backward
+            .get(uri)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Remove existing edges where this file is the parent
@@ -936,13 +1048,39 @@ impl DependencyGraph {
             }
         }
 
-        // Detect whether forward edges changed (for revalidation of dependents)
-        let new_targets: HashSet<Url> = self
+        // Detect whether forward OR backward edges changed for this file.
+        // Backward changes (added/removed `@lsp-sourced-by`) don't touch
+        // `forward[uri]`, but they DO change the dependency graph that
+        // `collect_neighborhood` and `detect_cycle` traverse — so the caches
+        // keyed on `edge_revision` must be invalidated for those too. We
+        // compare full DependencyEdge values (not just URIs), so a
+        // metadata-only change (e.g. moved call site) also bumps the
+        // revision and refreshes diagnostic positioning.
+        let new_forward: HashSet<DependencyEdge> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .map(|edges| edges.iter().cloned().collect())
             .unwrap_or_default();
-        result.edges_changed = old_targets != new_targets;
+        let new_backward: HashSet<DependencyEdge> = self
+            .backward
+            .get(uri)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        result.edges_changed = old_forward != new_forward || old_backward != new_backward;
+
+        // Bump edge_revision so cycle/subgraph caches become stale for every
+        // URI. detect_cycle and cached_neighborhood_subgraph then either
+        // re-fill their slot or evict via the revision-mismatch check.
+        if result.edges_changed {
+            self.edge_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
 
         // Log total edge count after update
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
@@ -992,7 +1130,21 @@ impl DependencyGraph {
             }
         }
 
-        Self { forward, backward }
+        // Subgraphs start with fresh caches; their edges are pruned, so
+        // any cached results from the parent graph would be wrong.
+        Self {
+            forward,
+            backward,
+            edge_revision: std::sync::atomic::AtomicU64::new(0),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
+            )),
+            cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
+                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
+            )),
+            subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Remove edges where the given URI is the child that were created from backward directives
@@ -1050,12 +1202,20 @@ impl DependencyGraph {
         }
     }
 
-    /// Remove all edges involving a file
+    /// Remove all edges involving a file. Bumps `edge_revision` so any
+    /// `cycle_cache` / `subgraph_cache` entries that referenced the deleted
+    /// file's edges are invalidated on the next lookup.
     pub fn remove_file(&mut self, uri: &Url) {
+        let had_forward = self.forward.contains_key(uri);
+        let had_backward = self.backward.contains_key(uri);
         // Remove edges where this file is the parent
         self.remove_forward_edges(uri);
         // Remove edges where this file is the child
         self.remove_backward_edges(uri);
+        if had_forward || had_backward {
+            self.edge_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Get edges where uri is the parent (caller)
@@ -1347,9 +1507,86 @@ impl DependencyGraph {
     }
 
     pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
+        use std::sync::atomic::Ordering;
+        let revision = self.edge_revision.load(Ordering::Acquire);
+
+        // Fast path: cache hit at the current edge revision. `peek` to keep
+        // the read lock concurrent (no LRU promotion under shared access).
+        if let Ok(guard) = self.cycle_cache.read() {
+            if let Some((cached_rev, cached_result)) = guard.peek(uri) {
+                if *cached_rev == revision {
+                    self.cycle_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return cached_result.clone();
+                }
+            }
+        }
+
         let mut visited = HashSet::new();
         let mut path = Vec::new();
-        self.detect_cycle_recursive(uri, uri, &mut visited, &mut path)
+        let computed = self.detect_cycle_recursive(uri, uri, &mut visited, &mut path);
+
+        if let Ok(mut guard) = self.cycle_cache.write() {
+            // `push` promotes/evicts under exclusive access.
+            guard.push(uri.clone(), (revision, computed.clone()));
+        }
+        computed
+    }
+
+    /// Number of `detect_cycle` calls served from the cache.
+    /// Exposed for tests; not used in production code.
+    pub fn cycle_cache_hits(&self) -> u64 {
+        self.cycle_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return the `(neighborhood, subgraph)` pair for `uri`, sharing the
+    /// computation across callers via a graph-edge-revisioned cache.
+    ///
+    /// Diagnostic snapshots fan out to many dependents; each dependent's
+    /// snapshot computes the neighborhood and trims the graph the same way.
+    /// Caching that result by `(uri, max_depth, max_visited, edge_revision)`
+    /// turns repeat calls (within a stable graph) into refcount bumps.
+    pub fn cached_neighborhood_subgraph(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> std::sync::Arc<NeighborhoodSubgraph> {
+        use std::sync::atomic::Ordering;
+        let revision = self.edge_revision.load(Ordering::Acquire);
+
+        if let Ok(guard) = self.subgraph_cache.read() {
+            if let Some((cached_rev, cached)) =
+                guard.peek(&(uri.clone(), max_depth, max_visited))
+            {
+                if *cached_rev == revision {
+                    self.subgraph_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return std::sync::Arc::clone(cached);
+                }
+            }
+        }
+
+        let neighborhood = self.collect_neighborhood(uri, max_depth, max_visited);
+        let subgraph = std::sync::Arc::new(self.extract_subgraph(&neighborhood));
+        let payload = std::sync::Arc::new(NeighborhoodSubgraph {
+            neighborhood,
+            subgraph,
+        });
+
+        if let Ok(mut guard) = self.subgraph_cache.write() {
+            guard.push(
+                (uri.clone(), max_depth, max_visited),
+                (revision, std::sync::Arc::clone(&payload)),
+            );
+        }
+        payload
+    }
+
+    /// Number of `cached_neighborhood_subgraph` calls served from the cache.
+    /// Exposed for tests; not used in production code.
+    pub fn subgraph_cache_hits(&self) -> u64 {
+        self.subgraph_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Dump the current state of the dependency graph for debugging.
@@ -1451,6 +1688,7 @@ mod tests {
     use super::super::types::BackwardDirective;
     use super::*;
     use std::fs::File;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn url(s: &str) -> Url {
@@ -1699,6 +1937,220 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_subgraph_cache_invalidates_on_call_site_change() {
+        // Codex follow-up: metadata-only edge changes (e.g. moving a
+        // `source()` call to a different line) leave the .to URI set
+        // unchanged but mutate `call_site_line` on the edge. The cached
+        // subgraph holds full DependencyEdge values that diagnostics
+        // consume for positioning, so this must invalidate the caches.
+        let mut graph = DependencyGraph::new();
+        let parent = url("parent.R");
+        let child = url("child.R");
+
+        let meta_v1 = make_meta_with_source("child.R", 5);
+        graph.update_file(&parent, &meta_v1, Some(&workspace_root()), |_| None);
+        graph.update_file(&child, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        let hits_before = graph.subgraph_cache_hits();
+
+        // Same target URI (child.R), different call_site line — must bump.
+        let meta_v2 = make_meta_with_source("child.R", 12);
+        let result = graph.update_file(&parent, &meta_v2, Some(&workspace_root()), |_| None);
+        assert!(
+            result.edges_changed,
+            "moving source() call to a new line must mark edges_changed"
+        );
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_before,
+            "call-site change must invalidate the subgraph cache"
+        );
+    }
+
+    #[test]
+    fn test_subgraph_cache_invalidates_on_backward_edge_change() {
+        // S1 + S4: changing a `@lsp-sourced-by` directive must bump
+        // `edge_revision` so cycle/subgraph caches don't hand out stale
+        // results that omit the new backward edge.
+        let mut graph = DependencyGraph::new();
+        let parent = Url::parse("file:///project/parent.R").unwrap();
+        let child = Url::parse("file:///project/child.R").unwrap();
+
+        // Establish baseline (no backward directive).
+        graph.update_file(&parent, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+        graph.update_file(&child, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        let _ = graph.detect_cycle(&parent);
+        let hits_before = graph.subgraph_cache_hits();
+
+        // Add a backward directive on child: child is sourced by parent.
+        // This rewires backward[child] and forward[parent], but leaves
+        // forward[child] unchanged. Without the fix the caches stay valid.
+        let child_meta_with_backward = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Line(1),
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        let result =
+            graph.update_file(&child, &child_meta_with_backward, Some(&workspace_root()), |_| None);
+        assert!(
+            result.edges_changed,
+            "adding @lsp-sourced-by must mark edges_changed"
+        );
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        // Cache must have missed (revision bumped) → hits unchanged.
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_before,
+            "backward-edge change must invalidate subgraph cache"
+        );
+    }
+
+    #[test]
+    fn test_remove_file_invalidates_caches() {
+        // Codex review: remove_file mutates the graph but previously did not
+        // bump edge_revision, leaving cycle_cache / subgraph_cache stale.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        graph.update_file(&b, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+
+        let _ = graph.cached_neighborhood_subgraph(&a, 10, 100);
+        let _ = graph.detect_cycle(&a);
+        let subgraph_hits_before = graph.subgraph_cache_hits();
+        let cycle_hits_before = graph.cycle_cache_hits();
+
+        graph.remove_file(&b);
+
+        let _ = graph.cached_neighborhood_subgraph(&a, 10, 100);
+        let _ = graph.detect_cycle(&a);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            subgraph_hits_before,
+            "remove_file must invalidate subgraph cache"
+        );
+        assert_eq!(
+            graph.cycle_cache_hits(),
+            cycle_hits_before,
+            "remove_file must invalidate cycle cache"
+        );
+    }
+
+    #[test]
+    fn test_neighborhood_subgraph_subgraph_is_arc_wrapped() {
+        // S2: the cached subgraph must be exposed as an Arc so the
+        // diagnostic snapshot can hold a refcount-bumped reference instead
+        // of cloning the trimmed DependencyGraph per snapshot.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+
+        let payload = graph.cached_neighborhood_subgraph(&a, 10, 100);
+        let arc1: Arc<DependencyGraph> = payload.subgraph.clone();
+        let arc2 = arc1.clone();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "Arc subgraph clones must share storage"
+        );
+    }
+
+    #[test]
+    fn test_neighborhood_subgraph_caches_until_edges_change() {
+        // S1: cache (neighborhood, subgraph) by (root, depth budget,
+        // edge revision). Repeated calls with no edge change must hit
+        // cache; an edge change must invalidate.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        let meta_b = CrossFileMetadata::default();
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        let max_depth = 10;
+        let max_visited = 100;
+
+        let result1 = graph.cached_neighborhood_subgraph(&a, max_depth, max_visited);
+        let hits_after_first = graph.subgraph_cache_hits();
+
+        let result2 = graph.cached_neighborhood_subgraph(&a, max_depth, max_visited);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_after_first + 1,
+            "second call at same edge revision must hit cache"
+        );
+        assert!(
+            Arc::ptr_eq(&result1, &result2),
+            "cache must return the same Arc allocation"
+        );
+
+        let meta_a_no_source = CrossFileMetadata::default();
+        let result = graph.update_file(&a, &meta_a_no_source, Some(&workspace_root()), |_| None);
+        assert!(result.edges_changed);
+
+        let hits_before_third = graph.subgraph_cache_hits();
+        let _ = graph.cached_neighborhood_subgraph(&a, max_depth, max_visited);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_before_third,
+            "edges_changed must invalidate the subgraph cache and force recompute"
+        );
+    }
+
+    #[test]
+    fn test_detect_cycle_caches_until_edges_change() {
+        // S4: detect_cycle results must be cached and keyed by graph edge
+        // revision. Repeated calls with no edge change should hit cache;
+        // an edge mutation should invalidate.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        let meta_b = make_meta_with_source("a.R", 2);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        // First call computes (cache miss).
+        let _ = graph.detect_cycle(&a);
+        let hits_after_first = graph.cycle_cache_hits();
+
+        // Second call with no edge change: cache hit.
+        let _ = graph.detect_cycle(&a);
+        assert_eq!(
+            graph.cycle_cache_hits(),
+            hits_after_first + 1,
+            "second detect_cycle for same URI at same edge revision must hit cache"
+        );
+
+        // Mutate edges → cache invalidated for this URI.
+        let meta_a_no_source = CrossFileMetadata::default();
+        let result = graph.update_file(&a, &meta_a_no_source, Some(&workspace_root()), |_| None);
+        assert!(result.edges_changed, "removing source() must mark edges_changed");
+
+        let hits_before_third = graph.cycle_cache_hits();
+        // Third call: edge revision bumped, cache invalidated → recomputes.
+        let _ = graph.detect_cycle(&a);
+        assert_eq!(
+            graph.cycle_cache_hits(),
+            hits_before_third,
+            "edges_changed must invalidate cycle cache and force a recompute"
+        );
     }
 
     #[test]
@@ -2289,7 +2741,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2319,7 +2771,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2373,7 +2825,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2405,7 +2857,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2435,7 +2887,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2463,7 +2915,7 @@ z <- 3
             &parent_uri,
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2505,7 +2957,7 @@ z <- 3
         let result =
             compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2601,9 +3053,9 @@ z <- 3
         let result =
             compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent1_uri {
-                    Some(parent1_meta.clone())
+                    Some(std::sync::Arc::new(parent1_meta.clone()))
                 } else if uri == &parent2_uri {
-                    Some(parent2_meta.clone())
+                    Some(std::sync::Arc::new(parent2_meta.clone()))
                 } else {
                     None
                 }
@@ -2641,7 +3093,7 @@ z <- 3
         let result =
             compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2748,7 +3200,7 @@ z <- 3
             Some(&workspace),
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2807,9 +3259,9 @@ z <- 3
         let result =
             compute_inherited_working_directory(&c_uri, &c_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else {
                     None
                 }
@@ -2857,7 +3309,7 @@ z <- 3
             Some(&workspace),
             |uri| {
                 if uri == &parent_uri {
-                    Some(parent_meta.clone())
+                    Some(std::sync::Arc::new(parent_meta.clone()))
                 } else {
                     None
                 }
@@ -2936,9 +3388,9 @@ z <- 3
         let result =
             compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else {
                     None
                 }
@@ -2974,7 +3426,7 @@ z <- 3
         let result =
             compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else {
                     None
                 }
@@ -3033,11 +3485,11 @@ z <- 3
         let result =
             compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
-                    Some(b_meta.clone())
+                    Some(std::sync::Arc::new(b_meta.clone()))
                 } else if uri == &c_uri {
-                    Some(c_meta.clone())
+                    Some(std::sync::Arc::new(c_meta.clone()))
                 } else {
                     None
                 }
@@ -3067,7 +3519,7 @@ z <- 3
             &a_uri,
             &|uri| {
                 if uri == &a_uri {
-                    Some(a_meta.clone())
+                    Some(std::sync::Arc::new(a_meta.clone()))
                 } else {
                     None
                 }

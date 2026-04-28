@@ -755,7 +755,7 @@ fn get_scope(
         content_provider.get_artifacts(target_uri)
     };
 
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         content_provider.get_metadata(target_uri)
     };
 
@@ -764,7 +764,7 @@ fn get_scope(
     let base_exports = if state.package_library_ready {
         state.package_library.base_exports().clone()
     } else {
-        HashSet::new()
+        crate::handlers::empty_base_exports().clone()
     };
 
     scope::scope_at_position_with_graph(

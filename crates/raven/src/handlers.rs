@@ -54,6 +54,15 @@ impl DiagCancelToken {
 // Diagnostics Snapshot
 // ============================================================================
 
+/// Process-wide cached empty `Arc<HashSet<String>>`. Reused whenever a
+/// snapshot or fallback path needs an "empty base_exports" stand-in so we
+/// don't allocate a fresh Arc per snapshot when the package library isn't
+/// ready (e.g. cold start or `WorldState::new` without an R subprocess).
+pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
+    static EMPTY: OnceLock<Arc<HashSet<String>>> = OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(HashSet::new()))
+}
+
 /// A snapshot of all state needed for diagnostic computation.
 ///
 /// Built under the read lock, then used to compute diagnostics
@@ -65,16 +74,19 @@ pub(crate) struct DiagnosticsSnapshot {
     // Cross-file state (pre-collected)
     pub directive_meta: crate::cross_file::CrossFileMetadata,
     pub cross_file_config: crate::cross_file::config::CrossFileConfig,
-    pub cross_file_graph: crate::cross_file::dependency::DependencyGraph,
+    /// Trimmed dependency subgraph for the queried URI's neighborhood.
+    /// Stored as `Arc` so concurrent fan-out revalidations share allocation
+    /// instead of each cloning the trimmed graph from the cache payload.
+    pub cross_file_graph: Arc<crate::cross_file::dependency::DependencyGraph>,
     pub workspace_folders: Vec<Url>,
-    pub base_exports: HashSet<String>,
+    pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
-    pub workspace_imports: Vec<(String, String)>,
+    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
-    pub metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata>,
+    pub metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
 
     // Cycle detection result (pre-computed from the full graph, not the trimmed subgraph,
     // so cycles longer than max_chain_depth are still detected)
@@ -94,51 +106,43 @@ impl DiagnosticsSnapshot {
         let doc = state.get_document(uri)?;
         let tree = doc.tree.as_ref()?.clone();
         let text = doc.text();
-        // Get enriched metadata
+        // Get enriched metadata. The snapshot owns its `directive_meta` so it
+        // can mutate `inherited_working_directory` in place; we deep-clone
+        // only this single entry, while neighbors stay Arc-wrapped.
         let mut directive_meta = state
             .get_enriched_metadata(uri)
+            .map(std::sync::Arc::unwrap_or_clone)
             .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
         let metadata_elapsed = build_start.elapsed();
 
         // Compute inherited working directory if needed
         if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
             let workspace_root = state.workspace_folders.first();
-            let content_provider = state.content_provider();
-            let get_metadata_for_uri =
-                |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-                    if let Some(doc) = state.documents.get(target_uri) {
-                        return Some(crate::cross_file::directive::parse_directives(&doc.text()));
-                    }
-                    if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
-                        return Some(meta);
-                    }
-                    if let Some(content) = content_provider.get_content(target_uri) {
-                        return Some(crate::cross_file::extract_metadata(&content));
-                    }
-                    None
-                };
             directive_meta.inherited_working_directory = compute_inherited_working_directory(
                 uri,
                 &directive_meta,
                 workspace_root,
-                get_metadata_for_uri,
+                |target_uri: &Url| state.get_or_parse_metadata(target_uri),
             );
         }
 
-        // Pre-collect artifacts and metadata for all files in the dependency neighborhood
+        // Pre-collect artifacts and metadata for all files in the dependency
+        // neighborhood. The (neighborhood, trimmed-subgraph) pair is cached by
+        // `(uri, max_depth, max_visited, edge_revision)` so concurrent fan-out
+        // revalidations share BFS + edge-cloning work.
         let neighborhood_start = std::time::Instant::now();
         let max_depth = state.cross_file_config.max_chain_depth;
         let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-        let neighborhood = state
+        let payload = state
             .cross_file_graph
-            .collect_neighborhood(uri, max_depth, max_visited);
+            .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider();
 
         let precollect_start = std::time::Instant::now();
         let mut artifacts_map = HashMap::new();
         let mut metadata_map = HashMap::new();
-        for neighbor_uri in &neighborhood {
+        for neighbor_uri in &payload.neighborhood {
             if let Some(artifacts) = content_provider.get_artifacts(neighbor_uri) {
                 artifacts_map.insert(neighbor_uri.clone(), artifacts);
             }
@@ -151,17 +155,18 @@ impl DiagnosticsSnapshot {
         let base_exports = if state.package_library_ready {
             state.package_library.base_exports().clone()
         } else {
-            HashSet::new()
+            empty_base_exports().clone()
         };
 
         // Pre-compute cycle detection from the FULL graph (not trimmed) so that
         // cycles longer than max_chain_depth are still detected.
         let cycle_detection = state.cross_file_graph.detect_cycle(uri);
 
-        // Build a trimmed graph containing only the neighborhood edges
-        // instead of cloning the entire workspace graph.
+        // Hold the trimmed subgraph as an Arc clone of the cached payload.
+        // The cache returns an `Arc<DependencyGraph>`, so this is a refcount
+        // bump rather than a deep clone of the trimmed forward/backward maps.
         let subgraph_start = std::time::Instant::now();
-        let trimmed_graph = state.cross_file_graph.extract_subgraph(&neighborhood);
+        let trimmed_graph = payload.subgraph.clone();
         let subgraph_elapsed = subgraph_start.elapsed();
 
         let total_elapsed = build_start.elapsed();
@@ -170,7 +175,7 @@ impl DiagnosticsSnapshot {
             uri.path(),
             metadata_elapsed,
             neighborhood_elapsed,
-            neighborhood.len(),
+            payload.neighborhood.len(),
             precollect_elapsed,
             artifacts_map.len(),
             metadata_map.len(),
@@ -208,7 +213,7 @@ impl DiagnosticsSnapshot {
         let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
         };
-        let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+        let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
             self.metadata_map.get(target_uri).cloned()
         };
 
@@ -2640,7 +2645,7 @@ fn get_cross_file_scope(
     };
 
     // Closure to get metadata for a URI
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         content_provider.get_metadata(target_uri)
     };
 
@@ -2652,7 +2657,7 @@ fn get_cross_file_scope(
     let base_exports = if state.package_library_ready {
         state.package_library.base_exports().clone()
     } else {
-        std::collections::HashSet::new()
+        empty_base_exports().clone()
     };
 
     let is_cancelled = || cancel.is_cancelled();
@@ -3597,6 +3602,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     // Fall back to extraction from current text+tree when metadata is unavailable.
     let mut directive_meta = state
         .get_enriched_metadata(uri)
+        .map(std::sync::Arc::unwrap_or_clone)
         .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(tree)));
 
     // Compute inherited working directory for files with backward directives
@@ -3605,32 +3611,11 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     // _Requirements: 5.1, 5.2, 6.1_
     if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
         let workspace_root = state.workspace_folders.first();
-        let content_provider = state.content_provider();
-
-        // Create a metadata getter that retrieves metadata from open documents,
-        // workspace index, or by parsing content from the file cache
-        let get_metadata_for_uri =
-            |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
-                // First check open documents
-                if let Some(doc) = state.documents.get(target_uri) {
-                    return Some(crate::cross_file::directive::parse_directives(&doc.text()));
-                }
-                // Then try workspace index
-                if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
-                    return Some(meta);
-                }
-                // Finally try to read from file cache
-                if let Some(content) = content_provider.get_content(target_uri) {
-                    return Some(crate::cross_file::extract_metadata(&content));
-                }
-                None
-            };
-
         directive_meta.inherited_working_directory = compute_inherited_working_directory(
             uri,
             &directive_meta,
             workspace_root,
-            get_metadata_for_uri,
+            |target_uri: &Url| state.get_or_parse_metadata(target_uri),
         );
 
         if directive_meta.inherited_working_directory.is_some() {
@@ -4491,9 +4476,11 @@ fn collect_max_depth_diagnostics(
         None
     };
 
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         if let Some(doc) = state.documents.get(target_uri) {
-            return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+            return Some(std::sync::Arc::new(
+                crate::cross_file::directive::parse_directives(&doc.text()),
+            ));
         }
         state.cross_file_workspace_index.get_metadata(target_uri)
     };
@@ -4773,7 +4760,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
-    let get_metadata = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         snapshot.metadata_map.get(target_uri).cloned()
     };
 
@@ -5145,7 +5132,7 @@ fn collect_undefined_variables_from_snapshot(
     // should still be flagged as undefined.
     let workspace_imports_map: HashMap<&str, Vec<&str>> = {
         let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (pkg, sym) in &snapshot.workspace_imports {
+        for (pkg, sym) in snapshot.workspace_imports.iter() {
             map.entry(sym.as_str()).or_default().push(pkg.as_str());
         }
         map
@@ -8069,6 +8056,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
 
                         let source_meta = content_provider
                             .get_metadata(source_uri)
+                            .map(std::sync::Arc::unwrap_or_clone)
                             .unwrap_or_else(|| crate::cross_file::extract_metadata(&source_text));
 
                         let Some(source_tree) = crate::parser_pool::with_parser(|parser| {
@@ -35497,7 +35485,7 @@ my_func <- function(a = default_value) {
         state.cross_file_config.packages_enabled = true;
         state.workspace_scan_complete = true;
         // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
-        state.workspace_imports = vec![("lme4".to_string(), "lmer".to_string())];
+        state.workspace_imports = std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
 
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();
         // lme4 cached with empty exports (prefetch saw R fail to load it).

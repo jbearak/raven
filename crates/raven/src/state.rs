@@ -549,7 +549,11 @@ pub struct WorldState {
     // Legacy fields (kept for migration compatibility)
     pub documents: HashMap<Url, Document>,
     pub workspace_index: HashMap<Url, Document>,
-    pub workspace_imports: Vec<(String, String)>, // (package, symbol) pairs from workspace NAMESPACE importFrom() entries
+    /// (package, symbol) pairs from workspace NAMESPACE importFrom() entries.
+    ///
+    /// Wrapped in `Arc` so `DiagnosticsSnapshot::build` does a refcount bump
+    /// rather than deep-cloning the entire vector on every snapshot build.
+    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
@@ -655,7 +659,7 @@ impl WorldState {
             // Legacy fields (kept for migration compatibility)
             documents: HashMap::new(),
             workspace_index: HashMap::new(),
-            workspace_imports: Vec::new(),
+            workspace_imports: Arc::new(Vec::new()),
 
             // Workspace configuration
             workspace_folders: Vec::new(),
@@ -765,6 +769,41 @@ impl WorldState {
         }
     }
 
+    /// Recompute the document_store's pinned URI set.
+    ///
+    /// The pinned set is the transitive dependency neighborhood of every open
+    /// document — closed-but-reachable files included. Pinned entries are
+    /// protected from LRU eviction in `DocumentStore`, so closed-but-reachable
+    /// documents that have been opened (e.g. via `did_open` in a deeply
+    /// connected workspace) survive across edits to other files and avoid the
+    /// `compute_artifacts_with_metadata` recomputation fallback.
+    ///
+    /// Call after the open set changes (`did_open` / `did_close`) or after a
+    /// dependency-graph edge change touches an open file.
+    pub fn recompute_open_neighborhood_pins(&mut self) {
+        let open_uris: Vec<Url> = self.document_store.uris();
+        if open_uris.is_empty() {
+            self.document_store.set_pinned_uris(HashSet::new());
+            return;
+        }
+
+        let max_depth = self.cross_file_config.max_chain_depth;
+        let max_visited = self.cross_file_config.max_transitive_dependents_visited;
+        // Same scaling as build_package_scope_snapshot: bound lock-hold time
+        // while preserving coverage equivalent to the per-seed loop.
+        let effective_max_visited = max_visited
+            .saturating_mul(open_uris.len().max(1))
+            .min(max_visited.saturating_mul(50));
+
+        let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
+            open_uris.iter().cloned(),
+            max_depth,
+            effective_max_visited,
+        );
+
+        self.document_store.set_pinned_uris(neighborhood);
+    }
+
     /// Resize all LRU caches based on configuration.
     /// Called after parsing initialization options.
     pub fn resize_caches(&self, config: &crate::cross_file::config::CrossFileConfig) {
@@ -819,7 +858,34 @@ impl WorldState {
     /// 3. Legacy cross_file_workspace_index
     /// 4. Legacy documents HashMap (re-extract metadata)
     /// 5. File cache (re-extract metadata)
-    pub fn get_enriched_metadata(&self, uri: &Url) -> Option<crate::cross_file::CrossFileMetadata> {
+    /// Find or parse `CrossFileMetadata` for `uri` for the working-directory
+    /// inheritance closures used by snapshot builds and several diagnostic
+    /// helpers. Walks the chain: open document → cross-file workspace index
+    /// → file-cache contents. Returns an `Arc` so callers (closures bound to
+    /// `compute_inherited_working_directory`) avoid deep clones.
+    pub fn get_or_parse_metadata(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        if let Some(doc) = self.documents.get(uri) {
+            return Some(Arc::new(crate::cross_file::directive::parse_directives(
+                &doc.text(),
+            )));
+        }
+        if let Some(meta) = self.cross_file_workspace_index.get_metadata(uri) {
+            return Some(meta);
+        }
+        let content_provider = self.content_provider();
+        if let Some(content) = content_provider.get_content(uri) {
+            return Some(Arc::new(crate::cross_file::extract_metadata(&content)));
+        }
+        None
+    }
+
+    pub fn get_enriched_metadata(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
         self.document_store
             .get_without_touch(uri)
             .map(|doc| doc.metadata.clone())
@@ -828,12 +894,12 @@ impl WorldState {
             .or_else(|| {
                 self.documents
                     .get(uri)
-                    .map(|doc| crate::cross_file::extract_metadata(&doc.text()))
+                    .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.text())))
             })
             .or_else(|| {
                 self.cross_file_file_cache
                     .get(uri)
-                    .map(|content| crate::cross_file::extract_metadata(&content))
+                    .map(|content| Arc::new(crate::cross_file::extract_metadata(&content)))
             })
     }
 
@@ -864,7 +930,7 @@ impl WorldState {
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
         self.workspace_index = index;
-        self.workspace_imports = imports;
+        self.workspace_imports = Arc::new(imports);
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -899,6 +965,11 @@ impl WorldState {
         self.build_dependency_graph_from_workspace();
         self.workspace_scan_complete = true;
         log::info!("[Background] Dependency graph built from workspace entries, workspace_scan_complete = true");
+
+        // Now that the graph reflects the workspace, refresh the document_store
+        // pin set so any file opened before the scan completes picks up its
+        // neighborhood.
+        self.recompute_open_neighborhood_pins();
     }
 
     /// Build the dependency graph from all entries in the workspace index.
@@ -911,7 +982,9 @@ impl WorldState {
         let workspace_root = self.workspace_folders.first().cloned();
 
         // Collect URIs and metadata to avoid borrow conflicts with self.
-        let mut entries: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
+        // `entry.metadata` is `Arc<CrossFileMetadata>`, so the clone is a
+        // refcount bump rather than a deep clone of Vec/HashSet/String fields.
+        let mut entries: Vec<(Url, Arc<crate::cross_file::CrossFileMetadata>)> = Vec::new();
         for (uri, entry) in self.workspace_index_new.iter() {
             entries.push((uri.clone(), entry.metadata.clone()));
         }
@@ -930,8 +1003,12 @@ impl WorldState {
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
             };
-            let _result =
-                cross_file_graph.update_file(uri, meta, workspace_root.as_ref(), get_content);
+            let _result = cross_file_graph.update_file(
+                uri,
+                meta.as_ref(),
+                workspace_root.as_ref(),
+                get_content,
+            );
         }
 
         log::info!(
@@ -947,7 +1024,7 @@ impl WorldState {
                 let namespace_path = folder_path.join("NAMESPACE");
                 if namespace_path.exists() {
                     self.workspace_imports =
-                        parse_namespace_imports(&namespace_path, &self.library);
+                        Arc::new(parse_namespace_imports(&namespace_path, &self.library));
                     log::info!(
                         "Loaded {} workspace imports from NAMESPACE",
                         self.workspace_imports.len()
@@ -1055,10 +1132,11 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         }
 
         // Build metadata map from current state
-        let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
-            .iter()
-            .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
-            .collect();
+        let metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
+            new_index_entries
+                .iter()
+                .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+                .collect();
 
         let mut newly_enriched = Vec::new();
 
@@ -1066,8 +1144,9 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         for uri in &files_needing_enrichment {
             if let Some(entry) = new_index_entries.get_mut(uri) {
                 let old_inherited = entry.metadata.inherited_working_directory.clone();
+                let meta = Arc::make_mut(&mut entry.metadata);
                 crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut entry.metadata,
+                    meta,
                     uri,
                     workspace_root.as_ref(),
                     |parent_uri| metadata_map.get(parent_uri).cloned(),
@@ -1079,8 +1158,9 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
             }
             // Also update legacy cross_file_entries
             if let Some(entry) = cross_file_entries.get_mut(uri) {
+                let meta = Arc::make_mut(&mut entry.metadata);
                 crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut entry.metadata,
+                    meta,
                     uri,
                     workspace_root.as_ref(),
                     |parent_uri| metadata_map.get(parent_uri).cloned(),
@@ -1206,6 +1286,7 @@ fn scan_directory(
                             );
 
                         // Create legacy cross-file entry
+                        let cross_file_meta = Arc::new(cross_file_meta);
                         cross_file_entries.insert(
                             uri.clone(),
                             crate::cross_file::workspace_index::IndexEntry {
@@ -1289,6 +1370,20 @@ mod tests {
 
     // Include workspace scanning tests
     include!("state_tests.rs");
+
+    #[test]
+    fn test_workspace_imports_is_arc_wrapped() {
+        // Locks in S5: WorldState.workspace_imports must be Arc<Vec<...>>
+        // so DiagnosticsSnapshot::build does a refcount bump rather than
+        // deep-cloning the (package, symbol) Vec on every snapshot build.
+        let state = WorldState::new(vec![]);
+        let arc1: Arc<Vec<(String, String)>> = state.workspace_imports.clone();
+        let arc2 = arc1.clone();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "Arc clones must share storage"
+        );
+    }
 
     #[test]
     fn test_document_apply_change_ascii() {

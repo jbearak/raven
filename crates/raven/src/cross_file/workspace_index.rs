@@ -22,7 +22,7 @@ pub struct IndexEntry {
     /// File snapshot for freshness checking
     pub snapshot: FileSnapshot,
     /// Extracted cross-file metadata
-    pub metadata: CrossFileMetadata,
+    pub metadata: Arc<CrossFileMetadata>,
     /// Computed scope artifacts
     pub artifacts: Arc<ScopeArtifacts>,
     /// Index version when this entry was created
@@ -92,7 +92,7 @@ impl CrossFileWorkspaceIndex {
     }
 
     /// Get metadata for a URI (without freshness check)
-    pub fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
+    pub fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
         self.inner
             .read()
             .ok()?
@@ -129,7 +129,7 @@ impl CrossFileWorkspaceIndex {
         let version = self.increment_version();
         let entry = IndexEntry {
             snapshot,
-            metadata,
+            metadata: Arc::new(metadata),
             artifacts,
             indexed_at_version: version,
         };
@@ -210,7 +210,7 @@ mod tests {
     fn test_entry(version: u64) -> IndexEntry {
         IndexEntry {
             snapshot: test_snapshot(),
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: version,
         }

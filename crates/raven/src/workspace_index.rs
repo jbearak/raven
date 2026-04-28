@@ -93,7 +93,7 @@ pub struct IndexEntry {
     /// File snapshot for freshness checking
     pub snapshot: FileSnapshot,
     /// Cross-file metadata (source() calls, directives)
-    pub metadata: CrossFileMetadata,
+    pub metadata: Arc<CrossFileMetadata>,
     /// Scope artifacts (exported symbols, timeline)
     pub artifacts: Arc<ScopeArtifacts>,
     /// Index version when this entry was created
@@ -225,7 +225,7 @@ impl WorkspaceIndex {
     ///
     /// # Returns
     /// Clone of CrossFileMetadata if found, None otherwise
-    pub fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
+    pub fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
         let guard = self.inner.read().ok()?;
         guard.peek(uri).map(|entry| entry.metadata.clone())
     }
@@ -667,7 +667,7 @@ mod tests {
             tree: None,
             loaded_packages: vec!["dplyr".to_string()],
             snapshot: make_test_snapshot(),
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: version,
         }
@@ -1298,7 +1298,7 @@ mod tests {
                 size: 6,
                 content_hash: Some(12345),
             },
-            metadata: CrossFileMetadata::default(),
+            metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
             indexed_at_version: version,
         }
