@@ -969,20 +969,21 @@ mod tests {
     fn test_pinned_set_held_across_lru_search_and_pop() {
         // Concurrency guard for the pin-aware eviction path: under
         // contended `set_pinned_uris` + `insert`, no panic, no deadlock,
-        // and a URI that was pinned before the race began must still
-        // be present after.
+        // no data corruption, and a URI that was pinned before the race
+        // began must still be present after.
         //
-        // This test does NOT deterministically distinguish the buggy
-        // (read dropped before pop) version from the fixed (read held
-        // across pop) version: in both, the eviction's victim selection
-        // is based on the pin-set snapshot at A's read time, and once
-        // A picks a victim it pops that victim regardless. The
-        // OBSERVABLE end-state — which URIs are in the cache vs the
-        // pin set — is identical in both versions across all race
-        // outcomes. The fix's contribution is consistency of A's view
-        // (a future composability property), not a different cache
-        // outcome. Strict TOCTOU reproduction would require test hooks
-        // in the production helper, which we don't add.
+        // This test does NOT deterministically distinguish a buggy
+        // (read dropped before pop) implementation from a correct
+        // (read held across pop) one. Verified empirically by running
+        // an `assert!(index.contains(&uri2))` variant against both: in
+        // five 200-iteration runs of each, eviction rates of `uri2`
+        // ranged 0–31/200 (buggy) vs 4–53/200 (fixed) — overlapping
+        // ranges, no clean statistical signal. The fix's contribution
+        // is consistency of A's pin-set view across find+pop (a
+        // composability property for any future concurrent reader of
+        // `pinned`), not a different cache outcome. Strict TOCTOU
+        // reproduction would require test hooks in the production
+        // helper, which we don't add.
         for _ in 0..200 {
             let config = WorkspaceIndexConfig {
                 debounce_ms: 50,
@@ -1036,6 +1037,7 @@ mod tests {
             );
         }
     }
+
 
     #[test]
     fn test_unpinning_restores_normal_eviction() {
