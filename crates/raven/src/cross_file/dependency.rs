@@ -618,12 +618,62 @@ pub struct UpdateResult {
 }
 
 /// Dependency graph tracking source relationships between files
-#[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,
     /// Reverse lookup: child URI -> edges from parents
     backward: HashMap<Url, Vec<DependencyEdge>>,
+    /// Monotonic counter bumped whenever `update_file` reports
+    /// `edges_changed`. Cached `detect_cycle` results are keyed on this so
+    /// they are invalidated as soon as forward edges change.
+    edge_revision: std::sync::atomic::AtomicU64,
+    /// Cache of `detect_cycle` results keyed by `(uri, edge_revision)`.
+    /// `RwLock` interior mutability lets `detect_cycle(&self, ...)` populate
+    /// the cache without forcing every caller to take `&mut`.
+    cycle_cache: std::sync::RwLock<HashMap<Url, (u64, Option<CycleDetection>)>>,
+    /// Counter of cache hits — exposed for tests; not used in production.
+    cycle_cache_hits: std::sync::atomic::AtomicU64,
+}
+
+impl Default for DependencyGraph {
+    fn default() -> Self {
+        Self {
+            forward: HashMap::new(),
+            backward: HashMap::new(),
+            edge_revision: std::sync::atomic::AtomicU64::new(0),
+            cycle_cache: std::sync::RwLock::new(HashMap::new()),
+            cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Clone for DependencyGraph {
+    fn clone(&self) -> Self {
+        // Cache is intentionally NOT cloned: clones (e.g. via
+        // `extract_subgraph`) typically have different edges, so any cached
+        // cycle results are not portable. The new graph starts at edge
+        // revision 0 with an empty cache.
+        Self {
+            forward: self.forward.clone(),
+            backward: self.backward.clone(),
+            edge_revision: std::sync::atomic::AtomicU64::new(0),
+            cycle_cache: std::sync::RwLock::new(HashMap::new()),
+            cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for DependencyGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DependencyGraph")
+            .field("forward", &self.forward)
+            .field("backward", &self.backward)
+            .field(
+                "edge_revision",
+                &self.edge_revision.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl DependencyGraph {
@@ -944,6 +994,14 @@ impl DependencyGraph {
             .unwrap_or_default();
         result.edges_changed = old_targets != new_targets;
 
+        // Bump edge_revision so the cycle cache becomes stale for every URI.
+        // detect_cycle then either re-fills its slot or evicts via the
+        // revision-mismatch check.
+        if result.edges_changed {
+            self.edge_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+
         // Log total edge count after update
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
         log::trace!(
@@ -992,7 +1050,15 @@ impl DependencyGraph {
             }
         }
 
-        Self { forward, backward }
+        // Subgraphs start with a fresh cache; their edges are pruned, so
+        // any cached cycle results from the parent graph would be wrong.
+        Self {
+            forward,
+            backward,
+            edge_revision: std::sync::atomic::AtomicU64::new(0),
+            cycle_cache: std::sync::RwLock::new(HashMap::new()),
+            cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Remove edges where the given URI is the child that were created from backward directives
@@ -1347,9 +1413,34 @@ impl DependencyGraph {
     }
 
     pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
+        use std::sync::atomic::Ordering;
+        let revision = self.edge_revision.load(Ordering::Acquire);
+
+        // Fast path: cache hit at the current edge revision.
+        if let Ok(guard) = self.cycle_cache.read() {
+            if let Some((cached_rev, cached_result)) = guard.get(uri) {
+                if *cached_rev == revision {
+                    self.cycle_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return cached_result.clone();
+                }
+            }
+        }
+
         let mut visited = HashSet::new();
         let mut path = Vec::new();
-        self.detect_cycle_recursive(uri, uri, &mut visited, &mut path)
+        let computed = self.detect_cycle_recursive(uri, uri, &mut visited, &mut path);
+
+        if let Ok(mut guard) = self.cycle_cache.write() {
+            guard.insert(uri.clone(), (revision, computed.clone()));
+        }
+        computed
+    }
+
+    /// Number of `detect_cycle` calls served from the cache.
+    /// Exposed for tests; not used in production code.
+    pub fn cycle_cache_hits(&self) -> u64 {
+        self.cycle_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Dump the current state of the dependency graph for debugging.
@@ -1699,6 +1790,47 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_detect_cycle_caches_until_edges_change() {
+        // S4: detect_cycle results must be cached and keyed by graph edge
+        // revision. Repeated calls with no edge change should hit cache;
+        // an edge mutation should invalidate.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        let meta_b = make_meta_with_source("a.R", 2);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        // First call computes (cache miss).
+        let _ = graph.detect_cycle(&a);
+        let hits_after_first = graph.cycle_cache_hits();
+
+        // Second call with no edge change: cache hit.
+        let _ = graph.detect_cycle(&a);
+        assert_eq!(
+            graph.cycle_cache_hits(),
+            hits_after_first + 1,
+            "second detect_cycle for same URI at same edge revision must hit cache"
+        );
+
+        // Mutate edges → cache invalidated for this URI.
+        let meta_a_no_source = CrossFileMetadata::default();
+        let result = graph.update_file(&a, &meta_a_no_source, Some(&workspace_root()), |_| None);
+        assert!(result.edges_changed, "removing source() must mark edges_changed");
+
+        let hits_before_third = graph.cycle_cache_hits();
+        // Third call: edge revision bumped, cache invalidated → recomputes.
+        let _ = graph.detect_cycle(&a);
+        assert_eq!(
+            graph.cycle_cache_hits(),
+            hits_before_third,
+            "edges_changed must invalidate cycle cache and force a recompute"
+        );
     }
 
     #[test]
