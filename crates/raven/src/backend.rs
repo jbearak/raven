@@ -992,15 +992,19 @@ impl LanguageServer for Backend {
                             );
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
-                            // and snapshot trigger versions while we hold the lock
-                            let items: Vec<(Url, Option<i32>, Option<u64>)> = state
-                                .documents
-                                .keys()
+                            // and snapshot trigger versions while we hold the lock.
+                            // Bulk-mark first to avoid per-URI lock churn on large
+                            // workspaces.
+                            let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
+                            state
+                                .diagnostics_gate
+                                .mark_force_republish_many(open_keys.iter());
+                            let items: Vec<(Url, Option<i32>, Option<u64>)> = open_keys
+                                .into_iter()
                                 .map(|uri| {
-                                    state.diagnostics_gate.mark_force_republish(uri);
-                                    let v = state.documents.get(uri).and_then(|d| d.version);
-                                    let r = state.documents.get(uri).map(|d| d.revision);
-                                    (uri.clone(), v, r)
+                                    let v = state.documents.get(&uri).and_then(|d| d.version);
+                                    let r = state.documents.get(&uri).map(|d| d.revision);
+                                    (uri, v, r)
                                 })
                                 .collect();
                             let debounce = state.cross_file_config.revalidation_debounce_ms;
@@ -1226,9 +1230,9 @@ impl LanguageServer for Backend {
                 // Force-republish diagnostics for all open documents.
                 {
                     let state = self.state.read().await;
-                    for uri in &open_uris {
-                        state.diagnostics_gate.mark_force_republish(uri);
-                    }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(open_uris.iter());
                 }
                 // Route through the same debounced pipeline the watcher consumer
                 // uses, so refresh runs in parallel (not serial) and cooperates
@@ -1499,16 +1503,18 @@ impl LanguageServer for Backend {
             // Invalidate dependents if interface changed OR dependency edges changed.
             // Interface changes affect symbol resolution in dependent files.
             // Edge changes affect cycle detection diagnostics in dependent files.
+            // Filter open dependents/children once, then bulk-mark them under a
+            // single write-lock acquisition.
+            let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || result.edges_changed {
                 let dependents = state.cross_file_graph.get_transitive_dependents(
                     &uri,
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
-                        state.diagnostics_gate.mark_force_republish(&dep);
+                        to_force_republish.push(dep.clone());
                         affected.insert(dep);
                     }
                 }
@@ -1516,10 +1522,13 @@ impl LanguageServer for Backend {
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
-                    state.diagnostics_gate.mark_force_republish(&child);
+                    to_force_republish.push(child.clone());
                     affected.insert(child);
                 }
             }
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(to_force_republish.iter());
 
             // Convert to Vec for sorting
             let mut affected: Vec<Url> = affected.into_iter().collect();
@@ -1757,14 +1766,18 @@ impl LanguageServer for Backend {
                         max_chain_depth,
                         max_visited,
                     );
+                    let mut to_force_republish: Vec<Url> = Vec::new();
                     for dep in dependents {
                         if state.documents.contains_key(&dep) {
-                            state.diagnostics_gate.mark_force_republish(&dep);
+                            to_force_republish.push(dep.clone());
                             let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
                             let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                             work_items.push((dep, trigger_version, trigger_revision));
                         }
                     }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(to_force_republish.iter());
                 }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
@@ -1862,14 +1875,18 @@ impl LanguageServer for Backend {
                     max_chain_depth,
                     max_visited,
                 );
+                let mut to_force_republish: Vec<Url> = Vec::new();
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
-                        state.diagnostics_gate.mark_force_republish(&dep);
+                        to_force_republish.push(dep.clone());
                         let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
                         let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                         work_items.push((dep, trigger_version, trigger_revision));
                     }
                 }
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(to_force_republish.iter());
             }
         }
 
@@ -2162,18 +2179,18 @@ impl LanguageServer for Backend {
             // Interface changes affect symbol resolution in dependent files.
             // Edge changes affect cycle detection diagnostics in dependent files
             // (e.g., commenting out a source() call breaks a cycle).
+            // Bulk-mark all dependents/children under a single write-lock to
+            // skip per-URI lock churn on large fan-outs (Requirement 0.8).
+            let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || edges_changed {
                 let dependents = state.cross_file_graph.get_transitive_dependents(
                     &uri,
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                // Filter to only open documents and mark for force republish
                 for dep in dependents {
                     if state.documents.contains_key(&dep) {
-                        // Mark dependent files for force republish (Requirement 0.8)
-                        // This allows same-version republish when dependency changes
-                        state.diagnostics_gate.mark_force_republish(&dep);
+                        to_force_republish.push(dep.clone());
                         affected.insert(dep);
                     }
                 }
@@ -2181,10 +2198,13 @@ impl LanguageServer for Backend {
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
-                    state.diagnostics_gate.mark_force_republish(&child);
+                    to_force_republish.push(child.clone());
                     affected.insert(child);
                 }
             }
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(to_force_republish.iter());
 
             // Convert to Vec for sorting
             let mut affected: Vec<Url> = affected.into_iter().collect();
@@ -2539,12 +2559,13 @@ impl LanguageServer for Backend {
                 old_trigger_on_open_paren != new_trigger_on_open_paren;
 
             // Mark all open documents for force republish (unless only the
-            // watcher-lifecycle settings changed).
+            // watcher-lifecycle settings changed). Bulk-mark to avoid per-URI
+            // lock churn on workspaces with many open files.
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
             if !only_watch_changed {
-                for uri in &open_uris {
-                    state.diagnostics_gate.mark_force_republish(uri);
-                }
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(open_uris.iter());
             }
 
             (
@@ -2715,6 +2736,9 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
             let mut affected = Vec::new();
+            // Collect every URI we will force-republish so we can bulk-mark
+            // them at the end of the lock under one write-lock acquisition.
+            let mut newly_affected: Vec<Url> = Vec::new();
 
             for change in &params.changes {
                 let uri = &change.uri;
@@ -2745,7 +2769,7 @@ impl LanguageServer for Backend {
                         );
                         for dep in dependents {
                             if state.documents.contains_key(&dep) && !affected.contains(&dep) {
-                                state.diagnostics_gate.mark_force_republish(&dep);
+                                newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
                         }
@@ -2760,7 +2784,7 @@ impl LanguageServer for Backend {
                         );
                         for dep in dependents {
                             if state.documents.contains_key(&dep) && !affected.contains(&dep) {
-                                state.diagnostics_gate.mark_force_republish(&dep);
+                                newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
                         }
@@ -2778,6 +2802,9 @@ impl LanguageServer for Backend {
                     _ => {}
                 }
             }
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(newly_affected.iter());
             (to_update, affected)
         };
 
@@ -2909,15 +2936,21 @@ impl LanguageServer for Backend {
                             &state.cross_file_graph,
                             &state.cross_file_meta,
                         );
-                        // Collect open children for diagnostics
+                        // Collect open children for diagnostics; bulk-mark
+                        // them so the watched-files burst doesn't acquire the
+                        // gate's write lock once per affected child.
+                        let mut newly_affected: Vec<Url> = Vec::new();
                         for child in wd_children {
                             if state.documents.contains_key(&child)
                                 && !wd_affected_children.contains(&child)
                             {
-                                state.diagnostics_gate.mark_force_republish(&child);
+                                newly_affected.push(child.clone());
                                 wd_affected_children.push(child);
                             }
                         }
+                        state
+                            .diagnostics_gate
+                            .mark_force_republish_many(newly_affected.iter());
                     }
 
                     log::trace!("Updated workspace index for: {}", uri);
@@ -4299,9 +4332,9 @@ pub(crate) async fn prepare_dropped_recovery(
     };
     {
         let state = state_arc.read().await;
-        for uri in &open_uris {
-            state.diagnostics_gate.mark_force_republish(uri);
-        }
+        state
+            .diagnostics_gate
+            .mark_force_republish_many(open_uris.iter());
     }
     open_uris
 }
@@ -4462,9 +4495,9 @@ async fn run_libpath_consumer(
                 // publish at the same version.
                 {
                     let state = state_arc.read().await;
-                    for uri in &affected_uris {
-                        state.diagnostics_gate.mark_force_republish(uri);
-                    }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(affected_uris.iter());
                 }
 
                 // Schedule diagnostics for each affected open URI.

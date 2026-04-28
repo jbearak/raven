@@ -193,6 +193,29 @@ impl CrossFileDiagnosticsGate {
     /// up to `MAX_FORCE_REPUBLISH`).
     pub fn mark_force_republish(&self, uri: &Url) {
         let mut force = self.force_republish.write().unwrap();
+        Self::mark_force_republish_locked(&mut force, uri);
+    }
+
+    /// Mark every URI in the iterator for forced republish under a single
+    /// `force_republish` write-lock acquisition. Use this when fanning out
+    /// to a batch of dependents so we don't pay the lock pair per URI.
+    pub fn mark_force_republish_many<'a, I>(&self, uris: I)
+    where
+        I: IntoIterator<Item = &'a Url>,
+    {
+        let mut iter = uris.into_iter().peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        let mut force = self.force_republish.write().unwrap();
+        for uri in iter {
+            Self::mark_force_republish_locked(&mut force, uri);
+        }
+    }
+
+    /// Inner increment helper, factored out so single and batch entry points
+    /// share the saturation behavior of `MAX_FORCE_REPUBLISH`.
+    fn mark_force_republish_locked(force: &mut HashMap<Url, u32>, uri: &Url) {
         let count = force.entry(uri.clone()).or_insert(0);
         if *count >= MAX_FORCE_REPUBLISH {
             log::debug!(
@@ -585,6 +608,31 @@ mod tests {
 
         // Both markers consumed: same-version publish blocked again.
         assert!(!gate.can_publish(&uri, 1));
+    }
+
+    #[test]
+    fn test_mark_force_republish_many_marks_all_uris() {
+        // S3: a bulk mark must mark every URI in one go (single critical
+        // section). Behavioral assertion: after the bulk mark, each URI's
+        // gate allows a same-version republish.
+        let gate = CrossFileDiagnosticsGate::new();
+        let uris: Vec<Url> = (0..5)
+            .map(|i| test_uri(&format!("file_{i}.R")))
+            .collect();
+
+        for u in &uris {
+            gate.record_publish(u, 1);
+        }
+
+        gate.mark_force_republish_many(uris.iter());
+
+        for u in &uris {
+            assert!(
+                gate.can_publish(u, 1),
+                "{} must be force-marked after mark_force_republish_many",
+                u
+            );
+        }
     }
 
     #[test]

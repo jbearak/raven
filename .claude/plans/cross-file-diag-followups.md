@@ -35,7 +35,7 @@ Use `--save-baseline before` / `--baseline before` to compare runs.
 
 - [ ] **S2: Move `detect_cycle` / `extract_subgraph` / `workspace_imports.clone()` out from under the read lock.** `DiagnosticsSnapshot::build` runs all of these while holding `WorldState`'s read lock. Lock-hold is now ≤0.12 ms after the eviction fix, so this is more about hygiene than perf. Could be done lazily (compute on first use, not in `build`).
 
-- [ ] **S3: Batch `mark_force_republish` over transitive dependents.** `did_change` (`backend.rs:2168`) loops over dependents and calls `mark_force_republish` per URI; each call takes write locks on `last_published_version` and `force_republish` maps. A bulk `mark_force_republish_many(&[Url])` would do one lock-acquire pair total. Microseconds today, but cleaner.
+- [x] **S3: Batch `mark_force_republish` over transitive dependents.** `did_change` (`backend.rs:2168`) loops over dependents and calls `mark_force_republish` per URI; each call takes write locks on `last_published_version` and `force_republish` maps. A bulk `mark_force_republish_many(&[Url])` would do one lock-acquire pair total. Microseconds today, but cleaner.
 
 - [x] **S4: Cache `detect_cycle` result by graph edge revision.** Recomputed on every snapshot build today; result only changes when graph edges change. Bump a counter in `DependencyGraph::update_file` when edges change, and key the cache on `(uri, edge_revision)`.
 
