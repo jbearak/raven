@@ -2805,6 +2805,10 @@ impl LanguageServer for Backend {
             state
                 .diagnostics_gate
                 .mark_force_republish_many(newly_affected.iter());
+            // Watched-file deletions can drop edges that put a closed neighbor
+            // outside the open-document neighborhood; refresh the pin set so
+            // newly unreachable URIs become LRU-evictable again.
+            state.recompute_open_neighborhood_pins();
             (to_update, affected)
         };
 

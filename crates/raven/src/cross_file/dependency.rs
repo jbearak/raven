@@ -780,6 +780,23 @@ impl DependencyGraph {
             .get(uri)
             .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
             .unwrap_or_default();
+        // Snapshot backward parents (incoming `is_backward_directive` edges)
+        // before removal: a `@lsp-sourced-by` directive change rewires the
+        // backward map for `uri` and the forward map for each parent, but
+        // leaves `forward[uri]` (this file's outgoing edges) untouched.
+        // Tracking the parent set lets us bump `edge_revision` and invalidate
+        // `cycle_cache` / `subgraph_cache` when a backward directive changes.
+        let old_backward_parents: HashSet<Url> = self
+            .backward
+            .get(uri)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive)
+                    .map(|e| e.from.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Remove existing edges where this file is the parent
         // BUT: only remove edges that were created by THIS file's forward sources/directives
@@ -1009,17 +1026,33 @@ impl DependencyGraph {
             }
         }
 
-        // Detect whether forward edges changed (for revalidation of dependents)
+        // Detect whether forward OR backward edges changed for this file.
+        // Backward changes (added/removed `@lsp-sourced-by`) don't touch
+        // `forward[uri]`, but they DO change the dependency graph that
+        // `collect_neighborhood` and `detect_cycle` traverse — so the caches
+        // keyed on `edge_revision` must be invalidated for those too.
         let new_targets: HashSet<Url> = self
             .forward
             .get(uri)
             .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
             .unwrap_or_default();
-        result.edges_changed = old_targets != new_targets;
+        let new_backward_parents: HashSet<Url> = self
+            .backward
+            .get(uri)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive)
+                    .map(|e| e.from.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        result.edges_changed =
+            old_targets != new_targets || old_backward_parents != new_backward_parents;
 
-        // Bump edge_revision so the cycle cache becomes stale for every URI.
-        // detect_cycle then either re-fills its slot or evicts via the
-        // revision-mismatch check.
+        // Bump edge_revision so cycle/subgraph caches become stale for every
+        // URI. detect_cycle and cached_neighborhood_subgraph then either
+        // re-fill their slot or evict via the revision-mismatch check.
         if result.edges_changed {
             self.edge_revision
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1141,12 +1174,20 @@ impl DependencyGraph {
         }
     }
 
-    /// Remove all edges involving a file
+    /// Remove all edges involving a file. Bumps `edge_revision` so any
+    /// `cycle_cache` / `subgraph_cache` entries that referenced the deleted
+    /// file's edges are invalidated on the next lookup.
     pub fn remove_file(&mut self, uri: &Url) {
+        let had_forward = self.forward.contains_key(uri);
+        let had_backward = self.backward.contains_key(uri);
         // Remove edges where this file is the parent
         self.remove_forward_edges(uri);
         // Remove edges where this file is the child
         self.remove_backward_edges(uri);
+        if had_forward || had_backward {
+            self.edge_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Get edges where uri is the parent (caller)
@@ -1866,6 +1907,82 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_subgraph_cache_invalidates_on_backward_edge_change() {
+        // S1 + S4: changing a `@lsp-sourced-by` directive must bump
+        // `edge_revision` so cycle/subgraph caches don't hand out stale
+        // results that omit the new backward edge.
+        let mut graph = DependencyGraph::new();
+        let parent = Url::parse("file:///project/parent.R").unwrap();
+        let child = Url::parse("file:///project/child.R").unwrap();
+
+        // Establish baseline (no backward directive).
+        graph.update_file(&parent, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+        graph.update_file(&child, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        let _ = graph.detect_cycle(&parent);
+        let hits_before = graph.subgraph_cache_hits();
+
+        // Add a backward directive on child: child is sourced by parent.
+        // This rewires backward[child] and forward[parent], but leaves
+        // forward[child] unchanged. Without the fix the caches stay valid.
+        let child_meta_with_backward = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Line(1),
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        let result =
+            graph.update_file(&child, &child_meta_with_backward, Some(&workspace_root()), |_| None);
+        assert!(
+            result.edges_changed,
+            "adding @lsp-sourced-by must mark edges_changed"
+        );
+
+        let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
+        // Cache must have missed (revision bumped) → hits unchanged.
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            hits_before,
+            "backward-edge change must invalidate subgraph cache"
+        );
+    }
+
+    #[test]
+    fn test_remove_file_invalidates_caches() {
+        // Codex review: remove_file mutates the graph but previously did not
+        // bump edge_revision, leaving cycle_cache / subgraph_cache stale.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        graph.update_file(&b, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+
+        let _ = graph.cached_neighborhood_subgraph(&a, 10, 100);
+        let _ = graph.detect_cycle(&a);
+        let subgraph_hits_before = graph.subgraph_cache_hits();
+        let cycle_hits_before = graph.cycle_cache_hits();
+
+        graph.remove_file(&b);
+
+        let _ = graph.cached_neighborhood_subgraph(&a, 10, 100);
+        let _ = graph.detect_cycle(&a);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            subgraph_hits_before,
+            "remove_file must invalidate subgraph cache"
+        );
+        assert_eq!(
+            graph.cycle_cache_hits(),
+            cycle_hits_before,
+            "remove_file must invalidate cycle cache"
+        );
     }
 
     #[test]
