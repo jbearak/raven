@@ -54,6 +54,15 @@ impl DiagCancelToken {
 // Diagnostics Snapshot
 // ============================================================================
 
+/// Process-wide cached empty `Arc<HashSet<String>>`. Reused whenever a
+/// snapshot or fallback path needs an "empty base_exports" stand-in so we
+/// don't allocate a fresh Arc per snapshot when the package library isn't
+/// ready (e.g. cold start or `WorldState::new` without an R subprocess).
+fn empty_base_exports() -> &'static Arc<HashSet<String>> {
+    static EMPTY: OnceLock<Arc<HashSet<String>>> = OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(HashSet::new()))
+}
+
 /// A snapshot of all state needed for diagnostic computation.
 ///
 /// Built under the read lock, then used to compute diagnostics
@@ -67,10 +76,10 @@ pub(crate) struct DiagnosticsSnapshot {
     pub cross_file_config: crate::cross_file::config::CrossFileConfig,
     pub cross_file_graph: crate::cross_file::dependency::DependencyGraph,
     pub workspace_folders: Vec<Url>,
-    pub base_exports: HashSet<String>,
+    pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
-    pub workspace_imports: Vec<(String, String)>,
+    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
@@ -158,7 +167,7 @@ impl DiagnosticsSnapshot {
         let base_exports = if state.package_library_ready {
             state.package_library.base_exports().clone()
         } else {
-            HashSet::new()
+            empty_base_exports().clone()
         };
 
         // Pre-compute cycle detection from the FULL graph (not trimmed) so that
@@ -2659,7 +2668,7 @@ fn get_cross_file_scope(
     let base_exports = if state.package_library_ready {
         state.package_library.base_exports().clone()
     } else {
-        std::collections::HashSet::new()
+        empty_base_exports().clone()
     };
 
     let is_cancelled = || cancel.is_cancelled();
@@ -5159,7 +5168,7 @@ fn collect_undefined_variables_from_snapshot(
     // should still be flagged as undefined.
     let workspace_imports_map: HashMap<&str, Vec<&str>> = {
         let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (pkg, sym) in &snapshot.workspace_imports {
+        for (pkg, sym) in snapshot.workspace_imports.iter() {
             map.entry(sym.as_str()).or_default().push(pkg.as_str());
         }
         map
@@ -35512,7 +35521,7 @@ my_func <- function(a = default_value) {
         state.cross_file_config.packages_enabled = true;
         state.workspace_scan_complete = true;
         // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
-        state.workspace_imports = vec![("lme4".to_string(), "lmer".to_string())];
+        state.workspace_imports = std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
 
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();
         // lme4 cached with empty exports (prefetch saw R fail to load it).

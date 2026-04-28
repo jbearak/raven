@@ -549,7 +549,11 @@ pub struct WorldState {
     // Legacy fields (kept for migration compatibility)
     pub documents: HashMap<Url, Document>,
     pub workspace_index: HashMap<Url, Document>,
-    pub workspace_imports: Vec<(String, String)>, // (package, symbol) pairs from workspace NAMESPACE importFrom() entries
+    /// (package, symbol) pairs from workspace NAMESPACE importFrom() entries.
+    ///
+    /// Wrapped in `Arc` so `DiagnosticsSnapshot::build` does a refcount bump
+    /// rather than deep-cloning the entire vector on every snapshot build.
+    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
@@ -655,7 +659,7 @@ impl WorldState {
             // Legacy fields (kept for migration compatibility)
             documents: HashMap::new(),
             workspace_index: HashMap::new(),
-            workspace_imports: Vec::new(),
+            workspace_imports: Arc::new(Vec::new()),
 
             // Workspace configuration
             workspace_folders: Vec::new(),
@@ -902,7 +906,7 @@ impl WorldState {
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
         self.workspace_index = index;
-        self.workspace_imports = imports;
+        self.workspace_imports = Arc::new(imports);
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -996,7 +1000,7 @@ impl WorldState {
                 let namespace_path = folder_path.join("NAMESPACE");
                 if namespace_path.exists() {
                     self.workspace_imports =
-                        parse_namespace_imports(&namespace_path, &self.library);
+                        Arc::new(parse_namespace_imports(&namespace_path, &self.library));
                     log::info!(
                         "Loaded {} workspace imports from NAMESPACE",
                         self.workspace_imports.len()
@@ -1342,6 +1346,20 @@ mod tests {
 
     // Include workspace scanning tests
     include!("state_tests.rs");
+
+    #[test]
+    fn test_workspace_imports_is_arc_wrapped() {
+        // Locks in S5: WorldState.workspace_imports must be Arc<Vec<...>>
+        // so DiagnosticsSnapshot::build does a refcount bump rather than
+        // deep-cloning the (package, symbol) Vec on every snapshot build.
+        let state = WorldState::new(vec![]);
+        let arc1: Arc<Vec<(String, String)>> = state.workspace_imports.clone();
+        let arc2 = arc1.clone();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "Arc clones must share storage"
+        );
+    }
 
     #[test]
     fn test_document_apply_change_ascii() {

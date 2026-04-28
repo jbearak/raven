@@ -764,7 +764,7 @@ fn get_scope(
     let base_exports = if state.package_library_ready {
         state.package_library.base_exports().clone()
     } else {
-        HashSet::new()
+        std::sync::Arc::new(HashSet::new())
     };
 
     scope::scope_at_position_with_graph(
