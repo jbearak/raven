@@ -762,19 +762,22 @@ pub struct ScopeAtPosition {
     /// query scope. The leak's signature is "this package's only known
     /// origin is the queried URI". Mirrors the same-file symbol filter on
     /// `ScopedSymbol.source_uri`.
-    pub package_origins: HashMap<String, HashSet<Url>>,
+    ///
+    /// Origins are stored as `Arc<Url>` so cross-file propagation between
+    /// scopes is a refcount bump rather than a Url-internals string clone.
+    pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
 }
 
 /// Record that `package` was loaded by `origin_uri`. Idempotent.
 fn record_package_origin(
-    package_origins: &mut HashMap<String, HashSet<Url>>,
+    package_origins: &mut HashMap<String, HashSet<Arc<Url>>>,
     package: &str,
     origin_uri: &Url,
 ) {
     package_origins
         .entry(package.to_string())
         .or_default()
-        .insert(origin_uri.clone());
+        .insert(Arc::new(origin_uri.clone()));
 }
 
 /// Returns `true` when the only known origin for `package` is `uri` — i.e.
@@ -785,23 +788,24 @@ fn record_package_origin(
 /// in forward-source dispatch) carry no origin metadata and must remain
 /// trustworthy inherited content.
 fn package_only_origin_is_uri(
-    package_origins: &HashMap<String, HashSet<Url>>,
+    package_origins: &HashMap<String, HashSet<Arc<Url>>>,
     package: &str,
     uri: &Url,
 ) -> bool {
     match package_origins.get(package) {
-        Some(origins) if !origins.is_empty() => origins.iter().all(|o| o == uri),
+        Some(origins) if !origins.is_empty() => origins.iter().all(|o| o.as_ref() == uri),
         _ => false,
     }
 }
 
 /// Copy the origin set for `package` from `src` to `dst`, unioning into any
 /// existing entry. Used when a package crosses a file boundary so that
-/// downstream merge sites can run the same-file leak filter.
+/// downstream merge sites can run the same-file leak filter. Cloning the
+/// `Arc<Url>` is a refcount bump.
 fn propagate_package_origins(
-    src: &HashMap<String, HashSet<Url>>,
+    src: &HashMap<String, HashSet<Arc<Url>>>,
     package: &str,
-    dst: &mut HashMap<String, HashSet<Url>>,
+    dst: &mut HashMap<String, HashSet<Arc<Url>>>,
 ) {
     if let Some(origins) = src.get(package) {
         let entry = dst.entry(package.to_string()).or_default();

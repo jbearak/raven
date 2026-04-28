@@ -4994,6 +4994,45 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &text[start..end]
     };
 
+    // Pre-resolve each source() target's local exports. Matching the legacy
+    // (non-snapshot) collector's semantics: the diagnostic fires only when
+    // the named symbol appears in *that specific* source target's
+    // `exported_interface`. Without this, a symbol brought in by an earlier
+    // source() (or inherited from a parent) could be misattributed to a
+    // later, unrelated source() call. Computed once per pass and reused.
+    let workspace_root = snapshot.workspace_folders.first();
+    let source_path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri,
+        &snapshot.directive_meta,
+        workspace_root,
+    );
+    let source_target_exports: Vec<(usize, Option<HashSet<String>>)> = source_calls
+        .iter()
+        .enumerate()
+        .map(|(idx, source)| {
+            let resolved_uri = source_path_ctx.as_ref().and_then(|ctx| {
+                let resolved = if source.is_directive {
+                    crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+                } else {
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        ctx,
+                    )
+                }?;
+                Url::from_file_path(resolved).ok()
+            });
+            let exports = resolved_uri.and_then(|target_uri| {
+                snapshot.artifacts_map.get(&target_uri).map(|a| {
+                    a.exported_interface
+                        .keys()
+                        .map(|k| k.to_string())
+                        .collect::<HashSet<String>>()
+                })
+            });
+            (idx, exports)
+        })
+        .collect();
+
     // Collect usages
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
     collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
@@ -5038,7 +5077,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             continue;
         }
 
-        for source in &source_calls {
+        for (src_idx, source) in source_calls.iter().enumerate() {
             if !source.inherits_symbols() {
                 continue;
             }
@@ -5046,46 +5085,59 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 continue;
             }
 
+            // Only fire if `name` is actually exported by *this* source's
+            // target file (matches legacy semantics; rejects misattribution
+            // to a later source() that doesn't bring in the symbol). When
+            // the target's artifacts aren't available (closed file not yet
+            // indexed), we conservatively skip — better to under-report
+            // than misattribute.
+            let exports_match = source_target_exports
+                .iter()
+                .find(|(i, _)| *i == src_idx)
+                .and_then(|(_, exports)| exports.as_ref())
+                .map(|set| set.contains(name.as_str()))
+                .unwrap_or(false);
+            if !exports_match {
+                continue;
+            }
+
+            // Defense in depth: also confirm the symbol record at the
+            // source() position points to a different file, guarding
+            // against the original `xyz <- xyz` self-leak shape that
+            // motivated commit 91c3617.
             let source_scope = scope_cache
                 .entry((source.line, source.column))
                 .or_insert_with(|| snapshot.get_scope(uri, source.line, source.column, cancel));
-
-            // Only fire if the symbol is actually inherited from another file
-            // at the source() position. A symbol that is in scope only because
-            // of a local assignment between the usage and the source() call
-            // (e.g. `xyz = xyz` followed by `source("indices.r")`) carries
-            // `source_uri == *uri` and must NOT be misattributed to the
-            // source() call. This mirrors the legacy
-            // `collect_out_of_scope_diagnostics`, which only fires for names
-            // that appear in the sourced file's `exported_interface`.
             let inherited = source_scope
                 .symbols
                 .get(name.as_str())
                 .map(|sym| sym.source_uri != *uri)
-                .unwrap_or(false);
-            if inherited {
-                let line_text = get_line(usage_node.start_position().row);
-                let start_col =
-                    byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-                let end_line_text = get_line(usage_node.end_position().row);
-                let end_col =
-                    byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
-
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(*usage_line, start_col),
-                        end: Position::new(usage_node.end_position().row as u32, end_col),
-                    },
-                    severity: Some(severity),
-                    message: format!(
-                        "'{}' is used before it's available (sourced on line {})",
-                        name,
-                        source.line + 1
-                    ),
-                    ..Default::default()
-                });
-                break;
+                .unwrap_or(true); // No symbol record yet (will be brought by source) → still attribute
+            if !inherited {
+                continue;
             }
+
+            let line_text = get_line(usage_node.start_position().row);
+            let start_col =
+                byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
+            let end_line_text = get_line(usage_node.end_position().row);
+            let end_col =
+                byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(*usage_line, start_col),
+                    end: Position::new(usage_node.end_position().row as u32, end_col),
+                },
+                severity: Some(severity),
+                message: format!(
+                    "'{}' is used before it's available (sourced on line {})",
+                    name,
+                    source.line + 1
+                ),
+                ..Default::default()
+            });
+            break;
         }
     }
 }
@@ -35219,6 +35271,84 @@ x
                 .iter()
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: the snapshot out-of-scope collector must NOT misattribute
+    /// a symbol brought in by an *earlier* source() call to a later one.
+    ///
+    /// Topology:
+    ///   main.R: `helper_a()           # usage at line 0`
+    ///           `source("a.R")        # line 1, brings in helper_a`
+    ///           `source("b.R")        # line 2, does NOT export helper_a`
+    ///   a.R:    `helper_a <- function() 1`
+    ///   b.R:    `helper_b <- function() 2`
+    ///
+    /// Pre-fix this test would emit "'helper_a' is used before it's
+    /// available (sourced on line 3)" because the snapshot collector iterated
+    /// to b.R's source position and saw helper_a in scope (brought by a.R's
+    /// effect) without checking that b.R actually exports it.
+    ///
+    /// Post-fix the diagnostic correctly attributes to a.R (line 2) — the
+    /// only source whose target's `exported_interface` contains `helper_a`.
+    #[test]
+    fn test_out_of_scope_attributes_to_correct_source_when_earlier_source_brings_symbol() {
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let a_uri = Url::parse("file:///workspace/a.R").unwrap();
+        let b_uri = Url::parse("file:///workspace/b.R").unwrap();
+
+        // Note: usage on line 0 is BEFORE both source() calls, which is what
+        // makes it a forward reference.
+        let main_code = "helper_a()\nsource(\"a.R\")\nsource(\"b.R\")\n";
+        let a_code = "helper_a <- function() 1\n";
+        let b_code = "helper_b <- function() 2\n";
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [(&main_uri, main_code), (&a_uri, a_code), (&b_uri, b_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri).expect("snapshot");
+        let diags =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("diags");
+
+        let used_before: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("is used before it's available"))
+            .collect();
+        assert_eq!(
+            used_before.len(),
+            1,
+            "Expected exactly one 'used before it's available' diagnostic, got: {:?}",
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        );
+
+        // Must attribute to a.R (line 2 in 1-indexed display = source.line+1
+        // where source.line=1 in 0-indexed) — NOT to b.R (which would be
+        // line 3).
+        assert!(
+            used_before[0].message.contains("(sourced on line 2)"),
+            "Expected attribution to a.R on line 2, got: {}",
+            used_before[0].message
+        );
+        assert!(
+            !used_before[0].message.contains("(sourced on line 3)"),
+            "Must NOT misattribute to b.R on line 3, got: {}",
+            used_before[0].message
         );
     }
 
