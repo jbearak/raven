@@ -2822,10 +2822,16 @@ impl LanguageServer for Backend {
             (to_update, affected)
         };
 
-        // Schedule async disk reads to update workspace index for changed files
+        // Schedule async disk reads to update workspace index for changed files.
+        // CREATED/CHANGED graph mutations happen inside the spawned task, so
+        // diagnostic publishes for `affected_open_docs` must be deferred to
+        // run *after* the graph is up to date — otherwise the debounced
+        // diagnostic pass can race the async update and emit results from
+        // the pre-update graph (Codex review #2).
         if !uris_to_update.is_empty() {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let affected_for_async = affected_open_docs.clone();
             tokio::spawn(async move {
                 // Collect children affected by WD changes for diagnostics.
                 // The set tracks dedupe in O(1) so a watched-files burst
@@ -3064,12 +3070,28 @@ impl LanguageServer for Backend {
                             .await;
                     }
                 }
-            });
-        }
 
-        // Schedule diagnostics for affected open documents (Requirement 13.4)
-        for uri in affected_open_docs {
-            self.publish_diagnostics(&uri).await;
+                // Now that the graph reflects every CREATED/CHANGED file in
+                // this batch, schedule diagnostics for the dependent open
+                // documents collected synchronously. Running this here (not
+                // before the spawn) guarantees the debounced diagnostic pass
+                // builds its snapshot from the post-update graph.
+                for uri in affected_for_async {
+                    Backend::publish_diagnostics_via_arc(
+                        state_arc.clone(),
+                        client.clone(),
+                        &uri,
+                    )
+                    .await;
+                }
+            });
+        } else {
+            // DELETED-only path: the sync block already mutated the graph
+            // (`remove_file` + `recompute_open_neighborhood_pins`), so
+            // publishing synchronously sees the post-update state.
+            for uri in affected_open_docs {
+                self.publish_diagnostics(&uri).await;
+            }
         }
     }
 
@@ -3608,6 +3630,11 @@ impl Backend {
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
+            // The graph just got new edges for `file_uri`; refresh pins so
+            // callers reached via index_backward_chain / index_forward_chain
+            // (which don't run their own pin recompute) see the updated
+            // open-doc neighborhood.
+            state.recompute_open_neighborhood_pins();
         }
 
         if !packages_to_prefetch.is_empty() {
@@ -3925,6 +3952,10 @@ impl Backend {
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
+            // Same rationale as `index_file_on_demand`: refresh pins after
+            // graph mutation so callers without their own recompute see the
+            // post-update open-doc neighborhood.
+            state.recompute_open_neighborhood_pins();
         }
 
         if !packages_to_prefetch.is_empty() {
