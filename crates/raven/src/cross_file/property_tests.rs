@@ -2153,9 +2153,14 @@ proptest! {
         prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function");
 
-        // Inside function body, local variable SHOULD be available
-        // Use a position derived from the generated code so it is always within the braces.
-        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        // Inside function body, local variable SHOULD be available.
+        // Query at the closing `}` of the body so the local assignment has
+        // ended and its binding is visible (R installs the LHS binding only
+        // after the RHS finishes evaluating).
+        let col_in_body = code
+            .find('}')
+            .map(|i| i as u32)
+            .expect("expected '}' in generated function-body code");
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body, false);
         prop_assert!(scope_inside.symbols.contains_key(func_name.as_str()),
             "Function name should be available inside function");
@@ -2199,18 +2204,24 @@ proptest! {
         prop_assert!(!scope_outside.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should NOT be available outside");
 
-        // Inside outer function but outside inner function
-        // Choose a position inside the outer body *after* the inner function definition begins.
-        // Be careful: `"{inner_func} <- function"` can match inside other identifiers (e.g. outer_func="ab", inner_func="b").
-        // Prefer a delimiter-aware search and use rfind to bias towards the inner definition.
+        // Inside outer function but outside inner function.
+        // Choose a position inside the outer body *after* the inner function
+        // definition begins. The generated code template always contains
+        // `; {inner_func} <- function` (with the leading `; `) or — once the
+        // first needle has been ruled out — ` {inner_func} <- function` with
+        // a leading space, so both needles are delimiter-aware and cannot
+        // match a substring of another identifier (`r_identifier` allows only
+        // `[a-z0-9_]`, so neither `;` nor ` ` can occur inside it). Avoid a
+        // bare-name `rfind(&inner_func)` fallback: with no surrounding
+        // delimiters it could match `inner_func` inside a longer identifier
+        // such as `outer_func`.
         let inner_def_needle = format!("; {} <- function", inner_func);
         let inner_def_needle2 = format!(" {} <- function", inner_func);
         let col_in_outer_after_inner_def = code
             .rfind(&inner_def_needle)
             .map(|i| (i + 3) as u32) // skip "; " then move inside identifier
             .or_else(|| code.rfind(&inner_def_needle2).map(|i| (i + 2) as u32))
-            .or_else(|| code.rfind(&inner_func).map(|i| (i + 1) as u32))
-            .unwrap_or(0);
+            .expect("expected inner-function-definition locator in generated code");
         let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def, false);
         prop_assert!(scope_outer.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside itself");
@@ -2221,14 +2232,14 @@ proptest! {
         prop_assert!(!scope_outer.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should NOT be available outside inner function");
 
-        // Inside inner function
-        // Choose a position inside the inner body after the inner_var definition.
-        let inner_var_def_needle = format!("{} <-", inner_var);
+        // Inside inner function. Query at the position immediately after
+        // `{inner_var} <- 2` ends so the local binding is in scope (R only
+        // installs the LHS binding once the RHS finishes evaluating).
+        let inner_var_assignment = format!("{} <- 2", inner_var);
         let col_in_inner_after_inner_var_def = code
-            .rfind(&inner_var_def_needle)
-            .or_else(|| code.rfind(&inner_var))
-            .map(|i| (i + 1) as u32)
-            .unwrap_or(0);
+            .rfind(&inner_var_assignment)
+            .map(|i| (i + inner_var_assignment.len()) as u32)
+            .expect("expected inner-variable-assignment locator in generated code");
         let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def, false);
         prop_assert!(scope_inner.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside inner function");
@@ -2660,9 +2671,13 @@ proptest! {
         prop_assert!(!scope_at_start.symbols.contains_key(sibling_symbol.as_str()),
             "Sibling symbol should NOT be available at start (before source() call)");
 
-        // At line 1 (after child_symbol definition, before source() call)
+        // At line 1 (after child_symbol definition, before source() call).
+        // Query at the column immediately after `{child_symbol} <- 3` ends so
+        // the binding is installed; querying mid-assignment would correctly
+        // not yet show the symbol (RHS-before-binding semantics).
+        let line1_end = format!("{} <- 3", child_symbol).len() as u32;
         let scope_at_middle = scope_at_position_with_graph(
-            &child_uri, 1, 10, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+            &child_uri, 1, line1_end, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
@@ -7553,7 +7568,7 @@ proptest! {
 // - The position ordering is correct
 // ============================================================================
 
-use super::scope::ScopeEvent;
+use super::scope::{event_effect_position, ScopeEvent};
 
 /// R reserved words that cannot be used as package names
 const R_RESERVED_PKG: &[&str] = &[
@@ -7684,17 +7699,13 @@ proptest! {
             code
         );
 
-        // 5. Timeline should be sorted by position
+        // 5. Timeline should be sorted by each event's *effect* position
+        //    (for `Def` events that's `visible_from_*`, not the LHS anchor; see
+        //    `event_effect_position` in scope.rs and the AGENTS.md learning that
+        //    locks down this invariant).
         let mut prev_pos = (0u32, 0u32);
         for event in &artifacts.timeline {
-            let pos = match event {
-                ScopeEvent::Def { line, column, .. } => (*line, *column),
-                ScopeEvent::Source { line, column, .. } => (*line, *column),
-                ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
-                ScopeEvent::Removal { line, column, .. } => (*line, *column),
-                ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-                ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-            };
+            let pos = event_effect_position(event);
             prop_assert!(
                 pos >= prev_pos,
                 "Timeline not sorted: event at ({}, {}) comes after ({}, {}). Code:\n{}",

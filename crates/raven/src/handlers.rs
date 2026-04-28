@@ -31999,9 +31999,14 @@ process_data <- function(data, threshold = 0.5, ...) {
             .documents
             .insert(uri.clone(), Document::new(code, None));
 
-        // Test scope resolution includes all iterators and parameters
+        // Test scope resolution includes all iterators and parameters.
+        // For `result`, query on line 7 (where `print(result)` is) so the
+        // `result <- i * j` assignment on line 5 has finished evaluating and
+        // the binding is visible. R installs the LHS binding only after the
+        // RHS evaluates, so querying at column 12 of line 5 (the LHS itself)
+        // would (correctly) not yet have `result` in scope.
         let positions = vec![
-            (Position::new(5, 12), "result", true), // result inside nested loop
+            (Position::new(7, 22), "result", true), // result used in print(result)
             (Position::new(4, 12), "i", true),      // i iterator
             (Position::new(4, 18), "j", true),      // j iterator
             (Position::new(12, 14), "item", true),  // item used inside the loop body
@@ -32164,8 +32169,13 @@ helper_transform <- function(data) {
             |_| None,
         );
 
-        // Test nested loop iterators are in scope
-        let nested_loop_position = Position::new(8, 8); // Inside nested loop
+        // Test nested loop iterators are in scope. Query on line 9 (after the
+        // `value <- i * j` assignment on line 8 has ended) so that all three
+        // bindings — outer iterator `i`, inner iterator `j`, and the local
+        // `value` — are visible. R installs the LHS binding only after the
+        // RHS finishes evaluating, so a query at column 8 of line 8 would
+        // (correctly) not yet have `value` in scope.
+        let nested_loop_position = Position::new(9, 8); // Inside nested loop, after `value <-` ends
         let symbols = get_cross_file_symbols(
             &state,
             &main_uri,
@@ -32186,8 +32196,11 @@ helper_transform <- function(data) {
             "Local variable 'value' should be in scope"
         );
 
-        // Test function parameters are in scope within function
-        let function_body_position = Position::new(19, 4); // Inside analyze_data function
+        // Test function parameters are in scope within function. Query on
+        // line 22 (where `filtered <- cleaned[cleaned > threshold]` references
+        // `cleaned`) so that the `cleaned <- ...` assignment on line 19 has
+        // finished evaluating and the binding is visible.
+        let function_body_position = Position::new(22, 19); // Inside analyze_data, after `cleaned <-` ends
         let func_symbols = get_cross_file_symbols(
             &state,
             &main_uri,
@@ -35784,6 +35797,201 @@ my_func <- function(a = default_value) {
                     .iter()
                     .map(|d| &d.message)
                     .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_self_referential_assignment_rhs_is_undefined() {
+        // In R, `merp <- merp` evaluates the RHS *before* assigning to the LHS,
+        // so the RHS reference must resolve in the enclosing scope. When `merp`
+        // is not defined anywhere else, the RHS reference is genuinely undefined
+        // and the LSP must emit an "Undefined variable" diagnostic for it.
+        //
+        // This guards against the LHS definition leaking into its own RHS scope.
+        // Both single-line `x <- x` and the equivalent multi-line form must flag
+        // the RHS, and a prior definition of `x` must continue to suppress the
+        // diagnostic (since the previous binding is what the RHS actually sees).
+        struct Case {
+            code: &'static str,
+            label: &'static str,
+            expected_undefined_count: usize,
+            // Lines of the file (0-indexed) where we expect "Undefined variable: merp"
+            expected_lines: &'static [u32],
+        }
+
+        let cases: &[Case] = &[
+            Case {
+                code: "merp <- merp\n",
+                label: "single-line self-reference",
+                expected_undefined_count: 1,
+                expected_lines: &[0],
+            },
+            Case {
+                code: "merp <-\n    merp\n",
+                label: "multi-line self-reference",
+                expected_undefined_count: 1,
+                expected_lines: &[1],
+            },
+            Case {
+                code: "merp <- 1\nmerp <- merp\n",
+                label: "self-assignment with prior binding (no diagnostic)",
+                expected_undefined_count: 0,
+                expected_lines: &[],
+            },
+        ];
+
+        for case in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", case.code);
+            let tree = parse_r_code(case.code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(case.code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                case.code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
+            );
+
+            let merp_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message == "Undefined variable: merp")
+                .collect();
+
+            assert_eq!(
+                merp_diags.len(),
+                case.expected_undefined_count,
+                "{} ({:?}): expected {} 'Undefined variable: merp' diagnostic(s), got {:?}",
+                case.label,
+                case.code,
+                case.expected_undefined_count,
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
+            );
+
+            let mut got_lines: Vec<u32> = merp_diags.iter().map(|d| d.range.start.line).collect();
+            got_lines.sort();
+            let mut want_lines: Vec<u32> = case.expected_lines.to_vec();
+            want_lines.sort();
+            assert_eq!(
+                got_lines, want_lines,
+                "{} ({:?}): diagnostic lines mismatch",
+                case.label, case.code
+            );
+        }
+    }
+
+    #[test]
+    fn test_assignment_binding_visible_after_rhs_with_internal_rm() {
+        // `x <- { rm(x); 1 }` — R evaluates the RHS first (`rm(x)` runs in the
+        // enclosing scope, then the block returns 1), and *then* installs the
+        // LHS binding. So at any position after the assignment, `x` must be
+        // bound to 1, regardless of any `rm(x)` that ran *inside* the RHS.
+        //
+        // This is the timeline-ordering corollary of the visible_from fix: the
+        // Def event's effect happens at the end of the assignment, so it must
+        // be processed *after* any Removal events that live inside the RHS,
+        // not in LHS-anchor order.
+        //
+        // We assert via the absence of an "Undefined variable: x" diagnostic
+        // on the line that uses `x` after the assignment.
+        let mut state = create_test_state();
+        let code = "x <- { rm(x); 1 }\nprint(x)\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let x_diags_on_print: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message == "Undefined variable: x" && d.range.start.line == 1)
+            .collect();
+
+        assert!(
+            x_diags_on_print.is_empty(),
+            "`x` must be in scope on the line after `x <- {{ rm(x); 1 }}`. \
+             Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_parenthesized_function_definition_rhs_supports_recursion() {
+        // `f <- (function() f())` — the parenthesized RHS still wraps a
+        // function definition, whose body is delayed-evaluation. Recursive
+        // calls to `f` inside the body must therefore resolve, just like the
+        // unwrapped form `f <- function() f()`.
+        //
+        // Without unwrapping the parentheses, `assignment_rhs_is_function_definition`
+        // sees a `parenthesized_expression` and treats the assignment as a
+        // non-function RHS, which would incorrectly flag the inner `f()` as
+        // an undefined variable.
+        let cases: &[(&str, &str)] = &[
+            ("f <- (function() f())\n", "left-assignment with parenthesized function"),
+            ("(function() g()) -> g\n", "right-assignment with parenthesized function"),
+        ];
+
+        for &(code, label) in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
+            );
+
+            let undefined_self_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| {
+                    d.message == "Undefined variable: f" || d.message == "Undefined variable: g"
+                })
+                .collect();
+
+            assert!(
+                undefined_self_diags.is_empty(),
+                "{} ({:?}): recursive call inside the parenthesized function body \
+                 must resolve to the LHS binding, not produce 'Undefined variable'. \
+                 Got: {:?}",
+                label,
+                code,
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
             );
         }
     }
