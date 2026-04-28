@@ -3526,6 +3526,50 @@ fn collect_workspace_symbols_from_artifacts(
 /// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
+/// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
+/// pipeline — exposed under the `test-support` feature so benchmarks can
+/// measure the same path used by `run_debounced_diagnostics` in production.
+#[cfg(feature = "test-support")]
+#[allow(dead_code)]
+pub fn diagnostics_via_snapshot(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
+    match DiagnosticsSnapshot::build(state, uri) {
+        Some(snapshot) => diagnostics_from_snapshot(&snapshot, uri, cancel).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Profile each phase of the snapshot-based diagnostic pipeline.
+///
+/// Returns `(snapshot_build, diag_phase, outcome)` where `outcome` is
+/// `Some(count)` when `diagnostics_from_snapshot` ran to completion (so a
+/// successful zero-diagnostic run is `Some(0)`) and `None` when the diagnostic
+/// phase short-circuited (master switch off, file is non-R, or the cancel
+/// token tripped). `snapshot_build` is `Duration::ZERO` when
+/// `DiagnosticsSnapshot::build` returns `None` — i.e. the document is missing
+/// or its tree failed to parse — and the outcome is `None` in that case too.
+#[cfg(feature = "test-support")]
+#[allow(dead_code)]
+pub fn diagnostics_via_snapshot_profile(
+    state: &WorldState,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> (
+    std::time::Duration, // snapshot build
+    std::time::Duration, // diagnostics_from_snapshot total
+    Option<usize>,       // diagnostic count, or None if the phase short-circuited
+) {
+    let t0 = std::time::Instant::now();
+    let snapshot = match DiagnosticsSnapshot::build(state, uri) {
+        Some(s) => s,
+        None => return (std::time::Duration::ZERO, std::time::Duration::ZERO, None),
+    };
+    let t_build = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let outcome = diagnostics_from_snapshot(&snapshot, uri, cancel).map(|d| d.len());
+    let t_diag = t1.elapsed();
+    (t_build, t_diag, outcome)
+}
+
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
