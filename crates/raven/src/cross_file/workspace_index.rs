@@ -163,7 +163,7 @@ impl CrossFileWorkspaceIndex {
         };
 
         if let Ok(mut guard) = self.inner.write() {
-            self.pin_aware_push(&mut guard, uri.clone(), entry);
+            super::cache::pin_aware_push(&mut guard, &self.pinned, uri.clone(), entry);
         }
     }
 
@@ -171,52 +171,8 @@ impl CrossFileWorkspaceIndex {
     pub fn insert(&self, uri: Url, entry: IndexEntry) {
         self.increment_version();
         if let Ok(mut guard) = self.inner.write() {
-            self.pin_aware_push(&mut guard, uri, entry);
+            super::cache::pin_aware_push(&mut guard, &self.pinned, uri, entry);
         }
-    }
-
-    /// Push an entry honoring the pin set.
-    ///
-    /// When the cache is at capacity and the URI is new, evict the LRU
-    /// unpinned entry. If every in-cache URI is pinned, grow the cache
-    /// rather than evict a reachable neighbor. Updates to existing URIs
-    /// (whether pinned or not) always succeed in place — pinning doesn't
-    /// block disk-update replacement, which is what keeps stale pinned
-    /// entries from accumulating.
-    ///
-    /// Lock order: caller holds `inner`; this acquires `pinned` for read.
-    /// The `pinned` read guard is held across both the LRU search and
-    /// the `pop` so a racing `set_pinned_uris` cannot install a pin on
-    /// the chosen victim between selection and removal.
-    fn pin_aware_push(
-        &self,
-        guard: &mut LruCache<Url, IndexEntry>,
-        uri: Url,
-        entry: IndexEntry,
-    ) {
-        let already_present = guard.contains(&uri);
-        let cap = guard.cap().get();
-        if !already_present && guard.len() >= cap {
-            if let Ok(pinned) = self.pinned.read() {
-                let lru_unpinned = guard
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| !pinned.contains(*k))
-                    .map(|(k, _)| k.clone());
-
-                if let Some(victim) = lru_unpinned {
-                    guard.pop(&victim);
-                } else {
-                    let new_cap = std::num::NonZeroUsize::new(guard.len() + 1)
-                        .expect("len() + 1 is always non-zero");
-                    guard.resize(new_cap);
-                }
-            }
-            // Pin lock poisoned: fall through to push(), which may evict
-            // a pinned entry. Acceptable poison-recovery behavior.
-        }
-
-        guard.push(uri, entry);
     }
 
     /// Invalidate index entry for a URI
