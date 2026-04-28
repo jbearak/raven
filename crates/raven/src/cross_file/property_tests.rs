@@ -7559,7 +7559,7 @@ proptest! {
 // - The position ordering is correct
 // ============================================================================
 
-use super::scope::ScopeEvent;
+use super::scope::{event_effect_position, ScopeEvent};
 
 /// R reserved words that cannot be used as package names
 const R_RESERVED_PKG: &[&str] = &[
@@ -7690,17 +7690,13 @@ proptest! {
             code
         );
 
-        // 5. Timeline should be sorted by position
+        // 5. Timeline should be sorted by each event's *effect* position
+        //    (for `Def` events that's `visible_from_*`, not the LHS anchor; see
+        //    `event_effect_position` in scope.rs and the AGENTS.md learning that
+        //    locks down this invariant).
         let mut prev_pos = (0u32, 0u32);
         for event in &artifacts.timeline {
-            let pos = match event {
-                ScopeEvent::Def { line, column, .. } => (*line, *column),
-                ScopeEvent::Source { line, column, .. } => (*line, *column),
-                ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
-                ScopeEvent::Removal { line, column, .. } => (*line, *column),
-                ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-                ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-            };
+            let pos = event_effect_position(event);
             prop_assert!(
                 pos >= prev_pos,
                 "Timeline not sorted: event at ({}, {}) comes after ({}, {}). Code:\n{}",

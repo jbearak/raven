@@ -799,7 +799,7 @@ fn active_function_scopes_at(
 /// order — for example, the `rm(x)` inside `x <- { rm(x); 1 }` is processed
 /// *before* the `Def x` it sits inside, so the new binding is not silently
 /// dropped at positions past the assignment.
-fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
+pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
     match event {
         ScopeEvent::Def {
             visible_from_line,
@@ -939,7 +939,9 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
 /// The function:
 /// - collects symbol and function-scope definitions from the AST,
 /// - records detected `source()` and `rm()/remove()` calls as timeline events,
-/// - sorts the timeline by position,
+/// - sorts the timeline by each event's *effect* position via [`event_effect_position`]
+///   (for `Def` events this is `visible_from_line/visible_from_column`, not the LHS anchor —
+///   see the `ScopeEvent::Def` doc for why the two positions diverge),
 /// - constructs a FunctionScopeTree from discovered function scopes and annotates removal events
 ///   with their containing function scope (if any),
 /// - computes the exported-interface hash.
@@ -1072,7 +1074,9 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
 /// - records detected `source()` calls from the AST as timeline events,
 /// - records forward directive sources from metadata as timeline events (avoiding duplicates),
 /// - records `rm()/remove()` calls as timeline events,
-/// - sorts the timeline by position,
+/// - sorts the timeline by each event's *effect* position via [`event_effect_position`]
+///   (for `Def` events this is `visible_from_line/visible_from_column`, not the LHS anchor —
+///   see the `ScopeEvent::Def` doc for why the two positions diverge),
 /// - constructs a FunctionScopeTree from discovered function scopes,
 /// - computes the exported-interface hash.
 ///
@@ -1963,11 +1967,14 @@ fn collect_definitions(
     // We track two distinct positions on the Def event:
     //
     //   * `line/column` — where the assignment is *anchored* in the document,
-    //     i.e. the LHS identifier. This drives timeline ordering and the
-    //     containing-function-scope lookup in `annotate_event_function_scopes`.
+    //     i.e. the LHS identifier. This drives the containing-function-scope
+    //     lookup in `annotate_event_function_scopes` and the symbol's own
+    //     `defined_line/defined_column` (used by hover and go-to-definition).
+    //     It is **not** the timeline sort key.
     //
     //   * `visible_from_line/visible_from_column` — where the new binding
-    //     actually becomes visible.
+    //     actually becomes visible. This is the effect position returned by
+    //     `event_effect_position` and is what the timeline is sorted by.
     //
     // For assignments whose RHS is a *function definition* (`f <- function() ...`)
     // the binding is visible from the LHS position. The function body is
