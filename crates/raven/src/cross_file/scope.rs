@@ -4027,20 +4027,24 @@ where
         }
         self.timeline_cursor = i;
 
-        // Pop function frames whose intervals no longer contain target.
+        // Drop function frames whose intervals no longer contain target.
+        // This must use `retain` over the whole stack, not a pop-from-top
+        // loop: a single `advance_to` call can sweep past two sibling
+        // functions in document order (e.g. `f <- function() {...}\n
+        // g <- function() {...}` with the cursor moving from a usage
+        // inside `f`'s body directly to a usage inside `g`'s body), which
+        // leaves both `[F, G]` on the stack. Popping until the topmost
+        // frame still contains target stops at G and leaks F's body-locals
+        // into g's scope. `active_function_scopes_at` in the recursive
+        // resolver has set semantics — keep parity by retaining frames
+        // independently of stack position.
         let target_pos = Position::new(target_line, target_column);
         // EOF sentinel positions are treated as "outside any function" in the
         // recursive resolver (`active_function_scopes_at` returns empty for
-        // full EOF). Match that behavior by popping all frames at EOF.
+        // full EOF). Match that behavior by dropping all frames at EOF.
         let target_at_full_eof = target_pos.is_full_eof();
-        while let Some((interval, _)) = self.function_stack.last() {
-            let still_inside = !target_at_full_eof && interval.contains(target_pos);
-            if !still_inside {
-                self.function_stack.pop();
-            } else {
-                break;
-            }
-        }
+        self.function_stack
+            .retain(|(interval, _)| !target_at_full_eof && interval.contains(target_pos));
 
         self.cursor = target;
     }
@@ -15918,12 +15922,26 @@ y <- filter(df)"#;
 
     #[test]
     fn test_scope_stream_resurrection_after_removal() {
-        // x <- 1; rm("x"); x <- 2 — x must be visible at line 3 and equal
-        // to the second Def's binding.
+        // x <- 1; rm(x); x <- 2 — x must be visible at line 3 and equal
+        // to the second Def's binding. Bare-identifier `rm(x)` is required
+        // for `detect_rm_calls` to produce a Removal event; positional
+        // string-literal `rm("x")` is silently ignored.
         let uri = test_uri();
-        let code = "x <- 1\nrm(\"x\")\nx <- 2\n";
+        let code = "x <- 1\nrm(x)\nx <- 2\n";
         let tree = parse_r(code);
         let artifacts = Arc::new(compute_artifacts(&uri, &tree, code));
+
+        // Sanity-check that the Removal actually made it onto the timeline,
+        // so the test exercises the resurrection path (not the trivial
+        // "two Defs in a row" fall-through).
+        let has_removal = artifacts.timeline.iter().any(|ev| {
+            matches!(ev, ScopeEvent::Removal { symbols, .. }
+                if symbols.iter().any(|s| &**s == "x"))
+        });
+        assert!(
+            has_removal,
+            "fixture must produce a Removal event for x to exercise resurrection",
+        );
         let meta: std::sync::Arc<crate::cross_file::types::CrossFileMetadata> =
             std::sync::Arc::new(crate::cross_file::types::CrossFileMetadata::default());
 
@@ -15992,6 +16010,116 @@ y <- filter(df)"#;
         assert!(
             direct.symbols.contains_key("x"),
             "direct path must also see x after resurrection"
+        );
+    }
+
+    /// Regression for C1: sibling-function frames must be dropped when the
+    /// cursor moves from inside one function's body directly into another's,
+    /// even though the popped frame is no longer at the top of the stack.
+    ///
+    /// Two top-level functions, each with a body-local variable. A single
+    /// `advance_to(line_inside_g, ...)` call from cursor `(0, 0)` will
+    /// push frames for f and g in document order; if the pop logic stops
+    /// at the first frame whose interval contains target (g), f leaks. Its
+    /// body-local `fa` would then appear in g's scope.
+    #[test]
+    fn test_scope_stream_drops_sibling_function_frames() {
+        let uri = test_uri();
+        let code = "f <- function() { fa <- 1; helper_f(fa) }\n\
+                    g <- function() { gb <- 2; helper_g(gb) }\n";
+        let tree = parse_r(code);
+        let artifacts = Arc::new(compute_artifacts(&uri, &tree, code));
+        let meta: std::sync::Arc<crate::cross_file::types::CrossFileMetadata> =
+            std::sync::Arc::new(crate::cross_file::types::CrossFileMetadata::default());
+
+        let uri_for_artifacts = uri.clone();
+        let artifacts_for_closure = artifacts.clone();
+        let get_artifacts = move |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri_for_artifacts {
+                Some(artifacts_for_closure.clone())
+            } else {
+                None
+            }
+        };
+        let uri_for_meta = uri.clone();
+        let meta_for_closure = meta.clone();
+        let get_metadata = move |u: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        > {
+            if u == &uri_for_meta {
+                Some(meta_for_closure.clone())
+            } else {
+                None
+            }
+        };
+
+        let graph = crate::cross_file::dependency::DependencyGraph::new();
+        let base_exports: HashSet<String> = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let is_cancelled = || false;
+
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &prefix_cache,
+        )
+        .expect("stream construction must succeed");
+
+        // Land directly inside g's body (line 1, column 30 — inside `helper_g(gb)`).
+        // No intermediate advance_to, so f's FunctionScope event is processed in
+        // the same sweep as g's, leaving the stack as [F, G] before the pop pass.
+        stream.advance_to(1, 30);
+        let scope = stream.snapshot();
+
+        assert!(
+            scope.symbols.contains_key("g"),
+            "g must be visible inside g's body (top-level Def)",
+        );
+        assert!(
+            scope.symbols.contains_key("gb"),
+            "gb must be visible inside g's body (g's body-local)",
+        );
+        assert!(
+            !scope.symbols.contains_key("fa"),
+            "fa is f's body-local — must NOT leak into g's scope",
+        );
+
+        // Cross-check against the recursive resolver: it must agree.
+        let mut throwaway = ParentPrefixCache::new();
+        let direct = scope_at_position_with_graph_cached(
+            &uri,
+            1,
+            30,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &mut throwaway,
+        );
+        assert!(
+            !direct.symbols.contains_key("fa"),
+            "recursive resolver must also exclude fa from g's scope",
+        );
+        let stream_names: std::collections::BTreeSet<String> =
+            scope.symbols.keys().map(|n| n.to_string()).collect();
+        let direct_names: std::collections::BTreeSet<String> =
+            direct.symbols.keys().map(|n| n.to_string()).collect();
+        assert_eq!(
+            stream_names, direct_names,
+            "stream and recursive resolver must agree on symbol set inside sibling function",
         );
     }
 }
