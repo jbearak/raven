@@ -97,12 +97,19 @@ Located in the same test module in `handlers.rs` as the deleted `debug_real_worl
 
 - Add `SelfRefChainFixture` struct (pub).
 - Add `pub fn create_self_ref_chain_fixture() -> SelfRefChainFixture`.
+- Add `use url::Url;` import (not currently present in this module).
 - No changes to existing `FixtureConfig`, `create_fixture_workspace`, or `write_fixture_workspace`.
 
 ### `crates/raven/src/handlers.rs`
 
 - **Delete** `debug_real_worldwide_data_r` entirely.
-- **Add** `self_ref_variable_not_in_scope_across_deep_source_chain` as a plain `#[test]`.
+- **Add** `self_ref_variable_not_in_scope_across_deep_source_chain` as a plain `#[test]` inside the existing `#[cfg(test)]` module. The test must live here (not in a separate integration test file) because `DiagnosticsSnapshot::get_scope` is private.
+
+## Implementation notes (from Codex review)
+
+- `diagnostics_from_snapshot` returns `Option<Vec<Diagnostic>>`; call `.expect("diagnostics")` before asserting on contents.
+- `package_library_ready` defaults to `false` in `WorldState::new`. Package export lookups are suppressed, but `library()` timeline events still populate `loaded_packages` / `inherited_packages` — assertion 3 (`dplyr` in scope) is valid without an R subprocess.
+- `undefined_variables_enabled` and `diagnostics_enabled` default to `true` in `CrossFileConfig`; only `workspace_scan_complete = true` needs to be set explicitly.
 
 ---
 
