@@ -815,6 +815,37 @@ fn propagate_package_origins(
     }
 }
 
+/// Memoization cache for cross-file scope resolution. Caches complete
+/// `ScopeAtPosition` results from recursive calls so that multiple
+/// `scope_at_position_with_graph` invocations on the SAME file at
+/// DIFFERENT positions can reuse parent and child scope resolutions
+/// that are identical across positions.
+///
+/// The memo key is `(uri, line, col, packages_fingerprint)` where
+/// `packages_fingerprint` is a sorted hash of the `inherited_packages`
+/// parameter. For parent calls (always `&empty`), the fingerprint is 0.
+///
+/// Created per diagnostic pass and passed as `Option<&mut ScopeResolutionMemo>`.
+/// Callers that make a single scope query pass `None`.
+pub type ScopeResolutionMemo = HashMap<(Url, u32, u32, u64), ScopeAtPosition>;
+
+/// Compute a deterministic fingerprint for a set of package names.
+/// Used as part of the `ScopeResolutionMemo` key to distinguish calls
+/// with different inherited package sets.
+pub fn packages_fingerprint(pkgs: &HashSet<String>) -> u64 {
+    if pkgs.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    sorted.len().hash(&mut hasher);
+    for s in sorted {
+        s.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Determine whether a `source()` call should use local scoping rules.
 ///
 /// The function returns `true` when the `ForwardSource` explicitly requests local
@@ -3456,6 +3487,41 @@ where
     }
 
     scope
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+
+    #[test]
+    fn test_packages_fingerprint_empty() {
+        let pkgs = HashSet::new();
+        assert_eq!(packages_fingerprint(&pkgs), 0);
+    }
+
+    #[test]
+    fn test_packages_fingerprint_deterministic() {
+        let mut a = HashSet::new();
+        a.insert("dplyr".to_string());
+        a.insert("ggplot2".to_string());
+
+        let mut b = HashSet::new();
+        b.insert("ggplot2".to_string());
+        b.insert("dplyr".to_string());
+
+        assert_eq!(packages_fingerprint(&a), packages_fingerprint(&b));
+    }
+
+    #[test]
+    fn test_packages_fingerprint_different_sets_differ() {
+        let mut a = HashSet::new();
+        a.insert("dplyr".to_string());
+
+        let mut b = HashSet::new();
+        b.insert("ggplot2".to_string());
+
+        assert_ne!(packages_fingerprint(&a), packages_fingerprint(&b));
+    }
 }
 
 #[cfg(test)]
