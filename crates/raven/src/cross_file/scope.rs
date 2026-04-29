@@ -2797,8 +2797,9 @@ impl ParentPrefixCache {
 ///
 /// For acyclic dependency graphs (the common case), the cached prefix is
 /// genuinely position-invariant. For cyclic graphs, the cached value is
-/// approximate — the first query's `(line, column)` seeds the visited map
-/// used during STEP 1 — but `entry`/`or_insert` merging keeps STEP 2 sound.
+/// approximate — the visited map is seeded with `(u32::MAX, u32::MAX)` so the
+/// prefix covers all positions in the queried URI within the snapshot — but
+/// `entry`/`or_insert` merging keeps STEP 2 sound.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph_cached<F, G>(
     uri: &Url,
@@ -2919,10 +2920,10 @@ pub(crate) struct ParentPrefix {
     pub depth_exceeded: Vec<(Url, u32, u32)>,
     // All parent-loaded packages flow into `inherited_packages` here —
     // `parent_prefix_at` never writes to `loaded_packages`. Both the
-    // backward-edge merge at scope.rs:3214 and the forward-edge merge at
-    // scope.rs:3224 funnel into `inherited_packages` after applying the
-    // same-file leak filter, so a separate `loaded_packages` field on
-    // `ParentPrefix` would always be empty and was removed in I2.
+    // backward-edge merge and the forward-edge merge inside `parent_prefix_at`
+    // funnel into `inherited_packages` after applying the same-file leak
+    // filter, so a separate `loaded_packages` field on `ParentPrefix` would
+    // always be empty and was removed in I2.
     pub inherited_packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
 }
@@ -3791,28 +3792,37 @@ struct ScopeFrame {
     packages: HashSet<String>,
     package_origins: HashMap<String, HashSet<Arc<Url>>>,
     /// Names removed by `rm()` / `remove()` calls applicable to this frame.
-    /// Applied at snapshot time AFTER all frames are layered, so a function
-    /// frame's `rm("x")` can strip an `x` inherited from the global frame or
-    /// from `prefix.symbols`.
+    /// Applied at `snapshot()` time AFTER all frame symbols have been layered
+    /// into the merged `scope.symbols` map, so that a `rm("x")` in any frame
+    /// can strip an `x` contributed by an earlier frame (global, prefix, or
+    /// an outer function frame) — matching the recursive resolver, which
+    /// applies `Removal` events in timeline order over a flat `scope.symbols`.
     removed_names: HashSet<Arc<str>>,
 }
 
 /// Cached contribution of one forward `Source` event: the symbols, packages,
-/// and chain entries that resolving the child URI introduces. Computed once
-/// per `(line, column)` source-call site for the lifetime of one
-/// [`ScopeStream`] and reused on subsequent applications (relevant for the
-/// late-binding pre-walk that materializes `global_late_frame`).
+/// chain, and depth-exceeded entries that resolving the child URI introduces.
+/// Computed once per `(line, column)` source-call site for the lifetime of
+/// one [`ScopeStream`] and reused on subsequent applications (relevant for
+/// the late-binding pre-walk that materializes `global_late_frame`).
+///
+/// `symbols`, `packages`, and `package_origins` are merged into `ScopeFrame`
+/// fields by [`ScopeStream::apply_event_to_strict`] and
+/// [`ScopeStream::apply_event_to_late`]. `chain` and `depth_exceeded` are
+/// NOT stored per frame (they belong to the overall scope result, not to a
+/// single frame's view); instead [`ScopeStream::snapshot`] reads them
+/// directly from this map, filtering to call sites whose effect position is
+/// ≤ the cursor — mirroring `scope_at_position_with_graph_recursive`'s
+/// `scope.chain.extend(child_scope.chain)` at the forward-source merge site.
 ///
 /// `packages` deliberately flattens the child's `loaded_packages` and
 /// `inherited_packages` into a single set: every package introduced via a
 /// forward `source()` is "inherited" from the perspective of the queried
-/// URI, and the merge sites in [`ScopeStream::apply_event_to_strict`] /
-/// [`ScopeStream::apply_event_to_late`] funnel both into
-/// `frame.packages`, which `snapshot()` projects to
-/// `ScopeAtPosition.loaded_packages`. The recursive resolver keeps the two
-/// distinct, but no current consumer differentiates inherited-vs-loaded for
-/// the merged set — they both feed completion, hover, and "undefined
-/// variable" suppression alike. If a future consumer needs the
+/// URI, and the merge sites funnel both into `frame.packages`, which
+/// `snapshot()` projects to `ScopeAtPosition.loaded_packages`. The recursive
+/// resolver keeps the two distinct, but no current consumer differentiates
+/// inherited-vs-loaded for the merged set — they both feed completion, hover,
+/// and "undefined variable" suppression alike. If a future consumer needs the
 /// distinction, this field would need to split back into two sets.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ChildSourceContribution {
@@ -4281,7 +4291,7 @@ where
         }
         // Prefix (parent walk).
         let prefix = self.choose_prefix();
-        prefix.symbols.iter().any(|(k, _)| &**k == name)
+        prefix.symbols.contains_key(name)
     }
 
     /// Materialize a full `ScopeAtPosition` at the cursor. The resulting
@@ -4297,9 +4307,16 @@ where
             self.ensure_global_late_frame();
         }
         let prefix = self.choose_prefix();
+        // The recursive resolver pushes the queried URI itself as the first
+        // chain entry at `current_depth == 0` (`scope.rs:3342-3343`), then
+        // extends with the prefix chain (`scope.rs:3382`). Mirror that here:
+        // start with queried_uri, then append the prefix (backward-edge) chain.
+        let mut chain = Vec::with_capacity(1 + prefix.chain.len());
+        chain.push(self.queried_uri.clone());
+        chain.extend(prefix.chain.iter().cloned());
         let mut scope = ScopeAtPosition {
             symbols: prefix.symbols.clone(),
-            chain: prefix.chain.clone(),
+            chain,
             depth_exceeded: prefix.depth_exceeded.clone(),
             inherited_packages: prefix.inherited_packages.clone(),
             // `ParentPrefix` no longer has a `loaded_packages` field —
@@ -4311,9 +4328,15 @@ where
             package_origins: prefix.package_origins.clone(),
         };
 
-        // Layer global frame on top — `extend` overwrites prefix entries
-        // (matching the recursive resolver, where local Def events
-        // `scope.symbols.insert(...)` overwrite parent contributions).
+        // Layer global frame on top. The global frame contains base exports
+        // (seeded at construction), Source-contributed symbols, and local
+        // top-level Defs. All of these overwrite prefix entries via
+        // `insert()` — matching the recursive resolver, where:
+        //   - base exports are inserted into an empty map before merging
+        //     the prefix (so base > prefix for the same name), and
+        //   - local Def events use `scope.symbols.insert(...)` which also
+        //     overwrites parent contributions.
+        // The net precedence is: local Defs > base exports > prefix symbols.
         let global = self.choose_global_frame();
         for (name, symbol) in &global.symbols {
             scope.symbols.insert(name.clone(), symbol.clone());
@@ -4327,12 +4350,6 @@ where
                 .entry(pkg.clone())
                 .or_default()
                 .extend(origins.iter().cloned());
-        }
-        // Apply global removals to the merged result so far. This is what
-        // makes a `rm("x")` strip `x` from prefix-contributed symbols too,
-        // matching `apply_removal`'s behavior.
-        for name in &global.removed_names {
-            scope.symbols.remove(name);
         }
 
         // Layer each function frame, outermost-to-innermost so innermost wins.
@@ -4350,8 +4367,64 @@ where
                     .or_default()
                     .extend(origins.iter().cloned());
             }
+        }
+
+        // Apply removals from ALL frames after ALL symbols are layered.
+        //
+        // The recursive resolver processes timeline events in effect-position
+        // order over a flat `scope.symbols` map: a `rm(x)` at effect
+        // position P removes whatever `x` was present at that instant,
+        // regardless of which function scope introduced it. Applying removals
+        // after layering all frames mirrors this flat-map semantics:
+        //
+        //   • global frame's `removed_names` can strip prefix-contributed
+        //     symbols (a top-level `rm(x)` removes an x inherited from a
+        //     parent file) and also function-frame symbols whose timeline
+        //     position is earlier than the rm — matching the recursive
+        //     resolver's timeline-order application.
+        //
+        //   • function frames' `removed_names` likewise apply over the
+        //     fully-merged symbol set, so an inner-function `rm(x)` removes
+        //     an `x` that the outer function or global frame contributed.
+        //
+        // The frames are collected outermost-to-innermost (the same order
+        // as the symbol layering above), so innermost-frame removals take
+        // precedence when two frames both target the same name and one later
+        // Def would resurrect it — the insertion order for removals into the
+        // flat set is consistent with the recursive resolver's timeline order.
+        for name in &global.removed_names {
+            scope.symbols.remove(name);
+        }
+        for (_iv, frame) in &self.function_stack {
             for name in &frame.removed_names {
                 scope.symbols.remove(name);
+            }
+        }
+
+        // Extend chain and depth_exceeded from forward source() contributions
+        // whose call sites are at or before the cursor.
+        //
+        // `ChildSourceContribution.chain` and `.depth_exceeded` are populated
+        // by `resolve_source_contribution` (mirroring `scope_at_position_with_
+        // graph_recursive`'s `scope.chain.extend(child_scope.chain)` at
+        // scope.rs:3651-3652). They are stored in `source_contributions` keyed
+        // by the source-call anchor `(src_line, src_col)`, but the map may
+        // contain entries resolved speculatively for the late-binding pre-walk
+        // that haven't been applied to the strict frame yet. Filter to
+        // contributions whose effect position (`src_col.saturating_add(1)`) is
+        // ≤ the current cursor — the same condition `advance_to` uses to decide
+        // whether to apply a Source event to the strict frame.
+        //
+        // Dedup note: contributions at different call sites are distinct; there
+        // is no double-counting risk from the strict/late frame both hitting the
+        // same `source_contributions` entry (both share the cached struct).
+        for (&(src_line, src_col), contrib) in &self.source_contributions {
+            let effect_col = src_col.saturating_add(1);
+            if (src_line, effect_col) <= self.cursor {
+                scope.chain.extend(contrib.chain.iter().cloned());
+                scope
+                    .depth_exceeded
+                    .extend(contrib.depth_exceeded.iter().cloned());
             }
         }
 
@@ -4384,11 +4457,7 @@ where
             return None;
         }
         let prefix = self.choose_prefix();
-        prefix
-            .symbols
-            .iter()
-            .find(|(k, _)| &***k == name)
-            .map(|(_, sym)| sym.clone())
+        prefix.symbols.get(name).cloned()
     }
 
     /// Pick the prefix slot matching the cursor's current state. With
@@ -4806,14 +4875,14 @@ where
     // `scope_at_position_with_graph_recursive` call doesn't transitively
     // try to re-enter the cache.
     let mut visited = HashMap::new();
-    // Mirror `scope_at_position_with_graph_cached`'s seeding: start the
-    // visited map with the queried URI at the requested position so the
+    // Seed the visited map with the queried URI at `(MAX, MAX)` so the
     // STEP 1 walk doesn't revisit the queried URI on its own backward
-    // edges. For the streaming entry point we always seed at `(MAX, MAX)`
-    // because the prefix is meant to cover ALL positions in the queried
-    // URI within the snapshot — a less-restrictive seed than the
-    // public-cached entry's `(line, column)`, but valid for acyclic
-    // graphs (the dominant case) and consistent across cache slots.
+    // edges. Both this streaming entry point and `scope_at_position_with_
+    // graph_cached` use the same seed — the prefix covers ALL positions
+    // within the snapshot, not just the call-site position — keeping
+    // first-writer-wins cache semantics deterministic regardless of which
+    // entry point populates the slot first. For acyclic graphs (the
+    // dominant case) this is identical to seeding at `(line, column)`.
     visited.insert(uri.clone(), (u32::MAX, u32::MAX));
     let computed = parent_prefix_at(
         uri,
@@ -12866,6 +12935,44 @@ y <- filter(df)"#;
                         "package_origins mismatch at ({}, {}) in fixture {}",
                         line, col, fixture_idx
                     );
+
+                    // chain and depth_exceeded: forward source() contributions
+                    // must be merged into snapshot() the same way
+                    // scope_at_position_with_graph_recursive merges them
+                    // (scope.rs `scope.chain.extend(child_scope.chain)`).
+                    // Before the Issue B fix, snapshot() only seeded from the
+                    // prefix (backward-edge chain), missing every forward
+                    // source() chain entry.
+                    let streamed_chain: std::collections::BTreeSet<String> =
+                        streamed.chain.iter().map(|u| u.to_string()).collect();
+                    let direct_chain: std::collections::BTreeSet<String> =
+                        direct.chain.iter().map(|u| u.to_string()).collect();
+                    prop_assert_eq!(
+                        streamed_chain,
+                        direct_chain,
+                        "chain mismatch at ({}, {}) in fixture {}",
+                        line, col, fixture_idx
+                    );
+
+                    // depth_exceeded is a Vec of (Url, line, col) triples.
+                    let streamed_de: std::collections::BTreeSet<(String, u32, u32)> =
+                        streamed
+                            .depth_exceeded
+                            .iter()
+                            .map(|(u, l, c)| (u.to_string(), *l, *c))
+                            .collect();
+                    let direct_de: std::collections::BTreeSet<(String, u32, u32)> =
+                        direct
+                            .depth_exceeded
+                            .iter()
+                            .map(|(u, l, c)| (u.to_string(), *l, *c))
+                            .collect();
+                    prop_assert_eq!(
+                        streamed_de,
+                        direct_de,
+                        "depth_exceeded mismatch at ({}, {}) in fixture {}",
+                        line, col, fixture_idx
+                    );
                 }
             }
         }
@@ -13156,6 +13263,123 @@ y <- filter(df)"#;
                 direct_x.source_uri, helper1_uri,
                 "sanity: recursive resolver should attribute x to the \
                  first source (helper1.R)"
+            );
+        }
+
+        /// Regression for Issue B: `chain` and `depth_exceeded` from forward
+        /// `source()` calls were missing from `snapshot()`.
+        ///
+        /// `snapshot()` only seeded `scope.chain` from the prefix (backward-
+        /// edge contributions). Forward source() contributions stored in
+        /// `source_contributions` were never merged. The recursive resolver
+        /// extends `scope.chain` at `scope.rs:3651`, so the two paths diverged.
+        #[test]
+        fn test_scope_stream_chain_from_forward_source_matches_recursive() {
+            // Use the 2-file fixture from build_two_file_fixture:
+            // main.R  sources helper.R  → forward source() edge
+            // After the source() call fires, scope.chain must contain
+            // both main_uri and helper_uri.
+            let main_code = "source(\"helper.R\")\nuse_helper <- helper_value + 1\n";
+            let (
+                workspace_root,
+                main_uri,
+                helper_uri,
+                main_artifacts,
+                helper_artifacts,
+                main_meta,
+                helper_meta,
+                graph,
+            ) = build_two_file_fixture(main_code);
+
+            let main_uri_for_artifacts = main_uri.clone();
+            let helper_uri_for_artifacts = helper_uri.clone();
+            let main_artifacts_for_closure = main_artifacts.clone();
+            let helper_artifacts_for_closure = helper_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_for_artifacts {
+                    Some(main_artifacts_for_closure.clone())
+                } else if uri == &helper_uri_for_artifacts {
+                    Some(helper_artifacts_for_closure.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_for_meta = main_uri.clone();
+            let helper_uri_for_meta = helper_uri.clone();
+            let main_meta_for_closure = main_meta.clone();
+            let helper_meta_for_closure = helper_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_for_meta {
+                    Some(main_meta_for_closure.clone())
+                } else if uri == &helper_uri_for_meta {
+                    Some(helper_meta_for_closure.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Query at line 1 col 0: the source("helper.R") call on line 0
+            // has an effect position of (0, col+1); it fires before line 1.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(1, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                1,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+            );
+
+            // Both paths should include helper_uri in chain (forward source()).
+            let streamed_chain: std::collections::BTreeSet<String> =
+                streamed.chain.iter().map(|u| u.to_string()).collect();
+            let direct_chain: std::collections::BTreeSet<String> =
+                direct.chain.iter().map(|u| u.to_string()).collect();
+
+            assert_eq!(
+                streamed_chain, direct_chain,
+                "ScopeStream::snapshot() chain must match scope_at_position_with_\
+                 graph_cached. Before the Issue B fix, snapshot() only seeded \
+                 chain from the prefix (backward edges) and missed all forward \
+                 source() contributions."
+            );
+
+            // Concretely: the chain must contain the helper URI since
+            // main.R sources helper.R.
+            assert!(
+                direct_chain.contains(&helper_uri.to_string()),
+                "sanity: recursive resolver must include helper_uri in chain \
+                 after source(\"helper.R\") fires"
             );
         }
     }
