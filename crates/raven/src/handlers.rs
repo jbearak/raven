@@ -209,6 +209,7 @@ impl DiagnosticsSnapshot {
         line: u32,
         column: u32,
         cancel: &DiagCancelToken,
+        memo: Option<&mut scope::ScopeResolutionMemo>,
     ) -> scope::ScopeAtPosition {
         let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
@@ -232,7 +233,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.hoist_globals_in_functions,
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
-            None,
+            memo,
         )
     }
 }
@@ -330,6 +331,13 @@ pub(crate) fn diagnostics_from_snapshot(
     // Shared scope cache for expensive collectors
     let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
 
+    // Shared memo for cross-file DFS memoization across scope queries.
+    // This eliminates redundant DFS traversals when the out-of-scope and
+    // undefined-variable collectors query scope at many different positions
+    // in the same file — the parent resolution and child resolutions are
+    // cached on first compute and reused for subsequent positions.
+    let mut scope_memo = scope::ScopeResolutionMemo::new();
+
     let scope_start = std::time::Instant::now();
 
     // Out-of-scope diagnostics
@@ -340,6 +348,7 @@ pub(crate) fn diagnostics_from_snapshot(
         &snapshot.text,
         &mut diagnostics,
         &mut scope_cache,
+        &mut scope_memo,
         cancel,
     );
 
@@ -360,6 +369,7 @@ pub(crate) fn diagnostics_from_snapshot(
             &snapshot.text,
             &mut diagnostics,
             &mut scope_cache,
+            &mut scope_memo,
             cancel,
         );
     }
@@ -4965,6 +4975,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     text: &str,
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+    scope_memo: &mut scope::ScopeResolutionMemo,
     cancel: &DiagCancelToken,
 ) {
     let Some(severity) = snapshot.cross_file_config.out_of_scope_severity else {
@@ -5073,9 +5084,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 
     // Phase 1: Compute scope at each breakpoint (the only DFS calls we make)
     for &(l, c) in &breakpoint_positions {
-        scope_cache
-            .entry((l, c))
-            .or_insert_with(|| snapshot.get_scope(uri, l, c, cancel));
+        if !scope_cache.contains_key(&(l, c)) {
+            let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
+            scope_cache.insert((l, c), computed);
+        }
     }
 
     // Phase 2: Extract lightweight name sets (no cloning of full ScopeAtPosition)
@@ -5157,9 +5169,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         // Fall back to per-position DFS for identifiers not resolved by
         // the breakpoint fast-path (local definitions between breakpoints,
         // or names removed by rm()).
-        let scope = scope_cache
-            .entry((*usage_line, *usage_col))
-            .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+        if !scope_cache.contains_key(&(*usage_line, *usage_col)) {
+            let computed = snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
+            scope_cache.insert((*usage_line, *usage_col), computed);
+        }
+        let scope = scope_cache.get(&(*usage_line, *usage_col)).unwrap();
         if let Some(symbol) = scope.symbols.get(name.as_str()) {
             if symbol.source_uri == *uri {
                 locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
@@ -5183,9 +5197,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             continue;
         }
 
-        let scope = scope_cache
-            .entry((*usage_line, *usage_col))
-            .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+        if !scope_cache.contains_key(&(*usage_line, *usage_col)) {
+            let computed = snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
+            scope_cache.insert((*usage_line, *usage_col), computed);
+        }
+        let scope = scope_cache.get(&(*usage_line, *usage_col)).unwrap();
 
         if scope.symbols.contains_key(name.as_str()) {
             continue;
@@ -5219,9 +5235,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // source() position points to a different file, guarding
             // against the original `xyz <- xyz` self-leak shape that
             // motivated commit 91c3617.
-            let source_scope = scope_cache
-                .entry((source.line, source.column))
-                .or_insert_with(|| snapshot.get_scope(uri, source.line, source.column, cancel));
+            if !scope_cache.contains_key(&(source.line, source.column)) {
+                let computed = snapshot.get_scope(uri, source.line, source.column, cancel, Some(scope_memo));
+                scope_cache.insert((source.line, source.column), computed);
+            }
+            let source_scope = scope_cache.get(&(source.line, source.column)).unwrap();
             let inherited = source_scope
                 .symbols
                 .get(name.as_str())
@@ -5263,6 +5281,7 @@ fn collect_undefined_variables_from_snapshot(
     text: &str,
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+    scope_memo: &mut scope::ScopeResolutionMemo,
     cancel: &DiagCancelToken,
 ) {
     use crate::cross_file::config::BackwardDependencyMode;
@@ -5330,9 +5349,11 @@ fn collect_undefined_variables_from_snapshot(
         });
 
     let parent_symbol_names: HashSet<String> = {
-        let scope_0_0 = scope_cache
-            .entry((0, 0))
-            .or_insert_with(|| snapshot.get_scope(uri, 0, 0, cancel));
+        if !scope_cache.contains_key(&(0, 0)) {
+            let computed = snapshot.get_scope(uri, 0, 0, cancel, Some(scope_memo));
+            scope_cache.insert((0, 0), computed);
+        }
+        let scope_0_0 = scope_cache.get(&(0, 0)).unwrap();
         // Only include symbols from OTHER files. When a parent sources this file,
         // the file's own exports flow into the parent's scope and back here via
         // backward edges. Including those would suppress forward-reference diagnostics.
@@ -5401,9 +5422,10 @@ fn collect_undefined_variables_from_snapshot(
 
     // Ensure breakpoints are in the cache (may already be there from out-of-scope)
     for &(l, c) in &undef_breakpoint_positions {
-        scope_cache
-            .entry((l, c))
-            .or_insert_with(|| snapshot.get_scope(uri, l, c, cancel));
+        if !scope_cache.contains_key(&(l, c)) {
+            let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
+            scope_cache.insert((l, c), computed);
+        }
     }
 
     // Extract lightweight all-symbol name sets from cached breakpoint scopes.
@@ -5536,11 +5558,11 @@ fn collect_undefined_variables_from_snapshot(
         // Fall back to per-position cross-file scope resolution.
         // This only happens for identifiers not found in any breakpoint scope
         // (local definitions between breakpoints, or names removed by rm()).
-        let scope = {
-            scope_cache
-                .entry((usage_line, usage_col))
-                .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col, cancel))
-        };
+        if !scope_cache.contains_key(&(usage_line, usage_col)) {
+            let computed = snapshot.get_scope(uri, usage_line, usage_col, cancel, Some(scope_memo));
+            scope_cache.insert((usage_line, usage_col), computed);
+        }
+        let scope = scope_cache.get(&(usage_line, usage_col)).unwrap();
 
         if let Some(sym) = scope.symbols.get(name.as_str()) {
             let usage_col_for_check = byte_offset_to_utf16_column(
@@ -35685,7 +35707,7 @@ x
         // Now also dump scope.symbols at data.r line 17 (0-indexed) col 6 (RHS xyz).
         let line: u32 = 17;
         let col: u32 = 6;
-        let scope_at = snapshot.get_scope(&data_uri, line, col, &DiagCancelToken::never());
+        let scope_at = snapshot.get_scope(&data_uri, line, col, &DiagCancelToken::never(), None);
         eprintln!(
             "scope.symbols at data.r ({}, {}) — {} entries",
             line,
@@ -35714,7 +35736,7 @@ x
 
         // Now query at (17, 0) - LHS position, BEFORE assignment.
         let lhs_scope =
-            snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never());
+            snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never(), None);
         eprintln!(
             "scope.symbols at LHS (17, 0): xyz in scope? {}",
             lhs_scope.symbols.contains_key("xyz")
@@ -35722,7 +35744,7 @@ x
 
         // And at (16, 0) - the line BEFORE xyz = xyz, no assignment yet.
         let prev_scope =
-            snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never());
+            snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never(), None);
         eprintln!(
             "scope.symbols at (16, 0): xyz in scope? {}",
             prev_scope.symbols.contains_key("xyz")
@@ -35751,7 +35773,7 @@ x
         // Lock in the fix: with the cross-file scope leak fixed, xyz must NOT
         // be in scope at the RHS of `xyz = xyz`, and the undefined-variable
         // diagnostic must fire on data.r.
-        let scope_rhs = snapshot.get_scope(&data_uri, 17, 6, &DiagCancelToken::never());
+        let scope_rhs = snapshot.get_scope(&data_uri, 17, 6, &DiagCancelToken::never(), None);
         assert!(
             !scope_rhs.symbols.contains_key("xyz"),
             "xyz must NOT leak back into data.r's scope at the RHS of its own assignment"
