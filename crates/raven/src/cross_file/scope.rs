@@ -2870,6 +2870,28 @@ where
         scope.chain.push(uri.clone());
     }
 
+    // ── Memo check (recursive calls only) ──
+    // At depth > 0, the result for (uri, line, col, inherited_packages) is
+    // reusable across different root queries because:
+    // - The same-file leak filter at the caller's merge point handles any
+    //   cycle-related differences in visited-map state.
+    // - The inherited_packages fingerprint captures the only other parameter
+    //   that varies between calls to the same file at the same position.
+    if current_depth > 0 {
+        if let Some(ref memo) = memo {
+            let fp = packages_fingerprint(inherited_packages);
+            let key = (uri.clone(), line, column, fp);
+            if let Some(cached) = memo.get(&key) {
+                // Update visited with the cached chain so cycle detection
+                // still works for subsequent sibling source() calls.
+                for chain_uri in &cached.chain {
+                    visited.entry(chain_uri.clone()).or_insert((u32::MAX, u32::MAX));
+                }
+                return cached.clone();
+            }
+        }
+    }
+
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
         None => return scope,
@@ -3488,6 +3510,19 @@ where
                         .or_insert_with(|| symbol.clone());
                 }
             }
+        }
+    }
+
+    // ── Memo store (recursive calls only) ──
+    // Cache the complete result so sibling queries at different positions
+    // can reuse parent and child resolutions. Only store on normal
+    // completion — early returns (max depth, visited-at-wider-position,
+    // cancelled) produce partial results that must not be cached.
+    if current_depth > 0 {
+        if let Some(ref mut memo) = memo {
+            let fp = packages_fingerprint(inherited_packages);
+            let key = (uri.clone(), line, column, fp);
+            memo.insert(key, scope.clone());
         }
     }
 
