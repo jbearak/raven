@@ -2083,12 +2083,10 @@ impl LanguageServer for Backend {
                         max_chain_depth,
                     );
 
-                    // Collect package names for prefetch
+                    // Collect package names for prefetch (validate names to
+                    // reject suspicious inputs before R subprocess calls)
                     let pkgs: Vec<String> = if packages_enabled {
-                        meta.library_calls
-                            .iter()
-                            .map(|c| c.package.clone())
-                            .collect()
+                        extract_loaded_packages_from_library_calls(&meta.library_calls)
                     } else {
                         Vec::new()
                     };

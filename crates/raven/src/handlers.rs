@@ -5020,6 +5020,9 @@ impl<'a> BreakpointFastPath<'a> {
         positions.dedup();
 
         for &(l, c) in &positions {
+            if cancel.is_cancelled() {
+                break;
+            }
             if !scope_cache.contains_key(&(l, c)) {
                 let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
                 scope_cache.insert((l, c), computed);
