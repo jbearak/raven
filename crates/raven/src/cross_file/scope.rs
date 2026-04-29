@@ -12633,17 +12633,6 @@ y <- filter(df)"#;
                 ).expect("stream construction must succeed");
 
                 for &(line, col) in &positions {
-                    // Known divergence at the (0, 0) boundary: ScopeStream
-                    // applies events whose effect position is (0, 0) on its
-                    // first advance_to(0, 0) call (per AGENTS.md learning),
-                    // while scope_at_position_with_graph_cached treats (0, 0)
-                    // as strictly before any event there. The two definitions
-                    // disagree only on this one boundary; skip it here and
-                    // track the underlying alignment as a follow-up.
-                    if line == 0 && col == 0 {
-                        stream.advance_to(line, col);
-                        continue;
-                    }
                     stream.advance_to(line, col);
                     let streamed = stream.snapshot();
 
