@@ -2264,6 +2264,7 @@ mod integration_tests {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Requirement 12.2: Declared symbol from indexed child file should be available
