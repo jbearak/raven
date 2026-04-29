@@ -870,11 +870,31 @@ Internally this resolves the child URI (via `graph.get_dependencies` lookup, mir
 * **Coalescing scope queries across diagnostic collectors.** Each collector has its own traversal pattern; `ScopeStream` is reconstructed per collector. Cross-collector coalescing is a bigger refactor not worth the coupling.
 * **Parallelizing `scan_workspace`.** Separate plan (Tier 1 of the cold-start lag investigation, ~890 ms saved) — covered in `crates/raven/examples/profile_worldwide.rs`'s "FIX EXPERIMENT B" output. This plan is independent and additive.
 
-## Kickoff prompt for a fresh session
+## Kickoff prompt for a fresh session — Stage 2 (Stage 1 already committed)
 
 Paste this into a fresh Claude Code session in worktree `/Users/jmb/.t3/worktrees/raven/t3code-9723b935`:
 
-> I'm continuing work on the Raven R LSP performance investigation on branch `t3code/optimize-diagnostic-updates`. The previous session measured the cold-start lag on `~/repos/worldwide/scripts/data.r` and produced an implementation plan at `.claude/plans/incremental-scope-resolution.md`. Read that plan in full — it's self-contained and includes background context, the architectural insight, two stages of tasks (Stage 1 caches the parent walk, Stage 2 streams the timeline), and risk/rollback notes. Both stages are required.
+> I'm continuing work on the Raven R LSP performance investigation on branch `t3code/incremental-scope-res`. Stage 1 of `.claude/plans/incremental-scope-resolution.md` is committed (commit `325f2de`, "perf: cache STEP 1 parent walk per snapshot"). I need you to execute Stage 2 (`ScopeStream`) — see the "Stage 2 — streaming STEP 2 over the timeline" section of the plan, tasks S2.1 through S2.8.
+>
+> Stage 1 results (already measured and saved):
+> - Baseline `data.r` post-scan diag: **680 ms** (`.claude/plans/incremental-scope-resolution-baseline.txt`).
+> - After Stage 1: **202 ms** (3.4× faster, `.claude/plans/incremental-scope-resolution-after-stage1.txt`).
+> - Codex profiling confirmed the cache is healthy: 359/360 cache hits on data.r, ~2 ms one-time STEP 1 compute, ~150 ms residual is per-position STEP 2 timeline replay × 360 positions, ~40 ms is collector overhead outside `get_scope`. Stage 2 targets that ~150 ms.
+> - Plan target for Stage 2: `data.r` POST-scan diag < 30 ms.
+>
+> Important constraints (from the plan, from `CLAUDE.md`, and from Stage 1 work):
+> - Same-file leak filters from 91c3617/65b2959 are upstream of `ScopeStream`. Two of them live inside `parent_prefix_at` (so every cached prefix entry already filters); the third lives in `handlers.rs:5094-5118` (the snapshot out-of-scope collector) and Stage 2 must still call `stream.snapshot()` when that branch is taken. S2.3's property test and S1.4's `test_cached_path_preserves_xyz_self_leak_filter` cover the regression surface — the new ScopeStream code must keep both passing.
+> - **3025** unit tests must continue passing (3013 baseline + 2 cache unit tests in `cross_file::scope::tests` + 10 function-form tests in `position_aware_tests`). Full suite is `cargo test --release -p raven --lib --features test-support` (~10 s).
+> - Don't hold the `WorldState` read lock across expensive operations; per-snapshot caches live inside `DiagnosticsSnapshot`.
+> - Measurement harness: `cargo run --release --example profile_worldwide --features test-support`. Save Stage 2 output to `.claude/plans/incremental-scope-resolution-after-stage2.txt`.
+> - The cached entry point is `scope::scope_at_position_with_graph_cached` (already wired through `DiagnosticsSnapshot::get_scope`). Stage 2's `compute_or_get_cached_prefix` (S2.1) should reuse `ParentPrefixCache` so child-source recursion benefits from the same Stage-1 caching.
+> - Stage 1 made the recursive function take an `Option<&Arc<ParentPrefix>>` parameter (`pre_computed_prefix`) — the cached path passes `Some`, all internal recursion passes `None`. Stage 2 may use the same pattern when `resolve_source_contribution` recurses into a child URI.
+>
+> Read the full plan at `.claude/plans/incremental-scope-resolution.md` (background, architectural insight, and Stage 2 design). Execute S2.1 → S2.8 in order. After S2.6 measurements, report the numbers before committing — I want to see them. After Stage 2 commits, append the CLAUDE.md learnings entry listed in S2.7. Use the `superpowers:systematic-debugging` skill if you hit a regression and the `codex:codex-rescue` agent for second opinions on tricky correctness decisions in `advance_to` or `resolve_source_contribution`.
+
+For reference, the original kickoff prompt that initiated this work (when both stages were still pending) was:
+
+> I'm continuing work on the Raven R LSP performance investigation on branch `t3code/incremental-scope-res`. The previous session measured the cold-start lag on `~/repos/worldwide/scripts/data.r` and produced an implementation plan at `.claude/plans/incremental-scope-resolution.md`. Read that plan in full — it's self-contained and includes background context, the architectural insight, two stages of tasks (Stage 1 caches the parent walk, Stage 2 streams the timeline), and risk/rollback notes. Both stages are required.
 >
 > Important constraints from the plan and from `CLAUDE.md`:
 > - The recent commits 91c3617 and 65b2959 added same-file leak filters at three cross-file merge points. Don't regress them.
