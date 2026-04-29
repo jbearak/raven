@@ -97,6 +97,17 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
+
+    /// STEP 1 (parent walk) cache shared across all `get_scope` calls in this
+    /// snapshot's diagnostic pass. STEP 1 is position-invariant within one
+    /// pass for a given URI (parametrized only by `query_inside_function`),
+    /// so two cache slots per URI eliminate redundant parent-walk work
+    /// across the per-identifier scope queries.
+    ///
+    /// `RefCell` because `get_scope` is called via `&self` and needs to
+    /// mutate the cache. The snapshot is owned by a single tokio task; no
+    /// `Sync` bound is required.
+    pub(crate) parent_prefix_cache: std::cell::RefCell<scope::ParentPrefixCache>,
 }
 
 impl DiagnosticsSnapshot {
@@ -199,10 +210,15 @@ impl DiagnosticsSnapshot {
             cycle_detection,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
+            parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
         })
     }
 
     /// Resolve cross-file scope from pre-collected snapshot data.
+    ///
+    /// Routes through `scope_at_position_with_graph_cached` so STEP 1 (the
+    /// parent walk) is memoized across the snapshot's many per-identifier
+    /// scope queries.
     fn get_scope(
         &self,
         uri: &Url,
@@ -219,7 +235,8 @@ impl DiagnosticsSnapshot {
 
         let is_cancelled = || cancel.is_cancelled();
 
-        scope::scope_at_position_with_graph(
+        let mut cache = self.parent_prefix_cache.borrow_mut();
+        scope::scope_at_position_with_graph_cached(
             uri,
             line,
             column,
@@ -232,6 +249,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.hoist_globals_in_functions,
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
+            &mut cache,
         )
     }
 }
@@ -35778,6 +35796,319 @@ x
             "Sanity check failed: somepkg must be in scope at line 6 (after \
              `library(somepkg)`). loaded_packages={:?}",
             scope_at_end.loaded_packages
+        );
+    }
+
+    // ========================================================================
+    // ParentPrefixCache (Stage 1) regression tests
+    //
+    // For every supported function-form (left/right/super arrow, equals,
+    // R 4.1+ lambda, paren-wrapped recursive, anonymous-as-call-arg) and a
+    // 4-file backward-cycle fixture (the worldwide-data.r self-leak shape),
+    // confirm that the cached scope path produces ScopeAtPosition values
+    // equal to the uncached path at every queried position.
+    //
+    // The same-file leak filters from commits 91c3617 / 65b2959 must also
+    // apply through the cached path: in the multi-file fixture, `xyz` must
+    // NOT be in scope at the RHS of `xyz <- xyz`.
+    // ========================================================================
+
+    /// Build a single-file snapshot from `text` and run `queries` through both
+    /// the cached and uncached scope paths. Asserts the two paths produce
+    /// equal symbol sets, inherited/loaded packages, and depth_exceeded at
+    /// every position.
+    fn assert_cached_matches_uncached(text: &str, queries: &[(u32, u32)]) {
+        use std::collections::BTreeSet;
+
+        let mut state = create_test_state();
+        state.cross_file_config.undefined_variables_enabled = true;
+        let uri = add_document(&mut state, "file:///test/cache.R", text);
+        state.cross_file_graph.update_file(
+            &uri,
+            &crate::cross_file::extract_metadata(text),
+            None,
+            |_| None,
+        );
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+
+        let get_artifacts =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
+                snapshot.artifacts_map.get(target_uri).cloned()
+            };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                snapshot.metadata_map.get(target_uri).cloned()
+            };
+
+        let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+
+        for &(line, col) in queries {
+            let cached = crate::cross_file::scope::scope_at_position_with_graph_cached(
+                &uri,
+                line,
+                col,
+                &get_artifacts,
+                &get_metadata,
+                &snapshot.cross_file_graph,
+                snapshot.workspace_folders.first(),
+                snapshot.cross_file_config.max_chain_depth,
+                &snapshot.base_exports,
+                snapshot.cross_file_config.hoist_globals_in_functions,
+                snapshot.cross_file_config.backward_dependencies,
+                &|| false,
+                &mut cache,
+            );
+            let direct = crate::cross_file::scope::scope_at_position_with_graph(
+                &uri,
+                line,
+                col,
+                &get_artifacts,
+                &get_metadata,
+                &snapshot.cross_file_graph,
+                snapshot.workspace_folders.first(),
+                snapshot.cross_file_config.max_chain_depth,
+                &snapshot.base_exports,
+                snapshot.cross_file_config.hoist_globals_in_functions,
+                snapshot.cross_file_config.backward_dependencies,
+                &|| false,
+            );
+
+            let cached_keys: BTreeSet<&str> =
+                cached.symbols.keys().map(|n| n.as_ref()).collect();
+            let direct_keys: BTreeSet<&str> =
+                direct.symbols.keys().map(|n| n.as_ref()).collect();
+            assert_eq!(
+                cached_keys, direct_keys,
+                "symbol set differs at ({line}, {col}) for fixture:\n{text}"
+            );
+            assert_eq!(
+                cached.inherited_packages, direct.inherited_packages,
+                "inherited_packages differ at ({line}, {col}) for fixture:\n{text}"
+            );
+            assert_eq!(
+                cached.loaded_packages, direct.loaded_packages,
+                "loaded_packages differ at ({line}, {col}) for fixture:\n{text}"
+            );
+            assert_eq!(
+                cached.depth_exceeded, direct.depth_exceeded,
+                "depth_exceeded differ at ({line}, {col}) for fixture:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cached_left_arrow_function() {
+        // `f <- function() { y <- 1; y }`
+        assert_cached_matches_uncached(
+            "f <- function() { y <- 1; y }\n",
+            &[(0, 0), (0, 5), (0, 18), (0, 24), (0, 28), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_equals_function() {
+        // `f = function() { y <- 1; y }`
+        assert_cached_matches_uncached(
+            "f = function() { y <- 1; y }\n",
+            &[(0, 0), (0, 5), (0, 17), (0, 23), (0, 27), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_super_assignment_function() {
+        // `f <<- function() { y <- 1; y }`
+        assert_cached_matches_uncached(
+            "f <<- function() { y <- 1; y }\n",
+            &[(0, 0), (0, 5), (0, 19), (0, 25), (0, 29), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_right_arrow_paren_function() {
+        // Right-arrow function-binding requires parens around the function
+        // (per CLAUDE.md learnings): `(function() { y <- 1; y }) -> f`
+        assert_cached_matches_uncached(
+            "(function() { y <- 1; y }) -> f\n",
+            &[(0, 0), (0, 14), (0, 21), (0, 26), (0, 30), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_right_super_paren_function() {
+        // `(function() { y <- 1; y }) ->> f`
+        assert_cached_matches_uncached(
+            "(function() { y <- 1; y }) ->> f\n",
+            &[(0, 0), (0, 14), (0, 21), (0, 28), (0, 31), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_paren_wrapped_recursive() {
+        // Paren-wrapped recursive function: `f <- (function() f())`.
+        // visible_from is the LHS so `f` is visible inside the body.
+        assert_cached_matches_uncached(
+            "f <- (function() f())\n",
+            &[(0, 0), (0, 5), (0, 17), (0, 19), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_lambda_backslash() {
+        // R 4.1+ lambda: `f <- \(x) x + 1`. tree-sitter-r normalizes \(x)
+        // into function_definition.
+        assert_cached_matches_uncached(
+            "f <- \\(x) x + 1\n",
+            &[(0, 0), (0, 5), (0, 8), (0, 10), (0, 14), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_anonymous_lambda_in_call() {
+        // Anonymous lambda passed as a call argument:
+        // `ys <- sapply(xs, \(p) p + 1)`. The lambda's body should be a
+        // FunctionScope event in the timeline.
+        assert_cached_matches_uncached(
+            "xs <- 1:5\nys <- sapply(xs, \\(p) p + 1)\n",
+            &[
+                (0, 0),
+                (0, 5),
+                (1, 0),
+                (1, 6),
+                (1, 18),
+                (1, 22),
+                (1, 27),
+                (2, 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_cached_bare_function_arrow_local_binding() {
+        // Bare `function() { ... } -> name` (no parens) is NOT a right-arrow
+        // function binding. tree-sitter-r parses the whole thing as a single
+        // function_definition whose body is `{ ... } -> name`. `name` becomes
+        // a function-LOCAL binding. The cached path must agree with the
+        // uncached path on this oddity.
+        assert_cached_matches_uncached(
+            "function() { x <- 1; x } -> f\n",
+            &[(0, 0), (0, 11), (0, 20), (0, 24), (0, 28), (1, 0)],
+        );
+    }
+
+    /// Mirrors the multi-file `xyz <- xyz` self-referential shape that
+    /// commits 91c3617 / 65b2959 fixed. Confirms the same-file leak filter
+    /// still applies when scope is resolved via the cached path: at the
+    /// RHS of `xyz <- xyz` on data.R, `xyz` must NOT be in scope (the
+    /// binding is not visible in its own RHS, and the recursion through
+    /// main.R → indices.R → main.R@MAX → data.R@MAX must not leak data.R's
+    /// own later definition back into the narrower query scope).
+    #[test]
+    fn test_cached_path_preserves_xyz_self_leak_filter() {
+        use std::collections::BTreeSet;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let covariates_uri = Url::parse("file:///workspace/covariates.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+
+        let main_code = "source(\"data.R\")\n";
+        let data_code = "source(\"covariates.R\")\nxyz = xyz\nsource(\"indices.R\")\n";
+        let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
+        let indices_code = "idx_a <- 10\n";
+
+        let mut state = create_test_state();
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&covariates_uri, covariates_code),
+            (&indices_uri, indices_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
+
+        let get_artifacts =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
+                snapshot.artifacts_map.get(target_uri).cloned()
+            };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                snapshot.metadata_map.get(target_uri).cloned()
+            };
+
+        // RHS of `xyz = xyz` on line 1 (0-indexed). The `=` is at col 4,
+        // RHS `xyz` starts at col 6.
+        let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+        let cached = crate::cross_file::scope::scope_at_position_with_graph_cached(
+            &data_uri,
+            1,
+            6,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.cross_file_graph,
+            snapshot.workspace_folders.first(),
+            snapshot.cross_file_config.max_chain_depth,
+            &snapshot.base_exports,
+            snapshot.cross_file_config.hoist_globals_in_functions,
+            snapshot.cross_file_config.backward_dependencies,
+            &|| false,
+            &mut cache,
+        );
+
+        // The same-file leak filter must keep `xyz` out of scope at its own RHS.
+        // Other symbols introduced by sibling files via main.R may still be
+        // present (cov_a, cov_b from covariates.R sourced before xyz = xyz).
+        assert!(
+            !cached.symbols.contains_key("xyz"),
+            "Cached path leaked `xyz` back into its own RHS scope. \
+             scope.symbols = {:?}",
+            cached
+                .symbols
+                .keys()
+                .map(|n| n.as_ref())
+                .collect::<BTreeSet<&str>>()
+        );
+
+        // Sanity: the cached path produces the same scope as the uncached path.
+        let direct = crate::cross_file::scope::scope_at_position_with_graph(
+            &data_uri,
+            1,
+            6,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.cross_file_graph,
+            snapshot.workspace_folders.first(),
+            snapshot.cross_file_config.max_chain_depth,
+            &snapshot.base_exports,
+            snapshot.cross_file_config.hoist_globals_in_functions,
+            snapshot.cross_file_config.backward_dependencies,
+            &|| false,
+        );
+        let cached_keys: BTreeSet<&str> = cached
+            .symbols
+            .keys()
+            .map(|n| n.as_ref())
+            .collect();
+        let direct_keys: BTreeSet<&str> = direct
+            .symbols
+            .keys()
+            .map(|n| n.as_ref())
+            .collect();
+        assert_eq!(
+            cached_keys, direct_keys,
+            "Cached and uncached scopes differ at xyz <- xyz RHS"
         );
     }
 }

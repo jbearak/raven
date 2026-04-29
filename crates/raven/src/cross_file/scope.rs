@@ -2747,7 +2747,473 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
+        None,
     )
+}
+
+// ============================================================================
+// Cached scope-at-position entry point (Stage 1)
+// ============================================================================
+
+/// Per-snapshot cache for `ParentPrefix` results, keyed by `(target URI,
+/// query_inside_function)`.
+///
+/// Lives inside `DiagnosticsSnapshot` so it shares the snapshot's lifetime;
+/// never shared across snapshots. Within one diagnostic pass, all scope queries
+/// against the same URI reuse the same prefix entries.
+#[derive(Debug, Default)]
+pub struct ParentPrefixCache {
+    entries: HashMap<(Url, bool), Arc<ParentPrefix>>,
+}
+
+impl ParentPrefixCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Cached counterpart of `scope_at_position_with_graph`. Memoizes STEP 1
+/// (the parent walk) per `(uri, query_inside_function)` inside the supplied
+/// `ParentPrefixCache`. STEP 2 still runs per call.
+///
+/// For acyclic dependency graphs (the common case), the cached prefix is
+/// genuinely position-invariant. For cyclic graphs, the cached value is
+/// approximate — the first query's `(line, column)` seeds the visited map
+/// used during STEP 1 — but `entry`/`or_insert` merging keeps STEP 2 sound.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_cached<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &mut ParentPrefixCache,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    // Determine query_inside_function for the queried URI at (line, column).
+    // This is the only bit that splits the cache for a given URI.
+    let inside = match get_artifacts(uri) {
+        Some(art) => {
+            hoist_globals
+                && !active_function_scopes_at(&art.function_scope_tree, line, column).is_empty()
+        }
+        None => false,
+    };
+
+    // Cache lookup. On hit, we share the Arc with the caller. On miss, we
+    // compute the prefix (mirroring STEP 1's visited[uri] = (line, col)
+    // semantics) and insert into the cache.
+    let prefix_arc: Arc<ParentPrefix> =
+        if let Some(arc) = prefix_cache.entries.get(&(uri.clone(), inside)).cloned() {
+            arc
+        } else {
+            let mut visited = HashMap::new();
+            // Mirror the recursive function's behavior: visited[uri] is set to
+            // (line, col) before STEP 1 runs. For acyclic graphs this never
+            // matters; for cyclic graphs it controls the revisit short-circuit
+            // and we accept slight approximation across cache hits.
+            visited.insert(uri.clone(), (line, column));
+            let computed = parent_prefix_at(
+                uri,
+                inside,
+                get_artifacts,
+                get_metadata,
+                graph,
+                workspace_root,
+                max_depth,
+                0,
+                &mut visited,
+                base_exports,
+                hoist_globals,
+                backward_dep_mode,
+                is_cancelled,
+            );
+            let arc = Arc::new(computed);
+            prefix_cache
+                .entries
+                .insert((uri.clone(), inside), arc.clone());
+            arc
+        };
+
+    // Build initial PathContext for the queried URI (mirrors the public
+    // uncached entry point).
+    let meta = get_metadata(uri);
+    let path_ctx = meta
+        .as_ref()
+        .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
+        .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
+
+    // Hand the precomputed prefix to the recursive function so STEP 1 is
+    // skipped at depth 0; STEP 2 runs as usual.
+    let mut visited = HashMap::new();
+    let empty_packages = HashSet::new();
+    scope_at_position_with_graph_recursive(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        path_ctx,
+        max_depth,
+        0,
+        &mut visited,
+        &empty_packages,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        Some(&prefix_arc),
+    )
+}
+
+/// Cached result of STEP 1 (the parent walk) for a queried URI.
+///
+/// Position-invariant within one `DiagnosticsSnapshot`'s diagnostic pass:
+/// parametrized only by `query_inside_function` (selects whether parents
+/// were queried at their call-site or at MAX), so callers cache two slots
+/// per URI.
+///
+/// Same-file leak filters from commits 91c3617/65b2959 are applied while
+/// computing this struct; the cached value is post-filter and safe to reuse.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParentPrefix {
+    pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    pub chain: Vec<Url>,
+    pub depth_exceeded: Vec<(Url, u32, u32)>,
+    pub inherited_packages: HashSet<String>,
+    pub loaded_packages: HashSet<String>,
+    pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
+}
+
+/// STEP 1 of `scope_at_position_with_graph_recursive`: collect parent (backward)
+/// contributions for `uri` at the given query position.
+///
+/// Returns a fresh `ParentPrefix` containing the merged parent symbols (with
+/// same-file leak filters applied), inherited packages, package origins, chain,
+/// and depth-exceeded entries. Does NOT include base exports — those are still
+/// injected by the caller at depth 0 before merging the prefix.
+///
+/// `query_inside_function` selects how parents are queried:
+/// - `false` (top-level): parents are queried at their call-site `(line, col)`.
+/// - `true` (inside function with `hoist_globals`): parents are queried at
+///   `(MAX, MAX)` to expose their full global scope (R late-binding semantics).
+///
+/// Cancellation: if `is_cancelled()` returns true between iterations, the
+/// returned `ParentPrefix` contains contributions from completed iterations
+/// only; the caller is responsible for re-checking cancellation and skipping
+/// STEP 2.
+#[allow(clippy::too_many_arguments)]
+fn parent_prefix_at<F, G>(
+    uri: &Url,
+    query_inside_function: bool,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    current_depth: usize,
+    visited: &mut HashMap<Url, (u32, u32)>,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+) -> ParentPrefix
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    let mut prefix = ParentPrefix::default();
+
+    // Get edges where this file is the child (callee)
+    //
+    // If multiple edges exist from the same parent (e.g., AST-detected source()
+    // plus an explicit backward directive), prefer the most inclusive call site
+    // so that `line=eof` correctly includes symbols from later sources.
+    let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
+    let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
+    for edge in graph.get_dependents(uri) {
+        let entry = parent_edge_indices.get(&edge.from).copied();
+        match entry {
+            Some(existing_index) => {
+                let existing = parent_edges[existing_index];
+                // None means "call site couldn't be resolved"; u32::MAX makes
+                // unresolved edges the most inclusive so they inherit the full
+                // parent scope (consistent with unwrap_or(u32::MAX) below).
+                let existing_call_site = (
+                    existing.call_site_line.unwrap_or(u32::MAX),
+                    existing.call_site_column.unwrap_or(u32::MAX),
+                );
+                let candidate_call_site = (
+                    edge.call_site_line.unwrap_or(u32::MAX),
+                    edge.call_site_column.unwrap_or(u32::MAX),
+                );
+
+                let should_replace = if candidate_call_site > existing_call_site {
+                    true
+                } else if candidate_call_site == existing_call_site {
+                    if edge.local != existing.local {
+                        // Prefer non-local edge (more inclusive)
+                        !edge.local
+                    } else if edge.is_backward_directive != existing.is_backward_directive {
+                        edge.is_backward_directive
+                    } else if edge.is_directive != existing.is_directive {
+                        edge.is_directive
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if should_replace {
+                    parent_edges[existing_index] = edge;
+                }
+            }
+            None => {
+                parent_edge_indices.insert(edge.from.clone(), parent_edges.len());
+                parent_edges.push(edge);
+            }
+        }
+    }
+
+    // Filter backward edges based on the backward dependency mode.
+    //
+    // - Explicit: Only use backward-directive edges (edges created from
+    //   @lsp-sourced-by directives). Forward-created backward entries from
+    //   the workspace scan are ignored.
+    // - Auto: Use all backward edges, UNLESS the file has explicit backward
+    //   directives — then only use those (per-file opt-out).
+    match backward_dep_mode {
+        super::config::BackwardDependencyMode::Explicit => {
+            parent_edges.retain(|e| e.is_backward_directive);
+        }
+        super::config::BackwardDependencyMode::Auto => {
+            let file_has_backward_directives =
+                get_metadata(uri).map_or(false, |m| !m.sourced_by.is_empty());
+            if file_has_backward_directives {
+                parent_edges.retain(|e| e.is_backward_directive);
+            }
+        }
+    }
+
+    for edge in parent_edges {
+        // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
+        // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
+        // Regular symbols are not inherited when local=TRUE
+        let is_local_scoped = if edge.local {
+            true
+        } else if edge.is_sys_source {
+            // For sys.source, check if it's targeting global env
+            if let Some(meta) = get_metadata(&edge.from) {
+                !meta.sources.iter().any(|s| {
+                    s.is_sys_source
+                        && s.sys_source_global_env
+                        && s.line == edge.call_site_line.unwrap_or(u32::MAX)
+                })
+            } else {
+                true // Assume non-global if no metadata
+            }
+        } else {
+            false
+        };
+
+        // Get call site position for filtering
+        let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
+        let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
+
+        // Check if we would exceed max depth
+        if current_depth + 1 >= max_depth {
+            prefix
+                .depth_exceeded
+                .push((uri.clone(), call_site_line, call_site_col));
+            continue;
+        }
+
+        // Build PathContext for parent
+        let parent_meta = get_metadata(&edge.from);
+        let parent_ctx = parent_meta
+            .as_ref()
+            .and_then(|m| {
+                super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root)
+            })
+            .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
+
+        // Get parent's scope at the call site (or EOF when hoisting from inside a function).
+        // When the child query is inside a function body, R's late-binding means we need
+        // the parent's full global scope, not just what's defined before the source() call.
+        // Note: We pass empty inherited_packages here because the parent will collect
+        // its own inherited packages from its parents via the dependency graph
+        // We pass base_exports since child files also need access to base R functions
+        let (parent_query_line, parent_query_col) = if query_inside_function {
+            (u32::MAX, u32::MAX)
+        } else {
+            (call_site_line, call_site_col)
+        };
+        // Early exit on cancellation before expensive recursive traversal
+        if is_cancelled() {
+            return prefix;
+        }
+
+        let empty_packages = HashSet::new();
+        let parent_scope = scope_at_position_with_graph_recursive(
+            &edge.from,
+            parent_query_line,
+            parent_query_col,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            parent_ctx,
+            max_depth,
+            current_depth + 1,
+            visited,
+            &empty_packages, // Parent collects its own inherited packages
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            None,
+        );
+
+        // Merge parent symbols (they are available at the START of this file)
+        // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
+        // (declarations describe symbol existence, not export behavior)
+        //
+        // Filter out symbols whose `source_uri` is the current file: those
+        // are *our own* bindings and their visibility at the query position
+        // is owned by the local timeline (with proper `visible_from`
+        // semantics). A cross-file path that revisits this file at a wider
+        // position (e.g. data.R → main.R → shrinkage.R → main.R@MAX → data.R@MAX)
+        // would otherwise leak our own later definitions back into our scope
+        // at the original narrow query position, suppressing legitimate
+        // "Undefined variable" diagnostics on self-referential assignments
+        // like `xyz <- xyz`. Same-file symbols always re-enter via STEP 2's
+        // visible_from-aware Def event, so filtering here is safe.
+        for (name, symbol) in parent_scope.symbols {
+            if symbol.source_uri == *uri {
+                continue;
+            }
+            if is_local_scoped {
+                // For local-scoped edges, only inherit declared symbols
+                if symbol.is_declared {
+                    prefix.symbols.entry(name).or_insert(symbol);
+                }
+            } else {
+                // For non-local edges, inherit all symbols
+                prefix.symbols.entry(name).or_insert(symbol);
+            }
+        }
+        prefix.chain.extend(parent_scope.chain);
+        prefix.depth_exceeded.extend(parent_scope.depth_exceeded);
+
+        // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
+        // Collect packages loaded in parent before the source() call site
+        // These packages are available in the child file from position (0, 0)
+        // When hoisting (child query is inside a function body), use EOF to include
+        // all global packages from the parent (matching R late-binding semantics).
+        let (effective_call_site_line, effective_call_site_col) = if query_inside_function {
+            (u32::MAX, u32::MAX)
+        } else {
+            (call_site_line, call_site_col)
+        };
+        if let Some(parent_artifacts) = get_artifacts(&edge.from) {
+            for event in &parent_artifacts.timeline {
+                if let ScopeEvent::PackageLoad {
+                    line: pkg_line,
+                    column: pkg_col,
+                    package,
+                    function_scope,
+                } = event
+                {
+                    // Only propagate packages loaded before the effective call site
+                    // Requirement 5.1: Package loaded before source() call is available in sourced file
+                    if (*pkg_line, *pkg_col)
+                        <= (effective_call_site_line, effective_call_site_col)
+                    {
+                        // Requirement 5.3: Respect function scope - only propagate global packages
+                        // or packages in the same function scope as the source() call
+                        let should_propagate = match function_scope {
+                            None => true, // Global package load - always propagate
+                            Some(pkg_scope) => {
+                                // Function-scoped package load - only propagate if the source() call
+                                // is within the same function scope or nested inside it
+                                let call_site_scope = parent_artifacts
+                                    .function_scope_tree
+                                    .query_innermost(Position::new(
+                                        effective_call_site_line,
+                                        effective_call_site_col,
+                                    ));
+                                is_same_or_descendant_function_scope(
+                                    call_site_scope,
+                                    *pkg_scope,
+                                )
+                            }
+                        };
+
+                        if should_propagate {
+                            prefix.inherited_packages.insert(package.clone());
+                            // Record the parent file as origin so downstream
+                            // merge sites can apply the same-file leak filter.
+                            record_package_origin(
+                                &mut prefix.package_origins,
+                                package,
+                                &edge.from,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also propagate packages that the parent inherited from its parents.
+        // Requirement 5.2: Inherit loaded packages from parent up to call site.
+        //
+        // Same-file leak filter: skip packages whose only known origin is
+        // the queried file (`*uri`). A recursive cross-file path that
+        // revisits the queried file at a wider position would otherwise
+        // import the queried file's own later `library()` calls back into
+        // a narrow query scope. The local-timeline PackageLoad pass below
+        // handles same-file packages with proper position semantics.
+        for pkg in &parent_scope.inherited_packages {
+            if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                continue;
+            }
+            prefix.inherited_packages.insert(pkg.clone());
+            propagate_package_origins(&parent_scope.package_origins, pkg, &mut prefix.package_origins);
+        }
+
+        // Also propagate packages that are loaded in the parent at the call site.
+        // This includes packages loaded in sourced files before the call site.
+        for pkg in &parent_scope.loaded_packages {
+            if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                continue;
+            }
+            prefix.inherited_packages.insert(pkg.clone());
+            propagate_package_origins(&parent_scope.package_origins, pkg, &mut prefix.package_origins);
+        }
+    }
+
+    prefix
 }
 
 /// Compute the lexical and cross-file scope visible at a position using the dependency graph.
@@ -2780,6 +3246,12 @@ fn scope_at_position_with_graph_recursive<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    // Optional pre-computed STEP 1 result. When `Some`, the recursive function
+    // skips computing `parent_prefix_at` itself and merges the supplied prefix
+    // into `scope` directly. The cached entry point uses this to memoize STEP
+    // 1 across snapshots' diagnostic passes. Internal recursion (parent walks
+    // in `parent_prefix_at`, forward children in STEP 2) always passes `None`.
+    pre_computed_prefix: Option<&Arc<ParentPrefix>>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -2859,272 +3331,85 @@ where
         // We don't need parent symbols again — they were already merged
         // into the caller's scope during the first visit.
     } else {
-        // Get edges where this file is the child (callee)
-        //
-        // If multiple edges exist from the same parent (e.g., AST-detected source()
-        // plus an explicit backward directive), prefer the most inclusive call site
-        // so that `line=eof` correctly includes symbols from later sources.
-        let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
-        let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
-        for edge in graph.get_dependents(uri) {
-            let entry = parent_edge_indices.get(&edge.from).copied();
-            match entry {
-                Some(existing_index) => {
-                    let existing = parent_edges[existing_index];
-                    // None means "call site couldn't be resolved"; u32::MAX makes
-                    // unresolved edges the most inclusive so they inherit the full
-                    // parent scope (consistent with unwrap_or(u32::MAX) below).
-                    let existing_call_site = (
-                        existing.call_site_line.unwrap_or(u32::MAX),
-                        existing.call_site_column.unwrap_or(u32::MAX),
-                    );
-                    let candidate_call_site = (
-                        edge.call_site_line.unwrap_or(u32::MAX),
-                        edge.call_site_column.unwrap_or(u32::MAX),
-                    );
-
-                    let should_replace = if candidate_call_site > existing_call_site {
-                        true
-                    } else if candidate_call_site == existing_call_site {
-                        if edge.local != existing.local {
-                            // Prefer non-local edge (more inclusive)
-                            !edge.local
-                        } else if edge.is_backward_directive != existing.is_backward_directive {
-                            edge.is_backward_directive
-                        } else if edge.is_directive != existing.is_directive {
-                            edge.is_directive
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if should_replace {
-                        parent_edges[existing_index] = edge;
-                    }
+        // Either reuse the supplied prefix (cached path) or compute it now.
+        // `parent_prefix_at` is the factored-out STEP 1 body; it returns
+        // parent-contributed symbols (post same-file-leak filter),
+        // inherited/loaded packages, package origins, chain entries, and
+        // depth-exceeded entries.
+        match pre_computed_prefix {
+            Some(prefix_arc) => {
+                let prefix = prefix_arc.as_ref();
+                for (name, symbol) in &prefix.symbols {
+                    scope
+                        .symbols
+                        .entry(name.clone())
+                        .or_insert_with(|| symbol.clone());
                 }
-                None => {
-                    parent_edge_indices.insert(edge.from.clone(), parent_edges.len());
-                    parent_edges.push(edge);
-                }
-            }
-        }
-
-        // Filter backward edges based on the backward dependency mode.
-        //
-        // - Explicit: Only use backward-directive edges (edges created from
-        //   @lsp-sourced-by directives). Forward-created backward entries from
-        //   the workspace scan are ignored.
-        // - Auto: Use all backward edges, UNLESS the file has explicit backward
-        //   directives — then only use those (per-file opt-out).
-        match backward_dep_mode {
-            super::config::BackwardDependencyMode::Explicit => {
-                parent_edges.retain(|e| e.is_backward_directive);
-            }
-            super::config::BackwardDependencyMode::Auto => {
-                let file_has_backward_directives =
-                    get_metadata(uri).map_or(false, |m| !m.sourced_by.is_empty());
-                if file_has_backward_directives {
-                    parent_edges.retain(|e| e.is_backward_directive);
-                }
-            }
-        }
-
-        for edge in parent_edges {
-            // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
-            // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
-            // Regular symbols are not inherited when local=TRUE
-            let is_local_scoped = if edge.local {
-                true
-            } else if edge.is_sys_source {
-                // For sys.source, check if it's targeting global env
-                if let Some(meta) = get_metadata(&edge.from) {
-                    !meta.sources.iter().any(|s| {
-                        s.is_sys_source
-                            && s.sys_source_global_env
-                            && s.line == edge.call_site_line.unwrap_or(u32::MAX)
-                    })
-                } else {
-                    true // Assume non-global if no metadata
-                }
-            } else {
-                false
-            };
-
-            // Get call site position for filtering
-            let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
-            let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
-
-            // Check if we would exceed max depth
-            if current_depth + 1 >= max_depth {
+                scope.chain.extend(prefix.chain.iter().cloned());
                 scope
                     .depth_exceeded
-                    .push((uri.clone(), call_site_line, call_site_col));
-                continue;
-            }
-
-            // Build PathContext for parent
-            let parent_meta = get_metadata(&edge.from);
-            let parent_ctx = parent_meta
-                .as_ref()
-                .and_then(|m| {
-                    super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root)
-                })
-                .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
-
-            // Get parent's scope at the call site (or EOF when hoisting from inside a function).
-            // When the child query is inside a function body, R's late-binding means we need
-            // the parent's full global scope, not just what's defined before the source() call.
-            // Note: We pass empty inherited_packages here because the parent will collect
-            // its own inherited packages from its parents via the dependency graph
-            // We pass base_exports since child files also need access to base R functions
-            let (parent_query_line, parent_query_col) = if query_inside_function {
-                (u32::MAX, u32::MAX)
-            } else {
-                (call_site_line, call_site_col)
-            };
-            // Early exit on cancellation before expensive recursive traversal
-            if is_cancelled() {
-                return scope;
-            }
-
-            let empty_packages = HashSet::new();
-            let parent_scope = scope_at_position_with_graph_recursive(
-                &edge.from,
-                parent_query_line,
-                parent_query_col,
-                get_artifacts,
-                get_metadata,
-                graph,
-                workspace_root,
-                parent_ctx,
-                max_depth,
-                current_depth + 1,
-                visited,
-                &empty_packages, // Parent collects its own inherited packages
-                base_exports,
-                hoist_globals,
-                backward_dep_mode,
-                is_cancelled,
-            );
-
-            // Merge parent symbols (they are available at the START of this file)
-            // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
-            // (declarations describe symbol existence, not export behavior)
-            //
-            // Filter out symbols whose `source_uri` is the current file: those
-            // are *our own* bindings and their visibility at the query position
-            // is owned by the local timeline (with proper `visible_from`
-            // semantics). A cross-file path that revisits this file at a wider
-            // position (e.g. data.R → main.R → shrinkage.R → main.R@MAX → data.R@MAX)
-            // would otherwise leak our own later definitions back into our scope
-            // at the original narrow query position, suppressing legitimate
-            // "Undefined variable" diagnostics on self-referential assignments
-            // like `xyz <- xyz`. Same-file symbols always re-enter via STEP 2's
-            // visible_from-aware Def event, so filtering here is safe.
-            for (name, symbol) in parent_scope.symbols {
-                if symbol.source_uri == *uri {
-                    continue;
+                    .extend(prefix.depth_exceeded.iter().cloned());
+                for pkg in &prefix.inherited_packages {
+                    scope.inherited_packages.insert(pkg.clone());
                 }
-                if is_local_scoped {
-                    // For local-scoped edges, only inherit declared symbols
-                    if symbol.is_declared {
-                        scope.symbols.entry(name).or_insert(symbol);
-                    }
-                } else {
-                    // For non-local edges, inherit all symbols
+                for pkg in &prefix.loaded_packages {
+                    scope.loaded_packages.insert(pkg.clone());
+                }
+                for (pkg, origins) in &prefix.package_origins {
+                    scope
+                        .package_origins
+                        .entry(pkg.clone())
+                        .or_default()
+                        .extend(origins.iter().cloned());
+                }
+            }
+            None => {
+                let prefix = parent_prefix_at(
+                    uri,
+                    query_inside_function,
+                    get_artifacts,
+                    get_metadata,
+                    graph,
+                    workspace_root,
+                    max_depth,
+                    current_depth,
+                    visited,
+                    base_exports,
+                    hoist_globals,
+                    backward_dep_mode,
+                    is_cancelled,
+                );
+
+                // Merge by move (no extra clones) — `entry().or_insert` for
+                // symbols preserves the depth-0 base_exports injection above
+                // and the "first parent wins" semantics within the prefix.
+                for (name, symbol) in prefix.symbols {
                     scope.symbols.entry(name).or_insert(symbol);
                 }
-            }
-            scope.chain.extend(parent_scope.chain);
-            scope.depth_exceeded.extend(parent_scope.depth_exceeded);
-
-            // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
-            // Collect packages loaded in parent before the source() call site
-            // These packages are available in the child file from position (0, 0)
-            // When hoisting (child query is inside a function body), use EOF to include
-            // all global packages from the parent (matching R late-binding semantics).
-            let (effective_call_site_line, effective_call_site_col) = if query_inside_function {
-                (u32::MAX, u32::MAX)
-            } else {
-                (call_site_line, call_site_col)
-            };
-            if let Some(parent_artifacts) = get_artifacts(&edge.from) {
-                for event in &parent_artifacts.timeline {
-                    if let ScopeEvent::PackageLoad {
-                        line: pkg_line,
-                        column: pkg_col,
-                        package,
-                        function_scope,
-                    } = event
-                    {
-                        // Only propagate packages loaded before the effective call site
-                        // Requirement 5.1: Package loaded before source() call is available in sourced file
-                        if (*pkg_line, *pkg_col)
-                            <= (effective_call_site_line, effective_call_site_col)
-                        {
-                            // Requirement 5.3: Respect function scope - only propagate global packages
-                            // or packages in the same function scope as the source() call
-                            let should_propagate = match function_scope {
-                                None => true, // Global package load - always propagate
-                                Some(pkg_scope) => {
-                                    // Function-scoped package load - only propagate if the source() call
-                                    // is within the same function scope or nested inside it
-                                    let call_site_scope = parent_artifacts
-                                        .function_scope_tree
-                                        .query_innermost(Position::new(
-                                            effective_call_site_line,
-                                            effective_call_site_col,
-                                        ));
-                                    is_same_or_descendant_function_scope(
-                                        call_site_scope,
-                                        *pkg_scope,
-                                    )
-                                }
-                            };
-
-                            if should_propagate {
-                                scope.inherited_packages.insert(package.clone());
-                                // Record the parent file as origin so downstream
-                                // merge sites can apply the same-file leak filter.
-                                record_package_origin(
-                                    &mut scope.package_origins,
-                                    package,
-                                    &edge.from,
-                                );
-                            }
-                        }
-                    }
+                scope.chain.extend(prefix.chain);
+                scope.depth_exceeded.extend(prefix.depth_exceeded);
+                for pkg in prefix.inherited_packages {
+                    scope.inherited_packages.insert(pkg);
+                }
+                for pkg in prefix.loaded_packages {
+                    scope.loaded_packages.insert(pkg);
+                }
+                for (pkg, origins) in prefix.package_origins {
+                    scope
+                        .package_origins
+                        .entry(pkg)
+                        .or_default()
+                        .extend(origins);
                 }
             }
+        }
 
-            // Also propagate packages that the parent inherited from its parents.
-            // Requirement 5.2: Inherit loaded packages from parent up to call site.
-            //
-            // Same-file leak filter: skip packages whose only known origin is
-            // the queried file (`*uri`). A recursive cross-file path that
-            // revisits the queried file at a wider position would otherwise
-            // import the queried file's own later `library()` calls back into
-            // a narrow query scope. The local-timeline PackageLoad pass below
-            // handles same-file packages with proper position semantics.
-            for pkg in &parent_scope.inherited_packages {
-                if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
-                    continue;
-                }
-                scope.inherited_packages.insert(pkg.clone());
-                propagate_package_origins(&parent_scope.package_origins, pkg, &mut scope.package_origins);
-            }
-
-            // Also propagate packages that are loaded in the parent at the call site.
-            // This includes packages loaded in sourced files before the call site.
-            for pkg in &parent_scope.loaded_packages {
-                if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
-                    continue;
-                }
-                scope.inherited_packages.insert(pkg.clone());
-                propagate_package_origins(&parent_scope.package_origins, pkg, &mut scope.package_origins);
-            }
+        // Preserve original cancellation behavior: if cancellation tripped
+        // mid-`parent_prefix_at`, skip STEP 2 just like the previous in-line
+        // `return scope` did. (The cached path won't trip here on a hit
+        // because the prefix is already complete.)
+        if is_cancelled() {
+            return scope;
         }
     } // end if !is_revisit (STEP 1)
 
@@ -3317,6 +3602,7 @@ where
                             hoist_globals,
                             backward_dep_mode,
                             is_cancelled,
+                            None,
                         );
                         // Merge child symbols (local definitions take precedence)
                         //
@@ -13472,6 +13758,303 @@ y <- filter(df)"#;
                 !scope.symbols.contains_key("parent_var"),
                 "With local=TRUE, child should NOT see parent_var. Got: {:?}",
                 scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // ========================================================================
+    // ParentPrefixCache (Stage 1) tests
+    // ========================================================================
+
+    /// Build a 2-file fixture (parent + child) where child forward-sources
+    /// parent at line 1. Returns the closures and URIs needed for cached /
+    /// uncached scope queries.
+    #[allow(clippy::type_complexity)]
+    fn build_cache_test_fixture() -> (
+        Url,
+        Url,
+        Url,
+        Arc<ScopeArtifacts>,
+        Arc<ScopeArtifacts>,
+        std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        crate::cross_file::dependency::DependencyGraph,
+    ) {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+
+        let parent_code = "library(stats)\nhelper <- function() 1\n";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts =
+            Arc::new(compute_artifacts(&parent_uri, &parent_tree, parent_code));
+        let parent_meta = std::sync::Arc::new(CrossFileMetadata::default());
+
+        // Child sources parent at line 0 col 0, then defines a function that
+        // uses `helper`, then uses `helper` at top-level too.
+        let child_code = "source(\"parent.R\")\nf <- function() {\n  helper()\n}\nx <- helper()\n";
+        let child_tree = parse_r(child_code);
+        let child_artifacts =
+            Arc::new(compute_artifacts(&child_uri, &child_tree, child_code));
+        let child_meta = std::sync::Arc::new(CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "parent.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
+
+        (
+            workspace_root,
+            parent_uri,
+            child_uri,
+            parent_artifacts,
+            child_artifacts,
+            parent_meta,
+            child_meta,
+            graph,
+        )
+    }
+
+    #[test]
+    fn test_parent_prefix_cache_two_slots() {
+        // After querying child.R at one top-level position and one
+        // inside-function position, the ParentPrefixCache must contain two
+        // distinct entries (keyed by (uri, query_inside_function)).
+        let (
+            workspace_root,
+            parent_uri,
+            child_uri,
+            parent_artifacts,
+            child_artifacts,
+            parent_meta,
+            child_meta,
+            graph,
+        ) = build_cache_test_fixture();
+
+        let parent_uri_for_closure = parent_uri.clone();
+        let child_uri_for_closure = child_uri.clone();
+        let parent_artifacts_for_closure = parent_artifacts.clone();
+        let child_artifacts_for_closure = child_artifacts.clone();
+        let parent_meta_for_closure = parent_meta.clone();
+        let child_meta_for_closure = child_meta.clone();
+
+        let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri_for_closure {
+                Some(parent_artifacts_for_closure.clone())
+            } else if uri == &child_uri_for_closure {
+                Some(child_artifacts_for_closure.clone())
+            } else {
+                None
+            }
+        };
+        let parent_uri_for_meta = parent_uri.clone();
+        let child_uri_for_meta = child_uri.clone();
+        let get_metadata = move |uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        > {
+            if uri == &parent_uri_for_meta {
+                Some(parent_meta_for_closure.clone())
+            } else if uri == &child_uri_for_meta {
+                Some(child_meta_for_closure.clone())
+            } else {
+                None
+            }
+        };
+
+        let base_exports: HashSet<String> = HashSet::new();
+        let mut cache = ParentPrefixCache::new();
+
+        // Query 1: top-level on child.R after the source() call.
+        // Line 4 col 5 is `x <- helper()` (after the source and after the
+        // function definition).
+        let scope_top = scope_at_position_with_graph_cached(
+            &child_uri,
+            4,
+            5,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &mut cache,
+        );
+
+        // Query 2: inside child's function body (line 2 col 4).
+        let scope_in_fn = scope_at_position_with_graph_cached(
+            &child_uri,
+            2,
+            4,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &mut cache,
+        );
+
+        // After both queries, cache must have two entries (one per inside bit).
+        assert_eq!(
+            cache.len(),
+            2,
+            "Cache must have 2 entries (top-level + inside-function)"
+        );
+
+        // helper must resolve in both queries (STEP 2 brings it in via the
+        // forward source to parent.R; for the inside-function query, hoisting
+        // makes the top-level binding visible inside the body).
+        assert!(
+            scope_top.symbols.contains_key("helper"),
+            "helper must be visible at top-level after source(\"parent.R\")"
+        );
+        assert!(
+            scope_in_fn.symbols.contains_key("helper"),
+            "helper must be visible inside the function body (hoisted)"
+        );
+    }
+
+    #[test]
+    fn test_parent_prefix_cache_hit_matches_uncached() {
+        // The cached path must produce ScopeAtPosition values equal to the
+        // uncached path at every query position.
+        let (
+            workspace_root,
+            parent_uri,
+            child_uri,
+            parent_artifacts,
+            child_artifacts,
+            parent_meta,
+            child_meta,
+            graph,
+        ) = build_cache_test_fixture();
+
+        let parent_uri_for_closure = parent_uri.clone();
+        let child_uri_for_closure = child_uri.clone();
+        let parent_artifacts_for_closure = parent_artifacts.clone();
+        let child_artifacts_for_closure = child_artifacts.clone();
+        let parent_meta_for_closure = parent_meta.clone();
+        let child_meta_for_closure = child_meta.clone();
+
+        let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri_for_closure {
+                Some(parent_artifacts_for_closure.clone())
+            } else if uri == &child_uri_for_closure {
+                Some(child_artifacts_for_closure.clone())
+            } else {
+                None
+            }
+        };
+        let parent_uri_for_meta = parent_uri.clone();
+        let child_uri_for_meta = child_uri.clone();
+        let get_metadata = move |uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        > {
+            if uri == &parent_uri_for_meta {
+                Some(parent_meta_for_closure.clone())
+            } else if uri == &child_uri_for_meta {
+                Some(child_meta_for_closure.clone())
+            } else {
+                None
+            }
+        };
+
+        let base_exports: HashSet<String> = HashSet::new();
+        let mut cache = ParentPrefixCache::new();
+
+        // Sample multiple positions: top-level before/after source(), inside
+        // the function body. Top-level-pre-source has no helper visible;
+        // post-source does. Inside-function (with hoist_globals=true) sees
+        // the post-source bindings.
+        let positions: &[(u32, u32)] = &[(0, 0), (1, 0), (2, 4), (3, 0), (4, 5)];
+        for &(line, col) in positions {
+            let cached = scope_at_position_with_graph_cached(
+                &child_uri,
+                line,
+                col,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &mut cache,
+            );
+            let direct = scope_at_position_with_graph(
+                &child_uri,
+                line,
+                col,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+            );
+
+            // Compare key fields. Symbol HashMap, package sets, package
+            // origins, chain, and depth_exceeded must all match.
+            let cached_syms: std::collections::BTreeSet<&str> = cached
+                .symbols
+                .keys()
+                .map(|n| n.as_ref())
+                .collect();
+            let direct_syms: std::collections::BTreeSet<&str> = direct
+                .symbols
+                .keys()
+                .map(|n| n.as_ref())
+                .collect();
+            assert_eq!(
+                cached_syms, direct_syms,
+                "symbol set mismatch at ({line}, {col})"
+            );
+            assert_eq!(
+                cached.inherited_packages, direct.inherited_packages,
+                "inherited_packages mismatch at ({line}, {col})"
+            );
+            assert_eq!(
+                cached.loaded_packages, direct.loaded_packages,
+                "loaded_packages mismatch at ({line}, {col})"
+            );
+            // package_origins: compare keys (Url Arc'd values may have
+            // different identity but equal content).
+            let cached_origin_keys: std::collections::BTreeSet<&str> =
+                cached.package_origins.keys().map(|s| s.as_str()).collect();
+            let direct_origin_keys: std::collections::BTreeSet<&str> =
+                direct.package_origins.keys().map(|s| s.as_str()).collect();
+            assert_eq!(
+                cached_origin_keys, direct_origin_keys,
+                "package_origins keys mismatch at ({line}, {col})"
+            );
+            assert_eq!(
+                cached.depth_exceeded, direct.depth_exceeded,
+                "depth_exceeded mismatch at ({line}, {col})"
             );
         }
     }
