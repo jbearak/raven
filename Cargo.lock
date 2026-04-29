@@ -1135,6 +1135,7 @@ dependencies = [
  "lru",
  "notify",
  "proptest",
+ "rayon",
  "regex",
  "ropey",
  "serde",

@@ -753,6 +753,97 @@ pub struct ScopeAtPosition {
     /// Combined with inherited_packages, this gives all packages available at the position.
     /// Requirements 8.1, 8.3: Position-aware package loading for diagnostics
     pub loaded_packages: HashSet<String>,
+    /// Per-package origin tracking: maps each package name to the set of file
+    /// URIs that loaded the package. Populated whenever a package is added to
+    /// `inherited_packages` or `loaded_packages`. Used at cross-file merge
+    /// points to detect and filter same-file leaks: a recursion path that
+    /// revisits the queried file at a wider position would otherwise import
+    /// the queried file's own later `library()` calls back into a narrow
+    /// query scope. The leak's signature is "this package's only known
+    /// origin is the queried URI". Mirrors the same-file symbol filter on
+    /// `ScopedSymbol.source_uri`.
+    ///
+    /// Origins are stored as `Arc<Url>` so cross-file propagation between
+    /// scopes is a refcount bump rather than a Url-internals string clone.
+    pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
+}
+
+/// Record that `package` was loaded by `origin_uri`. Idempotent.
+fn record_package_origin(
+    package_origins: &mut HashMap<String, HashSet<Arc<Url>>>,
+    package: &str,
+    origin_uri: &Url,
+) {
+    package_origins
+        .entry(package.to_string())
+        .or_default()
+        .insert(Arc::new(origin_uri.clone()));
+}
+
+/// Returns `true` when the only known origin for `package` is `uri` — i.e.
+/// the package would only appear in scope because a cross-file recursion
+/// revisited the queried file (`uri`) at a wider position. With no recorded
+/// origins we conservatively return `false` (don't filter): packages that
+/// flow through the `inherited_packages` parameter (e.g. `packages_for_child`
+/// in forward-source dispatch) carry no origin metadata and must remain
+/// trustworthy inherited content.
+fn package_only_origin_is_uri(
+    package_origins: &HashMap<String, HashSet<Arc<Url>>>,
+    package: &str,
+    uri: &Url,
+) -> bool {
+    match package_origins.get(package) {
+        Some(origins) if !origins.is_empty() => origins.iter().all(|o| o.as_ref() == uri),
+        _ => false,
+    }
+}
+
+/// Copy the origin set for `package` from `src` to `dst`, unioning into any
+/// existing entry. Used when a package crosses a file boundary so that
+/// downstream merge sites can run the same-file leak filter. Cloning the
+/// `Arc<Url>` is a refcount bump.
+fn propagate_package_origins(
+    src: &HashMap<String, HashSet<Arc<Url>>>,
+    package: &str,
+    dst: &mut HashMap<String, HashSet<Arc<Url>>>,
+) {
+    if let Some(origins) = src.get(package) {
+        let entry = dst.entry(package.to_string()).or_default();
+        for origin in origins {
+            entry.insert(origin.clone());
+        }
+    }
+}
+
+/// Memoization cache for cross-file scope resolution. Caches complete
+/// `ScopeAtPosition` results from recursive calls so that multiple
+/// `scope_at_position_with_graph` invocations on the SAME file at
+/// DIFFERENT positions can reuse parent and child scope resolutions
+/// that are identical across positions.
+///
+/// The memo key is `(uri, line, col, packages_fingerprint)` where
+/// `packages_fingerprint` is a sorted hash of the `inherited_packages`
+/// parameter. For parent calls (always `&empty`), the fingerprint is 0.
+///
+/// Created per diagnostic pass and passed as `Option<&mut ScopeResolutionMemo>`.
+/// Callers that make a single scope query pass `None`.
+pub type ScopeResolutionMemo = HashMap<(Url, u32, u32, u64), ScopeAtPosition>;
+
+/// Compute a deterministic fingerprint for a set of package names.
+/// Used as part of the `ScopeResolutionMemo` key to distinguish calls
+/// with different inherited package sets.
+pub fn packages_fingerprint(pkgs: &HashSet<String>) -> u64 {
+    if pkgs.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    sorted.len().hash(&mut hasher);
+    for s in sorted {
+        s.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Determine whether a `source()` call should use local scoping rules.
@@ -1431,6 +1522,9 @@ pub fn scope_at_position(
                     };
 
                     if should_include {
+                        // No URI to record as origin in this single-file path —
+                        // there is no cross-file recursion in `scope_at_position`,
+                        // so origin tracking is not needed for leak detection.
                         scope.loaded_packages.insert(package.clone());
                     }
                 }
@@ -1867,7 +1961,15 @@ where
                             visited,
                         );
                         // Merge child symbols (local definitions take precedence)
+                        //
+                        // Skip same-file leak: symbols whose `source_uri` is
+                        // the current file must not flow back into our scope
+                        // through a forward source() chain (see graph variant
+                        // for the full rationale).
                         for (name, symbol) in child_scope.symbols {
+                            if symbol.source_uri == *uri {
+                                continue;
+                            }
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
@@ -2644,6 +2746,7 @@ pub fn scope_at_position_with_graph<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    memo: Option<&mut ScopeResolutionMemo>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -2676,6 +2779,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
+        memo,
     )
 }
 
@@ -2709,6 +2813,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    mut memo: Option<&mut ScopeResolutionMemo>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -2763,6 +2868,28 @@ where
     visited.insert(uri.clone(), (line, column));
     if !is_revisit {
         scope.chain.push(uri.clone());
+    }
+
+    // ── Memo check (recursive calls only) ──
+    // At depth > 0, the result for (uri, line, col, inherited_packages) is
+    // reusable across different root queries because:
+    // - The same-file leak filter at the caller's merge point handles any
+    //   cycle-related differences in visited-map state.
+    // - The inherited_packages fingerprint captures the only other parameter
+    //   that varies between calls to the same file at the same position.
+    if current_depth > 0 {
+        if let Some(ref memo) = memo {
+            let fp = packages_fingerprint(inherited_packages);
+            let key = (uri.clone(), line, column, fp);
+            if let Some(cached) = memo.get(&key) {
+                // Update visited with the cached chain so cycle detection
+                // still works for subsequent sibling source() calls.
+                for chain_uri in &cached.chain {
+                    visited.entry(chain_uri.clone()).or_insert((u32::MAX, u32::MAX));
+                }
+                return cached.clone();
+            }
+        }
     }
 
     let artifacts = match get_artifacts(uri) {
@@ -2936,12 +3063,27 @@ where
                 hoist_globals,
                 backward_dep_mode,
                 is_cancelled,
+                memo.as_deref_mut(),
             );
 
             // Merge parent symbols (they are available at the START of this file)
             // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
             // (declarations describe symbol existence, not export behavior)
+            //
+            // Filter out symbols whose `source_uri` is the current file: those
+            // are *our own* bindings and their visibility at the query position
+            // is owned by the local timeline (with proper `visible_from`
+            // semantics). A cross-file path that revisits this file at a wider
+            // position (e.g. data.R → main.R → shrinkage.R → main.R@MAX → data.R@MAX)
+            // would otherwise leak our own later definitions back into our scope
+            // at the original narrow query position, suppressing legitimate
+            // "Undefined variable" diagnostics on self-referential assignments
+            // like `xyz <- xyz`. Same-file symbols always re-enter via STEP 2's
+            // visible_from-aware Def event, so filtering here is safe.
             for (name, symbol) in parent_scope.symbols {
+                if symbol.source_uri == *uri {
+                    continue;
+                }
                 if is_local_scoped {
                     // For local-scoped edges, only inherit declared symbols
                     if symbol.is_declared {
@@ -3001,22 +3143,44 @@ where
 
                             if should_propagate {
                                 scope.inherited_packages.insert(package.clone());
+                                // Record the parent file as origin so downstream
+                                // merge sites can apply the same-file leak filter.
+                                record_package_origin(
+                                    &mut scope.package_origins,
+                                    package,
+                                    &edge.from,
+                                );
                             }
                         }
                     }
                 }
             }
 
-            // Also propagate packages that the parent inherited from its parents
-            // Requirement 5.2: Inherit loaded packages from parent up to call site
+            // Also propagate packages that the parent inherited from its parents.
+            // Requirement 5.2: Inherit loaded packages from parent up to call site.
+            //
+            // Same-file leak filter: skip packages whose only known origin is
+            // the queried file (`*uri`). A recursive cross-file path that
+            // revisits the queried file at a wider position would otherwise
+            // import the queried file's own later `library()` calls back into
+            // a narrow query scope. The local-timeline PackageLoad pass below
+            // handles same-file packages with proper position semantics.
             for pkg in &parent_scope.inherited_packages {
+                if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                    continue;
+                }
                 scope.inherited_packages.insert(pkg.clone());
+                propagate_package_origins(&parent_scope.package_origins, pkg, &mut scope.package_origins);
             }
 
             // Also propagate packages that are loaded in the parent at the call site.
             // This includes packages loaded in sourced files before the call site.
             for pkg in &parent_scope.loaded_packages {
+                if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                    continue;
+                }
                 scope.inherited_packages.insert(pkg.clone());
+                propagate_package_origins(&parent_scope.package_origins, pkg, &mut scope.package_origins);
             }
         }
     } // end if !is_revisit (STEP 1)
@@ -3210,21 +3374,51 @@ where
                             hoist_globals,
                             backward_dep_mode,
                             is_cancelled,
+                            memo.as_deref_mut(),
                         );
                         // Merge child symbols (local definitions take precedence)
+                        //
+                        // Filter out symbols whose `source_uri` is the current
+                        // file: same rationale as the backward-edge merge
+                        // above. A forward source() may transitively revisit
+                        // this file at (MAX, MAX), and that revisit would
+                        // otherwise leak our own future definitions back into
+                        // our scope at the narrower original query position.
+                        // Self-file symbols are always re-entered by STEP 2
+                        // with proper `visible_from` filtering.
                         for (name, symbol) in child_scope.symbols {
+                            if symbol.source_uri == *uri {
+                                continue;
+                            }
                             scope.symbols.entry(name).or_insert(symbol);
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
 
                         // Packages loaded in the sourced file become available after the source() call.
+                        //
+                        // Same-file leak filter: skip packages whose only known
+                        // origin is the queried file (`*uri`). A child whose
+                        // own cross-file recursion brought packages back from a
+                        // path through `*uri` would otherwise re-import them.
                         for pkg in child_scope
                             .loaded_packages
                             .iter()
                             .chain(child_scope.inherited_packages.iter())
                         {
+                            if package_only_origin_is_uri(
+                                &child_scope.package_origins,
+                                pkg,
+                                uri,
+                            ) {
+                                continue;
+                            }
                             scope.loaded_packages.insert(pkg.clone());
+                            propagate_package_origins(
+                                &child_scope.package_origins,
+                                pkg,
+                                &mut scope.package_origins,
+                            );
                         }
                     }
                 }
@@ -3291,6 +3485,7 @@ where
 
                     if should_include {
                         scope.loaded_packages.insert(package.clone());
+                        record_package_origin(&mut scope.package_origins, package, uri);
                     }
                 }
             }
@@ -3318,7 +3513,55 @@ where
         }
     }
 
+    // ── Memo store (recursive calls only) ──
+    // Cache the complete result so sibling queries at different positions
+    // can reuse parent and child resolutions. Only store on normal
+    // completion — early returns (max depth, visited-at-wider-position,
+    // cancelled) produce partial results that must not be cached.
+    if current_depth > 0 {
+        if let Some(ref mut memo) = memo {
+            let fp = packages_fingerprint(inherited_packages);
+            let key = (uri.clone(), line, column, fp);
+            memo.insert(key, scope.clone());
+        }
+    }
+
     scope
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+
+    #[test]
+    fn test_packages_fingerprint_empty() {
+        let pkgs = HashSet::new();
+        assert_eq!(packages_fingerprint(&pkgs), 0);
+    }
+
+    #[test]
+    fn test_packages_fingerprint_deterministic() {
+        let mut a = HashSet::new();
+        a.insert("dplyr".to_string());
+        a.insert("ggplot2".to_string());
+
+        let mut b = HashSet::new();
+        b.insert("ggplot2".to_string());
+        b.insert("dplyr".to_string());
+
+        assert_eq!(packages_fingerprint(&a), packages_fingerprint(&b));
+    }
+
+    #[test]
+    fn test_packages_fingerprint_different_sets_differ() {
+        let mut a = HashSet::new();
+        a.insert("dplyr".to_string());
+
+        let mut b = HashSet::new();
+        b.insert("ggplot2".to_string());
+
+        assert_ne!(packages_fingerprint(&a), packages_fingerprint(&b));
+    }
 }
 
 #[cfg(test)]
@@ -3630,6 +3873,7 @@ mod tests {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -3828,6 +4072,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -3854,6 +4099,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_function.symbols.contains_key("child_var"),
@@ -3928,6 +4174,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -3956,6 +4203,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_after_function.symbols.contains_key("child_var"),
@@ -4068,6 +4316,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -4146,6 +4395,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -4266,6 +4516,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -4409,6 +4660,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -4578,6 +4830,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Should have depth_exceeded entry
@@ -4774,6 +5027,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -4864,6 +5118,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -7053,6 +7308,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -7073,6 +7329,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -7093,6 +7350,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -7172,6 +7430,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -7200,6 +7459,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -7296,6 +7556,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -7387,6 +7648,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -7471,6 +7733,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -7491,6 +7754,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -7511,6 +7775,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -7597,6 +7862,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -7683,6 +7949,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -7703,6 +7970,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -7806,6 +8074,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -7826,6 +8095,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -7939,6 +8209,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -9649,6 +9920,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Child should have inherited dplyr from parent
@@ -9728,6 +10000,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -9807,6 +10080,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Child should have both packages
@@ -9891,6 +10165,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -9965,6 +10240,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -10049,6 +10325,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -10130,6 +10407,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -10249,6 +10527,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -10273,6 +10552,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -10355,6 +10635,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -10379,6 +10660,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -10537,6 +10819,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -10641,6 +10924,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -10664,6 +10948,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -11197,6 +11482,7 @@ y <- filter(df)"#;
                 true, // hoisting ON
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11218,6 +11504,7 @@ y <- filter(df)"#;
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11269,6 +11556,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11397,6 +11685,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11484,6 +11773,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11630,6 +11920,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11768,6 +12059,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -11896,6 +12188,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12032,6 +12325,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12148,6 +12442,7 @@ y <- filter(df)"#;
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12279,6 +12574,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12382,6 +12678,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12495,6 +12792,7 @@ y <- filter(df)"#;
                 true, // hoisting ON, but query is at global level
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             // At global level, parent is queried at call site (line 0 col 0),
@@ -12644,6 +12942,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12781,6 +13080,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12873,6 +13173,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -12997,6 +13298,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -13082,6 +13384,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -13217,6 +13520,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -13244,6 +13548,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -13329,6 +13634,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
