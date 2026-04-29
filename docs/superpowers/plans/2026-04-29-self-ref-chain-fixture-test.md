@@ -10,6 +10,8 @@
 
 ---
 
+## Implementation Tasks
+
 ### Task 1: Add `SelfRefChainFixture` struct and builder to `fixture_workspace.rs`
 
 **Files:**
@@ -49,8 +51,9 @@
       pub mid_file_uri: Url,
       /// 0-indexed line of `xyz <- xyz` in file_5.R (line 2).
       pub mid_xyz_line: u32,
-      /// 0-indexed column of the RHS `xyz` in `xyz <- xyz` (column 7,
-      /// after the `xyz <- ` prefix: 3 chars + 2 operator chars + 1 space = 6, then RHS at 7).
+      /// 0-indexed column of the RHS `xyz` in `xyz <- xyz`.
+      /// Layout (zero-based columns): `x`@0, `y`@1, `z`@2, ` `@3, `<`@4, `-`@5, ` `@6, `x`@7.
+      /// So the RHS `xyz` starts at column 7.
       pub mid_xyz_rhs_col: u32,
   }
   ```
@@ -236,7 +239,7 @@
 
   Expected output includes:
 
-  ```
+  ```text
   test tests::self_ref_variable_not_in_scope_across_deep_source_chain ... ok
   ```
 
@@ -279,7 +282,8 @@
   ```
 
   Expected:
-  ```
+
+  ```text
   test tests::self_ref_variable_not_in_scope_across_deep_source_chain ... ok
   ```
 

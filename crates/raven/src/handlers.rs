@@ -35942,6 +35942,33 @@ x
                 cached.depth_exceeded, direct.depth_exceeded,
                 "depth_exceeded differ at ({line}, {col}) for fixture:\n{text}"
             );
+
+            // Provenance check: every shared symbol must agree on its
+            // attribution fields (source_uri + definition coordinates).
+            // assert_cached_matches_uncached must fail if a refactor in
+            // the cached path silently rewrites where a symbol came from
+            // even when the symbol-name set matches.
+            let cached_provenance: BTreeSet<(&str, &Url, u32, u32)> = cached
+                .symbols
+                .iter()
+                .map(|(name, sym)| {
+                    (name.as_ref(), &sym.source_uri, sym.defined_line, sym.defined_column)
+                })
+                .collect();
+            let direct_provenance: BTreeSet<(&str, &Url, u32, u32)> = direct
+                .symbols
+                .iter()
+                .map(|(name, sym)| {
+                    (name.as_ref(), &sym.source_uri, sym.defined_line, sym.defined_column)
+                })
+                .collect();
+            assert_eq!(
+                cached_provenance, direct_provenance,
+                "assert_cached_matches_uncached: symbol provenance differs \
+                 (source_uri / defined_line / defined_column) at ({line}, {col}) \
+                 for fixture:\n{text}\ncached={:#?}\ndirect={:#?}",
+                cached_provenance, direct_provenance
+            );
         }
     }
 
@@ -36731,8 +36758,10 @@ my_func <- function(a = default_value) {
         // have not been loaded into cache yet, function calls from that package
         // must be suppressed to avoid false positives during async cache loading.
         use std::fs;
+        use tempfile::TempDir;
 
-        let tmp = std::env::temp_dir().join("raven_test_cache_pending");
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let tmp = temp_dir.path().to_path_buf();
         let pkg_dir = tmp.join("__raven_pending_pkg__");
         fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
         fs::write(
@@ -36768,8 +36797,6 @@ my_func <- function(a = default_value) {
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
-
-        let _ = fs::remove_dir_all(&tmp);
 
         assert!(
             !diagnostics
@@ -36996,8 +37023,10 @@ my_func <- function(a = default_value) {
         // exports have not been loaded into cache yet, functions from that package
         // must NOT be flagged as undefined — the pending-load suppression should fire.
         use std::fs;
+        use tempfile::TempDir;
 
-        let tmp = std::env::temp_dir().join("raven_test_installed_pkg");
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let tmp = temp_dir.path().to_path_buf();
         let pkg_dir = tmp.join("__raven_installed_pkg__");
         fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
         fs::write(
@@ -37033,8 +37062,6 @@ my_func <- function(a = default_value) {
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
-
-        let _ = fs::remove_dir_all(&tmp);
 
         assert!(
             !diagnostics

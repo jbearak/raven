@@ -39,7 +39,7 @@ line 1: source("file_6.R")
 line 2: xyz <- xyz
 ```
 
-At `xyz <- xyz` on line 2, the RHS `xyz` starts at **column 7** (after `xyz <- `). This is the single query point used for all scope assertions.
+At `xyz <- xyz` on line 2, the RHS `xyz` starts at **column 7** (after the `xyz <-` prefix and one space). This is the single query point used for all scope assertions.
 
 ### Return type
 

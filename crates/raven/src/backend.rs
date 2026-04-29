@@ -1933,7 +1933,15 @@ impl LanguageServer for Backend {
 
                 let mut pkgs = scope.inherited_packages;
                 pkgs.extend(scope.loaded_packages);
-                let pkgs: Vec<String> = pkgs.into_iter().collect();
+                // Filter the merged set so suspicious names from inherited
+                // packages (which originate in parents' library_calls and
+                // are not pre-validated) cannot reach the R subprocess /
+                // filesystem path. Mirrors the validation applied to direct
+                // library_calls via extract_loaded_packages_from_library_calls.
+                let pkgs: Vec<String> = pkgs
+                    .into_iter()
+                    .filter(|p| is_valid_package_name(p))
+                    .collect();
 
                 (pkg_lib, ready, pkgs)
             };
@@ -2318,7 +2326,18 @@ impl LanguageServer for Backend {
                     return;
                 }
 
-                let packages_vec: Vec<String> = all_packages.into_iter().collect();
+                // Filter the merged set to drop suspicious names from
+                // inherited/loaded packages (parents may carry unvalidated
+                // entries through scope resolution). Mirrors the
+                // `prefetch_packages_for_open_documents` filter so every
+                // prefetch call site applies the same validation.
+                let packages_vec: Vec<String> = all_packages
+                    .into_iter()
+                    .filter(|p| is_valid_package_name(p))
+                    .collect();
+                if packages_vec.is_empty() {
+                    return;
+                }
                 log::trace!(
                     "Background prefetching {} packages",
                     packages_vec.len()
