@@ -3131,7 +3131,10 @@ where
         // "Undefined variable" diagnostics on self-referential assignments
         // like `xyz <- xyz`. Same-file symbols always re-enter via STEP 2's
         // visible_from-aware Def event, so filtering here is safe.
-        for (name, symbol) in parent_scope.symbols {
+        for (i, (name, symbol)) in parent_scope.symbols.into_iter().enumerate() {
+            if i & 63 == 0 && is_cancelled() {
+                return prefix;
+            }
             if symbol.source_uri == *uri {
                 continue;
             }
@@ -3159,7 +3162,10 @@ where
             (call_site_line, call_site_col)
         };
         if let Some(parent_artifacts) = get_artifacts(&edge.from) {
-            for event in &parent_artifacts.timeline {
+            for (i, event) in parent_artifacts.timeline.iter().enumerate() {
+                if i & 63 == 0 && is_cancelled() {
+                    return prefix;
+                }
                 if let ScopeEvent::PackageLoad {
                     line: pkg_line,
                     column: pkg_col,
@@ -3216,7 +3222,10 @@ where
         // import the queried file's own later `library()` calls back into
         // a narrow query scope. The local-timeline PackageLoad pass below
         // handles same-file packages with proper position semantics.
-        for pkg in &parent_scope.inherited_packages {
+        for (i, pkg) in parent_scope.inherited_packages.iter().enumerate() {
+            if i & 63 == 0 && is_cancelled() {
+                return prefix;
+            }
             if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
                 continue;
             }
@@ -3226,7 +3235,10 @@ where
 
         // Also propagate packages that are loaded in the parent at the call site.
         // This includes packages loaded in sourced files before the call site.
-        for pkg in &parent_scope.loaded_packages {
+        for (i, pkg) in parent_scope.loaded_packages.iter().enumerate() {
+            if i & 63 == 0 && is_cancelled() {
+                return prefix;
+            }
             if package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
                 continue;
             }
@@ -3790,6 +3802,18 @@ struct ScopeFrame {
 /// per `(line, column)` source-call site for the lifetime of one
 /// [`ScopeStream`] and reused on subsequent applications (relevant for the
 /// late-binding pre-walk that materializes `global_late_frame`).
+///
+/// `packages` deliberately flattens the child's `loaded_packages` and
+/// `inherited_packages` into a single set: every package introduced via a
+/// forward `source()` is "inherited" from the perspective of the queried
+/// URI, and the merge sites in [`ScopeStream::apply_event_to_strict`] /
+/// [`ScopeStream::apply_event_to_late`] funnel both into
+/// `frame.packages`, which `snapshot()` projects to
+/// `ScopeAtPosition.loaded_packages`. The recursive resolver keeps the two
+/// distinct, but no current consumer differentiates inherited-vs-loaded for
+/// the merged set — they both feed completion, hover, and "undefined
+/// variable" suppression alike. If a future consumer needs the
+/// distinction, this field would need to split back into two sets.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ChildSourceContribution {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
@@ -4739,6 +4763,20 @@ fn seed_base_exports(frame: &mut ScopeFrame, base_exports: &HashSet<String>) {
 /// `&RefCell<ParentPrefixCache>` (so child-source recursion can reach the
 /// same cache through a shared reference) whereas the public cached entry
 /// takes `&mut ParentPrefixCache`.
+///
+/// **Caller invariant — the cache MUST be snapshot-scoped.** A
+/// `ParentPrefixCache` instance is implicitly bound to the artifacts and
+/// dependency graph captured by exactly one [`DiagnosticsSnapshot`] (or
+/// equivalent transient context). The function signature can't enforce
+/// this lifetime: it takes `&RefCell<ParentPrefixCache>` with no
+/// `'snapshot` tag, so a future caller could accidentally reuse the same
+/// `ParentPrefixCache` across two different snapshots whose underlying
+/// `get_artifacts` / `graph` returned divergent results, producing stale
+/// cache hits keyed only on `(Url, bool)`. Production callers
+/// (`DiagnosticsSnapshot::get_scope` in handlers.rs:206-236, the streaming
+/// collectors at handlers.rs:5092 and 5375) instantiate a fresh
+/// `ParentPrefixCache` per snapshot and never share it. Don't reuse the
+/// same cache across snapshot boundaries.
 #[allow(clippy::too_many_arguments)]
 fn compute_or_get_cached_prefix<F, G>(
     uri: &Url,
@@ -12732,6 +12770,52 @@ y <- filter(df)"#;
                         line, col, fixture_idx, FIXTURES[fixture_idx]
                     );
 
+                    // Identity comparison: regression-protect first-source-wins
+                    // and Def-overwrite semantics. Compare
+                    // `(name, source_uri, defined_line, defined_column, kind)`
+                    // tuples. A bare-name comparison would silently miss a
+                    // last-source-wins regression in the Source-merge path
+                    // (different `ScopedSymbol` for the same name, affecting
+                    // hover and find-references — see AGENTS.md learning on
+                    // `entry().or_insert()` for Source events).
+                    let streamed_identity: std::collections::BTreeSet<(
+                        String, String, u32, u32, String,
+                    )> = streamed
+                        .symbols
+                        .iter()
+                        .map(|(n, s)| {
+                            (
+                                n.to_string(),
+                                s.source_uri.to_string(),
+                                s.defined_line,
+                                s.defined_column,
+                                format!("{:?}", s.kind),
+                            )
+                        })
+                        .collect();
+                    let direct_identity: std::collections::BTreeSet<(
+                        String, String, u32, u32, String,
+                    )> = direct
+                        .symbols
+                        .iter()
+                        .map(|(n, s)| {
+                            (
+                                n.to_string(),
+                                s.source_uri.to_string(),
+                                s.defined_line,
+                                s.defined_column,
+                                format!("{:?}", s.kind),
+                            )
+                        })
+                        .collect();
+                    prop_assert_eq!(
+                        &streamed_identity,
+                        &direct_identity,
+                        "symbol identity mismatch at ({}, {}) in fixture {}: \
+                         differing (name, source_uri, defined_line, defined_column, kind) tuples",
+                        line, col, fixture_idx
+                    );
+
                     prop_assert_eq!(
                         streamed.inherited_packages.clone(),
                         direct.inherited_packages.clone(),
@@ -12742,6 +12826,44 @@ y <- filter(df)"#;
                         streamed.loaded_packages.clone(),
                         direct.loaded_packages.clone(),
                         "loaded_packages mismatch at ({}, {}) in fixture {}",
+                        line, col, fixture_idx
+                    );
+
+                    // package_origins comparison: regressions in the
+                    // same-file leak filter (which consults the origin
+                    // map) are invisible to the package-name-set check
+                    // above. Compare the full `pkg -> {origin Url, ...}`
+                    // map projected to comparable types.
+                    let streamed_origins: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeSet<String>,
+                    > = streamed
+                        .package_origins
+                        .iter()
+                        .map(|(pkg, urls)| {
+                            (
+                                pkg.clone(),
+                                urls.iter().map(|u| u.to_string()).collect(),
+                            )
+                        })
+                        .collect();
+                    let direct_origins: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeSet<String>,
+                    > = direct
+                        .package_origins
+                        .iter()
+                        .map(|(pkg, urls)| {
+                            (
+                                pkg.clone(),
+                                urls.iter().map(|u| u.to_string()).collect(),
+                            )
+                        })
+                        .collect();
+                    prop_assert_eq!(
+                        streamed_origins,
+                        direct_origins,
+                        "package_origins mismatch at ({}, {}) in fixture {}",
                         line, col, fixture_idx
                     );
                 }

@@ -36159,6 +36159,116 @@ x
             "Cached and uncached scopes differ at xyz <- xyz RHS"
         );
     }
+
+    /// Companion to `test_cached_path_preserves_xyz_self_leak_filter` that
+    /// covers the *other* `ParentPrefixCache` slot — the one keyed on
+    /// `query_inside_function = true`. The two slots are computed via
+    /// distinct recursive walks (top-level queries pass the parent its
+    /// `call_site` position; inside-function queries pass `MAX`), so a
+    /// regression in one slot's leak filter would not be caught by the
+    /// other test. Wrapping the self-referential assignment in a function
+    /// body forces the inside-function slot.
+    #[test]
+    fn test_cached_path_preserves_xyz_self_leak_filter_inside_function() {
+        use std::collections::BTreeSet;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let covariates_uri = Url::parse("file:///workspace/covariates.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+
+        let main_code = "source(\"data.R\")\n";
+        // Wrap `xyz <- xyz` in a function body so the query at the RHS
+        // resolves with `query_inside_function = true`.
+        let data_code = "source(\"covariates.R\")\nf <- function() {\n  xyz <- xyz\n}\nsource(\"indices.R\")\n";
+        let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
+        let indices_code = "idx_a <- 10\n";
+
+        let mut state = create_test_state();
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&covariates_uri, covariates_code),
+            (&indices_uri, indices_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
+
+        let get_artifacts =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
+                snapshot.artifacts_map.get(target_uri).cloned()
+            };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                snapshot.metadata_map.get(target_uri).cloned()
+            };
+
+        // Inside the function body: `  xyz <- xyz` on line 2 (0-indexed),
+        // RHS `xyz` starts at col 9 (after `  xyz <- `).
+        let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+        let cached = crate::cross_file::scope::scope_at_position_with_graph_cached(
+            &data_uri,
+            2,
+            9,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.cross_file_graph,
+            snapshot.workspace_folders.first(),
+            snapshot.cross_file_config.max_chain_depth,
+            &snapshot.base_exports,
+            snapshot.cross_file_config.hoist_globals_in_functions,
+            snapshot.cross_file_config.backward_dependencies,
+            &|| false,
+            &mut cache,
+        );
+
+        assert!(
+            !cached.symbols.contains_key("xyz"),
+            "Cached path (inside-function slot) leaked `xyz` back into its own RHS scope. \
+             scope.symbols = {:?}",
+            cached
+                .symbols
+                .keys()
+                .map(|n| n.as_ref())
+                .collect::<BTreeSet<&str>>()
+        );
+
+        // Cached and uncached must still agree inside the function body.
+        let direct = crate::cross_file::scope::scope_at_position_with_graph(
+            &data_uri,
+            2,
+            9,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.cross_file_graph,
+            snapshot.workspace_folders.first(),
+            snapshot.cross_file_config.max_chain_depth,
+            &snapshot.base_exports,
+            snapshot.cross_file_config.hoist_globals_in_functions,
+            snapshot.cross_file_config.backward_dependencies,
+            &|| false,
+        );
+        let cached_keys: BTreeSet<&str> =
+            cached.symbols.keys().map(|n| n.as_ref()).collect();
+        let direct_keys: BTreeSet<&str> =
+            direct.symbols.keys().map(|n| n.as_ref()).collect();
+        assert_eq!(
+            cached_keys, direct_keys,
+            "Cached and uncached scopes differ inside function body at xyz <- xyz RHS"
+        );
+    }
 }
 
 #[cfg(test)]
