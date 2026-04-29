@@ -431,6 +431,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
         true,
         mode,
         &never_cancel,
+        None,
     );
 
     let elapsed = median_of_3(|| {
@@ -447,6 +448,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
             true,
             mode,
             &never_cancel,
+            None,
         );
     });
 
@@ -513,7 +515,9 @@ fn budget_single_file_completion() {
         let path = entry.path();
         let content = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
-        state.documents.insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
     }
 
     // Run workspace scan and apply index (populates cross-file state)
