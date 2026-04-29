@@ -31,16 +31,7 @@ enum IndexCategory {
     BackwardDirective,
 }
 
-fn is_valid_package_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-}
+use crate::r_subprocess::is_valid_package_name;
 
 /// Extract loaded packages from metadata-derived library calls.
 fn extract_loaded_packages_from_library_calls(

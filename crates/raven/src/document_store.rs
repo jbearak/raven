@@ -826,17 +826,6 @@ impl DocumentStore {
         Self::visit_for_packages(root, content, &mut packages);
         packages
     }
-    fn is_valid_package_name(name: &str) -> bool {
-        if name.is_empty() {
-            return false;
-        }
-        if name.contains("..") || name.contains('/') || name.contains('\\') {
-            return false;
-        }
-        name.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-    }
-
     /// Recursively visit nodes to find library/require calls
     fn visit_for_packages(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
         if node.kind() == "call" {
@@ -853,7 +842,7 @@ impl DocumentStore {
                                         let value_text = &text[value_node.byte_range()];
                                         let pkg_name = value_text
                                             .trim_matches(|c: char| c == '"' || c == '\'');
-                                        if Self::is_valid_package_name(pkg_name) {
+                                        if crate::r_subprocess::is_valid_package_name(pkg_name) {
                                             packages.push(pkg_name.to_string());
                                         } else {
                                             log::warn!(

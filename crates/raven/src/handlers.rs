@@ -5034,7 +5034,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &snapshot.directive_meta,
         workspace_root,
     );
-    let source_target_exports: Vec<Option<HashSet<String>>> = source_calls
+    // Borrow each source target's `ScopeArtifacts` (an `Arc` clone is a
+    // refcount bump, no deep copy) and call `exported_interface.contains_key`
+    // directly during attribution — avoids per-source `HashSet<String>`
+    // allocation that would otherwise stringify every exported name.
+    let source_target_artifacts: Vec<Option<Arc<scope::ScopeArtifacts>>> = source_calls
         .iter()
         .map(|source| {
             let resolved_uri = source_path_ctx.as_ref().and_then(|ctx| {
@@ -5048,14 +5052,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 }?;
                 Url::from_file_path(resolved).ok()
             });
-            resolved_uri.and_then(|target_uri| {
-                snapshot.artifacts_map.get(&target_uri).map(|a| {
-                    a.exported_interface
-                        .keys()
-                        .map(|k| k.to_string())
-                        .collect::<HashSet<String>>()
-                })
-            })
+            resolved_uri.and_then(|target_uri| snapshot.artifacts_map.get(&target_uri).cloned())
         })
         .collect();
 
@@ -5171,10 +5168,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // the target's artifacts aren't available (closed file not yet
             // indexed), we conservatively skip — better to under-report
             // than misattribute.
-            let exports_match = source_target_exports
+            let exports_match = source_target_artifacts
                 .get(src_idx)
-                .and_then(|exports| exports.as_ref())
-                .map(|set| set.contains(name.as_str()))
+                .and_then(|artifacts| artifacts.as_ref())
+                .map(|a| a.exported_interface.contains_key(name.as_str()))
                 .unwrap_or(false);
             if !exports_match {
                 continue;

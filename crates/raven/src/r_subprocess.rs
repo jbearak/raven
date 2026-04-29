@@ -1006,7 +1006,7 @@ fn parse_packages_output(output: &str) -> Vec<String> {
 /// - Be at least 2 characters long (or 1 character if it's a letter)
 ///
 /// This validation prevents malicious input from being executed as R code.
-fn is_valid_package_name(name: &str) -> bool {
+pub(crate) fn is_valid_package_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
