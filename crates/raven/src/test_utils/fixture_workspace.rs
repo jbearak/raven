@@ -9,6 +9,7 @@
 use std::fmt::Write;
 use std::path::Path;
 use tempfile::TempDir;
+use url::Url;
 
 /// Configuration for generating a fixture workspace.
 #[derive(Debug, Clone)]
@@ -133,6 +134,70 @@ pub fn write_fixture_workspace(dir: &Path, config: &FixtureConfig) {
         let filepath = dir.join(&filename);
         std::fs::write(&filepath, &content)
             .unwrap_or_else(|e| panic!("Failed to write fixture file {}: {}", filename, e));
+    }
+}
+
+/// Fixture for testing cross-file scope invariants: a 10-file linear
+/// source() chain with a self-referential assignment in the middle file.
+#[derive(Debug)]
+pub struct SelfRefChainFixture {
+    /// Keeps the TempDir alive for the test's duration. Prefixed with `_`
+    /// to signal intentional non-use while still dropping at end of scope.
+    pub _dir: TempDir,
+    /// All 10 file URIs in chain order: file_0.R (root) through file_9.R (leaf).
+    pub all_uris: Vec<Url>,
+    /// URI of file_5.R — the "mid-chain" file containing `xyz <- xyz`.
+    pub mid_file_uri: Url,
+    /// 0-indexed line of `xyz <- xyz` in file_5.R (line 2).
+    pub mid_xyz_line: u32,
+    /// 0-indexed column of the RHS `xyz` in `xyz <- xyz` (column 7,
+    /// after the `xyz <- ` prefix: 3 chars + 4 operator/space chars = 7).
+    pub mid_xyz_rhs_col: u32,
+}
+
+/// Creates a self-contained 10-file fixture workspace for testing cross-file
+/// scope invariants.
+///
+/// Chain layout: file_0.R → file_1.R → … → file_9.R
+///
+/// - file_0.R: `library(dplyr)` + `source("file_1.R")`
+/// - file_1.R–file_4.R: pass-through (define func_N, source next)
+/// - file_5.R: `func_5`, `source("file_6.R")`, `xyz <- xyz`  ← key file
+/// - file_6.R–file_8.R: pass-through
+/// - file_9.R: `func_9`, `leaf_var <- 42`  ← leaf definition
+pub fn create_self_ref_chain_fixture() -> SelfRefChainFixture {
+    let dir = TempDir::new().expect("create temp dir for self-ref chain fixture");
+
+    for i in 0..10usize {
+        let content = match i {
+            0 => "library(dplyr)\nsource(\"file_1.R\")\n".to_owned(),
+            5 => "func_5 <- function(x) x + 1\nsource(\"file_6.R\")\nxyz <- xyz\n".to_owned(),
+            9 => "func_9 <- function(x) x + 1\nleaf_var <- 42\n".to_owned(),
+            n => format!(
+                "func_{n} <- function(x) x + 1\nsource(\"file_{next}.R\")\n",
+                n = n,
+                next = n + 1
+            ),
+        };
+        let path = dir.path().join(format!("file_{}.R", i));
+        std::fs::write(&path, content).expect("write fixture file");
+    }
+
+    let all_uris: Vec<Url> = (0..10)
+        .map(|i| {
+            Url::from_file_path(dir.path().join(format!("file_{}.R", i)))
+                .expect("URI from fixture path")
+        })
+        .collect();
+
+    let mid_file_uri = all_uris[5].clone();
+
+    SelfRefChainFixture {
+        _dir: dir,
+        all_uris,
+        mid_file_uri,
+        mid_xyz_line: 2,
+        mid_xyz_rhs_col: 7,
     }
 }
 
