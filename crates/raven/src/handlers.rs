@@ -35479,6 +35479,101 @@ x
         );
     }
 
+    /// Regression test for the cross-file scope "same-file leak filter" and
+    /// `visible_from` semantics. Uses a self-contained 10-file fixture so CI
+    /// does not depend on ~/repos/worldwide.
+    ///
+    /// Invariants verified:
+    /// 1. At the RHS of `xyz <- xyz` in file_5.R, `xyz` is NOT in scope
+    ///    (visible_from = end of assignment node, not LHS position).
+    /// 2. `leaf_var` (defined in file_9.R) IS in scope at the same point,
+    ///    confirming the DFS actually traversed the file_6→…→file_9 suffix.
+    /// 3. `dplyr` (library() in file_0.R) appears in inherited/loaded packages,
+    ///    confirming library() propagates across all 5 source() edges.
+    /// 4. The "Undefined variable: xyz" diagnostic fires in the full pipeline.
+    #[test]
+    fn self_ref_variable_not_in_scope_across_deep_source_chain() {
+        use crate::state::{Document, WorldState};
+        use crate::test_utils::fixture_workspace::create_self_ref_chain_fixture;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        let fixture = create_self_ref_chain_fixture();
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        // undefined_variables_enabled and diagnostics_enabled default to true;
+        // out_of_scope_severity just needs to be non-None to enable that collector.
+        state.cross_file_config.out_of_scope_severity =
+            Some(DiagnosticSeverity::WARNING);
+
+        let workspace_url =
+            url::Url::from_file_path(fixture._dir.path()).expect("workspace url");
+        // workspace_folders must be set so workspace-root fallback resolution works.
+        state.workspace_folders = vec![workspace_url.clone()];
+
+        for uri in &fixture.all_uris {
+            let path = uri.to_file_path().expect("uri to path");
+            let content = std::fs::read_to_string(&path).expect("read fixture file");
+            state
+                .documents
+                .insert(uri.clone(), Document::new(&content, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(&content),
+                Some(&workspace_url),
+                |_| None,
+            );
+        }
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &fixture.mid_file_uri).expect("snapshot");
+        let diags =
+            diagnostics_from_snapshot(&snapshot, &fixture.mid_file_uri, &DiagCancelToken::never())
+                .expect("diagnostics");
+
+        // Single scope query at the RHS position — used for assertions 1–3.
+        let rhs_scope = snapshot.get_scope(
+            &fixture.mid_file_uri,
+            fixture.mid_xyz_line,
+            fixture.mid_xyz_rhs_col,
+            &DiagCancelToken::never(),
+        );
+
+        // 1. Negative: xyz must NOT leak back as visible at its own RHS.
+        assert!(
+            !rhs_scope.symbols.contains_key("xyz"),
+            "xyz must NOT be visible at the RHS of its own assignment; \
+             visible symbols: {:?}",
+            rhs_scope.symbols.keys().collect::<Vec<_>>()
+        );
+
+        // 2. Positive: leaf_var from file_9.R must be reachable via the chain.
+        assert!(
+            rhs_scope.symbols.contains_key("leaf_var"),
+            "leaf_var (defined in file_9.R) must be in scope at the query point \
+             (confirms DFS traversed the full suffix); \
+             visible symbols: {:?}",
+            rhs_scope.symbols.keys().collect::<Vec<_>>()
+        );
+
+        // 3. Package propagation: dplyr loaded in file_0.R must propagate.
+        let has_dplyr = rhs_scope.inherited_packages.iter().any(|p| p == "dplyr")
+            || rhs_scope.loaded_packages.iter().any(|p| p == "dplyr");
+        assert!(
+            has_dplyr,
+            "dplyr (library() in file_0.R) must propagate to mid-chain scope; \
+             inherited={:?}, loaded={:?}",
+            rhs_scope.inherited_packages, rhs_scope.loaded_packages
+        );
+
+        // 4. Diagnostic: the pipeline must also report "Undefined variable: xyz".
+        assert!(
+            diags.iter().any(|d| d.message.contains("Undefined variable: xyz")),
+            "Expected 'Undefined variable: xyz' diagnostic; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     /// Reproduce against the user's real worldwide files. Inserts every
     /// .r/.R file under ~/repos/worldwide into state, simulates the user
     /// editing data.r to add `xyz = xyz`, and prints the diagnostics for
