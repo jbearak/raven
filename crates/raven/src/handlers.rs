@@ -232,6 +232,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.hoist_globals_in_functions,
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
+            None,
         )
     }
 }
@@ -2676,6 +2677,7 @@ fn get_cross_file_scope(
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
+        None,
     )
 }
 
@@ -4505,6 +4507,7 @@ fn collect_max_depth_diagnostics(
         false, // depth-exceeded check doesn't need hoisting
         state.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
+        None,
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -4778,6 +4781,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         false,
         snapshot.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
+        None,
     );
 
     {
@@ -35861,6 +35865,7 @@ x
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             !scope_at.symbols.contains_key("xyz"),
@@ -35963,6 +35968,7 @@ x
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         let in_loaded = scope_at.loaded_packages.contains("somepkg");
         let in_inherited = scope_at.inherited_packages.contains("somepkg");
@@ -35990,6 +35996,7 @@ x
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_at_end.loaded_packages.contains("somepkg"),
