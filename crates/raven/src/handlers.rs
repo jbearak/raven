@@ -4977,6 +4977,143 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
     }
 }
 
+/// Pre-computed breakpoint scope data for fast-path resolution in diagnostic collectors.
+///
+/// Cross-file scope only changes at source()/library() call positions ("breakpoints").
+/// Between breakpoints, only local definitions change. This struct pre-computes scope
+/// at each breakpoint and extracts lightweight name sets, so per-identifier lookups
+/// can skip the expensive cross-file DFS when the name is already in scope at the
+/// nearest preceding breakpoint.
+struct BreakpointFastPath<'a> {
+    positions: Vec<(u32, u32)>,
+    name_sets: Vec<((u32, u32), HashSet<String>)>,
+    fn_tree: Option<&'a scope::FunctionScopeTree>,
+    removal_events: Vec<(u32, u32, Vec<String>)>,
+}
+
+impl<'a> BreakpointFastPath<'a> {
+    /// Build breakpoint data from source call positions and PackageLoad events.
+    ///
+    /// `name_filter`: controls which symbols are included in the name sets.
+    /// - For out-of-scope: only same-file symbols (`sym.source_uri == *uri`)
+    /// - For undefined-variable: all symbols
+    fn build(
+        snapshot: &'a DiagnosticsSnapshot,
+        uri: &Url,
+        source_positions: &[(u32, u32)],
+        scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
+        scope_memo: &mut scope::ScopeResolutionMemo,
+        cancel: &DiagCancelToken,
+        name_filter: impl Fn(&Url, &scope::ScopedSymbol) -> bool,
+    ) -> Self {
+        let mut positions = Vec::with_capacity(source_positions.len() + 1);
+        positions.push((0, 0));
+        positions.extend_from_slice(source_positions);
+        if let Some(artifacts) = snapshot.artifacts_map.get(uri) {
+            for event in &artifacts.timeline {
+                if let scope::ScopeEvent::PackageLoad { line, column, .. } = event {
+                    positions.push((*line, *column));
+                }
+            }
+        }
+        positions.sort();
+        positions.dedup();
+
+        for &(l, c) in &positions {
+            if !scope_cache.contains_key(&(l, c)) {
+                let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
+                scope_cache.insert((l, c), computed);
+            }
+        }
+
+        let name_sets: Vec<((u32, u32), HashSet<String>)> = positions
+            .iter()
+            .filter_map(|&pos| {
+                let scope = scope_cache.get(&pos)?;
+                let names: HashSet<String> = scope
+                    .symbols
+                    .iter()
+                    .filter(|(_, sym)| name_filter(uri, sym))
+                    .map(|(name, _)| name.to_string())
+                    .collect();
+                Some((pos, names))
+            })
+            .collect();
+
+        let fn_tree = snapshot
+            .artifacts_map
+            .get(uri)
+            .map(|a| &a.function_scope_tree);
+
+        let removal_events = snapshot
+            .artifacts_map
+            .get(uri)
+            .map(|artifacts| {
+                artifacts
+                    .timeline
+                    .iter()
+                    .filter_map(|event| {
+                        if let scope::ScopeEvent::Removal {
+                            line,
+                            column,
+                            symbols,
+                            ..
+                        } = event
+                        {
+                            Some((*line, *column, symbols.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            positions,
+            name_sets,
+            fn_tree,
+            removal_events,
+        }
+    }
+
+    /// Check if a name is locally resolved at the given usage position via the
+    /// breakpoint fast-path. Returns `true` if the name is in scope at the nearest
+    /// preceding breakpoint and hasn't been removed between the breakpoint and usage.
+    fn is_resolved(&self, name: &str, usage_line: u32, usage_col: u32) -> bool {
+        let bp_idx = self
+            .positions
+            .partition_point(|&(l, c)| (l, c) <= (usage_line, usage_col))
+            .saturating_sub(1);
+
+        if bp_idx >= self.name_sets.len() {
+            return false;
+        }
+
+        let (bp_pos, ref bp_names) = self.name_sets[bp_idx];
+
+        let fn_scope_compatible = self.fn_tree.map_or(true, |tree| {
+            let bp_innermost = tree.query_innermost(scope::Position::new(bp_pos.0, bp_pos.1));
+            let usage_innermost =
+                tree.query_innermost(scope::Position::new(usage_line, usage_col));
+            bp_innermost == usage_innermost
+        });
+
+        if !fn_scope_compatible || !bp_names.contains(name) {
+            return false;
+        }
+
+        // Verify the name wasn't removed between the breakpoint and the usage.
+        let was_removed = self.removal_events.iter().any(|(rl, rc, names)| {
+            (*rl, *rc) > bp_pos
+                && (*rl, *rc) <= (usage_line, usage_col)
+                && names.iter().any(|n| n == name)
+        });
+
+        !was_removed
+    }
+}
+
 fn collect_out_of_scope_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -5030,10 +5167,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &snapshot.directive_meta,
         workspace_root,
     );
-    let source_target_exports: Vec<(usize, Option<HashSet<String>>)> = source_calls
+    let source_target_exports: Vec<Option<HashSet<String>>> = source_calls
         .iter()
-        .enumerate()
-        .map(|(idx, source)| {
+        .map(|source| {
             let resolved_uri = source_path_ctx.as_ref().and_then(|ctx| {
                 let resolved = if source.is_directive {
                     crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
@@ -5045,15 +5181,14 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 }?;
                 Url::from_file_path(resolved).ok()
             });
-            let exports = resolved_uri.and_then(|target_uri| {
+            resolved_uri.and_then(|target_uri| {
                 snapshot.artifacts_map.get(&target_uri).map(|a| {
                     a.exported_interface
                         .keys()
                         .map(|k| k.to_string())
                         .collect::<HashSet<String>>()
                 })
-            });
-            (idx, exports)
+            })
         })
         .collect();
 
@@ -5063,131 +5198,34 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 
     // ── Breakpoint scope optimization (out-of-scope collector) ──
     //
-    // The cross-file scope only changes at source()/library() call positions
-    // ("breakpoints"). Between two consecutive breakpoints, only local
-    // definitions change. Pre-compute scope at each breakpoint and extract
-    // just the set of same-file symbol names (lightweight). For each
-    // identifier, the nearest preceding breakpoint's name set tells us
-    // whether it's locally resolved, avoiding the expensive per-position
-    // cross-file DFS for the vast majority of identifiers.
-    //
-    // This reduces DFS calls from O(unique_identifier_positions) to
-    // O(breakpoint_count) — e.g. 361→10 for data.r, 2367→6 for outcomes.r.
-    let breakpoint_positions: Vec<(u32, u32)> = {
-        let mut bp = Vec::with_capacity(source_calls.len() + 1);
-        bp.push((0, 0)); // Start of file (parent scope only)
-        for source in &source_calls {
-            bp.push((source.line, source.column));
-        }
-        if let Some(artifacts) = snapshot.artifacts_map.get(uri) {
-            for event in &artifacts.timeline {
-                if let scope::ScopeEvent::PackageLoad { line, column, .. } = event {
-                    bp.push((*line, *column));
-                }
-            }
-        }
-        bp.sort();
-        bp.dedup();
-        bp
-    };
-
-    // Phase 1: Compute scope at each breakpoint (the only DFS calls we make)
-    for &(l, c) in &breakpoint_positions {
-        if !scope_cache.contains_key(&(l, c)) {
-            let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
-            scope_cache.insert((l, c), computed);
-        }
-    }
-
-    // Phase 2: Extract lightweight name sets (no cloning of full ScopeAtPosition)
-    let breakpoint_local_names: Vec<((u32, u32), HashSet<String>)> = breakpoint_positions
+    // Cross-file scope only changes at source()/library() call positions
+    // ("breakpoints"). Pre-compute scope at each breakpoint and extract
+    // same-file symbol names. For each identifier, the nearest preceding
+    // breakpoint's name set tells us whether it's locally resolved,
+    // avoiding the expensive per-position cross-file DFS.
+    let source_positions: Vec<(u32, u32)> = source_calls
         .iter()
-        .filter_map(|&pos| {
-            let scope = scope_cache.get(&pos)?;
-            let names: HashSet<String> = scope
-                .symbols
-                .iter()
-                .filter(|(_, sym)| sym.source_uri == *uri)
-                .map(|(name, _)| name.to_string())
-                .collect();
-            Some((pos, names))
-        })
+        .map(|s| (s.line, s.column))
         .collect();
+    let bp_fast_path = BreakpointFastPath::build(
+        snapshot,
+        uri,
+        &source_positions,
+        scope_cache,
+        scope_memo,
+        cancel,
+        |file_uri, sym| sym.source_uri == *file_uri, // same-file only
+    );
 
-    // Get the function scope tree for fast-path scope-compatibility checks.
-    let fn_tree_oos: Option<&scope::FunctionScopeTree> = snapshot
-        .artifacts_map
-        .get(uri)
-        .map(|a| &a.function_scope_tree);
-
-    // Collect rm() events for stale-entry detection in the breakpoint fast-path.
-    let removal_events_oos: Vec<(u32, u32, Vec<String>)> = snapshot
-        .artifacts_map
-        .get(uri)
-        .map(|artifacts| {
-            artifacts
-                .timeline
-                .iter()
-                .filter_map(|event| {
-                    if let scope::ScopeEvent::Removal {
-                        line,
-                        column,
-                        symbols,
-                        ..
-                    } = event
-                    {
-                        Some((*line, *column, symbols.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Filter to only usages that appear before their source() call.
-    // Use breakpoint name sets as a fast-path: if a name is locally defined
-    // at the nearest preceding breakpoint, it's locally resolved without
-    // needing a full cross-file DFS at the exact position. A symbol in scope
-    // at breakpoint P is also in scope at any later position (monotonic
-    // additions), unless removed by rm() between P and the usage.
     let mut locally_resolved_usages: HashSet<(String, u32, u32)> = HashSet::new();
     for (idx, (name, usage_line, usage_col, _)) in usages.iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
         }
 
-        // ── Breakpoint fast-path ──
-        let bp_idx = breakpoint_positions
-            .partition_point(|&(l, c)| (l, c) <= (*usage_line, *usage_col))
-            .saturating_sub(1);
-
-        if bp_idx < breakpoint_local_names.len() {
-            let (bp_pos, ref local_names) = breakpoint_local_names[bp_idx];
-
-            // Guard: skip the fast-path when the breakpoint and usage are in
-            // different function scope contexts. A breakpoint inside a function
-            // includes function-local symbols that aren't visible outside it.
-            let fn_scope_compatible = fn_tree_oos.map_or(true, |tree| {
-                let bp_innermost = tree.query_innermost(scope::Position::new(bp_pos.0, bp_pos.1));
-                let usage_innermost =
-                    tree.query_innermost(scope::Position::new(*usage_line, *usage_col));
-                bp_innermost == usage_innermost
-            });
-
-            if fn_scope_compatible && local_names.contains(name.as_str()) {
-                // Symbol was locally resolved at the breakpoint. Verify it
-                // wasn't removed between the breakpoint and the usage.
-                let was_removed = removal_events_oos.iter().any(|(rl, rc, names)| {
-                    (*rl, *rc) > bp_pos
-                        && (*rl, *rc) <= (*usage_line, *usage_col)
-                        && names.iter().any(|n| n == name.as_str())
-                });
-                if !was_removed {
-                    locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
-                    continue;
-                }
-            }
+        if bp_fast_path.is_resolved(name, *usage_line, *usage_col) {
+            locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
+            continue;
         }
 
         // Fall back to per-position DFS for identifiers not resolved by
@@ -5248,9 +5286,8 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // indexed), we conservatively skip — better to under-report
             // than misattribute.
             let exports_match = source_target_exports
-                .iter()
-                .find(|(i, _)| *i == src_idx)
-                .and_then(|(_, exports)| exports.as_ref())
+                .get(src_idx)
+                .and_then(|exports| exports.as_ref())
                 .map(|set| set.contains(name.as_str()))
                 .unwrap_or(false);
             if !exports_match {
@@ -5426,75 +5463,20 @@ fn collect_undefined_variables_from_snapshot(
     //
     // Reuse breakpoint scopes from the scope_cache (already computed by the
     // out-of-scope collector above). Extract ALL symbol names at each
-    // breakpoint as a lightweight fast-path filter. If a name is in any
-    // preceding breakpoint scope, it's definitely in scope at the identifier
-    // position too (definitions are monotonically additive, modulo rm()).
-    let undef_breakpoint_positions: Vec<(u32, u32)> = {
-        let mut bp: Vec<(u32, u32)> = Vec::with_capacity(direct_sources.len() + 1);
-        bp.push((0, 0));
-        for (line, col, _) in &direct_sources {
-            bp.push((*line, *col));
-        }
-        if let Some(artifacts) = snapshot.artifacts_map.get(uri) {
-            for event in &artifacts.timeline {
-                if let scope::ScopeEvent::PackageLoad { line, column, .. } = event {
-                    bp.push((*line, *column));
-                }
-            }
-        }
-        bp.sort();
-        bp.dedup();
-        bp
-    };
-
-    // Ensure breakpoints are in the cache (may already be there from out-of-scope)
-    for &(l, c) in &undef_breakpoint_positions {
-        if !scope_cache.contains_key(&(l, c)) {
-            let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
-            scope_cache.insert((l, c), computed);
-        }
-    }
-
-    // Extract lightweight all-symbol name sets from cached breakpoint scopes.
-    // Also extract package info for package-export fast-path.
-    let undef_bp_names: Vec<((u32, u32), HashSet<String>)> = undef_breakpoint_positions
+    // breakpoint as a lightweight fast-path filter.
+    let undef_source_positions: Vec<(u32, u32)> = direct_sources
         .iter()
-        .filter_map(|&pos| {
-            let scope = scope_cache.get(&pos)?;
-            let names: HashSet<String> = scope.symbols.keys().map(|k| k.to_string()).collect();
-            Some((pos, names))
-        })
+        .map(|(l, c, _)| (*l, *c))
         .collect();
-
-    // Get the function scope tree for fast-path scope-compatibility checks.
-    let fn_tree_undef: Option<&scope::FunctionScopeTree> = snapshot
-        .artifacts_map
-        .get(uri)
-        .map(|a| &a.function_scope_tree);
-
-    let undef_removal_events: Vec<(u32, u32, Vec<String>)> = snapshot
-        .artifacts_map
-        .get(uri)
-        .map(|artifacts| {
-            artifacts
-                .timeline
-                .iter()
-                .filter_map(|event| {
-                    if let scope::ScopeEvent::Removal {
-                        line,
-                        column,
-                        symbols,
-                        ..
-                    } = event
-                    {
-                        Some((*line, *column, symbols.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let undef_bp_fast_path = BreakpointFastPath::build(
+        snapshot,
+        uri,
+        &undef_source_positions,
+        scope_cache,
+        scope_memo,
+        cancel,
+        |_, _| true, // all symbols
+    );
 
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
@@ -5548,48 +5530,11 @@ fn collect_undefined_variables_from_snapshot(
         }
 
         // ── Breakpoint fast-path ──
-        // Find the nearest preceding breakpoint and check if the name is in
-        // that scope. If it is (and no rm() removed it between the breakpoint
-        // and the usage), the symbol is definitely visible — skip the
-        // expensive per-position cross-file DFS.
         let usage_col_byte = usage_node.start_position().column as u32;
         let line_text_for_col = get_line(usage_node.start_position().row);
         let usage_col = byte_offset_to_utf16_column(line_text_for_col, usage_col_byte as usize);
 
-        let bp_idx = undef_breakpoint_positions
-            .partition_point(|&(l, c)| (l, c) <= (usage_line, usage_col))
-            .saturating_sub(1);
-
-        let mut used_breakpoint_fast_path = false;
-        if bp_idx < undef_bp_names.len() {
-            let (bp_pos, ref bp_names) = undef_bp_names[bp_idx];
-
-            // Guard: skip the fast-path when the breakpoint and usage are in
-            // different function scope contexts. A breakpoint inside a function
-            // includes function-local symbols that aren't visible outside it.
-            let fn_scope_compatible = fn_tree_undef.map_or(true, |tree| {
-                let bp_innermost = tree.query_innermost(scope::Position::new(bp_pos.0, bp_pos.1));
-                let usage_innermost =
-                    tree.query_innermost(scope::Position::new(usage_line, usage_col));
-                bp_innermost == usage_innermost
-            });
-
-            if fn_scope_compatible && bp_names.contains(name.as_str()) {
-                // Symbol was in scope at the breakpoint. Verify it wasn't
-                // removed between the breakpoint and the usage.
-                let was_removed = undef_removal_events.iter().any(|(rl, rc, names)| {
-                    (*rl, *rc) > bp_pos
-                        && (*rl, *rc) <= (usage_line, usage_col)
-                        && names.iter().any(|n| n == name.as_str())
-                });
-
-                if !was_removed {
-                    used_breakpoint_fast_path = true;
-                }
-            }
-        }
-
-        if used_breakpoint_fast_path {
+        if undef_bp_fast_path.is_resolved(&name, usage_line, usage_col) {
             continue;
         }
 

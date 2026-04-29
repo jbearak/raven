@@ -33,12 +33,15 @@ fn main() {
         let home = std::env::var_os("HOME").expect("HOME not set");
         PathBuf::from(home).join("repos/worldwide")
     };
-    if !workspace.exists() {
-        eprintln!("Error: {} doesn't exist", workspace.display());
-        std::process::exit(1);
-    }
+    let workspace = match workspace.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: cannot resolve {}: {}", workspace.display(), e);
+            std::process::exit(1);
+        }
+    };
 
-    let workspace_url = Url::from_file_path(&workspace).unwrap();
+    let workspace_url = Url::from_file_path(&workspace).expect("canonical path to URL");
 
     // ── Phase 1: scan_workspace (cold filesystem) ──
     eprintln!("\n=== Phase 1: scan_workspace (cold) ===");
@@ -74,18 +77,23 @@ fn main() {
     // ── Phase 3: open data.r and build diagnostic snapshot ──
     eprintln!("\n=== Phase 3: open data.r + snapshot + diagnostics ===");
     let data_path = workspace.join("scripts/data.r");
-    let data_uri = Url::from_file_path(&data_path).unwrap();
-    let data_content = std::fs::read_to_string(&data_path).expect("read data.r");
-    state.documents.insert(
-        data_uri.clone(),
-        Document::new_with_uri(&data_content, None, &data_uri),
-    );
-
-    let (build_dur, diag_dur, diag_count) =
-        diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
-    eprintln!("  snapshot build:      {:?}", build_dur);
-    eprintln!("  diagnostics compute: {:?}", diag_dur);
-    eprintln!("  diagnostic count:    {:?}", diag_count);
+    let (build_dur, diag_dur, _diag_count) = if data_path.exists() {
+        let data_uri = Url::from_file_path(&data_path).unwrap();
+        let data_content = std::fs::read_to_string(&data_path).expect("read data.r");
+        state.documents.insert(
+            data_uri.clone(),
+            Document::new_with_uri(&data_content, None, &data_uri),
+        );
+        let result =
+            diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
+        eprintln!("  snapshot build:      {:?}", result.0);
+        eprintln!("  diagnostics compute: {:?}", result.1);
+        eprintln!("  diagnostic count:    {:?}", result.2);
+        result
+    } else {
+        eprintln!("  Phase 3 skipped: scripts/data.r not found");
+        (std::time::Duration::ZERO, std::time::Duration::ZERO, None)
+    };
 
     // ── Phase 3b: profile diagnostics for other representative files ──
     eprintln!("\n=== Phase 3b: diagnostics for other files ===");

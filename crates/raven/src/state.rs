@@ -1091,6 +1091,14 @@ struct ProcessedFile {
 
 /// Recursively collect file paths from a directory (serial walk, fast).
 fn collect_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut visited = HashSet::new();
+    if let Ok(canonical) = fs::canonicalize(dir) {
+        visited.insert(canonical);
+    }
+    collect_file_paths_inner(dir, out, &mut visited);
+}
+
+fn collect_file_paths_inner(dir: &Path, out: &mut Vec<PathBuf>, visited: &mut HashSet<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1105,7 +1113,19 @@ fn collect_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
                     continue;
                 }
             }
-            collect_file_paths(&path, out);
+            match fs::canonicalize(&path) {
+                Ok(canonical) => {
+                    if !visited.insert(canonical) {
+                        log::trace!("Skipping symlink cycle: {}", path.display());
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    log::trace!("Skipping unresolvable dir {}: {}", path.display(), e);
+                    continue;
+                }
+            }
+            collect_file_paths_inner(&path, out, visited);
         } else if is_stat_model_extension(&path) {
             out.push(path);
         }

@@ -1350,10 +1350,7 @@ impl LanguageServer for Backend {
 
             // Collect package names from library calls for background prefetch
             let packages_to_prefetch: Vec<String> = if packages_enabled {
-                meta.library_calls
-                    .iter()
-                    .map(|c| c.package.clone())
-                    .collect()
+                extract_loaded_packages_from_library_calls(&meta.library_calls)
             } else {
                 Vec::new()
             };
