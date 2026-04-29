@@ -79,5 +79,5 @@ name = "profile_diagnostics"
 required-features = ["test-support"]
 
 [[example]]
-name = "profile_real_workspace"
+name = "profile_worldwide"
 required-features = ["test-support"]

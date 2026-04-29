@@ -97,6 +97,17 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
+
+    /// STEP 1 (parent walk) cache shared across all `get_scope` calls in this
+    /// snapshot's diagnostic pass. STEP 1 is position-invariant within one
+    /// pass for a given URI (parametrized only by `query_inside_function`),
+    /// so two cache slots per URI eliminate redundant parent-walk work
+    /// across the per-identifier scope queries.
+    ///
+    /// `RefCell` because `get_scope` is called via `&self` and needs to
+    /// mutate the cache. The snapshot is owned by a single tokio task; no
+    /// `Sync` bound is required.
+    pub(crate) parent_prefix_cache: std::cell::RefCell<scope::ParentPrefixCache>,
 }
 
 impl DiagnosticsSnapshot {
@@ -200,17 +211,21 @@ impl DiagnosticsSnapshot {
             cycle_detection,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
+            parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
         })
     }
 
     /// Resolve cross-file scope from pre-collected snapshot data.
+    ///
+    /// Routes through `scope_at_position_with_graph_cached` so STEP 1 (the
+    /// parent walk) is memoized across the snapshot's many per-identifier
+    /// scope queries.
     fn get_scope(
         &self,
         uri: &Url,
         line: u32,
         column: u32,
         cancel: &DiagCancelToken,
-        memo: Option<&mut scope::ScopeResolutionMemo>,
     ) -> scope::ScopeAtPosition {
         let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
@@ -222,7 +237,8 @@ impl DiagnosticsSnapshot {
 
         let is_cancelled = || cancel.is_cancelled();
 
-        scope::scope_at_position_with_graph(
+        let mut cache = self.parent_prefix_cache.borrow_mut();
+        scope::scope_at_position_with_graph_cached(
             uri,
             line,
             column,
@@ -235,7 +251,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.hoist_globals_in_functions,
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
-            memo,
+            &mut cache,
         )
     }
 }
@@ -333,13 +349,6 @@ pub(crate) fn diagnostics_from_snapshot(
     // Shared scope cache for expensive collectors
     let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
 
-    // Shared memo for cross-file DFS memoization across scope queries.
-    // This eliminates redundant DFS traversals when the out-of-scope and
-    // undefined-variable collectors query scope at many different positions
-    // in the same file — the parent resolution and child resolutions are
-    // cached on first compute and reused for subsequent positions.
-    let mut scope_memo = scope::ScopeResolutionMemo::new();
-
     let scope_start = std::time::Instant::now();
 
     // Out-of-scope diagnostics
@@ -350,7 +359,6 @@ pub(crate) fn diagnostics_from_snapshot(
         &snapshot.text,
         &mut diagnostics,
         &mut scope_cache,
-        &mut scope_memo,
         cancel,
     );
 
@@ -371,7 +379,6 @@ pub(crate) fn diagnostics_from_snapshot(
             &snapshot.text,
             &mut diagnostics,
             &mut scope_cache,
-            &mut scope_memo,
             cancel,
         );
     }
@@ -2690,7 +2697,6 @@ fn get_cross_file_scope(
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
-        None,
     )
 }
 
@@ -4525,7 +4531,6 @@ fn collect_max_depth_diagnostics(
         false, // depth-exceeded check doesn't need hoisting
         state.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
-        None,
     );
 
     // Emit diagnostics for depth exceeded, filtering to only those in this file
@@ -4800,7 +4805,6 @@ fn collect_max_depth_diagnostics_from_snapshot(
         false,
         snapshot.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
-        None,
     );
 
     {
@@ -4977,145 +4981,6 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
     }
 }
 
-/// Pre-computed breakpoint scope data for fast-path resolution in diagnostic collectors.
-///
-/// Cross-file scope only changes at source()/library() call positions ("breakpoints").
-/// Between breakpoints, only local definitions change. This struct pre-computes scope
-/// at each breakpoint and extracts lightweight name sets, so per-identifier lookups
-/// can skip the expensive cross-file DFS when the name is already in scope at the
-/// nearest preceding breakpoint.
-struct BreakpointFastPath<'a> {
-    positions: Vec<(u32, u32)>,
-    name_sets: Vec<((u32, u32), HashSet<String>)>,
-    fn_tree: Option<&'a scope::FunctionScopeTree>,
-    removal_events: Vec<(u32, u32, Vec<String>)>,
-}
-
-impl<'a> BreakpointFastPath<'a> {
-    /// Build breakpoint data from source call positions and PackageLoad events.
-    ///
-    /// `name_filter`: controls which symbols are included in the name sets.
-    /// - For out-of-scope: only same-file symbols (`sym.source_uri == *uri`)
-    /// - For undefined-variable: all symbols
-    fn build(
-        snapshot: &'a DiagnosticsSnapshot,
-        uri: &Url,
-        source_positions: &[(u32, u32)],
-        scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
-        scope_memo: &mut scope::ScopeResolutionMemo,
-        cancel: &DiagCancelToken,
-        name_filter: impl Fn(&Url, &scope::ScopedSymbol) -> bool,
-    ) -> Self {
-        let mut positions = Vec::with_capacity(source_positions.len() + 1);
-        positions.push((0, 0));
-        positions.extend_from_slice(source_positions);
-        if let Some(artifacts) = snapshot.artifacts_map.get(uri) {
-            for event in &artifacts.timeline {
-                if let scope::ScopeEvent::PackageLoad { line, column, .. } = event {
-                    positions.push((*line, *column));
-                }
-            }
-        }
-        positions.sort();
-        positions.dedup();
-
-        for &(l, c) in &positions {
-            if cancel.is_cancelled() {
-                break;
-            }
-            if !scope_cache.contains_key(&(l, c)) {
-                let computed = snapshot.get_scope(uri, l, c, cancel, Some(scope_memo));
-                scope_cache.insert((l, c), computed);
-            }
-        }
-
-        let name_sets: Vec<((u32, u32), HashSet<String>)> = positions
-            .iter()
-            .filter_map(|&pos| {
-                let scope = scope_cache.get(&pos)?;
-                let names: HashSet<String> = scope
-                    .symbols
-                    .iter()
-                    .filter(|(_, sym)| name_filter(uri, sym))
-                    .map(|(name, _)| name.to_string())
-                    .collect();
-                Some((pos, names))
-            })
-            .collect();
-
-        let fn_tree = snapshot
-            .artifacts_map
-            .get(uri)
-            .map(|a| &a.function_scope_tree);
-
-        let removal_events = snapshot
-            .artifacts_map
-            .get(uri)
-            .map(|artifacts| {
-                artifacts
-                    .timeline
-                    .iter()
-                    .filter_map(|event| {
-                        if let scope::ScopeEvent::Removal {
-                            line,
-                            column,
-                            symbols,
-                            ..
-                        } = event
-                        {
-                            Some((*line, *column, symbols.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Self {
-            positions,
-            name_sets,
-            fn_tree,
-            removal_events,
-        }
-    }
-
-    /// Check if a name is locally resolved at the given usage position via the
-    /// breakpoint fast-path. Returns `true` if the name is in scope at the nearest
-    /// preceding breakpoint and hasn't been removed between the breakpoint and usage.
-    fn is_resolved(&self, name: &str, usage_line: u32, usage_col: u32) -> bool {
-        let bp_idx = self
-            .positions
-            .partition_point(|&(l, c)| (l, c) <= (usage_line, usage_col))
-            .saturating_sub(1);
-
-        if bp_idx >= self.name_sets.len() {
-            return false;
-        }
-
-        let (bp_pos, ref bp_names) = self.name_sets[bp_idx];
-
-        let fn_scope_compatible = self.fn_tree.map_or(true, |tree| {
-            let bp_innermost = tree.query_innermost(scope::Position::new(bp_pos.0, bp_pos.1));
-            let usage_innermost =
-                tree.query_innermost(scope::Position::new(usage_line, usage_col));
-            bp_innermost == usage_innermost
-        });
-
-        if !fn_scope_compatible || !bp_names.contains(name) {
-            return false;
-        }
-
-        // Verify the name wasn't removed between the breakpoint and the usage.
-        let was_removed = self.removal_events.iter().any(|(rl, rc, names)| {
-            (*rl, *rc) > bp_pos
-                && (*rl, *rc) <= (usage_line, usage_col)
-                && names.iter().any(|n| n == name)
-        });
-
-        !was_removed
-    }
-}
 
 fn collect_out_of_scope_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
@@ -5124,7 +4989,6 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     text: &str,
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
-    scope_memo: &mut scope::ScopeResolutionMemo,
     cancel: &DiagCancelToken,
 ) {
     let Some(severity) = snapshot.cross_file_config.out_of_scope_severity else {
@@ -5195,65 +5059,72 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         })
         .collect();
 
-    // Collect usages
+    // Collect usages and sort by document order so the ScopeStream cursor
+    // advances monotonically. tree-sitter's `walk()` typically yields
+    // nodes in document order; the sort is a defensive guarantee.
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
     collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
+    usages.sort_by_key(|(_, l, c, _)| (*l, *c));
 
-    // ── Breakpoint scope optimization (out-of-scope collector) ──
-    //
-    // Cross-file scope only changes at source()/library() call positions
-    // ("breakpoints"). Pre-compute scope at each breakpoint and extract
-    // same-file symbol names. For each identifier, the nearest preceding
-    // breakpoint's name set tells us whether it's locally resolved,
-    // avoiding the expensive per-position cross-file DFS.
-    let source_positions: Vec<(u32, u32)> = source_calls
-        .iter()
-        .map(|s| (s.line, s.column))
-        .collect();
-    let bp_fast_path = BreakpointFastPath::build(
-        snapshot,
+    // Build a ScopeStream for the queried URI. The closures borrow the
+    // snapshot's pre-collected artifacts/metadata maps; the stream
+    // borrows the snapshot's shared `parent_prefix_cache` so child-source
+    // recursion benefits from the same Stage-1 caching.
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        snapshot.artifacts_map.get(target_uri).cloned()
+    };
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+        snapshot.metadata_map.get(target_uri).cloned()
+    };
+    let is_cancelled_fn = || cancel.is_cancelled();
+
+    let mut stream_opt = scope::ScopeStream::new(
         uri,
-        &source_positions,
-        scope_cache,
-        scope_memo,
-        cancel,
-        |file_uri, sym| sym.source_uri == *file_uri, // same-file only
+        &get_artifacts,
+        &get_metadata,
+        &snapshot.cross_file_graph,
+        snapshot.workspace_folders.first(),
+        snapshot.cross_file_config.max_chain_depth,
+        &snapshot.base_exports,
+        snapshot.cross_file_config.hoist_globals_in_functions,
+        snapshot.cross_file_config.backward_dependencies,
+        &is_cancelled_fn,
+        &snapshot.parent_prefix_cache,
     );
 
-    let mut locally_resolved_usages: HashSet<(String, u32, u32)> = HashSet::new();
-    for (idx, (name, usage_line, usage_col, _)) in usages.iter().enumerate() {
-        if idx & 63 == 0 && cancel.is_cancelled() {
-            return;
-        }
-
-        if bp_fast_path.is_resolved(name, *usage_line, *usage_col) {
-            locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
+    // Pre-resolve scope at each forward-source's call site so the
+    // defense-in-depth check (which needs `symbol.source_uri != *uri`)
+    // doesn't require per-usage out-of-order cursor jumps. Source
+    // positions are typically a small set (≤ tens) so the upfront cost
+    // is bounded; computing once per source is cheaper than per-usage.
+    //
+    // We use `snapshot.get_scope` here (cached path with the same prefix
+    // cache as the stream) rather than the stream itself because the
+    // source positions can be ANY line/column in the file, not necessarily
+    // monotonic with the per-usage forward sweep.
+    let mut source_scope_symbols: HashMap<(u32, u32), HashMap<String, Url>> = HashMap::new();
+    for source in &source_calls {
+        if !source.inherits_symbols() {
             continue;
         }
-
-        // Fall back to per-position DFS for identifiers not resolved by
-        // the breakpoint fast-path (local definitions between breakpoints,
-        // or names removed by rm()).
-        if !scope_cache.contains_key(&(*usage_line, *usage_col)) {
-            let computed =
-                snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
-            scope_cache.insert((*usage_line, *usage_col), computed);
-        }
-        let scope = scope_cache.get(&(*usage_line, *usage_col)).unwrap();
-        if let Some(symbol) = scope.symbols.get(name.as_str()) {
-            if symbol.source_uri == *uri {
-                locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
-            }
-        }
+        let key = (source.line, source.column);
+        source_scope_symbols.entry(key).or_insert_with(|| {
+            let s = scope_cache
+                .entry(key)
+                .or_insert_with(|| snapshot.get_scope(uri, key.0, key.1, cancel));
+            // Build a slimmed map of (symbol_name → source_uri) for the
+            // defense-in-depth `inherited` check. Cloning just the URI
+            // avoids holding borrows on `scope_cache`.
+            s.symbols
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.source_uri.clone()))
+                .collect()
+        });
     }
 
     for (idx, (name, usage_line, usage_col, usage_node)) in usages.iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
-        }
-
-        if locally_resolved_usages.contains(&(name.clone(), *usage_line, *usage_col)) {
-            continue;
         }
 
         if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, *usage_line) {
@@ -5263,14 +5134,26 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             continue;
         }
 
-        if !scope_cache.contains_key(&(*usage_line, *usage_col)) {
-            let computed =
-                snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
-            scope_cache.insert((*usage_line, *usage_col), computed);
-        }
-        let scope = scope_cache.get(&(*usage_line, *usage_col)).unwrap();
+        // Stream-based visibility check. Collapses the original
+        // `locally_resolved_usages` set + `scope.symbols.contains_key`
+        // pre-filter into a single `is_visible` check: any symbol in
+        // scope (locally defined or inherited) suppresses the
+        // out-of-scope diagnostic. The original two-pass structure was
+        // an optimization that no longer applies under streaming
+        // (single forward sweep amortizes the cache work). Falls back
+        // to the legacy snapshot-cache path when the stream couldn't be
+        // constructed.
+        let in_scope = if let Some(stream) = stream_opt.as_mut() {
+            stream.advance_to(*usage_line, *usage_col);
+            stream.is_visible(name)
+        } else {
+            let scope = scope_cache
+                .entry((*usage_line, *usage_col))
+                .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+            scope.symbols.contains_key(name.as_str())
+        };
 
-        if scope.symbols.contains_key(name.as_str()) {
+        if in_scope {
             continue;
         }
 
@@ -5300,18 +5183,16 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // Defense in depth: also confirm the symbol record at the
             // source() position points to a different file, guarding
             // against the original `xyz <- xyz` self-leak shape that
-            // motivated commit 91c3617.
-            if !scope_cache.contains_key(&(source.line, source.column)) {
-                let computed =
-                    snapshot.get_scope(uri, source.line, source.column, cancel, Some(scope_memo));
-                scope_cache.insert((source.line, source.column), computed);
-            }
-            let source_scope = scope_cache.get(&(source.line, source.column)).unwrap();
-            let inherited = source_scope
-                .symbols
-                .get(name.as_str())
-                .map(|sym| sym.source_uri != *uri)
-                .unwrap_or(true); // No symbol record yet (will be brought by source) → still attribute
+            // motivated commit 91c3617. The pre-computed
+            // `source_scope_symbols` map gives us the (name → source_uri)
+            // mapping for this source's call site without re-querying.
+            let inherited = match source_scope_symbols.get(&(source.line, source.column)) {
+                Some(syms) => syms
+                    .get(name.as_str())
+                    .map(|src_uri| src_uri != uri)
+                    .unwrap_or(true), // No symbol record yet (will be brought by source) → still attribute
+                None => true, // Source not in pre-resolve map (e.g. doesn't inherit symbols)
+            };
             if !inherited {
                 continue;
             }
@@ -5348,7 +5229,6 @@ fn collect_undefined_variables_from_snapshot(
     text: &str,
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
-    scope_memo: &mut scope::ScopeResolutionMemo,
     cancel: &DiagCancelToken,
 ) {
     use crate::cross_file::config::BackwardDependencyMode;
@@ -5417,7 +5297,7 @@ fn collect_undefined_variables_from_snapshot(
 
     let parent_symbol_names: HashSet<String> = {
         if !scope_cache.contains_key(&(0, 0)) {
-            let computed = snapshot.get_scope(uri, 0, 0, cancel, Some(scope_memo));
+            let computed = snapshot.get_scope(uri, 0, 0, cancel);
             scope_cache.insert((0, 0), computed);
         }
         let scope_0_0 = scope_cache.get(&(0, 0)).unwrap();
@@ -5462,23 +5342,37 @@ fn collect_undefined_variables_from_snapshot(
     // name is checked at most once across all identifiers in this diagnostic pass.
     let mut package_exists_memo: HashMap<String, bool> = HashMap::new();
 
-    // ── Breakpoint scope optimization (undefined-variable collector) ──
-    //
-    // Reuse breakpoint scopes from the scope_cache (already computed by the
-    // out-of-scope collector above). Extract ALL symbol names at each
-    // breakpoint as a lightweight fast-path filter.
-    let undef_source_positions: Vec<(u32, u32)> = direct_sources
-        .iter()
-        .map(|(l, c, _)| (*l, *c))
-        .collect();
-    let undef_bp_fast_path = BreakpointFastPath::build(
-        snapshot,
+    // Sort usages by document order so the ScopeStream cursor advances
+    // monotonically. tree-sitter's `walk()` typically yields nodes in
+    // document order already; the sort is a defensive guarantee for the
+    // streaming `advance_to` invariant.
+    let mut used = used;
+    used.sort_by_key(|(_, n)| (n.start_position().row, n.start_position().column));
+
+    // Build a single ScopeStream for the queried URI. The closures
+    // borrow the snapshot's pre-collected artifacts/metadata maps; the
+    // stream borrows the snapshot's shared `parent_prefix_cache` so
+    // child-source recursion benefits from the same Stage-1 caching.
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        snapshot.artifacts_map.get(target_uri).cloned()
+    };
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+        snapshot.metadata_map.get(target_uri).cloned()
+    };
+    let is_cancelled_fn = || cancel.is_cancelled();
+
+    let mut stream_opt = scope::ScopeStream::new(
         uri,
-        &undef_source_positions,
-        scope_cache,
-        scope_memo,
-        cancel,
-        |_, _| true, // all symbols
+        &get_artifacts,
+        &get_metadata,
+        &snapshot.cross_file_graph,
+        snapshot.workspace_folders.first(),
+        snapshot.cross_file_config.max_chain_depth,
+        &snapshot.base_exports,
+        snapshot.cross_file_config.hoist_globals_in_functions,
+        snapshot.cross_file_config.backward_dependencies,
+        &is_cancelled_fn,
+        &snapshot.parent_prefix_cache,
     );
 
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
@@ -5511,13 +5405,15 @@ fn collect_undefined_variables_from_snapshot(
             }
         }
 
+        // Compute usage_col_utf16 once per iteration; subsequent checks
+        // share it.
+        let usage_line_text = get_line(usage_node.start_position().row);
+        let usage_col_utf16 =
+            byte_offset_to_utf16_column(usage_line_text, usage_node.start_position().column);
+
         if hoist_globals {
             if let Some((ref exports, ref fn_tree)) = local_opt {
                 if exports.contains(name.as_str()) {
-                    let usage_col_byte = usage_node.start_position().column as u32;
-                    let line_text = get_line(usage_node.start_position().row);
-                    let usage_col_utf16 =
-                        byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
                     let inside_function = !fn_tree
                         .query_point(scope::Position::new(usage_line, usage_col_utf16))
                         .is_empty();
@@ -5532,38 +5428,48 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
 
-        // ── Breakpoint fast-path ──
-        let usage_col_byte = usage_node.start_position().column as u32;
-        let line_text_for_col = get_line(usage_node.start_position().row);
-        let usage_col = byte_offset_to_utf16_column(line_text_for_col, usage_col_byte as usize);
+        // Advance the stream cursor and query visibility. Fall back to
+        // the legacy snapshot.get_scope path if stream construction
+        // failed (no artifacts for the queried URI).
+        let scope = if let Some(stream) = stream_opt.as_mut() {
+            stream.advance_to(usage_line, usage_col_utf16);
+            // Fast path: if the symbol is visible AND not a forward
+            // reference in the same file, skip the diagnostic. The
+            // `symbol_for` walk is cheaper than materializing a full
+            // ScopeAtPosition because it short-circuits on the first
+            // matching frame.
+            if let Some(sym) = stream.symbol_for(&name) {
+                if !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16) {
+                    continue;
+                }
+            }
+            // Slow path: name is undefined or forward-referenced. We
+            // need the full ScopeAtPosition for the package checks
+            // below. Materialize once via `snapshot()` and store in
+            // `scope_cache` so repeat lookups (rare; same usage twice)
+            // are free, AND so the out-of-scope collector can read the
+            // populated entry if it runs over the same positions.
+            let entry = scope_cache.entry((usage_line, usage_col_utf16));
+            entry.or_insert_with(|| stream.snapshot())
+        } else {
+            // No artifacts → fall back to the legacy path. This branch
+            // is rare (it happens only for files that aren't open or
+            // indexed), and matches the pre-Stage-2 behavior.
+            scope_cache
+                .entry((usage_line, usage_col_utf16))
+                .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col_utf16, cancel))
+        };
 
-        if undef_bp_fast_path.is_resolved(&name, usage_line, usage_col) {
-            continue;
-        }
-
-        // Fall back to per-position cross-file scope resolution.
-        // This only happens for identifiers not found in any breakpoint scope
-        // (local definitions between breakpoints, or names removed by rm()).
-        if !scope_cache.contains_key(&(usage_line, usage_col)) {
-            let computed = snapshot.get_scope(uri, usage_line, usage_col, cancel, Some(scope_memo));
-            scope_cache.insert((usage_line, usage_col), computed);
-        }
-        let scope = scope_cache.get(&(usage_line, usage_col)).unwrap();
-
-        if let Some(sym) = scope.symbols.get(name.as_str()) {
-            let usage_col_for_check = byte_offset_to_utf16_column(
-                get_line(usage_node.start_position().row),
-                usage_node.start_position().column,
-            );
-            if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_for_check) {
-                continue;
+        // For the no-stream fall-back path we still need to apply the
+        // forward-reference check (the stream path applied it above
+        // before the snapshot materialization).
+        if stream_opt.is_none() {
+            if let Some(sym) = scope.symbols.get(name.as_str()) {
+                if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16) {
+                    continue;
+                }
             }
         }
-
-        let usage_col_utf16 = byte_offset_to_utf16_column(
-            get_line(usage_node.start_position().row),
-            usage_node.start_position().column,
-        );
 
         let defined_in_loaded_direct_source = direct_sources
             .iter()
@@ -35700,7 +35606,7 @@ x
         // Now also dump scope.symbols at data.r line 17 (0-indexed) col 6 (RHS xyz).
         let line: u32 = 17;
         let col: u32 = 6;
-        let scope_at = snapshot.get_scope(&data_uri, line, col, &DiagCancelToken::never(), None);
+        let scope_at = snapshot.get_scope(&data_uri, line, col, &DiagCancelToken::never());
         eprintln!(
             "scope.symbols at data.r ({}, {}) — {} entries",
             line,
@@ -35728,14 +35634,14 @@ x
         );
 
         // Now query at (17, 0) - LHS position, BEFORE assignment.
-        let lhs_scope = snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never(), None);
+        let lhs_scope = snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never());
         eprintln!(
             "scope.symbols at LHS (17, 0): xyz in scope? {}",
             lhs_scope.symbols.contains_key("xyz")
         );
 
         // And at (16, 0) - the line BEFORE xyz = xyz, no assignment yet.
-        let prev_scope = snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never(), None);
+        let prev_scope = snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never());
         eprintln!(
             "scope.symbols at (16, 0): xyz in scope? {}",
             prev_scope.symbols.contains_key("xyz")
@@ -35764,7 +35670,7 @@ x
         // Lock in the fix: with the cross-file scope leak fixed, xyz must NOT
         // be in scope at the RHS of `xyz = xyz`, and the undefined-variable
         // diagnostic must fire on data.r.
-        let scope_rhs = snapshot.get_scope(&data_uri, 17, 6, &DiagCancelToken::never(), None);
+        let scope_rhs = snapshot.get_scope(&data_uri, 17, 6, &DiagCancelToken::never());
         assert!(
             !scope_rhs.symbols.contains_key("xyz"),
             "xyz must NOT leak back into data.r's scope at the RHS of its own assignment"
@@ -35885,7 +35791,6 @@ x
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
-            None,
         );
         assert!(
             !scope_at.symbols.contains_key("xyz"),
@@ -35999,7 +35904,6 @@ x
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
-            None,
         );
         let in_loaded = scope_at.loaded_packages.contains("somepkg");
         let in_inherited = scope_at.inherited_packages.contains("somepkg");
@@ -36027,13 +35931,325 @@ x
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
-            None,
         );
         assert!(
             scope_at_end.loaded_packages.contains("somepkg"),
             "Sanity check failed: somepkg must be in scope at line 6 (after \
              `library(somepkg)`). loaded_packages={:?}",
             scope_at_end.loaded_packages
+        );
+    }
+
+    // ========================================================================
+    // ParentPrefixCache (Stage 1) regression tests
+    //
+    // For every supported function-form (left/right/super arrow, equals,
+    // R 4.1+ lambda, paren-wrapped recursive, anonymous-as-call-arg) and a
+    // 4-file backward-cycle fixture (the worldwide-data.r self-leak shape),
+    // confirm that the cached scope path produces ScopeAtPosition values
+    // equal to the uncached path at every queried position.
+    //
+    // The same-file leak filters from commits 91c3617 / 65b2959 must also
+    // apply through the cached path: in the multi-file fixture, `xyz` must
+    // NOT be in scope at the RHS of `xyz <- xyz`.
+    // ========================================================================
+
+    /// Build a single-file snapshot from `text` and run `queries` through both
+    /// the cached and uncached scope paths. Asserts the two paths produce
+    /// equal symbol sets, inherited/loaded packages, and depth_exceeded at
+    /// every position.
+    fn assert_cached_matches_uncached(text: &str, queries: &[(u32, u32)]) {
+        use std::collections::BTreeSet;
+
+        let mut state = create_test_state();
+        state.cross_file_config.undefined_variables_enabled = true;
+        let uri = add_document(&mut state, "file:///test/cache.R", text);
+        state.cross_file_graph.update_file(
+            &uri,
+            &crate::cross_file::extract_metadata(text),
+            None,
+            |_| None,
+        );
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+
+        let get_artifacts =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
+                snapshot.artifacts_map.get(target_uri).cloned()
+            };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                snapshot.metadata_map.get(target_uri).cloned()
+            };
+
+        let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+
+        for &(line, col) in queries {
+            let cached = crate::cross_file::scope::scope_at_position_with_graph_cached(
+                &uri,
+                line,
+                col,
+                &get_artifacts,
+                &get_metadata,
+                &snapshot.cross_file_graph,
+                snapshot.workspace_folders.first(),
+                snapshot.cross_file_config.max_chain_depth,
+                &snapshot.base_exports,
+                snapshot.cross_file_config.hoist_globals_in_functions,
+                snapshot.cross_file_config.backward_dependencies,
+                &|| false,
+                &mut cache,
+            );
+            let direct = crate::cross_file::scope::scope_at_position_with_graph(
+                &uri,
+                line,
+                col,
+                &get_artifacts,
+                &get_metadata,
+                &snapshot.cross_file_graph,
+                snapshot.workspace_folders.first(),
+                snapshot.cross_file_config.max_chain_depth,
+                &snapshot.base_exports,
+                snapshot.cross_file_config.hoist_globals_in_functions,
+                snapshot.cross_file_config.backward_dependencies,
+                &|| false,
+            );
+
+            let cached_keys: BTreeSet<&str> =
+                cached.symbols.keys().map(|n| n.as_ref()).collect();
+            let direct_keys: BTreeSet<&str> =
+                direct.symbols.keys().map(|n| n.as_ref()).collect();
+            assert_eq!(
+                cached_keys, direct_keys,
+                "symbol set differs at ({line}, {col}) for fixture:\n{text}"
+            );
+            assert_eq!(
+                cached.inherited_packages, direct.inherited_packages,
+                "inherited_packages differ at ({line}, {col}) for fixture:\n{text}"
+            );
+            assert_eq!(
+                cached.loaded_packages, direct.loaded_packages,
+                "loaded_packages differ at ({line}, {col}) for fixture:\n{text}"
+            );
+            assert_eq!(
+                cached.depth_exceeded, direct.depth_exceeded,
+                "depth_exceeded differ at ({line}, {col}) for fixture:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cached_left_arrow_function() {
+        // `f <- function() { y <- 1; y }`
+        assert_cached_matches_uncached(
+            "f <- function() { y <- 1; y }\n",
+            &[(0, 0), (0, 5), (0, 18), (0, 24), (0, 28), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_equals_function() {
+        // `f = function() { y <- 1; y }`
+        assert_cached_matches_uncached(
+            "f = function() { y <- 1; y }\n",
+            &[(0, 0), (0, 5), (0, 17), (0, 23), (0, 27), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_super_assignment_function() {
+        // `f <<- function() { y <- 1; y }`
+        assert_cached_matches_uncached(
+            "f <<- function() { y <- 1; y }\n",
+            &[(0, 0), (0, 5), (0, 19), (0, 25), (0, 29), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_right_arrow_paren_function() {
+        // Right-arrow function-binding requires parens around the function
+        // (per CLAUDE.md learnings): `(function() { y <- 1; y }) -> f`
+        assert_cached_matches_uncached(
+            "(function() { y <- 1; y }) -> f\n",
+            &[(0, 0), (0, 14), (0, 21), (0, 26), (0, 30), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_right_super_paren_function() {
+        // `(function() { y <- 1; y }) ->> f`
+        assert_cached_matches_uncached(
+            "(function() { y <- 1; y }) ->> f\n",
+            &[(0, 0), (0, 14), (0, 21), (0, 28), (0, 31), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_paren_wrapped_recursive() {
+        // Paren-wrapped recursive function: `f <- (function() f())`.
+        // visible_from is the LHS so `f` is visible inside the body.
+        assert_cached_matches_uncached(
+            "f <- (function() f())\n",
+            &[(0, 0), (0, 5), (0, 17), (0, 19), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_lambda_backslash() {
+        // R 4.1+ lambda: `f <- \(x) x + 1`. tree-sitter-r normalizes \(x)
+        // into function_definition.
+        assert_cached_matches_uncached(
+            "f <- \\(x) x + 1\n",
+            &[(0, 0), (0, 5), (0, 8), (0, 10), (0, 14), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn test_cached_anonymous_lambda_in_call() {
+        // Anonymous lambda passed as a call argument:
+        // `ys <- sapply(xs, \(p) p + 1)`. The lambda's body should be a
+        // FunctionScope event in the timeline.
+        assert_cached_matches_uncached(
+            "xs <- 1:5\nys <- sapply(xs, \\(p) p + 1)\n",
+            &[
+                (0, 0),
+                (0, 5),
+                (1, 0),
+                (1, 6),
+                (1, 18),
+                (1, 22),
+                (1, 27),
+                (2, 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_cached_bare_function_arrow_local_binding() {
+        // Bare `function() { ... } -> name` (no parens) is NOT a right-arrow
+        // function binding. tree-sitter-r parses the whole thing as a single
+        // function_definition whose body is `{ ... } -> name`. `name` becomes
+        // a function-LOCAL binding. The cached path must agree with the
+        // uncached path on this oddity.
+        assert_cached_matches_uncached(
+            "function() { x <- 1; x } -> f\n",
+            &[(0, 0), (0, 11), (0, 20), (0, 24), (0, 28), (1, 0)],
+        );
+    }
+
+    /// Mirrors the multi-file `xyz <- xyz` self-referential shape that
+    /// commits 91c3617 / 65b2959 fixed. Confirms the same-file leak filter
+    /// still applies when scope is resolved via the cached path: at the
+    /// RHS of `xyz <- xyz` on data.R, `xyz` must NOT be in scope (the
+    /// binding is not visible in its own RHS, and the recursion through
+    /// main.R → indices.R → main.R@MAX → data.R@MAX must not leak data.R's
+    /// own later definition back into the narrower query scope).
+    #[test]
+    fn test_cached_path_preserves_xyz_self_leak_filter() {
+        use std::collections::BTreeSet;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let data_uri = Url::parse("file:///workspace/data.R").unwrap();
+        let covariates_uri = Url::parse("file:///workspace/covariates.R").unwrap();
+        let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
+
+        let main_code = "source(\"data.R\")\n";
+        let data_code = "source(\"covariates.R\")\nxyz = xyz\nsource(\"indices.R\")\n";
+        let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
+        let indices_code = "idx_a <- 10\n";
+
+        let mut state = create_test_state();
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&covariates_uri, covariates_code),
+            (&indices_uri, indices_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
+
+        let get_artifacts =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
+                snapshot.artifacts_map.get(target_uri).cloned()
+            };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                snapshot.metadata_map.get(target_uri).cloned()
+            };
+
+        // RHS of `xyz = xyz` on line 1 (0-indexed). The `=` is at col 4,
+        // RHS `xyz` starts at col 6.
+        let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+        let cached = crate::cross_file::scope::scope_at_position_with_graph_cached(
+            &data_uri,
+            1,
+            6,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.cross_file_graph,
+            snapshot.workspace_folders.first(),
+            snapshot.cross_file_config.max_chain_depth,
+            &snapshot.base_exports,
+            snapshot.cross_file_config.hoist_globals_in_functions,
+            snapshot.cross_file_config.backward_dependencies,
+            &|| false,
+            &mut cache,
+        );
+
+        // The same-file leak filter must keep `xyz` out of scope at its own RHS.
+        // Other symbols introduced by sibling files via main.R may still be
+        // present (cov_a, cov_b from covariates.R sourced before xyz = xyz).
+        assert!(
+            !cached.symbols.contains_key("xyz"),
+            "Cached path leaked `xyz` back into its own RHS scope. \
+             scope.symbols = {:?}",
+            cached
+                .symbols
+                .keys()
+                .map(|n| n.as_ref())
+                .collect::<BTreeSet<&str>>()
+        );
+
+        // Sanity: the cached path produces the same scope as the uncached path.
+        let direct = crate::cross_file::scope::scope_at_position_with_graph(
+            &data_uri,
+            1,
+            6,
+            &get_artifacts,
+            &get_metadata,
+            &snapshot.cross_file_graph,
+            snapshot.workspace_folders.first(),
+            snapshot.cross_file_config.max_chain_depth,
+            &snapshot.base_exports,
+            snapshot.cross_file_config.hoist_globals_in_functions,
+            snapshot.cross_file_config.backward_dependencies,
+            &|| false,
+        );
+        let cached_keys: BTreeSet<&str> = cached
+            .symbols
+            .keys()
+            .map(|n| n.as_ref())
+            .collect();
+        let direct_keys: BTreeSet<&str> = direct
+            .symbols
+            .keys()
+            .map(|n| n.as_ref())
+            .collect();
+        assert_eq!(
+            cached_keys, direct_keys,
+            "Cached and uncached scopes differ at xyz <- xyz RHS"
         );
     }
 }

@@ -430,8 +430,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
         &base_exports,
         true,
         mode,
-        &never_cancel,
-        None,
+        &never_cancel
     );
 
     let elapsed = median_of_3(|| {
@@ -447,8 +446,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
             &base_exports,
             true,
             mode,
-            &never_cancel,
-            None,
+            &never_cancel
         );
     });
 

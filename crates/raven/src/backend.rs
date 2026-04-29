@@ -1929,7 +1929,6 @@ impl LanguageServer for Backend {
                     false,
                     probe.backward_dependencies,
                     &|| false,
-                    None,
                 );
 
                 let mut pkgs = scope.inherited_packages;
@@ -2310,7 +2309,6 @@ impl LanguageServer for Backend {
                         false,
                         probe.backward_dependencies,
                         &|| false,
-                        None,
                     );
                     all_packages.extend(scope.inherited_packages);
                     all_packages.extend(scope.loaded_packages);
@@ -4174,7 +4172,6 @@ pub(crate) async fn prefetch_packages_for_open_documents(
             false,
             probe.backward_dependencies,
             &|| false,
-            None,
         );
         for p in scope.inherited_packages {
             all_pkgs.insert(p);
@@ -4524,7 +4521,6 @@ async fn run_libpath_consumer(
                             false,
                             probe.backward_dependencies,
                             &|| false,
-                            None,
                         );
                         // Scope probe captures inherited + global-scope packages.
                         // Also check the document's full loaded_packages which
@@ -5898,7 +5894,6 @@ mod refresh_packages_tests {
             false,
             snapshot.backward_dependencies,
             &|| false,
-            None,
         );
         // dplyr appears in loaded_packages (from forward source() chain),
         // not inherited_packages (which come from backward/parent edges).
