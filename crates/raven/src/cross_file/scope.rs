@@ -876,7 +876,14 @@ pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
             start_column,
             ..
         } => (*start_line, *start_column),
-        ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        // Removal: the recursive resolver applies a `rm(x)` only when its
+        // anchor is *strictly* before the query (`scope.rs:3683`,
+        // `(rm_line, rm_col) < (line, column)`). `ScopeStream::advance_to`
+        // applies any event whose effect position is `<= target`. Bumping
+        // the column by one keeps the streaming `<=` compare equivalent
+        // to the recursive `<` compare, mirroring the same trick `Source`
+        // events use just above.
+        ScopeEvent::Removal { line, column, .. } => (*line, column.saturating_add(1)),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     }
@@ -2830,11 +2837,17 @@ where
             arc
         } else {
             let mut visited = HashMap::new();
-            // Mirror the recursive function's behavior: visited[uri] is set to
-            // (line, col) before STEP 1 runs. For acyclic graphs this never
-            // matters; for cyclic graphs it controls the revisit short-circuit
-            // and we accept slight approximation across cache hits.
-            visited.insert(uri.clone(), (line, column));
+            // Position-invariant seed: the cache slot `(uri, inside)` is
+            // shared with `compute_or_get_cached_prefix` (the streaming
+            // entry point), which seeds at `(MAX, MAX)` because the
+            // prefix is meant to cover ALL positions in `uri` within the
+            // snapshot. Using the same seed here keeps the first-writer-
+            // wins cache deterministic regardless of which entry point
+            // populates the slot first. For acyclic graphs (the dominant
+            // case) this is identical to seeding at `(line, column)`;
+            // for cyclic graphs it's a slightly wider over-approximation
+            // and is what the streaming path already used.
+            visited.insert(uri.clone(), (u32::MAX, u32::MAX));
             let computed = parent_prefix_at(
                 uri,
                 inside,
@@ -2904,8 +2917,13 @@ pub(crate) struct ParentPrefix {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
     pub chain: Vec<Url>,
     pub depth_exceeded: Vec<(Url, u32, u32)>,
+    // All parent-loaded packages flow into `inherited_packages` here —
+    // `parent_prefix_at` never writes to `loaded_packages`. Both the
+    // backward-edge merge at scope.rs:3214 and the forward-edge merge at
+    // scope.rs:3224 funnel into `inherited_packages` after applying the
+    // same-file leak filter, so a separate `loaded_packages` field on
+    // `ParentPrefix` would always be empty and was removed in I2.
     pub inherited_packages: HashSet<String>,
-    pub loaded_packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
 }
 
@@ -3356,9 +3374,6 @@ where
                 for pkg in &prefix.inherited_packages {
                     scope.inherited_packages.insert(pkg.clone());
                 }
-                for pkg in &prefix.loaded_packages {
-                    scope.loaded_packages.insert(pkg.clone());
-                }
                 for (pkg, origins) in &prefix.package_origins {
                     scope
                         .package_origins
@@ -3394,9 +3409,6 @@ where
                 scope.depth_exceeded.extend(prefix.depth_exceeded);
                 for pkg in prefix.inherited_packages {
                     scope.inherited_packages.insert(pkg);
-                }
-                for pkg in prefix.loaded_packages {
-                    scope.loaded_packages.insert(pkg);
                 }
                 for (pkg, origins) in prefix.package_origins {
                     scope
@@ -4121,9 +4133,19 @@ where
                 // borrow `self` mutably for `pick_frame_mut`.
                 let contrib = self.source_contributions[&key].clone();
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
+                    // First-source-wins: mirror the recursive resolver's
+                    // `scope.symbols.entry(name).or_insert(symbol)` at
+                    // scope.rs:3632. When two `source()` calls bring the
+                    // same name, downstream consumers (hover,
+                    // find-references) must see the *first* source's
+                    // ScopedSymbol, not the most-recent-merge's. The
+                    // `removed_names` clear still happens unconditionally
+                    // — a prior `rm()` is invalidated by either source.
+                    // (Local Defs in the same frame override sources via
+                    // their own Def event, which always overwrites.)
                     for (name, symbol) in contrib.symbols {
                         frame.removed_names.remove(&name);
-                        frame.symbols.insert(name, symbol);
+                        frame.symbols.entry(name).or_insert(symbol);
                     }
                     for pkg in contrib.packages {
                         frame.packages.insert(pkg);
@@ -4217,7 +4239,7 @@ where
             if frame.symbols.contains_key(name) {
                 return true;
             }
-            if frame.removed_names.iter().any(|n| &**n == name) {
+            if frame.removed_names.contains(name) {
                 return false;
             }
         }
@@ -4226,7 +4248,7 @@ where
         if global.symbols.contains_key(name) {
             return true;
         }
-        if global.removed_names.iter().any(|n| &**n == name) {
+        if global.removed_names.contains(name) {
             return false;
         }
         // Prefix (parent walk).
@@ -4252,7 +4274,12 @@ where
             chain: prefix.chain.clone(),
             depth_exceeded: prefix.depth_exceeded.clone(),
             inherited_packages: prefix.inherited_packages.clone(),
-            loaded_packages: prefix.loaded_packages.clone(),
+            // `ParentPrefix` no longer has a `loaded_packages` field —
+            // parent-side packages live entirely in `inherited_packages`
+            // (see ParentPrefix doc). The streaming path layers its own
+            // global/late frame's `packages` onto `scope.loaded_packages`
+            // a few lines below.
+            loaded_packages: HashSet::new(),
             package_origins: prefix.package_origins.clone(),
         };
 
@@ -4317,7 +4344,7 @@ where
             if let Some(sym) = frame.symbols.get(name) {
                 return Some(sym.clone());
             }
-            if frame.removed_names.iter().any(|n| &**n == name) {
+            if frame.removed_names.contains(name) {
                 return None;
             }
         }
@@ -4325,7 +4352,7 @@ where
         if let Some(sym) = global.symbols.get(name) {
             return Some(sym.clone());
         }
-        if global.removed_names.iter().any(|n| &**n == name) {
+        if global.removed_names.contains(name) {
             return None;
         }
         let prefix = self.choose_prefix();
@@ -4377,7 +4404,13 @@ where
         // are skipped — the late-binding semantics from the recursive
         // resolver only hoist GLOBAL events; function-local symbols still
         // require the cursor to be inside that scope.
-        let timeline_len = self.artifacts.timeline.len();
+        //
+        // Clone the `Arc<ScopeArtifacts>` (one refcount bump) so the loop
+        // can borrow `&artifacts.timeline[idx]` immutably while
+        // `apply_event_to_late` reborrows `&mut self`. Without this, the
+        // borrow checker forces a per-event `ScopeEvent::clone()`.
+        let artifacts = self.artifacts.clone();
+        let timeline_len = artifacts.timeline.len();
         let mut idx = 0;
         while idx < timeline_len {
             if idx & 63 == 0 && (self.is_cancelled)() {
@@ -4385,8 +4418,7 @@ where
                 // un-set so the next non-cancelled call rebuilds.
                 return;
             }
-            let event = self.artifacts.timeline[idx].clone();
-            self.apply_event_to_late(&mut frame, &event);
+            self.apply_event_to_late(&mut frame, &artifacts.timeline[idx]);
             idx += 1;
         }
         self.global_late_frame = Some(frame);
@@ -4457,9 +4489,11 @@ where
                     self.source_contributions.insert(key, contrib);
                 }
                 let contrib = self.source_contributions[&key].clone();
+                // First-source-wins: see the matching note in
+                // `apply_event_to_strict`'s Source branch.
                 for (name, symbol) in contrib.symbols {
                     frame.removed_names.remove(&name);
-                    frame.symbols.insert(name, symbol);
+                    frame.symbols.entry(name).or_insert(symbol);
                 }
                 for pkg in contrib.packages {
                     frame.packages.insert(pkg);
@@ -4654,6 +4688,19 @@ where
     }
 }
 
+/// `package:base` URL — parsed once and reused for every `seed_base_exports`
+/// call. Each `ScopeStream` construction (and every recursive resolver
+/// invocation that injects base exports) would otherwise re-parse the same
+/// literal.
+fn base_package_uri() -> &'static Url {
+    static BASE_URI: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+    BASE_URI.get_or_init(|| {
+        Url::parse("package:base").unwrap_or_else(|_| {
+            Url::parse("package:unknown").expect("package:unknown is a valid URL")
+        })
+    })
+}
+
 /// Insert `base_exports` into `frame.symbols` with `SymbolKind::Variable`,
 /// matching the `current_depth == 0` injection in
 /// `scope_at_position_with_graph_recursive`.
@@ -4661,8 +4708,7 @@ fn seed_base_exports(frame: &mut ScopeFrame, base_exports: &HashSet<String>) {
     if base_exports.is_empty() {
         return;
     }
-    let base_uri = Url::parse("package:base")
-        .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+    let base_uri = base_package_uri();
     for export_name in base_exports {
         let name: Arc<str> = Arc::from(export_name.as_str());
         frame.symbols.insert(
@@ -12470,17 +12516,32 @@ y <- filter(df)"#;
             // 2: nested function.
             "outer <- function(x) {\n  inner <- function(y) {\n    y + 1\n  }\n  inner(x)\n}\n",
             // 3: removal followed by re-definition (resurrection).
-            "x <- 1\nrm(\"x\")\nx <- 2\ny <- x\n",
+            //    Bare `rm(x)` (not `rm("x")`) — `detect_rm_calls` only
+            //    extracts bare-identifier args, so the string-literal form
+            //    would produce *no* Removal events on the timeline.
+            "x <- 1\nrm(x)\nx <- 2\ny <- x\n",
             // 4: package load + usage.
             "library(stats)\nx <- mean(c(1, 2, 3))\n",
             // 5: forward source() to helper.R.
             "source(\"helper.R\")\nuse_helper <- helper_value + 1\n",
             // 6: function inside source-target chain.
             "source(\"helper.R\")\nf <- function() {\n  helper_value\n}\n",
-            // 7: rm in function scope.
-            "x <- 1\nf <- function() {\n  rm(\"x\")\n  x\n}\n",
+            // 7: rm inside a function body — exercises the function-scoped
+            //    Removal pathway (`pick_frame_mut(Some(scope))`).
+            "x <- 1\nf <- function() {\n  rm(x)\n  x\n}\n",
             // 8: late-binding inside function (forward reference).
             "f <- function() { later_var }\nlater_var <- 42\n",
+            // 9: top-level Removal *between* a function-scoped Def and a
+            //    later top-level usage. The function-scope Def must NOT
+            //    survive the global rm; the recursive resolver removes
+            //    `helper` from the global frame and the streaming path
+            //    must do the same (covers the global Removal branch in
+            //    apply_event_to_late and the strict-frame branch).
+            "helper <- function() { 1 }\nrm(helper)\nresult <- helper\n",
+            // 10: top-level rm followed by re-definition with a later
+            //    usage — proves the resurrection path (insert clears
+            //    `removed_names`) works at top level too.
+            "h <- function() { 1 }\nrm(h)\nh <- function() { 2 }\nresult <- h()\n",
         ];
 
         /// The helper.R content shared by source()-using fixtures.
@@ -12556,7 +12617,10 @@ y <- filter(df)"#;
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(50))]
+            // 200 cases × ~11 fixtures gives each fixture ~18 samples on
+            // average — enough that the Removal-bearing fixtures (3, 7,
+            // 9, 10) all get exercised across a range of positions.
+            #![proptest_config(ProptestConfig::with_cases(200))]
 
             /// For any fixture and any sequence of in-document-order query
             /// positions, ScopeStream must produce the same scope membership
@@ -12678,6 +12742,295 @@ y <- filter(df)"#;
                     );
                 }
             }
+        }
+
+        /// Regression for the Removal effect-position divergence (C1).
+        ///
+        /// Recursive resolver applies `Removal` with strict `<`
+        /// (`scope.rs:3683`): a `rm(x)` call at exactly `(line, col)` is
+        /// NOT applied when the query is at `(line, col)`.
+        ///
+        /// `ScopeStream::advance_to` uses `<=` semantics (it processes any
+        /// event whose `event_effect_position <= target`). For the two
+        /// paths to agree, `event_effect_position` for `Removal` must
+        /// return one column past the rm anchor — mirroring the existing
+        /// `Source` event's `column.saturating_add(1)` trick.
+        #[test]
+        fn test_scope_stream_removal_effect_position_matches_recursive() {
+            // Line 0: `x <- 1`
+            // Line 1: `rm(x)`     <-- Removal anchor at (1, 0)
+            // Line 2: `x <- 2`
+            // Line 3: `y <- x`
+            let main_code = "x <- 1\nrm(x)\nx <- 2\ny <- x\n";
+            let (
+                workspace_root,
+                main_uri,
+                helper_uri,
+                main_artifacts,
+                helper_artifacts,
+                main_meta,
+                helper_meta,
+                graph,
+            ) = build_two_file_fixture(main_code);
+
+            // Sanity-check: the timeline must actually contain a Removal
+            // for "x" before we can claim to test the divergence. (C2's
+            // companion fix ensures fixtures use bare-identifier rm(x).)
+            let has_removal = main_artifacts.timeline.iter().any(|ev| {
+                matches!(ev, ScopeEvent::Removal { symbols, .. }
+                    if symbols.iter().any(|s| &**s == "x"))
+            });
+            assert!(
+                has_removal,
+                "fixture must produce a Removal event for x; \
+                 detect_rm_calls only extracts bare-identifier args. \
+                 timeline: {:?}",
+                main_artifacts.timeline
+            );
+
+            let main_uri_for_artifacts = main_uri.clone();
+            let helper_uri_for_artifacts = helper_uri.clone();
+            let main_artifacts_for_closure = main_artifacts.clone();
+            let helper_artifacts_for_closure = helper_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_for_artifacts {
+                    Some(main_artifacts_for_closure.clone())
+                } else if uri == &helper_uri_for_artifacts {
+                    Some(helper_artifacts_for_closure.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_for_meta = main_uri.clone();
+            let helper_uri_for_meta = helper_uri.clone();
+            let main_meta_for_closure = main_meta.clone();
+            let helper_meta_for_closure = helper_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_for_meta {
+                    Some(main_meta_for_closure.clone())
+                } else if uri == &helper_uri_for_meta {
+                    Some(helper_meta_for_closure.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+            )
+            .expect("stream construction must succeed");
+
+            // Query at the rm() anchor: (1, 0). Recursive treats the rm as
+            // not-yet-applied, so x is still bound to the line-0 Def.
+            stream.advance_to(1, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                1,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+            );
+
+            let stream_has_x = streamed.symbols.contains_key("x");
+            let direct_has_x = direct.symbols.contains_key("x");
+            assert_eq!(
+                stream_has_x, direct_has_x,
+                "ScopeStream and recursive resolver must agree at the rm() \
+                 anchor position. stream_has_x={}, direct_has_x={}. \
+                 Recursive uses strict `<` for Removal at scope.rs:3683; \
+                 event_effect_position for Removal must return \
+                 column.saturating_add(1) so ScopeStream's `<=` matches.",
+                stream_has_x, direct_has_x
+            );
+            // Concretely: x should still be visible — the rm hasn't fired.
+            assert!(
+                direct_has_x,
+                "sanity: recursive resolver should report x as bound at \
+                 the rm() anchor (rm has strict `<` semantics)"
+            );
+        }
+
+        /// Regression for the Source-merge precedence divergence (C3).
+        ///
+        /// When two `source()` calls in the queried file both bring a
+        /// symbol with the same name, the recursive resolver records the
+        /// symbol from the *first* source (`scope.rs:3632`,
+        /// `scope.symbols.entry(name).or_insert(symbol)`), but
+        /// `ScopeStream::apply_event_to_strict` (`scope.rs:4126`) used
+        /// `frame.symbols.insert(name, symbol)` and ended up with the
+        /// *last* source's symbol. The name-set property test missed
+        /// this because both paths still record the same name.
+        ///
+        /// Consumers that consult `ScopedSymbol::source_uri` /
+        /// `defined_line` (hover, find-references) would see different
+        /// answers between the streaming and recursive paths.
+        #[test]
+        fn test_scope_stream_source_merge_precedence_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::CrossFileMetadata;
+
+            // 3-file workspace:
+            //   main.R    sources helper1 then helper2; both define `x`.
+            //   helper1.R defines x at line 0.
+            //   helper2.R defines x at line 0.
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper1_uri = Url::parse("file:///project/helper1.R").unwrap();
+            let helper2_uri = Url::parse("file:///project/helper2.R").unwrap();
+
+            let main_code = "source(\"helper1.R\")\nsource(\"helper2.R\")\nuse_x <- x\n";
+            let helper1_code = "x <- 1\n";
+            let helper2_code = "x <- 2\n";
+
+            let main_tree = parse_r(main_code);
+            let helper1_tree = parse_r(helper1_code);
+            let helper2_tree = parse_r(helper2_code);
+
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper1_artifacts =
+                Arc::new(compute_artifacts(&helper1_uri, &helper1_tree, helper1_code));
+            let helper2_artifacts =
+                Arc::new(compute_artifacts(&helper2_uri, &helper2_tree, helper2_code));
+
+            let main_meta = std::sync::Arc::new(
+                crate::cross_file::extract_metadata_with_tree(main_code, Some(&main_tree)),
+            );
+            let helper1_meta = std::sync::Arc::new(CrossFileMetadata::default());
+            let helper2_meta = std::sync::Arc::new(CrossFileMetadata::default());
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&helper1_uri, &helper1_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&helper2_uri, &helper2_meta, Some(&workspace_root), |_| None);
+
+            let main_uri_a = main_uri.clone();
+            let h1_uri_a = helper1_uri.clone();
+            let h2_uri_a = helper2_uri.clone();
+            let main_arts_c = main_artifacts.clone();
+            let h1_arts_c = helper1_artifacts.clone();
+            let h2_arts_c = helper2_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &h1_uri_a {
+                    Some(h1_arts_c.clone())
+                } else if uri == &h2_uri_a {
+                    Some(h2_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_m = main_uri.clone();
+            let h1_uri_m = helper1_uri.clone();
+            let h2_uri_m = helper2_uri.clone();
+            let main_meta_c = main_meta.clone();
+            let h1_meta_c = helper1_meta.clone();
+            let h2_meta_c = helper2_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &h1_uri_m {
+                    Some(h1_meta_c.clone())
+                } else if uri == &h2_uri_m {
+                    Some(h2_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Query at end of file (line 3, col 0): both source() calls
+            // have fired, so `x` is in scope.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(3, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                3,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+            );
+
+            let stream_x = streamed
+                .symbols
+                .get("x")
+                .expect("stream must have x in scope after both source() calls");
+            let direct_x = direct
+                .symbols
+                .get("x")
+                .expect("recursive must have x in scope after both source() calls");
+
+            assert_eq!(
+                stream_x.source_uri, direct_x.source_uri,
+                "ScopeStream and recursive resolver must agree on which \
+                 source() contributes the symbol when two sources define \
+                 the same name. Recursive uses first-source-wins via \
+                 `entry(name).or_insert(symbol)` at scope.rs:3632; \
+                 ScopeStream's apply_event_to_strict / apply_event_to_late \
+                 must use the same precedence."
+            );
+            // Concretely: helper1.R is sourced first, so it wins.
+            assert_eq!(
+                direct_x.source_uri, helper1_uri,
+                "sanity: recursive resolver should attribute x to the \
+                 first source (helper1.R)"
+            );
         }
     }
 
