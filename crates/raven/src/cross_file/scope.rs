@@ -866,7 +866,11 @@ pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
             visible_from_column,
             ..
         } => (*visible_from_line, *visible_from_column),
-        ScopeEvent::Source { line, column, .. } => (*line, *column),
+        // Source: child symbols are visible only AFTER the call site, so the
+        // effect position is one column past the call — matching the strict-<
+        // check in `scope_at_position_with_graph_recursive` (line 3448).
+        // `saturating_add` guards against the (theoretical) u32::MAX column.
+        ScopeEvent::Source { line, column, .. } => (*line, column.saturating_add(1)),
         ScopeEvent::FunctionScope {
             start_line,
             start_column,

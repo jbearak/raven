@@ -6,8 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 4c5927f77076807e997f9d55d0f17aa661fcfb45149a7d1affc513326ea41de7 # shrinks to fixture_idx = 5, positions = [(0, 1)]
 cc 585c4e84338b0d8b8166cf9633b929e520fe40c58ead97859ab9e501c40d293f # shrinks to fixture_idx = 8, positions = [(0, 0)]
-# 0949c3e4...: known divergence at fixture 5 position (0, 0) — scope_at_position
-# returns {} but ScopeStream returns {helper_value} for the source() event at
-# (0,0). Pre-existing in opus47's ScopeStream alignment with scope_at_position;
-# tracked as follow-up rather than blocking the perf merge.
-cc 326369dfd8d7c5790497eb7fd484931e19355ad44fa8ac7c5c65b453641839fa # shrinks to fixture_idx = 5, positions = [(0, 0)]
+cc a4bf62742451a931a8a7c44c77980e75d8c5c413894d9acf0a9c970f794691e0 # shrinks to fixture_idx = 5, positions = [(0, 0)]

@@ -35498,192 +35498,99 @@ x
         );
     }
 
-    /// Reproduce against the user's real worldwide files. Inserts every
-    /// .r/.R file under ~/repos/worldwide into state, simulates the user
-    /// editing data.r to add `xyz = xyz`, and prints the diagnostics for
-    /// data.r. Skips silently if the worldwide repo isn't available (CI).
+    /// Regression test for the cross-file scope "same-file leak filter" and
+    /// `visible_from` semantics. Uses a self-contained 10-file fixture so CI
+    /// does not depend on ~/repos/worldwide.
+    ///
+    /// Invariants verified:
+    /// 1. At the RHS of `xyz <- xyz` in file_5.R, `xyz` is NOT in scope
+    ///    (visible_from = end of assignment node, not LHS position).
+    /// 2. `leaf_var` (defined in file_9.R) IS in scope at the same point,
+    ///    confirming the DFS actually traversed the file_6→…→file_9 suffix.
+    /// 3. `dplyr` (library() in file_0.R) appears in inherited/loaded packages,
+    ///    confirming library() propagates across all 5 source() edges.
+    /// 4. The "Undefined variable: xyz" diagnostic fires in the full pipeline.
     #[test]
-    #[ignore] // Requires ~/repos/worldwide checked out; run manually with --ignored
-    fn debug_real_worldwide_data_r() {
-        use std::path::PathBuf;
-        use std::sync::Arc;
+    fn self_ref_variable_not_in_scope_across_deep_source_chain() {
+        use crate::state::{Document, WorldState};
+        use crate::test_utils::fixture_workspace::create_self_ref_chain_fixture;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
 
-        let home = match std::env::var_os("HOME") {
-            Some(h) => PathBuf::from(h),
-            None => return,
-        };
-        let workspace = home.join("repos/worldwide");
-        if !workspace.exists() {
-            eprintln!("Skipping: {} doesn't exist", workspace.display());
-            return;
-        }
+        let fixture = create_self_ref_chain_fixture();
 
         let mut state = WorldState::new(vec![]);
-        state.workspace_folders = vec![Url::from_file_path(&workspace).unwrap()];
         state.workspace_scan_complete = true;
+        // undefined_variables_enabled and diagnostics_enabled default to true;
+        // out_of_scope_severity just needs to be non-None to enable that collector.
         state.cross_file_config.out_of_scope_severity =
-            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+            Some(DiagnosticSeverity::WARNING);
 
-        // Walk all .r/.R files
-        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-            if let Ok(read_dir) = std::fs::read_dir(dir) {
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        // Skip .git, node_modules, output, etc.
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with(".")
-                                || name == "node_modules"
-                                || name == "output"
-                                || name == "abortion_data"
-                                || name == "fertility_surveys"
-                            {
-                                continue;
-                            }
-                        }
-                        walk(&path, out);
-                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if matches!(ext, "r" | "R") {
-                            out.push(path);
-                        }
-                    }
-                }
-            }
-        }
+        let workspace_url =
+            url::Url::from_file_path(fixture._dir.path()).expect("workspace url");
+        // workspace_folders must be set so workspace-root fallback resolution works.
+        state.workspace_folders = vec![workspace_url.clone()];
 
-        let mut paths = Vec::new();
-        walk(&workspace, &mut paths);
-        eprintln!("Found {} R files", paths.len());
-
-        // The key file - data.r with xyz = xyz on line 18 (1-indexed) = line 17 (0-indexed)
-        let data_path = workspace.join("scripts/data.r");
-        let data_uri = Url::from_file_path(&data_path).unwrap();
-
-        for path in &paths {
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let uri = Url::from_file_path(path).unwrap();
+        for uri in &fixture.all_uris {
+            let path = uri.to_file_path().expect("uri to path");
+            let content = std::fs::read_to_string(&path).expect("read fixture file");
             state
                 .documents
                 .insert(uri.clone(), Document::new(&content, None));
             state.cross_file_graph.update_file(
-                &uri,
+                uri,
                 &crate::cross_file::extract_metadata(&content),
-                Some(&Url::from_file_path(&workspace).unwrap()),
+                Some(&workspace_url),
                 |_| None,
             );
         }
 
-        let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
-        eprintln!(
-            "snapshot.workspace_scan_complete = {}",
-            snapshot.workspace_scan_complete
-        );
-        eprintln!(
-            "snapshot.directive_meta.sourced_by = {:?}",
-            snapshot.directive_meta.sourced_by
-        );
-        eprintln!(
-            "snapshot.cross_file_config.backward_dependencies = {:?}",
-            snapshot.cross_file_config.backward_dependencies
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &fixture.mid_file_uri).expect("snapshot");
+        let diags =
+            diagnostics_from_snapshot(&snapshot, &fixture.mid_file_uri, &DiagCancelToken::never())
+                .expect("diagnostics");
+
+        // Single scope query at the RHS position — used for assertions 1–3.
+        let rhs_scope = snapshot.get_scope(
+            &fixture.mid_file_uri,
+            fixture.mid_xyz_line,
+            fixture.mid_xyz_rhs_col,
+            &DiagCancelToken::never(),
         );
 
-        let diags = diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
-            .expect("diags");
-        eprintln!("Total diagnostics for data.r: {}", diags.len());
-        for d in diags.iter().take(20) {
-            eprintln!("  {:?}: {}", d.range, d.message);
-        }
-
-        let xyz_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("xyz")).collect();
-        eprintln!("xyz-related diagnostics:");
-        for d in &xyz_diags {
-            eprintln!("  {:?}: {}", d.range, d.message);
-        }
-
-        // Now also dump scope.symbols at data.r line 17 (0-indexed) col 6 (RHS xyz).
-        let line: u32 = 17;
-        let col: u32 = 6;
-        let scope_at = snapshot.get_scope(&data_uri, line, col, &DiagCancelToken::never());
-        eprintln!(
-            "scope.symbols at data.r ({}, {}) — {} entries",
-            line,
-            col,
-            scope_at.symbols.len()
-        );
-        if let Some(sym) = scope_at.symbols.get("xyz") {
-            eprintln!("  xyz IS in scope: {:?}", sym);
-        } else {
-            eprintln!("  xyz is NOT in scope at this position");
-        }
-        eprintln!("scope.chain length: {}", scope_at.chain.len());
-        let chain_count = scope_at.chain.len();
-        eprintln!("scope.chain (first 30 of {}):", chain_count);
-        for (i, u) in scope_at.chain.iter().take(30).enumerate() {
-            eprintln!("  [{}] {}", i, u.path());
-        }
-        eprintln!(
-            "scope.inherited_packages: {} pkgs",
-            scope_at.inherited_packages.len()
-        );
-        eprintln!(
-            "scope.loaded_packages: {} pkgs",
-            scope_at.loaded_packages.len()
-        );
-
-        // Now query at (17, 0) - LHS position, BEFORE assignment.
-        let lhs_scope = snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never());
-        eprintln!(
-            "scope.symbols at LHS (17, 0): xyz in scope? {}",
-            lhs_scope.symbols.contains_key("xyz")
-        );
-
-        // And at (16, 0) - the line BEFORE xyz = xyz, no assignment yet.
-        let prev_scope = snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never());
-        eprintln!(
-            "scope.symbols at (16, 0): xyz in scope? {}",
-            prev_scope.symbols.contains_key("xyz")
-        );
-
-        // Print the data.r artifacts timeline events around xyz.
-        if let Some(artifacts) = snapshot.artifacts_map.get(&data_uri) {
-            eprintln!("data.r timeline (events around line 17):");
-            for ev in artifacts.timeline.iter() {
-                let line = match ev {
-                    crate::cross_file::scope::ScopeEvent::Def { line, .. } => *line,
-                    crate::cross_file::scope::ScopeEvent::Source { line, .. } => *line,
-                    crate::cross_file::scope::ScopeEvent::Removal { line, .. } => *line,
-                    crate::cross_file::scope::ScopeEvent::PackageLoad { line, .. } => *line,
-                    crate::cross_file::scope::ScopeEvent::FunctionScope { start_line, .. } => {
-                        *start_line
-                    }
-                    crate::cross_file::scope::ScopeEvent::Declaration { line, .. } => *line,
-                };
-                if line >= 14 && line <= 25 {
-                    eprintln!("  line={}: {:?}", line, ev);
-                }
-            }
-        }
-
-        // Lock in the fix: with the cross-file scope leak fixed, xyz must NOT
-        // be in scope at the RHS of `xyz = xyz`, and the undefined-variable
-        // diagnostic must fire on data.r.
-        let scope_rhs = snapshot.get_scope(&data_uri, 17, 6, &DiagCancelToken::never());
+        // 1. Negative: xyz must NOT leak back as visible at its own RHS.
         assert!(
-            !scope_rhs.symbols.contains_key("xyz"),
-            "xyz must NOT leak back into data.r's scope at the RHS of its own assignment"
-        );
-        assert!(
-            xyz_diags
-                .iter()
-                .any(|d| d.message.contains("Undefined variable: xyz")),
-            "Expected 'Undefined variable: xyz' in real worldwide data.r, got: {:?}",
-            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+            !rhs_scope.symbols.contains_key("xyz"),
+            "xyz must NOT be visible at the RHS of its own assignment; \
+             visible symbols: {:?}",
+            rhs_scope.symbols.keys().collect::<Vec<_>>()
         );
 
-        let _ = (Arc::new(()), data_uri);
+        // 2. Positive: leaf_var from file_9.R must be reachable via the chain.
+        assert!(
+            rhs_scope.symbols.contains_key("leaf_var"),
+            "leaf_var (defined in file_9.R) must be in scope at the query point \
+             (confirms DFS traversed the full suffix); \
+             visible symbols: {:?}",
+            rhs_scope.symbols.keys().collect::<Vec<_>>()
+        );
+
+        // 3. Package propagation: dplyr loaded in file_0.R must propagate.
+        let has_dplyr = rhs_scope.inherited_packages.iter().any(|p| p == "dplyr")
+            || rhs_scope.loaded_packages.iter().any(|p| p == "dplyr");
+        assert!(
+            has_dplyr,
+            "dplyr (library() in file_0.R) must propagate to mid-chain scope; \
+             inherited={:?}, loaded={:?}",
+            rhs_scope.inherited_packages, rhs_scope.loaded_packages
+        );
+
+        // 4. Diagnostic: the pipeline must also report "Undefined variable: xyz".
+        assert!(
+            diags.iter().any(|d| d.message.contains("Undefined variable: xyz")),
+            "Expected 'Undefined variable: xyz' diagnostic; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     /// Regression: cross-file scope resolution must not let a file's own
