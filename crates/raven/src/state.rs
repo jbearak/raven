@@ -586,7 +586,8 @@ pub struct WorldState {
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
     /// Handle to the running libpath watcher, if any. Dropping it stops watching.
-    pub libpath_watcher_handle: Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
+    pub libpath_watcher_handle:
+        Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
     pub package_library_ready: bool,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
@@ -1124,12 +1125,18 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
     let cross_file_meta = crate::cross_file::extract_metadata(&text);
 
     let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
-        crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, &text, Some(&cross_file_meta))
+        crate::cross_file::scope::compute_artifacts_with_metadata(
+            &uri,
+            tree,
+            &text,
+            Some(&cross_file_meta),
+        )
     } else {
         crate::cross_file::scope::ScopeArtifacts::default()
     });
 
-    let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata_result, &text);
+    let snapshot =
+        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata_result, &text);
     let cross_file_meta = Arc::new(cross_file_meta);
 
     let cross_file_entry = crate::cross_file::workspace_index::IndexEntry {
@@ -1160,10 +1167,7 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
     use rayon::prelude::*;
 
-    let mut index = HashMap::new();
     let mut imports = Vec::new();
-    let mut cross_file_entries = HashMap::new();
-    let mut new_index_entries = HashMap::new();
 
     // Get workspace root for path resolution
     let workspace_root = folders.first().cloned();
@@ -1191,24 +1195,42 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         file_paths.len()
     );
 
-    // Phase 2: Process files in parallel (CPU-bound: read + parse + artifacts)
-    let processed: Vec<_> = file_paths
-        .par_iter()
-        .filter_map(|path| process_workspace_file(path))
-        .collect();
+    // Type aliases for the thread-local accumulators used in fold/reduce.
+    type IndexMap = HashMap<Url, Document>;
+    type CrossFileMap = HashMap<Url, crate::cross_file::workspace_index::IndexEntry>;
+    type NewIndexMap = HashMap<Url, crate::workspace_index::IndexEntry>;
 
-    // Phase 3: Merge results (serial — HashMap inserts are fast)
-    for item in processed {
-        cross_file_entries.insert(
-            item.uri.clone(),
-            item.cross_file_entry,
+    // Phase 2+3: Process files in parallel and accumulate directly into
+    // thread-local HashMaps via fold, then merge with reduce. This avoids
+    // an intermediate Vec<ProcessedFile> that would transiently hold all
+    // file contents + ASTs and require two extra Url clones per file for
+    // the serial insert loop.
+    let (index, mut cross_file_entries, mut new_index_entries): (
+        IndexMap,
+        CrossFileMap,
+        NewIndexMap,
+    ) = file_paths
+        .par_iter()
+        .fold(
+            || (IndexMap::new(), CrossFileMap::new(), NewIndexMap::new()),
+            |(mut idx, mut cfe, mut nie), path| {
+                if let Some(item) = process_workspace_file(path) {
+                    cfe.insert(item.uri.clone(), item.cross_file_entry);
+                    nie.insert(item.uri.clone(), item.new_index_entry);
+                    idx.insert(item.uri, item.document);
+                }
+                (idx, cfe, nie)
+            },
+        )
+        .reduce(
+            || (IndexMap::new(), CrossFileMap::new(), NewIndexMap::new()),
+            |(mut idx_a, mut cfe_a, mut nie_a), (idx_b, cfe_b, nie_b)| {
+                idx_a.extend(idx_b);
+                cfe_a.extend(cfe_b);
+                nie_a.extend(nie_b);
+                (idx_a, cfe_a, nie_a)
+            },
         );
-        new_index_entries.insert(
-            item.uri.clone(),
-            item.new_index_entry,
-        );
-        index.insert(item.uri, item.document);
-    }
 
     // Second pass: iteratively enrich metadata with inherited_working_directory
     // Track only files that need enrichment to avoid O(n²) behavior
@@ -1342,7 +1364,8 @@ fn is_stat_model_extension(path: &Path) -> bool {
 /// (whole-namespace import) is intentionally skipped here because expanding it
 /// requires reading `pkg`'s exports, which this parser has no access to during the
 /// initial workspace scan (the `PackageLibrary` may not be initialized yet, and
-/// even when it is, this function is called from a sync `scan_directory` path).
+/// even when it is, this function is called during the parallel workspace scan
+/// implemented by `collect_file_paths` + `process_workspace_file` / `scan_workspace`).
 ///
 /// The Library-aware variant `parse_namespace_imports` (above) does expand
 /// `import(pkg)`. If a workspace package uses `import(pkg)` to re-export an
@@ -1394,10 +1417,7 @@ mod tests {
         let state = WorldState::new(vec![]);
         let arc1: Arc<Vec<(String, String)>> = state.workspace_imports.clone();
         let arc2 = arc1.clone();
-        assert!(
-            Arc::ptr_eq(&arc1, &arc2),
-            "Arc clones must share storage"
-        );
+        assert!(Arc::ptr_eq(&arc1, &arc2), "Arc clones must share storage");
     }
 
     #[test]

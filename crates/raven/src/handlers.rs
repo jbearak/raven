@@ -133,9 +133,10 @@ impl DiagnosticsSnapshot {
         let neighborhood_start = std::time::Instant::now();
         let max_depth = state.cross_file_config.max_chain_depth;
         let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-        let payload = state
-            .cross_file_graph
-            .cached_neighborhood_subgraph(uri, max_depth, max_visited);
+        let payload =
+            state
+                .cross_file_graph
+                .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider();
 
@@ -214,9 +215,10 @@ impl DiagnosticsSnapshot {
         let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
             self.artifacts_map.get(target_uri).cloned()
         };
-        let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-            self.metadata_map.get(target_uri).cloned()
-        };
+        let get_metadata =
+            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+                self.metadata_map.get(target_uri).cloned()
+            };
 
         let is_cancelled = || cancel.is_cancelled();
 
@@ -2656,9 +2658,10 @@ fn get_cross_file_scope(
     };
 
     // Closure to get metadata for a URI
-    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-        content_provider.get_metadata(target_uri)
-    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            content_provider.get_metadata(target_uri)
+        };
 
     let max_depth = state.cross_file_config.max_chain_depth;
 
@@ -3548,7 +3551,11 @@ fn collect_workspace_symbols_from_artifacts(
 /// measure the same path used by `run_debounced_diagnostics` in production.
 #[cfg(feature = "test-support")]
 #[allow(dead_code)]
-pub fn diagnostics_via_snapshot(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
+pub fn diagnostics_via_snapshot(
+    state: &WorldState,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> Vec<Diagnostic> {
     match DiagnosticsSnapshot::build(state, uri) {
         Some(snapshot) => diagnostics_from_snapshot(&snapshot, uri, cancel).unwrap_or_default(),
         None => Vec::new(),
@@ -4488,14 +4495,15 @@ fn collect_max_depth_diagnostics(
         None
     };
 
-    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-        if let Some(doc) = state.documents.get(target_uri) {
-            return Some(std::sync::Arc::new(
-                crate::cross_file::directive::parse_directives(&doc.text()),
-            ));
-        }
-        state.cross_file_workspace_index.get_metadata(target_uri)
-    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            if let Some(doc) = state.documents.get(target_uri) {
+                return Some(std::sync::Arc::new(
+                    crate::cross_file::directive::parse_directives(&doc.text()),
+                ));
+            }
+            state.cross_file_workspace_index.get_metadata(target_uri)
+        };
 
     let max_depth = state.cross_file_config.max_chain_depth;
 
@@ -4773,9 +4781,10 @@ fn collect_max_depth_diagnostics_from_snapshot(
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
-    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-        snapshot.metadata_map.get(target_uri).cloned()
-    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            snapshot.metadata_map.get(target_uri).cloned()
+        };
 
     let empty_base_exports = HashSet::new();
     let scope_result = scope::scope_at_position_with_graph(
@@ -5105,6 +5114,12 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         })
         .collect();
 
+    // Get the function scope tree for fast-path scope-compatibility checks.
+    let fn_tree_oos: Option<&scope::FunctionScopeTree> = snapshot
+        .artifacts_map
+        .get(uri)
+        .map(|a| &a.function_scope_tree);
+
     // Collect rm() events for stale-entry detection in the breakpoint fast-path.
     let removal_events_oos: Vec<(u32, u32, Vec<String>)> = snapshot
         .artifacts_map
@@ -5150,7 +5165,17 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         if bp_idx < breakpoint_local_names.len() {
             let (bp_pos, ref local_names) = breakpoint_local_names[bp_idx];
 
-            if local_names.contains(name.as_str()) {
+            // Guard: skip the fast-path when the breakpoint and usage are in
+            // different function scope contexts. A breakpoint inside a function
+            // includes function-local symbols that aren't visible outside it.
+            let fn_scope_compatible = fn_tree_oos.map_or(true, |tree| {
+                let bp_innermost = tree.query_innermost(scope::Position::new(bp_pos.0, bp_pos.1));
+                let usage_innermost =
+                    tree.query_innermost(scope::Position::new(*usage_line, *usage_col));
+                bp_innermost == usage_innermost
+            });
+
+            if fn_scope_compatible && local_names.contains(name.as_str()) {
                 // Symbol was locally resolved at the breakpoint. Verify it
                 // wasn't removed between the breakpoint and the usage.
                 let was_removed = removal_events_oos.iter().any(|(rl, rc, names)| {
@@ -5159,8 +5184,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                         && names.iter().any(|n| n == name.as_str())
                 });
                 if !was_removed {
-                    locally_resolved_usages
-                        .insert((name.clone(), *usage_line, *usage_col));
+                    locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
                     continue;
                 }
             }
@@ -5170,7 +5194,8 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         // the breakpoint fast-path (local definitions between breakpoints,
         // or names removed by rm()).
         if !scope_cache.contains_key(&(*usage_line, *usage_col)) {
-            let computed = snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
+            let computed =
+                snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
             scope_cache.insert((*usage_line, *usage_col), computed);
         }
         let scope = scope_cache.get(&(*usage_line, *usage_col)).unwrap();
@@ -5198,7 +5223,8 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         }
 
         if !scope_cache.contains_key(&(*usage_line, *usage_col)) {
-            let computed = snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
+            let computed =
+                snapshot.get_scope(uri, *usage_line, *usage_col, cancel, Some(scope_memo));
             scope_cache.insert((*usage_line, *usage_col), computed);
         }
         let scope = scope_cache.get(&(*usage_line, *usage_col)).unwrap();
@@ -5236,7 +5262,8 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // against the original `xyz <- xyz` self-leak shape that
             // motivated commit 91c3617.
             if !scope_cache.contains_key(&(source.line, source.column)) {
-                let computed = snapshot.get_scope(uri, source.line, source.column, cancel, Some(scope_memo));
+                let computed =
+                    snapshot.get_scope(uri, source.line, source.column, cancel, Some(scope_memo));
                 scope_cache.insert((source.line, source.column), computed);
             }
             let source_scope = scope_cache.get(&(source.line, source.column)).unwrap();
@@ -5434,14 +5461,16 @@ fn collect_undefined_variables_from_snapshot(
         .iter()
         .filter_map(|&pos| {
             let scope = scope_cache.get(&pos)?;
-            let names: HashSet<String> = scope
-                .symbols
-                .keys()
-                .map(|k| k.to_string())
-                .collect();
+            let names: HashSet<String> = scope.symbols.keys().map(|k| k.to_string()).collect();
             Some((pos, names))
         })
         .collect();
+
+    // Get the function scope tree for fast-path scope-compatibility checks.
+    let fn_tree_undef: Option<&scope::FunctionScopeTree> = snapshot
+        .artifacts_map
+        .get(uri)
+        .map(|a| &a.function_scope_tree);
 
     let undef_removal_events: Vec<(u32, u32, Vec<String>)> = snapshot
         .artifacts_map
@@ -5525,8 +5554,7 @@ fn collect_undefined_variables_from_snapshot(
         // expensive per-position cross-file DFS.
         let usage_col_byte = usage_node.start_position().column as u32;
         let line_text_for_col = get_line(usage_node.start_position().row);
-        let usage_col =
-            byte_offset_to_utf16_column(line_text_for_col, usage_col_byte as usize);
+        let usage_col = byte_offset_to_utf16_column(line_text_for_col, usage_col_byte as usize);
 
         let bp_idx = undef_breakpoint_positions
             .partition_point(|&(l, c)| (l, c) <= (usage_line, usage_col))
@@ -5536,7 +5564,17 @@ fn collect_undefined_variables_from_snapshot(
         if bp_idx < undef_bp_names.len() {
             let (bp_pos, ref bp_names) = undef_bp_names[bp_idx];
 
-            if bp_names.contains(name.as_str()) {
+            // Guard: skip the fast-path when the breakpoint and usage are in
+            // different function scope contexts. A breakpoint inside a function
+            // includes function-local symbols that aren't visible outside it.
+            let fn_scope_compatible = fn_tree_undef.map_or(true, |tree| {
+                let bp_innermost = tree.query_innermost(scope::Position::new(bp_pos.0, bp_pos.1));
+                let usage_innermost =
+                    tree.query_innermost(scope::Position::new(usage_line, usage_col));
+                bp_innermost == usage_innermost
+            });
+
+            if fn_scope_compatible && bp_names.contains(name.as_str()) {
                 // Symbol was in scope at the breakpoint. Verify it wasn't
                 // removed between the breakpoint and the usage.
                 let was_removed = undef_removal_events.iter().any(|(rl, rc, names)| {
@@ -5629,11 +5667,7 @@ fn collect_undefined_variables_from_snapshot(
                 if snapshot.package_library.is_cached_sync(pkg) {
                     return false;
                 }
-                package_exists_memoized(
-                    pkg,
-                    &snapshot.package_library,
-                    &mut package_exists_memo,
-                )
+                package_exists_memoized(pkg, &snapshot.package_library, &mut package_exists_memo)
             });
             if (has_prior_library_call || has_cross_file_packages)
                 && package_cache_pending
@@ -8168,8 +8202,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // installed — otherwise the import declaration is broken and the symbol
     // should still be flagged as undefined.
     let workspace_imports_map: std::collections::HashMap<&str, Vec<&str>> = {
-        let mut map: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
         for (pkg, sym) in workspace_imports {
             map.entry(sym.as_str()).or_default().push(pkg.as_str());
         }
@@ -8801,8 +8834,7 @@ fn is_forward_reference_in_same_file(
     usage_line: u32,
     usage_col_utf16: u32,
 ) -> bool {
-    sym.source_uri == *uri
-        && (sym.defined_line, sym.defined_column) > (usage_line, usage_col_utf16)
+    sym.source_uri == *uri && (sym.defined_line, sym.defined_column) > (usage_line, usage_col_utf16)
 }
 
 /// Determines whether an identifier is a recognized R builtin (constant or function).
@@ -9444,9 +9476,10 @@ fn collect_jags_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate
         let code = line.split('#').next().unwrap_or(line);
 
         // Check each candidate position (full line, then after each '{')
-        for (offset, candidate) in
-            std::iter::once((0, code)).chain(code.match_indices('{').map(|(i, _)| (i + 1, &code[i + 1..])))
-        {
+        for (offset, candidate) in std::iter::once((0, code)).chain(
+            code.match_indices('{')
+                .map(|(i, _)| (i + 1, &code[i + 1..])),
+        ) {
             if let Some(captures) = def_re.captures(candidate) {
                 if let Some(name) = captures.get(1) {
                     let byte_start = offset + name.start();
@@ -9477,9 +9510,7 @@ fn collect_jags_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate
                     start_col: crate::cross_file::types::byte_offset_to_utf16_column(
                         line, byte_start,
                     ),
-                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(
-                        line, byte_end,
-                    ),
+                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(line, byte_end),
                 });
             }
         }
@@ -32192,7 +32223,7 @@ result1 <- helper_func(1)  # Should not resolve
 
 source("utils.R")
 
-# After source call - symbol available  
+# After source call - symbol available
 result2 <- helper_func(2)  # Should resolve"#;
 
         let utils_uri = Url::parse("file:///workspace/utils.R").unwrap();
@@ -32446,18 +32477,18 @@ for (i in 1:10) {
 }
 
 # Function with parameters and locals
-analyze_data <- function(dataset, 
+analyze_data <- function(dataset,
                         min_threshold = 0.1,
                         max_threshold = 0.9,
                         ...) {
     # Multi-line function definition
     cleaned <- dataset[!is.na(dataset)]
-    
+
     for (threshold in seq(min_threshold, max_threshold, 0.1)) {
         filtered <- cleaned[cleaned > threshold]
         cat("Threshold:", threshold, "Count:", length(filtered), "\n")
     }
-    
+
     return(cleaned)
 }
 
@@ -34529,7 +34560,8 @@ x <- 1
 
         let main_code = "source(\"functions.R\")\nsource(\"data.R\")\nww$c.oos <- 1\n";
         let functions_code = "helper <- function(x) x * 2\n";
-        let data_code = "ww <- list()\nsource(\"covariates.R\")\nsource(\"indices.R\")\nsource(\"impute.R\")\n";
+        let data_code =
+            "ww <- list()\nsource(\"covariates.R\")\nsource(\"indices.R\")\nsource(\"impute.R\")\n";
         let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
         let indices_code = "idx_a <- 10\nidx_b <- 20\n";
         let impute_code = "apple <- food\nbar <- food\nfood <- 1\nfoo <- 1\n";
@@ -34545,7 +34577,9 @@ x <- 1
             (&impute_uri, impute_code),
             (&report_uri, report_code),
         ] {
-            state.documents.insert(uri.clone(), Document::new(code, None));
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
             state.cross_file_graph.update_file(
                 uri,
                 &crate::cross_file::extract_metadata(code),
@@ -34574,11 +34608,16 @@ x <- 1
         );
 
         // food is used on lines 0 and 1, defined on line 2 → 2 forward references
-        let food_diags: Vec<_> = diagnostics.iter()
+        let food_diags: Vec<_> = diagnostics
+            .iter()
             .filter(|d| d.message.contains("Undefined variable: food"))
             .collect();
-        assert_eq!(food_diags.len(), 2, "Should have 2 forward-reference diagnostics (position_aware): {:?}",
-            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert_eq!(
+            food_diags.len(),
+            2,
+            "Should have 2 forward-reference diagnostics (position_aware): {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
         let mut lines: Vec<u32> = food_diags.iter().map(|d| d.range.start.line).collect();
         lines.sort();
         assert_eq!(lines, vec![0, 1]);
@@ -34586,14 +34625,24 @@ x <- 1
         // Now test via the snapshot path (what the real LSP uses)
         let snapshot = DiagnosticsSnapshot::build(&state, &impute_uri)
             .expect("Should build snapshot for impute.R");
-        let snapshot_diags = diagnostics_from_snapshot(&snapshot, &impute_uri, &DiagCancelToken::never())
-            .expect("Should produce diagnostics");
-        let snapshot_food: Vec<_> = snapshot_diags.iter()
+        let snapshot_diags =
+            diagnostics_from_snapshot(&snapshot, &impute_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+        let snapshot_food: Vec<_> = snapshot_diags
+            .iter()
             .filter(|d| d.message.contains("Undefined variable: food"))
             .collect();
-        assert_eq!(snapshot_food.len(), 2, "Snapshot path should also have 2 forward-reference diagnostics: {:?}",
-            snapshot_diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-        let mut snapshot_lines: Vec<u32> = snapshot_food.iter().map(|d| d.range.start.line).collect();
+        assert_eq!(
+            snapshot_food.len(),
+            2,
+            "Snapshot path should also have 2 forward-reference diagnostics: {:?}",
+            snapshot_diags
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+        let mut snapshot_lines: Vec<u32> =
+            snapshot_food.iter().map(|d| d.range.start.line).collect();
         snapshot_lines.sort();
         assert_eq!(snapshot_lines, vec![0, 1]);
     }
@@ -35566,9 +35615,8 @@ x
         }
 
         let snapshot = DiagnosticsSnapshot::build(&state, &main_uri).expect("snapshot");
-        let diags =
-            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
-                .expect("diags");
+        let diags = diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+            .expect("diags");
 
         let used_before: Vec<_> = diags
             .iter()
@@ -35695,10 +35743,7 @@ x
             eprintln!("  {:?}: {}", d.range, d.message);
         }
 
-        let xyz_diags: Vec<_> = diags
-            .iter()
-            .filter(|d| d.message.contains("xyz"))
-            .collect();
+        let xyz_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("xyz")).collect();
         eprintln!("xyz-related diagnostics:");
         for d in &xyz_diags {
             eprintln!("  {:?}: {}", d.range, d.message);
@@ -35735,16 +35780,14 @@ x
         );
 
         // Now query at (17, 0) - LHS position, BEFORE assignment.
-        let lhs_scope =
-            snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never(), None);
+        let lhs_scope = snapshot.get_scope(&data_uri, 17, 0, &DiagCancelToken::never(), None);
         eprintln!(
             "scope.symbols at LHS (17, 0): xyz in scope? {}",
             lhs_scope.symbols.contains_key("xyz")
         );
 
         // And at (16, 0) - the line BEFORE xyz = xyz, no assignment yet.
-        let prev_scope =
-            snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never(), None);
+        let prev_scope = snapshot.get_scope(&data_uri, 16, 0, &DiagCancelToken::never(), None);
         eprintln!(
             "scope.symbols at (16, 0): xyz in scope? {}",
             prev_scope.symbols.contains_key("xyz")
@@ -35856,10 +35899,14 @@ x
         }
 
         // Direct scope check: xyz must NOT be in scope at the RHS.
-        let mut artifacts_map: std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>> =
-            std::collections::HashMap::new();
-        let mut metadata_map: std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
-            std::collections::HashMap::new();
+        let mut artifacts_map: std::collections::HashMap<
+            Url,
+            Arc<crate::cross_file::scope::ScopeArtifacts>,
+        > = std::collections::HashMap::new();
+        let mut metadata_map: std::collections::HashMap<
+            Url,
+            Arc<crate::cross_file::CrossFileMetadata>,
+        > = std::collections::HashMap::new();
         for (uri, code) in [
             (&data_uri, data_code),
             (&main_uri, main_code),
@@ -35869,7 +35916,10 @@ x
             let tree = parse_r_code(code);
             let metadata = crate::cross_file::extract_metadata(code);
             let artifacts = crate::cross_file::scope::compute_artifacts_with_metadata(
-                uri, &tree, code, Some(&metadata),
+                uri,
+                &tree,
+                code,
+                Some(&metadata),
             );
             artifacts_map.insert(uri.clone(), Arc::new(artifacts));
             metadata_map.insert(uri.clone(), Arc::new(metadata));
@@ -35892,7 +35942,10 @@ x
         assert!(
             !scope_at.symbols.contains_key("xyz"),
             "xyz must not be in scope at RHS of `xyz <- xyz`. Found: {:?}",
-            scope_at.symbols.get("xyz").map(|s| (s.source_uri.path().to_string(), s.defined_line))
+            scope_at
+                .symbols
+                .get("xyz")
+                .map(|s| (s.source_uri.path().to_string(), s.defined_line))
         );
 
         // Snapshot diagnostic check: the production path must emit
@@ -35932,7 +35985,8 @@ x
 
         // data.R loads somepkg at line 5 (0-indexed). Querying at line 1
         // (before the library call) must NOT see somepkg.
-        let data_code = "ww <- list()\nx <- 1\ny <- 2\nz <- 3\nhelper <- function() x\nlibrary(somepkg)\n";
+        let data_code =
+            "ww <- list()\nx <- 1\ny <- 2\nz <- 3\nhelper <- function() x\nlibrary(somepkg)\n";
         let main_code = "source(\"data.R\")\n";
         let shrinkage_code = "source(\"main.R\")\nsource(\"validate.R\")\n";
         let validate_code = "source(\"main.R\")\n";
@@ -35957,10 +36011,14 @@ x
             );
         }
 
-        let mut artifacts_map: std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>> =
-            std::collections::HashMap::new();
-        let mut metadata_map: std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
-            std::collections::HashMap::new();
+        let mut artifacts_map: std::collections::HashMap<
+            Url,
+            Arc<crate::cross_file::scope::ScopeArtifacts>,
+        > = std::collections::HashMap::new();
+        let mut metadata_map: std::collections::HashMap<
+            Url,
+            Arc<crate::cross_file::CrossFileMetadata>,
+        > = std::collections::HashMap::new();
         for (uri, code) in [
             (&data_uri, data_code),
             (&main_uri, main_code),
@@ -35970,7 +36028,10 @@ x
             let tree = parse_r_code(code);
             let metadata = crate::cross_file::extract_metadata(code);
             let artifacts = crate::cross_file::scope::compute_artifacts_with_metadata(
-                uri, &tree, code, Some(&metadata),
+                uri,
+                &tree,
+                code,
+                Some(&metadata),
             );
             artifacts_map.insert(uri.clone(), Arc::new(artifacts));
             metadata_map.insert(uri.clone(), Arc::new(metadata));
@@ -36493,8 +36554,11 @@ my_func <- function(a = default_value) {
         let tmp = std::env::temp_dir().join("raven_test_cache_pending");
         let pkg_dir = tmp.join("__raven_pending_pkg__");
         fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
-        fs::write(pkg_dir.join("DESCRIPTION"), "Package: __raven_pending_pkg__\n")
-            .expect("write DESCRIPTION");
+        fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: __raven_pending_pkg__\n",
+        )
+        .expect("write DESCRIPTION");
 
         let mut state = create_test_state();
         state.package_library_ready = true;
@@ -36563,7 +36627,8 @@ my_func <- function(a = default_value) {
         state.cross_file_config.packages_enabled = true;
         state.workspace_scan_complete = true;
         // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
-        state.workspace_imports = std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
+        state.workspace_imports =
+            std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
 
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();
         // lme4 cached with empty exports (prefetch saw R fail to load it).
@@ -36754,8 +36819,11 @@ my_func <- function(a = default_value) {
         let tmp = std::env::temp_dir().join("raven_test_installed_pkg");
         let pkg_dir = tmp.join("__raven_installed_pkg__");
         fs::create_dir_all(&pkg_dir).expect("create tmp pkg dir");
-        fs::write(pkg_dir.join("DESCRIPTION"), "Package: __raven_installed_pkg__\n")
-            .expect("write DESCRIPTION");
+        fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: __raven_installed_pkg__\n",
+        )
+        .expect("write DESCRIPTION");
 
         let mut state = create_test_state();
         state.package_library_ready = true;
@@ -37061,8 +37129,14 @@ my_func <- function(a = default_value) {
         // non-function RHS, which would incorrectly flag the inner `f()` as
         // an undefined variable.
         let cases: &[(&str, &str)] = &[
-            ("f <- (function() f())\n", "left-assignment with parenthesized function"),
-            ("(function() g()) -> g\n", "right-assignment with parenthesized function"),
+            (
+                "f <- (function() f())\n",
+                "left-assignment with parenthesized function",
+            ),
+            (
+                "(function() g()) -> g\n",
+                "right-assignment with parenthesized function",
+            ),
         ];
 
         for &(code, label) in cases {
@@ -38132,8 +38206,7 @@ mod jags_goto_definition_tests {
     }
 
     fn jags_definition_range(state: &WorldState, uri: &Url, pos: Position) -> (u32, u32, u32) {
-        let response =
-            goto_definition(state, uri, pos).expect("Expected a definition");
+        let response = goto_definition(state, uri, pos).expect("Expected a definition");
 
         match response {
             GotoDefinitionResponse::Scalar(loc) => (
@@ -38207,7 +38280,8 @@ mod jags_goto_definition_tests {
 
         // Navigate from `x` on line 2 (usage in `y <- x[1] + 1`) to definition on line 1
         let occ = nth_jags_occurrence(code, "x", 1);
-        let (line, start, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        let (line, start, _) =
+            jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
         assert_eq!(line, 1); // definition is `x[1] ~ dnorm(...)`
         assert_eq!(start, 2); // `x` starts at column 2 (after two spaces)
     }
@@ -38219,7 +38293,8 @@ mod jags_goto_definition_tests {
 
         // Navigate from `log.omega` on line 2 to definition on line 1
         let occ = nth_jags_occurrence(code, "log.omega", 1);
-        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        let (line, _, _) =
+            jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
         assert_eq!(line, 1);
     }
 
@@ -38230,7 +38305,8 @@ mod jags_goto_definition_tests {
 
         // Navigate from `c` in `x[c]` to `c` in `for (c in ...)`
         let occ = nth_jags_occurrence(code, "c", 1); // second occurrence of `c`
-        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        let (line, _, _) =
+            jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
         assert_eq!(line, 1); // for loop is on line 1
     }
 
@@ -38253,7 +38329,8 @@ mod jags_goto_definition_tests {
 
         // Click on `married.unmet` on line 2 (second occurrence)
         let occ = nth_jags_occurrence(code, "married.unmet", 1);
-        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        let (line, _, _) =
+            jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
         // Falls back to first occurrence on line 1
         assert_eq!(line, 1);
     }
@@ -38266,7 +38343,8 @@ mod jags_goto_definition_tests {
 
         // Click on `logit.min.prob` inside T()
         let occ = nth_jags_occurrence(code, "logit.min.prob", 1);
-        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        let (line, _, _) =
+            jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
         // Should navigate to the definition on line 1
         assert_eq!(line, 1);
     }
@@ -38279,7 +38357,8 @@ mod jags_goto_definition_tests {
 
         // Click on `w.idx` on line 2 (second occurrence inside y[...])
         let occ = nth_jags_occurrence(code, "w.idx", 1);
-        let (line, _, _) = jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
+        let (line, _, _) =
+            jags_definition_range(&state, &uri, Position::new(occ.line, occ.start_col));
         // Falls back to first occurrence (also line 2, in x[c, w.idx])
         assert_eq!(line, 2);
     }

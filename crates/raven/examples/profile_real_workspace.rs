@@ -2,8 +2,14 @@
 //
 // Run with:
 //   cargo run --release --example profile_real_workspace --features test-support
+//   cargo run --release --example profile_real_workspace --features test-support -- /path/to/workspace
+//   WORKSPACE=/path/to/workspace cargo run --release --example profile_real_workspace --features test-support
 //
-// Requires ~/repos/worldwide to exist.
+// Workspace resolution order:
+//   1. WORKSPACE environment variable
+//   2. First CLI argument
+//   3. Current working directory (fallback)
+//   4. ~/repos/worldwide (legacy default)
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -17,8 +23,16 @@ fn main() {
         .format_timestamp_millis()
         .init();
 
-    let home = std::env::var_os("HOME").expect("HOME not set");
-    let workspace = PathBuf::from(home).join("repos/worldwide");
+    let workspace = if let Ok(ws) = std::env::var("WORKSPACE") {
+        PathBuf::from(ws)
+    } else if let Some(arg) = std::env::args().nth(1) {
+        PathBuf::from(arg)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd
+    } else {
+        let home = std::env::var_os("HOME").expect("HOME not set");
+        PathBuf::from(home).join("repos/worldwide")
+    };
     if !workspace.exists() {
         eprintln!("Error: {} doesn't exist", workspace.display());
         std::process::exit(1);
@@ -62,9 +76,10 @@ fn main() {
     let data_path = workspace.join("scripts/data.r");
     let data_uri = Url::from_file_path(&data_path).unwrap();
     let data_content = std::fs::read_to_string(&data_path).expect("read data.r");
-    state
-        .documents
-        .insert(data_uri.clone(), Document::new_with_uri(&data_content, None, &data_uri));
+    state.documents.insert(
+        data_uri.clone(),
+        Document::new_with_uri(&data_content, None, &data_uri),
+    );
 
     let (build_dur, diag_dur, diag_count) =
         diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
@@ -91,9 +106,14 @@ fn main() {
         let uri = Url::from_file_path(&path).unwrap();
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("  {:50} (read error: {})", rel, e);
+                continue;
+            }
         };
-        state.documents.insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
         let (b, d, c) = diagnostics_via_snapshot_profile(&state, &uri, &DiagCancelToken::never());
         eprintln!(
             "  {:50} build={:>7.2}ms  diag={:>7.2}ms  total={:>7.2}ms  diags={}",
@@ -122,8 +142,11 @@ fn main() {
                 let path = entry.path();
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with('.') || name == "node_modules" || name == "output"
-                            || name == "abortion_data" || name == "fertility_surveys"
+                        if name.starts_with('.')
+                            || name == "node_modules"
+                            || name == "output"
+                            || name == "abortion_data"
+                            || name == "fertility_surveys"
                         {
                             continue;
                         }
@@ -144,7 +167,10 @@ fn main() {
 
     for (path, size) in file_sizes.iter().take(10) {
         let Ok(content) = std::fs::read_to_string(path) else {
-            eprintln!("  {:50} (non-UTF-8, skipped)", path.strip_prefix(&workspace).unwrap_or(path).display());
+            eprintln!(
+                "  {:50} (non-UTF-8, skipped)",
+                path.strip_prefix(&workspace).unwrap_or(path).display()
+            );
             continue;
         };
         let uri = Url::from_file_path(path).unwrap();
@@ -156,9 +182,12 @@ fn main() {
 
         let ta = Instant::now();
         if let Some(tree) = doc.tree.as_ref() {
-            let _meta = raven::cross_file::extract_metadata(&content);
+            let meta = raven::cross_file::extract_metadata(&content);
             let _arts = raven::cross_file::scope::compute_artifacts_with_metadata(
-                &uri, tree, &content, None,
+                &uri,
+                tree,
+                &content,
+                Some(&meta),
             );
         }
         let artifact_time = ta.elapsed();
