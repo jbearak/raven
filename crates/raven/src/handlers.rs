@@ -5051,33 +5051,72 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         })
         .collect();
 
-    // Collect usages
+    // Collect usages and sort by document order so the ScopeStream cursor
+    // advances monotonically. tree-sitter's `walk()` typically yields
+    // nodes in document order; the sort is a defensive guarantee.
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
     collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
+    usages.sort_by_key(|(_, l, c, _)| (*l, *c));
 
-    // Filter to only usages that appear before their source() call
-    let mut locally_resolved_usages: HashSet<(String, u32, u32)> = HashSet::new();
-    for (idx, (name, usage_line, usage_col, _)) in usages.iter().enumerate() {
-        if idx & 63 == 0 && cancel.is_cancelled() {
-            return;
+    // Build a ScopeStream for the queried URI. The closures borrow the
+    // snapshot's pre-collected artifacts/metadata maps; the stream
+    // borrows the snapshot's shared `parent_prefix_cache` so child-source
+    // recursion benefits from the same Stage-1 caching.
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        snapshot.artifacts_map.get(target_uri).cloned()
+    };
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+        snapshot.metadata_map.get(target_uri).cloned()
+    };
+    let is_cancelled_fn = || cancel.is_cancelled();
+
+    let mut stream_opt = scope::ScopeStream::new(
+        uri,
+        &get_artifacts,
+        &get_metadata,
+        &snapshot.cross_file_graph,
+        snapshot.workspace_folders.first(),
+        snapshot.cross_file_config.max_chain_depth,
+        &snapshot.base_exports,
+        snapshot.cross_file_config.hoist_globals_in_functions,
+        snapshot.cross_file_config.backward_dependencies,
+        &is_cancelled_fn,
+        &snapshot.parent_prefix_cache,
+    );
+
+    // Pre-resolve scope at each forward-source's call site so the
+    // defense-in-depth check (which needs `symbol.source_uri != *uri`)
+    // doesn't require per-usage out-of-order cursor jumps. Source
+    // positions are typically a small set (≤ tens) so the upfront cost
+    // is bounded; computing once per source is cheaper than per-usage.
+    //
+    // We use `snapshot.get_scope` here (cached path with the same prefix
+    // cache as the stream) rather than the stream itself because the
+    // source positions can be ANY line/column in the file, not necessarily
+    // monotonic with the per-usage forward sweep.
+    let mut source_scope_symbols: HashMap<(u32, u32), HashMap<String, Url>> = HashMap::new();
+    for source in &source_calls {
+        if !source.inherits_symbols() {
+            continue;
         }
-        let scope = scope_cache
-            .entry((*usage_line, *usage_col))
-            .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
-        if let Some(symbol) = scope.symbols.get(name.as_str()) {
-            if symbol.source_uri == *uri {
-                locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
-            }
-        }
+        let key = (source.line, source.column);
+        source_scope_symbols.entry(key).or_insert_with(|| {
+            let s = scope_cache
+                .entry(key)
+                .or_insert_with(|| snapshot.get_scope(uri, key.0, key.1, cancel));
+            // Build a slimmed map of (symbol_name → source_uri) for the
+            // defense-in-depth `inherited` check. Cloning just the URI
+            // avoids holding borrows on `scope_cache`.
+            s.symbols
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.source_uri.clone()))
+                .collect()
+        });
     }
 
     for (idx, (name, usage_line, usage_col, usage_node)) in usages.iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
-        }
-
-        if locally_resolved_usages.contains(&(name.clone(), *usage_line, *usage_col)) {
-            continue;
         }
 
         if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, *usage_line) {
@@ -5087,11 +5126,26 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             continue;
         }
 
-        let scope = scope_cache
-            .entry((*usage_line, *usage_col))
-            .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+        // Stream-based visibility check. Collapses the original
+        // `locally_resolved_usages` set + `scope.symbols.contains_key`
+        // pre-filter into a single `is_visible` check: any symbol in
+        // scope (locally defined or inherited) suppresses the
+        // out-of-scope diagnostic. The original two-pass structure was
+        // an optimization that no longer applies under streaming
+        // (single forward sweep amortizes the cache work). Falls back
+        // to the legacy snapshot-cache path when the stream couldn't be
+        // constructed.
+        let in_scope = if let Some(stream) = stream_opt.as_mut() {
+            stream.advance_to(*usage_line, *usage_col);
+            stream.is_visible(name)
+        } else {
+            let scope = scope_cache
+                .entry((*usage_line, *usage_col))
+                .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+            scope.symbols.contains_key(name.as_str())
+        };
 
-        if scope.symbols.contains_key(name.as_str()) {
+        if in_scope {
             continue;
         }
 
@@ -5122,15 +5176,16 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // Defense in depth: also confirm the symbol record at the
             // source() position points to a different file, guarding
             // against the original `xyz <- xyz` self-leak shape that
-            // motivated commit 91c3617.
-            let source_scope = scope_cache
-                .entry((source.line, source.column))
-                .or_insert_with(|| snapshot.get_scope(uri, source.line, source.column, cancel));
-            let inherited = source_scope
-                .symbols
-                .get(name.as_str())
-                .map(|sym| sym.source_uri != *uri)
-                .unwrap_or(true); // No symbol record yet (will be brought by source) → still attribute
+            // motivated commit 91c3617. The pre-computed
+            // `source_scope_symbols` map gives us the (name → source_uri)
+            // mapping for this source's call site without re-querying.
+            let inherited = match source_scope_symbols.get(&(source.line, source.column)) {
+                Some(syms) => syms
+                    .get(name.as_str())
+                    .map(|src_uri| src_uri != uri)
+                    .unwrap_or(true), // No symbol record yet (will be brought by source) → still attribute
+                None => true, // Source not in pre-resolve map (e.g. doesn't inherit symbols)
+            };
             if !inherited {
                 continue;
             }
@@ -5278,6 +5333,39 @@ fn collect_undefined_variables_from_snapshot(
     // name is checked at most once across all identifiers in this diagnostic pass.
     let mut package_exists_memo: HashMap<String, bool> = HashMap::new();
 
+    // Sort usages by document order so the ScopeStream cursor advances
+    // monotonically. tree-sitter's `walk()` typically yields nodes in
+    // document order already; the sort is a defensive guarantee for the
+    // streaming `advance_to` invariant.
+    let mut used = used;
+    used.sort_by_key(|(_, n)| (n.start_position().row, n.start_position().column));
+
+    // Build a single ScopeStream for the queried URI. The closures
+    // borrow the snapshot's pre-collected artifacts/metadata maps; the
+    // stream borrows the snapshot's shared `parent_prefix_cache` so
+    // child-source recursion benefits from the same Stage-1 caching.
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        snapshot.artifacts_map.get(target_uri).cloned()
+    };
+    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+        snapshot.metadata_map.get(target_uri).cloned()
+    };
+    let is_cancelled_fn = || cancel.is_cancelled();
+
+    let mut stream_opt = scope::ScopeStream::new(
+        uri,
+        &get_artifacts,
+        &get_metadata,
+        &snapshot.cross_file_graph,
+        snapshot.workspace_folders.first(),
+        snapshot.cross_file_config.max_chain_depth,
+        &snapshot.base_exports,
+        snapshot.cross_file_config.hoist_globals_in_functions,
+        snapshot.cross_file_config.backward_dependencies,
+        &is_cancelled_fn,
+        &snapshot.parent_prefix_cache,
+    );
+
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
@@ -5308,13 +5396,15 @@ fn collect_undefined_variables_from_snapshot(
             }
         }
 
+        // Compute usage_col_utf16 once per iteration; subsequent checks
+        // share it.
+        let usage_line_text = get_line(usage_node.start_position().row);
+        let usage_col_utf16 =
+            byte_offset_to_utf16_column(usage_line_text, usage_node.start_position().column);
+
         if hoist_globals {
             if let Some((ref exports, ref fn_tree)) = local_opt {
                 if exports.contains(name.as_str()) {
-                    let usage_col_byte = usage_node.start_position().column as u32;
-                    let line_text = get_line(usage_node.start_position().row);
-                    let usage_col_utf16 =
-                        byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
                     let inside_function = !fn_tree
                         .query_point(scope::Position::new(usage_line, usage_col_utf16))
                         .is_empty();
@@ -5329,29 +5419,48 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
 
-        let scope = {
-            let line_text = get_line(usage_node.start_position().row);
-            let usage_col =
-                byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
+        // Advance the stream cursor and query visibility. Fall back to
+        // the legacy snapshot.get_scope path if stream construction
+        // failed (no artifacts for the queried URI).
+        let scope = if let Some(stream) = stream_opt.as_mut() {
+            stream.advance_to(usage_line, usage_col_utf16);
+            // Fast path: if the symbol is visible AND not a forward
+            // reference in the same file, skip the diagnostic. The
+            // `symbol_for` walk is cheaper than materializing a full
+            // ScopeAtPosition because it short-circuits on the first
+            // matching frame.
+            if let Some(sym) = stream.symbol_for(&name) {
+                if !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16) {
+                    continue;
+                }
+            }
+            // Slow path: name is undefined or forward-referenced. We
+            // need the full ScopeAtPosition for the package checks
+            // below. Materialize once via `snapshot()` and store in
+            // `scope_cache` so repeat lookups (rare; same usage twice)
+            // are free, AND so the out-of-scope collector can read the
+            // populated entry if it runs over the same positions.
+            let entry = scope_cache.entry((usage_line, usage_col_utf16));
+            entry.or_insert_with(|| stream.snapshot())
+        } else {
+            // No artifacts → fall back to the legacy path. This branch
+            // is rare (it happens only for files that aren't open or
+            // indexed), and matches the pre-Stage-2 behavior.
             scope_cache
-                .entry((usage_line, usage_col))
-                .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col, cancel))
+                .entry((usage_line, usage_col_utf16))
+                .or_insert_with(|| snapshot.get_scope(uri, usage_line, usage_col_utf16, cancel))
         };
 
-        if let Some(sym) = scope.symbols.get(name.as_str()) {
-            let usage_col_for_check = byte_offset_to_utf16_column(
-                get_line(usage_node.start_position().row),
-                usage_node.start_position().column,
-            );
-            if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_for_check) {
-                continue;
+        // For the no-stream fall-back path we still need to apply the
+        // forward-reference check (the stream path applied it above
+        // before the snapshot materialization).
+        if stream_opt.is_none() {
+            if let Some(sym) = scope.symbols.get(name.as_str()) {
+                if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16) {
+                    continue;
+                }
             }
         }
-
-        let usage_col_utf16 = byte_offset_to_utf16_column(
-            get_line(usage_node.start_position().row),
-            usage_node.start_position().column,
-        );
 
         let defined_in_loaded_direct_source = direct_sources
             .iter()
