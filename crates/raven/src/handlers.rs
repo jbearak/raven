@@ -5785,20 +5785,31 @@ fn collect_identifier_usages_utf16<'a>(
     };
 
     if node.kind() == "identifier" {
-        // Skip if this is the LHS of an assignment
+        // Skip if this is the LHS of a left-assignment or the RHS target of
+        // a right-assignment. Both are *definition* sites, not usages.
         if let Some(parent) = node.parent() {
             if parent.kind() == "binary_operator" {
                 let mut cursor = parent.walk();
                 let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
+                if children.len() >= 2 {
                     let op = children[1];
                     let op_text = &text[op.byte_range()];
-                    if matches!(op_text, "<-" | "=" | "<<-") {
+                    // Left-assignment: target is children[0] (e.g., `x <- 1`).
+                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-")
+                    {
                         // Skip LHS of assignment, but recurse into children
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
                             collect_identifier_usages_utf16(child, text, line_starts, usages);
                         }
+                        return;
+                    }
+                    // Right-assignment: target is children[2] (e.g., `1 -> x`).
+                    // Mirrors the equivalent skip in `collect_usages_with_context`.
+                    if children.len() >= 3
+                        && children[2].id() == node.id()
+                        && matches!(op_text, "->" | "->>")
+                    {
                         return;
                     }
                 }
@@ -5822,6 +5833,30 @@ fn collect_identifier_usages_utf16<'a>(
             if parent.kind() == "argument" {
                 if let Some(name_node) = parent.child_by_field_name("name") {
                     if name_node.id() == node.id() {
+                        return;
+                    }
+                }
+            }
+            // Skip identifiers inside a `namespace_operator` (`pkg::name` or
+            // `pkg:::name`). Both the package-name LHS and the member-name
+            // RHS are qualified references — neither is a bare variable
+            // lookup, so collecting them as usages produces false-positive
+            // "used before it's available" diagnostics whenever a later
+            // source() target happens to export a symbol of the same name.
+            // Mirrors the equivalent skip in `collect_usages_with_context`.
+            if parent.kind() == "namespace_operator" {
+                return;
+            }
+            // Skip the rhs of `$` / `@` extract operators (e.g. the `X` in
+            // `ww$X` or the `slot` in `obj@slot`). These are member-name
+            // strings, not bare variable references — collecting them as
+            // usages produces false-positive "used before it's available"
+            // diagnostics whenever a later source() target happens to export
+            // a top-level symbol with the same name. Mirrors the equivalent
+            // skip in `collect_usages_with_context`.
+            if parent.kind() == "extract_operator" {
+                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
+                    if rhs_node.id() == node.id() {
                         return;
                     }
                 }
@@ -35233,6 +35268,195 @@ x
                 .collect::<Vec<_>>()
         );
         assert_eq!(undefined[0].range.start.line, 0);
+    }
+
+    /// Regression for the worldwide/scripts/data/outcomes.r false positive:
+    /// the snapshot out-of-scope collector must NOT treat an identifier that
+    /// appears as the field name in `obj$X` (or `obj@X`) as a bare reference
+    /// to a top-level `X`. Tree-sitter-r parses `ww$X` as an `extract_operator`
+    /// where `X` is the `rhs` field; semantically `X` is a string-valued
+    /// member name on `ww`, not a variable lookup.
+    ///
+    /// Pre-fix `collect_identifier_usages_utf16` collected those `X` nodes
+    /// (its sibling `collect_usages_with_context` already skipped them via the
+    /// `extract_operator` rhs check), so a later `source("failure.R")` that
+    /// happens to export a top-level `X` produced bogus
+    /// "'X' is used before it's available (sourced on line N)" diagnostics
+    /// for `ww$X <- ...`, `... ww$X)`, and `1:ww$X`.
+    #[test]
+    fn test_extract_operator_rhs_does_not_emit_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        let outcomes_uri = Url::parse("file:///workspace/outcomes.R").unwrap();
+        let failure_uri = Url::parse("file:///workspace/failure.R").unwrap();
+
+        // Three shapes from outcomes.r at lines 208, 217, 221:
+        //   - assignment LHS: `ww$X <- nrow(df)`
+        //   - call argument:  `rep(0, ww$X)`
+        //   - sequence RHS:   `1:ww$X`
+        // Then a later `source("failure.R")` whose target exports a top-level X.
+        let outcomes_code = "\
+ww <- list()
+ww$X <- nrow(df)
+ww$zero <- rep(0, ww$X)
+df$index <- 1:ww$X
+source(\"failure.R\")
+";
+        let failure_code = "X <- read.csv(\"data.csv\")\n";
+
+        for (uri, code) in [(&outcomes_uri, outcomes_code), (&failure_uri, failure_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &outcomes_uri)
+            .expect("Should build snapshot for outcomes.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &outcomes_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'X'")
+            })
+            .collect();
+        assert!(
+            used_before_x.is_empty(),
+            "Field name X in `ww$X` (extract_operator rhs) must not be flagged \
+             as 'used before it's available'. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression mirroring `test_extract_operator_rhs_does_not_emit_used_before_sourced`
+    /// for the namespace-operator gap. `dplyr::filter` parses as a
+    /// `namespace_operator` where both the package-name LHS (`dplyr`) and the
+    /// member-name RHS (`filter`) are qualified references — neither is a
+    /// bare variable lookup. Pre-fix `collect_identifier_usages_utf16` lacked
+    /// the namespace_operator skip its sibling `collect_usages_with_context`
+    /// already had, so a later `source("helpers.R")` whose target exports a
+    /// top-level `filter` produced a bogus
+    /// "'filter' is used before it's available" diagnostic on the
+    /// `dplyr::filter(...)` line.
+    #[test]
+    fn test_namespace_operator_does_not_emit_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+
+        // `dplyr::filter(df, x > 0)` and the `:::` triple-colon variant, then a
+        // later source() whose target exports top-level `filter` and `inner`.
+        let main_code = "\
+out <- dplyr::filter(df, x > 0)
+out2 <- dplyr:::inner(df)
+source(\"helpers.R\")
+";
+        let helpers_code = "filter <- function(x) x\ninner <- function(x) x\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_qualified: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && (d.message.contains("'filter'")
+                        || d.message.contains("'inner'")
+                        || d.message.contains("'dplyr'"))
+            })
+            .collect();
+        assert!(
+            used_before_qualified.is_empty(),
+            "Identifiers inside namespace_operator (pkg::name / pkg:::name) \
+             must not be flagged as 'used before it's available'. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression mirroring `test_extract_operator_rhs_does_not_emit_used_before_sourced`
+    /// for the right-assignment target gap. `1 -> x` (and `1 ->> x`) parses
+    /// as a `binary_operator` whose third child `x` is the *target* of the
+    /// assignment, not a usage. Pre-fix `collect_identifier_usages_utf16`
+    /// only skipped the LHS of left-assignment forms (`x <- ...`, `x = ...`,
+    /// `x <<- ...`) and collected the RHS target of `->`/`->>` as a bare
+    /// identifier reference.
+    ///
+    /// In end-to-end diagnostics the bug is masked at the global level by
+    /// the `inherited` defense-in-depth check in
+    /// `collect_out_of_scope_usages_from_snapshot` (the local right-assign
+    /// shows up at the later source's position with `source_uri ==
+    /// queried_uri`), and inside function bodies it is masked by
+    /// late-binding hoisting. So this regression is asserted at the
+    /// *collector* level: the contract is that `collect_identifier_usages_utf16`
+    /// must not list the RHS target of a right-assignment, mirroring the
+    /// `children[2]` skip in `collect_usages_with_context` (handlers.rs ~8551).
+    #[test]
+    fn test_collect_identifier_usages_utf16_skips_right_assignment_target() {
+        use crate::handlers::collect_identifier_usages_utf16;
+
+        let code = "1 -> x\n2 ->> y\nz <- 3\n";
+        let tree = parse_r_code(code);
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(code.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let mut usages: Vec<(String, u32, u32, tree_sitter::Node)> = Vec::new();
+        collect_identifier_usages_utf16(tree.root_node(), code, &line_starts, &mut usages);
+
+        let names: Vec<&str> = usages.iter().map(|(n, _, _, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"x"),
+            "RHS target of `1 -> x` must be skipped (mirrors collect_usages_with_context). \
+             Collected usages: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"y"),
+            "RHS target of `2 ->> y` must be skipped (mirrors collect_usages_with_context). \
+             Collected usages: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"z"),
+            "LHS target of `z <- 3` must continue to be skipped. Collected usages: {:?}",
+            names
+        );
     }
 
     /// Reproduces the worldwide/scripts/data.r structure end-to-end: a parent
