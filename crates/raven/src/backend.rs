@@ -646,6 +646,24 @@ impl Backend {
     }
 }
 
+/// Sort watched-file diagnostic fanout by activity and enforce the configured
+/// per-trigger cap before any force-republish markers are created.
+fn cap_watched_file_revalidations(
+    affected: &mut Vec<Url>,
+    activity: &crate::cross_file::revalidation::CrossFileActivityState,
+    max_revalidations: usize,
+) {
+    affected.sort_by_key(|u| activity.priority_score(u).saturating_add(1));
+    if affected.len() > max_revalidations {
+        log::trace!(
+            "Watched-files revalidation cap exceeded: {} affected, scheduling {}",
+            affected.len(),
+            max_revalidations
+        );
+        affected.truncate(max_revalidations);
+    }
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -2885,31 +2903,23 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Apply revalidation cap to honor `max_revalidations_per_trigger`
-            // for watched-file fanouts (matches did_change/did_open). A burst
-            // of watched-file events (e.g. `git checkout` rewriting many
-            // files) can otherwise schedule unbounded publishes. Sort by
-            // activity priority so the highest-value docs survive the
-            // truncate. Truncating BEFORE `mark_force_republish_many`
-            // prevents orphaned force-republish counters on dropped URIs
-            // from leaking into a future unrelated same-version publish
-            // (same invariant as commit 71ca32f).
-            let activity = &state.cross_file_activity;
-            affected.sort_by_key(|u| activity.priority_score(u).saturating_add(1));
-            let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
-            if affected.len() > max_revalidations {
-                log::trace!(
-                    "Watched-files revalidation cap exceeded: {} affected, scheduling {}",
-                    affected.len(),
-                    max_revalidations
+            // CREATED/CHANGED graph mutations happen in the async disk-read
+            // pass below. When that pass is needed, defer capping and
+            // force-republish marking until after the post-update graph walk
+            // has added newly reachable open documents. For DELETED-only
+            // batches, the graph is already updated here, so cap and mark now.
+            if to_update.is_empty() {
+                cap_watched_file_revalidations(
+                    &mut affected,
+                    &state.cross_file_activity,
+                    state.cross_file_config.max_revalidations_per_trigger,
                 );
-                affected.truncate(max_revalidations);
+                // Bulk-mark force-republish on the post-truncation set under a
+                // single write-lock acquisition.
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(affected.iter());
             }
-            // Bulk-mark force-republish on the post-truncation set under a
-            // single write-lock acquisition.
-            state
-                .diagnostics_gate
-                .mark_force_republish_many(affected.iter());
             // Watched-file deletions can drop edges that put a closed neighbor
             // outside the open-document neighborhood; refresh the pin set so
             // newly unreachable URIs become LRU-evictable again.
@@ -2932,13 +2942,6 @@ impl LanguageServer for Backend {
             let mut affected_for_async_set: std::collections::HashSet<Url> =
                 affected_for_async.iter().cloned().collect();
             tokio::spawn(async move {
-                // Collect children affected by WD changes for diagnostics.
-                // The set tracks dedupe in O(1) so a watched-files burst
-                // doesn't spend O(n) Vec::contains scans per child.
-                let mut wd_affected_children: Vec<Url> = Vec::new();
-                let mut wd_affected_children_set: std::collections::HashSet<Url> =
-                    std::collections::HashSet::new();
-
                 for uri in uris_to_update {
                     // Read file content asynchronously
                     let path = match uri.to_file_path() {
@@ -3059,26 +3062,17 @@ impl LanguageServer for Backend {
                             &state.cross_file_graph,
                             &state.cross_file_meta,
                         );
-                        // Collect open children for diagnostics; bulk-mark
-                        // them so the watched-files burst doesn't acquire the
-                        // gate's write lock once per affected child. Skip any
-                        // child already scheduled for the affected_for_async
-                        // pipeline — otherwise that URI gets force-republish
-                        // marked twice (phantom counter) and published twice
-                        // (once by the WD loop, once by the async loop).
-                        let mut newly_affected: Vec<Url> = Vec::new();
+                        // Collect open children for diagnostics. Force-marking
+                        // is intentionally deferred until after the full async
+                        // union is capped, avoiding both duplicate markers and
+                        // cap bypasses from post-update fanout.
                         for child in wd_children {
                             if state.documents.contains_key(&child)
-                                && !affected_for_async_set.contains(&child)
-                                && wd_affected_children_set.insert(child.clone())
+                                && affected_for_async_set.insert(child.clone())
                             {
-                                newly_affected.push(child.clone());
-                                wd_affected_children.push(child);
+                                affected_for_async.push(child);
                             }
                         }
-                        state
-                            .diagnostics_gate
-                            .mark_force_republish_many(newly_affected.iter());
 
                         // Recompute neighbors against the POST-update graph.
                         // The sync pass at watched-files entry computed
@@ -3087,9 +3081,9 @@ impl LanguageServer for Backend {
                         // its new content (e.g. a freshly-added `source()`
                         // call) is invisible to that pass. Re-running the
                         // walk here picks up newly-reachable open neighbors.
-                        // Skip any URI already in the WD pipeline so the two
-                        // publish loops don't race on the same URI.
-                        let mut newly_affected_post_update: Vec<Url> = Vec::new();
+                        // Force-marking is deferred until after the full union
+                        // is capped so newly discovered neighbors cannot push
+                        // this trigger past `max_revalidations_per_trigger`.
                         if graph_result.edges_changed {
                             let post_neighbors =
                                 crate::cross_file::revalidation::compute_affected_dependents_after_edit(
@@ -3102,17 +3096,11 @@ impl LanguageServer for Backend {
                                     state.cross_file_config.max_transitive_dependents_visited,
                                 );
                             for dep in post_neighbors {
-                                if !wd_affected_children_set.contains(&dep)
-                                    && affected_for_async_set.insert(dep.clone())
-                                {
-                                    newly_affected_post_update.push(dep);
+                                if affected_for_async_set.insert(dep.clone()) {
+                                    affected_for_async.push(dep);
                                 }
                             }
-                            state
-                                .diagnostics_gate
-                                .mark_force_republish_many(newly_affected_post_update.iter());
                         }
-                        affected_for_async.extend(newly_affected_post_update);
                         graph_result.edges_changed
                     };
 
@@ -3128,92 +3116,24 @@ impl LanguageServer for Backend {
                     log::trace!("Updated workspace index for: {}", uri);
                 }
 
-                // Publish diagnostics for children affected by WD changes (outside the loop)
-                for child_uri in wd_affected_children {
-                    let diagnostics_data = {
-                        let state = state_arc.read().await;
-                        let version = state.documents.get(&child_uri).and_then(|d| d.version);
-                        let revision = state.documents.get(&child_uri).map(|d| d.revision);
-                        let can_publish = version
-                            .map(|ver| state.diagnostics_gate.can_publish(&child_uri, ver))
-                            .unwrap_or(true);
-                        if !can_publish {
-                            None
-                        } else {
-                            let sync_diagnostics = crate::handlers::diagnostics(
-                                &state,
-                                &child_uri,
-                                &handlers::DiagCancelToken::never(),
-                            );
-                            let directive_meta = state
-                                .documents
-                                .get(&child_uri)
-                                .map(|doc| {
-                                    crate::cross_file::directive::parse_directives(&doc.text())
-                                })
-                                .unwrap_or_default();
-                            let workspace_folder = state.workspace_folders.first().cloned();
-                            let missing_file_severity =
-                                state.cross_file_config.missing_file_severity;
-                            Some((
-                                version,
-                                revision,
-                                sync_diagnostics,
-                                directive_meta,
-                                workspace_folder,
-                                missing_file_severity,
-                            ))
-                        }
-                    };
-
-                    let Some((
-                        version,
-                        revision,
-                        sync_diagnostics,
-                        directive_meta,
-                        workspace_folder,
-                        missing_file_severity,
-                    )) = diagnostics_data
-                    else {
-                        continue;
-                    };
-
-                    let diagnostics = crate::handlers::diagnostics_async_standalone(
-                        &child_uri,
-                        sync_diagnostics,
-                        &directive_meta,
-                        workspace_folder.as_ref(),
-                        missing_file_severity,
-                    )
-                    .await;
-
-                    let can_publish = {
-                        let state = state_arc.read().await;
-                        let current_version =
-                            state.documents.get(&child_uri).and_then(|d| d.version);
-                        let current_revision = state.documents.get(&child_uri).map(|d| d.revision);
-                        if current_version != version || current_revision != revision {
-                            false
-                        } else if let Some(ver) = current_version {
-                            state
-                                .diagnostics_gate
-                                .try_consume_publish(&child_uri, ver)
-                        } else {
-                            true
-                        }
-                    };
-                    if can_publish {
-                        client
-                            .publish_diagnostics(child_uri.clone(), diagnostics, None)
-                            .await;
-                    }
-                }
-
                 // Now that the graph reflects every CREATED/CHANGED file in
-                // this batch, schedule diagnostics for the dependent open
-                // documents collected synchronously. Running this here (not
-                // before the spawn) guarantees the debounced diagnostic pass
-                // builds its snapshot from the post-update graph.
+                // this batch, cap and force-mark the full union of affected
+                // open documents before scheduling diagnostics. Running this
+                // here (not before the spawn) guarantees the debounced
+                // diagnostic pass builds its snapshot from the post-update
+                // graph, and prevents post-update edge fanout from bypassing
+                // `max_revalidations_per_trigger`.
+                {
+                    let state = state_arc.read().await;
+                    cap_watched_file_revalidations(
+                        &mut affected_for_async,
+                        &state.cross_file_activity,
+                        state.cross_file_config.max_revalidations_per_trigger,
+                    );
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(affected_for_async.iter());
+                }
                 for uri in affected_for_async {
                     Backend::publish_diagnostics_via_arc(
                         state_arc.clone(),
@@ -4798,6 +4718,53 @@ mod tests {
             assert!(set.contains("file1.R"));
             assert!(set.contains("file2.R"));
             assert!(set.contains("file3.R"));
+        }
+    }
+
+    /// Tests for watched-file revalidation cap handling.
+    mod watched_file_revalidation_cap {
+        use super::super::cap_watched_file_revalidations;
+        use crate::cross_file::revalidation::CrossFileActivityState;
+        use tower_lsp::lsp_types::Url;
+
+        fn uri(name: &str) -> Url {
+            Url::parse(&format!("file:///workspace/{name}")).unwrap()
+        }
+
+        #[test]
+        fn post_update_union_is_capped_after_activity_prioritization() {
+            let stale_pre_update_a = uri("pre_a.R");
+            let stale_pre_update_b = uri("pre_b.R");
+            let active_post_update = uri("post_active.R");
+
+            let mut activity = CrossFileActivityState::new();
+            activity.update(Some(active_post_update.clone()), vec![], 1);
+
+            // Mirrors the watched-files async path: pre-update neighbors are
+            // collected first, then post-update edge fanout appends a newly
+            // reachable URI. The cap must apply to the final union so the
+            // post-update URI cannot increase the scheduled count past max.
+            let mut affected = vec![
+                stale_pre_update_a.clone(),
+                stale_pre_update_b,
+                active_post_update.clone(),
+            ];
+
+            cap_watched_file_revalidations(&mut affected, &activity, 2);
+
+            assert_eq!(affected.len(), 2);
+            assert!(affected.contains(&active_post_update));
+            assert!(affected.contains(&stale_pre_update_a));
+        }
+
+        #[test]
+        fn zero_cap_schedules_no_watched_file_revalidations() {
+            let mut affected = vec![uri("a.R"), uri("b.R")];
+            let activity = CrossFileActivityState::new();
+
+            cap_watched_file_revalidations(&mut affected, &activity, 0);
+
+            assert!(affected.is_empty());
         }
     }
 
