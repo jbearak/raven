@@ -2697,6 +2697,12 @@ type TopLevelRemoval<'a> = (&'a str, u32);
 /// interface hash separately includes top-level removals (with their lines)
 /// to drive revalidation. Diagnostic-side checks that ask "is this name still
 /// available at EOF of the sourced file?" must use this helper instead.
+///
+/// Each call rebuilds the result with an O(timeline) walk and a fresh
+/// `HashSet<String>` allocation. Callers in hot paths (per-identifier loops,
+/// per-source-call lookups) must memoize the result for the diagnostic pass —
+/// see `source_target_live_exports` and `source_exports_cache` in
+/// `handlers.rs` for the established pattern.
 pub fn live_top_level_exports(artifacts: &ScopeArtifacts) -> std::collections::HashSet<String> {
     let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
     for event in &artifacts.timeline {
