@@ -1,0 +1,82 @@
+   Compiling raven v0.3.5 (/Users/jmb/.t3/worktrees/raven/t3code-9723b935/crates/raven)
+    Finished `release` profile [optimized] target(s) in 8.61s
+     Running `target/release/examples/profile_worldwide`
+=== Profile: cold-start on /Users/jmb/repos/worldwide ===
+
+[1] Per-file scan body (single-threaded, mirrors scan_directory):
+    files: 414, bytes: 3337 KB
+    discover (read_dir tree):    16.4ms
+    fs::read_to_string:           28.1ms ( 2.5%)
+    Document::new_with_uri:      337.7ms (30.3%)  <- tree-sitter parse
+    fs::metadata:                  1.2ms ( 0.1%)
+    extract_metadata:            447.1ms (40.1%)
+    compute_artifacts:           285.1ms (25.5%)  <- AST walk
+    HashMap inserts:               0.3ms ( 0.0%)
+    TOTAL:                      1115.9ms
+
+[2] scan_workspace (end-to-end, includes dependency-graph buildup):
+    median scan_workspace:  1078.9ms
+    runs: [1076.247208, 1078.8684580000001, 1087.459583]
+    files: 413, imports: 0, cross_file_entries: 413, new_index: 413
+
+[3] apply_workspace_index (write-lock-held in Task A):
+    median apply_workspace_index:     1.9ms
+    runs: [1.841833, 1.8599160000000001, 1.914041]
+
+[4] PackageLibrary init (Task B / on-demand from did_open):
+    RSubprocess::new:                13.4ms (R discovery + sanity check)
+    lib.initialize:                 164.7ms (2 lib_paths, 7 base_packages, 3381 base_exports)
+    Total init:                     178.1ms
+
+[5] scripts/data.r diagnostics — COLD start (workspace_scan_complete=false):
+    snapshot build:   0.00ms  diag:   6.10ms  total:   6.11ms  diags=0
+
+[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):
+    snapshot build:   0.08ms  diag:  34.80ms  total:  34.88ms  diags=0
+
+=== Cold-start lag attribution ===
+
+Wall-clock from did_open(data.r) to first non-deferred diagnostic publish ≈
+  scan_workspace          :  1078.9ms
+  apply_workspace_index   :     1.9ms
+  post-scan diagnostic     :    34.9ms (build   0.1ms + diag  34.8ms)
+  ---------------------------  1115.6ms (lower bound; ignores prefetch + lock contention)
+
+R subprocess startup (parallel to scan if Task B not ready):
+  RSubprocess::new        :    13.4ms
+  lib.initialize          :   164.7ms
+
+=== FIX EXPERIMENT A: eliminate redundant parse in scan_directory ===
+
+Current scan_directory calls Document::new_with_uri (parses) AND
+extract_metadata (parses AGAIN via parser_pool::with_parser).
+If we pass the existing tree via extract_metadata_with_tree, we skip
+the second parse for every file.
+
+(measuring across 414 files)
+  current   (extract_metadata):               1084.4ms (median of 3)
+  fix       (extract_metadata_with_tree):     766.9ms (median of 3)
+  saved:                                       317.4ms (29.3%)
+
+=== FIX EXPERIMENT B: parallel scan via std::thread ===
+
+Mirrors what rayon::par_iter (or a thread pool) over the file list
+would do. The dependency-graph rebuild (apply_workspace_index) still
+runs serially, but the per-file parse + metadata + artifacts (the
+dominant 1100ms phase) is embarrassingly parallel.
+
+(machine has 16 CPUs reported by available_parallelism)
+
+  threads= 1:    773.4ms (1.40x vs serial-with-current-dual-parse)
+  threads= 2:    539.6ms (2.01x vs serial-with-current-dual-parse)
+  threads= 4:    381.6ms (2.84x vs serial-with-current-dual-parse)
+  threads= 8:    309.8ms (3.50x vs serial-with-current-dual-parse)
+  threads=16:    214.8ms (5.05x vs serial-with-current-dual-parse)
+
+=== Summary of fix candidates ===
+
+Cold-start path BEFORE fixes (measured):
+  scan_workspace                :  1078.9ms
+  apply_workspace_index         :     1.9ms
+  post-scan diagnostics (data.r):    34.9ms
+  TOTAL                          :  1115.6ms

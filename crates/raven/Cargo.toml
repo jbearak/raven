@@ -29,6 +29,7 @@ walkdir = "2"
 dashmap = "5.4.0"
 indexmap = "2.2"
 regex = "1.10.0"
+rayon = "1.10"
 ropey = "1.6"
 lru = "0.16"
 notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
@@ -75,4 +76,12 @@ required-features = ["test-support"]
 
 [[example]]
 name = "profile_diagnostics"
+required-features = ["test-support"]
+
+[[example]]
+name = "profile_real_workspace"
+required-features = ["test-support"]
+
+[[example]]
+name = "profile_worldwide"
 required-features = ["test-support"]

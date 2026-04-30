@@ -31,16 +31,7 @@ enum IndexCategory {
     BackwardDirective,
 }
 
-fn is_valid_package_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-}
+use crate::r_subprocess::is_valid_package_name;
 
 /// Extract loaded packages from metadata-derived library calls.
 fn extract_loaded_packages_from_library_calls(
@@ -1350,10 +1341,7 @@ impl LanguageServer for Backend {
 
             // Collect package names from library calls for background prefetch
             let packages_to_prefetch: Vec<String> = if packages_enabled {
-                meta.library_calls
-                    .iter()
-                    .map(|c| c.package.clone())
-                    .collect()
+                extract_loaded_packages_from_library_calls(&meta.library_calls)
             } else {
                 Vec::new()
             };
@@ -1936,7 +1924,15 @@ impl LanguageServer for Backend {
 
                 let mut pkgs = scope.inherited_packages;
                 pkgs.extend(scope.loaded_packages);
-                let pkgs: Vec<String> = pkgs.into_iter().collect();
+                // Filter the merged set so suspicious names from inherited
+                // packages (which originate in parents' library_calls and
+                // are not pre-validated) cannot reach the R subprocess /
+                // filesystem path. Mirrors the validation applied to direct
+                // library_calls via extract_loaded_packages_from_library_calls.
+                let pkgs: Vec<String> = pkgs
+                    .into_iter()
+                    .filter(|p| is_valid_package_name(p))
+                    .collect();
 
                 (pkg_lib, ready, pkgs)
             };
@@ -2085,12 +2081,10 @@ impl LanguageServer for Backend {
                         max_chain_depth,
                     );
 
-                    // Collect package names for prefetch
+                    // Collect package names for prefetch (validate names to
+                    // reject suspicious inputs before R subprocess calls)
                     let pkgs: Vec<String> = if packages_enabled {
-                        meta.library_calls
-                            .iter()
-                            .map(|c| c.package.clone())
-                            .collect()
+                        extract_loaded_packages_from_library_calls(&meta.library_calls)
                     } else {
                         Vec::new()
                     };
@@ -2323,7 +2317,18 @@ impl LanguageServer for Backend {
                     return;
                 }
 
-                let packages_vec: Vec<String> = all_packages.into_iter().collect();
+                // Filter the merged set to drop suspicious names from
+                // inherited/loaded packages (parents may carry unvalidated
+                // entries through scope resolution). Mirrors the
+                // `prefetch_packages_for_open_documents` filter so every
+                // prefetch call site applies the same validation.
+                let packages_vec: Vec<String> = all_packages
+                    .into_iter()
+                    .filter(|p| is_valid_package_name(p))
+                    .collect();
+                if packages_vec.is_empty() {
+                    return;
+                }
                 log::trace!(
                     "Background prefetching {} packages",
                     packages_vec.len()

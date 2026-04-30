@@ -26,7 +26,7 @@ fn precompute_artifacts(
     workspace_path: &std::path::Path,
 ) -> (
     HashMap<Url, Arc<ScopeArtifacts>>,
-    HashMap<Url, CrossFileMetadata>,
+    HashMap<Url, Arc<CrossFileMetadata>>,
 ) {
     let mut artifacts_map = HashMap::new();
     let mut metadata_map = HashMap::new();
@@ -51,7 +51,7 @@ fn precompute_artifacts(
             let arts = Arc::new(compute_artifacts(&uri, &tree, &content));
             artifacts_map.insert(uri.clone(), arts);
         }
-        metadata_map.insert(uri, meta);
+        metadata_map.insert(uri, Arc::new(meta));
     }
 
     (artifacts_map, metadata_map)
@@ -59,7 +59,7 @@ fn precompute_artifacts(
 
 /// Build a DependencyGraph from pre-computed metadata for all files.
 fn build_dependency_graph(
-    metadata_map: &HashMap<Url, CrossFileMetadata>,
+    metadata_map: &HashMap<Url, Arc<CrossFileMetadata>>,
     workspace_root: Option<&Url>,
 ) -> DependencyGraph {
     let mut graph = DependencyGraph::new();
@@ -170,7 +170,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
                     &base_exports,
                     true,
                     raven::cross_file::config::BackwardDependencyMode::Explicit,
-                    &|| false,
+                    &|| false
                 ))
             })
         });
@@ -232,7 +232,7 @@ fn bench_scope_hotspots(c: &mut Criterion) {
                         &base_exports,
                         true,
                         raven::cross_file::config::BackwardDependencyMode::Explicit,
-                        &|| false,
+                        &|| false
                     ))
                 })
             },

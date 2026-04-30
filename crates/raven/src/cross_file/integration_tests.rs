@@ -4817,7 +4817,7 @@ child_var <- 100
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -4844,7 +4844,7 @@ child_var <- 100
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -4870,7 +4870,7 @@ child_var <- 100
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -5003,7 +5003,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -5026,7 +5026,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -5149,7 +5149,7 @@ x <- 1
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false,
+                &|| false
             );
 
             assert!(
@@ -5642,7 +5642,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -5720,7 +5720,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -5823,7 +5823,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -5901,7 +5901,7 @@ x <- 1
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         assert!(
@@ -6106,7 +6106,7 @@ mod cross_directory_hoisting_tests {
             &base_exports,
             true,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false,
+            &|| false
         );
 
         println!(
