@@ -1556,17 +1556,11 @@ impl LanguageServer for Backend {
                 affected.truncate(max_revalidations);
             }
 
-            // Mark force-republish on the post-truncation set, excluding the
-            // edited URI itself (its publish is driven by its own version
-            // bump, not by a cross-file marker). Marking after the cap
-            // prevents URIs that were dropped from `work_items` from
-            // carrying orphaned force counters that would leak into a
-            // future unrelated same-version publish.
-            state
-                .diagnostics_gate
-                .mark_force_republish_many(affected.iter().filter(|u| **u != uri));
-
             // Build work items with trigger revision snapshot
+            // NOTE: force-republish markers are NOT set here — they must be
+            // deferred until after re-enrichment completes, since re-enrichment
+            // can evict entries from work_items. Marking here would create
+            // orphaned force counters on evicted URIs.
             let work_items: Vec<_> = affected
                 .into_iter()
                 .map(|affected_uri| {
@@ -1809,12 +1803,8 @@ impl LanguageServer for Backend {
                         }
                     });
                     union.truncate(max_revalidations);
-                    // Mark force-republish only for URIs newly entering the
-                    // set (not in the original work_items) to avoid
-                    // double-incrementing the force counter.
-                    state.diagnostics_gate.mark_force_republish_many(
-                        union.iter().filter(|u| !prev_uris.contains(u)),
-                    );
+                    // Re-enrichment changed work_items; force-republish marking
+                    // is deferred until after both re-enrichment paths complete.
                     work_items = union
                         .into_iter()
                         .map(|u| {
@@ -1951,9 +1941,8 @@ impl LanguageServer for Backend {
                     }
                 });
                 union.truncate(max_revalidations);
-                state.diagnostics_gate.mark_force_republish_many(
-                    union.iter().filter(|u| !prev_uris.contains(u)),
-                );
+                // Re-enrichment changed work_items; force-republish marking
+                // is deferred until after both re-enrichment paths complete.
                 work_items = union
                     .into_iter()
                     .map(|u| {
@@ -2035,6 +2024,17 @@ impl LanguageServer for Backend {
                     log::trace!("did_open prefetch: package library not ready, skipping");
                 }
             }
+        }
+
+        // Mark force-republish on the final work_items set, excluding the
+        // edited URI itself (its publish is driven by its own version bump,
+        // not by a cross-file marker). Marking after re-enrichment ensures
+        // that evicted URIs don't carry orphaned force counters.
+        {
+            let state = self.state.read().await;
+            state.diagnostics_gate.mark_force_republish_many(
+                work_items.iter().map(|(u, _, _)| u).filter(|u| **u != uri)
+            );
         }
 
         // Schedule debounced diagnostics for all affected files via revalidation system

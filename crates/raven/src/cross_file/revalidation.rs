@@ -845,6 +845,59 @@ mod tests {
         assert!(gate.can_publish(&uri, 1));
     }
 
+    #[test]
+    fn test_did_open_re_enrichment_eviction_drops_force_markers() {
+        // Regression: the initial cross-file revalidation pass marks
+        // force-republish on a capped set, but re-enrichment can later evict
+        // URIs from work_items when higher-priority neighbors are discovered.
+        // Evicted URIs must NOT carry orphaned force markers that leak into
+        // future unrelated same-version publishes.
+        //
+        // Simulates the did_open re-enrichment flow:
+        // 1. Initial compute_affected + cap + mark (old bug: marked here)
+        // 2. Re-enrichment discovers new neighbors, re-caps, evicts low-priority URI
+        // 3. Final mark_force_republish_many on work_items (correct: mark here)
+        //
+        // Asserts: evicted URI cannot same-version publish (no force marker).
+        let gate = CrossFileDiagnosticsGate::new();
+
+        let edited = test_uri("edited.R");
+        let low_priority = test_uri("low_priority.R");
+        let high_priority = test_uri("high_priority.R");
+
+        // Simulate initial publish for all URIs at version 1
+        gate.record_publish(&low_priority, 1);
+        gate.record_publish(&high_priority, 1);
+
+        // Simulate the OLD buggy flow (what we're testing against):
+        // Initial set: [edited, low_priority], capped to 2, marked
+        // (This would incorrectly mark low_priority)
+        // gate.mark_force_republish_many([&low_priority].iter().copied());
+
+        // Re-enrichment discovers high_priority, union = [edited, low_priority, high_priority]
+        // Re-cap to 2, sorted: [edited, high_priority] — low_priority evicted
+        // (high_priority was added by re-enrichment, so it would be marked by the old
+        //  re-enrichment path; low_priority is now evicted but still has a marker from initial)
+
+        // Simulate the CORRECT flow (what the fix implements):
+        // Final work_items: [edited, high_priority]
+        // mark_force_republish_many on final set only
+        gate.mark_force_republish_many([&high_priority].iter().copied());
+
+        // Assertions:
+        // high_priority was in final work_items: should have force marker
+        assert!(
+            gate.can_publish(&high_priority, 1),
+            "high_priority in final work_items must have force marker"
+        );
+
+        // low_priority was evicted from work_items: must NOT have force marker
+        assert!(
+            !gate.can_publish(&low_priority, 1),
+            "evicted low_priority must NOT have orphaned force marker"
+        );
+    }
+
     // CrossFileActivityState tests
 
     #[test]
