@@ -664,6 +664,52 @@ fn cap_watched_file_revalidations(
     }
 }
 
+/// Merge post-update neighbors into the existing scheduled `prev_uris` set,
+/// re-sort by activity priority (with `pinned_uri` always first), and
+/// truncate to `max_revalidations`.
+///
+/// Returns `(final_uris, newly_added)`:
+/// - `final_uris`: the deduped, priority-sorted, capped union.
+/// - `newly_added`: URIs in `final_uris` that were NOT already in `prev_uris`.
+///   Callers pass these to `mark_force_republish_many` so URIs already
+///   force-marked by the initial scheduling pass are not double-counted.
+///
+/// Used by both `did_open` re-enrichment paths (on-demand-indexing and
+/// non-on-demand branches). The original implementation appended new
+/// neighbors only when `prev_uris.len() < max_revalidations`. Since the
+/// initial scheduling pass already truncates to the cap, the loop body
+/// never executed when the cap was full, silently dropping newly reachable
+/// neighbors regardless of priority.
+fn merge_and_cap_reenrichment_revalidations(
+    pinned_uri: &Url,
+    prev_uris: &std::collections::HashSet<Url>,
+    new_neighbors: Vec<Url>,
+    max_revalidations: usize,
+    activity: &crate::cross_file::revalidation::CrossFileActivityState,
+) -> (Vec<Url>, Vec<Url>) {
+    let mut union: Vec<Url> = prev_uris.iter().cloned().collect();
+    let mut seen = prev_uris.clone();
+    for dep in new_neighbors {
+        if seen.insert(dep.clone()) {
+            union.push(dep);
+        }
+    }
+    union.sort_by_key(|u| {
+        if u == pinned_uri {
+            0
+        } else {
+            activity.priority_score(u).saturating_add(1)
+        }
+    });
+    union.truncate(max_revalidations);
+    let newly_added: Vec<Url> = union
+        .iter()
+        .filter(|u| !prev_uris.contains(u))
+        .cloned()
+        .collect();
+    (union, newly_added)
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -1782,40 +1828,21 @@ impl LanguageServer for Backend {
                         state.cross_file_config.max_chain_depth,
                         state.cross_file_config.max_transitive_dependents_visited,
                     );
-                    // Merge post-update neighbors into the candidate set,
-                    // re-sort by priority, and re-cap. The initial pass may
-                    // have filled the cap with lower-priority URIs that should
-                    // yield to higher-priority neighbors discovered after
-                    // re-enrichment changed the dependency graph.
                     let max_revalidations =
                         state.cross_file_config.max_revalidations_per_trigger;
                     let prev_uris: std::collections::HashSet<Url> =
                         work_items.iter().map(|(u, _, _)| u.clone()).collect();
-                    let mut union: Vec<Url> = prev_uris.iter().cloned().collect();
-                    {
-                        let mut seen = prev_uris.clone();
-                        for dep in neighbors {
-                            if seen.insert(dep.clone()) {
-                                union.push(dep);
-                            }
-                        }
-                    }
-                    let activity = &state.cross_file_activity;
-                    union.sort_by_key(|u| {
-                        if *u == uri {
-                            0
-                        } else {
-                            activity.priority_score(u).saturating_add(1)
-                        }
-                    });
-                    union.truncate(max_revalidations);
-                    // Mark force-republish only for URIs newly entering the
-                    // set (not in the original work_items) to avoid
-                    // double-incrementing the force counter.
-                    state.diagnostics_gate.mark_force_republish_many(
-                        union.iter().filter(|u| !prev_uris.contains(u)),
+                    let (final_uris, newly_added) = merge_and_cap_reenrichment_revalidations(
+                        &uri,
+                        &prev_uris,
+                        neighbors,
+                        max_revalidations,
+                        &state.cross_file_activity,
                     );
-                    work_items = union
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(newly_added.iter());
+                    work_items = final_uris
                         .into_iter()
                         .map(|u| {
                             let trigger_version =
@@ -1927,34 +1954,20 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                // Merge post-update neighbors into the candidate set,
-                // re-sort by priority, and re-cap (same logic as the
-                // did_open re-enrichment path above).
                 let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
                 let prev_uris: std::collections::HashSet<Url> =
                     work_items.iter().map(|(u, _, _)| u.clone()).collect();
-                let mut union: Vec<Url> = prev_uris.iter().cloned().collect();
-                {
-                    let mut seen = prev_uris.clone();
-                    for dep in neighbors {
-                        if seen.insert(dep.clone()) {
-                            union.push(dep);
-                        }
-                    }
-                }
-                let activity = &state.cross_file_activity;
-                union.sort_by_key(|u| {
-                    if *u == uri {
-                        0
-                    } else {
-                        activity.priority_score(u).saturating_add(1)
-                    }
-                });
-                union.truncate(max_revalidations);
-                state.diagnostics_gate.mark_force_republish_many(
-                    union.iter().filter(|u| !prev_uris.contains(u)),
+                let (final_uris, newly_added) = merge_and_cap_reenrichment_revalidations(
+                    &uri,
+                    &prev_uris,
+                    neighbors,
+                    max_revalidations,
+                    &state.cross_file_activity,
                 );
-                work_items = union
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(newly_added.iter());
+                work_items = final_uris
                     .into_iter()
                     .map(|u| {
                         let trigger_version =
@@ -4794,6 +4807,195 @@ mod tests {
             cap_watched_file_revalidations(&mut affected, &activity, 0);
 
             assert!(affected.is_empty());
+        }
+    }
+
+    /// Tests for `did_open` re-enrichment cap merge-and-resort behavior.
+    ///
+    /// Regression coverage for commit 9f4bc45: when the initial scheduling
+    /// pass already filled `work_items` to `max_revalidations_per_trigger`,
+    /// the prior implementation appended new neighbors only while
+    /// `work_items.len() < max_revalidations`, so it silently dropped every
+    /// post-update neighbor — including higher-priority URIs that should
+    /// have displaced lower-priority initial-pass entries.
+    mod reenrichment_revalidation_cap {
+        use super::super::merge_and_cap_reenrichment_revalidations;
+        use crate::cross_file::revalidation::CrossFileActivityState;
+        use std::collections::HashSet;
+        use tower_lsp::lsp_types::Url;
+
+        fn uri(name: &str) -> Url {
+            Url::parse(&format!("file:///workspace/{name}")).unwrap()
+        }
+
+        #[test]
+        fn higher_priority_post_update_neighbor_displaces_lower_priority_initial_pass_entry() {
+            // Pinned trigger.
+            let edited = uri("edited.R");
+            // Initial pass filled the cap with two low-priority URIs.
+            let stale_a = uri("stale_a.R");
+            let stale_b = uri("stale_b.R");
+            // Re-enrichment surfaces a high-priority URI (the user's active
+            // document) that wasn't reachable before the graph update.
+            let active_post_update = uri("active.R");
+
+            let mut activity = CrossFileActivityState::new();
+            activity.update(Some(active_post_update.clone()), vec![], 1);
+
+            let prev_uris: HashSet<Url> =
+                [stale_a.clone(), stale_b.clone()].into_iter().collect();
+            let new_neighbors = vec![active_post_update.clone()];
+
+            let (final_uris, newly_added) = merge_and_cap_reenrichment_revalidations(
+                &edited,
+                &prev_uris,
+                new_neighbors,
+                2,
+                &activity,
+            );
+
+            // Cap honored: still two URIs.
+            assert_eq!(final_uris.len(), 2);
+            // The high-priority post-update URI MUST be scheduled — this is
+            // the regression: pre-fix, it was silently dropped because the
+            // initial pass had already filled the cap.
+            assert!(
+                final_uris.contains(&active_post_update),
+                "active post-update URI was dropped: {final_uris:?}"
+            );
+            // Sorted by priority: active comes first.
+            assert_eq!(final_uris[0], active_post_update);
+            // newly_added contains exactly the URIs that entered the set —
+            // callers use this to mark force_republish without
+            // double-incrementing the counter for URIs already marked by
+            // the initial scheduling pass.
+            assert_eq!(newly_added, vec![active_post_update]);
+        }
+
+        #[test]
+        fn pinned_uri_sorts_first_even_when_low_activity_priority() {
+            // Pinned trigger: not in activity state at all (priority MAX
+            // via fallback) — but must still sort first because it's the
+            // edited file.
+            let edited = uri("edited.R");
+            let active = uri("active.R");
+
+            let mut activity = CrossFileActivityState::new();
+            activity.update(Some(active.clone()), vec![], 1);
+
+            let prev_uris: HashSet<Url> = [edited.clone(), active.clone()].into_iter().collect();
+
+            let (final_uris, _) = merge_and_cap_reenrichment_revalidations(
+                &edited,
+                &prev_uris,
+                vec![],
+                10,
+                &activity,
+            );
+
+            assert_eq!(final_uris[0], edited);
+            assert_eq!(final_uris[1], active);
+        }
+
+        #[test]
+        fn newly_added_excludes_uris_already_in_prev_uris() {
+            // A URI in both prev_uris AND new_neighbors must not be marked
+            // as newly added, otherwise force_republish gets
+            // double-incremented for that URI.
+            let edited = uri("edited.R");
+            let already_scheduled = uri("dup.R");
+            let fresh = uri("fresh.R");
+
+            let activity = CrossFileActivityState::new();
+            let prev_uris: HashSet<Url> = [already_scheduled.clone()].into_iter().collect();
+            let new_neighbors = vec![already_scheduled.clone(), fresh.clone()];
+
+            let (_, newly_added) = merge_and_cap_reenrichment_revalidations(
+                &edited,
+                &prev_uris,
+                new_neighbors,
+                10,
+                &activity,
+            );
+
+            assert_eq!(newly_added, vec![fresh]);
+        }
+
+        #[test]
+        fn deduplicates_new_neighbors_against_prev_uris_and_each_other() {
+            let edited = uri("edited.R");
+            let a = uri("a.R");
+            let b = uri("b.R");
+
+            let activity = CrossFileActivityState::new();
+            let prev_uris: HashSet<Url> = [a.clone()].into_iter().collect();
+            // Duplicates within new_neighbors AND against prev_uris.
+            let new_neighbors = vec![a.clone(), b.clone(), b.clone(), a.clone()];
+
+            let (final_uris, newly_added) = merge_and_cap_reenrichment_revalidations(
+                &edited,
+                &prev_uris,
+                new_neighbors,
+                10,
+                &activity,
+            );
+
+            assert_eq!(final_uris.len(), 2);
+            assert!(final_uris.contains(&a));
+            assert!(final_uris.contains(&b));
+            assert_eq!(newly_added, vec![b]);
+        }
+
+        #[test]
+        fn cap_truncates_lowest_priority_first() {
+            let edited = uri("edited.R");
+            let active = uri("active.R");
+            let visible = uri("visible.R");
+            let other = uri("other.R");
+
+            let mut activity = CrossFileActivityState::new();
+            activity.update(Some(active.clone()), vec![visible.clone()], 1);
+
+            let prev_uris: HashSet<Url> = [other.clone()].into_iter().collect();
+            let new_neighbors = vec![active.clone(), visible.clone()];
+
+            let (final_uris, newly_added) = merge_and_cap_reenrichment_revalidations(
+                &edited,
+                &prev_uris,
+                new_neighbors,
+                2,
+                &activity,
+            );
+
+            // Cap = 2: active and visible win, `other` is truncated.
+            assert_eq!(final_uris.len(), 2);
+            assert_eq!(final_uris[0], active);
+            assert_eq!(final_uris[1], visible);
+            assert!(!final_uris.contains(&other));
+            // newly_added reflects what survived AFTER the cap, not the raw
+            // intersection with prev_uris before truncation.
+            assert!(newly_added.contains(&active));
+            assert!(newly_added.contains(&visible));
+            assert!(!newly_added.contains(&other));
+        }
+
+        #[test]
+        fn zero_cap_schedules_nothing() {
+            let edited = uri("edited.R");
+            let activity = CrossFileActivityState::new();
+            let prev_uris: HashSet<Url> = [uri("a.R")].into_iter().collect();
+            let new_neighbors = vec![uri("b.R")];
+
+            let (final_uris, newly_added) = merge_and_cap_reenrichment_revalidations(
+                &edited,
+                &prev_uris,
+                new_neighbors,
+                0,
+                &activity,
+            );
+
+            assert!(final_uris.is_empty());
+            assert!(newly_added.is_empty());
         }
     }
 
