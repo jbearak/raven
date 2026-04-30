@@ -34346,6 +34346,95 @@ y <- x"#;
             "Should create backward directive edge with call_site_line = u32::MAX for line=eof"
         );
     }
+
+    /// File A: `x <- 1`. File B: `source('a.R')\ny <- x`. Editing A to remove
+    /// the definition must cause B's next diagnostic pass to surface
+    /// "Undefined variable: x" — confirms diagnostic logic, not LSP plumbing.
+    #[test]
+    fn test_undefined_variable_appears_in_dependent_after_parent_edit() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let a_path = workspace_path.join("a.R");
+        let b_path = workspace_path.join("b.R");
+
+        let a_initial = "x <- 1";
+        let b_code = "source('a.R')\ny <- x";
+
+        std::fs::write(&a_path, a_initial).unwrap();
+        std::fs::write(&b_path, b_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let a_url = Url::from_file_path(&a_path).unwrap();
+        let b_url = Url::from_file_path(&b_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        // Auto + sourced_by-empty + scan-not-complete defers undefined-variable
+        // diagnostics entirely. Mark scan complete so the collector runs.
+        state.workspace_scan_complete = true;
+
+        state
+            .documents
+            .insert(a_url.clone(), Document::new(a_initial, None));
+        state
+            .documents
+            .insert(b_url.clone(), Document::new(b_code, None));
+
+        let meta_a = crate::cross_file::extract_metadata(a_initial);
+        let meta_b = crate::cross_file::extract_metadata(b_code);
+        state.cross_file_graph.update_file(
+            &a_url,
+            &meta_a,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &b_url,
+            &meta_b,
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        // Pre-condition: B should NOT report `x` as undefined — A defines it.
+        let pre_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
+        let pre_undefined_x: Vec<_> = pre_diags
+            .iter()
+            .filter(|d| d.message == "Undefined variable: x")
+            .collect();
+        assert!(
+            pre_undefined_x.is_empty(),
+            "Pre-edit: B should NOT report `x` as undefined; got: {:?}",
+            pre_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // SIMULATE THE EDIT: A's content changes to remove `x <- 1`.
+        let a_after = "";
+        state
+            .documents
+            .insert(a_url.clone(), Document::new(a_after, None));
+        let meta_a_after = crate::cross_file::extract_metadata(a_after);
+        state.cross_file_graph.update_file(
+            &a_url,
+            &meta_a_after,
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        // Post-condition: B SHOULD now report "Undefined variable: x".
+        let post_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
+        let post_undefined_x: Vec<_> = post_diags
+            .iter()
+            .filter(|d| d.message == "Undefined variable: x")
+            .collect();
+        assert_eq!(
+            post_undefined_x.len(),
+            1,
+            "Post-edit: B should report `x` as undefined; got: {:?}",
+            post_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }
 
 #[cfg(test)]

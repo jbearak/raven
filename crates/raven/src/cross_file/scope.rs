@@ -1126,10 +1126,21 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         })
         .collect();
 
-    // Compute interface hash including symbols, loaded packages, and declared symbols
-    // Note: compute_artifacts (without metadata) has no declared symbols
-    artifacts.interface_hash =
-        compute_interface_hash(&artifacts.exported_interface, &loaded_packages, &[]);
+    // Compute interface hash including symbols, loaded packages, declared
+    // symbols, and top-level rm() events (which affect cross-file scope at
+    // source() call sites). compute_artifacts (without metadata) has no
+    // declared symbols.
+    let top_level_removals = extract_top_level_removals(&artifacts.timeline);
+    let removal_refs: Vec<TopLevelRemoval> = top_level_removals
+        .iter()
+        .map(|(name, line)| (name.as_str(), *line))
+        .collect();
+    artifacts.interface_hash = compute_interface_hash(
+        &artifacts.exported_interface,
+        &loaded_packages,
+        &[],
+        &removal_refs,
+    );
 
     artifacts
 }
@@ -1368,11 +1379,19 @@ pub fn compute_artifacts_with_metadata(
         })
         .unwrap_or_default();
 
-    // Compute interface hash including symbols, loaded packages, and declared symbols
+    // Compute interface hash including symbols, loaded packages, declared
+    // symbols, and top-level rm() events (which affect cross-file scope at
+    // source() call sites).
+    let top_level_removals = extract_top_level_removals(&artifacts.timeline);
+    let removal_refs: Vec<TopLevelRemoval> = top_level_removals
+        .iter()
+        .map(|(name, line)| (name.as_str(), *line))
+        .collect();
     artifacts.interface_hash = compute_interface_hash(
         &artifacts.exported_interface,
         &loaded_packages,
         &declared_symbols,
+        &removal_refs,
     );
 
     artifacts
@@ -2656,19 +2675,62 @@ fn is_function_definition_after_parens(node: Node) -> bool {
     unwrap_function_definition(node).is_some()
 }
 
+/// Top-level removal entry for inclusion in `compute_interface_hash`.
+///
+/// Each tuple is `(symbol_name, line)` where `line` is the 0-based line of
+/// the rm() call. Position is included because moving an rm() across a
+/// `source()` call changes which sourced files see the symbol — exactly
+/// the same reason `DeclaredSymbol::line` is hashed.
+type TopLevelRemoval<'a> = (&'a str, u32);
+
+/// Extract top-level rm()/remove() events from a finalized timeline.
+///
+/// Only events with `function_scope = None` are returned — rm() inside a
+/// function body is delayed-evaluation and has no cross-file effect.
+/// Callers must invoke this AFTER `annotate_event_function_scopes` so the
+/// `function_scope` field is populated.
+fn extract_top_level_removals(timeline: &[ScopeEvent]) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for event in timeline {
+        if let ScopeEvent::Removal {
+            line,
+            symbols,
+            function_scope: None,
+            ..
+        } = event
+        {
+            for sym in symbols {
+                out.push((sym.clone(), *line));
+            }
+        }
+    }
+    out
+}
+
 /// Compute a deterministic hash of the exported interface and loaded packages.
 ///
 /// Symbols are incorporated deterministically by sorting the interface keys before hashing each
 /// ScopedSymbol; package names are included sorted as well. The resulting hash is suitable for
 /// cache invalidation when a file's exported symbols or loaded packages change.
 ///
+/// `top_level_removals` is the set of (symbol_name, line) pairs extracted
+/// from top-level `rm()`/`remove()` calls. They are hashed sorted so the
+/// digest is stable across timeline event ordering. Including them is
+/// required so cross-file revalidation fires when a user inserts an
+/// `rm()` between a definition and a `source()` call: without it, the
+/// symbol is still in `exported_interface` (which captures all
+/// definitions) and the hash would not change, leaving stale
+/// undefined-variable diagnostics in the sourced file.
+///
 /// # Returns
 ///
-/// `u64` hash of the provided `interface`, `packages`, and `declared_symbols`.
+/// `u64` hash of the provided `interface`, `packages`, `declared_symbols`,
+/// and `top_level_removals`.
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
+    top_level_removals: &[TopLevelRemoval<'_>],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -2699,6 +2761,17 @@ fn compute_interface_hash(
         decl.name.hash(&mut hasher);
         decl.is_function.hash(&mut hasher);
         decl.line.hash(&mut hasher);
+    }
+
+    // Include top-level rm()/remove() events (sorted for determinism).
+    // Sort by (line, name) so rm calls hash in deterministic order; both
+    // line and name are part of the key because moving an rm across a
+    // source() call changes which children inherit the symbol.
+    let mut sorted_removals: Vec<&TopLevelRemoval> = top_level_removals.iter().collect();
+    sorted_removals.sort_by_key(|(name, line)| (*line, *name));
+    for (name, line) in sorted_removals {
+        name.hash(&mut hasher);
+        line.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -5054,6 +5127,81 @@ mod tests {
         let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
 
         assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_top_level_rm_added() {
+        // Adding a top-level `rm(y)` must change interface_hash because it
+        // alters which symbols are visible at downstream `source()` call
+        // sites. Without this, cross-file revalidation never fires when
+        // the user inserts an `rm()` between a definition and a `source()`,
+        // leaving stale undefined-variable diagnostics in the child file.
+        let code1 = "y <- 1\nsource(\"child.R\")";
+        let code2 = "y <- 1\nrm(y)\nsource(\"child.R\")";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "interface_hash must change when a top-level rm() is inserted"
+        );
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_top_level_rm_target_changes() {
+        // Changing which symbol an rm() targets must change the hash, even
+        // though the rm() count and position is unchanged.
+        let code1 = "x <- 1\ny <- 2\nrm(x)";
+        let code2 = "x <- 1\ny <- 2\nrm(y)";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_top_level_rm_moves() {
+        // Moving an rm() across a `source()` call changes which symbols
+        // the sourced file inherits — the hash must reflect the line.
+        let code1 = "y <- 1\nrm(y)\nsource(\"child.R\")";
+        let code2 = "y <- 1\nsource(\"child.R\")\nrm(y)";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "interface_hash must reflect rm() line because it determines which sourced files see the symbol"
+        );
+    }
+
+    #[test]
+    fn test_interface_hash_unchanged_when_rm_inside_function_body() {
+        // rm() inside a function body has no cross-file effect — the body
+        // is delayed-evaluation and doesn't run at top level. Such rm()
+        // calls must not perturb interface_hash, otherwise local edits to
+        // function bodies would needlessly republish dependents.
+        let code1 = "f <- function() { 1 }\ny <- 2";
+        let code2 = "f <- function() { rm(z); 1 }\ny <- 2";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        // Note: function body contents typically don't show up in
+        // interface_hash because exported_interface only lists top-level
+        // symbols. The function `f` itself is unchanged either way. So we
+        // assert the hash is stable to lock in that an in-body rm() never
+        // contributes.
+        assert_eq!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "rm() inside a function body must not change interface_hash"
+        );
     }
 
     #[test]

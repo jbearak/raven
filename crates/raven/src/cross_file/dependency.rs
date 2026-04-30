@@ -1285,6 +1285,61 @@ impl DependencyGraph {
         }
     }
 
+    /// Get all transitive dependencies — files that `uri` sources directly or
+    /// transitively (children, grandchildren, etc.).
+    ///
+    /// Mirror of [`Self::get_transitive_dependents`] but in the *forward*
+    /// direction. Used by the cross-file plumbing in `did_change` so that an
+    /// edit to a parent file revalidates the entire forward subtree: child
+    /// scope inherits from the parent at the `source()` call site, so a
+    /// content change in the parent can change every descendant's diagnostics.
+    pub fn get_transitive_dependencies(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> Vec<Url> {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        self.collect_dependencies(uri, max_depth, 0, &mut visited, &mut result, max_visited);
+        result
+    }
+
+    fn collect_dependencies(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        current_depth: usize,
+        visited: &mut HashSet<Url>,
+        result: &mut Vec<Url>,
+        max_visited: usize,
+    ) {
+        if current_depth > max_depth || visited.len() >= max_visited || !visited.insert(uri.clone())
+        {
+            return;
+        }
+        if current_depth > 0 {
+            result.push(uri.clone());
+        }
+        if current_depth == max_depth {
+            return;
+        }
+
+        for edge in self.get_dependencies(uri) {
+            if visited.len() >= max_visited {
+                break;
+            }
+            self.collect_dependencies(
+                &edge.to,
+                max_depth,
+                current_depth + 1,
+                visited,
+                result,
+                max_visited,
+            );
+        }
+    }
+
     fn add_edge(&mut self, edge: DependencyEdge) {
         log::trace!(
             "Adding edge: {} -> {} at line {:?}, column {:?} (directive: {}, local: {}, chdir: {})",
@@ -1799,6 +1854,70 @@ mod tests {
         assert_eq!(dependents.len(), 2);
         assert!(dependents.contains(&b));
         assert!(dependents.contains(&a));
+    }
+
+    #[test]
+    fn test_transitive_dependencies() {
+        // Forward-direction transitive walk: when `a` sources `b` and `b`
+        // sources `c`, the *dependencies* of `a` include `b` and `c`.
+        // Children inherit symbols from their parent's scope at the
+        // `source()` call site, so a content edit in `a` requires
+        // revalidating both `b` and `c` (use case for the cross-file
+        // diagnostic plumbing fix in `did_change`).
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let c = url("c.R");
+
+        // a sources b, b sources c
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+
+        let meta_b = make_meta_with_source("c.R", 1);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        let dependencies = graph.get_transitive_dependencies(&a, 10, 200);
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.contains(&b));
+        assert!(dependencies.contains(&c));
+
+        // Symmetric check: c, the leaf, has no dependencies.
+        let leaf = graph.get_transitive_dependencies(&c, 10, 200);
+        assert!(leaf.is_empty());
+    }
+
+    #[test]
+    fn test_transitive_dependencies_respects_max_depth() {
+        // Walk depth must be bounded. With max_depth = 1, only direct
+        // children are returned, not grandchildren.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        let meta_b = make_meta_with_source("c.R", 1);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        let depth1 = graph.get_transitive_dependencies(&a, 1, 200);
+        assert_eq!(depth1, vec![b.clone()]);
+    }
+
+    #[test]
+    fn test_transitive_dependencies_handles_cycles() {
+        // Cycles must terminate without infinite recursion. a → b → a.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        let meta_b = make_meta_with_source("a.R", 1);
+        graph.update_file(&b, &meta_b, Some(&workspace_root()), |_| None);
+
+        let deps = graph.get_transitive_dependencies(&a, 10, 200);
+        // a's children: b. b's children: a (cycle, skipped). So only b.
+        assert_eq!(deps, vec![b]);
     }
 
     #[test]

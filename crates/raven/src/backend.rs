@@ -1488,23 +1488,25 @@ impl LanguageServer for Backend {
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
 
-            // Invalidate dependents if interface changed OR dependency edges changed.
-            // Interface changes affect symbol resolution in dependent files.
-            // Edge changes affect cycle detection diagnostics in dependent files.
-            // Filter open dependents/children once, then bulk-mark them under a
-            // single write-lock acquisition.
+            // Invalidate cross-file scope neighbors if interface changed OR
+            // dependency edges changed. See `compute_affected_dependents_after_edit`
+            // for the symmetric backward+forward walk — children of `uri` also
+            // need revalidation because their inherited scope is taken from
+            // `uri`'s symbols at the source() call site.
             let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || result.edges_changed {
-                let dependents = state.cross_file_graph.get_transitive_dependents(
+                let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &uri,
+                    interface_changed,
+                    result.edges_changed,
+                    &state.cross_file_graph,
+                    |u| state.documents.contains_key(u),
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                for dep in dependents {
-                    if state.documents.contains_key(&dep) {
-                        to_force_republish.push(dep.clone());
-                        affected.insert(dep);
-                    }
+                for dep in neighbors {
+                    to_force_republish.push(dep.clone());
+                    affected.insert(dep);
                 }
             }
             // Include children affected by WD change (Requirement 8)
@@ -1745,23 +1747,26 @@ impl LanguageServer for Backend {
                 );
 
                 // If re-enrichment changed dependency edges (e.g., inherited WD
-                // altered path resolution), schedule newly affected dependents.
+                // altered path resolution), schedule newly affected open
+                // neighbors — both backward dependents and forward children
+                // (their inherited scope is taken from this file's symbols at
+                // the source() call site).
                 if second_result.edges_changed {
-                    let max_chain_depth = state.cross_file_config.max_chain_depth;
-                    let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-                    let dependents = state.cross_file_graph.get_transitive_dependents(
+                    let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                         &uri,
-                        max_chain_depth,
-                        max_visited,
+                        false,
+                        true,
+                        &state.cross_file_graph,
+                        |u| state.documents.contains_key(u),
+                        state.cross_file_config.max_chain_depth,
+                        state.cross_file_config.max_transitive_dependents_visited,
                     );
                     let mut to_force_republish: Vec<Url> = Vec::new();
-                    for dep in dependents {
-                        if state.documents.contains_key(&dep) {
-                            to_force_republish.push(dep.clone());
-                            let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
-                            let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
-                            work_items.push((dep, trigger_version, trigger_revision));
-                        }
+                    for dep in neighbors {
+                        to_force_republish.push(dep.clone());
+                        let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
+                        let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
+                        work_items.push((dep, trigger_version, trigger_revision));
                     }
                     state
                         .diagnostics_gate
@@ -1859,21 +1864,21 @@ impl LanguageServer for Backend {
             );
 
             if second_result.edges_changed {
-                let max_chain_depth = state.cross_file_config.max_chain_depth;
-                let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-                let dependents = state.cross_file_graph.get_transitive_dependents(
+                let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &uri,
-                    max_chain_depth,
-                    max_visited,
+                    false,
+                    true,
+                    &state.cross_file_graph,
+                    |u| state.documents.contains_key(u),
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
                 );
                 let mut to_force_republish: Vec<Url> = Vec::new();
-                for dep in dependents {
-                    if state.documents.contains_key(&dep) {
-                        to_force_republish.push(dep.clone());
-                        let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
-                        let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
-                        work_items.push((dep, trigger_version, trigger_revision));
-                    }
+                for dep in neighbors {
+                    to_force_republish.push(dep.clone());
+                    let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
+                    let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
+                    work_items.push((dep, trigger_version, trigger_revision));
                 }
                 state
                     .diagnostics_gate
@@ -2175,24 +2180,34 @@ impl LanguageServer for Backend {
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
 
-            // Invalidate dependents if interface changed OR dependency edges changed.
-            // Interface changes affect symbol resolution in dependent files.
-            // Edge changes affect cycle detection diagnostics in dependent files
-            // (e.g., commenting out a source() call breaks a cycle).
+            // Invalidate cross-file scope neighbors if interface changed OR
+            // dependency edges changed. Walks both directions:
+            //   - backward (parents who source `uri`): they consume `uri`'s
+            //     exported interface, so their cycle/symbol diagnostics may
+            //     change.
+            //   - forward (files `uri` sources): their inherited scope is
+            //     taken from `uri` at the source() call site, so changing
+            //     `uri`'s top-level symbols or source() topology can flip
+            //     undefined-variable diagnostics in descendants. Without
+            //     this, an edit to `parent.R` that drops `y <- 1` never
+            //     triggers a republish of `child.R` (which uses `y`) until
+            //     the user manually edits `child.R`.
             // Bulk-mark all dependents/children under a single write-lock to
             // skip per-URI lock churn on large fan-outs (Requirement 0.8).
             let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || edges_changed {
-                let dependents = state.cross_file_graph.get_transitive_dependents(
+                let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &uri,
+                    interface_changed,
+                    edges_changed,
+                    &state.cross_file_graph,
+                    |u| state.documents.contains_key(u),
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                for dep in dependents {
-                    if state.documents.contains_key(&dep) {
-                        to_force_republish.push(dep.clone());
-                        affected.insert(dep);
-                    }
+                for dep in neighbors {
+                    to_force_republish.push(dep.clone());
+                    affected.insert(dep);
                 }
             }
             // Include children affected by WD change (Requirement 8)
@@ -2776,14 +2791,22 @@ impl LanguageServer for Backend {
                         // Schedule for async update (legacy)
                         to_update.push(uri.clone());
 
-                        // Find open documents that depend on this file
-                        let dependents = state.cross_file_graph.get_transitive_dependents(
-                            uri,
-                            state.cross_file_config.max_chain_depth,
-                            state.cross_file_config.max_transitive_dependents_visited,
-                        );
-                        for dep in dependents {
-                            if state.documents.contains_key(&dep) && affected_set.insert(dep.clone()) {
+                        // Find open neighbors (both backward dependents and
+                        // forward children) of this file. Forward children
+                        // need revalidation because their inherited scope is
+                        // taken from this file's symbols at the source() call.
+                        let neighbors =
+                            crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                                uri,
+                                true,
+                                false,
+                                &state.cross_file_graph,
+                                |u| state.documents.contains_key(u),
+                                state.cross_file_config.max_chain_depth,
+                                state.cross_file_config.max_transitive_dependents_visited,
+                            );
+                        for dep in neighbors {
+                            if affected_set.insert(dep.clone()) {
                                 newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
@@ -2791,14 +2814,22 @@ impl LanguageServer for Backend {
                         log::trace!("Invalidated caches for changed file: {}", uri);
                     }
                     FileChangeType::DELETED => {
-                        // Find dependents before removing from graph
-                        let dependents = state.cross_file_graph.get_transitive_dependents(
-                            uri,
-                            state.cross_file_config.max_chain_depth,
-                            state.cross_file_config.max_transitive_dependents_visited,
-                        );
-                        for dep in dependents {
-                            if state.documents.contains_key(&dep) && affected_set.insert(dep.clone()) {
+                        // Find affected open neighbors before removing from graph.
+                        // Walks both backward (parents that source the deleted
+                        // file lose its symbols) and forward (children that
+                        // were sourced by it lose their inherited parent scope).
+                        let neighbors =
+                            crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                                uri,
+                                true,
+                                false,
+                                &state.cross_file_graph,
+                                |u| state.documents.contains_key(u),
+                                state.cross_file_config.max_chain_depth,
+                                state.cross_file_config.max_transitive_dependents_visited,
+                            );
+                        for dep in neighbors {
+                            if affected_set.insert(dep.clone()) {
                                 newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
@@ -2836,7 +2867,11 @@ impl LanguageServer for Backend {
         if !uris_to_update.is_empty() {
             let state_arc = self.state.clone();
             let client = self.client.clone();
-            let affected_for_async = affected_open_docs.clone();
+            let mut affected_for_async = affected_open_docs.clone();
+            // Track URIs already in `affected_for_async` so the post-update
+            // recomputation can union new neighbors without rescans.
+            let mut affected_for_async_set: std::collections::HashSet<Url> =
+                affected_for_async.iter().cloned().collect();
             tokio::spawn(async move {
                 // Collect children affected by WD changes for diagnostics.
                 // The set tracks dedupe in O(1) so a watched-files burst
@@ -2980,6 +3015,36 @@ impl LanguageServer for Backend {
                         state
                             .diagnostics_gate
                             .mark_force_republish_many(newly_affected.iter());
+
+                        // Recompute neighbors against the POST-update graph.
+                        // The sync pass at watched-files entry computed
+                        // affected URIs from the *pre-update* graph, so any
+                        // forward/backward edge that this file introduces in
+                        // its new content (e.g. a freshly-added `source()`
+                        // call) is invisible to that pass. Re-running the
+                        // walk here picks up newly-reachable open neighbors.
+                        let mut newly_affected_post_update: Vec<Url> = Vec::new();
+                        if graph_result.edges_changed {
+                            let post_neighbors =
+                                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                                    &uri,
+                                    true,
+                                    true,
+                                    &state.cross_file_graph,
+                                    |u| state.documents.contains_key(u),
+                                    state.cross_file_config.max_chain_depth,
+                                    state.cross_file_config.max_transitive_dependents_visited,
+                                );
+                            for dep in post_neighbors {
+                                if affected_for_async_set.insert(dep.clone()) {
+                                    newly_affected_post_update.push(dep);
+                                }
+                            }
+                            state
+                                .diagnostics_gate
+                                .mark_force_republish_many(newly_affected_post_update.iter());
+                        }
+                        affected_for_async.extend(newly_affected_post_update);
                         graph_result.edges_changed
                     };
 
