@@ -1782,32 +1782,49 @@ impl LanguageServer for Backend {
                         state.cross_file_config.max_chain_depth,
                         state.cross_file_config.max_transitive_dependents_visited,
                     );
-                    // Dedupe against URIs already scheduled by the initial
-                    // pass and respect the same `max_revalidations_per_trigger`
-                    // cap so a re-enriched edge expansion can't double-mark a
-                    // URI (phantom force-republish counter increments) or
-                    // blow past the cap the initial scheduling honored.
+                    // Merge post-update neighbors into the candidate set,
+                    // re-sort by priority, and re-cap. The initial pass may
+                    // have filled the cap with lower-priority URIs that should
+                    // yield to higher-priority neighbors discovered after
+                    // re-enrichment changed the dependency graph.
                     let max_revalidations =
                         state.cross_file_config.max_revalidations_per_trigger;
-                    let mut already_scheduled: std::collections::HashSet<Url> =
+                    let prev_uris: std::collections::HashSet<Url> =
                         work_items.iter().map(|(u, _, _)| u.clone()).collect();
-                    let mut new_neighbors: Vec<Url> = Vec::new();
-                    for dep in neighbors {
-                        if work_items.len() + new_neighbors.len() >= max_revalidations {
-                            break;
-                        }
-                        if already_scheduled.insert(dep.clone()) {
-                            new_neighbors.push(dep);
+                    let mut union: Vec<Url> = prev_uris.iter().cloned().collect();
+                    {
+                        let mut seen = prev_uris.clone();
+                        for dep in neighbors {
+                            if seen.insert(dep.clone()) {
+                                union.push(dep);
+                            }
                         }
                     }
-                    state
-                        .diagnostics_gate
-                        .mark_force_republish_many(new_neighbors.iter());
-                    for dep in new_neighbors {
-                        let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
-                        let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
-                        work_items.push((dep, trigger_version, trigger_revision));
-                    }
+                    let activity = &state.cross_file_activity;
+                    union.sort_by_key(|u| {
+                        if *u == uri {
+                            0
+                        } else {
+                            activity.priority_score(u).saturating_add(1)
+                        }
+                    });
+                    union.truncate(max_revalidations);
+                    // Mark force-republish only for URIs newly entering the
+                    // set (not in the original work_items) to avoid
+                    // double-incrementing the force counter.
+                    state.diagnostics_gate.mark_force_republish_many(
+                        union.iter().filter(|u| !prev_uris.contains(u)),
+                    );
+                    work_items = union
+                        .into_iter()
+                        .map(|u| {
+                            let trigger_version =
+                                state.documents.get(&u).and_then(|d| d.version);
+                            let trigger_revision =
+                                state.documents.get(&u).map(|d| d.revision);
+                            (u, trigger_version, trigger_revision)
+                        })
+                        .collect();
                     // Re-enrichment moved edges; refresh pins so the open-doc
                     // neighborhood matches the post-update graph.
                     state.recompute_open_neighborhood_pins();
@@ -1910,31 +1927,43 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                // Dedupe against URIs already scheduled by the initial pass
-                // and respect the same `max_revalidations_per_trigger` cap.
-                // Without this, a re-enriched edge expansion can double-mark
-                // a URI (phantom force-republish counter increments) or blow
-                // past the cap the initial scheduling honored.
+                // Merge post-update neighbors into the candidate set,
+                // re-sort by priority, and re-cap (same logic as the
+                // did_open re-enrichment path above).
                 let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
-                let mut already_scheduled: std::collections::HashSet<Url> =
+                let prev_uris: std::collections::HashSet<Url> =
                     work_items.iter().map(|(u, _, _)| u.clone()).collect();
-                let mut new_neighbors: Vec<Url> = Vec::new();
-                for dep in neighbors {
-                    if work_items.len() + new_neighbors.len() >= max_revalidations {
-                        break;
-                    }
-                    if already_scheduled.insert(dep.clone()) {
-                        new_neighbors.push(dep);
+                let mut union: Vec<Url> = prev_uris.iter().cloned().collect();
+                {
+                    let mut seen = prev_uris.clone();
+                    for dep in neighbors {
+                        if seen.insert(dep.clone()) {
+                            union.push(dep);
+                        }
                     }
                 }
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(new_neighbors.iter());
-                for dep in new_neighbors {
-                    let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
-                    let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
-                    work_items.push((dep, trigger_version, trigger_revision));
-                }
+                let activity = &state.cross_file_activity;
+                union.sort_by_key(|u| {
+                    if *u == uri {
+                        0
+                    } else {
+                        activity.priority_score(u).saturating_add(1)
+                    }
+                });
+                union.truncate(max_revalidations);
+                state.diagnostics_gate.mark_force_republish_many(
+                    union.iter().filter(|u| !prev_uris.contains(u)),
+                );
+                work_items = union
+                    .into_iter()
+                    .map(|u| {
+                        let trigger_version =
+                            state.documents.get(&u).and_then(|d| d.version);
+                        let trigger_revision =
+                            state.documents.get(&u).map(|d| d.revision);
+                        (u, trigger_version, trigger_revision)
+                    })
+                    .collect();
                 // Re-enrichment moved edges; refresh pins so the open-doc
                 // neighborhood matches the post-update graph.
                 state.recompute_open_neighborhood_pins();
