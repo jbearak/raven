@@ -700,6 +700,44 @@ fn merge_and_cap_reenrichment_revalidations(
     union
 }
 
+/// Rebuild `work_items` for the `did_open` re-enrichment paths after the
+/// dependency graph has changed: derive `prev_uris` from the current
+/// `work_items`, merge in the new neighbors via
+/// [`merge_and_cap_reenrichment_revalidations`], and snapshot each surviving
+/// URI's current `(version, revision)` from `state.documents` for the
+/// freshness guard in `run_debounced_diagnostics`.
+///
+/// Both `did_open` re-enrichment branches (on-demand-indexing and
+/// non-on-demand) share this exact shape. Force-republish marking is NOT
+/// done here — it is deferred to a single end-of-flow site so URIs evicted
+/// by the cap don't carry orphaned force counters.
+fn rebuild_work_items_after_reenrichment(
+    pinned_uri: &Url,
+    prev_work_items: &[(Url, Option<i32>, Option<u64>)],
+    new_neighbors: Vec<Url>,
+    state: &WorldState,
+) -> Vec<(Url, Option<i32>, Option<u64>)> {
+    let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
+    let prev_uris: std::collections::HashSet<Url> =
+        prev_work_items.iter().map(|(u, _, _)| u.clone()).collect();
+    let final_uris = merge_and_cap_reenrichment_revalidations(
+        pinned_uri,
+        &prev_uris,
+        new_neighbors,
+        max_revalidations,
+        &state.cross_file_activity,
+    );
+    final_uris
+        .into_iter()
+        .map(|u| {
+            let doc = state.documents.get(&u);
+            let trigger_version = doc.and_then(|d| d.version);
+            let trigger_revision = doc.map(|d| d.revision);
+            (u, trigger_version, trigger_revision)
+        })
+        .collect()
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -1815,29 +1853,15 @@ impl LanguageServer for Backend {
                         state.cross_file_config.max_chain_depth,
                         state.cross_file_config.max_transitive_dependents_visited,
                     );
-                    let max_revalidations =
-                        state.cross_file_config.max_revalidations_per_trigger;
-                    let prev_uris: std::collections::HashSet<Url> =
-                        work_items.iter().map(|(u, _, _)| u.clone()).collect();
-                    let final_uris = merge_and_cap_reenrichment_revalidations(
-                        &uri,
-                        &prev_uris,
-                        neighbors,
-                        max_revalidations,
-                        &state.cross_file_activity,
-                    );
                     // Re-enrichment changed work_items; force-republish marking
                     // is deferred until after both re-enrichment paths complete
                     // so evicted URIs don't carry orphaned force counters.
-                    work_items = final_uris
-                        .into_iter()
-                        .map(|u| {
-                            let doc = state.documents.get(&u);
-                            let trigger_version = doc.and_then(|d| d.version);
-                            let trigger_revision = doc.map(|d| d.revision);
-                            (u, trigger_version, trigger_revision)
-                        })
-                        .collect();
+                    work_items = rebuild_work_items_after_reenrichment(
+                        &uri,
+                        &work_items,
+                        neighbors,
+                        &state,
+                    );
                     // Re-enrichment moved edges; refresh pins so the open-doc
                     // neighborhood matches the post-update graph.
                     state.recompute_open_neighborhood_pins();
@@ -1940,28 +1964,15 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
-                let prev_uris: std::collections::HashSet<Url> =
-                    work_items.iter().map(|(u, _, _)| u.clone()).collect();
-                let final_uris = merge_and_cap_reenrichment_revalidations(
-                    &uri,
-                    &prev_uris,
-                    neighbors,
-                    max_revalidations,
-                    &state.cross_file_activity,
-                );
                 // Re-enrichment changed work_items; force-republish marking
                 // is deferred until after both re-enrichment paths complete
                 // so evicted URIs don't carry orphaned force counters.
-                work_items = final_uris
-                    .into_iter()
-                    .map(|u| {
-                        let doc = state.documents.get(&u);
-                        let trigger_version = doc.and_then(|d| d.version);
-                        let trigger_revision = doc.map(|d| d.revision);
-                        (u, trigger_version, trigger_revision)
-                    })
-                    .collect();
+                work_items = rebuild_work_items_after_reenrichment(
+                    &uri,
+                    &work_items,
+                    neighbors,
+                    &state,
+                );
                 // Re-enrichment moved edges; refresh pins so the open-doc
                 // neighborhood matches the post-update graph.
                 state.recompute_open_neighborhood_pins();
