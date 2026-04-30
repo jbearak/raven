@@ -1126,10 +1126,21 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         })
         .collect();
 
-    // Compute interface hash including symbols, loaded packages, and declared symbols
-    // Note: compute_artifacts (without metadata) has no declared symbols
-    artifacts.interface_hash =
-        compute_interface_hash(&artifacts.exported_interface, &loaded_packages, &[]);
+    // Compute interface hash including symbols, loaded packages, declared
+    // symbols, and top-level rm() events (which affect cross-file scope at
+    // source() call sites). compute_artifacts (without metadata) has no
+    // declared symbols.
+    let top_level_removals = extract_top_level_removals(&artifacts.timeline);
+    let removal_refs: Vec<TopLevelRemoval> = top_level_removals
+        .iter()
+        .map(|(name, line)| (name.as_str(), *line))
+        .collect();
+    artifacts.interface_hash = compute_interface_hash(
+        &artifacts.exported_interface,
+        &loaded_packages,
+        &[],
+        &removal_refs,
+    );
 
     artifacts
 }
@@ -1368,11 +1379,19 @@ pub fn compute_artifacts_with_metadata(
         })
         .unwrap_or_default();
 
-    // Compute interface hash including symbols, loaded packages, and declared symbols
+    // Compute interface hash including symbols, loaded packages, declared
+    // symbols, and top-level rm() events (which affect cross-file scope at
+    // source() call sites).
+    let top_level_removals = extract_top_level_removals(&artifacts.timeline);
+    let removal_refs: Vec<TopLevelRemoval> = top_level_removals
+        .iter()
+        .map(|(name, line)| (name.as_str(), *line))
+        .collect();
     artifacts.interface_hash = compute_interface_hash(
         &artifacts.exported_interface,
         &loaded_packages,
         &declared_symbols,
+        &removal_refs,
     );
 
     artifacts
@@ -2656,19 +2675,111 @@ fn is_function_definition_after_parens(node: Node) -> bool {
     unwrap_function_definition(node).is_some()
 }
 
+/// Top-level removal entry for inclusion in `compute_interface_hash`.
+///
+/// Each tuple is `(symbol_name, line)` where `line` is the 0-based line of
+/// the rm() call. Position is included because moving an rm() across a
+/// `source()` call changes which sourced files see the symbol — exactly
+/// the same reason `DeclaredSymbol::line` is hashed.
+type TopLevelRemoval<'a> = (&'a str, u32);
+
+/// Compute the set of top-level symbol names that are still live at end-of-file.
+///
+/// Walks `artifacts.timeline` in effect-position order, inserting names from
+/// top-level `Def` and `Declaration` events and removing names from top-level
+/// `Removal` events. The result is the set of symbols a parent file would
+/// inherit *after* a `source()` call to this file finishes — equivalent to
+/// the symbol set produced by querying [`scope_at_position_with_graph`] at
+/// `(u32::MAX, u32::MAX)` but restricted to symbols defined in this file.
+///
+/// `exported_interface` differs in that it captures *every* top-level
+/// definition without applying `rm()`s — that is intentional because the
+/// interface hash separately includes top-level removals (with their lines)
+/// to drive revalidation. Diagnostic-side checks that ask "is this name still
+/// available at EOF of the sourced file?" must use this helper instead.
+///
+/// Each call rebuilds the result with an O(timeline) walk and a fresh
+/// `HashSet<String>` allocation. Callers in hot paths (per-identifier loops,
+/// per-source-call lookups) must memoize the result for the diagnostic pass —
+/// see `source_target_live_exports` and `source_exports_cache` in
+/// `handlers.rs` for the established pattern.
+pub fn live_top_level_exports(artifacts: &ScopeArtifacts) -> std::collections::HashSet<String> {
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for event in &artifacts.timeline {
+        match event {
+            ScopeEvent::Def {
+                symbol,
+                function_scope: None,
+                ..
+            } => {
+                live.insert(symbol.name.to_string());
+            }
+            ScopeEvent::Declaration { symbol, .. } => {
+                live.insert(symbol.name.to_string());
+            }
+            ScopeEvent::Removal {
+                symbols,
+                function_scope: None,
+                ..
+            } => {
+                for sym in symbols {
+                    live.remove(sym.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    live
+}
+
+/// Extract top-level rm()/remove() events from a finalized timeline.
+///
+/// Only events with `function_scope = None` are returned — rm() inside a
+/// function body is delayed-evaluation and has no cross-file effect.
+/// Callers must invoke this AFTER `annotate_event_function_scopes` so the
+/// `function_scope` field is populated.
+fn extract_top_level_removals(timeline: &[ScopeEvent]) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for event in timeline {
+        if let ScopeEvent::Removal {
+            line,
+            symbols,
+            function_scope: None,
+            ..
+        } = event
+        {
+            for sym in symbols {
+                out.push((sym.clone(), *line));
+            }
+        }
+    }
+    out
+}
+
 /// Compute a deterministic hash of the exported interface and loaded packages.
 ///
 /// Symbols are incorporated deterministically by sorting the interface keys before hashing each
 /// ScopedSymbol; package names are included sorted as well. The resulting hash is suitable for
 /// cache invalidation when a file's exported symbols or loaded packages change.
 ///
+/// `top_level_removals` is the set of (symbol_name, line) pairs extracted
+/// from top-level `rm()`/`remove()` calls. They are hashed sorted so the
+/// digest is stable across timeline event ordering. Including them is
+/// required so cross-file revalidation fires when a user inserts an
+/// `rm()` between a definition and a `source()` call: without it, the
+/// symbol is still in `exported_interface` (which captures all
+/// definitions) and the hash would not change, leaving stale
+/// undefined-variable diagnostics in the sourced file.
+///
 /// # Returns
 ///
-/// `u64` hash of the provided `interface`, `packages`, and `declared_symbols`.
+/// `u64` hash of the provided `interface`, `packages`, `declared_symbols`,
+/// and `top_level_removals`.
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
+    top_level_removals: &[TopLevelRemoval<'_>],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -2699,6 +2810,17 @@ fn compute_interface_hash(
         decl.name.hash(&mut hasher);
         decl.is_function.hash(&mut hasher);
         decl.line.hash(&mut hasher);
+    }
+
+    // Include top-level rm()/remove() events (sorted for determinism).
+    // Sort by (line, name) so rm calls hash in deterministic order; both
+    // line and name are part of the key because moving an rm across a
+    // source() call changes which children inherit the symbol.
+    let mut sorted_removals: Vec<&TopLevelRemoval> = top_level_removals.iter().collect();
+    sorted_removals.sort_by_key(|(name, line)| (*line, *name));
+    for (name, line) in sorted_removals {
+        name.hash(&mut hasher);
+        line.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -5054,6 +5176,81 @@ mod tests {
         let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
 
         assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_top_level_rm_added() {
+        // Adding a top-level `rm(y)` must change interface_hash because it
+        // alters which symbols are visible at downstream `source()` call
+        // sites. Without this, cross-file revalidation never fires when
+        // the user inserts an `rm()` between a definition and a `source()`,
+        // leaving stale undefined-variable diagnostics in the child file.
+        let code1 = "y <- 1\nsource(\"child.R\")";
+        let code2 = "y <- 1\nrm(y)\nsource(\"child.R\")";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "interface_hash must change when a top-level rm() is inserted"
+        );
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_top_level_rm_target_changes() {
+        // Changing which symbol an rm() targets must change the hash, even
+        // though the rm() count and position is unchanged.
+        let code1 = "x <- 1\ny <- 2\nrm(x)";
+        let code2 = "x <- 1\ny <- 2\nrm(y)";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_top_level_rm_moves() {
+        // Moving an rm() across a `source()` call changes which symbols
+        // the sourced file inherits — the hash must reflect the line.
+        let code1 = "y <- 1\nrm(y)\nsource(\"child.R\")";
+        let code2 = "y <- 1\nsource(\"child.R\")\nrm(y)";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "interface_hash must reflect rm() line because it determines which sourced files see the symbol"
+        );
+    }
+
+    #[test]
+    fn test_interface_hash_unchanged_when_rm_inside_function_body() {
+        // rm() inside a function body has no cross-file effect — the body
+        // is delayed-evaluation and doesn't run at top level. Such rm()
+        // calls must not perturb interface_hash, otherwise local edits to
+        // function bodies would needlessly republish dependents.
+        let code1 = "f <- function() { 1 }\ny <- 2";
+        let code2 = "f <- function() { rm(z); 1 }\ny <- 2";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        // Note: function body contents typically don't show up in
+        // interface_hash because exported_interface only lists top-level
+        // symbols. The function `f` itself is unchanged either way. So we
+        // assert the hash is stable to lock in that an in-body rm() never
+        // contributes.
+        assert_eq!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "rm() inside a function body must not change interface_hash"
+        );
     }
 
     #[test]
@@ -7568,6 +7765,93 @@ outside_var <- 2"#;
     // ============================================================================
 
     #[test]
+    fn test_live_top_level_exports_applies_top_level_rm() {
+        // Top-level def-then-rm: name is dead at EOF.
+        let code = "x <- 1\nrm(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let live = live_top_level_exports(&artifacts);
+        assert!(
+            !live.contains("x"),
+            "x must be absent from live exports after top-level rm(x); got {:?}",
+            live
+        );
+        assert!(
+            artifacts.exported_interface.contains_key("x"),
+            "exported_interface still tracks all top-level defs (rm-ignoring) by design"
+        );
+    }
+
+    #[test]
+    fn test_live_top_level_exports_redef_after_rm_resurrects() {
+        // x <- 1; rm(x); x <- 2 — the second def installs a fresh binding.
+        let code = "x <- 1\nrm(x)\nx <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let live = live_top_level_exports(&artifacts);
+        assert!(
+            live.contains("x"),
+            "x must be live at EOF after a redefinition following rm; got {:?}",
+            live
+        );
+    }
+
+    #[test]
+    fn test_live_top_level_exports_remove_long_form() {
+        // The long form `remove()` is an alias for `rm()` (see
+        // source_detect.rs); both must remove names from the live exports.
+        let code = "x <- 1\nremove(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let live = live_top_level_exports(&artifacts);
+        assert!(
+            !live.contains("x"),
+            "remove(x) (long form) must remove x from live exports; got {:?}",
+            live
+        );
+    }
+
+    #[test]
+    fn test_live_top_level_exports_repeated_rm_and_redef() {
+        // x <- 1; rm(x); x <- 2; rm(x); x <- 3 — final state: x is live.
+        let code = "x <- 1\nrm(x)\nx <- 2\nrm(x)\nx <- 3";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let live = live_top_level_exports(&artifacts);
+        assert!(
+            live.contains("x"),
+            "x must be live at EOF after the final redef; got {:?}",
+            live
+        );
+
+        // Trailing rm wins.
+        let code2 = "x <- 1\nx <- 2\nrm(x)";
+        let tree2 = parse_r(code2);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+        let live2 = live_top_level_exports(&artifacts2);
+        assert!(
+            !live2.contains("x"),
+            "x must be dead at EOF when the final event is rm(); got {:?}",
+            live2
+        );
+    }
+
+    #[test]
+    fn test_live_top_level_exports_ignores_function_local_rm() {
+        // rm() inside a function body is delayed-evaluation and has no
+        // cross-file effect: the top-level binding must remain live.
+        let code = "x <- 1\nf <- function() { rm(x) }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let live = live_top_level_exports(&artifacts);
+        assert!(
+            live.contains("x"),
+            "function-scoped rm(x) must not affect cross-file live exports; got {:?}",
+            live
+        );
+    }
+
+    #[test]
     fn test_artifacts_define_then_remove() {
         // Test: x <- 1; rm(x) - timeline should have Def then Removal
         // Validates: Requirements 1.1, 7.1
@@ -8798,6 +9082,142 @@ outside_var <- 2"#;
         assert!(
             scope_after_rm.symbols.contains_key("func_c"),
             "func_c should still be in scope after rm()"
+        );
+    }
+
+    #[test]
+    fn test_rm_in_directly_sourced_child_propagates_to_parent_scope() {
+        // Regression: rm(x) in a directly-sourced child must remove x from
+        // the parent's scope after the source() call, mirroring how rm(z) in
+        // a transitively-sourced grandchild already removes z from the
+        // parent's scope. The two cases are symmetric — both files run before
+        // control returns to the parent — so neither x nor z should be in
+        // parent's scope after `source("child.R")`.
+        //
+        //   parent.R:
+        //     source("child.R")   # line 0
+        //     z                   # line 1
+        //     x                   # line 2
+        //
+        //   child.R:
+        //     source("grandchild.R")  # line 0
+        //     x <- 1                  # line 1
+        //     rm(x)                   # line 2
+        //     z                       # line 3
+        //
+        //   grandchild.R:
+        //     z <- 1   # line 0
+        //     rm(z)    # line 1
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let grandchild_uri = Url::parse("file:///project/grandchild.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let parent_code = "source(\"child.R\")\nz\nx\n";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        let child_code = "source(\"grandchild.R\")\nx <- 1\nrm(x)\nz\n";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let grandchild_code = "z <- 1\nrm(z)\n";
+        let grandchild_tree = parse_r(grandchild_code);
+        let grandchild_artifacts =
+            compute_artifacts(&grandchild_uri, &grandchild_tree, grandchild_code);
+
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let child_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "grandchild.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else if uri == &grandchild_uri {
+                Some(Arc::new(grandchild_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = {
+            let parent_meta = parent_meta.clone();
+            let child_meta = child_meta.clone();
+            let parent_uri = parent_uri.clone();
+            let child_uri = child_uri.clone();
+            move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if uri == &parent_uri {
+                    Some(std::sync::Arc::new(parent_meta.clone()))
+                } else if uri == &child_uri {
+                    Some(std::sync::Arc::new(child_meta.clone()))
+                } else {
+                    None
+                }
+            }
+        };
+
+        // Query parent.R at line 2, col 0 — the position of the `x` reference.
+        // After source("child.R"), child.R has run (def x, rm x) and
+        // grandchild.R has run (def z, rm z); so neither x nor z should be in
+        // parent's scope.
+        let scope_at_x = scope_at_position_with_graph(
+            &parent_uri,
+            2,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+        );
+        assert!(
+            !scope_at_x.symbols.contains_key("z"),
+            "z should NOT be in parent's scope after source(child.R) — \
+             grandchild.R's `rm(z)` ran before control returned to parent"
+        );
+        assert!(
+            !scope_at_x.symbols.contains_key("x"),
+            "x should NOT be in parent's scope after source(child.R) — \
+             child.R's `rm(x)` ran before control returned to parent (symmetric \
+             with the rm(z) case above)"
         );
     }
 

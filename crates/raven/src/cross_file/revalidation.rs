@@ -445,6 +445,87 @@ pub fn invalidate_children_on_parent_wd_change(
     affected_children
 }
 
+/// Compute the URIs whose diagnostics need force-republish in response to an
+/// edit of `edited_uri`.
+///
+/// The cross-file scope of any document depends on its parents, its
+/// children, AND its siblings under shared ancestors. Three traversals
+/// together cover every file whose scope-resolution would visit
+/// `edited_uri`:
+///
+/// 1. **Backward** (`get_transitive_dependents`): every parent that sources
+///    `edited_uri` directly or transitively consumes its exported
+///    interface, so their cycle/symbol diagnostics may change.
+/// 2. **Forward** (`get_transitive_dependencies`): every child sourced by
+///    `edited_uri` inherits the parent's scope at the `source()` call site,
+///    so a change to `edited_uri` flips descendants' undefined-variable
+///    diagnostics.
+/// 3. **Sibling subtrees**: for every backward ancestor `A`, walk forward
+///    from `A` to capture `A`'s OTHER descendants — siblings of
+///    `edited_uri` under a shared parent (and their subtrees). Example:
+///    `parent.R` sources `child.R` and then sources `grandchild.R`; the
+///    grandchild's scope at its source() call site includes the child's
+///    exports because `parent.R`'s scope at that point already consumed
+///    them. Editing the child must republish the grandchild even though
+///    they are not directly connected in the graph.
+///
+/// Returns deduplicated URIs filtered through `is_open`; never includes
+/// `edited_uri` itself. Returns an empty vec if neither `interface_changed`
+/// nor `edges_changed`. The traversals share a single `seen` set so each
+/// URI walks at most once even when multiple paths reach it (e.g. diamond
+/// topologies).
+///
+/// `is_open` is a predicate, not a `&HashSet<Url>`, so callers can reuse
+/// their existing `HashMap<Url, Document>` directly (`|u| state.documents.contains_key(u)`)
+/// without cloning every URI on every edit.
+pub(crate) fn compute_affected_dependents_after_edit<F>(
+    edited_uri: &Url,
+    interface_changed: bool,
+    edges_changed: bool,
+    graph: &DependencyGraph,
+    is_open: F,
+    max_depth: usize,
+    max_visited: usize,
+) -> Vec<Url>
+where
+    F: Fn(&Url) -> bool,
+{
+    if !(interface_changed || edges_changed) {
+        return Vec::new();
+    }
+
+    let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
+    let mut result: Vec<Url> = Vec::new();
+    let push_if_new = |dep: Url,
+                       seen: &mut std::collections::HashSet<Url>,
+                       result: &mut Vec<Url>| {
+        if dep == *edited_uri || !is_open(&dep) {
+            return;
+        }
+        if seen.insert(dep.clone()) {
+            result.push(dep);
+        }
+    };
+
+    // (1) Backward ancestors of edited_uri.
+    let backward = graph.get_transitive_dependents(edited_uri, max_depth, max_visited);
+    for dep in &backward {
+        push_if_new(dep.clone(), &mut seen, &mut result);
+    }
+
+    // (2 + 3) Forward descendants of edited_uri AND of each backward
+    //         ancestor (sibling subtrees), in a single traversal that shares
+    //         a `visited` set so overlapping subtrees aren't re-walked once
+    //         per ancestor. This is `O(union of all forward subtrees)`
+    //         rather than `O(|ancestors| * subtree)`.
+    let forward_roots = std::iter::once(edited_uri).chain(backward.iter());
+    for dep in graph.get_transitive_dependencies_multi_root(forward_roots, max_depth, max_visited) {
+        push_if_new(dep, &mut seen, &mut result);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +843,65 @@ mod tests {
 
         // After clear, any version should be allowed
         assert!(gate.can_publish(&uri, 1));
+    }
+
+    #[test]
+    fn test_force_marker_persists_until_consumed_by_publish() {
+        // Documents the gate semantics that motivate `did_open`'s
+        // deferred-marking design (commits 9f4bc45 + 01e3411).
+        //
+        // `mark_force_republish` increments a counter; `record_publish`
+        // decrements it. A marker is *not tied* to the work item that
+        // produced it — once incremented, it persists until any publish
+        // consumes it, including a publish triggered by an unrelated
+        // later edit.
+        //
+        // Consequence for `did_open`: if the initial cap pass marks a URI
+        // and re-enrichment then evicts that URI from `work_items`, the
+        // marker is left behind and the next unrelated same-version
+        // publish for that URI slips through the gate. The fix is to
+        // defer marking until after re-enrichment has settled
+        // `work_items`, so URIs that won't actually be republished by
+        // this trigger never receive a marker.
+        //
+        // This test exercises the gate-side leak directly: a URI that has
+        // an outstanding marker passes the same-version gate even though
+        // nothing in this test "owns" the planned republish.
+        let gate = CrossFileDiagnosticsGate::new();
+        let evicted = test_uri("evicted.R");
+
+        // Baseline: a URI that has been published at v=1 and has no
+        // marker is blocked from same-version republish.
+        gate.record_publish(&evicted, 1);
+        assert!(
+            !gate.can_publish(&evicted, 1),
+            "no marker → same-version publish blocked"
+        );
+
+        // Pre-fix `did_open`: the initial cap pass would mark this URI
+        // before re-enrichment had a chance to evict it.
+        gate.mark_force_republish_many([&evicted].iter().copied());
+
+        // Pre-fix bug: even though re-enrichment "evicts" `evicted` from
+        // `work_items` (modeled here as: nothing further consumes the
+        // marker on its behalf), the marker persists and lets an
+        // unrelated same-version publish pass the gate.
+        assert!(
+            gate.can_publish(&evicted, 1),
+            "outstanding marker leaks: orphan passes same-version gate"
+        );
+
+        // The post-fix `did_open` avoids ever creating that marker for
+        // an evicted URI: marking is deferred to a single end-of-flow
+        // site that iterates the *final* work_items only. No regression
+        // hook exists at the gate level for the post-fix path because
+        // the deferred-marking flow simply does not invoke
+        // `mark_force_republish_many` for evicted URIs — the contract is
+        // structural, not algorithmic. The helper-level `cap_truncates_*`
+        // and `higher_priority_*` tests in
+        // `backend::tests::reenrichment_revalidation_cap` cover the
+        // eviction logic that determines which URIs reach the
+        // end-of-flow mark.
     }
 
     // CrossFileActivityState tests
@@ -1337,5 +1477,439 @@ mod tests {
 
         // Child's metadata cache entry should still be present
         assert!(metadata_cache.get(&child_uri).is_some());
+    }
+
+    // compute_affected_dependents_after_edit tests
+
+    fn affected_url(s: &str) -> Url {
+        Url::parse(&format!("file:///project/{}", s)).unwrap()
+    }
+
+    fn affected_workspace_root() -> Url {
+        Url::parse("file:///project").unwrap()
+    }
+
+    fn make_meta_with_source(path: &str, line: u32) -> CrossFileMetadata {
+        CrossFileMetadata {
+            sources: vec![crate::cross_file::types::ForwardSource {
+                path: path.to_string(),
+                line,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_compute_affected_skips_when_nothing_changed() {
+        // No interface change, no edges change → no force-republishes.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let meta_parent = make_meta_with_source("child.R", 1);
+        graph.update_file(
+            &parent,
+            &meta_parent,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&parent, false, false, &graph, |u| open.contains(u), 10, 200);
+        assert!(affected.is_empty());
+    }
+
+    #[test]
+    fn test_compute_affected_includes_backward_dependents() {
+        // child is edited; parent (which sources child) must be revalidated.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let meta_parent = make_meta_with_source("child.R", 1);
+        graph.update_file(
+            &parent,
+            &meta_parent,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&child, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected.len(), 1);
+        assert!(affected.contains(&parent));
+    }
+
+    #[test]
+    fn test_compute_affected_includes_forward_dependencies() {
+        // parent is edited; child (sourced by parent) must be revalidated.
+        // This is the bug: the previous implementation only walked backward
+        // dependents, so a parent edit never triggered a child republish.
+        // User-visible symptom: edits removing `y <- 1` from parent.R never
+        // produced "Undefined variable: y" in child.R until the user
+        // manually edited child.R.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let meta_parent = make_meta_with_source("child.R", 1);
+        graph.update_file(
+            &parent,
+            &meta_parent,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected.len(), 1);
+        assert!(
+            affected.contains(&child),
+            "child must be force-republished when its parent's interface changes; got {affected:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_affected_propagates_through_grandchildren() {
+        // parent → child → grandchild. Editing parent must revalidate both
+        // child and grandchild — matches the user's grandchild observation.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let grandchild = affected_url("grandchild.R");
+
+        graph.update_file(
+            &parent,
+            &make_meta_with_source("child.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &child,
+            &make_meta_with_source("grandchild.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+        open.insert(grandchild.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert!(affected.contains(&child));
+        assert!(affected.contains(&grandchild));
+        assert_eq!(affected.len(), 2);
+    }
+
+    #[test]
+    fn test_compute_affected_filters_unopen_documents() {
+        // Files not in `open_documents` must not be returned (we only
+        // republish for files the editor has open).
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let grandchild = affected_url("grandchild.R");
+        let _ = &grandchild; // referenced only for graph topology below
+
+        graph.update_file(
+            &parent,
+            &make_meta_with_source("child.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &child,
+            &make_meta_with_source("grandchild.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        // grandchild is NOT open
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected, vec![child]);
+    }
+
+    #[test]
+    fn test_compute_affected_excludes_edited_uri_from_result() {
+        // The edited URI itself must not appear in the affected set —
+        // callers handle the edited URI's republish separately.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        graph.update_file(
+            &parent,
+            &make_meta_with_source("child.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert!(!affected.contains(&parent));
+    }
+
+    #[test]
+    fn test_compute_affected_includes_siblings_under_shared_parent() {
+        // parent.R: source("child.R"); source("grandchild.R")
+        // child.R: x <- 1
+        // grandchild.R: x       (uses x from parent's pre-source(grandchild) scope)
+        //
+        // When child is edited, grandchild's INHERITED scope changes because
+        // parent's scope at source("grandchild.R") includes child's exports
+        // (from a prior source("child.R") call). The previous fix walks
+        // Backward(child) = [parent] and Forward(child) = [], missing the
+        // sibling. To catch this, the walk must also include forward
+        // descendants of every backward ancestor.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let grandchild = affected_url("grandchild.R");
+
+        let parent_meta = CrossFileMetadata {
+            sources: vec![
+                crate::cross_file::types::ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+                crate::cross_file::types::ForwardSource {
+                    path: "grandchild.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(
+            &parent,
+            &parent_meta,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+        open.insert(grandchild.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&child, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert!(affected.contains(&parent), "parent must be revalidated");
+        assert!(
+            affected.contains(&grandchild),
+            "grandchild must be revalidated when its sibling child is edited; got {affected:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_affected_includes_transitive_siblings() {
+        // grandparent.R sources parent.R, then sources auntie.R.
+        // parent.R sources child.R.
+        // Editing child should affect auntie (via shared grandparent).
+        // child's backward ancestors: [parent, grandparent]
+        // grandparent's forward descendants: [parent, child, auntie]
+        // → auntie is captured.
+        let mut graph = DependencyGraph::new();
+        let grandparent = affected_url("grandparent.R");
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let auntie = affected_url("auntie.R");
+
+        let grandparent_meta = CrossFileMetadata {
+            sources: vec![
+                crate::cross_file::types::ForwardSource {
+                    path: "parent.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+                crate::cross_file::types::ForwardSource {
+                    path: "auntie.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(
+            &grandparent,
+            &grandparent_meta,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &parent,
+            &make_meta_with_source("child.R", 0),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(grandparent.clone());
+        open.insert(parent.clone());
+        open.insert(child.clone());
+        open.insert(auntie.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&child, true, false, &graph, |u| open.contains(u), 10, 200);
+        assert!(affected.contains(&grandparent));
+        assert!(affected.contains(&parent));
+        assert!(
+            affected.contains(&auntie),
+            "auntie (transitive sibling via grandparent) must be revalidated; got {affected:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_affected_dedups_diamond() {
+        // a → b, a → c, b → d, c → d. Editing a returns b, c, d each once.
+        let mut graph = DependencyGraph::new();
+        let a = affected_url("a.R");
+        let b = affected_url("b.R");
+        let c = affected_url("c.R");
+        let d = affected_url("d.R");
+
+        let meta_a = CrossFileMetadata {
+            sources: vec![
+                crate::cross_file::types::ForwardSource {
+                    path: "b.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+                crate::cross_file::types::ForwardSource {
+                    path: "c.R".to_string(),
+                    line: 2,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&a, &meta_a, Some(&affected_workspace_root()), |_| None);
+        graph.update_file(
+            &b,
+            &make_meta_with_source("d.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &c,
+            &make_meta_with_source("d.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(a.clone());
+        open.insert(b.clone());
+        open.insert(c.clone());
+        open.insert(d.clone());
+
+        let affected =
+            compute_affected_dependents_after_edit(&a, true, false, &graph, |u| open.contains(u), 10, 200);
+        let mut sorted = affected.clone();
+        sorted.sort_by_key(|u| u.path().to_string());
+        assert_eq!(sorted, vec![b, c, d], "diamond must yield deduped URIs");
+    }
+
+    #[test]
+    fn test_compute_affected_edges_only_revalidates_dependents() {
+        // edges_changed=true with interface_changed=false must still walk
+        // dependents — e.g. when a file's `source()` topology changes but
+        // its declared symbols hash to the same value, the cycle/sibling
+        // diagnostics in dependents can still flip.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        graph.update_file(
+            &parent,
+            &make_meta_with_source("child.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        // child edited; only edges changed (e.g. it added a new source()
+        // line), but its exported interface is unchanged.
+        let affected_from_child =
+            compute_affected_dependents_after_edit(&child, false, true, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected_from_child.len(), 1);
+        assert!(
+            affected_from_child.contains(&parent),
+            "edges_only edit on child must still revalidate its parent"
+        );
+
+        // parent edited; only edges changed.
+        let affected_from_parent =
+            compute_affected_dependents_after_edit(&parent, false, true, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected_from_parent.len(), 1);
+        assert!(
+            affected_from_parent.contains(&child),
+            "edges_only edit on parent must still revalidate its forward subtree"
+        );
     }
 }

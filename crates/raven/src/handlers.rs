@@ -5034,11 +5034,19 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &snapshot.directive_meta,
         workspace_root,
     );
-    // Borrow each source target's `ScopeArtifacts` (an `Arc` clone is a
-    // refcount bump, no deep copy) and call `exported_interface.contains_key`
-    // directly during attribution — avoids per-source `HashSet<String>`
-    // allocation that would otherwise stringify every exported name.
-    let source_target_artifacts: Vec<Option<Arc<scope::ScopeArtifacts>>> = source_calls
+    // For each source() call, precompute the set of names the target file
+    // *actually* exports at end-of-file — i.e. top-level `Def` /
+    // `Declaration` events with later top-level `rm()`s applied. Using
+    // `exported_interface.keys()` here would be rm-blind and produce a
+    // misleading "used before sourced" diagnostic for a symbol the source
+    // defines and then removes.
+    //
+    // Memoize per resolved target URI so a file sourcing the same target
+    // twice does not pay the timeline-replay cost twice. The doc comment
+    // on `live_top_level_exports` flags per-source-call lookups as a hot
+    // path that must be cached.
+    let mut live_exports_cache: HashMap<Url, HashSet<String>> = HashMap::new();
+    let source_target_live_exports: Vec<Option<HashSet<String>>> = source_calls
         .iter()
         .map(|source| {
             let resolved_uri = source_path_ctx.as_ref().and_then(|ctx| {
@@ -5052,7 +5060,17 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 }?;
                 Url::from_file_path(resolved).ok()
             });
-            resolved_uri.and_then(|target_uri| snapshot.artifacts_map.get(&target_uri).cloned())
+            resolved_uri.and_then(|target_uri| {
+                if let Some(cached) = live_exports_cache.get(&target_uri) {
+                    return Some(cached.clone());
+                }
+                let computed = snapshot
+                    .artifacts_map
+                    .get(&target_uri)
+                    .map(|artifacts| crate::cross_file::scope::live_top_level_exports(artifacts))?;
+                live_exports_cache.insert(target_uri, computed.clone());
+                Some(computed)
+            })
         })
         .collect();
 
@@ -5163,15 +5181,15 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             }
 
             // Only fire if `name` is actually exported by *this* source's
-            // target file (matches legacy semantics; rejects misattribution
-            // to a later source() that doesn't bring in the symbol). When
-            // the target's artifacts aren't available (closed file not yet
-            // indexed), we conservatively skip — better to under-report
-            // than misattribute.
-            let exports_match = source_target_artifacts
+            // target file at EOF (rm-aware; rejects misattribution to a
+            // later source() that defines-then-removes the symbol or
+            // doesn't bring it in at all). When the target's artifacts
+            // aren't available (closed file not yet indexed), we
+            // conservatively skip — better to under-report than misattribute.
+            let exports_match = source_target_live_exports
                 .get(src_idx)
-                .and_then(|artifacts| artifacts.as_ref())
-                .map(|a| a.exported_interface.contains_key(name.as_str()))
+                .and_then(|exports| exports.as_ref())
+                .map(|set| set.contains(name.as_str()))
                 .unwrap_or(false);
             if !exports_match {
                 continue;
@@ -5284,11 +5302,13 @@ fn collect_undefined_variables_from_snapshot(
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
     let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> =
         snapshot.artifacts_map.get(uri).map(|artifacts| {
-            let exports = artifacts
-                .exported_interface
-                .keys()
-                .map(|k| k.to_string())
-                .collect();
+            // The hoist-globals fast path skips a usage when the name is in
+            // *this file's* live top-level exports and the usage is inside a
+            // function body — R late-binding sees globals from anywhere in
+            // the file. `exported_interface.keys()` would include names that
+            // a top-level `rm()` later removed; using `live_top_level_exports`
+            // keeps the fast path consistent with the rm-aware scope path.
+            let exports = scope::live_top_level_exports(artifacts);
             (exports, artifacts.function_scope_tree.clone())
         });
 
@@ -5478,12 +5498,12 @@ fn collect_undefined_variables_from_snapshot(
                 let exported = source_exports_cache
                     .entry(source_uri.clone())
                     .or_insert_with(|| {
+                        // Use `live_top_level_exports` (timeline replay with
+                        // rm() applied), not `exported_interface.keys()`.
+                        // See the matching comment in
+                        // `collect_undefined_variables_position_aware`.
                         if let Some(artifacts) = snapshot.artifacts_map.get(source_uri) {
-                            return artifacts
-                                .exported_interface
-                                .keys()
-                                .map(|k| k.to_string())
-                                .collect();
+                            return crate::cross_file::scope::live_top_level_exports(artifacts);
                         }
                         HashSet::new()
                     });
@@ -5645,62 +5665,88 @@ fn collect_out_of_scope_diagnostics(
     let mut emitted: std::collections::HashSet<(String, u32, u32)> =
         std::collections::HashSet::new();
 
+    use crate::cross_file::path_resolve::{
+        resolve_path, resolve_path_with_workspace_fallback, PathContext,
+    };
+
+    // Use PathContext::from_metadata (respects @lsp-cd, splits AST vs
+    // directive sources) to match the snapshot path's resolution
+    // semantics. Without this, files declaring @lsp-cd would resolve
+    // their source() targets relative to the wrong base directory.
+    let source_path_ctx =
+        PathContext::from_metadata(uri, directive_meta, state.workspace_folders.first());
+
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        if let Some(doc) = state.documents.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                return Some(Arc::new(scope::compute_artifacts(
+                    target_uri,
+                    tree,
+                    &doc.text(),
+                )));
+            }
+        }
+        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
+            return Some(artifacts);
+        }
+        if let Some(doc) = state.workspace_index.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                return Some(Arc::new(scope::compute_artifacts(
+                    target_uri,
+                    tree,
+                    &doc.text(),
+                )));
+            }
+        }
+        None
+    };
+
+    // Memoize per source URI: if the same file is sourced from multiple
+    // `source()` calls / `@lsp-source` directives in this document, we
+    // must not recompute its live top-level exports each time.
+    // `live_top_level_exports` walks the timeline and allocates a fresh
+    // `HashSet`, so per-source-call recomputation is the hot-path
+    // pattern that the doc comment in `cross_file::scope` warns against.
+    let mut source_exports_cache: HashMap<Url, std::collections::HashSet<String>> = HashMap::new();
+
     // For each source() call, check if any symbols from that file are used before the call
     for source in &source_calls {
         if cancel.is_cancelled() {
             return;
         }
+        // Skip sources that don't bring symbols into the current scope
+        // (`local=TRUE`, `sys.source` with a non-global env). The
+        // snapshot collector does this; without it we'd flag symbols
+        // that are never actually inherited.
+        if !source.inherits_symbols() {
+            continue;
+        }
         let source_line = source.line;
         let source_col = source.column; // Already UTF-16
 
-        // Resolve the source path
-        let resolve_path = |path: &str| -> Option<Url> {
-            let from_path = uri.to_file_path().ok()?;
-            let parent_dir = from_path.parent()?;
-            let resolved = parent_dir.join(path);
-            let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-            Url::from_file_path(normalized).ok()
-        };
-
-        let Some(source_uri) = resolve_path(&source.path) else {
+        let Some(source_uri) = source_path_ctx.as_ref().and_then(|ctx| {
+            let resolved = if source.is_directive {
+                resolve_path(&source.path, ctx)
+            } else {
+                resolve_path_with_workspace_fallback(&source.path, ctx)
+            }?;
+            Url::from_file_path(resolved).ok()
+        }) else {
             continue;
         };
 
-        // Get symbols from the sourced file
-        let source_symbols: std::collections::HashSet<String> = {
-            let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-                // Try open documents first (authoritative)
-                if let Some(doc) = state.documents.get(target_uri) {
-                    if let Some(tree) = &doc.tree {
-                        return Some(Arc::new(scope::compute_artifacts(
-                            target_uri,
-                            tree,
-                            &doc.text(),
-                        )));
-                    }
-                }
-                // Try cross-file workspace index (preferred for closed files)
-                if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri)
-                {
-                    return Some(artifacts);
-                }
-                // Fallback to legacy workspace index
-                if let Some(doc) = state.workspace_index.get(target_uri) {
-                    if let Some(tree) = &doc.tree {
-                        return Some(Arc::new(scope::compute_artifacts(
-                            target_uri,
-                            tree,
-                            &doc.text(),
-                        )));
-                    }
-                }
-                None
-            };
-
-            get_artifacts(&source_uri)
-                .map(|a| a.exported_interface.keys().map(|k| k.to_string()).collect())
-                .unwrap_or_default()
-        };
+        // `live_top_level_exports`, not `exported_interface.keys()`:
+        // a sourced file that defines-then-removes a symbol does not
+        // actually make it available, and firing a "used before
+        // sourced" diagnostic in that case is misleading — the
+        // undefined-variable diagnostic should fire instead.
+        let source_symbols = source_exports_cache
+            .entry(source_uri.clone())
+            .or_insert_with(|| {
+                get_artifacts(&source_uri)
+                    .map(|a| crate::cross_file::scope::live_top_level_exports(&a))
+                    .unwrap_or_default()
+            });
 
         // Check for usages of these symbols before the source() call
         for (name, usage_line, usage_col, usage_node) in &usages {
@@ -8239,11 +8285,13 @@ pub(crate) fn collect_undefined_variables_position_aware(
         let provider = state.content_provider();
         use crate::content_provider::ContentProvider;
         provider.get_artifacts(uri).map(|artifacts| {
-            let exports = artifacts
-                .exported_interface
-                .keys()
-                .map(|k| k.to_string())
-                .collect();
+            // Apply top-level `rm()`s when computing the hoist-fast-path's
+            // local export set: a name removed at file scope is NOT visible
+            // inside a later function body under R's late-binding semantics.
+            // `exported_interface.keys()` is rm-blind (interface_hash takes
+            // rm into account separately) and would suppress a legitimate
+            // "Undefined variable" diagnostic.
+            let exports = scope::live_top_level_exports(&artifacts);
             (exports, artifacts.function_scope_tree.clone())
         })
     };
@@ -8394,12 +8442,15 @@ pub(crate) fn collect_undefined_variables_position_aware(
                 let exported = source_exports_cache
                     .entry(source_uri.clone())
                     .or_insert_with(|| {
+                        // Use `live_top_level_exports` (timeline replay with rm()
+                        // applied), not `exported_interface.keys()`. The latter
+                        // captures every top-level definition regardless of a
+                        // later top-level `rm()` and would suppress the
+                        // "Undefined variable" diagnostic for a symbol that the
+                        // sourced file defined-then-removed before returning to
+                        // the parent.
                         if let Some(artifacts) = content_provider.get_artifacts(source_uri) {
-                            return artifacts
-                                .exported_interface
-                                .keys()
-                                .map(|k| k.to_string())
-                                .collect();
+                            return crate::cross_file::scope::live_top_level_exports(&artifacts);
                         }
 
                         let source_text = content_provider.get_content(source_uri).or_else(|| {
@@ -8423,16 +8474,13 @@ pub(crate) fn collect_undefined_variables_position_aware(
                             return std::collections::HashSet::new();
                         };
 
-                        crate::cross_file::scope::compute_artifacts_with_metadata(
+                        let artifacts = crate::cross_file::scope::compute_artifacts_with_metadata(
                             source_uri,
                             &source_tree,
                             &source_text,
                             Some(&source_meta),
-                        )
-                        .exported_interface
-                        .keys()
-                        .map(|k| k.to_string())
-                        .collect()
+                        );
+                        crate::cross_file::scope::live_top_level_exports(&artifacts)
                     });
                 exported.contains(name.as_str())
             });
@@ -34344,6 +34392,389 @@ y <- x"#;
         assert!(
             eof_edge.is_some(),
             "Should create backward directive edge with call_site_line = u32::MAX for line=eof"
+        );
+    }
+
+    /// File A: `x <- 1`. File B: `source('a.R')\ny <- x`. Editing A to remove
+    /// the definition must cause B's next diagnostic pass to surface
+    /// "Undefined variable: x" — confirms diagnostic logic, not LSP plumbing.
+    #[test]
+    fn test_undefined_variable_appears_in_dependent_after_parent_edit() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let a_path = workspace_path.join("a.R");
+        let b_path = workspace_path.join("b.R");
+
+        let a_initial = "x <- 1";
+        let b_code = "source('a.R')\ny <- x";
+
+        std::fs::write(&a_path, a_initial).unwrap();
+        std::fs::write(&b_path, b_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let a_url = Url::from_file_path(&a_path).unwrap();
+        let b_url = Url::from_file_path(&b_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        // Auto + sourced_by-empty + scan-not-complete defers undefined-variable
+        // diagnostics entirely. Mark scan complete so the collector runs.
+        state.workspace_scan_complete = true;
+
+        state
+            .documents
+            .insert(a_url.clone(), Document::new(a_initial, None));
+        state
+            .documents
+            .insert(b_url.clone(), Document::new(b_code, None));
+
+        let meta_a = crate::cross_file::extract_metadata(a_initial);
+        let meta_b = crate::cross_file::extract_metadata(b_code);
+        state.cross_file_graph.update_file(
+            &a_url,
+            &meta_a,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &b_url,
+            &meta_b,
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        // Pre-condition: B should NOT report `x` as undefined — A defines it.
+        let pre_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
+        let pre_undefined_x: Vec<_> = pre_diags
+            .iter()
+            .filter(|d| d.message == "Undefined variable: x")
+            .collect();
+        assert!(
+            pre_undefined_x.is_empty(),
+            "Pre-edit: B should NOT report `x` as undefined; got: {:?}",
+            pre_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // SIMULATE THE EDIT: A's content changes to remove `x <- 1`.
+        let a_after = "";
+        state
+            .documents
+            .insert(a_url.clone(), Document::new(a_after, None));
+        let meta_a_after = crate::cross_file::extract_metadata(a_after);
+        state.cross_file_graph.update_file(
+            &a_url,
+            &meta_a_after,
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        // Post-condition: B SHOULD now report "Undefined variable: x".
+        let post_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
+        let post_undefined_x: Vec<_> = post_diags
+            .iter()
+            .filter(|d| d.message == "Undefined variable: x")
+            .collect();
+        assert_eq!(
+            post_undefined_x.len(),
+            1,
+            "Post-edit: B should report `x` as undefined; got: {:?}",
+            post_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: `rm()` in a directly-sourced child must propagate to the
+    /// parent's scope as cleanly as `rm()` in a transitively-sourced
+    /// grandchild does.
+    ///
+    ///   parent.R:
+    ///     source("child.R")
+    ///     z
+    ///     x
+    ///
+    ///   child.R:
+    ///     source("grandchild.R")
+    ///     x <- 1
+    ///     rm(x)
+    ///     z
+    ///
+    ///   grandchild.R:
+    ///     z <- 1
+    ///     rm(z)
+    ///
+    /// After `source("child.R")`, both child and grandchild have run and
+    /// removed the symbols they defined. parent's `z` IS already flagged as
+    /// undefined (rm in grandchild propagates) — but parent's `x` is NOT
+    /// flagged because the undefined-variable diagnostic's
+    /// "directly-sourced exported_interface" fallback ignores `rm()`s.
+    #[test]
+    fn test_rm_in_directly_sourced_child_propagates_to_parent_diagnostics() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let parent_path = workspace_path.join("parent.R");
+        let child_path = workspace_path.join("child.R");
+        let grandchild_path = workspace_path.join("grandchild.R");
+
+        let parent_code = "source(\"child.R\")\nz\nx\n";
+        let child_code = "source(\"grandchild.R\")\nx <- 1\nrm(x)\nz\n";
+        let grandchild_code = "z <- 1\nrm(z)\n";
+
+        std::fs::write(&parent_path, parent_code).unwrap();
+        std::fs::write(&child_path, child_code).unwrap();
+        std::fs::write(&grandchild_path, grandchild_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let parent_url = Url::from_file_path(&parent_path).unwrap();
+        let child_url = Url::from_file_path(&child_path).unwrap();
+        let grandchild_url = Url::from_file_path(&grandchild_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.workspace_scan_complete = true;
+
+        state
+            .documents
+            .insert(parent_url.clone(), Document::new(parent_code, None));
+        state
+            .documents
+            .insert(child_url.clone(), Document::new(child_code, None));
+        state
+            .documents
+            .insert(grandchild_url.clone(), Document::new(grandchild_code, None));
+
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child_meta = crate::cross_file::extract_metadata(child_code);
+        let grandchild_meta = crate::cross_file::extract_metadata(grandchild_code);
+
+        state.cross_file_graph.update_file(
+            &parent_url,
+            &parent_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &child_url,
+            &child_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &grandchild_url,
+            &grandchild_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &parent_url, &DiagCancelToken::never());
+        let messages: Vec<_> = diags.iter().map(|d| d.message.clone()).collect();
+
+        // `z` is correctly flagged today (rm in transitively-sourced grandchild
+        // propagates through scope resolution) — keep this assertion as a
+        // canary so a future regression on the symmetric path is also caught.
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: z"),
+            "z should be flagged as undefined in parent.R after \
+             source(child.R), since grandchild.R's rm(z) ran. Got: {:?}",
+            messages
+        );
+
+        // The bug: `x` should also be flagged — child.R's rm(x) ran before
+        // control returned to parent.R, so x is not in scope at parent's
+        // line 2 reference.
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: x"),
+            "x should be flagged as undefined in parent.R after \
+             source(child.R), since child.R's rm(x) ran. Got: {:?}",
+            messages
+        );
+
+        // Run the same scenario through the snapshot-based pipeline (the
+        // production debounced path goes through `diagnostics_from_snapshot`),
+        // because the legacy and snapshot paths each have their own copy of
+        // the `defined_in_loaded_direct_source` fallback. A fix that only
+        // touches the legacy path would silently leave the production path
+        // broken.
+        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &parent_url)
+            .expect("snapshot build should succeed");
+        let snapshot_diags = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &parent_url,
+            &DiagCancelToken::never(),
+        )
+        .unwrap_or_default();
+        let snapshot_messages: Vec<_> =
+            snapshot_diags.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            snapshot_messages.iter().any(|m| m == "Undefined variable: z"),
+            "snapshot path: z should be flagged as undefined; got: {:?}",
+            snapshot_messages
+        );
+        assert!(
+            snapshot_messages.iter().any(|m| m == "Undefined variable: x"),
+            "snapshot path: x should be flagged as undefined; got: {:?}",
+            snapshot_messages
+        );
+    }
+
+    /// Sibling structure: parent.R sources child1.R (defines and removes x)
+    /// then child2.R (uses x). child1's rm(x) means x is not in scope by the
+    /// time child2 runs, so child2's reference must be flagged as undefined.
+    /// This exercises the "directly-sourced exported_interface" suppression
+    /// in a different shape than the parent-uses-x case.
+    #[test]
+    fn test_rm_in_sibling_directly_sourced_does_not_leak_to_later_sibling() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let parent_path = workspace_path.join("parent.R");
+        let child1_path = workspace_path.join("child1.R");
+        let child2_path = workspace_path.join("child2.R");
+
+        let parent_code = "source(\"child1.R\")\nsource(\"child2.R\")\n";
+        let child1_code = "x <- 1\nrm(x)\n";
+        let child2_code = "y <- x + 1\n";
+
+        std::fs::write(&parent_path, parent_code).unwrap();
+        std::fs::write(&child1_path, child1_code).unwrap();
+        std::fs::write(&child2_path, child2_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let parent_url = Url::from_file_path(&parent_path).unwrap();
+        let child1_url = Url::from_file_path(&child1_path).unwrap();
+        let child2_url = Url::from_file_path(&child2_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.workspace_scan_complete = true;
+
+        state
+            .documents
+            .insert(parent_url.clone(), Document::new(parent_code, None));
+        state
+            .documents
+            .insert(child1_url.clone(), Document::new(child1_code, None));
+        state
+            .documents
+            .insert(child2_url.clone(), Document::new(child2_code, None));
+
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child1_meta = crate::cross_file::extract_metadata(child1_code);
+        let child2_meta = crate::cross_file::extract_metadata(child2_code);
+
+        state.cross_file_graph.update_file(
+            &parent_url,
+            &parent_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &child1_url,
+            &child1_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &child2_url,
+            &child2_meta,
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        // Diagnose parent.R — x must be undefined at the implicit usage site
+        // inside child2.R when computed as part of the parent's neighborhood.
+        // The most direct check is to diagnose child2.R itself: with
+        // `auto`-mode sourced_by populated by the workspace scan, child2 sees
+        // child1 as a sibling under parent, and x must NOT be in scope.
+        let diags = diagnostics(&state, &child2_url, &DiagCancelToken::never());
+        let messages: Vec<_> = diags.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: x"),
+            "x should be undefined in child2.R: child1.R defined and removed \
+             it before child2.R was sourced. Got: {:?}",
+            messages
+        );
+
+        // Snapshot path too.
+        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &child2_url)
+            .expect("snapshot build should succeed");
+        let snap_diags = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &child2_url,
+            &DiagCancelToken::never(),
+        )
+        .unwrap_or_default();
+        let snap_messages: Vec<_> = snap_diags.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            snap_messages.iter().any(|m| m == "Undefined variable: x"),
+            "snapshot path: x should be undefined in child2.R; got: {:?}",
+            snap_messages
+        );
+    }
+
+    /// Hoisting + rm interaction. With `hoist_globals_in_functions` enabled,
+    /// inside a function body any global name is normally visible regardless
+    /// of source-order (R late-binding). But a top-level `rm()` removes the
+    /// global binding — so a function body referencing the removed name must
+    /// still be flagged. The hoist fast path used to consult
+    /// `exported_interface.keys()` (rm-blind) and would silently suppress
+    /// the diagnostic.
+    #[test]
+    fn test_hoist_globals_does_not_resurrect_rm_removed_name() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let file_path = workspace_path.join("a.R");
+        let code = "x <- 1\nrm(x)\nf <- function() { x }\n";
+        std::fs::write(&file_path, code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let file_url = Url::from_file_path(&file_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.workspace_scan_complete = true;
+        // Hoisting must be enabled to exercise the affected fast path.
+        state.cross_file_config.hoist_globals_in_functions = true;
+
+        state
+            .documents
+            .insert(file_url.clone(), Document::new(code, None));
+        let meta = crate::cross_file::extract_metadata(code);
+        state
+            .cross_file_graph
+            .update_file(&file_url, &meta, Some(&workspace_url), |_| None);
+
+        // Legacy path.
+        let diags = diagnostics(&state, &file_url, &DiagCancelToken::never());
+        let messages: Vec<_> = diags.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: x"),
+            "x referenced inside f() must be flagged: top-level rm(x) \
+             removed it before the function is called, and hoist must not \
+             resurrect it. Got: {:?}",
+            messages
+        );
+
+        // Snapshot path.
+        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &file_url)
+            .expect("snapshot build should succeed");
+        let snap_diags = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &file_url,
+            &DiagCancelToken::never(),
+        )
+        .unwrap_or_default();
+        let snap_messages: Vec<_> = snap_diags.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            snap_messages.iter().any(|m| m == "Undefined variable: x"),
+            "snapshot path: x referenced inside f() must be flagged when \
+             rm(x) precedes the function definition; got: {:?}",
+            snap_messages
         );
     }
 }
