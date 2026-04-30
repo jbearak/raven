@@ -5826,6 +5826,20 @@ fn collect_identifier_usages_utf16<'a>(
                     }
                 }
             }
+            // Skip the rhs of `$` / `@` extract operators (e.g. the `X` in
+            // `ww$X` or the `slot` in `obj@slot`). These are member-name
+            // strings, not bare variable references — collecting them as
+            // usages produces false-positive "used before it's available"
+            // diagnostics whenever a later source() target happens to export
+            // a top-level symbol with the same name. Mirrors the equivalent
+            // skip in `collect_usages_with_context`.
+            if parent.kind() == "extract_operator" {
+                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
+                    if rhs_node.id() == node.id() {
+                        return;
+                    }
+                }
+            }
         }
 
         let name = text[node.byte_range()].to_string();
@@ -35233,6 +35247,79 @@ x
                 .collect::<Vec<_>>()
         );
         assert_eq!(undefined[0].range.start.line, 0);
+    }
+
+    /// Regression for the worldwide/scripts/data/outcomes.r false positive:
+    /// the snapshot out-of-scope collector must NOT treat an identifier that
+    /// appears as the field name in `obj$X` (or `obj@X`) as a bare reference
+    /// to a top-level `X`. Tree-sitter-r parses `ww$X` as an `extract_operator`
+    /// where `X` is the `rhs` field; semantically `X` is a string-valued
+    /// member name on `ww`, not a variable lookup.
+    ///
+    /// Pre-fix `collect_identifier_usages_utf16` collected those `X` nodes
+    /// (its sibling `collect_usages_with_context` already skipped them via the
+    /// `extract_operator` rhs check), so a later `source("failure.R")` that
+    /// happens to export a top-level `X` produced bogus
+    /// "'X' is used before it's available (sourced on line N)" diagnostics
+    /// for `ww$X <- ...`, `... ww$X)`, and `1:ww$X`.
+    #[test]
+    fn test_extract_operator_rhs_does_not_emit_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        let outcomes_uri = Url::parse("file:///workspace/outcomes.R").unwrap();
+        let failure_uri = Url::parse("file:///workspace/failure.R").unwrap();
+
+        // Three shapes from outcomes.r at lines 208, 217, 221:
+        //   - assignment LHS: `ww$X <- nrow(df)`
+        //   - call argument:  `rep(0, ww$X)`
+        //   - sequence RHS:   `1:ww$X`
+        // Then a later `source("failure.R")` whose target exports a top-level X.
+        let outcomes_code = "\
+ww <- list()
+ww$X <- nrow(df)
+ww$zero <- rep(0, ww$X)
+df$index <- 1:ww$X
+source(\"failure.R\")
+";
+        let failure_code = "X <- read.csv(\"data.csv\")\n";
+
+        for (uri, code) in [(&outcomes_uri, outcomes_code), (&failure_uri, failure_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &outcomes_uri)
+            .expect("Should build snapshot for outcomes.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &outcomes_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'X'")
+            })
+            .collect();
+        assert!(
+            used_before_x.is_empty(),
+            "Field name X in `ww$X` (extract_operator rhs) must not be flagged \
+             as 'used before it's available'. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Reproduces the worldwide/scripts/data.r structure end-to-end: a parent
