@@ -5758,7 +5758,192 @@ fn collect_out_of_scope_diagnostics(
     }
 }
 
-/// Collect identifier usages with UTF-16 column positions
+/// Returns true if the given identifier node is a *structural non-reference*:
+/// an identifier that exists in the AST but never refers to a value at runtime,
+/// regardless of which diagnostic pipeline is consuming it.
+///
+/// Covers the universal skips that EVERY usage collector in this file must
+/// honor — the LHS of `<-` / `=` / `<<-`, the RHS target of `->` / `->>`, named
+/// argument labels, function-parameter NAMES (not their default expressions),
+/// identifiers directly inside a `parameters` list, both sides of a
+/// `namespace_operator` (`pkg::name` / `pkg:::name`), and the rhs field of
+/// `extract_operator` (`obj$name` / `obj@slot`). A previous regression
+/// (`test_extract_operator_rhs_does_not_emit_used_before_sourced`) showed
+/// what happens when the two production collectors fall out of sync on one of
+/// these skips, so they must call this predicate instead of duplicating the
+/// checks inline. Pipeline-specific skips (e.g. `for_statement` iterator
+/// handling, NSE / formula context) are intentionally NOT included here —
+/// those legitimately differ between pipelines.
+///
+/// Note on the named-argument branch: it is only observable from
+/// `collect_identifier_usages_utf16` (the use-before-source pipeline). The
+/// undefined-variable pipeline (`collect_usages_with_context`) already
+/// early-returns on every identifier inside call arguments via its
+/// `in_call_like_arguments` context flag, so the named-arg check here never
+/// fires for that consumer. The branch is still load-bearing — removing it
+/// would re-introduce the named-arg false positive in the utf16 pipeline.
+fn is_structural_non_reference(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if parent.kind() == "binary_operator" {
+        let mut cursor = parent.walk();
+        let mut children = parent.children(&mut cursor);
+        let first = children.next();
+        let second = children.next();
+        let third = children.next();
+
+        if let (Some(first), Some(second)) = (first, second) {
+            let op_text = node_text(second, text);
+            // Left-assignment LHS: `x <- 1`, `x = 1`, `x <<- 1`.
+            if first.id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
+                return true;
+            }
+            // Right-assignment target: `1 -> x`, `1 ->> x`.
+            if let Some(third) = third {
+                if third.id() == node.id() && matches!(op_text, "->" | "->>") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Named argument: `n = 1` in `f(..., n = 1)`.
+    if parent.kind() == "argument" {
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            if name_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+
+    // Parameter NAME only. Default expressions are intentionally treated as
+    // usages: R evaluates them lazily, but the out-of-scope diagnostic flags
+    // source-order dependencies such as `function(a = b)` before a later
+    // `source()` that defines `b`, because relying on that later side effect
+    // is fragile.
+    if matches!(parent.kind(), "parameter" | "default_parameter") {
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            if name_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+
+    // Identifier directly inside a `parameters` list.
+    if parent.kind() == "parameters" {
+        return true;
+    }
+
+    // `namespace_operator` (`pkg::name`, `pkg:::name`) — both sides are
+    // qualified references, not bare variable lookups.
+    if parent.kind() == "namespace_operator" {
+        return true;
+    }
+
+    // RHS of `extract_operator` (`obj$X`, `obj@slot`) — member-name string.
+    if parent.kind() == "extract_operator" {
+        if let Some(rhs_node) = parent.child_by_field_name("rhs") {
+            if rhs_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns true when `node` is an identifier inside a default-parameter
+/// expression that names one of the containing function's formal parameters.
+///
+/// In R, default expressions are evaluated in the function call frame, where
+/// all formals are bound as promises. That means `function(y, x = y)` and even
+/// `function(x = y, y = 1)` are valid name lookups for `y`. This is narrower
+/// than treating every default-expression identifier as locally defined:
+/// `function(x = missing)` must still allow undefined-variable diagnostics,
+/// and `function(a = x)` must still allow source-order diagnostics when `x` is
+/// only provided by a later `source()`.
+fn references_formal_from_default_expression(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    let Some(default_parameter) = containing_default_parameter(node) else {
+        return false;
+    };
+
+    if default_parameter
+        .child_by_field_name("name")
+        .is_some_and(|name_node| name_node.id() == node.id())
+    {
+        return false;
+    }
+
+    let Some(parameters) = default_parameter.parent().filter(|n| n.kind() == "parameters") else {
+        return false;
+    };
+
+    let name = node_text(node, text);
+    let mut cursor = parameters.walk();
+    for child in parameters.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        if parameter_node_name(child, text).is_some_and(|param_name| param_name == name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn containing_default_parameter(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "default_parameter" {
+            return Some(parent);
+        }
+        if parent.kind() == "parameter" {
+            if let Some(default_node) = parent.child_by_field_name("default") {
+                let node_range = node.byte_range();
+                let default_range = default_node.byte_range();
+                if default_range.start <= node_range.start && node_range.end <= default_range.end {
+                    return Some(parent);
+                }
+            }
+        }
+        current = parent;
+    }
+    None
+}
+
+fn parameter_node_name<'a>(node: Node<'a>, text: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "parameter" | "default_parameter" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                return Some(node_text(name_node, text));
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if matches!(child.kind(), "identifier" | "dots") {
+                    return Some(node_text(child, text));
+                }
+            }
+            None
+        }
+        "identifier" | "dots" => Some(node_text(node, text)),
+        _ => None,
+    }
+}
+
+/// Collect identifier usages with UTF-16 column positions for the
+/// use-before-source diagnostic pipeline. Skips universal structural
+/// non-references via `is_structural_non_reference`, formal references inside
+/// default-parameter expressions, plus the pipeline-specific `for_statement`
+/// iterator skip (this pipeline lacks the scope resolution that the
+/// undefined-variable pipeline uses to define the iterator).
 fn collect_identifier_usages_utf16<'a>(
     node: Node<'a>,
     text: &str,
@@ -5785,90 +5970,35 @@ fn collect_identifier_usages_utf16<'a>(
     };
 
     if node.kind() == "identifier" {
-        // Skip if this is the LHS of a left-assignment or the RHS target of
-        // a right-assignment. Both are *definition* sites, not usages.
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 {
-                    let op = children[1];
-                    let op_text = &text[op.byte_range()];
-                    // Left-assignment: target is children[0] (e.g., `x <- 1`).
-                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-")
-                    {
-                        // Skip LHS of assignment, but recurse into children
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            collect_identifier_usages_utf16(child, text, line_starts, usages);
-                        }
-                        return;
-                    }
-                    // Right-assignment: target is children[2] (e.g., `1 -> x`).
-                    // Mirrors the equivalent skip in `collect_usages_with_context`.
-                    if children.len() >= 3
-                        && children[2].id() == node.id()
-                        && matches!(op_text, "->" | "->>")
-                    {
-                        return;
-                    }
-                }
-            }
-            // Skip declaration sites for function parameters.
-            if matches!(
-                parent.kind(),
-                "parameter" | "default_parameter" | "parameters"
-            ) {
-                return;
-            }
-            // Skip declaration site for for-loop iterator variable.
-            if parent.kind() == "for_statement" {
-                if let Some(var_node) = parent.child_by_field_name("variable") {
-                    if var_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-            // Skip named arguments
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-            // Skip identifiers inside a `namespace_operator` (`pkg::name` or
-            // `pkg:::name`). Both the package-name LHS and the member-name
-            // RHS are qualified references — neither is a bare variable
-            // lookup, so collecting them as usages produces false-positive
-            // "used before it's available" diagnostics whenever a later
-            // source() target happens to export a symbol of the same name.
-            // Mirrors the equivalent skip in `collect_usages_with_context`.
-            if parent.kind() == "namespace_operator" {
-                return;
-            }
-            // Skip the rhs of `$` / `@` extract operators (e.g. the `X` in
-            // `ww$X` or the `slot` in `obj@slot`). These are member-name
-            // strings, not bare variable references — collecting them as
-            // usages produces false-positive "used before it's available"
-            // diagnostics whenever a later source() target happens to export
-            // a top-level symbol with the same name. Mirrors the equivalent
-            // skip in `collect_usages_with_context`.
-            if parent.kind() == "extract_operator" {
-                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
-                    if rhs_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
+        if is_structural_non_reference(node, text) {
+            return;
+        }
+
+        // Pipeline-specific skip: the use-before-source pipeline does not
+        // run scope resolution to define the iterator, so skip the
+        // declaration site here. (This intentionally diverges from
+        // `collect_usages_with_context`, which relies on scope resolution.)
+        let skip_for_iter = node.parent().is_some_and(|parent| {
+            parent.kind() == "for_statement"
+                && parent
+                    .child_by_field_name("variable")
+                    .is_some_and(|var| var.id() == node.id())
+        });
+
+        if skip_for_iter {
+            return;
+        }
+
+        if references_formal_from_default_expression(node, text) {
+            return;
         }
 
         let name = text[node.byte_range()].to_string();
         let line = node.start_position().row as u32;
-        // Convert byte column to UTF-16 using pre-computed line offsets
         let line_text = get_line(node.start_position().row);
         let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
         usages.push((name, line, col, node));
+        return;
     }
 
     let mut cursor = node.walk();
@@ -8472,64 +8602,11 @@ struct UsageContext {
     in_call_like_arguments: bool,
 }
 
-/// Legacy version of collect_usages without NSE context tracking.
-/// Only used in tests for backward compatibility with existing property tests.
-#[cfg(test)]
-fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'a>)>) {
-    if node.is_error() || node.is_missing() {
-        return;
-    }
-
-    if node.kind() == "identifier" {
-        // Skip if this is the target of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 {
-                    let op_text = node_text(children[1], text);
-                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
-                        return;
-                    }
-                    if children.len() >= 3
-                        && children[2].id() == node.id()
-                        && matches!(op_text, "->" | "->>")
-                    {
-                        return;
-                    }
-                }
-            }
-
-            if let Some(prev) = node.prev_sibling() {
-                if prev.is_error() {
-                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
-                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
-                        return;
-                    }
-                }
-            }
-
-            // Skip if this is a named argument (e.g., n = 1 in readLines(..., n = 1))
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return; // Skip argument names
-                    }
-                }
-            }
-        }
-
-        used.push((node_text(node, text).to_string(), node));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_usages(child, text, used);
-    }
-}
-
-/// Context-aware version of collect_usages that tracks NSE-related state during AST traversal.
-/// This function skips undefined variable checks in contexts where R uses non-standard evaluation.
+/// Collects identifier usages while tracking NSE-related state during AST traversal.
+/// Skips undefined-variable checks in contexts where R uses non-standard evaluation
+/// (formula `~`, call-like arguments), plus formal references inside
+/// default-parameter expressions. Universal structural skips that apply
+/// regardless of pipeline are delegated to `is_structural_non_reference`.
 fn collect_usages_with_context<'a>(
     node: Node<'a>,
     text: &str,
@@ -8557,85 +8634,24 @@ fn collect_usages_with_context<'a>(
             return;
         }
 
-        // Skip if this is the target of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 {
-                    let op_text = node_text(children[1], text);
-                    // Left-assignment: target is children[0] (e.g., x <- 1)
-                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
-                        return;
-                    }
-                    // Right-assignment: target is children[2] (e.g., 1 -> x)
-                    if children.len() >= 3
-                        && children[2].id() == node.id()
-                        && matches!(op_text, "->" | "->>")
-                    {
-                        return;
-                    }
+        if is_structural_non_reference(node, text) {
+            return;
+        }
+
+        if references_formal_from_default_expression(node, text) {
+            return;
+        }
+
+        // Pipeline-specific skip: an identifier that follows an ERROR node
+        // containing a right-assignment operator (e.g., `-> x` or `->> x` where
+        // the parser couldn't find a LHS value). This handles broken-tree
+        // recovery that the structural predicate can't see.
+        if let Some(prev) = node.prev_sibling() {
+            if prev.is_error() {
+                let prev_text = &text[prev.start_byte()..prev.end_byte()];
+                if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                    return;
                 }
-            }
-
-            // Skip if this identifier follows an ERROR node containing a
-            // right-assignment operator (e.g., `-> x` or `->> x` where the
-            // parser couldn't find a LHS value for the operator).
-            if let Some(prev) = node.prev_sibling() {
-                if prev.is_error() {
-                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
-                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
-                        return;
-                    }
-                }
-            }
-
-            // Skip if this is a named argument (e.g., n = 1 in readLines(..., n = 1))
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return; // Skip argument names
-                    }
-                }
-            }
-
-            // Skip if this identifier is inside a namespace_operator (pkg:: or pkg:::)
-            // Both the package name (LHS) and function name (RHS) are qualified
-            // references and should not be checked as standalone variables.
-            if parent.kind() == "namespace_operator" {
-                return;
-            }
-
-            // Skip if this is the RHS of an extract operator ($ or @)
-            // e.g., df$column or obj@slot - we don't want to check if column/slot is defined
-            // The LHS (df, obj) should still be checked for undefined variables
-            if parent.kind() == "extract_operator" {
-                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
-                    if rhs_node.id() == node.id() {
-                        return; // Skip RHS of extract operator
-                    }
-                }
-            }
-
-            // Skip if this is a function parameter definition
-            // Function parameters appear inside `parameter` or `default_parameter` nodes
-            // which are children of `parameters` nodes.
-            // Only skip the parameter name (name field), NOT identifiers in the default
-            // expression (e.g., function(a = b) should check b for undefined)
-            if parent.kind() == "parameter" || parent.kind() == "default_parameter" {
-                // Only skip if this identifier is the parameter name (name field)
-                // The default expression should still be checked for undefined variables
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return; // Skip the parameter name
-                    }
-                }
-                // Don't return here - identifiers in default expressions should be checked
-            }
-
-            // Also check if we're directly inside a `parameters` node (some grammars)
-            if parent.kind() == "parameters" {
-                return; // Skip identifiers directly in parameters list
             }
         }
 
@@ -22847,7 +22863,12 @@ mod proptests {
 
             let tree = parse_r_code(&code);
             let mut used = Vec::new();
-            collect_usages(tree.root_node(), &code, &mut used);
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
 
             // func_name should be in used, but arg_name should NOT be
             let func_used = used.iter().any(|(name, _)| name == &func_name);
@@ -22869,7 +22890,12 @@ mod proptests {
 
             let tree = parse_r_code(&code);
             let mut used = Vec::new();
-            collect_usages(tree.root_node(), &code, &mut used);
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
 
             // None of the argument names should be flagged as usages
             for i in 0..arg_count {
@@ -23087,24 +23113,19 @@ mod proptests {
 
     #[test]
     fn test_readlines_named_arg() {
-        // This is the exact code from collate.r line 13
-        let code = r#"run_hash <- trimws(readLines("output/oos/latest_hash.txt", n = 1))"#;
+        // Pattern from collate.r line 13: a named-argument `n = 1` must not
+        // surface as a usage. `collect_usages_with_context` excludes it via
+        // the `in_call_like_arguments` early-return; the assertion below is
+        // the user-visible contract regardless of which code path enforces it.
+        let code = r#"readLines("output/oos/latest_hash.txt", n = 1)"#;
         let tree = parse_r_code(code);
 
         let mut used = Vec::new();
-        collect_usages(tree.root_node(), code, &mut used);
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        eprintln!("\n=== Collected usages ===");
-        for (name, node) in &used {
-            eprintln!("  '{}' (kind: {})", name, node.kind());
-        }
-
-        // trimws and readLines should be collected, but n should NOT be
-        let trimws_used = used.iter().any(|(name, _)| name == "trimws");
         let readlines_used = used.iter().any(|(name, _)| name == "readLines");
         let n_used = used.iter().any(|(name, _)| name == "n");
 
-        assert!(trimws_used, "trimws should be collected");
         assert!(readlines_used, "readLines should be collected");
         assert!(
             !n_used,
@@ -35270,6 +35291,126 @@ x
         assert_eq!(undefined[0].range.start.line, 0);
     }
 
+    /// Default parameter expressions are lazy in R, but Raven intentionally
+    /// treats them as source-order dependencies for the out-of-scope
+    /// diagnostic. A later source() can make this code work if the default is
+    /// forced after the source executes, but depending on that side effect is
+    /// fragile enough to warn on.
+    #[test]
+    fn test_default_parameter_expression_emits_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = false;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+
+        let main_code = "\
+f <- function(a = x) {
+  a
+}
+source(\"helpers.R\")
+";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'x'")
+            })
+            .collect();
+
+        assert_eq!(
+            used_before_x.len(),
+            1,
+            "Default parameter expression `x` should be flagged as a \
+             source-order dependency before the later source(). Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(used_before_x[0].range.start.line, 0);
+    }
+
+    /// A default expression can refer to another formal parameter. If a later
+    /// source() happens to export the same name, the out-of-scope collector
+    /// must not attribute that formal reference to the source target.
+    #[test]
+    fn test_default_parameter_formal_reference_does_not_emit_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = false;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+
+        let main_code = "\
+f <- function(y, x = y) {
+  x
+}
+source(\"helpers.R\")
+";
+        let helpers_code = "y <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_y: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'y'")
+            })
+            .collect();
+
+        assert!(
+            used_before_y.is_empty(),
+            "Formal parameter `y` in `x = y` must not be attributed to the \
+             later source target. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Regression for the worldwide/scripts/data/outcomes.r false positive:
     /// the snapshot out-of-scope collector must NOT treat an identifier that
     /// appears as the field name in `obj$X` (or `obj@X`) as a bare reference
@@ -35457,6 +35598,155 @@ source(\"helpers.R\")
             "LHS target of `z <- 3` must continue to be skipped. Collected usages: {:?}",
             names
         );
+    }
+
+    /// Direct unit tests for the shared `is_structural_non_reference`
+    /// predicate. These complement the end-to-end regressions above by
+    /// asserting the predicate's behavior branch-by-branch — when one of these
+    /// fails, the failing branch is named in the test, no need to chase
+    /// through a diagnostic snapshot to localize the bug.
+    fn nth_identifier_named<'a>(
+        tree: &'a tree_sitter::Tree,
+        text: &str,
+        name: &str,
+        occurrence: usize,
+    ) -> tree_sitter::Node<'a> {
+        fn walk<'a>(
+            node: tree_sitter::Node<'a>,
+            text: &str,
+            name: &str,
+            occurrence: usize,
+            counter: &mut usize,
+            found: &mut Option<tree_sitter::Node<'a>>,
+        ) {
+            if found.is_some() {
+                return;
+            }
+            if node.kind() == "identifier" && &text[node.byte_range()] == name {
+                if *counter == occurrence {
+                    *found = Some(node);
+                    return;
+                }
+                *counter += 1;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, text, name, occurrence, counter, found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+
+        let mut counter = 0usize;
+        let mut found = None;
+        walk(
+            tree.root_node(),
+            text,
+            name,
+            occurrence,
+            &mut counter,
+            &mut found,
+        );
+        found.unwrap_or_else(|| {
+            panic!(
+                "identifier {:?} occurrence #{} not found in source: {:?}",
+                name, occurrence, text
+            )
+        })
+    }
+
+    fn check_predicate(code: &str, name: &str, occurrence: usize, expected: bool) {
+        use crate::handlers::is_structural_non_reference;
+
+        let tree = parse_r_code(code);
+        let node = nth_identifier_named(&tree, code, name, occurrence);
+        let actual = is_structural_non_reference(node, code);
+        let parent_kind = node.parent().map(|p| p.kind().to_string());
+        assert_eq!(
+            actual, expected,
+            "is_structural_non_reference for {:?} occurrence #{} in {:?}: \
+             expected {}, got {} (parent kind: {:?})",
+            name, occurrence, code, expected, actual, parent_kind
+        );
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_bare_identifier() {
+        // Control: a free identifier with no structural parent must be a
+        // reference (predicate returns false).
+        check_predicate("foo\n", "foo", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_left_assignment_lhs() {
+        check_predicate("x <- 1\n", "x", 0, true);
+        check_predicate("x = 1\n", "x", 0, true);
+        check_predicate("x <<- 1\n", "x", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_left_assignment_rhs_is_reference() {
+        // The RHS *value* of `<-` is a real reference and must NOT be
+        // structurally skipped — otherwise undefined-variable diagnostics
+        // would silently miss `a <- b` when `b` is undefined.
+        check_predicate("a <- b\n", "b", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_right_assignment_target() {
+        check_predicate("1 -> x\n", "x", 0, true);
+        check_predicate("1 ->> x\n", "x", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_named_argument_name() {
+        // `n` in `f(n = 1)` is a named-argument label, not a reference.
+        check_predicate("f(n = 1)\n", "n", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_positional_argument_is_reference() {
+        // `n` in `f(n)` is a positional argument value — a real reference.
+        check_predicate("f(n)\n", "n", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_parameter_name() {
+        // `a` in `function(a) 1` is a parameter name; the body identifier
+        // (had there been one referencing `a`) would be a reference. Here we
+        // only assert the structural skip on the parameter name itself.
+        check_predicate("function(a) 1\n", "a", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_default_parameter_split() {
+        // `function(a = b) 1`: `a` is the parameter name (structural), `b`
+        // is the default expression and must remain a reference so an
+        // undefined `b` is still flagged.
+        check_predicate("function(a = b) 1\n", "a", 0, true);
+        check_predicate("function(a = b) 1\n", "b", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_namespace_operator_both_sides() {
+        // Both `pkg` and `name` in `pkg::name` / `pkg:::name` are qualified
+        // references — neither is a bare variable lookup.
+        check_predicate("dplyr::filter(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr::filter(df)\n", "filter", 0, true);
+        check_predicate("dplyr:::filter(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr:::filter(df)\n", "filter", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_extract_operator_rhs_only() {
+        // `obj$field`: the rhs `field` is a member-name string (structural),
+        // but the lhs `obj` is a real reference and must be flagged when
+        // undefined.
+        check_predicate("obj$field\n", "obj", 0, false);
+        check_predicate("obj$field\n", "field", 0, true);
+        check_predicate("obj@slot\n", "obj", 0, false);
+        check_predicate("obj@slot\n", "slot", 0, true);
     }
 
     /// Reproduces the worldwide/scripts/data.r structure end-to-end: a parent
@@ -36725,6 +37015,138 @@ my_func <- function(a = undefined_var) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: undefined_var"),
             "Undefined variable 'undefined_var' in default expression should be flagged"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_prior_parameter_with_default() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(y = 1, x = y) {
+  print(x)
+}
+my_func()
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: y"),
+            "Default expression `x = y` should resolve `y` as a formal parameter. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_required_prior_parameter() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(y, x = y) {
+  print(x)
+}
+my_func(1)
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: y"),
+            "Default expression `x = y` should resolve required formal parameter `y`. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_later_parameter() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(x = y, y = 1) {
+  print(x)
+}
+my_func()
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: y"),
+            "Default expression `x = y` should resolve later formal parameter `y`. \
+             Diagnostics: {:?}",
+            undefined_var_diags
         );
     }
 
