@@ -5758,7 +5758,6 @@ fn collect_out_of_scope_diagnostics(
     }
 }
 
-/// Collect identifier usages with UTF-16 column positions
 /// Returns true if the given identifier node is a *structural non-reference*:
 /// an identifier that exists in the AST but never refers to a value at runtime,
 /// regardless of which diagnostic pipeline is consuming it.
@@ -5775,6 +5774,14 @@ fn collect_out_of_scope_diagnostics(
 /// checks inline. Pipeline-specific skips (e.g. `for_statement` iterator
 /// handling, NSE / formula context) are intentionally NOT included here —
 /// those legitimately differ between pipelines.
+///
+/// Note on the named-argument branch: it is only observable from
+/// `collect_identifier_usages_utf16` (the use-before-source pipeline). The
+/// undefined-variable pipeline (`collect_usages_with_context`) already
+/// early-returns on every identifier inside call arguments via its
+/// `in_call_like_arguments` context flag, so the named-arg check here never
+/// fires for that consumer. The branch is still load-bearing — removing it
+/// would re-introduce the named-arg false positive in the utf16 pipeline.
 fn is_structural_non_reference(node: Node, text: &str) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
 
@@ -5844,6 +5851,12 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
     false
 }
 
+/// Collect identifier usages with UTF-16 column positions for the
+/// use-before-source diagnostic pipeline. Skips universal structural
+/// non-references via `is_structural_non_reference`, plus the
+/// pipeline-specific `for_statement` iterator skip (this pipeline lacks the
+/// scope resolution that the undefined-variable pipeline uses to define the
+/// iterator).
 fn collect_identifier_usages_utf16<'a>(
     node: Node<'a>,
     text: &str,
@@ -5869,26 +5882,24 @@ fn collect_identifier_usages_utf16<'a>(
         &text[start..end]
     };
 
-    if node.kind() == "identifier" {
-        if !is_structural_non_reference(node, text) {
-            // Pipeline-specific skip: the use-before-source pipeline does not
-            // run scope resolution to define the iterator, so skip the
-            // declaration site here. (This intentionally diverges from
-            // `collect_usages_with_context`, which relies on scope resolution.)
-            let skip_for_iter = node.parent().is_some_and(|parent| {
-                parent.kind() == "for_statement"
-                    && parent
-                        .child_by_field_name("variable")
-                        .is_some_and(|var| var.id() == node.id())
-            });
+    if node.kind() == "identifier" && !is_structural_non_reference(node, text) {
+        // Pipeline-specific skip: the use-before-source pipeline does not
+        // run scope resolution to define the iterator, so skip the
+        // declaration site here. (This intentionally diverges from
+        // `collect_usages_with_context`, which relies on scope resolution.)
+        let skip_for_iter = node.parent().is_some_and(|parent| {
+            parent.kind() == "for_statement"
+                && parent
+                    .child_by_field_name("variable")
+                    .is_some_and(|var| var.id() == node.id())
+        });
 
-            if !skip_for_iter {
-                let name = text[node.byte_range()].to_string();
-                let line = node.start_position().row as u32;
-                let line_text = get_line(node.start_position().row);
-                let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
-                usages.push((name, line, col, node));
-            }
+        if !skip_for_iter {
+            let name = text[node.byte_range()].to_string();
+            let line = node.start_position().row as u32;
+            let line_text = get_line(node.start_position().row);
+            let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+            usages.push((name, line, col, node));
         }
     }
 
@@ -35364,6 +35375,155 @@ source(\"helpers.R\")
             "LHS target of `z <- 3` must continue to be skipped. Collected usages: {:?}",
             names
         );
+    }
+
+    /// Direct unit tests for the shared `is_structural_non_reference`
+    /// predicate. These complement the end-to-end regressions above by
+    /// asserting the predicate's behavior branch-by-branch — when one of these
+    /// fails, the failing branch is named in the test, no need to chase
+    /// through a diagnostic snapshot to localize the bug.
+    fn nth_identifier_named<'a>(
+        tree: &'a tree_sitter::Tree,
+        text: &str,
+        name: &str,
+        occurrence: usize,
+    ) -> tree_sitter::Node<'a> {
+        fn walk<'a>(
+            node: tree_sitter::Node<'a>,
+            text: &str,
+            name: &str,
+            occurrence: usize,
+            counter: &mut usize,
+            found: &mut Option<tree_sitter::Node<'a>>,
+        ) {
+            if found.is_some() {
+                return;
+            }
+            if node.kind() == "identifier" && &text[node.byte_range()] == name {
+                if *counter == occurrence {
+                    *found = Some(node);
+                    return;
+                }
+                *counter += 1;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, text, name, occurrence, counter, found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+
+        let mut counter = 0usize;
+        let mut found = None;
+        walk(
+            tree.root_node(),
+            text,
+            name,
+            occurrence,
+            &mut counter,
+            &mut found,
+        );
+        found.unwrap_or_else(|| {
+            panic!(
+                "identifier {:?} occurrence #{} not found in source: {:?}",
+                name, occurrence, text
+            )
+        })
+    }
+
+    fn check_predicate(code: &str, name: &str, occurrence: usize, expected: bool) {
+        use crate::handlers::is_structural_non_reference;
+
+        let tree = parse_r_code(code);
+        let node = nth_identifier_named(&tree, code, name, occurrence);
+        let actual = is_structural_non_reference(node, code);
+        let parent_kind = node.parent().map(|p| p.kind().to_string());
+        assert_eq!(
+            actual, expected,
+            "is_structural_non_reference for {:?} occurrence #{} in {:?}: \
+             expected {}, got {} (parent kind: {:?})",
+            name, occurrence, code, expected, actual, parent_kind
+        );
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_bare_identifier() {
+        // Control: a free identifier with no structural parent must be a
+        // reference (predicate returns false).
+        check_predicate("foo\n", "foo", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_left_assignment_lhs() {
+        check_predicate("x <- 1\n", "x", 0, true);
+        check_predicate("x = 1\n", "x", 0, true);
+        check_predicate("x <<- 1\n", "x", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_left_assignment_rhs_is_reference() {
+        // The RHS *value* of `<-` is a real reference and must NOT be
+        // structurally skipped — otherwise undefined-variable diagnostics
+        // would silently miss `a <- b` when `b` is undefined.
+        check_predicate("a <- b\n", "b", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_right_assignment_target() {
+        check_predicate("1 -> x\n", "x", 0, true);
+        check_predicate("1 ->> x\n", "x", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_named_argument_name() {
+        // `n` in `f(n = 1)` is a named-argument label, not a reference.
+        check_predicate("f(n = 1)\n", "n", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_positional_argument_is_reference() {
+        // `n` in `f(n)` is a positional argument value — a real reference.
+        check_predicate("f(n)\n", "n", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_parameter_name() {
+        // `a` in `function(a) 1` is a parameter name; the body identifier
+        // (had there been one referencing `a`) would be a reference. Here we
+        // only assert the structural skip on the parameter name itself.
+        check_predicate("function(a) 1\n", "a", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_default_parameter_split() {
+        // `function(a = b) 1`: `a` is the parameter name (structural), `b`
+        // is the default expression and must remain a reference so an
+        // undefined `b` is still flagged.
+        check_predicate("function(a = b) 1\n", "a", 0, true);
+        check_predicate("function(a = b) 1\n", "b", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_namespace_operator_both_sides() {
+        // Both `pkg` and `name` in `pkg::name` / `pkg:::name` are qualified
+        // references — neither is a bare variable lookup.
+        check_predicate("dplyr::filter(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr::filter(df)\n", "filter", 0, true);
+        check_predicate("dplyr:::filter(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr:::filter(df)\n", "filter", 0, true);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_extract_operator_rhs_only() {
+        // `obj$field`: the rhs `field` is a member-name string (structural),
+        // but the lhs `obj` is a real reference and must be flagged when
+        // undefined.
+        check_predicate("obj$field\n", "obj", 0, false);
+        check_predicate("obj$field\n", "field", 0, true);
+        check_predicate("obj@slot\n", "obj", 0, false);
+        check_predicate("obj@slot\n", "slot", 0, true);
     }
 
     /// Reproduces the worldwide/scripts/data.r structure end-to-end: a parent
