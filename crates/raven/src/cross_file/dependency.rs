@@ -1305,6 +1305,32 @@ impl DependencyGraph {
         result
     }
 
+    /// Forward-walk descendants from multiple roots with a single shared
+    /// `visited` set. Each node/edge is visited at most once across the whole
+    /// traversal, even if the roots' subtrees overlap (e.g. the edited file
+    /// plus all its backward ancestors during sibling-subtree expansion in
+    /// `compute_affected_dependents_after_edit`). Roots themselves are
+    /// excluded from the result, matching `get_transitive_dependencies`.
+    pub fn get_transitive_dependencies_multi_root<'a, I>(
+        &self,
+        roots: I,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> Vec<Url>
+    where
+        I: IntoIterator<Item = &'a Url>,
+    {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        for root in roots {
+            if visited.len() >= max_visited {
+                break;
+            }
+            self.collect_dependencies(root, max_depth, 0, &mut visited, &mut result, max_visited);
+        }
+        result
+    }
+
     fn collect_dependencies(
         &self,
         uri: &Url,

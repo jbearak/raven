@@ -513,17 +513,14 @@ where
         push_if_new(dep.clone(), &mut seen, &mut result);
     }
 
-    // (2) Forward descendants of edited_uri.
-    for dep in graph.get_transitive_dependencies(edited_uri, max_depth, max_visited) {
+    // (2 + 3) Forward descendants of edited_uri AND of each backward
+    //         ancestor (sibling subtrees), in a single traversal that shares
+    //         a `visited` set so overlapping subtrees aren't re-walked once
+    //         per ancestor. This is `O(union of all forward subtrees)`
+    //         rather than `O(|ancestors| * subtree)`.
+    let forward_roots = std::iter::once(edited_uri).chain(backward.iter());
+    for dep in graph.get_transitive_dependencies_multi_root(forward_roots, max_depth, max_visited) {
         push_if_new(dep, &mut seen, &mut result);
-    }
-
-    // (3) Sibling subtrees: for each backward ancestor, walk forward to
-    //     capture descendants that share an ancestor with edited_uri.
-    for ancestor in &backward {
-        for dep in graph.get_transitive_dependencies(ancestor, max_depth, max_visited) {
-            push_if_new(dep, &mut seen, &mut result);
-        }
     }
 
     result
@@ -1815,5 +1812,45 @@ mod tests {
         let mut sorted = affected.clone();
         sorted.sort_by_key(|u| u.path().to_string());
         assert_eq!(sorted, vec![b, c, d], "diamond must yield deduped URIs");
+    }
+
+    #[test]
+    fn test_compute_affected_edges_only_revalidates_dependents() {
+        // edges_changed=true with interface_changed=false must still walk
+        // dependents — e.g. when a file's `source()` topology changes but
+        // its declared symbols hash to the same value, the cycle/sibling
+        // diagnostics in dependents can still flip.
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        graph.update_file(
+            &parent,
+            &make_meta_with_source("child.R", 1),
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        // child edited; only edges changed (e.g. it added a new source()
+        // line), but its exported interface is unchanged.
+        let affected_from_child =
+            compute_affected_dependents_after_edit(&child, false, true, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected_from_child.len(), 1);
+        assert!(
+            affected_from_child.contains(&parent),
+            "edges_only edit on child must still revalidate its parent"
+        );
+
+        // parent edited; only edges changed.
+        let affected_from_parent =
+            compute_affected_dependents_after_edit(&parent, false, true, &graph, |u| open.contains(u), 10, 200);
+        assert_eq!(affected_from_parent.len(), 1);
+        assert!(
+            affected_from_parent.contains(&child),
+            "edges_only edit on parent must still revalidate its forward subtree"
+        );
     }
 }

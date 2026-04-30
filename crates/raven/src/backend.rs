@@ -1493,7 +1493,6 @@ impl LanguageServer for Backend {
             // for the symmetric backward+forward walk — children of `uri` also
             // need revalidation because their inherited scope is taken from
             // `uri`'s symbols at the source() call site.
-            let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || result.edges_changed {
                 let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &uri,
@@ -1505,21 +1504,15 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
                 for dep in neighbors {
-                    to_force_republish.push(dep.clone());
                     affected.insert(dep);
                 }
             }
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
-                    to_force_republish.push(child.clone());
                     affected.insert(child);
                 }
             }
-            state
-                .diagnostics_gate
-                .mark_force_republish_many(to_force_republish.iter());
-
             // Convert to Vec for sorting
             let mut affected: Vec<Url> = affected.into_iter().collect();
 
@@ -1544,6 +1537,16 @@ impl LanguageServer for Backend {
                 );
                 affected.truncate(max_revalidations);
             }
+
+            // Mark force-republish on the post-truncation set, excluding the
+            // edited URI itself (its publish is driven by its own version
+            // bump, not by a cross-file marker). Marking after the cap
+            // prevents URIs that were dropped from `work_items` from
+            // carrying orphaned force counters that would leak into a
+            // future unrelated same-version publish.
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(affected.iter().filter(|u| **u != uri));
 
             // Build work items with trigger revision snapshot
             let work_items: Vec<_> = affected
@@ -1761,16 +1764,32 @@ impl LanguageServer for Backend {
                         state.cross_file_config.max_chain_depth,
                         state.cross_file_config.max_transitive_dependents_visited,
                     );
-                    let mut to_force_republish: Vec<Url> = Vec::new();
+                    // Dedupe against URIs already scheduled by the initial
+                    // pass and respect the same `max_revalidations_per_trigger`
+                    // cap so a re-enriched edge expansion can't double-mark a
+                    // URI (phantom force-republish counter increments) or
+                    // blow past the cap the initial scheduling honored.
+                    let max_revalidations =
+                        state.cross_file_config.max_revalidations_per_trigger;
+                    let mut already_scheduled: std::collections::HashSet<Url> =
+                        work_items.iter().map(|(u, _, _)| u.clone()).collect();
+                    let mut new_neighbors: Vec<Url> = Vec::new();
                     for dep in neighbors {
-                        to_force_republish.push(dep.clone());
+                        if work_items.len() + new_neighbors.len() >= max_revalidations {
+                            break;
+                        }
+                        if already_scheduled.insert(dep.clone()) {
+                            new_neighbors.push(dep);
+                        }
+                    }
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(new_neighbors.iter());
+                    for dep in new_neighbors {
                         let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
                         let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                         work_items.push((dep, trigger_version, trigger_revision));
                     }
-                    state
-                        .diagnostics_gate
-                        .mark_force_republish_many(to_force_republish.iter());
                     // Re-enrichment moved edges; refresh pins so the open-doc
                     // neighborhood matches the post-update graph.
                     state.recompute_open_neighborhood_pins();
@@ -1873,16 +1892,31 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_chain_depth,
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
-                let mut to_force_republish: Vec<Url> = Vec::new();
+                // Dedupe against URIs already scheduled by the initial pass
+                // and respect the same `max_revalidations_per_trigger` cap.
+                // Without this, a re-enriched edge expansion can double-mark
+                // a URI (phantom force-republish counter increments) or blow
+                // past the cap the initial scheduling honored.
+                let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
+                let mut already_scheduled: std::collections::HashSet<Url> =
+                    work_items.iter().map(|(u, _, _)| u.clone()).collect();
+                let mut new_neighbors: Vec<Url> = Vec::new();
                 for dep in neighbors {
-                    to_force_republish.push(dep.clone());
+                    if work_items.len() + new_neighbors.len() >= max_revalidations {
+                        break;
+                    }
+                    if already_scheduled.insert(dep.clone()) {
+                        new_neighbors.push(dep);
+                    }
+                }
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(new_neighbors.iter());
+                for dep in new_neighbors {
                     let trigger_version = state.documents.get(&dep).and_then(|d| d.version);
                     let trigger_revision = state.documents.get(&dep).map(|d| d.revision);
                     work_items.push((dep, trigger_version, trigger_revision));
                 }
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(to_force_republish.iter());
                 // Re-enrichment moved edges; refresh pins so the open-doc
                 // neighborhood matches the post-update graph.
                 state.recompute_open_neighborhood_pins();
@@ -2194,7 +2228,6 @@ impl LanguageServer for Backend {
             //     the user manually edits `child.R`.
             // Bulk-mark all dependents/children under a single write-lock to
             // skip per-URI lock churn on large fan-outs (Requirement 0.8).
-            let mut to_force_republish: Vec<Url> = Vec::new();
             if interface_changed || edges_changed {
                 let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &uri,
@@ -2206,21 +2239,15 @@ impl LanguageServer for Backend {
                     state.cross_file_config.max_transitive_dependents_visited,
                 );
                 for dep in neighbors {
-                    to_force_republish.push(dep.clone());
                     affected.insert(dep);
                 }
             }
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
-                    to_force_republish.push(child.clone());
                     affected.insert(child);
                 }
             }
-            state
-                .diagnostics_gate
-                .mark_force_republish_many(to_force_republish.iter());
-
             // Convert to Vec for sorting
             let mut affected: Vec<Url> = affected.into_iter().collect();
 
@@ -2245,6 +2272,20 @@ impl LanguageServer for Backend {
                 );
                 affected.truncate(max_revalidations);
             }
+
+            // Bulk-mark dependents under a single write-lock, AFTER the cap
+            // is applied. Iterating the deduped, truncated set prevents two
+            // bugs: (1) a URI present in both the dependency-graph walk and
+            // `wd_affected` would otherwise get its force-republish counter
+            // incremented twice (the counter decrements only on a consumed
+            // publish, so duplicate marks leak as phantom markers); (2) URIs
+            // dropped by the cap would otherwise carry orphaned force
+            // counters that leak into a future unrelated same-version
+            // publish. The edited URI itself is excluded — its publish is
+            // driven by its own version bump.
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(affected.iter().filter(|u| **u != uri));
 
             // Build work items with trigger revision snapshot for freshness guard
             let work_items: Vec<_> = affected
@@ -3002,10 +3043,15 @@ impl LanguageServer for Backend {
                         );
                         // Collect open children for diagnostics; bulk-mark
                         // them so the watched-files burst doesn't acquire the
-                        // gate's write lock once per affected child.
+                        // gate's write lock once per affected child. Skip any
+                        // child already scheduled for the affected_for_async
+                        // pipeline — otherwise that URI gets force-republish
+                        // marked twice (phantom counter) and published twice
+                        // (once by the WD loop, once by the async loop).
                         let mut newly_affected: Vec<Url> = Vec::new();
                         for child in wd_children {
                             if state.documents.contains_key(&child)
+                                && !affected_for_async_set.contains(&child)
                                 && wd_affected_children_set.insert(child.clone())
                             {
                                 newly_affected.push(child.clone());
@@ -3023,6 +3069,8 @@ impl LanguageServer for Backend {
                         // its new content (e.g. a freshly-added `source()`
                         // call) is invisible to that pass. Re-running the
                         // walk here picks up newly-reachable open neighbors.
+                        // Skip any URI already in the WD pipeline so the two
+                        // publish loops don't race on the same URI.
                         let mut newly_affected_post_update: Vec<Url> = Vec::new();
                         if graph_result.edges_changed {
                             let post_neighbors =
@@ -3036,7 +3084,9 @@ impl LanguageServer for Backend {
                                     state.cross_file_config.max_transitive_dependents_visited,
                                 );
                             for dep in post_neighbors {
-                                if affected_for_async_set.insert(dep.clone()) {
+                                if !wd_affected_children_set.contains(&dep)
+                                    && affected_for_async_set.insert(dep.clone())
+                                {
                                     newly_affected_post_update.push(dep);
                                 }
                             }
