@@ -5654,67 +5654,88 @@ fn collect_out_of_scope_diagnostics(
     let mut emitted: std::collections::HashSet<(String, u32, u32)> =
         std::collections::HashSet::new();
 
+    use crate::cross_file::path_resolve::{
+        resolve_path, resolve_path_with_workspace_fallback, PathContext,
+    };
+
+    // Use PathContext::from_metadata (respects @lsp-cd, splits AST vs
+    // directive sources) to match the snapshot path's resolution
+    // semantics. Without this, files declaring @lsp-cd would resolve
+    // their source() targets relative to the wrong base directory.
+    let source_path_ctx =
+        PathContext::from_metadata(uri, directive_meta, state.workspace_folders.first());
+
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        if let Some(doc) = state.documents.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                return Some(Arc::new(scope::compute_artifacts(
+                    target_uri,
+                    tree,
+                    &doc.text(),
+                )));
+            }
+        }
+        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
+            return Some(artifacts);
+        }
+        if let Some(doc) = state.workspace_index.get(target_uri) {
+            if let Some(tree) = &doc.tree {
+                return Some(Arc::new(scope::compute_artifacts(
+                    target_uri,
+                    tree,
+                    &doc.text(),
+                )));
+            }
+        }
+        None
+    };
+
+    // Memoize per source URI: if the same file is sourced from multiple
+    // `source()` calls / `@lsp-source` directives in this document, we
+    // must not recompute its live top-level exports each time.
+    // `live_top_level_exports` walks the timeline and allocates a fresh
+    // `HashSet`, so per-source-call recomputation is the hot-path
+    // pattern that the doc comment in `cross_file::scope` warns against.
+    let mut source_exports_cache: HashMap<Url, std::collections::HashSet<String>> = HashMap::new();
+
     // For each source() call, check if any symbols from that file are used before the call
     for source in &source_calls {
         if cancel.is_cancelled() {
             return;
         }
+        // Skip sources that don't bring symbols into the current scope
+        // (`local=TRUE`, `sys.source` with a non-global env). The
+        // snapshot collector does this; without it we'd flag symbols
+        // that are never actually inherited.
+        if !source.inherits_symbols() {
+            continue;
+        }
         let source_line = source.line;
         let source_col = source.column; // Already UTF-16
 
-        // Resolve the source path
-        let resolve_path = |path: &str| -> Option<Url> {
-            let from_path = uri.to_file_path().ok()?;
-            let parent_dir = from_path.parent()?;
-            let resolved = parent_dir.join(path);
-            let normalized = crate::cross_file::path_resolve::normalize_path_public(&resolved)?;
-            Url::from_file_path(normalized).ok()
-        };
-
-        let Some(source_uri) = resolve_path(&source.path) else {
+        let Some(source_uri) = source_path_ctx.as_ref().and_then(|ctx| {
+            let resolved = if source.is_directive {
+                resolve_path(&source.path, ctx)
+            } else {
+                resolve_path_with_workspace_fallback(&source.path, ctx)
+            }?;
+            Url::from_file_path(resolved).ok()
+        }) else {
             continue;
         };
 
-        // Get symbols from the sourced file
-        let source_symbols: std::collections::HashSet<String> = {
-            let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-                // Try open documents first (authoritative)
-                if let Some(doc) = state.documents.get(target_uri) {
-                    if let Some(tree) = &doc.tree {
-                        return Some(Arc::new(scope::compute_artifacts(
-                            target_uri,
-                            tree,
-                            &doc.text(),
-                        )));
-                    }
-                }
-                // Try cross-file workspace index (preferred for closed files)
-                if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri)
-                {
-                    return Some(artifacts);
-                }
-                // Fallback to legacy workspace index
-                if let Some(doc) = state.workspace_index.get(target_uri) {
-                    if let Some(tree) = &doc.tree {
-                        return Some(Arc::new(scope::compute_artifacts(
-                            target_uri,
-                            tree,
-                            &doc.text(),
-                        )));
-                    }
-                }
-                None
-            };
-
-            // `live_top_level_exports`, not `exported_interface.keys()`:
-            // a sourced file that defines-then-removes a symbol does not
-            // actually make it available, and firing a "used before
-            // sourced" diagnostic in that case is misleading — the
-            // undefined-variable diagnostic should fire instead.
-            get_artifacts(&source_uri)
-                .map(|a| crate::cross_file::scope::live_top_level_exports(&a))
-                .unwrap_or_default()
-        };
+        // `live_top_level_exports`, not `exported_interface.keys()`:
+        // a sourced file that defines-then-removes a symbol does not
+        // actually make it available, and firing a "used before
+        // sourced" diagnostic in that case is misleading — the
+        // undefined-variable diagnostic should fire instead.
+        let source_symbols = source_exports_cache
+            .entry(source_uri.clone())
+            .or_insert_with(|| {
+                get_artifacts(&source_uri)
+                    .map(|a| crate::cross_file::scope::live_top_level_exports(&a))
+                    .unwrap_or_default()
+            });
 
         // Check for usages of these symbols before the source() call
         for (name, usage_line, usage_col, usage_node) in &usages {
