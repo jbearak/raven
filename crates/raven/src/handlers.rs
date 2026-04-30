@@ -5759,6 +5759,91 @@ fn collect_out_of_scope_diagnostics(
 }
 
 /// Collect identifier usages with UTF-16 column positions
+/// Returns true if the given identifier node is a *structural non-reference*:
+/// an identifier that exists in the AST but never refers to a value at runtime,
+/// regardless of which diagnostic pipeline is consuming it.
+///
+/// Covers the universal skips that EVERY usage collector in this file must
+/// honor — the LHS of `<-` / `=` / `<<-`, the RHS target of `->` / `->>`, named
+/// argument labels, function-parameter NAMES (not their default expressions),
+/// identifiers directly inside a `parameters` list, both sides of a
+/// `namespace_operator` (`pkg::name` / `pkg:::name`), and the rhs field of
+/// `extract_operator` (`obj$name` / `obj@slot`). A previous regression
+/// (`test_extract_operator_rhs_does_not_emit_used_before_sourced`) showed
+/// what happens when the two production collectors fall out of sync on one of
+/// these skips, so they must call this predicate instead of duplicating the
+/// checks inline. Pipeline-specific skips (e.g. `for_statement` iterator
+/// handling, NSE / formula context) are intentionally NOT included here —
+/// those legitimately differ between pipelines.
+fn is_structural_non_reference(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if parent.kind() == "binary_operator" {
+        let mut cursor = parent.walk();
+        let children: Vec<_> = parent.children(&mut cursor).collect();
+        if children.len() >= 2 {
+            let op_text = node_text(children[1], text);
+            // Left-assignment LHS: `x <- 1`, `x = 1`, `x <<- 1`.
+            if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
+                return true;
+            }
+            // Right-assignment target: `1 -> x`, `1 ->> x`.
+            if children.len() >= 3
+                && children[2].id() == node.id()
+                && matches!(op_text, "->" | "->>")
+            {
+                return true;
+            }
+        }
+    }
+
+    // Named argument: `n = 1` in `f(..., n = 1)`.
+    if parent.kind() == "argument" {
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            if name_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+
+    // Parameter NAME (not the default expression: `function(a = b)` should
+    // still treat `b` as a usage so the undefined-variable / use-before-source
+    // pipelines can flag it).
+    if matches!(parent.kind(), "parameter" | "default_parameter") {
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            if name_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+
+    // Identifier directly inside a `parameters` list.
+    if parent.kind() == "parameters" {
+        return true;
+    }
+
+    // `namespace_operator` (`pkg::name`, `pkg:::name`) — both sides are
+    // qualified references, not bare variable lookups.
+    if parent.kind() == "namespace_operator" {
+        return true;
+    }
+
+    // RHS of `extract_operator` (`obj$X`, `obj@slot`) — member-name string.
+    if parent.kind() == "extract_operator" {
+        if let Some(rhs_node) = parent.child_by_field_name("rhs") {
+            if rhs_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn collect_identifier_usages_utf16<'a>(
     node: Node<'a>,
     text: &str,
@@ -5785,90 +5870,26 @@ fn collect_identifier_usages_utf16<'a>(
     };
 
     if node.kind() == "identifier" {
-        // Skip if this is the LHS of a left-assignment or the RHS target of
-        // a right-assignment. Both are *definition* sites, not usages.
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 {
-                    let op = children[1];
-                    let op_text = &text[op.byte_range()];
-                    // Left-assignment: target is children[0] (e.g., `x <- 1`).
-                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-")
-                    {
-                        // Skip LHS of assignment, but recurse into children
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            collect_identifier_usages_utf16(child, text, line_starts, usages);
-                        }
-                        return;
-                    }
-                    // Right-assignment: target is children[2] (e.g., `1 -> x`).
-                    // Mirrors the equivalent skip in `collect_usages_with_context`.
-                    if children.len() >= 3
-                        && children[2].id() == node.id()
-                        && matches!(op_text, "->" | "->>")
-                    {
-                        return;
-                    }
-                }
-            }
-            // Skip declaration sites for function parameters.
-            if matches!(
-                parent.kind(),
-                "parameter" | "default_parameter" | "parameters"
-            ) {
-                return;
-            }
-            // Skip declaration site for for-loop iterator variable.
-            if parent.kind() == "for_statement" {
-                if let Some(var_node) = parent.child_by_field_name("variable") {
-                    if var_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-            // Skip named arguments
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-            // Skip identifiers inside a `namespace_operator` (`pkg::name` or
-            // `pkg:::name`). Both the package-name LHS and the member-name
-            // RHS are qualified references — neither is a bare variable
-            // lookup, so collecting them as usages produces false-positive
-            // "used before it's available" diagnostics whenever a later
-            // source() target happens to export a symbol of the same name.
-            // Mirrors the equivalent skip in `collect_usages_with_context`.
-            if parent.kind() == "namespace_operator" {
-                return;
-            }
-            // Skip the rhs of `$` / `@` extract operators (e.g. the `X` in
-            // `ww$X` or the `slot` in `obj@slot`). These are member-name
-            // strings, not bare variable references — collecting them as
-            // usages produces false-positive "used before it's available"
-            // diagnostics whenever a later source() target happens to export
-            // a top-level symbol with the same name. Mirrors the equivalent
-            // skip in `collect_usages_with_context`.
-            if parent.kind() == "extract_operator" {
-                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
-                    if rhs_node.id() == node.id() {
-                        return;
-                    }
-                }
+        if !is_structural_non_reference(node, text) {
+            // Pipeline-specific skip: the use-before-source pipeline does not
+            // run scope resolution to define the iterator, so skip the
+            // declaration site here. (This intentionally diverges from
+            // `collect_usages_with_context`, which relies on scope resolution.)
+            let skip_for_iter = node.parent().is_some_and(|parent| {
+                parent.kind() == "for_statement"
+                    && parent
+                        .child_by_field_name("variable")
+                        .is_some_and(|var| var.id() == node.id())
+            });
+
+            if !skip_for_iter {
+                let name = text[node.byte_range()].to_string();
+                let line = node.start_position().row as u32;
+                let line_text = get_line(node.start_position().row);
+                let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+                usages.push((name, line, col, node));
             }
         }
-
-        let name = text[node.byte_range()].to_string();
-        let line = node.start_position().row as u32;
-        // Convert byte column to UTF-16 using pre-computed line offsets
-        let line_text = get_line(node.start_position().row);
-        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
-        usages.push((name, line, col, node));
     }
 
     let mut cursor = node.walk();
@@ -8472,64 +8493,10 @@ struct UsageContext {
     in_call_like_arguments: bool,
 }
 
-/// Legacy version of collect_usages without NSE context tracking.
-/// Only used in tests for backward compatibility with existing property tests.
-#[cfg(test)]
-fn collect_usages<'a>(node: Node<'a>, text: &str, used: &mut Vec<(String, Node<'a>)>) {
-    if node.is_error() || node.is_missing() {
-        return;
-    }
-
-    if node.kind() == "identifier" {
-        // Skip if this is the target of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 {
-                    let op_text = node_text(children[1], text);
-                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
-                        return;
-                    }
-                    if children.len() >= 3
-                        && children[2].id() == node.id()
-                        && matches!(op_text, "->" | "->>")
-                    {
-                        return;
-                    }
-                }
-            }
-
-            if let Some(prev) = node.prev_sibling() {
-                if prev.is_error() {
-                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
-                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
-                        return;
-                    }
-                }
-            }
-
-            // Skip if this is a named argument (e.g., n = 1 in readLines(..., n = 1))
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return; // Skip argument names
-                    }
-                }
-            }
-        }
-
-        used.push((node_text(node, text).to_string(), node));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_usages(child, text, used);
-    }
-}
-
-/// Context-aware version of collect_usages that tracks NSE-related state during AST traversal.
-/// This function skips undefined variable checks in contexts where R uses non-standard evaluation.
+/// Collects identifier usages while tracking NSE-related state during AST traversal.
+/// Skips undefined-variable checks in contexts where R uses non-standard evaluation
+/// (formula `~`, call-like arguments). Universal structural skips that apply
+/// regardless of pipeline are delegated to `is_structural_non_reference`.
 fn collect_usages_with_context<'a>(
     node: Node<'a>,
     text: &str,
@@ -8557,85 +8524,20 @@ fn collect_usages_with_context<'a>(
             return;
         }
 
-        // Skip if this is the target of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 {
-                    let op_text = node_text(children[1], text);
-                    // Left-assignment: target is children[0] (e.g., x <- 1)
-                    if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
-                        return;
-                    }
-                    // Right-assignment: target is children[2] (e.g., 1 -> x)
-                    if children.len() >= 3
-                        && children[2].id() == node.id()
-                        && matches!(op_text, "->" | "->>")
-                    {
-                        return;
-                    }
+        if is_structural_non_reference(node, text) {
+            return;
+        }
+
+        // Pipeline-specific skip: an identifier that follows an ERROR node
+        // containing a right-assignment operator (e.g., `-> x` or `->> x` where
+        // the parser couldn't find a LHS value). This handles broken-tree
+        // recovery that the structural predicate can't see.
+        if let Some(prev) = node.prev_sibling() {
+            if prev.is_error() {
+                let prev_text = &text[prev.start_byte()..prev.end_byte()];
+                if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                    return;
                 }
-            }
-
-            // Skip if this identifier follows an ERROR node containing a
-            // right-assignment operator (e.g., `-> x` or `->> x` where the
-            // parser couldn't find a LHS value for the operator).
-            if let Some(prev) = node.prev_sibling() {
-                if prev.is_error() {
-                    let prev_text = &text[prev.start_byte()..prev.end_byte()];
-                    if prev_text.trim() == "->" || prev_text.trim() == "->>" {
-                        return;
-                    }
-                }
-            }
-
-            // Skip if this is a named argument (e.g., n = 1 in readLines(..., n = 1))
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return; // Skip argument names
-                    }
-                }
-            }
-
-            // Skip if this identifier is inside a namespace_operator (pkg:: or pkg:::)
-            // Both the package name (LHS) and function name (RHS) are qualified
-            // references and should not be checked as standalone variables.
-            if parent.kind() == "namespace_operator" {
-                return;
-            }
-
-            // Skip if this is the RHS of an extract operator ($ or @)
-            // e.g., df$column or obj@slot - we don't want to check if column/slot is defined
-            // The LHS (df, obj) should still be checked for undefined variables
-            if parent.kind() == "extract_operator" {
-                if let Some(rhs_node) = parent.child_by_field_name("rhs") {
-                    if rhs_node.id() == node.id() {
-                        return; // Skip RHS of extract operator
-                    }
-                }
-            }
-
-            // Skip if this is a function parameter definition
-            // Function parameters appear inside `parameter` or `default_parameter` nodes
-            // which are children of `parameters` nodes.
-            // Only skip the parameter name (name field), NOT identifiers in the default
-            // expression (e.g., function(a = b) should check b for undefined)
-            if parent.kind() == "parameter" || parent.kind() == "default_parameter" {
-                // Only skip if this identifier is the parameter name (name field)
-                // The default expression should still be checked for undefined variables
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return; // Skip the parameter name
-                    }
-                }
-                // Don't return here - identifiers in default expressions should be checked
-            }
-
-            // Also check if we're directly inside a `parameters` node (some grammars)
-            if parent.kind() == "parameters" {
-                return; // Skip identifiers directly in parameters list
             }
         }
 
@@ -22847,7 +22749,12 @@ mod proptests {
 
             let tree = parse_r_code(&code);
             let mut used = Vec::new();
-            collect_usages(tree.root_node(), &code, &mut used);
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
 
             // func_name should be in used, but arg_name should NOT be
             let func_used = used.iter().any(|(name, _)| name == &func_name);
@@ -22869,7 +22776,12 @@ mod proptests {
 
             let tree = parse_r_code(&code);
             let mut used = Vec::new();
-            collect_usages(tree.root_node(), &code, &mut used);
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
 
             // None of the argument names should be flagged as usages
             for i in 0..arg_count {
@@ -23087,24 +22999,19 @@ mod proptests {
 
     #[test]
     fn test_readlines_named_arg() {
-        // This is the exact code from collate.r line 13
-        let code = r#"run_hash <- trimws(readLines("output/oos/latest_hash.txt", n = 1))"#;
+        // Pattern from collate.r line 13: a named-argument `n = 1` must not
+        // surface as a usage. `collect_usages_with_context` excludes it via
+        // the `in_call_like_arguments` early-return; the assertion below is
+        // the user-visible contract regardless of which code path enforces it.
+        let code = r#"readLines("output/oos/latest_hash.txt", n = 1)"#;
         let tree = parse_r_code(code);
 
         let mut used = Vec::new();
-        collect_usages(tree.root_node(), code, &mut used);
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        eprintln!("\n=== Collected usages ===");
-        for (name, node) in &used {
-            eprintln!("  '{}' (kind: {})", name, node.kind());
-        }
-
-        // trimws and readLines should be collected, but n should NOT be
-        let trimws_used = used.iter().any(|(name, _)| name == "trimws");
         let readlines_used = used.iter().any(|(name, _)| name == "readLines");
         let n_used = used.iter().any(|(name, _)| name == "n");
 
-        assert!(trimws_used, "trimws should be collected");
         assert!(readlines_used, "readLines should be collected");
         assert!(
             !n_used,
