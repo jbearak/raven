@@ -5817,9 +5817,11 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
         }
     }
 
-    // Parameter NAME (not the default expression: `function(a = b)` should
-    // still treat `b` as a usage so the undefined-variable / use-before-source
-    // pipelines can flag it).
+    // Parameter NAME only. Default expressions are intentionally treated as
+    // usages: R evaluates them lazily, but the out-of-scope diagnostic flags
+    // source-order dependencies such as `function(a = b)` before a later
+    // `source()` that defines `b`, because relying on that later side effect
+    // is fragile.
     if matches!(parent.kind(), "parameter" | "default_parameter") {
         if let Some(name_node) = parent.child_by_field_name("name") {
             if name_node.id() == node.id() {
@@ -5851,12 +5853,94 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
     false
 }
 
+/// Returns true when `node` is an identifier inside a default-parameter
+/// expression that names one of the containing function's formal parameters.
+///
+/// In R, default expressions are evaluated in the function call frame, where
+/// all formals are bound as promises. That means `function(y, x = y)` and even
+/// `function(x = y, y = 1)` are valid name lookups for `y`. This is narrower
+/// than treating every default-expression identifier as locally defined:
+/// `function(x = missing)` must still allow undefined-variable diagnostics,
+/// and `function(a = x)` must still allow source-order diagnostics when `x` is
+/// only provided by a later `source()`.
+fn references_formal_from_default_expression(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    let Some(default_parameter) = containing_default_parameter(node) else {
+        return false;
+    };
+
+    if default_parameter
+        .child_by_field_name("name")
+        .is_some_and(|name_node| name_node.id() == node.id())
+    {
+        return false;
+    }
+
+    let Some(parameters) = default_parameter.parent().filter(|n| n.kind() == "parameters") else {
+        return false;
+    };
+
+    let name = node_text(node, text);
+    let mut cursor = parameters.walk();
+    for child in parameters.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        if parameter_node_name(child, text).is_some_and(|param_name| param_name == name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn containing_default_parameter(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "default_parameter" {
+            return Some(parent);
+        }
+        if parent.kind() == "parameter" {
+            if let Some(default_node) = parent.child_by_field_name("default") {
+                let node_range = node.byte_range();
+                let default_range = default_node.byte_range();
+                if default_range.start <= node_range.start && node_range.end <= default_range.end {
+                    return Some(parent);
+                }
+            }
+        }
+        current = parent;
+    }
+    None
+}
+
+fn parameter_node_name<'a>(node: Node<'a>, text: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "parameter" | "default_parameter" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                return Some(node_text(name_node, text));
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if matches!(child.kind(), "identifier" | "dots") {
+                    return Some(node_text(child, text));
+                }
+            }
+            None
+        }
+        "identifier" | "dots" => Some(node_text(node, text)),
+        _ => None,
+    }
+}
+
 /// Collect identifier usages with UTF-16 column positions for the
 /// use-before-source diagnostic pipeline. Skips universal structural
-/// non-references via `is_structural_non_reference`, plus the
-/// pipeline-specific `for_statement` iterator skip (this pipeline lacks the
-/// scope resolution that the undefined-variable pipeline uses to define the
-/// iterator).
+/// non-references via `is_structural_non_reference`, formal references inside
+/// default-parameter expressions, plus the pipeline-specific `for_statement`
+/// iterator skip (this pipeline lacks the scope resolution that the
+/// undefined-variable pipeline uses to define the iterator).
 fn collect_identifier_usages_utf16<'a>(
     node: Node<'a>,
     text: &str,
@@ -5895,6 +5979,10 @@ fn collect_identifier_usages_utf16<'a>(
         });
 
         if !skip_for_iter {
+            if references_formal_from_default_expression(node, text) {
+                return;
+            }
+
             let name = text[node.byte_range()].to_string();
             let line = node.start_position().row as u32;
             let line_text = get_line(node.start_position().row);
@@ -8506,7 +8594,8 @@ struct UsageContext {
 
 /// Collects identifier usages while tracking NSE-related state during AST traversal.
 /// Skips undefined-variable checks in contexts where R uses non-standard evaluation
-/// (formula `~`, call-like arguments). Universal structural skips that apply
+/// (formula `~`, call-like arguments), plus formal references inside
+/// default-parameter expressions. Universal structural skips that apply
 /// regardless of pipeline are delegated to `is_structural_non_reference`.
 fn collect_usages_with_context<'a>(
     node: Node<'a>,
@@ -8536,6 +8625,10 @@ fn collect_usages_with_context<'a>(
         }
 
         if is_structural_non_reference(node, text) {
+            return;
+        }
+
+        if references_formal_from_default_expression(node, text) {
             return;
         }
 
@@ -35188,6 +35281,126 @@ x
         assert_eq!(undefined[0].range.start.line, 0);
     }
 
+    /// Default parameter expressions are lazy in R, but Raven intentionally
+    /// treats them as source-order dependencies for the out-of-scope
+    /// diagnostic. A later source() can make this code work if the default is
+    /// forced after the source executes, but depending on that side effect is
+    /// fragile enough to warn on.
+    #[test]
+    fn test_default_parameter_expression_emits_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = false;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+
+        let main_code = "\
+f <- function(a = x) {
+  a
+}
+source(\"helpers.R\")
+";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'x'")
+            })
+            .collect();
+
+        assert_eq!(
+            used_before_x.len(),
+            1,
+            "Default parameter expression `x` should be flagged as a \
+             source-order dependency before the later source(). Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(used_before_x[0].range.start.line, 0);
+    }
+
+    /// A default expression can refer to another formal parameter. If a later
+    /// source() happens to export the same name, the out-of-scope collector
+    /// must not attribute that formal reference to the source target.
+    #[test]
+    fn test_default_parameter_formal_reference_does_not_emit_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = false;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+
+        let main_code = "\
+f <- function(y, x = y) {
+  x
+}
+source(\"helpers.R\")
+";
+        let helpers_code = "y <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before_y: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'y'")
+            })
+            .collect();
+
+        assert!(
+            used_before_y.is_empty(),
+            "Formal parameter `y` in `x = y` must not be attributed to the \
+             later source target. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Regression for the worldwide/scripts/data/outcomes.r false positive:
     /// the snapshot out-of-scope collector must NOT treat an identifier that
     /// appears as the field name in `obj$X` (or `obj@X`) as a bare reference
@@ -36792,6 +37005,138 @@ my_func <- function(a = undefined_var) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: undefined_var"),
             "Undefined variable 'undefined_var' in default expression should be flagged"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_prior_parameter_with_default() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(y = 1, x = y) {
+  print(x)
+}
+my_func()
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: y"),
+            "Default expression `x = y` should resolve `y` as a formal parameter. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_required_prior_parameter() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(y, x = y) {
+  print(x)
+}
+my_func(1)
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: y"),
+            "Default expression `x = y` should resolve required formal parameter `y`. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_later_parameter() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(x = y, y = 1) {
+  print(x)
+}
+my_func()
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: y"),
+            "Default expression `x = y` should resolve later formal parameter `y`. \
+             Diagnostics: {:?}",
+            undefined_var_diags
         );
     }
 
