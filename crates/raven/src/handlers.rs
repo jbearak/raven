@@ -5039,7 +5039,13 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     // `Declaration` events with later top-level `rm()`s applied. Using
     // `exported_interface.keys()` here would be rm-blind and produce a
     // misleading "used before sourced" diagnostic for a symbol the source
-    // defines and then removes. The set is built once per source() call.
+    // defines and then removes.
+    //
+    // Memoize per resolved target URI so a file sourcing the same target
+    // twice does not pay the timeline-replay cost twice. The doc comment
+    // on `live_top_level_exports` flags per-source-call lookups as a hot
+    // path that must be cached.
+    let mut live_exports_cache: HashMap<Url, HashSet<String>> = HashMap::new();
     let source_target_live_exports: Vec<Option<HashSet<String>>> = source_calls
         .iter()
         .map(|source| {
@@ -5055,10 +5061,15 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 Url::from_file_path(resolved).ok()
             });
             resolved_uri.and_then(|target_uri| {
-                snapshot
+                if let Some(cached) = live_exports_cache.get(&target_uri) {
+                    return Some(cached.clone());
+                }
+                let computed = snapshot
                     .artifacts_map
                     .get(&target_uri)
-                    .map(|artifacts| crate::cross_file::scope::live_top_level_exports(artifacts))
+                    .map(|artifacts| crate::cross_file::scope::live_top_level_exports(artifacts))?;
+                live_exports_cache.insert(target_uri, computed.clone());
+                Some(computed)
             })
         })
         .collect();

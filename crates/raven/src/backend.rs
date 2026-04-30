@@ -2807,9 +2807,6 @@ impl LanguageServer for Backend {
             // watched-file changes can otherwise spend the lock-hold time
             // doing Vec::contains scans per dependent.
             let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
-            // Collect every URI we will force-republish so we can bulk-mark
-            // them at the end of the lock under one write-lock acquisition.
-            let mut newly_affected: Vec<Url> = Vec::new();
 
             for change in &params.changes {
                 let uri = &change.uri;
@@ -2848,7 +2845,6 @@ impl LanguageServer for Backend {
                             );
                         for dep in neighbors {
                             if affected_set.insert(dep.clone()) {
-                                newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
                         }
@@ -2871,7 +2867,6 @@ impl LanguageServer for Backend {
                             );
                         for dep in neighbors {
                             if affected_set.insert(dep.clone()) {
-                                newly_affected.push(dep.clone());
                                 affected.push(dep);
                             }
                         }
@@ -2889,9 +2884,32 @@ impl LanguageServer for Backend {
                     _ => {}
                 }
             }
+
+            // Apply revalidation cap to honor `max_revalidations_per_trigger`
+            // for watched-file fanouts (matches did_change/did_open). A burst
+            // of watched-file events (e.g. `git checkout` rewriting many
+            // files) can otherwise schedule unbounded publishes. Sort by
+            // activity priority so the highest-value docs survive the
+            // truncate. Truncating BEFORE `mark_force_republish_many`
+            // prevents orphaned force-republish counters on dropped URIs
+            // from leaking into a future unrelated same-version publish
+            // (same invariant as commit 71ca32f).
+            let activity = &state.cross_file_activity;
+            affected.sort_by_key(|u| activity.priority_score(u).saturating_add(1));
+            let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
+            if affected.len() > max_revalidations {
+                log::trace!(
+                    "Watched-files revalidation cap exceeded: {} affected, scheduling {}",
+                    affected.len(),
+                    max_revalidations
+                );
+                affected.truncate(max_revalidations);
+            }
+            // Bulk-mark force-republish on the post-truncation set under a
+            // single write-lock acquisition.
             state
                 .diagnostics_gate
-                .mark_force_republish_many(newly_affected.iter());
+                .mark_force_republish_many(affected.iter());
             // Watched-file deletions can drop edges that put a closed neighbor
             // outside the open-document neighborhood; refresh the pin set so
             // newly unreachable URIs become LRU-evictable again.

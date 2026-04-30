@@ -1245,25 +1245,40 @@ impl DependencyGraph {
         max_visited: usize,
     ) -> Vec<Url> {
         let mut result = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited: HashMap<Url, usize> = HashMap::new();
         self.collect_dependents(uri, max_depth, 0, &mut visited, &mut result, max_visited);
         result
     }
 
+    /// `visited` tracks the *shallowest* depth at which each URI has been
+    /// reached. Same depth-shortest invariant as `collect_dependencies`:
+    /// a revisit at a strictly shallower depth must continue recursing so
+    /// ancestors reachable within the budget through the shorter path are
+    /// not silently dropped.
     fn collect_dependents(
         &self,
         uri: &Url,
         max_depth: usize,
         current_depth: usize,
-        visited: &mut HashSet<Url>,
+        visited: &mut HashMap<Url, usize>,
         result: &mut Vec<Url>,
         max_visited: usize,
     ) {
-        if current_depth > max_depth || visited.len() >= max_visited || !visited.insert(uri.clone())
-        {
+        if current_depth > max_depth {
             return;
         }
-        if current_depth > 0 {
+        let is_first_visit = match visited.get(uri) {
+            Some(&prev_depth) if prev_depth <= current_depth => return,
+            Some(_) => false,
+            None => {
+                if visited.len() >= max_visited {
+                    return;
+                }
+                true
+            }
+        };
+        visited.insert(uri.clone(), current_depth);
+        if is_first_visit && current_depth > 0 {
             result.push(uri.clone());
         }
         if current_depth == max_depth {
@@ -1271,7 +1286,7 @@ impl DependencyGraph {
         }
 
         for edge in self.get_dependents(uri) {
-            if visited.len() >= max_visited {
+            if visited.len() >= max_visited && !visited.contains_key(&edge.from) {
                 break;
             }
             self.collect_dependents(
@@ -1300,17 +1315,18 @@ impl DependencyGraph {
         max_visited: usize,
     ) -> Vec<Url> {
         let mut result = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited: HashMap<Url, usize> = HashMap::new();
         self.collect_dependencies(uri, max_depth, 0, &mut visited, &mut result, max_visited);
         result
     }
 
     /// Forward-walk descendants from multiple roots with a single shared
-    /// `visited` set. Each node/edge is visited at most once across the whole
-    /// traversal, even if the roots' subtrees overlap (e.g. the edited file
-    /// plus all its backward ancestors during sibling-subtree expansion in
-    /// `compute_affected_dependents_after_edit`). Roots themselves are
-    /// excluded from the result, matching `get_transitive_dependencies`.
+    /// `visited` map. Each node/edge is visited at most once across the whole
+    /// traversal at the *shallowest* depth found, even if the roots' subtrees
+    /// overlap (e.g. the edited file plus all its backward ancestors during
+    /// sibling-subtree expansion in `compute_affected_dependents_after_edit`).
+    /// Roots themselves are excluded from the result, matching
+    /// `get_transitive_dependencies`.
     pub fn get_transitive_dependencies_multi_root<'a, I>(
         &self,
         roots: I,
@@ -1321,7 +1337,7 @@ impl DependencyGraph {
         I: IntoIterator<Item = &'a Url>,
     {
         let mut result = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited: HashMap<Url, usize> = HashMap::new();
         for root in roots {
             if visited.len() >= max_visited {
                 break;
@@ -1331,20 +1347,36 @@ impl DependencyGraph {
         result
     }
 
+    /// `visited` tracks the *shallowest* depth at which each URI has been
+    /// reached. A revisit at a strictly shallower depth must continue
+    /// recursing so descendants reachable within the budget through the
+    /// shorter path are not silently dropped — diamond-shaped dep graphs
+    /// (a common helper sourced via multiple paths of differing length)
+    /// would otherwise lose subtrees beyond `max_depth - prev_depth`.
     fn collect_dependencies(
         &self,
         uri: &Url,
         max_depth: usize,
         current_depth: usize,
-        visited: &mut HashSet<Url>,
+        visited: &mut HashMap<Url, usize>,
         result: &mut Vec<Url>,
         max_visited: usize,
     ) {
-        if current_depth > max_depth || visited.len() >= max_visited || !visited.insert(uri.clone())
-        {
+        if current_depth > max_depth {
             return;
         }
-        if current_depth > 0 {
+        let is_first_visit = match visited.get(uri) {
+            Some(&prev_depth) if prev_depth <= current_depth => return,
+            Some(_) => false,
+            None => {
+                if visited.len() >= max_visited {
+                    return;
+                }
+                true
+            }
+        };
+        visited.insert(uri.clone(), current_depth);
+        if is_first_visit && current_depth > 0 {
             result.push(uri.clone());
         }
         if current_depth == max_depth {
@@ -1352,7 +1384,7 @@ impl DependencyGraph {
         }
 
         for edge in self.get_dependencies(uri) {
-            if visited.len() >= max_visited {
+            if visited.len() >= max_visited && !visited.contains_key(&edge.to) {
                 break;
             }
             self.collect_dependencies(
@@ -1927,6 +1959,156 @@ mod tests {
 
         let depth1 = graph.get_transitive_dependencies(&a, 1, 200);
         assert_eq!(depth1, vec![b.clone()]);
+    }
+
+    #[test]
+    fn test_transitive_dependencies_diamond_short_path_subtree_not_lost() {
+        // Diamond at differing depths: descendants reachable through the
+        // SHORT path must survive even if the long path was visited first.
+        //
+        //   root → b → c → d → x → y
+        //   root → e → x
+        //
+        // With max_depth = 5, the long path reaches `x` at depth 4 and
+        // recurses into `y` at depth 5 (== max_depth, so `y`'s children
+        // would not be visited). The short path reaches `x` at depth 2; if
+        // edge order forces the long path first, a `HashSet` `visited`
+        // would short-circuit the second visit and lose any descendants
+        // reachable from `x` via the short path.
+        //
+        // We exercise the reachability invariant by adding `y` and `z` so
+        // that on the SHORT path z is at depth 4 (≤ max_depth) but on the
+        // LONG path z would be at depth 6 (> max_depth). Without
+        // depth-shortest tracking, `z` is missing whenever the long path
+        // visits `x` first.
+        let mut graph = DependencyGraph::new();
+        let root = url("root.R");
+        let b = url("b.R");
+        let c = url("c.R");
+        let d = url("d.R");
+        let e = url("e.R");
+        let x = url("x.R");
+        let y = url("y.R");
+        let z = url("z.R");
+
+        // Long path: root → b → c → d → x
+        use super::super::types::ForwardSource;
+        let meta_root = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "b.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "e.R".to_string(),
+                    line: 2,
+                    column: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&root, &meta_root, Some(&workspace_root()), |_| None);
+        graph.update_file(
+            &b,
+            &make_meta_with_source("c.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &c,
+            &make_meta_with_source("d.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &d,
+            &make_meta_with_source("x.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        // Short path: root → e → x
+        graph.update_file(
+            &e,
+            &make_meta_with_source("x.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        // x → y → z
+        graph.update_file(
+            &x,
+            &make_meta_with_source("y.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &y,
+            &make_meta_with_source("z.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        // max_depth = 5. Short path: root(0)→e(1)→x(2)→y(3)→z(4) — all
+        // reachable. Long path: root(0)→b(1)→c(2)→d(3)→x(4)→y(5)→z(6,
+        // beyond max). With shortest-depth tracking, z must be in result
+        // regardless of edge iteration order.
+        let deps = graph.get_transitive_dependencies(&root, 5, 1000);
+        assert!(deps.contains(&z), "z must be reachable via the short path; deps={deps:?}");
+        assert!(deps.contains(&y), "y must be reachable; deps={deps:?}");
+        assert!(deps.contains(&x), "x must be in deps; deps={deps:?}");
+    }
+
+    #[test]
+    fn test_transitive_dependents_diamond_short_path_subtree_not_lost() {
+        // Symmetric case for the backward walk: ancestors reachable through
+        // a short path must survive even if a long path was visited first.
+        //
+        //   root_anc → mid → x      (long path: ancestor at depth 2)
+        //   short_anc → x           (short path: ancestor at depth 1)
+        //
+        // x's transitive dependents (parents-of-parents) must include
+        // root_anc regardless of edge iteration order.
+        let mut graph = DependencyGraph::new();
+        let root_anc = url("root_anc.R");
+        let mid = url("mid.R");
+        let short_anc = url("short_anc.R");
+        let x = url("x.R");
+
+        // root_anc → mid → x
+        graph.update_file(
+            &root_anc,
+            &make_meta_with_source("mid.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &mid,
+            &make_meta_with_source("x.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        // short_anc → x
+        graph.update_file(
+            &short_anc,
+            &make_meta_with_source("x.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        // max_depth = 2. Querying x's transitive dependents must yield
+        // {mid (depth 1), short_anc (depth 1), root_anc (depth 2)}.
+        let dependents = graph.get_transitive_dependents(&x, 2, 1000);
+        assert!(dependents.contains(&mid), "mid must be reachable; dependents={dependents:?}");
+        assert!(
+            dependents.contains(&short_anc),
+            "short_anc must be reachable; dependents={dependents:?}"
+        );
+        assert!(
+            dependents.contains(&root_anc),
+            "root_anc must be reachable at depth 2; dependents={dependents:?}"
+        );
     }
 
     #[test]
