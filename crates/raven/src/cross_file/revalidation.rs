@@ -846,56 +846,62 @@ mod tests {
     }
 
     #[test]
-    fn test_did_open_re_enrichment_eviction_drops_force_markers() {
-        // Regression: the initial cross-file revalidation pass marks
-        // force-republish on a capped set, but re-enrichment can later evict
-        // URIs from work_items when higher-priority neighbors are discovered.
-        // Evicted URIs must NOT carry orphaned force markers that leak into
-        // future unrelated same-version publishes.
+    fn test_force_marker_persists_until_consumed_by_publish() {
+        // Documents the gate semantics that motivate `did_open`'s
+        // deferred-marking design (commits 9f4bc45 + 01e3411).
         //
-        // Simulates the did_open re-enrichment flow:
-        // 1. Initial compute_affected + cap + mark (old bug: marked here)
-        // 2. Re-enrichment discovers new neighbors, re-caps, evicts low-priority URI
-        // 3. Final mark_force_republish_many on work_items (correct: mark here)
+        // `mark_force_republish` increments a counter; `record_publish`
+        // decrements it. A marker is *not tied* to the work item that
+        // produced it — once incremented, it persists until any publish
+        // consumes it, including a publish triggered by an unrelated
+        // later edit.
         //
-        // Asserts: evicted URI cannot same-version publish (no force marker).
+        // Consequence for `did_open`: if the initial cap pass marks a URI
+        // and re-enrichment then evicts that URI from `work_items`, the
+        // marker is left behind and the next unrelated same-version
+        // publish for that URI slips through the gate. The fix is to
+        // defer marking until after re-enrichment has settled
+        // `work_items`, so URIs that won't actually be republished by
+        // this trigger never receive a marker.
+        //
+        // This test exercises the gate-side leak directly: a URI that has
+        // an outstanding marker passes the same-version gate even though
+        // nothing in this test "owns" the planned republish.
         let gate = CrossFileDiagnosticsGate::new();
+        let evicted = test_uri("evicted.R");
 
-        let edited = test_uri("edited.R");
-        let low_priority = test_uri("low_priority.R");
-        let high_priority = test_uri("high_priority.R");
-
-        // Simulate initial publish for all URIs at version 1
-        gate.record_publish(&low_priority, 1);
-        gate.record_publish(&high_priority, 1);
-
-        // Simulate the OLD buggy flow (what we're testing against):
-        // Initial set: [edited, low_priority], capped to 2, marked
-        // (This would incorrectly mark low_priority)
-        // gate.mark_force_republish_many([&low_priority].iter().copied());
-
-        // Re-enrichment discovers high_priority, union = [edited, low_priority, high_priority]
-        // Re-cap to 2, sorted: [edited, high_priority] — low_priority evicted
-        // (high_priority was added by re-enrichment, so it would be marked by the old
-        //  re-enrichment path; low_priority is now evicted but still has a marker from initial)
-
-        // Simulate the CORRECT flow (what the fix implements):
-        // Final work_items: [edited, high_priority]
-        // mark_force_republish_many on final set only
-        gate.mark_force_republish_many([&high_priority].iter().copied());
-
-        // Assertions:
-        // high_priority was in final work_items: should have force marker
+        // Baseline: a URI that has been published at v=1 and has no
+        // marker is blocked from same-version republish.
+        gate.record_publish(&evicted, 1);
         assert!(
-            gate.can_publish(&high_priority, 1),
-            "high_priority in final work_items must have force marker"
+            !gate.can_publish(&evicted, 1),
+            "no marker → same-version publish blocked"
         );
 
-        // low_priority was evicted from work_items: must NOT have force marker
+        // Pre-fix `did_open`: the initial cap pass would mark this URI
+        // before re-enrichment had a chance to evict it.
+        gate.mark_force_republish_many([&evicted].iter().copied());
+
+        // Pre-fix bug: even though re-enrichment "evicts" `evicted` from
+        // `work_items` (modeled here as: nothing further consumes the
+        // marker on its behalf), the marker persists and lets an
+        // unrelated same-version publish pass the gate.
         assert!(
-            !gate.can_publish(&low_priority, 1),
-            "evicted low_priority must NOT have orphaned force marker"
+            gate.can_publish(&evicted, 1),
+            "outstanding marker leaks: orphan passes same-version gate"
         );
+
+        // The post-fix `did_open` avoids ever creating that marker for
+        // an evicted URI: marking is deferred to a single end-of-flow
+        // site that iterates the *final* work_items only. No regression
+        // hook exists at the gate level for the post-fix path because
+        // the deferred-marking flow simply does not invoke
+        // `mark_force_republish_many` for evicted URIs — the contract is
+        // structural, not algorithmic. The helper-level `cap_truncates_*`
+        // and `higher_priority_*` tests in
+        // `backend::tests::reenrichment_revalidation_cap` cover the
+        // eviction logic that determines which URIs reach the
+        // end-of-flow mark.
     }
 
     // CrossFileActivityState tests
