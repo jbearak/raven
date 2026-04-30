@@ -732,8 +732,9 @@ async fn run_debounced_diagnostics(
     let snapshot_data = {
         let state = state_arc.read().await;
 
-        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
-        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+        let doc = state.documents.get(&affected_uri);
+        let current_version = doc.and_then(|d| d.version);
+        let current_revision = doc.map(|d| d.revision);
 
         if current_version != trigger_version || current_revision != trigger_revision {
             log::trace!(
@@ -805,8 +806,9 @@ async fn run_debounced_diagnostics(
     // two same-version publishes could share one marker.
     let can_publish = {
         let state = state_arc.read().await;
-        let current_version = state.documents.get(&affected_uri).and_then(|d| d.version);
-        let current_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+        let doc = state.documents.get(&affected_uri);
+        let current_version = doc.and_then(|d| d.version);
+        let current_revision = doc.map(|d| d.revision);
 
         if current_version != trigger_version || current_revision != trigger_revision {
             false
@@ -1047,8 +1049,9 @@ impl LanguageServer for Backend {
                             let items: Vec<(Url, Option<i32>, Option<u64>)> = open_keys
                                 .into_iter()
                                 .map(|uri| {
-                                    let v = state.documents.get(&uri).and_then(|d| d.version);
-                                    let r = state.documents.get(&uri).map(|d| d.revision);
+                                    let doc = state.documents.get(&uri);
+                                    let v = doc.and_then(|d| d.version);
+                                    let r = doc.map(|d| d.revision);
                                     (uri, v, r)
                                 })
                                 .collect();
@@ -1600,9 +1603,9 @@ impl LanguageServer for Backend {
             let work_items: Vec<_> = affected
                 .into_iter()
                 .map(|affected_uri| {
-                    let trigger_version =
-                        state.documents.get(&affected_uri).and_then(|d| d.version);
-                    let trigger_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    let doc = state.documents.get(&affected_uri);
+                    let trigger_version = doc.and_then(|d| d.version);
+                    let trigger_revision = doc.map(|d| d.revision);
                     (affected_uri, trigger_version, trigger_revision)
                 })
                 .collect();
@@ -1829,10 +1832,9 @@ impl LanguageServer for Backend {
                     work_items = final_uris
                         .into_iter()
                         .map(|u| {
-                            let trigger_version =
-                                state.documents.get(&u).and_then(|d| d.version);
-                            let trigger_revision =
-                                state.documents.get(&u).map(|d| d.revision);
+                            let doc = state.documents.get(&u);
+                            let trigger_version = doc.and_then(|d| d.version);
+                            let trigger_revision = doc.map(|d| d.revision);
                             (u, trigger_version, trigger_revision)
                         })
                         .collect();
@@ -1954,10 +1956,9 @@ impl LanguageServer for Backend {
                 work_items = final_uris
                     .into_iter()
                     .map(|u| {
-                        let trigger_version =
-                            state.documents.get(&u).and_then(|d| d.version);
-                        let trigger_revision =
-                            state.documents.get(&u).map(|d| d.revision);
+                        let doc = state.documents.get(&u);
+                        let trigger_version = doc.and_then(|d| d.version);
+                        let trigger_revision = doc.map(|d| d.revision);
                         (u, trigger_version, trigger_revision)
                     })
                     .collect();
@@ -2074,11 +2075,9 @@ impl LanguageServer for Backend {
                     state
                         .diagnostics_gate
                         .mark_force_republish(&stabilization_uri);
-                    let ver = state
-                        .documents
-                        .get(&stabilization_uri)
-                        .and_then(|d| d.version);
-                    let rev = state.documents.get(&stabilization_uri).map(|d| d.revision);
+                    let doc = state.documents.get(&stabilization_uri);
+                    let ver = doc.and_then(|d| d.version);
+                    let rev = doc.map(|d| d.revision);
                     (ver, rev)
                 };
 
@@ -2346,9 +2345,9 @@ impl LanguageServer for Backend {
             let work_items: Vec<_> = affected
                 .into_iter()
                 .map(|affected_uri| {
-                    let trigger_version =
-                        state.documents.get(&affected_uri).and_then(|d| d.version);
-                    let trigger_revision = state.documents.get(&affected_uri).map(|d| d.revision);
+                    let doc = state.documents.get(&affected_uri);
+                    let trigger_version = doc.and_then(|d| d.version);
+                    let trigger_revision = doc.map(|d| d.revision);
                     (affected_uri, trigger_version, trigger_revision)
                 })
                 .collect();
@@ -2455,11 +2454,9 @@ impl LanguageServer for Backend {
                     state
                         .diagnostics_gate
                         .mark_force_republish(&revalidation_uri);
-                    let ver = state
-                        .documents
-                        .get(&revalidation_uri)
-                        .and_then(|d| d.version);
-                    let rev = state.documents.get(&revalidation_uri).map(|d| d.revision);
+                    let doc = state.documents.get(&revalidation_uri);
+                    let ver = doc.and_then(|d| d.version);
+                    let rev = doc.map(|d| d.revision);
                     (state.cross_file_config.revalidation_debounce_ms, ver, rev)
                 };
 
