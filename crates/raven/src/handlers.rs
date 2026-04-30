@@ -5791,19 +5791,22 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
 
     if parent.kind() == "binary_operator" {
         let mut cursor = parent.walk();
-        let children: Vec<_> = parent.children(&mut cursor).collect();
-        if children.len() >= 2 {
-            let op_text = node_text(children[1], text);
+        let mut children = parent.children(&mut cursor);
+        let first = children.next();
+        let second = children.next();
+        let third = children.next();
+
+        if let (Some(first), Some(second)) = (first, second) {
+            let op_text = node_text(second, text);
             // Left-assignment LHS: `x <- 1`, `x = 1`, `x <<- 1`.
-            if children[0].id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
+            if first.id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
                 return true;
             }
             // Right-assignment target: `1 -> x`, `1 ->> x`.
-            if children.len() >= 3
-                && children[2].id() == node.id()
-                && matches!(op_text, "->" | "->>")
-            {
-                return true;
+            if let Some(third) = third {
+                if third.id() == node.id() && matches!(op_text, "->" | "->>") {
+                    return true;
+                }
             }
         }
     }
@@ -5966,7 +5969,11 @@ fn collect_identifier_usages_utf16<'a>(
         &text[start..end]
     };
 
-    if node.kind() == "identifier" && !is_structural_non_reference(node, text) {
+    if node.kind() == "identifier" {
+        if is_structural_non_reference(node, text) {
+            return;
+        }
+
         // Pipeline-specific skip: the use-before-source pipeline does not
         // run scope resolution to define the iterator, so skip the
         // declaration site here. (This intentionally diverges from
@@ -5978,17 +5985,20 @@ fn collect_identifier_usages_utf16<'a>(
                     .is_some_and(|var| var.id() == node.id())
         });
 
-        if !skip_for_iter {
-            if references_formal_from_default_expression(node, text) {
-                return;
-            }
-
-            let name = text[node.byte_range()].to_string();
-            let line = node.start_position().row as u32;
-            let line_text = get_line(node.start_position().row);
-            let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
-            usages.push((name, line, col, node));
+        if skip_for_iter {
+            return;
         }
+
+        if references_formal_from_default_expression(node, text) {
+            return;
+        }
+
+        let name = text[node.byte_range()].to_string();
+        let line = node.start_position().row as u32;
+        let line_text = get_line(node.start_position().row);
+        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+        usages.push((name, line, col, node));
+        return;
     }
 
     let mut cursor = node.walk();
