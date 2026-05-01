@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -157,7 +158,7 @@ impl WorkspaceIndex {
     /// # Returns
     /// A new WorkspaceIndex instance
     pub fn new(config: WorkspaceIndexConfig) -> Self {
-        let cap = crate::cross_file::cache::non_zero_or(config.max_files, 1000);
+        let cap = Self::effective_cap_for(&config);
         Self {
             inner: RwLock::new(LruCache::new(cap)),
             version: AtomicU64::new(0),
@@ -169,6 +170,14 @@ impl WorkspaceIndex {
         }
     }
 
+    /// Effective runtime cap for a config — `max_files`, normalized to
+    /// `NonZeroUsize` with the same default `new()` applies. Shared by
+    /// the constructor and the shrink-back path so both interpret
+    /// `max_files == 0` identically.
+    fn effective_cap_for(config: &WorkspaceIndexConfig) -> NonZeroUsize {
+        crate::cross_file::cache::non_zero_or(config.max_files, 1000)
+    }
+
     /// Replace the set of URIs protected from LRU eviction.
     ///
     /// Pinned URIs are skipped during eviction; if every in-cache URI is
@@ -176,9 +185,28 @@ impl WorkspaceIndex {
     /// drop a reachable neighbor. Oversized files remain rejected by
     /// `insert`, and explicit `invalidate` / disk-update replacement still
     /// work for pinned URIs.
+    ///
+    /// Also opportunistically shrinks the runtime cap back to
+    /// `config.max_files` when `len() <= max_files`, so repeated all-pinned
+    /// overflow events followed by safe unpins don't ratchet the cap
+    /// upward indefinitely (issue #128). The shrink only fires when it
+    /// can't itself force eviction.
+    ///
+    /// Lock order: acquires `inner.write()` before `pinned.write()`,
+    /// matching the order established by `pin_aware_push` (which holds
+    /// `inner.write()` and then takes `pinned.read()`).
     pub fn set_pinned_uris(&self, uris: HashSet<Url>) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
         if let Ok(mut pinned) = self.pinned.write() {
             *pinned = uris;
+        }
+
+        let user_cap_nz = Self::effective_cap_for(&self.config);
+        let user_cap = user_cap_nz.get();
+        if guard.cap().get() > user_cap && guard.len() <= user_cap {
+            guard.resize(user_cap_nz);
         }
     }
 
@@ -333,6 +361,19 @@ impl WorkspaceIndex {
     /// Get the number of indexed entries
     pub fn len(&self) -> usize {
         self.inner.read().map(|guard| guard.len()).unwrap_or(0)
+    }
+
+    /// Get the current cache capacity.
+    ///
+    /// May exceed `config.max_files` after an all-pinned overflow has
+    /// forced the underlying LRU to grow (see `pin_aware_push`).
+    /// `set_pinned_uris` opportunistically restores the cap to
+    /// `config.max_files` when shrinking is safe (`len() <= max_files`).
+    pub fn cap(&self) -> usize {
+        self.inner
+            .read()
+            .map(|guard| guard.cap().get())
+            .unwrap_or(0)
     }
 
     /// Check if the index is empty
@@ -1038,6 +1079,168 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn test_cap_shrinks_back_when_max_files_is_zero_and_runtime_cap_is_default() {
+        // Issue #128 review finding 1: `new()` normalizes `max_files == 0`
+        // to the default runtime cap (1000) via `non_zero_or`, so the
+        // shrink-back path must compare and resize against that same
+        // normalized value — not the raw `config.max_files == 0`,
+        // which would disable shrink entirely.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 0,
+            // No file-size cap so we can insert tiny entries freely.
+            max_file_size_bytes: 0,
+        };
+        let index = WorkspaceIndex::new(config);
+        // Effective runtime cap is the default (1000) because of the
+        // `non_zero_or(max_files, 1000)` normalization in `new()`.
+        assert_eq!(index.cap(), 1000, "runtime cap should default to 1000");
+
+        // Pin every entry up to the effective cap, then trigger an
+        // all-pinned overflow.
+        let mut pin_set = HashSet::new();
+        for i in 0..1000 {
+            let uri = test_uri(&format!("pre_{}.R", i));
+            assert!(index.insert(uri.clone(), make_test_entry(i as u64)));
+            pin_set.insert(uri);
+        }
+        assert_eq!(index.len(), 1000);
+        index.set_pinned_uris(pin_set.clone());
+
+        // All-pinned overflow grows cap to 1001.
+        let overflow_uri = test_uri("overflow.R");
+        assert!(index.insert(overflow_uri.clone(), make_test_entry(9999)));
+        assert_eq!(index.cap(), 1001);
+
+        // Drain back to the effective cap (1000).
+        assert!(index.invalidate(&overflow_uri));
+        assert_eq!(index.len(), 1000);
+
+        // Clearing pins should now shrink cap back to 1000 — the
+        // effective user_cap, not the raw `0` from config.
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(
+            index.cap(),
+            1000,
+            "shrink-back must use the normalized cap, not raw max_files"
+        );
+    }
+
+    #[test]
+    fn test_cap_shrinks_back_to_user_cap_when_safe() {
+        // Issue #128: after an all-pinned overflow grew the cap, calling
+        // `set_pinned_uris` while `len() <= user_cap` should restore the
+        // cap to its configured value, so repeated overflow/unpin cycles
+        // don't grow `cap()` monotonically beyond `user_cap`.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        assert!(index.insert(uri1.clone(), make_test_entry(0)));
+        assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
+        assert_eq!(index.cap(), 3, "all-pinned overflow grew the cap");
+        assert_eq!(index.len(), 3);
+
+        // Drop one entry so len falls back to user_cap.
+        assert!(index.invalidate(&uri3));
+        assert_eq!(index.len(), 2);
+
+        // Clearing the pin set should now opportunistically shrink cap
+        // back to user_cap (precondition: len() <= user_cap).
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(index.cap(), 2, "cap should shrink back to user_cap");
+    }
+
+    #[test]
+    fn test_cap_does_not_shrink_when_len_still_exceeds_user_cap() {
+        // Issue #128: shrinking must never force eviction. If `len()`
+        // currently exceeds `user_cap`, leave the cap alone — the next
+        // safe call to `set_pinned_uris` (after `len()` falls back) will
+        // shrink it.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        assert!(index.insert(uri1.clone(), make_test_entry(0)));
+        assert!(index.insert(uri2.clone(), make_test_entry(1)));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
+        assert_eq!(index.cap(), 3);
+        assert_eq!(index.len(), 3);
+
+        // Clear pins. len(3) > user_cap(2): shrinking would force eviction,
+        // so cap must stay at 3.
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(index.cap(), 3, "cap must not shrink when len > user_cap");
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn test_repeated_overflow_then_unpin_does_not_grow_cap_monotonically() {
+        // Issue #128: the worst-case trace from the issue. Repeated
+        // all-pinned overflow events, each followed by an unpin to a
+        // safe state, must not let `cap()` ratchet upward forever.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 2,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+
+        for cycle in 0..5 {
+            let a = test_uri(&format!("cycle{}_a.R", cycle));
+            let b = test_uri(&format!("cycle{}_b.R", cycle));
+            let c = test_uri(&format!("cycle{}_c.R", cycle));
+
+            assert!(index.insert(a.clone(), make_test_entry(cycle * 3)));
+            assert!(index.insert(b.clone(), make_test_entry(cycle * 3 + 1)));
+
+            let mut pinned = HashSet::new();
+            pinned.insert(a.clone());
+            pinned.insert(b.clone());
+            index.set_pinned_uris(pinned);
+
+            assert!(index.insert(c.clone(), make_test_entry(cycle * 3 + 2)));
+
+            // Drain back to a safe state so cap-shrink can fire.
+            index.invalidate(&a);
+            index.invalidate(&b);
+            index.invalidate(&c);
+            assert_eq!(index.len(), 0);
+
+            index.set_pinned_uris(HashSet::new());
+            assert_eq!(
+                index.cap(),
+                2,
+                "cap must shrink back to user_cap on cycle {}",
+                cycle
+            );
+        }
+    }
 
     #[test]
     fn test_unpinning_restores_normal_eviction() {
