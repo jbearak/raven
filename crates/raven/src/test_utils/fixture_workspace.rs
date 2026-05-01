@@ -137,6 +137,97 @@ pub fn write_fixture_workspace(dir: &Path, config: &FixtureConfig) {
     }
 }
 
+/// Number of distinct functions defined in `shared.R` of the fanout fixture.
+///
+/// Each parent file calls one of these functions, indexed by `i mod K`.
+const FANOUT_SHARED_FUNCTIONS: usize = 5;
+
+/// Generate the deterministic content of `shared.R` for the fanout fixture.
+///
+/// The file defines `FANOUT_SHARED_FUNCTIONS` simple functions that any
+/// parent can call. Each function takes a single argument and returns a
+/// linear combination — enough to give the cross-file scope resolver real
+/// symbols to thread through.
+fn generate_fanout_shared_content() -> String {
+    let mut content = String::new();
+    content.push_str("library(stats)\n\n");
+    for k in 0..FANOUT_SHARED_FUNCTIONS {
+        writeln!(content, "shared_func_{} <- function(x) {{", k).unwrap();
+        writeln!(content, "    result <- x + {}", k + 1).unwrap();
+        writeln!(content, "    if (is.na(result)) {{").unwrap();
+        writeln!(content, "        return(NULL)").unwrap();
+        writeln!(content, "    }}").unwrap();
+        writeln!(content, "    result").unwrap();
+        writeln!(content, "}}").unwrap();
+        content.push('\n');
+    }
+    content
+}
+
+/// Generate the deterministic content of one parent file in the fanout fixture.
+///
+/// Each parent sources `shared.R` and calls one of its functions, picked
+/// deterministically by `index mod FANOUT_SHARED_FUNCTIONS`.
+fn generate_fanout_parent_content(index: usize) -> String {
+    let mut content = String::new();
+    writeln!(content, "library(stats)").unwrap();
+    writeln!(content, "source(\"shared.R\")").unwrap();
+    content.push('\n');
+    writeln!(
+        content,
+        "result_{} <- shared_func_{}({})",
+        index,
+        index % FANOUT_SHARED_FUNCTIONS,
+        index
+    )
+    .unwrap();
+    content
+}
+
+/// Create a temporary fanout-shaped fixture workspace.
+///
+/// Layout:
+/// - `shared.R` defines `FANOUT_SHARED_FUNCTIONS` functions.
+/// - `parent_0.R` … `parent_{N-1}.R` each `source("shared.R")` and call one
+///   of the shared functions.
+///
+/// This is the shape the production watched-file revalidation cascade walks
+/// after a change to `shared.R` — every parent must be rediagnosed.
+///
+/// Calling this twice with the same `parent_count` produces byte-identical files.
+pub fn create_fanout_fixture_workspace(parent_count: usize) -> TempDir {
+    let temp_dir =
+        TempDir::new().expect("Failed to create temp directory for fanout fixture workspace");
+    write_fanout_fixture_workspace(temp_dir.path(), parent_count);
+    temp_dir
+}
+
+/// Write fanout fixture files into an existing directory.
+pub fn write_fanout_fixture_workspace(dir: &Path, parent_count: usize) {
+    let shared_path = dir.join("shared.R");
+    std::fs::write(&shared_path, generate_fanout_shared_content())
+        .expect("Failed to write fanout shared.R");
+
+    for i in 0..parent_count {
+        let content = generate_fanout_parent_content(i);
+        let filename = format!("parent_{}.R", i);
+        let filepath = dir.join(&filename);
+        std::fs::write(&filepath, &content)
+            .unwrap_or_else(|e| panic!("Failed to write fanout fixture file {}: {}", filename, e));
+    }
+}
+
+/// Return the URIs of the fanout parents in deterministic order
+/// (`parent_0.R` first through `parent_{parent_count - 1}.R`).
+pub fn fanout_parent_uris(workspace: &Path, parent_count: usize) -> Vec<Url> {
+    (0..parent_count)
+        .map(|i| {
+            Url::from_file_path(workspace.join(format!("parent_{}.R", i)))
+                .expect("URI from fanout parent path")
+        })
+        .collect()
+}
+
 /// Fixture for testing cross-file scope invariants: a 10-file linear
 /// source() chain with a self-referential assignment in the middle file.
 #[derive(Debug)]
