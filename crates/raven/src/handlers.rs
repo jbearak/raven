@@ -31625,7 +31625,7 @@ result <- helper_with_spaces(42)"#;
     }
 
     // ============================================================================
-    // Tests for collect_missing_package_diagnostics - Task 10.3
+    // Tests for collect_missing_package_diagnostics_from_snapshot - Task 10.3 (originally validated the legacy collector before issue #135)
     // ============================================================================
 
     #[test]
