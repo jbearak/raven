@@ -33735,13 +33735,16 @@ result <- helper_with_spaces(42)"#;
         let main_path = workspace_path.join("main.R");
         let helper_path = workspace_path.join("helper.R");
 
-        // helper.R defines `helper`. main.R sources it with local=TRUE BEFORE
-        // calling helper(). Because local=TRUE doesn't inherit symbols,
-        // helper() at the call site is genuinely undefined — but the
-        // out-of-scope collector should NOT flag it as "used before sourced"
-        // (the source comes earlier than the use). It should only show up,
-        // if at all, as an undefined-variable diagnostic.
-        let main_code = "source(\"helper.R\", local=TRUE)\nresult <- helper(1)\n";
+        // helper.R defines `helper`. main.R uses helper() BEFORE sourcing
+        // helper.R with local=TRUE. The use-before-source layout is what
+        // actually exercises the `inherits_symbols()` skip filter: if the
+        // filter regressed and treated local=TRUE as inheriting, the source
+        // would be considered for "used before sourced" attribution and the
+        // diagnostic would fire. Because local=TRUE doesn't inherit symbols,
+        // the filter must skip the source and no diagnostic should fire.
+        // helper() is also genuinely undefined from the caller's perspective,
+        // so the undefined-variable diagnostic IS expected.
+        let main_code = "result <- helper(1)\nsource(\"helper.R\", local=TRUE)\n";
         let helper_code = "helper <- function(x) x + 1\n";
         std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&helper_path, helper_code).unwrap();
@@ -33819,6 +33822,9 @@ result <- helper_with_spaces(42)"#;
     /// `sys.source("helper.R", envir=new.env())` evaluates in a fresh env;
     /// symbols are NOT inherited into the caller's scope. The "used before
     /// sourced" collector must skip such sources via `inherits_symbols()`.
+    /// The use-before-source layout forces the filter to be the only thing
+    /// preventing the diagnostic — if the filter regressed, the source
+    /// would be considered for attribution and the diagnostic would fire.
     #[test]
     fn test_out_of_scope_skips_sys_source_non_global_env() {
         use tempfile::TempDir;
@@ -33829,7 +33835,7 @@ result <- helper_with_spaces(42)"#;
         let helper_path = workspace_path.join("helper.R");
 
         let main_code =
-            "sys.source(\"helper.R\", envir=new.env())\nresult <- helper(1)\n";
+            "result <- helper(1)\nsys.source(\"helper.R\", envir=new.env())\n";
         let helper_code = "helper <- function(x) x + 1\n";
         std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&helper_path, helper_code).unwrap();
