@@ -653,7 +653,7 @@ fn cap_watched_file_revalidations(
     activity: &crate::cross_file::revalidation::CrossFileActivityState,
     max_revalidations: usize,
 ) {
-    affected.sort_by_key(|u| activity.priority_score(u).saturating_add(1));
+    affected.sort_by_cached_key(|u| activity.priority_score(u).saturating_add(1));
     if affected.len() > max_revalidations {
         log::trace!(
             "Watched-files revalidation cap exceeded: {} affected, scheduling {}",
@@ -677,19 +677,19 @@ fn cap_watched_file_revalidations(
 /// neighbors regardless of priority.
 fn merge_and_cap_reenrichment_revalidations(
     pinned_uri: &Url,
-    prev_uris: &std::collections::HashSet<Url>,
+    prev_uris: std::collections::HashSet<Url>,
     new_neighbors: Vec<Url>,
     max_revalidations: usize,
     activity: &crate::cross_file::revalidation::CrossFileActivityState,
 ) -> Vec<Url> {
     let mut union: Vec<Url> = prev_uris.iter().cloned().collect();
-    let mut seen = prev_uris.clone();
+    let mut seen = prev_uris;
     for dep in new_neighbors {
         if seen.insert(dep.clone()) {
             union.push(dep);
         }
     }
-    union.sort_by_key(|u| {
+    union.sort_by_cached_key(|u| {
         if u == pinned_uri {
             0
         } else {
@@ -722,7 +722,7 @@ fn rebuild_work_items_after_reenrichment(
         prev_work_items.iter().map(|(u, _, _)| u.clone()).collect();
     let final_uris = merge_and_cap_reenrichment_revalidations(
         pinned_uri,
-        &prev_uris,
+        prev_uris,
         new_neighbors,
         max_revalidations,
         &state.cross_file_activity,
@@ -1612,9 +1612,12 @@ impl LanguageServer for Backend {
             let mut affected: Vec<Url> = affected.into_iter().collect();
 
             // Prioritize by activity
-            // Use saturating_add to prevent integer overflow at usize::MAX
+            // Use saturating_add to prevent integer overflow at usize::MAX.
+            // sort_by_cached_key memoizes priority_score per URI so the
+            // O(N) recent_uris position scan runs once per element rather
+            // than once per sort comparison.
             let activity = &state.cross_file_activity;
-            affected.sort_by_key(|u| {
+            affected.sort_by_cached_key(|u| {
                 if *u == uri {
                     0
                 } else {
@@ -2317,9 +2320,12 @@ impl LanguageServer for Backend {
             let mut affected: Vec<Url> = affected.into_iter().collect();
 
             // Prioritize by activity (trigger first, then active, then visible, then recent)
-            // Use saturating_add to prevent integer overflow at usize::MAX
+            // Use saturating_add to prevent integer overflow at usize::MAX.
+            // sort_by_cached_key memoizes priority_score per URI so the
+            // O(N) recent_uris position scan runs once per element rather
+            // than once per sort comparison.
             let activity = &state.cross_file_activity;
-            affected.sort_by_key(|u| {
+            affected.sort_by_cached_key(|u| {
                 if *u == uri {
                     0
                 } else {
@@ -4851,7 +4857,7 @@ mod tests {
 
             let final_uris = merge_and_cap_reenrichment_revalidations(
                 &edited,
-                &prev_uris,
+                prev_uris,
                 new_neighbors,
                 2,
                 &activity,
@@ -4885,7 +4891,7 @@ mod tests {
 
             let final_uris = merge_and_cap_reenrichment_revalidations(
                 &edited,
-                &prev_uris,
+                prev_uris,
                 vec![],
                 10,
                 &activity,
@@ -4908,7 +4914,7 @@ mod tests {
 
             let final_uris = merge_and_cap_reenrichment_revalidations(
                 &edited,
-                &prev_uris,
+                prev_uris,
                 new_neighbors,
                 10,
                 &activity,
@@ -4934,7 +4940,7 @@ mod tests {
 
             let final_uris = merge_and_cap_reenrichment_revalidations(
                 &edited,
-                &prev_uris,
+                prev_uris,
                 new_neighbors,
                 2,
                 &activity,
@@ -4956,7 +4962,7 @@ mod tests {
 
             let final_uris = merge_and_cap_reenrichment_revalidations(
                 &edited,
-                &prev_uris,
+                prev_uris,
                 new_neighbors,
                 0,
                 &activity,
