@@ -883,7 +883,7 @@ Expected: Criterion runs both `small_10` and `medium_50` fixtures; outputs mean/
 
 Create `docs/superpowers/specs/2026-04-30-issue-135-bench-baseline.md` with the following content (replace the placeholder rows with actual numbers from `/tmp/bench-baseline.txt`):
 
-```markdown
+````markdown
 # Benchmark Baseline for Issue #135
 
 **Captured on:** 2026-04-30
@@ -915,7 +915,7 @@ Filled in during Phase 4. Acceptance gates:
 1. CI lower bound on percent change ≤ 15% on `medium_50` (or `large` if added).
 2. Per-iteration mean increase ≤ 5 ms on every fixture, regardless of percentage.
 3. Same gates apply to any fanout-shaped fixture added in Phase 2.
-```
+````
 
 - [ ] **Step 3: Commit baseline**
 
@@ -1566,7 +1566,7 @@ git commit -m "test: migrate undefined_variables batch <N> to snapshot path (#13
 ### Task 5.3: Update CLAUDE.md
 
 **Files:**
-- Modify: `/Users/jmb/repos/raven/CLAUDE.md` (two distinct bullets)
+- Modify: `CLAUDE.md` (two distinct bullets)
 
 The CLAUDE.md Learnings section has two bullets that reference the dual-path
 parallelism. **Both must be updated, not deleted** — they encode invariants

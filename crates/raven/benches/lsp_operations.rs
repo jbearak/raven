@@ -287,7 +287,7 @@ fn bench_diagnostics(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_diagnostics_fanout(c: &mut Criterion) {
-    let mut group = c.benchmark_group("lsp_diagnostics");
+    let mut group = c.benchmark_group("lsp_diagnostics_fanout");
     group.sample_size(20);
 
     // Cap fanout sizes per the task spec (≤ 200) and to keep the bench
