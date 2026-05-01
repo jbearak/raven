@@ -33631,6 +33631,92 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// In an unannotated workspace (no @lsp-cd), `source("scripts/helper.R")`
+    /// resolves via workspace-root fallback when the literal relative path
+    /// doesn't exist next to the parent file. This is the AST-detected
+    /// source-call-only fallback. If the fallback regresses, the source target
+    /// won't resolve and the "used before sourced" diagnostic won't fire.
+    /// The single "used before sourced" diagnostic is the signal that the
+    /// fallback worked.
+    #[test]
+    fn test_out_of_scope_uses_workspace_root_fallback_for_ast_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let scripts_path = workspace_path.join("scripts");
+        std::fs::create_dir(&scripts_path).unwrap();
+
+        let main_path = scripts_path.join("main.R");
+        let helper_path = scripts_path.join("helper.R");
+
+        // main.R lives in scripts/; sources "scripts/helper.R" relative to
+        // workspace root, NOT relative to main.R's parent dir. The literal
+        // `<scripts_dir>/scripts/helper.R` does not exist; workspace-root
+        // fallback should resolve to `<workspace>/scripts/helper.R`.
+        let main_code = "result <- helper(1)\nsource(\"scripts/helper.R\")\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        // `helper` should resolve through workspace-root fallback; expect a
+        // single "used before sourced" diagnostic on line 0. If the fallback
+        // regresses, this won't fire because the source target won't be found.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+                    && d.range.start.line == 0
+            })
+            .collect();
+        assert_eq!(
+            used_before_helper.len(),
+            1,
+            "Expected one 'used before sourced' diagnostic for `helper` on \
+             line 0 (proves workspace-root fallback resolved \
+             scripts/helper.R); got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_out_of_scope_ignores_locally_scoped_names() {
         use tempfile::TempDir;
