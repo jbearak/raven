@@ -31915,7 +31915,6 @@ result <- helper_with_spaces(42)"#;
         // Test that a diagnostic is emitted when @lsp-source directive without line=
         // targets the same file as an earlier source() call.
         // Validates: Requirement 6.2
-        use crate::cross_file::types::ForwardSource;
         use tempfile::TempDir;
 
         // Create temp workspace with actual files
@@ -31923,7 +31922,9 @@ result <- helper_with_spaces(42)"#;
         let workspace_path = temp_dir.path();
         let main_path = workspace_path.join("main.R");
         let utils_path = workspace_path.join("utils.R");
-        std::fs::write(&main_path, "# main").unwrap();
+        // Lines 0-4 blank, line 5 source(), lines 6-9 blank, line 10 directive.
+        let main_code = "\n\n\n\n\nsource('utils.R')\n\n\n\n\n# @lsp-source utils.R";
+        std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&utils_path, "# utils").unwrap();
 
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
@@ -31931,38 +31932,18 @@ result <- helper_with_spaces(42)"#;
 
         let mut state = WorldState::new(Vec::new());
         state.workspace_folders.push(workspace_url);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
 
-        // Metadata with AST source at line 5 and directive at line 10
-        let meta = crate::cross_file::CrossFileMetadata {
-            sources: vec![
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 5,
-                    column: 0,
-                    is_directive: false, // AST source at line 5 (earlier)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 10,
-                    column: 0,
-                    is_directive: true, // Directive at line 10 (later)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_redundant_directive_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_redundant_directive_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            &mut diagnostics,
+        );
 
         assert_eq!(
             diagnostics.len(),
@@ -31980,7 +31961,6 @@ result <- helper_with_spaces(42)"#;
     fn test_redundant_directive_diagnostic_not_emitted_when_disabled() {
         // Test that no diagnostic is emitted when redundant_directive_severity is None
         // Validates: Requirement 6.2 (configurable severity)
-        use crate::cross_file::types::ForwardSource;
         use tempfile::TempDir;
 
         // Create temp workspace with actual files
@@ -31988,7 +31968,8 @@ result <- helper_with_spaces(42)"#;
         let workspace_path = temp_dir.path();
         let main_path = workspace_path.join("main.R");
         let utils_path = workspace_path.join("utils.R");
-        std::fs::write(&main_path, "# main").unwrap();
+        let main_code = "\n\n\n\n\nsource('utils.R')\n\n\n\n\n# @lsp-source utils.R";
+        std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&utils_path, "# utils").unwrap();
 
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
@@ -31997,38 +31978,18 @@ result <- helper_with_spaces(42)"#;
         let mut state = WorldState::new(Vec::new());
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.redundant_directive_severity = None; // Disabled
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
 
-        // Metadata with AST source at line 5 and directive at line 10
-        let meta = crate::cross_file::CrossFileMetadata {
-            sources: vec![
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 5,
-                    column: 0,
-                    is_directive: false,
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 10,
-                    column: 0,
-                    is_directive: true,
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_redundant_directive_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_redundant_directive_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            &mut diagnostics,
+        );
 
         assert_eq!(
             diagnostics.len(),
@@ -32041,7 +32002,6 @@ result <- helper_with_spaces(42)"#;
     fn test_redundant_directive_diagnostic_not_emitted_when_directive_is_earlier() {
         // Test that no diagnostic is emitted when directive is at an earlier line than source()
         // Validates: Requirement 6.2 (only emit when directive is later)
-        use crate::cross_file::types::ForwardSource;
         use tempfile::TempDir;
 
         // Create temp workspace with actual files
@@ -32049,7 +32009,9 @@ result <- helper_with_spaces(42)"#;
         let workspace_path = temp_dir.path();
         let main_path = workspace_path.join("main.R");
         let utils_path = workspace_path.join("utils.R");
-        std::fs::write(&main_path, "# main").unwrap();
+        // Lines 0-4 blank, line 5 directive, lines 6-9 blank, line 10 source().
+        let main_code = "\n\n\n\n\n# @lsp-source utils.R\n\n\n\n\nsource('utils.R')";
+        std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&utils_path, "# utils").unwrap();
 
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
@@ -32057,38 +32019,18 @@ result <- helper_with_spaces(42)"#;
 
         let mut state = WorldState::new(Vec::new());
         state.workspace_folders.push(workspace_url);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
 
-        // Metadata with directive at line 5 and AST source at line 10
-        let meta = crate::cross_file::CrossFileMetadata {
-            sources: vec![
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 5,
-                    column: 0,
-                    is_directive: true, // Directive at line 5 (earlier)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 10,
-                    column: 0,
-                    is_directive: false, // AST source at line 10 (later)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_redundant_directive_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_redundant_directive_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            &mut diagnostics,
+        );
 
         assert_eq!(
             diagnostics.len(),
