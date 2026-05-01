@@ -92,6 +92,11 @@ pub(crate) struct DiagnosticsSnapshot {
     // so cycles longer than max_chain_depth are still detected)
     pub cycle_detection: Option<crate::cross_file::dependency::CycleDetection>,
 
+    // Pre-resolved snippet of the closing edge's call site line, captured at
+    // snapshot build time from `state.documents` or `state.cross_file_file_cache`.
+    // Used to enrich the circular-dependency diagnostic message.
+    pub cycle_closing_snippet: Option<String>,
+
     // Package library (Arc, cheap clone)
     pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
 
@@ -174,6 +179,21 @@ impl DiagnosticsSnapshot {
         // cycles longer than max_chain_depth are still detected.
         let cycle_detection = state.cross_file_graph.detect_cycle(uri);
 
+        // Capture the closing-edge call-site snippet under the read lock so the
+        // diagnostic message can include the offending source() line. Mirrors
+        // the legacy `diagnostics()` snippet-retrieval branch.
+        let cycle_closing_snippet = cycle_detection.as_ref().and_then(|cycle| {
+            let close = &cycle.closing_edge;
+            close.call_site_line.and_then(|cl| {
+                let content = state
+                    .documents
+                    .get(&close.from)
+                    .map(|d| d.text())
+                    .or_else(|| state.cross_file_file_cache.get(&close.from));
+                content.and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
+            })
+        });
+
         // Hold the trimmed subgraph as an Arc clone of the cached payload.
         // The cache returns an `Arc<DependencyGraph>`, so this is a refcount
         // bump rather than a deep clone of the trimmed forward/backward maps.
@@ -209,6 +229,7 @@ impl DiagnosticsSnapshot {
             artifacts_map,
             metadata_map,
             cycle_detection,
+            cycle_closing_snippet,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
@@ -302,8 +323,13 @@ pub(crate) fn diagnostics_from_snapshot(
                 .unwrap_or_default();
             let closing_line_1based = close.call_site_line.map(|l| l + 1);
 
-            let message = match closing_line_1based {
-                Some(cl) => {
+            let message = match (closing_line_1based, snapshot.cycle_closing_snippet.as_deref()) {
+                (Some(cl), Some(code)) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
+                    )
+                }
+                (Some(cl), None) => {
                     format!("Circular dependency: {closing_file} line {cl} sources this file")
                 }
                 _ => {
@@ -3553,10 +3579,9 @@ fn collect_workspace_symbols_from_artifacts(
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
 /// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
-/// pipeline — exposed under the `test-support` feature so benchmarks can
-/// measure the same path used by `run_debounced_diagnostics` in production.
-#[cfg(feature = "test-support")]
-#[allow(dead_code)]
+/// pipeline. This is the production entry point for sync diagnostic
+/// computation (called by `pub fn diagnostics`), and is also the bench
+/// harness target for `crates/raven/benches/lsp_operations.rs`.
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
     uri: &Url,
@@ -3615,169 +3640,14 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
         return Vec::new();
     };
 
-    let Some(tree) = &doc.tree else {
+    if doc.tree.is_none() {
         return Vec::new();
-    };
-
-    let text = doc.text();
-    let mut diagnostics = Vec::new();
-
-    // Use enriched cross-file metadata from state when available so diagnostics
-    // can see source() and library()/require()/loadNamespace() context at open time.
-    // Fall back to extraction from current text+tree when metadata is unavailable.
-    let mut directive_meta = state
-        .get_enriched_metadata(uri)
-        .map(std::sync::Arc::unwrap_or_clone)
-        .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(tree)));
-
-    // Compute inherited working directory for files with backward directives
-    // This enables child files to inherit the parent's working directory context
-    // for resolving paths in their own source() calls.
-    // _Requirements: 5.1, 5.2, 6.1_
-    if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
-        let workspace_root = state.workspace_folders.first();
-        directive_meta.inherited_working_directory = compute_inherited_working_directory(
-            uri,
-            &directive_meta,
-            workspace_root,
-            |target_uri: &Url| state.get_or_parse_metadata(target_uri),
-        );
-
-        if directive_meta.inherited_working_directory.is_some() {
-            log::trace!(
-                "Computed inherited working directory for {}: {:?}",
-                uri,
-                directive_meta.inherited_working_directory
-            );
-        }
     }
 
-    // Collect syntax errors (not suppressed by @lsp-ignore)
-    collect_syntax_errors(tree.root_node(), &text, &mut diagnostics);
-
-    // Collect else-on-newline errors
-    // _Requirements: 4.1_
-    collect_else_newline_errors(tree.root_node(), &text, &mut diagnostics);
-
-    // Check for circular dependencies
-    if let Some(severity) = state.cross_file_config.circular_dependency_severity {
-        if let Some(cycle) = state.cross_file_graph.detect_cycle(uri) {
-            let out = &cycle.outgoing_edge;
-            let close = &cycle.closing_edge;
-
-            // Position: the source() call in THIS file that starts the cycle
-            let line = out.call_site_line.unwrap_or(0);
-            let col = out.call_site_column.unwrap_or(0);
-
-            // Clamp to file bounds as safety net
-            let max_line = text.lines().count().saturating_sub(1) as u32;
-            let line = line.min(max_line);
-
-            // Closing file name + line (1-based for display)
-            let closing_file = close
-                .from
-                .path_segments()
-                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-                .unwrap_or_default();
-            let closing_line_1based = close.call_site_line.map(|l| l + 1);
-
-            // Try to get the code snippet from the closing edge's file
-            let snippet = close.call_site_line.and_then(|cl| {
-                let content = state
-                    .documents
-                    .get(&close.from)
-                    .map(|d| d.text())
-                    .or_else(|| state.cross_file_file_cache.get(&close.from));
-                content.and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
-            });
-
-            let message = match (closing_line_1based, snippet) {
-                (Some(cl), Some(code)) => {
-                    format!(
-                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
-                    )
-                }
-                (Some(cl), None) => {
-                    format!("Circular dependency: {closing_file} line {cl} sources this file")
-                }
-                _ => {
-                    format!("Circular dependency: {closing_file} sources this file")
-                }
-            };
-
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(line, col),
-                    end: Position::new(line, col.saturating_add(1)),
-                },
-                severity: Some(severity),
-                message,
-                ..Default::default()
-            });
-        }
-    }
-
-    // Check for max chain depth exceeded (Requirement 5.8)
-    collect_max_depth_diagnostics(state, uri, &mut diagnostics, cancel);
-
-    // Check for missing files in source() calls and directives (Requirement 10.2)
-    collect_missing_file_diagnostics(state, uri, &directive_meta, &mut diagnostics);
-
-    // Note: "Ambiguous parent" diagnostics removed - multiple parents is a valid use case
-    // A file can legitimately be sourced by multiple scripts
-
-    if cancel.is_cancelled() {
-        return diagnostics;
-    }
-
-    // Shared scope cache: computed once, reused by both out-of-scope and undefined-variable
-    // collectors. Keyed by (line, column) — different columns on the same line can have
-    // different scopes (e.g., inside vs outside a single-line anonymous function).
-    let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
-
-    // Check for out-of-scope symbol usage (Requirement 10.3)
-    collect_out_of_scope_diagnostics(
-        state,
-        uri,
-        tree.root_node(),
-        &text,
-        &directive_meta,
-        &mut diagnostics,
-        &mut scope_cache,
-        cancel,
-    );
-
-    // Check for missing packages in library() calls (Requirement 15.1)
-    collect_missing_package_diagnostics(state, &directive_meta, &mut diagnostics);
-
-    // Check for redundant forward directives (Requirement 6.2)
-    collect_redundant_directive_diagnostics(state, uri, &directive_meta, &mut diagnostics);
-
-    // Check for invalid line=0 in forward directives
-    collect_invalid_line_param_diagnostics(&directive_meta, &mut diagnostics);
-
-    if cancel.is_cancelled() {
-        return diagnostics;
-    }
-
-    // Collect undefined variable errors if enabled in config
-    if state.cross_file_config.undefined_variables_enabled {
-        collect_undefined_variables_position_aware(
-            state,
-            uri,
-            tree.root_node(),
-            &text,
-            &doc.loaded_packages,
-            &state.workspace_imports,
-            &state.package_library,
-            &directive_meta,
-            &mut diagnostics,
-            &mut scope_cache,
-            cancel,
-        );
-    }
-
-    diagnostics
+    // Delegate to the snapshot-based pipeline (the same path used by the
+    // debounced production pipeline in `run_debounced_diagnostics`). Issue
+    // #135 retired the legacy collector path that previously lived here.
+    diagnostics_via_snapshot(state, uri, cancel)
 }
 
 /// Async version of diagnostics that uses batched existence checks for missing files
@@ -4110,6 +3980,8 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
 /// Uses ContentProvider for unified access to cached file existence.
 ///
 /// **Validates: Requirements 14.2, 14.5**
+// removed in Phase 5 (issue #135)
+#[allow(dead_code)]
 fn collect_missing_file_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -4468,6 +4340,8 @@ pub async fn collect_missing_file_diagnostics_async(
 }
 
 /// Collect diagnostics for max chain depth exceeded (Requirement 5.8)
+// removed in Phase 5 (issue #135)
+#[allow(dead_code)]
 fn collect_max_depth_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -4570,6 +4444,8 @@ fn collect_max_depth_diagnostics(
 /// //
 /// // After the call, `diagnostics` will contain a warning about package "foo".
 /// ```
+// removed in Phase 5 (issue #135)
+#[allow(dead_code)]
 fn collect_missing_package_diagnostics(
     state: &WorldState,
     meta: &crate::cross_file::CrossFileMetadata,
@@ -4648,6 +4524,8 @@ fn collect_missing_package_diagnostics(
 /// - `diagnostics`: Mutable vector to receive emitted diagnostics.
 ///
 /// _Requirements: 6.2_
+// removed in Phase 5 (issue #135)
+#[allow(dead_code)]
 fn collect_redundant_directive_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -5606,6 +5484,8 @@ fn collect_undefined_variables_from_snapshot(
 /// - `directive_meta`: Cross-file directive metadata (contains `@lsp-source` / `source()` locations).
 /// - `diagnostics`: Mutable vector to receive emitted diagnostics.
 ///
+// removed in Phase 5 (issue #135)
+#[allow(dead_code)]
 fn collect_out_of_scope_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -8193,6 +8073,8 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// // collect_undefined_variables_position_aware(&state, &uri, root_node, &text, &[], &workspace_imports, &package_library, &directive_meta, &mut diagnostics);
 /// ```
 #[allow(clippy::too_many_arguments)]
+// removed in Phase 5 (issue #135)
+#[allow(dead_code)]
 pub(crate) fn collect_undefined_variables_position_aware(
     state: &WorldState,
     uri: &Url,
@@ -33978,7 +33860,6 @@ result <- helper_with_spaces(42)"#;
     /// The use of `helper()` is in-scope from `main.R` (via backward edge), so
     /// the snapshot path suppresses the "used before sourced" diagnostic;
     /// the legacy path emits it.
-    #[ignore = "legacy parity gap; un-ignored in Phase 3 (issue #135)"]
     #[test]
     fn test_out_of_scope_suppresses_when_in_scope_via_backward_edge() {
         use tempfile::TempDir;
@@ -34055,7 +33936,6 @@ result <- helper_with_spaces(42)"#;
     /// URI defines `xyz` at top-level AND a sourced file ALSO defines `xyz`,
     /// and legacy emits the diagnostic without checking that `xyz` resolves
     /// to a DIFFERENT URI than the queried one.
-    #[ignore = "legacy parity gap; un-ignored in Phase 3 (issue #135)"]
     #[test]
     fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
         use tempfile::TempDir;
