@@ -105,6 +105,15 @@ pub struct ForwardSource {
     /// Only relevant when is_directive=true and explicit_line=true.
     #[serde(default)]
     pub user_line_zero: bool,
+    /// true if the source() call is lexically inside a function body.
+    ///
+    /// Function-body source() calls only execute when the enclosing function
+    /// is invoked, so they are not load-time ordering constraints for
+    /// top-level usages. Used by the "used before it's available" diagnostic
+    /// to skip blame attribution. Always false for `@lsp-source` directives,
+    /// which are header-only and run at load time.
+    #[serde(default)]
+    pub is_function_scoped: bool,
 }
 
 fn default_sys_source_global_env() -> bool {
