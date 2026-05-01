@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use lru::LruCache;
@@ -49,14 +49,20 @@ pub struct CrossFileWorkspaceIndex {
     /// pressure. Lock order: acquire `inner` before `pinned` when both
     /// are needed.
     pinned: RwLock<HashSet<Url>>,
-    /// Original user-configured capacity.
+    /// User-configured baseline capacity.
     ///
     /// `inner.cap()` may temporarily exceed this when an all-pinned
     /// overflow forces growth (see `pin_aware_push`). `set_pinned_uris`
     /// uses this value to opportunistically shrink the cache back when
     /// `len() <= user_cap` so the runtime cap doesn't ratchet upward
     /// across repeated overflow/unpin cycles (issue #128).
-    user_cap: usize,
+    ///
+    /// Mutable so `resize()` can keep it in sync with the new runtime
+    /// cap; otherwise a post-resize shrink-back would silently revert
+    /// to the constructor value rather than the configured one. Stored
+    /// as `AtomicUsize` and updated under `inner.write()` so writers
+    /// see a consistent (`inner.cap()`, `user_cap`) pair.
+    user_cap: AtomicUsize,
 }
 
 impl std::fmt::Debug for CrossFileWorkspaceIndex {
@@ -83,7 +89,7 @@ impl CrossFileWorkspaceIndex {
             inner: RwLock::new(LruCache::new(cap_nz)),
             version: AtomicU64::new(0),
             pinned: RwLock::new(HashSet::new()),
-            user_cap: cap_nz.get(),
+            user_cap: AtomicUsize::new(cap_nz.get()),
         }
     }
 
@@ -111,8 +117,9 @@ impl CrossFileWorkspaceIndex {
             *pinned = uris;
         }
 
-        if let Some(user_cap_nz) = NonZeroUsize::new(self.user_cap) {
-            if guard.cap().get() > self.user_cap && guard.len() <= self.user_cap {
+        let user_cap = self.user_cap.load(Ordering::Relaxed);
+        if let Some(user_cap_nz) = NonZeroUsize::new(user_cap) {
+            if guard.cap().get() > user_cap && guard.len() <= user_cap {
                 guard.resize(user_cap_nz);
             }
         }
@@ -251,10 +258,17 @@ impl CrossFileWorkspaceIndex {
     }
 
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.
+    ///
+    /// Also updates the `user_cap` baseline so `set_pinned_uris` will
+    /// shrink back to this resized value after a future all-pinned
+    /// overflow, rather than reverting to the constructor capacity.
+    /// `inner` and `user_cap` are written together under
+    /// `inner.write()` so concurrent readers see a consistent pair.
     pub fn resize(&self, cap: usize) {
         let cap = non_zero_or(cap, DEFAULT_WORKSPACE_INDEX_CAPACITY);
         if let Ok(mut guard) = self.inner.write() {
             guard.resize(cap);
+            self.user_cap.store(cap.get(), Ordering::Relaxed);
         }
     }
 }
@@ -567,5 +581,45 @@ mod tests {
         assert!(!index.contains(&test_uri("2.R")));
         assert!(index.contains(&test_uri("3.R")));
         assert!(index.contains(&test_uri("4.R")));
+    }
+
+    #[test]
+    fn test_resize_updates_shrink_baseline() {
+        // Issue #128 review finding 2: `resize()` is called from
+        // production at startup (`state::resize_caches`). After a resize
+        // grows the cache, `set_pinned_uris` must shrink back to the
+        // *resized* baseline, not the original constructor value, or
+        // shrink-back would silently override the user's configured
+        // `cache_workspace_index_max_entries`.
+        let index = CrossFileWorkspaceIndex::with_capacity(2);
+        index.resize(5);
+        assert_eq!(index.cap(), 5);
+
+        // Fill to the resized capacity and pin everything.
+        let mut pin_set = HashSet::new();
+        for i in 0..5 {
+            let uri = test_uri(&format!("a{}.R", i));
+            index.insert(uri.clone(), test_entry(i));
+            pin_set.insert(uri);
+        }
+        index.set_pinned_uris(pin_set);
+
+        // Trigger an all-pinned overflow.
+        let overflow = test_uri("overflow.R");
+        index.insert(overflow.clone(), test_entry(99));
+        assert_eq!(index.cap(), 6);
+
+        // Drain back below the resized baseline.
+        index.invalidate(&overflow);
+        assert_eq!(index.uris().len(), 5);
+
+        // Clearing pins should shrink to the resized baseline (5),
+        // not the constructor value (2).
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(
+            index.cap(),
+            5,
+            "shrink-back must track the resized baseline, not the constructor cap"
+        );
     }
 }

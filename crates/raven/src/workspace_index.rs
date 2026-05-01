@@ -158,7 +158,7 @@ impl WorkspaceIndex {
     /// # Returns
     /// A new WorkspaceIndex instance
     pub fn new(config: WorkspaceIndexConfig) -> Self {
-        let cap = crate::cross_file::cache::non_zero_or(config.max_files, 1000);
+        let cap = Self::effective_cap_for(&config);
         Self {
             inner: RwLock::new(LruCache::new(cap)),
             version: AtomicU64::new(0),
@@ -168,6 +168,14 @@ impl WorkspaceIndex {
             metrics: RwLock::new(WorkspaceIndexMetrics::default()),
             pinned: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Effective runtime cap for a config — `max_files`, normalized to
+    /// `NonZeroUsize` with the same default `new()` applies. Shared by
+    /// the constructor and the shrink-back path so both interpret
+    /// `max_files == 0` identically.
+    fn effective_cap_for(config: &WorkspaceIndexConfig) -> NonZeroUsize {
+        crate::cross_file::cache::non_zero_or(config.max_files, 1000)
     }
 
     /// Replace the set of URIs protected from LRU eviction.
@@ -195,11 +203,10 @@ impl WorkspaceIndex {
             *pinned = uris;
         }
 
-        let user_cap = self.config.max_files;
-        if let Some(user_cap_nz) = NonZeroUsize::new(user_cap) {
-            if guard.cap().get() > user_cap && guard.len() <= user_cap {
-                guard.resize(user_cap_nz);
-            }
+        let user_cap_nz = Self::effective_cap_for(&self.config);
+        let user_cap = user_cap_nz.get();
+        if guard.cap().get() > user_cap && guard.len() <= user_cap {
+            guard.resize(user_cap_nz);
         }
     }
 
@@ -1072,6 +1079,54 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn test_cap_shrinks_back_when_max_files_is_zero_and_runtime_cap_is_default() {
+        // Issue #128 review finding 1: `new()` normalizes `max_files == 0`
+        // to the default runtime cap (1000) via `non_zero_or`, so the
+        // shrink-back path must compare and resize against that same
+        // normalized value — not the raw `config.max_files == 0`,
+        // which would disable shrink entirely.
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 0,
+            // No file-size cap so we can insert tiny entries freely.
+            max_file_size_bytes: 0,
+        };
+        let index = WorkspaceIndex::new(config);
+        // Effective runtime cap is the default (1000) because of the
+        // `non_zero_or(max_files, 1000)` normalization in `new()`.
+        assert_eq!(index.cap(), 1000, "runtime cap should default to 1000");
+
+        // Pin every entry up to the effective cap, then trigger an
+        // all-pinned overflow.
+        let mut pin_set = HashSet::new();
+        for i in 0..1000 {
+            let uri = test_uri(&format!("pre_{}.R", i));
+            assert!(index.insert(uri.clone(), make_test_entry(i as u64)));
+            pin_set.insert(uri);
+        }
+        assert_eq!(index.len(), 1000);
+        index.set_pinned_uris(pin_set.clone());
+
+        // All-pinned overflow grows cap to 1001.
+        let overflow_uri = test_uri("overflow.R");
+        assert!(index.insert(overflow_uri.clone(), make_test_entry(9999)));
+        assert_eq!(index.cap(), 1001);
+
+        // Drain back to the effective cap (1000).
+        assert!(index.invalidate(&overflow_uri));
+        assert_eq!(index.len(), 1000);
+
+        // Clearing pins should now shrink cap back to 1000 — the
+        // effective user_cap, not the raw `0` from config.
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(
+            index.cap(),
+            1000,
+            "shrink-back must use the normalized cap, not raw max_files"
+        );
+    }
 
     #[test]
     fn test_cap_shrinks_back_to_user_cap_when_safe() {
