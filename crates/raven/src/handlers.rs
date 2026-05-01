@@ -32284,9 +32284,10 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(code, None));
 
-        let meta = crate::cross_file::directive::parse_directives(code);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_file_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_missing_file_diagnostics_from_snapshot(&snapshot, &main_url, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
