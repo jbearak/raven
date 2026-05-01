@@ -12,7 +12,9 @@ use tower_lsp::lsp_types::Position;
 use url::Url;
 
 use raven::state::{scan_workspace, Document, WorldState};
-use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
+use raven::test_utils::fixture_workspace::{
+    create_fanout_fixture_workspace, create_fixture_workspace, fanout_parent_uris, FixtureConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -273,11 +275,61 @@ fn bench_diagnostics(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark: Diagnostics (fanout shape)
+//
+// Simulates the production watched-file revalidation cascade: many parents
+// source the same shared file, so a change to `shared.R` must republish
+// diagnostics for every parent. We time the per-iteration cost of looping
+// over all parent URIs and calling `diagnostics(...)` on each.
+//
+// Added in Phase 2 of issue #135 per codex:rescue verdict.
+// ---------------------------------------------------------------------------
+
+fn bench_diagnostics_fanout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lsp_diagnostics_fanout");
+    group.sample_size(20);
+
+    // Cap fanout sizes per the task spec (≤ 200) and to keep the bench
+    // budget reasonable. fanout_50 is comparable to medium_50; fanout_200
+    // exercises the cascade at scale.
+    let fanout_sizes: &[(&str, usize)] = &[("fanout_50", 50), ("fanout_200", 200)];
+
+    for (label, parent_count) in fanout_sizes {
+        let workspace = create_fanout_fixture_workspace(*parent_count);
+        let state = build_state_from_fixture(workspace.path());
+        let parent_uris = fanout_parent_uris(workspace.path(), *parent_count);
+        let cancel = raven::handlers::DiagCancelToken::never();
+
+        group.bench_with_input(
+            BenchmarkId::new("fanout_diagnostics", *label),
+            &(&state, &parent_uris, &cancel),
+            |b, &(state, uris, cancel)| {
+                b.iter(|| {
+                    let mut acc: usize = 0;
+                    for uri in uris.iter() {
+                        let diags = raven::handlers::diagnostics(
+                            black_box(state),
+                            black_box(uri),
+                            black_box(cancel),
+                        );
+                        acc = acc.wrapping_add(diags.len());
+                    }
+                    black_box(acc)
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_completion,
     bench_hover,
     bench_goto_definition,
     bench_diagnostics,
+    bench_diagnostics_fanout,
 );
 criterion_main!(benches);

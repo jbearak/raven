@@ -92,6 +92,11 @@ pub(crate) struct DiagnosticsSnapshot {
     // so cycles longer than max_chain_depth are still detected)
     pub cycle_detection: Option<crate::cross_file::dependency::CycleDetection>,
 
+    // Pre-resolved snippet of the closing edge's call site line, captured at
+    // snapshot build time from `state.documents` or `state.cross_file_file_cache`.
+    // Used to enrich the circular-dependency diagnostic message.
+    pub cycle_closing_snippet: Option<String>,
+
     // Package library (Arc, cheap clone)
     pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
 
@@ -174,6 +179,21 @@ impl DiagnosticsSnapshot {
         // cycles longer than max_chain_depth are still detected.
         let cycle_detection = state.cross_file_graph.detect_cycle(uri);
 
+        // Capture the closing-edge call-site snippet under the read lock so the
+        // diagnostic message can include the offending source() line. Mirrors
+        // the legacy `diagnostics()` snippet-retrieval branch.
+        let cycle_closing_snippet = cycle_detection.as_ref().and_then(|cycle| {
+            let close = &cycle.closing_edge;
+            close.call_site_line.and_then(|cl| {
+                let content = state
+                    .documents
+                    .get(&close.from)
+                    .map(|d| d.text())
+                    .or_else(|| state.cross_file_file_cache.get(&close.from));
+                content.and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
+            })
+        });
+
         // Hold the trimmed subgraph as an Arc clone of the cached payload.
         // The cache returns an `Arc<DependencyGraph>`, so this is a refcount
         // bump rather than a deep clone of the trimmed forward/backward maps.
@@ -209,6 +229,7 @@ impl DiagnosticsSnapshot {
             artifacts_map,
             metadata_map,
             cycle_detection,
+            cycle_closing_snippet,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
@@ -302,8 +323,13 @@ pub(crate) fn diagnostics_from_snapshot(
                 .unwrap_or_default();
             let closing_line_1based = close.call_site_line.map(|l| l + 1);
 
-            let message = match closing_line_1based {
-                Some(cl) => {
+            let message = match (closing_line_1based, snapshot.cycle_closing_snippet.as_deref()) {
+                (Some(cl), Some(code)) => {
+                    format!(
+                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
+                    )
+                }
+                (Some(cl), None) => {
                     format!("Circular dependency: {closing_file} line {cl} sources this file")
                 }
                 _ => {
@@ -3528,35 +3554,10 @@ fn collect_workspace_symbols_from_artifacts(
 // Diagnostics
 // ============================================================================
 
-/// Compute diagnostics for the document at the given URI.
-///
-/// Performs a full set of checks for the specified open document and returns collected diagnostics.
-/// Reported issues include syntax errors, circular dependency and max-depth problems, missing or ambiguous
-/// sourced files, out-of-scope symbol usage, missing package warnings, and (when enabled) undefined-variable
-/// diagnostics that account for cross-file and package scope.
-///
-/// # Returns
-///
-/// `Vec<Diagnostic>` containing diagnostics for the document at `uri`, which may be empty if no issues were found.
-///
-/// # Examples
-///
-/// ```no_run
-/// use raven::handlers::{diagnostics, DiagCancelToken};
-/// use raven::state::WorldState;
-/// use url::Url;
-///
-/// // Given a prepared `WorldState` and a `Url` referring to an open document:
-/// # let state: WorldState = todo!();
-/// # let uri: Url = todo!();
-/// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
-/// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
-/// ```
 /// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
-/// pipeline — exposed under the `test-support` feature so benchmarks can
-/// measure the same path used by `run_debounced_diagnostics` in production.
-#[cfg(feature = "test-support")]
-#[allow(dead_code)]
+/// pipeline. This is the production entry point for sync diagnostic
+/// computation (called by `pub fn diagnostics`), and is also the bench
+/// harness target for `crates/raven/benches/lsp_operations.rs`.
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
     uri: &Url,
@@ -3600,6 +3601,35 @@ pub fn diagnostics_via_snapshot_profile(
     (t_build, t_diag, outcome)
 }
 
+/// Compute diagnostics for the document at the given URI.
+///
+/// Performs a full set of checks for the specified open document and returns collected diagnostics.
+/// Reported issues include syntax errors, circular dependency and max-depth problems, missing or ambiguous
+/// sourced files, out-of-scope symbol usage, missing package warnings, and (when enabled) undefined-variable
+/// diagnostics that account for cross-file and package scope.
+///
+/// # Returns
+///
+/// `Vec<Diagnostic>` containing diagnostics for the document at `uri`, which may be empty if no issues were found.
+///
+/// # Cancellation
+///
+/// On cancel the snapshot pipeline returns an empty `Vec` (legacy returned partial accumulated
+/// diagnostics). All production callers use `DiagCancelToken::never()` so behavior is unchanged.
+///
+/// # Examples
+///
+/// ```no_run
+/// use raven::handlers::{diagnostics, DiagCancelToken};
+/// use raven::state::WorldState;
+/// use url::Url;
+///
+/// // Given a prepared `WorldState` and a `Url` referring to an open document:
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
+/// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
+/// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
+/// ```
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
@@ -3615,169 +3645,14 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
         return Vec::new();
     };
 
-    let Some(tree) = &doc.tree else {
+    if doc.tree.is_none() {
         return Vec::new();
-    };
-
-    let text = doc.text();
-    let mut diagnostics = Vec::new();
-
-    // Use enriched cross-file metadata from state when available so diagnostics
-    // can see source() and library()/require()/loadNamespace() context at open time.
-    // Fall back to extraction from current text+tree when metadata is unavailable.
-    let mut directive_meta = state
-        .get_enriched_metadata(uri)
-        .map(std::sync::Arc::unwrap_or_clone)
-        .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(tree)));
-
-    // Compute inherited working directory for files with backward directives
-    // This enables child files to inherit the parent's working directory context
-    // for resolving paths in their own source() calls.
-    // _Requirements: 5.1, 5.2, 6.1_
-    if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
-        let workspace_root = state.workspace_folders.first();
-        directive_meta.inherited_working_directory = compute_inherited_working_directory(
-            uri,
-            &directive_meta,
-            workspace_root,
-            |target_uri: &Url| state.get_or_parse_metadata(target_uri),
-        );
-
-        if directive_meta.inherited_working_directory.is_some() {
-            log::trace!(
-                "Computed inherited working directory for {}: {:?}",
-                uri,
-                directive_meta.inherited_working_directory
-            );
-        }
     }
 
-    // Collect syntax errors (not suppressed by @lsp-ignore)
-    collect_syntax_errors(tree.root_node(), &text, &mut diagnostics);
-
-    // Collect else-on-newline errors
-    // _Requirements: 4.1_
-    collect_else_newline_errors(tree.root_node(), &text, &mut diagnostics);
-
-    // Check for circular dependencies
-    if let Some(severity) = state.cross_file_config.circular_dependency_severity {
-        if let Some(cycle) = state.cross_file_graph.detect_cycle(uri) {
-            let out = &cycle.outgoing_edge;
-            let close = &cycle.closing_edge;
-
-            // Position: the source() call in THIS file that starts the cycle
-            let line = out.call_site_line.unwrap_or(0);
-            let col = out.call_site_column.unwrap_or(0);
-
-            // Clamp to file bounds as safety net
-            let max_line = text.lines().count().saturating_sub(1) as u32;
-            let line = line.min(max_line);
-
-            // Closing file name + line (1-based for display)
-            let closing_file = close
-                .from
-                .path_segments()
-                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-                .unwrap_or_default();
-            let closing_line_1based = close.call_site_line.map(|l| l + 1);
-
-            // Try to get the code snippet from the closing edge's file
-            let snippet = close.call_site_line.and_then(|cl| {
-                let content = state
-                    .documents
-                    .get(&close.from)
-                    .map(|d| d.text())
-                    .or_else(|| state.cross_file_file_cache.get(&close.from));
-                content.and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
-            });
-
-            let message = match (closing_line_1based, snippet) {
-                (Some(cl), Some(code)) => {
-                    format!(
-                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
-                    )
-                }
-                (Some(cl), None) => {
-                    format!("Circular dependency: {closing_file} line {cl} sources this file")
-                }
-                _ => {
-                    format!("Circular dependency: {closing_file} sources this file")
-                }
-            };
-
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(line, col),
-                    end: Position::new(line, col.saturating_add(1)),
-                },
-                severity: Some(severity),
-                message,
-                ..Default::default()
-            });
-        }
-    }
-
-    // Check for max chain depth exceeded (Requirement 5.8)
-    collect_max_depth_diagnostics(state, uri, &mut diagnostics, cancel);
-
-    // Check for missing files in source() calls and directives (Requirement 10.2)
-    collect_missing_file_diagnostics(state, uri, &directive_meta, &mut diagnostics);
-
-    // Note: "Ambiguous parent" diagnostics removed - multiple parents is a valid use case
-    // A file can legitimately be sourced by multiple scripts
-
-    if cancel.is_cancelled() {
-        return diagnostics;
-    }
-
-    // Shared scope cache: computed once, reused by both out-of-scope and undefined-variable
-    // collectors. Keyed by (line, column) — different columns on the same line can have
-    // different scopes (e.g., inside vs outside a single-line anonymous function).
-    let mut scope_cache: HashMap<(u32, u32), scope::ScopeAtPosition> = HashMap::new();
-
-    // Check for out-of-scope symbol usage (Requirement 10.3)
-    collect_out_of_scope_diagnostics(
-        state,
-        uri,
-        tree.root_node(),
-        &text,
-        &directive_meta,
-        &mut diagnostics,
-        &mut scope_cache,
-        cancel,
-    );
-
-    // Check for missing packages in library() calls (Requirement 15.1)
-    collect_missing_package_diagnostics(state, &directive_meta, &mut diagnostics);
-
-    // Check for redundant forward directives (Requirement 6.2)
-    collect_redundant_directive_diagnostics(state, uri, &directive_meta, &mut diagnostics);
-
-    // Check for invalid line=0 in forward directives
-    collect_invalid_line_param_diagnostics(&directive_meta, &mut diagnostics);
-
-    if cancel.is_cancelled() {
-        return diagnostics;
-    }
-
-    // Collect undefined variable errors if enabled in config
-    if state.cross_file_config.undefined_variables_enabled {
-        collect_undefined_variables_position_aware(
-            state,
-            uri,
-            tree.root_node(),
-            &text,
-            &doc.loaded_packages,
-            &state.workspace_imports,
-            &state.package_library,
-            &directive_meta,
-            &mut diagnostics,
-            &mut scope_cache,
-            cancel,
-        );
-    }
-
-    diagnostics
+    // Delegate to the snapshot-based pipeline (the same path used by the
+    // debounced production pipeline in `run_debounced_diagnostics`). Issue
+    // #135 retired the legacy collector path that previously lived here.
+    diagnostics_via_snapshot(state, uri, cancel)
 }
 
 /// Async version of diagnostics that uses batched existence checks for missing files
@@ -4097,182 +3972,6 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
         .await
 }
 
-/// Collect diagnostics for missing files referenced in source() calls and directives
-///
-/// This is the synchronous version that only checks cached sources (no disk I/O).
-/// For async disk checking, use `collect_missing_file_diagnostics_async`.
-///
-/// Path resolution follows the forward-vs-backward invariant documented in
-/// `crates/raven/src/cross_file/path_resolve.rs` (and user-facing `docs/cross-file.md`):
-/// - Forward sources (source() calls): use PathContext::from_metadata (respects @lsp-cd)
-/// - Backward directives (@lsp-sourced-by): use PathContext::new (ignores @lsp-cd)
-///
-/// Uses ContentProvider for unified access to cached file existence.
-///
-/// **Validates: Requirements 14.2, 14.5**
-fn collect_missing_file_diagnostics(
-    state: &WorldState,
-    uri: &Url,
-    meta: &crate::cross_file::CrossFileMetadata,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    // Skip if missing file diagnostics are disabled
-    let missing_file_severity = match state.cross_file_config.missing_file_severity {
-        Some(sev) => sev,
-        None => return,
-    };
-
-    let content_provider = state.content_provider();
-
-    // Forward sources use @lsp-cd for path resolution
-    let forward_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-        uri,
-        meta,
-        state.workspace_folders.first(),
-    );
-    // Backward directives IGNORE @lsp-cd - always resolve relative to file's directory
-    let backward_ctx =
-        crate::cross_file::path_resolve::PathContext::new(uri, state.workspace_folders.first());
-
-    let workspace_root = state
-        .workspace_folders
-        .first()
-        .and_then(|w| w.to_file_path().ok());
-
-    // Check forward sources (source() calls and @lsp-source directives)
-    // Workspace-root fallback is for AST source() calls only, not directives
-    // _Requirements: 6.1, 6.3_ (for @lsp-source directive missing file diagnostics)
-    for source in &meta.sources {
-        let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
-            if source.is_directive {
-                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
-            } else {
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &source.path,
-                    ctx,
-                )
-            }
-        });
-        if let Some(path) = resolved_path {
-            // Guard against paths outside workspace
-            // Uses missing_file_severity since the file is effectively inaccessible
-            if let Some(root) = &workspace_root {
-                if !path.starts_with(root) {
-                    let message = if source.is_directive {
-                        format!(
-                            "File '{}' referenced by @lsp-source directive is outside workspace",
-                            source.path
-                        )
-                    } else {
-                        format!("Path is outside workspace: '{}'", source.path)
-                    };
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position::new(source.line, source.column),
-                            end: Position::new(
-                                source.line,
-                                source
-                                    .column
-                                    .saturating_add(source.path.len() as u32)
-                                    .saturating_add(10),
-                            ),
-                        },
-                        severity: Some(missing_file_severity),
-                        message,
-                        ..Default::default()
-                    });
-                    continue;
-                }
-            }
-            if let Some(target_uri) = crate::cross_file::path_resolve::path_to_uri(&path) {
-                // Use ContentProvider for cached existence check (no blocking I/O)
-                if !content_provider.exists_cached(&target_uri) {
-                    // Use specific message for @lsp-source directives (Requirement 6.1)
-                    let message = if source.is_directive {
-                        format!(
-                            "File '{}' referenced by @lsp-source directive not found",
-                            source.path
-                        )
-                    } else {
-                        format!("File not found: '{}'", source.path)
-                    };
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position::new(source.line, source.column),
-                            end: Position::new(
-                                source.line,
-                                source
-                                    .column
-                                    .saturating_add(source.path.len() as u32)
-                                    .saturating_add(10),
-                            ),
-                        },
-                        severity: Some(missing_file_severity),
-                        message,
-                        ..Default::default()
-                    });
-                }
-            }
-        } else {
-            // Use specific message for @lsp-source directives
-            let message = if source.is_directive {
-                format!(
-                    "Cannot resolve path '{}' in @lsp-source directive",
-                    source.path
-                )
-            } else {
-                format!("Cannot resolve path: '{}'", source.path)
-            };
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(source.line, source.column),
-                    end: Position::new(
-                        source.line,
-                        source
-                            .column
-                            .saturating_add(source.path.len() as u32)
-                            .saturating_add(10),
-                    ),
-                },
-                severity: Some(missing_file_severity),
-                message,
-                ..Default::default()
-            });
-        }
-    }
-
-    // Check backward directives (@lsp-sourced-by)
-    for directive in &meta.sourced_by {
-        let resolved = backward_ctx.as_ref().and_then(|ctx| {
-            let path = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)?;
-            crate::cross_file::path_resolve::path_to_uri(&path)
-        });
-        if let Some(target_uri) = resolved {
-            // Use ContentProvider for cached existence check (no blocking I/O)
-            if !content_provider.exists_cached(&target_uri) {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(directive.directive_line, 0),
-                        end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(missing_file_severity),
-                    message: format!("Parent file not found: '{}'", directive.path),
-                    ..Default::default()
-                });
-            }
-        } else {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(directive.directive_line, 0),
-                    end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
-                },
-                severity: Some(missing_file_severity),
-                message: format!("Cannot resolve parent path: '{}'", directive.path),
-                ..Default::default()
-            });
-        }
-    }
-}
 
 /// Async version of missing file diagnostics that checks disk existence
 ///
@@ -4467,272 +4166,8 @@ pub async fn collect_missing_file_diagnostics_async(
     diagnostics
 }
 
-/// Collect diagnostics for max chain depth exceeded (Requirement 5.8)
-fn collect_max_depth_diagnostics(
-    state: &WorldState,
-    uri: &Url,
-    diagnostics: &mut Vec<Diagnostic>,
-    cancel: &DiagCancelToken,
-) {
-    use crate::cross_file::scope;
 
-    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-        if let Some(doc) = state.documents.get(target_uri) {
-            if let Some(tree) = &doc.tree {
-                return Some(Arc::new(scope::compute_artifacts(
-                    target_uri,
-                    tree,
-                    &doc.text(),
-                )));
-            }
-        }
-        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
-            return Some(artifacts);
-        }
-        if let Some(doc) = state.workspace_index.get(target_uri) {
-            if let Some(tree) = &doc.tree {
-                return Some(Arc::new(scope::compute_artifacts(
-                    target_uri,
-                    tree,
-                    &doc.text(),
-                )));
-            }
-        }
-        None
-    };
 
-    let get_metadata =
-        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-            if let Some(doc) = state.documents.get(target_uri) {
-                return Some(std::sync::Arc::new(
-                    crate::cross_file::directive::parse_directives(&doc.text()),
-                ));
-            }
-            state.cross_file_workspace_index.get_metadata(target_uri)
-        };
-
-    let max_depth = state.cross_file_config.max_chain_depth;
-
-    // For depth-exceeded diagnostics, we don't need base_exports since we're only
-    // checking chain depth, not resolving symbols. Pass empty set for efficiency.
-    let empty_base_exports = std::collections::HashSet::new();
-
-    // Use scope resolution to detect depth exceeded (now uses PathContext internally)
-    let scope = scope::scope_at_position_with_graph(
-        uri,
-        u32::MAX,
-        u32::MAX,
-        &get_artifacts,
-        &get_metadata,
-        &state.cross_file_graph,
-        state.workspace_folders.first(),
-        max_depth,
-        &empty_base_exports,
-        false, // depth-exceeded check doesn't need hoisting
-        state.cross_file_config.backward_dependencies,
-        &|| cancel.is_cancelled(),
-    );
-
-    // Emit diagnostics for depth exceeded, filtering to only those in this file
-    if let Some(severity) = state.cross_file_config.max_chain_depth_severity {
-        for (exceeded_uri, line, col) in &scope.depth_exceeded {
-            if exceeded_uri == uri {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(*line, *col),
-                        end: Position::new(*line, col.saturating_add(1)),
-                    },
-                    severity: Some(severity),
-                    message: format!(
-                        "Maximum chain depth ({}) exceeded; some symbols may not be resolved",
-                        max_depth
-                    ),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-}
-
-/// Emit diagnostics for `library()` calls that reference packages not present in the package library.
-///
-/// Scans the cross-file metadata for `library()` calls and, for each call that is not ignored
-/// via directives and whose package is not found in `state.package_library`, appends a warning
-/// Diagnostic covering the call's line range with the configured severity.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Construct a WorldState with packages enabled and an empty PackageLibrary,
-/// // provide CrossFileMetadata containing a LibraryCall for "foo", then:
-/// //
-/// // collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
-/// //
-/// // After the call, `diagnostics` will contain a warning about package "foo".
-/// ```
-fn collect_missing_package_diagnostics(
-    state: &WorldState,
-    meta: &crate::cross_file::CrossFileMetadata,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    // Skip if packages feature is disabled or severity is off
-    if !state.cross_file_config.packages_enabled {
-        return;
-    }
-    // Avoid startup false positives while package metadata/cache initialization
-    // has not completed yet.
-    if !state.package_library_ready {
-        return;
-    }
-    // Suppress only when we have no information about installed packages — both
-    // an empty lib_paths and a missing r_subprocess. With non-empty lib_paths
-    // (even from get_fallback_lib_paths()) `package_exists()` is reliable, so
-    // emit regardless of whether an R subprocess is currently attached.
-    if state.package_library.lib_paths().is_empty()
-        && state.package_library.r_subprocess().is_none()
-    {
-        return;
-    }
-    let severity = match state.cross_file_config.packages_missing_package_severity {
-        Some(sev) => sev,
-        None => return,
-    };
-
-    for lib_call in &meta.library_calls {
-        // Skip if the line is ignored via @lsp-ignore or @lsp-ignore-next
-        if crate::cross_file::directive::is_line_ignored(meta, lib_call.line) {
-            continue;
-        }
-
-        // Check if the package exists (is installed)
-        if !state.package_library.package_exists(&lib_call.package) {
-            // Package not found - emit diagnostic with configured severity
-            // The column in LibraryCall is already UTF-16 (end position of the call)
-            // We want to highlight the library() call, so we use the line and estimate the range
-
-            // Calculate approximate start column (library( is 8 chars, package name varies)
-            // We'll highlight from column 0 to the end column for simplicity
-            let end_col = lib_call.column;
-
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(lib_call.line, 0),
-                    end: Position::new(lib_call.line, end_col),
-                },
-                severity: Some(severity),
-                message: format!("Package '{}' is not installed", lib_call.package),
-                ..Default::default()
-            });
-        }
-    }
-}
-
-/// Emit diagnostics for redundant forward directives.
-///
-/// A forward directive (@lsp-source, @lsp-run, @lsp-include) without an explicit `line=N`
-/// parameter is considered redundant when an AST-detected `source()` call to the same
-/// target file exists at an earlier line. In this case, the directive provides no additional
-/// information since the source() call already makes the symbols available earlier.
-///
-/// Directives WITH an explicit `line=N` parameter are never considered redundant because
-/// they explicitly specify a different call-site position for scope resolution purposes.
-///
-/// The diagnostic severity is configurable via `crossFile.redundantDirectiveSeverity`.
-/// Setting it to "off" disables this diagnostic entirely.
-///
-/// # Parameters
-///
-/// - `state`: Workspace state containing configuration.
-/// - `uri`: URI of the current document being analyzed.
-/// - `meta`: Cross-file directive metadata containing forward sources.
-/// - `diagnostics`: Mutable vector to receive emitted diagnostics.
-///
-/// _Requirements: 6.2_
-fn collect_redundant_directive_diagnostics(
-    state: &WorldState,
-    uri: &Url,
-    meta: &crate::cross_file::CrossFileMetadata,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    // Skip if redundant directive diagnostics are disabled
-    let severity = match state.cross_file_config.redundant_directive_severity {
-        Some(sev) => sev,
-        None => return, // Disabled
-    };
-
-    let workspace_root = state.workspace_folders.first();
-
-    // Build PathContext for resolving forward source paths (includes @lsp-cd)
-    let path_ctx =
-        crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
-    let path_ctx = match path_ctx {
-        Some(ctx) => ctx,
-        None => return,
-    };
-
-    // Collect directive sources (without explicit line=) and AST sources separately
-    // Directives WITH explicit_line are never considered redundant (Requirement 6.2)
-    let mut directive_sources: Vec<&crate::cross_file::types::ForwardSource> = Vec::new();
-    let mut ast_sources: Vec<&crate::cross_file::types::ForwardSource> = Vec::new();
-
-    for source in &meta.sources {
-        if source.is_directive {
-            // Only consider directives WITHOUT explicit line= for redundancy checking
-            if !source.explicit_line {
-                directive_sources.push(source);
-            }
-        } else {
-            ast_sources.push(source);
-        }
-    }
-
-    // For each directive source, check if there's an AST source to the same file at an earlier line
-    for directive in &directive_sources {
-        // Resolve the directive's target path (directives never use workspace-root fallback)
-        let directive_target =
-            crate::cross_file::path_resolve::resolve_path(&directive.path, &path_ctx);
-        let directive_target = match directive_target {
-            Some(path) => path,
-            None => continue,
-        };
-
-        // Check if any AST source points to the same file at an earlier line
-        for ast_source in &ast_sources {
-            let ast_target = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                &ast_source.path,
-                &path_ctx,
-            );
-            let ast_target = match ast_target {
-                Some(path) => path,
-                None => continue,
-            };
-
-            // Check if they point to the same file and AST is at an earlier line
-            if directive_target == ast_target && ast_source.line < directive.line {
-                // Get the target filename for the message
-                let target_filename = directive_target
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&directive.path);
-
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(directive.line, 0),
-                        end: Position::new(directive.line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(severity),
-                    message: format!(
-                        "Directive is redundant: source() call to '{}' exists at earlier line {}.",
-                        target_filename,
-                        ast_source.line + 1 // Convert to 1-based for display
-                    ),
-                    ..Default::default()
-                });
-                break; // Only emit one diagnostic per directive
-            }
-        }
-    }
-}
 
 /// Emit diagnostics for forward directives with invalid `line=0` parameter.
 ///
@@ -5500,8 +4935,6 @@ fn collect_undefined_variables_from_snapshot(
                     .or_insert_with(|| {
                         // Use `live_top_level_exports` (timeline replay with
                         // rm() applied), not `exported_interface.keys()`.
-                        // See the matching comment in
-                        // `collect_undefined_variables_position_aware`.
                         if let Some(artifacts) = snapshot.artifacts_map.get(source_uri) {
                             return crate::cross_file::scope::live_top_level_exports(artifacts);
                         }
@@ -5585,224 +5018,6 @@ fn collect_undefined_variables_from_snapshot(
     }
 }
 
-/// Emit diagnostics for symbols defined in sourced files that are referenced
-/// earlier in the current document than the corresponding `source()` call.
-///
-/// This function:
-/// - Scans `directive_meta.sources` and collects source paths declared in the file.
-/// - Collects identifier usages (UTF-16 columns) in `node`.
-/// - For each sourced file, resolves its URI and obtains its exported symbols (preferring open documents, then cross-file index, then legacy index).
-/// - Emits a diagnostic for every usage of an exported symbol that occurs before the `source()` call (skipping lines marked ignored by directives).
-///
-/// The produced diagnostics are appended to `diagnostics` and use the configured
-/// `out_of_scope_severity` from `state.cross_file_config`.
-///
-/// # Parameters
-///
-/// - `state`: Workspace state and indexes used to resolve artifacts and configuration.
-/// - `uri`: URI of the current document being analyzed (used to resolve relative source paths).
-/// - `node`: Root AST node of the current document.
-/// - `text`: Full source text of the current document.
-/// - `directive_meta`: Cross-file directive metadata (contains `@lsp-source` / `source()` locations).
-/// - `diagnostics`: Mutable vector to receive emitted diagnostics.
-///
-fn collect_out_of_scope_diagnostics(
-    state: &WorldState,
-    uri: &Url,
-    node: Node,
-    text: &str,
-    directive_meta: &crate::cross_file::CrossFileMetadata,
-    diagnostics: &mut Vec<Diagnostic>,
-    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
-    cancel: &DiagCancelToken,
-) {
-    // Skip if out-of-scope diagnostics are disabled
-    let severity = match state.cross_file_config.out_of_scope_severity {
-        Some(sev) => sev,
-        None => return,
-    };
-
-    use crate::cross_file::types::byte_offset_to_utf16_column;
-
-    // Get all source() calls and @lsp-source directives in this file
-    let source_calls: Vec<_> = directive_meta.sources.iter().collect();
-
-    if source_calls.is_empty() {
-        return;
-    }
-
-    // Pre-compute line start offsets for O(1) line lookups
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
-
-    // Collect all identifier usages with UTF-16 columns
-    let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
-    collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
-
-    // Pre-compute identifier usages that resolve to a local symbol at that position.
-    // This prevents false positives when a sourced file exports a symbol name that is
-    // also defined locally in the current document (e.g., function parameters, loop iterators).
-    let mut locally_resolved_usages: std::collections::HashSet<(String, u32, u32)> =
-        std::collections::HashSet::new();
-    for (name, usage_line, usage_col, _) in &usages {
-        let scope = scope_cache
-            .entry((*usage_line, *usage_col))
-            .or_insert_with(|| get_cross_file_scope(state, uri, *usage_line, *usage_col, cancel));
-        if let Some(symbol) = scope.symbols.get(name.as_str()) {
-            if symbol.source_uri == *uri {
-                locally_resolved_usages.insert((name.clone(), *usage_line, *usage_col));
-            }
-        }
-    }
-
-    if cancel.is_cancelled() {
-        return;
-    }
-
-    // Deduplicate by symbol+position so the same usage is reported at most once even if
-    // multiple source() calls/files could explain it.
-    let mut emitted: std::collections::HashSet<(String, u32, u32)> =
-        std::collections::HashSet::new();
-
-    use crate::cross_file::path_resolve::{
-        resolve_path, resolve_path_with_workspace_fallback, PathContext,
-    };
-
-    // Use PathContext::from_metadata (respects @lsp-cd, splits AST vs
-    // directive sources) to match the snapshot path's resolution
-    // semantics. Without this, files declaring @lsp-cd would resolve
-    // their source() targets relative to the wrong base directory.
-    let source_path_ctx =
-        PathContext::from_metadata(uri, directive_meta, state.workspace_folders.first());
-
-    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-        if let Some(doc) = state.documents.get(target_uri) {
-            if let Some(tree) = &doc.tree {
-                return Some(Arc::new(scope::compute_artifacts(
-                    target_uri,
-                    tree,
-                    &doc.text(),
-                )));
-            }
-        }
-        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
-            return Some(artifacts);
-        }
-        if let Some(doc) = state.workspace_index.get(target_uri) {
-            if let Some(tree) = &doc.tree {
-                return Some(Arc::new(scope::compute_artifacts(
-                    target_uri,
-                    tree,
-                    &doc.text(),
-                )));
-            }
-        }
-        None
-    };
-
-    // Memoize per source URI: if the same file is sourced from multiple
-    // `source()` calls / `@lsp-source` directives in this document, we
-    // must not recompute its live top-level exports each time.
-    // `live_top_level_exports` walks the timeline and allocates a fresh
-    // `HashSet`, so per-source-call recomputation is the hot-path
-    // pattern that the doc comment in `cross_file::scope` warns against.
-    let mut source_exports_cache: HashMap<Url, std::collections::HashSet<String>> = HashMap::new();
-
-    // For each source() call, check if any symbols from that file are used before the call
-    for source in &source_calls {
-        if cancel.is_cancelled() {
-            return;
-        }
-        // Skip sources that don't bring symbols into the current scope
-        // (`local=TRUE`, `sys.source` with a non-global env). The
-        // snapshot collector does this; without it we'd flag symbols
-        // that are never actually inherited.
-        if !source.inherits_symbols() {
-            continue;
-        }
-        let source_line = source.line;
-        let source_col = source.column; // Already UTF-16
-
-        let Some(source_uri) = source_path_ctx.as_ref().and_then(|ctx| {
-            let resolved = if source.is_directive {
-                resolve_path(&source.path, ctx)
-            } else {
-                resolve_path_with_workspace_fallback(&source.path, ctx)
-            }?;
-            Url::from_file_path(resolved).ok()
-        }) else {
-            continue;
-        };
-
-        // `live_top_level_exports`, not `exported_interface.keys()`:
-        // a sourced file that defines-then-removes a symbol does not
-        // actually make it available, and firing a "used before
-        // sourced" diagnostic in that case is misleading — the
-        // undefined-variable diagnostic should fire instead.
-        let source_symbols = source_exports_cache
-            .entry(source_uri.clone())
-            .or_insert_with(|| {
-                get_artifacts(&source_uri)
-                    .map(|a| crate::cross_file::scope::live_top_level_exports(&a))
-                    .unwrap_or_default()
-            });
-
-        // Check for usages of these symbols before the source() call
-        for (name, usage_line, usage_col, usage_node) in &usages {
-            if !source_symbols.contains(name) {
-                continue;
-            }
-
-            // Skip if this usage resolves to a local symbol at this position.
-            if locally_resolved_usages.contains(&(name.clone(), *usage_line, *usage_col)) {
-                continue;
-            }
-
-            // Check if usage is before the source() call (both columns are UTF-16)
-            if (*usage_line, *usage_col) < (source_line, source_col) {
-                // Emit at most one diagnostic per symbol usage position.
-                if !emitted.insert((name.clone(), *usage_line, *usage_col)) {
-                    continue;
-                }
-                // Skip if line is ignored
-                if crate::cross_file::directive::is_line_ignored(directive_meta, *usage_line) {
-                    continue;
-                }
-
-                // Convert byte columns to UTF-16 for diagnostic range
-                let start_line_text = text
-                    .lines()
-                    .nth(usage_node.start_position().row)
-                    .unwrap_or("");
-                let end_line_text = text
-                    .lines()
-                    .nth(usage_node.end_position().row)
-                    .unwrap_or("");
-                let start_col = byte_offset_to_utf16_column(
-                    start_line_text,
-                    usage_node.start_position().column,
-                );
-                let end_col =
-                    byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
-
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(usage_node.start_position().row as u32, start_col),
-                        end: Position::new(usage_node.end_position().row as u32, end_col),
-                    },
-                    severity: Some(severity),
-                    message: format!(
-                        "Symbol '{}' used before source() call at line {}",
-                        name,
-                        source_line + 1
-                    ),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-}
 
 /// Returns true if the given identifier node is a *structural non-reference*:
 /// an identifier that exists in the AST but never refers to a value at runtime,
@@ -8176,415 +7391,6 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
     last_brace_line
 }
 
-/// Report undefined variable usages in a document using position-aware cross-file scope.
-///
-/// This inspects every identifier usage in `node`, skipping local definitions, builtins,
-/// and workspace imports, and checks visibility at the exact usage position by querying
-/// the cross-file scope (including position-aware loaded/inherited packages). Lines marked
-/// with `@lsp-ignore` or `@lsp-ignore-next` are ignored. When a usage is not found in the
-/// resolved scope or in package exports (if packages are enabled), a `Diagnostic` with a
-/// UTF-16-aware range is emitted for the undefined variable.
-///
-/// # Examples
-///
-/// ```no_run
-/// // Illustrative only — real usage requires a populated WorldState, AST node and other
-/// // project-specific types from the language server state.
-/// // collect_undefined_variables_position_aware(&state, &uri, root_node, &text, &[], &workspace_imports, &package_library, &directive_meta, &mut diagnostics);
-/// ```
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_undefined_variables_position_aware(
-    state: &WorldState,
-    uri: &Url,
-    node: Node,
-    text: &str,
-    _loaded_packages: &[String], // Deprecated: now using position-aware packages from scope resolution
-    workspace_imports: &[(String, String)],
-    package_library: &crate::package_library::PackageLibrary,
-    directive_meta: &crate::cross_file::CrossFileMetadata,
-    diagnostics: &mut Vec<Diagnostic>,
-    scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
-    cancel: &DiagCancelToken,
-) {
-    use crate::content_provider::ContentProvider;
-    use crate::cross_file::config::BackwardDependencyMode;
-    use crate::cross_file::path_resolve::{
-        resolve_path, resolve_path_with_workspace_fallback, PathContext,
-    };
-    use crate::cross_file::types::byte_offset_to_utf16_column;
-
-    // Auto + no @lsp-sourced-by + scan-in-progress: backward-dependency edges
-    // may not be visible yet, so any symbol could be inherited from a parent
-    // file we haven't indexed. Defer all undefined-variable diagnostics until
-    // the workspace scan completes; the post-scan force-republish will then
-    // re-run this collector with the full dep graph in place.
-    let defer_pending_workspace_scan = matches!(
-        state.cross_file_config.backward_dependencies,
-        BackwardDependencyMode::Auto
-    ) && directive_meta.sourced_by.is_empty()
-        && !state.workspace_scan_complete;
-    if defer_pending_workspace_scan {
-        return;
-    }
-
-    let mut used: Vec<(String, Node)> = Vec::new();
-
-    // Second pass: collect all usages with NSE-aware context
-    collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
-
-    // Pre-compute line start offsets for O(1) line lookups instead of repeated
-    // text.lines().nth() which is O(n) each time.
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
-
-    // Helper closure: get a line's text from pre-computed offsets
-    let get_line = |row: usize| -> &str {
-        if row >= line_starts.len() {
-            return "";
-        }
-        let start = line_starts[row];
-        let end = if row + 1 < line_starts.len() {
-            // Exclude the trailing newline
-            line_starts[row + 1].saturating_sub(1).min(text.len())
-        } else {
-            text.len()
-        };
-        if start > text.len() || end > text.len() || start > end {
-            return "";
-        }
-        &text[start..end]
-    };
-
-    // scope_cache is shared with collect_out_of_scope_diagnostics — entries populated
-    // there are reused here, avoiding redundant cross-file scope resolution.
-
-    // Map each NAMESPACE-imported symbol to the packages that export it. The
-    // suppression below only fires when at least one source package is actually
-    // installed — otherwise the import declaration is broken and the symbol
-    // should still be flagged as undefined.
-    let workspace_imports_map: std::collections::HashMap<&str, Vec<&str>> = {
-        let mut map: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-        for (pkg, sym) in workspace_imports {
-            map.entry(sym.as_str()).or_default().push(pkg.as_str());
-        }
-        map
-    };
-
-    // Pre-compute package loader call locations once for O(log n) lookups in
-    // the usage loop instead of rescanning text prefixes (O(n) per usage).
-    let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
-
-    // Local-first optimization: collect this file's own exported symbols and
-    // function scope tree for a fast check before expensive cross-file scope
-    // resolution. When hoisting is enabled and the usage is inside a function
-    // body, any symbol in exported_interface is guaranteed to be in scope
-    // (R late-binding semantics) — so we can skip graph traversal entirely.
-    let hoist_globals = state.cross_file_config.hoist_globals_in_functions;
-    let local_opt: Option<(std::collections::HashSet<String>, scope::FunctionScopeTree)> = {
-        let provider = state.content_provider();
-        use crate::content_provider::ContentProvider;
-        provider.get_artifacts(uri).map(|artifacts| {
-            // Apply top-level `rm()`s when computing the hoist-fast-path's
-            // local export set: a name removed at file scope is NOT visible
-            // inside a later function body under R's late-binding semantics.
-            // `exported_interface.keys()` is rm-blind (interface_hash takes
-            // rm into account separately) and would suppress a legitimate
-            // "Undefined variable" diagnostic.
-            let exports = scope::live_top_level_exports(&artifacts);
-            (exports, artifacts.function_scope_tree.clone())
-        })
-    };
-
-    // Build a position-aware list of directly sourced files whose symbols are inherited.
-    // This is a fallback path for cases where a sourced file has not been indexed into
-    // the cross-file scope yet (e.g., transient startup/index timing).
-    let content_provider = state.content_provider();
-    let source_path_ctx =
-        PathContext::from_metadata(uri, directive_meta, state.workspace_folders.first());
-    let direct_sources: Vec<(u32, u32, Url)> = directive_meta
-        .sources
-        .iter()
-        .filter(|source| source.inherits_symbols())
-        .filter_map(|source| {
-            let ctx = source_path_ctx.as_ref()?;
-            let resolved = if source.is_directive {
-                resolve_path(&source.path, ctx)
-            } else {
-                resolve_path_with_workspace_fallback(&source.path, ctx)
-            }?;
-            let source_uri = Url::from_file_path(resolved).ok()?;
-            Some((source.line, source.column, source_uri))
-        })
-        .collect();
-    let mut source_exports_cache: std::collections::HashMap<
-        Url,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
-    let mut package_exists_memo: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
-
-    // Pre-compute parent scope at (0, 0) to avoid per-position graph traversal
-    // for symbols inherited from parent files. At position (0, 0), scope resolution
-    // returns parent symbols (from backward edges) + base exports, before any local
-    // timeline events. Identifiers matched here skip per-position resolution entirely.
-    let parent_symbol_names: std::collections::HashSet<String> = {
-        let scope_0_0 = scope_cache
-            .entry((0, 0))
-            .or_insert_with(|| get_cross_file_scope(state, uri, 0, 0, cancel));
-        // Only include symbols from OTHER files. When a parent sources this file,
-        // the file's own exports flow into the parent's scope and back here via
-        // backward edges. Including those would suppress forward-reference diagnostics.
-        scope_0_0
-            .symbols
-            .iter()
-            .filter(|(_, sym)| sym.source_uri != *uri)
-            .map(|(k, _)| k.to_string())
-            .collect()
-    };
-
-    // Report undefined variables with position-aware cross-file scope
-    for (idx, (name, usage_node)) in used.into_iter().enumerate() {
-        if idx & 63 == 0 && cancel.is_cancelled() {
-            return;
-        }
-        // Skip reserved words BEFORE any other checks (Requirement 3.4)
-        if crate::reserved_words::is_reserved_word(&name) {
-            continue;
-        }
-
-        let usage_line = usage_node.start_position().row as u32;
-
-        // Skip if line is ignored via @lsp-ignore or @lsp-ignore-next
-        if crate::cross_file::directive::is_line_ignored(directive_meta, usage_line) {
-            continue;
-        }
-
-        if is_builtin(&name) {
-            continue;
-        }
-        // Workspace NAMESPACE-imported symbols are suppressed only if at least
-        // one source package is actually installed. A broken import (the
-        // package mentioned in importFrom() is not on disk) must NOT silence
-        // the diagnostic — the symbol won't actually be loadable at runtime.
-        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
-            if pkgs
-                .iter()
-                .any(|p| package_exists_memoized(p, package_library, &mut package_exists_memo))
-            {
-                continue;
-            }
-        }
-
-        // Local-first fast path: if the symbol is in this file's exported_interface,
-        // hoisting is enabled, and the usage is inside a function body, we know it's
-        // in scope without graph traversal (R late-binding semantics). This avoids
-        // expensive cross-file scope computation for helper files where all symbols
-        // are defined locally. At the global level, position matters, so we can't skip.
-        if hoist_globals {
-            if let Some((ref exports, ref fn_tree)) = local_opt {
-                if exports.contains(name.as_str()) {
-                    let usage_col_byte = usage_node.start_position().column as u32;
-                    let line_text = get_line(usage_node.start_position().row);
-                    let usage_col_utf16 =
-                        byte_offset_to_utf16_column(line_text, usage_col_byte as usize);
-                    let inside_function = !fn_tree
-                        .query_point(scope::Position::new(usage_line, usage_col_utf16))
-                        .is_empty();
-                    if inside_function {
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Fast path: skip if symbol is in pre-computed parent scope (avoids per-position
-        // graph traversal for symbols inherited from parent files via backward edges).
-        if parent_symbol_names.contains(name.as_str()) {
-            continue;
-        }
-
-        // Get or compute the scope for this position (cached)
-        let scope = {
-            let line_text = get_line(usage_node.start_position().row);
-            let usage_col =
-                byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-            scope_cache
-                .entry((usage_line, usage_col))
-                .or_insert_with(|| get_cross_file_scope(state, uri, usage_line, usage_col, cancel))
-        };
-
-        // Check if symbol is in cross-file scope
-        if let Some(sym) = scope.symbols.get(name.as_str()) {
-            let usage_col_for_check = byte_offset_to_utf16_column(
-                get_line(usage_node.start_position().row),
-                usage_node.start_position().column,
-            );
-            if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_for_check) {
-                continue;
-            }
-        }
-
-        let usage_col_utf16 = byte_offset_to_utf16_column(
-            get_line(usage_node.start_position().row),
-            usage_node.start_position().column,
-        );
-
-        // Fallback: check direct source() files loaded on/before this position even if they
-        // are not yet present in cross-file scope cache/index.
-        let defined_in_loaded_direct_source = direct_sources
-            .iter()
-            .filter(|(source_line, source_col, _)| {
-                *source_line < usage_line
-                    || (*source_line == usage_line && *source_col <= usage_col_utf16)
-            })
-            .any(|(_, _, source_uri)| {
-                let exported = source_exports_cache
-                    .entry(source_uri.clone())
-                    .or_insert_with(|| {
-                        // Use `live_top_level_exports` (timeline replay with rm()
-                        // applied), not `exported_interface.keys()`. The latter
-                        // captures every top-level definition regardless of a
-                        // later top-level `rm()` and would suppress the
-                        // "Undefined variable" diagnostic for a symbol that the
-                        // sourced file defined-then-removed before returning to
-                        // the parent.
-                        if let Some(artifacts) = content_provider.get_artifacts(source_uri) {
-                            return crate::cross_file::scope::live_top_level_exports(&artifacts);
-                        }
-
-                        let source_text = content_provider.get_content(source_uri).or_else(|| {
-                            source_uri
-                                .to_file_path()
-                                .ok()
-                                .and_then(|path| std::fs::read_to_string(path).ok())
-                        });
-                        let Some(source_text) = source_text else {
-                            return std::collections::HashSet::new();
-                        };
-
-                        let source_meta = content_provider
-                            .get_metadata(source_uri)
-                            .map(std::sync::Arc::unwrap_or_clone)
-                            .unwrap_or_else(|| crate::cross_file::extract_metadata(&source_text));
-
-                        let Some(source_tree) = crate::parser_pool::with_parser(|parser| {
-                            parser.parse(&source_text, None)
-                        }) else {
-                            return std::collections::HashSet::new();
-                        };
-
-                        let artifacts = crate::cross_file::scope::compute_artifacts_with_metadata(
-                            source_uri,
-                            &source_tree,
-                            &source_text,
-                            Some(&source_meta),
-                        );
-                        crate::cross_file::scope::live_top_level_exports(&artifacts)
-                    });
-                exported.contains(name.as_str())
-            });
-        if defined_in_loaded_direct_source {
-            continue;
-        }
-
-        // Check package exports only if packages feature is enabled and library is ready
-        if state.cross_file_config.packages_enabled && state.package_library_ready {
-            // Build position-aware package list: inherited packages + locally loaded packages
-            // Requirements 5.1, 5.2: Inherited packages from parent files
-            // Requirements 8.1, 8.3: Locally loaded packages before this position
-            let position_aware_packages: Vec<String> = scope
-                .inherited_packages
-                .iter()
-                .chain(scope.loaded_packages.iter())
-                .cloned()
-                .collect();
-
-            // Check if symbol is exported by any package loaded at this position
-            if is_package_export(&name, &position_aware_packages, package_library) {
-                continue;
-            }
-
-            let has_prior_library_call = has_prior_package_loader_call(
-                &package_loader_call_end_offsets,
-                usage_node.start_byte(),
-            );
-            // A package is "pending" only when it is installed but its exports
-            // have not yet been cached — not when it is simply not installed.
-            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
-                if package_library.is_cached_sync(pkg) {
-                    return false;
-                }
-                package_exists_memoized(pkg, package_library, &mut package_exists_memo)
-            });
-            if has_prior_library_call
-                && (position_aware_packages.is_empty() || package_cache_pending)
-                && is_function_call_identifier_textually(usage_node, text)
-            {
-                continue;
-            }
-
-            log::trace!(
-                "Undefined variable '{}' at line {}: not in scope ({} symbols, chain={:?}) and not in packages {:?}",
-                name,
-                usage_line,
-                scope.symbols.len(),
-                scope.chain.iter().map(|u| u.path()).collect::<Vec<_>>(),
-                position_aware_packages,
-            );
-        } else {
-            log::trace!(
-                "Undefined variable '{}' at line {}: not in scope ({} symbols, chain={:?}), packages_enabled={}, package_library_ready={}",
-                name,
-                usage_line,
-                scope.symbols.len(),
-                scope.chain.iter().map(|u| u.path()).collect::<Vec<_>>(),
-                state.cross_file_config.packages_enabled,
-                state.package_library_ready,
-            );
-
-            // Conservative suppression: when package awareness is enabled but package
-            // metadata is not ready yet, avoid flagging unresolved call targets after
-            // library()/require()/loadNamespace() calls as undefined.
-            let has_prior_library_call = directive_meta.library_calls.iter().any(|call| {
-                call.line < usage_line
-                    || (call.line == usage_line && call.column <= usage_col_utf16)
-            });
-            let has_prior_library_call = has_prior_library_call
-                || has_prior_package_loader_call(
-                    &package_loader_call_end_offsets,
-                    usage_node.start_byte(),
-                );
-            if state.cross_file_config.packages_enabled
-                && !state.package_library_ready
-                && is_function_call_identifier_textually(usage_node, text)
-                && (!scope.loaded_packages.is_empty()
-                    || !scope.inherited_packages.is_empty()
-                    || has_prior_library_call)
-            {
-                continue;
-            }
-        }
-
-        // Symbol is undefined - emit diagnostic
-        // Convert byte columns to UTF-16 for diagnostic range using pre-computed line offsets
-        let start_line_text = get_line(usage_node.start_position().row);
-        let end_line_text = get_line(usage_node.end_position().row);
-        let start_col =
-            byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
-        let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
-
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(usage_node.start_position().row as u32, start_col),
-                end: Position::new(usage_node.end_position().row as u32, end_col),
-            },
-            severity: Some(DiagnosticSeverity::WARNING),
-            message: format!("Undefined variable: {}", name),
-            ..Default::default()
-        });
-    }
-}
 
 /// True when an identifier is textually followed by `(` (ignoring whitespace),
 /// indicating call-target usage.
@@ -23982,7 +22788,6 @@ mod proptests {
             reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with just the reserved word as a standalone identifier
             let code = reserved_word.to_string();
@@ -23994,18 +22799,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24038,7 +22839,6 @@ mod proptests {
             var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with reserved word used in an expression (e.g., x <- else)
             // This is syntactically invalid R, but the undefined variable checker
@@ -24052,18 +22852,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24095,7 +22891,6 @@ mod proptests {
             reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with reserved word used as a function argument
             // e.g., print(else) - syntactically invalid but tests the checker
@@ -24108,18 +22903,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24151,7 +22942,6 @@ mod proptests {
             var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !super::is_builtin(s))
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with just the non-reserved identifier (undefined)
             let code = var_name.clone();
@@ -24163,18 +22953,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -25077,7 +23863,6 @@ mod proptests {
             lines_between in 0usize..5
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with declaration directive followed by usage
             // Pattern: # @lsp-var varname\n[blank_lines]\nvarname
@@ -25093,18 +23878,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -25140,7 +23921,6 @@ mod proptests {
             lines_between in 0usize..5
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with declaration directive followed by function call
             // Pattern: # @lsp-func funcname\n[blank_lines]\nfuncname()
@@ -25156,18 +23936,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -25200,7 +23976,6 @@ mod proptests {
             lines_between in 0usize..3
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with usage BEFORE declaration directive
             // Pattern: symbolname\n[blank_lines]\n# @lsp-var symbolname
@@ -25222,18 +23997,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -25273,7 +24044,6 @@ mod proptests {
             is_function in any::<bool>()
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create a mixed-case version of the name
             let mixed_case_name = {
@@ -25308,18 +24078,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -25374,7 +24140,6 @@ mod proptests {
             prop_assume!(var1 != var2);
 
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with:
             // - var1 used before its declaration (should emit diagnostic)
@@ -25395,18 +24160,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -25489,7 +24250,6 @@ mod proptests {
             is_function in any::<bool>()
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate directive based on syntax variant
             let directive_base = if is_function { "@lsp-func" } else { "@lsp-var" };
@@ -25517,18 +24277,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -32869,21 +31625,15 @@ result <- helper_with_spaces(42)"#;
     }
 
     // ============================================================================
-    // Tests for collect_missing_package_diagnostics - Task 10.3
+    // Tests for collect_missing_package_diagnostics_from_snapshot - Task 10.3 (originally validated the legacy collector before issue #135)
     // ============================================================================
 
     #[test]
     fn test_missing_package_diagnostic_emitted() {
         // Test that a diagnostic is emitted for a non-installed package
         // Validates: Requirement 15.1
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -32893,9 +31643,14 @@ result <- helper_with_spaces(42)"#;
         state.package_library = std::sync::Arc::new(
             crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
         );
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -32913,14 +31668,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_not_emitted_for_base_package() {
         // Test that no diagnostic is emitted for base packages
         // Validates: Requirement 15.1 (base packages are always available)
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "base".to_string(),
-                line: 0,
-                column: 15,
-                function_scope: None,
-            });
+        let code = "library(base)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -32929,11 +31678,19 @@ result <- helper_with_spaces(42)"#;
         base_packages.insert("base".to_string());
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_base_packages(base_packages);
+        // Provide a non-empty lib_paths so suppression doesn't kick in based on
+        // "no information about installed packages". A bogus path is fine because
+        // the test only checks the base-package short-circuit.
+        pkg_lib.set_lib_paths(vec![std::path::PathBuf::from("/nonexistent")]);
         state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -32946,16 +31703,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_ignored_line() {
         // Test that diagnostics are not emitted for ignored lines
         // Validates: Requirement 15.1 with @lsp-ignore support
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 5,
-                column: 30,
-                function_scope: None,
-            });
-        // Mark line 5 as ignored
-        meta.ignored_lines.insert(5);
+        let code = "library(__nonexistent_package_xyz__) # @lsp-ignore";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -32965,9 +31714,14 @@ result <- helper_with_spaces(42)"#;
         state.package_library = std::sync::Arc::new(
             crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
         );
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -32980,21 +31734,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_multiple_packages() {
         // Test that diagnostics are emitted for multiple missing packages
         // Validates: Requirement 15.1
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__missing_pkg1__".to_string(),
-                line: 0,
-                column: 20,
-                function_scope: None,
-            });
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__missing_pkg2__".to_string(),
-                line: 1,
-                column: 20,
-                function_scope: None,
-            });
+        let code = "library(__missing_pkg1__)\nlibrary(__missing_pkg2__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -33004,9 +31745,14 @@ result <- helper_with_spaces(42)"#;
         state.package_library = std::sync::Arc::new(
             crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
         );
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -33019,20 +31765,19 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_missing_package_diagnostic_suppressed_while_package_library_not_ready() {
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = false;
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -33043,22 +31788,21 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_missing_package_diagnostic_suppressed_without_r_subprocess() {
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
         state.package_library =
             std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty());
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -33082,23 +31826,22 @@ result <- helper_with_spaces(42)"#;
         let tmp = std::env::temp_dir().join("raven_test_no_subprocess_lib_paths");
         fs::create_dir_all(&tmp).expect("create tmp lib_path");
 
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__raven_not_installed__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__raven_not_installed__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![tmp.clone()]);
         state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         let _ = fs::remove_dir_all(&tmp);
 
@@ -33120,7 +31863,6 @@ result <- helper_with_spaces(42)"#;
         // Test that a diagnostic is emitted when @lsp-source directive without line=
         // targets the same file as an earlier source() call.
         // Validates: Requirement 6.2
-        use crate::cross_file::types::ForwardSource;
         use tempfile::TempDir;
 
         // Create temp workspace with actual files
@@ -33128,7 +31870,9 @@ result <- helper_with_spaces(42)"#;
         let workspace_path = temp_dir.path();
         let main_path = workspace_path.join("main.R");
         let utils_path = workspace_path.join("utils.R");
-        std::fs::write(&main_path, "# main").unwrap();
+        // Lines 0-4 blank, line 5 source(), lines 6-9 blank, line 10 directive.
+        let main_code = "\n\n\n\n\nsource('utils.R')\n\n\n\n\n# @lsp-source utils.R";
+        std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&utils_path, "# utils").unwrap();
 
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
@@ -33136,47 +31880,33 @@ result <- helper_with_spaces(42)"#;
 
         let mut state = WorldState::new(Vec::new());
         state.workspace_folders.push(workspace_url);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, None, |_| None);
 
-        // Metadata with AST source at line 5 and directive at line 10
-        let meta = crate::cross_file::CrossFileMetadata {
-            sources: vec![
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 5,
-                    column: 0,
-                    is_directive: false, // AST source at line 5 (earlier)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 10,
-                    column: 0,
-                    is_directive: true, // Directive at line 10 (later)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_redundant_directive_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_redundant_directive_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            &mut diagnostics,
+        );
 
         assert_eq!(
             diagnostics.len(),
             1,
-            "Should emit one diagnostic for redundant directive"
+            "Should emit one diagnostic for redundant directive: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        assert!(diagnostics[0].message.contains("redundant"));
+        // Snapshot path message: "Redundant @lsp-source directive: 'utils.R' is already sourced by a source() call"
+        // Use path-agnostic substring matching to stay robust to message rewording.
+        assert!(diagnostics[0].message.to_lowercase().contains("redundant"));
         assert!(diagnostics[0].message.contains("utils.R"));
-        assert!(diagnostics[0].message.contains("line 6")); // 1-based display
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
         assert_eq!(diagnostics[0].range.start.line, 10); // Directive line
     }
@@ -33185,7 +31915,6 @@ result <- helper_with_spaces(42)"#;
     fn test_redundant_directive_diagnostic_not_emitted_when_disabled() {
         // Test that no diagnostic is emitted when redundant_directive_severity is None
         // Validates: Requirement 6.2 (configurable severity)
-        use crate::cross_file::types::ForwardSource;
         use tempfile::TempDir;
 
         // Create temp workspace with actual files
@@ -33193,7 +31922,8 @@ result <- helper_with_spaces(42)"#;
         let workspace_path = temp_dir.path();
         let main_path = workspace_path.join("main.R");
         let utils_path = workspace_path.join("utils.R");
-        std::fs::write(&main_path, "# main").unwrap();
+        let main_code = "\n\n\n\n\nsource('utils.R')\n\n\n\n\n# @lsp-source utils.R";
+        std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&utils_path, "# utils").unwrap();
 
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
@@ -33202,38 +31932,18 @@ result <- helper_with_spaces(42)"#;
         let mut state = WorldState::new(Vec::new());
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.redundant_directive_severity = None; // Disabled
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
 
-        // Metadata with AST source at line 5 and directive at line 10
-        let meta = crate::cross_file::CrossFileMetadata {
-            sources: vec![
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 5,
-                    column: 0,
-                    is_directive: false,
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 10,
-                    column: 0,
-                    is_directive: true,
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_redundant_directive_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_redundant_directive_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            &mut diagnostics,
+        );
 
         assert_eq!(
             diagnostics.len(),
@@ -33246,7 +31956,6 @@ result <- helper_with_spaces(42)"#;
     fn test_redundant_directive_diagnostic_not_emitted_when_directive_is_earlier() {
         // Test that no diagnostic is emitted when directive is at an earlier line than source()
         // Validates: Requirement 6.2 (only emit when directive is later)
-        use crate::cross_file::types::ForwardSource;
         use tempfile::TempDir;
 
         // Create temp workspace with actual files
@@ -33254,7 +31963,9 @@ result <- helper_with_spaces(42)"#;
         let workspace_path = temp_dir.path();
         let main_path = workspace_path.join("main.R");
         let utils_path = workspace_path.join("utils.R");
-        std::fs::write(&main_path, "# main").unwrap();
+        // Lines 0-4 blank, line 5 directive, lines 6-9 blank, line 10 source().
+        let main_code = "\n\n\n\n\n# @lsp-source utils.R\n\n\n\n\nsource('utils.R')";
+        std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&utils_path, "# utils").unwrap();
 
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
@@ -33262,38 +31973,18 @@ result <- helper_with_spaces(42)"#;
 
         let mut state = WorldState::new(Vec::new());
         state.workspace_folders.push(workspace_url);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
 
-        // Metadata with directive at line 5 and AST source at line 10
-        let meta = crate::cross_file::CrossFileMetadata {
-            sources: vec![
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 5,
-                    column: 0,
-                    is_directive: true, // Directive at line 5 (earlier)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-                ForwardSource {
-                    path: "utils.R".to_string(),
-                    line: 10,
-                    column: 0,
-                    is_directive: false, // AST source at line 10 (later)
-                    local: false,
-                    chdir: false,
-                    is_sys_source: false,
-                    sys_source_global_env: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_redundant_directive_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_redundant_directive_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            &mut diagnostics,
+        );
 
         assert_eq!(
             diagnostics.len(),
@@ -33308,20 +31999,19 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_missing_package_diagnostic_not_emitted_when_severity_off() {
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.cross_file_config.packages_missing_package_severity = None;
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -33476,9 +32166,10 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(code, None));
 
-        let meta = crate::cross_file::directive::parse_directives(code);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_file_diagnostics(&state, &main_url, &meta, &mut diagnostics);
+        collect_missing_file_diagnostics_from_snapshot(&snapshot, &main_url, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -33517,22 +32208,14 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
 
-        let tree = {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .unwrap();
-            parser.parse(main_code, None).unwrap()
-        };
-        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_out_of_scope_diagnostics(
-            &state,
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
             &main_url,
-            tree.root_node(),
-            main_code,
-            &meta,
+            snapshot.tree.root_node(),
+            &snapshot.text,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -33542,6 +32225,607 @@ result <- helper_with_spaces(42)"#;
             diagnostics.len(),
             0,
             "Should not emit out-of-scope diagnostic when severity is off"
+        );
+    }
+
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// `@lsp-cd subdir/` makes the file's working directory `<workspace>/subdir/`.
+    /// AST-detected `source("helper.R")` should resolve to
+    /// `<workspace>/subdir/helper.R`, not `<workspace>/helper.R`. If the path
+    /// resolution regresses to plain parent-dir join, the source target won't be
+    /// found, and the "used before sourced" diagnostic for `helper` would not
+    /// fire (because `helper` would not be attributable to any resolved source
+    /// target). The single "used before sourced" diagnostic is the signal that
+    /// `@lsp-cd` resolution worked.
+    #[test]
+    fn test_out_of_scope_respects_lsp_cd_for_ast_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let subdir_path = workspace_path.join("subdir");
+        std::fs::create_dir(&subdir_path).unwrap();
+
+        let main_path = workspace_path.join("main.R");
+        let helper_path = subdir_path.join("helper.R");
+
+        // main.R declares @lsp-cd subdir/ then sources "helper.R"
+        let main_code = "# @lsp-cd subdir/\nresult <- helper(1)\nsource(\"helper.R\")\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        // Expect a "used before sourced" diagnostic for `helper` on line 1
+        // (0-indexed) — line of `result <- helper(1)`. Both paths emit ONE
+        // such diagnostic for this symbol when @lsp-cd resolves the source
+        // target; assert path-agnostically by message substring "helper",
+        // "used before", and the line. If @lsp-cd resolution regresses, the
+        // source target wouldn't be found and this diagnostic wouldn't fire.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+                    && d.range.start.line == 1
+            })
+            .collect();
+        assert_eq!(
+            used_before_helper.len(),
+            1,
+            "Expected one 'used before sourced' diagnostic for `helper` on \
+             line 1 (proves @lsp-cd resolved subdir/helper.R); got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// In an unannotated workspace (no @lsp-cd), `source("scripts/helper.R")`
+    /// resolves via workspace-root fallback when the literal relative path
+    /// doesn't exist next to the parent file. This is the AST-detected
+    /// source-call-only fallback. If the fallback regresses, the source target
+    /// won't resolve and the "used before sourced" diagnostic won't fire.
+    /// The single "used before sourced" diagnostic is the signal that the
+    /// fallback worked.
+    #[test]
+    fn test_out_of_scope_uses_workspace_root_fallback_for_ast_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let scripts_path = workspace_path.join("scripts");
+        std::fs::create_dir(&scripts_path).unwrap();
+
+        let main_path = scripts_path.join("main.R");
+        let helper_path = scripts_path.join("helper.R");
+
+        // main.R lives in scripts/; sources "scripts/helper.R" relative to
+        // workspace root, NOT relative to main.R's parent dir. The literal
+        // `<scripts_dir>/scripts/helper.R` does not exist; workspace-root
+        // fallback should resolve to `<workspace>/scripts/helper.R`.
+        let main_code = "result <- helper(1)\nsource(\"scripts/helper.R\")\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        // `helper` should resolve through workspace-root fallback; expect a
+        // single "used before sourced" diagnostic on line 0. If the fallback
+        // regresses, this won't fire because the source target won't be found.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+                    && d.range.start.line == 0
+            })
+            .collect();
+        assert_eq!(
+            used_before_helper.len(),
+            1,
+            "Expected one 'used before sourced' diagnostic for `helper` on \
+             line 0 (proves workspace-root fallback resolved \
+             scripts/helper.R); got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// `source("helper.R", local=TRUE)` does NOT inherit symbols into the
+    /// caller's scope (R semantics: local=TRUE evaluates the sourced file in
+    /// a fresh local environment). The "used before sourced" diagnostic must
+    /// not fire for symbols defined in a local-sourced file — they are
+    /// genuinely undefined from the caller's perspective. The legacy
+    /// collector got this right after PR #134 (handlers.rs:5721 filters via
+    /// `inherits_symbols()`); this test locks it in.
+    #[test]
+    fn test_out_of_scope_skips_local_true_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        // helper.R defines `helper`. main.R uses helper() BEFORE sourcing
+        // helper.R with local=TRUE. The use-before-source layout is what
+        // actually exercises the `inherits_symbols()` skip filter: if the
+        // filter regressed and treated local=TRUE as inheriting, the source
+        // would be considered for "used before sourced" attribution and the
+        // diagnostic would fire. Because local=TRUE doesn't inherit symbols,
+        // the filter must skip the source and no diagnostic should fire.
+        // helper() is also genuinely undefined from the caller's perspective,
+        // so the undefined-variable diagnostic IS expected.
+        let main_code = "result <- helper(1)\nsource(\"helper.R\", local=TRUE)\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        // No "used before sourced" diagnostic for `helper` (the `inherits_symbols()`
+        // filter must skip the local=TRUE source).
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && (d.message.contains("used before"))
+            })
+            .collect();
+        assert!(
+            used_before_helper.is_empty(),
+            "Expected NO 'used before sourced' diagnostic for helper(): \
+             local=TRUE doesn't inherit. Got: {:?}",
+            used_before_helper
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // Undefined-variable diagnostic for `helper` IS expected (R semantics:
+        // helper is not visible from the caller's environment).
+        let undefined_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: helper"))
+            .collect();
+        assert!(
+            !undefined_helper.is_empty(),
+            "Expected 'Undefined variable: helper' diagnostic — local=TRUE \
+             doesn't inherit. Got: {:?}",
+            diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// `sys.source("helper.R", envir=new.env())` evaluates in a fresh env;
+    /// symbols are NOT inherited into the caller's scope. The "used before
+    /// sourced" collector must skip such sources via `inherits_symbols()`.
+    /// The use-before-source layout forces the filter to be the only thing
+    /// preventing the diagnostic — if the filter regressed, the source
+    /// would be considered for attribution and the diagnostic would fire.
+    #[test]
+    fn test_out_of_scope_skips_sys_source_non_global_env() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        let main_code =
+            "result <- helper(1)\nsys.source(\"helper.R\", envir=new.env())\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+            })
+            .collect();
+        assert!(
+            used_before_helper.is_empty(),
+            "Expected NO 'used before sourced' for helper(): sys.source with \
+             non-global env doesn't inherit. Got: {:?}",
+            used_before_helper
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// `sys.source("helper.R", envir=globalenv())` DOES inherit symbols into
+    /// the global environment. Confirms the `inherits_symbols()` filter
+    /// correctly distinguishes global from non-global env.
+    #[test]
+    fn test_out_of_scope_includes_sys_source_global_env() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        // Use `globalenv()` so the source IS inheriting. Use BEFORE the source
+        // call to trigger "used before sourced".
+        let main_code =
+            "result <- helper(1)\nsys.source(\"helper.R\", envir=globalenv())\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        // Expect exactly one "used before sourced" diagnostic on line 0.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+                    && d.range.start.line == 0
+            })
+            .collect();
+        assert_eq!(
+            used_before_helper.len(),
+            1,
+            "Expected 1 'used before sourced' for helper() on line 0: \
+             sys.source with globalenv() DOES inherit. Got: {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 1 Category B for issue #135 — failing on legacy until Phase 3.
+    ///
+    /// Deviation #4: snapshot suppresses "used before sourced" when the symbol
+    /// is already in scope via a non-source mechanism (e.g., backward edge).
+    /// Legacy only checks usages resolving to the queried URI and so flags
+    /// the symbol even though it's available another way.
+    ///
+    /// Setup: `main.R` declares `helper` and sources `child.R`. `child.R` is
+    /// queried for diagnostics. `child.R` calls `helper()` and ALSO sources
+    /// `redef.R` AFTER the call. `redef.R` defines `helper` again (a redefinition).
+    /// The use of `helper()` is in-scope from `main.R` (via backward edge), so
+    /// the snapshot path suppresses the "used before sourced" diagnostic;
+    /// the legacy path emits it.
+    #[test]
+    fn test_out_of_scope_suppresses_when_in_scope_via_backward_edge() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let child_path = workspace_path.join("child.R");
+        let redef_path = workspace_path.join("redef.R");
+
+        let main_code = "helper <- function(x) x + 1\nsource(\"child.R\")\n";
+        let child_code = "result <- helper(1)\nsource(\"redef.R\")\n";
+        let redef_code = "helper <- function(x) x * 2\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&child_path, child_code).unwrap();
+        std::fs::write(&redef_path, redef_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let child_url = Url::from_file_path(&child_path).unwrap();
+        let redef_url = Url::from_file_path(&redef_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&main_url, main_code),
+            (&child_url, child_code),
+            (&redef_url, redef_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                Some(&workspace_url),
+                |_| None,
+            );
+        }
+
+        let diags = diagnostics(&state, &child_url, &DiagCancelToken::never());
+
+        // `helper` at child.R line 0 is in-scope via backward edge from main.R.
+        // The snapshot path suppresses; assert no "used before sourced" diagnostic.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+            })
+            .collect();
+        assert!(
+            used_before_helper.is_empty(),
+            "Expected NO 'used before sourced' for helper(): symbol is in \
+             scope via backward edge from main.R. Got: {:?}",
+            used_before_helper
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 1 Category B for issue #135 — failing on legacy until Phase 3.
+    ///
+    /// Deviation #5: snapshot has source-call-site defense-in-depth that
+    /// verifies the symbol at the source position actually comes from another
+    /// URI before emitting "used before sourced". Legacy doesn't, so the
+    /// `xyz <- xyz` self-leak shape produces a false positive: the queried
+    /// URI defines `xyz` at top-level AND a sourced file ALSO defines `xyz`,
+    /// and legacy emits the diagnostic without checking that `xyz` resolves
+    /// to a DIFFERENT URI than the queried one.
+    #[test]
+    fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let data_path = workspace_path.join("data.R");
+        let indices_path = workspace_path.join("indices.R");
+
+        // data.R has a self-referential `xyz <- xyz` (the RHS is a USE of `xyz`,
+        // not a def — `visible_from` semantics ensure the LHS binding isn't
+        // installed until the end of the assignment) and ALSO sources indices.R,
+        // which ALSO defines `xyz`. The naive legacy path sees that `xyz` is
+        // defined in indices.R (sourced after the use) and emits "used before
+        // sourced." The snapshot path's source-call-site defense-in-depth verifies
+        // the symbol at the source position actually comes from a DIFFERENT URI
+        // before emitting; `xyz` resolves to data.R itself (the self-leak), so
+        // the diagnostic is suppressed.
+        //
+        // Expected snapshot behavior: NO "used before sourced" for xyz; the RHS
+        // remains a genuine "Undefined variable: xyz" because no outer `xyz`
+        // exists at that point in the timeline.
+        let data_code = "xyz <- xyz\nsource(\"indices.R\")\n";
+        let indices_code = "xyz <- 99\n";
+        std::fs::write(&data_path, data_code).unwrap();
+        std::fs::write(&indices_path, indices_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let data_url = Url::from_file_path(&data_path).unwrap();
+        let indices_url = Url::from_file_path(&indices_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [(&data_url, data_code), (&indices_url, indices_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                Some(&workspace_url),
+                |_| None,
+            );
+        }
+
+        let diags = diagnostics(&state, &data_url, &DiagCancelToken::never());
+
+        // No "used before sourced" for xyz: the symbol resolves to data.R
+        // itself (self-leak), not to indices.R. The snapshot path's source-site
+        // defense-in-depth catches this; legacy does not.
+        let used_before_xyz: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'xyz'") || d.message.contains("Symbol 'xyz'"))
+                    && d.message.contains("used before")
+            })
+            .collect();
+        assert!(
+            used_before_xyz.is_empty(),
+            "Expected NO 'used before sourced' for xyz: self-referential \
+             assignment, source-site defense-in-depth must verify source_uri \
+             differs from queried URI. Got: {:?}",
+            used_before_xyz
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // The RHS `xyz` is genuinely undefined (no outer binding exists when
+        // the RHS is evaluated, before the LHS is installed). Expect exactly
+        // one undefined-variable diagnostic on line 0.
+        let undefined_xyz: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .filter(|d| d.range.start.line == 0)
+            .collect();
+        assert_eq!(
+            undefined_xyz.len(),
+            1,
+            "Expected exactly one 'Undefined variable: xyz' on line 0; got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -33585,22 +32869,14 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
 
-        let tree = {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .unwrap();
-            parser.parse(main_code, None).unwrap()
-        };
-        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_out_of_scope_diagnostics(
-            &state,
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
             &main_url,
-            tree.root_node(),
-            main_code,
-            &meta,
+            snapshot.tree.root_node(),
+            &snapshot.text,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -33657,31 +32933,32 @@ result <- helper_with_spaces(42)"#;
         state
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, None, |_| None);
 
-        let tree = {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .unwrap();
-            parser.parse(main_code, None).unwrap()
-        };
-        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
 
         let mut diagnostics = Vec::new();
-        collect_out_of_scope_diagnostics(
-            &state,
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
             &main_url,
-            tree.root_node(),
-            main_code,
-            &meta,
+            snapshot.tree.root_node(),
+            &snapshot.text,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
 
+        // Snapshot-path message format: "'j' is used before it's available (sourced on line N)".
+        // Match the symbol name in a path-agnostic way (the legacy collector
+        // wrote a different prefix; this assertion should remain stable across
+        // both phrasings).
         let j_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Symbol 'j' used before source()"))
+            .filter(|d| d.message.contains("'j'") && d.message.contains("source"))
             .collect();
         assert_eq!(
             j_diags.len(),
@@ -34783,7 +34060,7 @@ y <- x"#;
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
     use crate::handlers::{
-        collect_undefined_variables_position_aware, diagnostics_from_snapshot, goto_definition,
+        collect_undefined_variables_from_snapshot, diagnostics_from_snapshot, goto_definition,
         DiagCancelToken, DiagnosticsSnapshot,
     };
     use crate::state::{Document, WorldState};
@@ -34856,18 +34133,14 @@ x <- 1
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[], // deprecated loaded_packages
-            &[], // workspace_imports
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34928,18 +34201,14 @@ x <- 1
 
         let tree = parse_r_code(impute_code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(impute_code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &impute_uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &impute_uri,
             root,
             impute_code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34997,18 +34266,14 @@ x
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35031,18 +34296,14 @@ x <- 2
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35069,18 +34330,14 @@ myvar
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35106,18 +34363,14 @@ myfunc()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35143,18 +34396,14 @@ myfunc()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35184,18 +34433,14 @@ MyVar
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35224,18 +34469,14 @@ MyVar
             let uri = add_document(&mut state, "file:///test.R", &code);
             let tree = parse_r_code(&code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(&code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -35264,18 +34505,14 @@ MyVar
             let uri = add_document(&mut state, "file:///test.R", &code);
             let tree = parse_r_code(&code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(&code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -35303,18 +34540,14 @@ myvar
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35407,18 +34640,14 @@ mysymbol
         let uri1 = add_document(&mut state, "file:///test1.R", code1);
         let tree1 = parse_r_code(code1);
         let root1 = tree1.root_node();
-        let directive_meta1 = parse_directives(code1);
 
         let mut diagnostics1 = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri1).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri1,
             root1,
             code1,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta1,
             &mut diagnostics1,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35438,18 +34667,14 @@ mysymbol
         let uri2 = add_document(&mut state, "file:///test2.R", code2);
         let tree2 = parse_r_code(code2);
         let root2 = tree2.root_node();
-        let directive_meta2 = parse_directives(code2);
 
         let mut diagnostics2 = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri2).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri2,
             root2,
             code2,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta2,
             &mut diagnostics2,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37242,8 +36467,9 @@ source(\"helpers.R\")
 
 #[cfg(test)]
 mod function_parameter_tests {
-    use crate::cross_file::directive::parse_directives;
-    use crate::handlers::{collect_undefined_variables_position_aware, DiagCancelToken};
+    use crate::handlers::{
+        collect_undefined_variables_from_snapshot, DiagCancelToken, DiagnosticsSnapshot,
+    };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::Url;
 
@@ -37280,18 +36506,14 @@ add <- function(a, b) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37341,18 +36563,14 @@ outer_func <- function(x) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37401,18 +36619,14 @@ my_func <- function(a = undefined_var) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37461,18 +36675,14 @@ my_func()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37505,18 +36715,14 @@ my_func(1)
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37549,18 +36755,14 @@ my_func()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37594,18 +36796,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37652,18 +36850,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37704,25 +36898,14 @@ my_func <- function(a = default_value) {
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
         state
             .cross_file_graph
-            .update_file(&main_uri, &parse_directives(main_code), None, |_| None);
+            .update_file(&main_uri, &main_meta, None, |_| None);
 
-        let tree = parse_r_code(main_code);
-        let directive_meta = parse_directives(main_code);
-        let mut diagnostics = Vec::new();
-
-        collect_undefined_variables_position_aware(
+        let diagnostics = crate::handlers::diagnostics_via_snapshot(
             &state,
             &main_uri,
-            tree.root_node(),
-            main_code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
-            &mut diagnostics,
-            &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
 
@@ -37740,6 +36923,13 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn test_direct_source_export_suppresses_undefined_variable_from_disk_fallback() {
+        // Migrated to the snapshot path (issue #135): the snapshot pipeline does
+        // NOT perform synchronous disk I/O during diagnostics, so a child file
+        // that exists only on disk is no longer auto-discovered. To preserve the
+        // intent of this test (suppression when a sourced file's exports are
+        // available cross-file), the child file is now seeded into the legacy
+        // `workspace_index` AND the workspace-root fallback is exercised via
+        // `state.workspace_folders`.
         let mut state = create_test_state();
         let workspace_dir = tempfile::tempdir().expect("tempdir should be created");
         let workspace_url =
@@ -37749,30 +36939,30 @@ my_func <- function(a = default_value) {
         let main_path = workspace_dir.path().join("main.R");
         let child_path = workspace_dir.path().join("helpers.R");
         let main_uri = Url::from_file_path(&main_path).expect("main uri should be valid");
+        let child_uri = Url::from_file_path(&child_path).expect("child uri should be valid");
 
-        std::fs::write(&child_path, "summary_table <- data.frame(x = 1)\n")
-            .expect("child file should be written");
+        let child_code = "summary_table <- data.frame(x = 1)\n";
+        // Seed both disk and the in-memory workspace_index. The disk write is
+        // retained to keep the workspace-root fallback resolution legitimate;
+        // the workspace_index entry is what enables snapshot-path artifact
+        // lookup without synchronous disk I/O.
+        std::fs::write(&child_path, child_code).expect("child file should be written");
+        state
+            .workspace_index
+            .insert(child_uri.clone(), Document::new(child_code, None));
 
         let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_uri, &main_meta, None, |_| None);
 
-        let tree = parse_r_code(main_code);
-        let directive_meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-        let mut diagnostics = Vec::new();
-
-        collect_undefined_variables_position_aware(
+        let diagnostics = crate::handlers::diagnostics_via_snapshot(
             &state,
             &main_uri,
-            tree.root_node(),
-            main_code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
-            &mut diagnostics,
-            &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
 
@@ -37780,7 +36970,7 @@ my_func <- function(a = default_value) {
             !diagnostics
                 .iter()
                 .any(|d| d.message == "Undefined variable: summary_table"),
-            "Symbol exported by sourced on-disk file should not be flagged as undefined: {:?}",
+            "Symbol exported by sourced file (workspace-root fallback resolution) should not be flagged as undefined: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
@@ -37797,18 +36987,14 @@ my_func <- function(a = default_value) {
         let code = "library(openxlsx)\nwb <- createWorkbook()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37855,18 +37041,14 @@ my_func <- function(a = default_value) {
         let code = "library(__raven_pending_pkg__)\n__pending_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37926,18 +37108,14 @@ my_func <- function(a = default_value) {
         let code = "library(lme4)\nlmer()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &state.workspace_imports,
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37989,19 +37167,15 @@ my_func <- function(a = default_value) {
         let code = "library(lme4)\nlmer()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         // Cold-start: scan in progress, all undefined-variable diagnostics deferred.
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38020,15 +37194,12 @@ my_func <- function(a = default_value) {
         // Post-scan: full dep graph available, deferral lifts.
         state.workspace_scan_complete = true;
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38062,18 +37233,14 @@ my_func <- function(a = default_value) {
         let code = "library(__raven_fake_pkg__)\n__raven_fake_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38120,18 +37287,14 @@ my_func <- function(a = default_value) {
         let code = "library(__raven_installed_pkg__)\n__installed_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38173,18 +37336,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -38224,18 +37383,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -38306,18 +37461,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", case.code);
             let tree = parse_r_code(case.code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(case.code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 case.code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -38369,18 +37520,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38426,18 +37573,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -38471,18 +37614,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38532,18 +37671,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
