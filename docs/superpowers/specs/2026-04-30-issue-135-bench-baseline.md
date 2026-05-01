@@ -140,7 +140,7 @@ lsp_diagnostics/fanout_diagnostics/fanout_200
 
 ### Verdict
 
-**PASS.** All three gates pass with massive headroom. The snapshot path is 5–12× faster than the legacy chain-of-collectors path; the cumulative win on the production-shaped fanout fixtures is dramatic (827 ms → 127 ms at fanout_200).
+**PASS.** All three gates pass with massive headroom. The snapshot path is 5–12× faster than the legacy chain-of-collectors path; the cumulative win on the production-shaped fanout fixtures is dramatic (949 ms → 127 ms at fanout_200).
 
 The snapshot pipeline already incorporates the optimizations from earlier
 work (parent-prefix cache, ScopeStream forward-only cursor, parallel
