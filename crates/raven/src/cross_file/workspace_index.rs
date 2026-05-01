@@ -5,6 +5,7 @@
 //
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -48,6 +49,14 @@ pub struct CrossFileWorkspaceIndex {
     /// pressure. Lock order: acquire `inner` before `pinned` when both
     /// are needed.
     pinned: RwLock<HashSet<Url>>,
+    /// Original user-configured capacity.
+    ///
+    /// `inner.cap()` may temporarily exceed this when an all-pinned
+    /// overflow forces growth (see `pin_aware_push`). `set_pinned_uris`
+    /// uses this value to opportunistically shrink the cache back when
+    /// `len() <= user_cap` so the runtime cap doesn't ratchet upward
+    /// across repeated overflow/unpin cycles (issue #128).
+    user_cap: usize,
 }
 
 impl std::fmt::Debug for CrossFileWorkspaceIndex {
@@ -69,11 +78,12 @@ impl CrossFileWorkspaceIndex {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        let cap = non_zero_or(cap, DEFAULT_WORKSPACE_INDEX_CAPACITY);
+        let cap_nz = non_zero_or(cap, DEFAULT_WORKSPACE_INDEX_CAPACITY);
         Self {
-            inner: RwLock::new(LruCache::new(cap)),
+            inner: RwLock::new(LruCache::new(cap_nz)),
             version: AtomicU64::new(0),
             pinned: RwLock::new(HashSet::new()),
+            user_cap: cap_nz.get(),
         }
     }
 
@@ -83,9 +93,28 @@ impl CrossFileWorkspaceIndex {
     /// pinned, the cache is allowed to grow past its configured capacity.
     /// Explicit `invalidate` and `update_from_disk` still work for pinned
     /// URIs (the open-document gate in `update_from_disk` is unchanged).
+    ///
+    /// Also opportunistically shrinks the runtime cap back to `user_cap`
+    /// when `len() <= user_cap`, so repeated all-pinned overflow events
+    /// followed by safe unpins don't ratchet the cap upward indefinitely
+    /// (issue #128). The shrink only fires when it can't itself force
+    /// eviction.
+    ///
+    /// Lock order: acquires `inner.write()` before `pinned.write()`,
+    /// matching the order established by `pin_aware_push` (which holds
+    /// `inner.write()` and then takes `pinned.read()`).
     pub fn set_pinned_uris(&self, uris: HashSet<Url>) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
         if let Ok(mut pinned) = self.pinned.write() {
             *pinned = uris;
+        }
+
+        if let Some(user_cap_nz) = NonZeroUsize::new(self.user_cap) {
+            if guard.cap().get() > self.user_cap && guard.len() <= self.user_cap {
+                guard.resize(user_cap_nz);
+            }
         }
     }
 
@@ -207,6 +236,18 @@ impl CrossFileWorkspaceIndex {
             .ok()
             .map(|g| g.iter().map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Get the current cache capacity.
+    ///
+    /// May exceed the user-configured capacity after an all-pinned
+    /// overflow has forced the underlying LRU to grow.
+    pub fn cap(&self) -> usize {
+        self.inner
+            .read()
+            .ok()
+            .map(|g| g.cap().get())
+            .unwrap_or(0)
     }
 
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.
@@ -426,6 +467,61 @@ mod tests {
         assert!(index.contains(&uri1));
         assert!(index.contains(&uri2));
         assert!(index.contains(&uri3));
+        assert_eq!(index.uris().len(), 3);
+    }
+
+    #[test]
+    fn test_cap_shrinks_back_to_user_cap_when_safe() {
+        // Issue #128: after an all-pinned overflow grew the cap, calling
+        // `set_pinned_uris` while `uris().len() <= user_cap` should
+        // restore the cap to its configured value.
+        let index = CrossFileWorkspaceIndex::with_capacity(2);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        index.insert(uri1.clone(), test_entry(1));
+        index.insert(uri2.clone(), test_entry(2));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+        index.insert(uri3.clone(), test_entry(3));
+        assert_eq!(index.cap(), 3, "all-pinned overflow grew the cap");
+        assert_eq!(index.uris().len(), 3);
+
+        // Drop one entry so len falls back to user_cap.
+        index.invalidate(&uri3);
+        assert_eq!(index.uris().len(), 2);
+
+        // Clearing the pin set should now opportunistically shrink cap.
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(index.cap(), 2, "cap should shrink back to user_cap");
+    }
+
+    #[test]
+    fn test_cap_does_not_shrink_when_len_still_exceeds_user_cap() {
+        // Issue #128: shrinking must never force eviction.
+        let index = CrossFileWorkspaceIndex::with_capacity(2);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+
+        index.insert(uri1.clone(), test_entry(1));
+        index.insert(uri2.clone(), test_entry(2));
+
+        let mut pinned = HashSet::new();
+        pinned.insert(uri1.clone());
+        pinned.insert(uri2.clone());
+        index.set_pinned_uris(pinned);
+        index.insert(uri3.clone(), test_entry(3));
+        assert_eq!(index.cap(), 3);
+        assert_eq!(index.uris().len(), 3);
+
+        // Clear pins; len(3) > user_cap(2) so cap must remain 3.
+        index.set_pinned_uris(HashSet::new());
+        assert_eq!(index.cap(), 3, "cap must not shrink when len > user_cap");
         assert_eq!(index.uris().len(), 3);
     }
 
