@@ -59,27 +59,37 @@ series) followed by a `codex:rescue` review gate before proceeding.
 
 #### Phase 1 — Add gap-coverage tests against the legacy path
 
-Add tests that exercise the four parity-gap areas listed in issue #135:
+Two test categories. PR #134 fixed three of the five originally-reported
+deviations in-place (memoization, `inherits_symbols()` filter, and
+`PathContext::from_metadata` path resolution — all confirmed present in legacy
+as of `main`). Two deviations remain. Phase 1 covers both.
 
-| Area | Why it matters |
-|---|---|
-| `@lsp-cd` directive | Legacy collector used plain parent-dir join; snapshot uses `PathContext::from_metadata`. Files declaring `@lsp-cd` resolve source targets relative to the wrong base in legacy. |
-| Workspace-root fallback | AST-detected `source()` calls in unannotated workspaces fall back to workspace-root resolution; snapshot honors this, legacy may not. |
-| `local=TRUE` / non-global `sys.source` | Snapshot uses `inherits_symbols()` to skip non-inheriting source calls; legacy did not skip these and would flag "used before sourced" for symbols never actually inherited. |
-| Source-call-site defense-in-depth | Snapshot verifies the symbol at the source position actually comes from another URI before emitting (deviation #5 in issue #135); legacy does not. |
+**Category A — Regression locks** (already pass on legacy as of `main`; we lock
+them in so the path resolution and `inherits_symbols()` filter cannot regress):
 
-Each area gets at least one test. Tests run through `pub fn diagnostics()`
-(legacy path). For each test that we expect to fail under the current legacy
-behavior, mark `#[ignore = "legacy parity gap; un-ignored when diagnostics() delegates to snapshot in Phase 3"]`
-with a comment pointing to issue #135. Tests that already pass on legacy stay
-un-ignored.
+| Area | Test shape | Status on legacy |
+|---|---|---|
+| `@lsp-cd` resolves AST `source()` targets relative to the directive's base | parent file declares `@lsp-cd subdir/`; sources `helper.R` from there; child uses a sibling-not-yet-sourced symbol | Passes (handlers.rs:5677 uses `PathContext::from_metadata`) |
+| Workspace-root fallback for unannotated `source("rel.R")` | parent file at `<workspace>/scripts/main.R` does `source("scripts/helper.R")`; resolves via workspace root | Passes (handlers.rs:5731 uses `resolve_path_with_workspace_fallback`) |
+| `source(..., local=TRUE)` does not flag "used before sourced" | parent uses a symbol the local-sourced file defines; should be a true undefined, not a "used before sourced" | Passes (handlers.rs:5721 filters via `inherits_symbols()`) |
+| `sys.source(..., envir=new.env())` does not flag "used before sourced" | same shape, with `sys.source` and a non-global env | Passes (same filter at 5721; `inherits_symbols()` returns false) |
+| `sys.source(..., envir=globalenv())` DOES participate in "used before sourced" | confirms the filter distinguishes global from non-global env | Passes |
 
-The full test suite must pass — failing-on-legacy tests are ignored, so the
-tree is green.
+**Category B — Failing-on-legacy parity gaps** (the two remaining deviations
+from issue #135):
+
+| Area | Test shape | Status on legacy | Mark |
+|---|---|---|---|
+| Broader "already in scope" suppression (deviation #4) | a symbol is in scope through some non-source mechanism (e.g., a parent-file declaration via backward edge) AND is also defined in a file sourced after the use site; legacy flags "used before sourced," snapshot suppresses | Fails | `#[ignore = "legacy parity gap; un-ignored in Phase 3 (issue #135)"]` |
+| Source-call-site defense-in-depth (deviation #5) | the `xyz <- xyz` self-leak shape: queried URI defines `xyz` at top-level, AST-sources another file that ALSO defines `xyz`; legacy emits "used before sourced" without verifying `source_uri` differs | Fails | `#[ignore = "legacy parity gap; un-ignored in Phase 3 (issue #135)"]` |
+
+Tests run through `pub fn diagnostics()` so they exercise the legacy path during
+Phases 1–2 and the snapshot path from Phase 3 onward. The full test suite must
+pass — failing-on-legacy tests are ignored, so the tree is green.
 
 **Why this order?** The tests document the parity gap before the legacy code
-goes away. After Phase 3 deletes the legacy path, the tests un-ignore and
-prove parity by passing.
+goes away. After Phase 3 the ignored tests un-ignore and prove parity by
+passing.
 
 → **codex:rescue gate:** review test coverage adequacy; confirm tests actually
 exercise the deviation areas (not just lookalike shapes); flag any missed
@@ -97,11 +107,13 @@ snapshot-build cost (e.g. neighborhood pre-collection), add a `large` fixture
 variant or extend existing fixtures in this phase. The decision is informed by
 codex:rescue's recommendation in the gate below.
 
-→ **codex:rescue gate:** sanity-check baseline numbers; recommend whether to add
-a `large` fixture or a new bench targeting `backend.rs:3125` (watched-files
-child publish path) specifically. The watched-files path is the only sync caller
-of `diagnostics()` likely to fan out across many files per edit; if the existing
-benches don't cover it, propose what would.
+→ **codex:rescue gate:** sanity-check baseline numbers; recommend whether to
+add a `large` fixture or a new bench targeting the watched-files cascade. The
+production sync caller is `Backend::publish_diagnostics` at backend.rs:4135;
+watched-files fanout reaches it via `publish_diagnostics_via_arc` /
+`publish_diagnostics`. The fanout itself (one publish per affected URI per
+edit) is the cost characteristic the existing per-URI bench may not cover; if
+needed, propose a new bench shape.
 
 #### Phase 3 — Delegate `diagnostics()` to the snapshot path
 
@@ -113,46 +125,72 @@ benches don't cover it, propose what would.
    by a call to `diagnostics_via_snapshot(state, uri, cancel)`. The early returns
    are preserved because they short-circuit before `DiagnosticsSnapshot::build`
    does any work.
-3. Un-ignore the Phase 1 tests that were marked failing-on-legacy. Update their
-   `#[ignore]` attributes — remove them entirely.
-4. Run `cargo test -p raven`. Must pass green.
+3. Un-ignore the Phase 1 Category-B tests that were marked failing-on-legacy.
+   Update their `#[ignore]` attributes — remove them entirely.
+4. Add `#[allow(dead_code)]` to the six legacy collectors that Phase 5 will
+   delete (`collect_out_of_scope_diagnostics`, `collect_undefined_variables_position_aware`,
+   `collect_max_depth_diagnostics`, `collect_missing_file_diagnostics`,
+   `collect_missing_package_diagnostics`, `collect_redundant_directive_diagnostics`).
+   The annotations are temporary and removed in Phase 5; they keep the tree
+   warning-free during the inter-phase window. Each annotation gets a comment
+   `// removed in Phase 5 (issue #135)`.
+5. Run `cargo test -p raven` and `cargo build -p raven`. Both must be green
+   (no warnings).
 
-This phase touches only the public `diagnostics()` and the cfg gate on
-`diagnostics_via_snapshot`. Legacy collectors remain in the file (will become
-dead-code after the binding to `diagnostics()` is severed; `cargo` will warn).
+**Definition of "green phase boundary":** zero compiler warnings, zero test
+failures, zero ignored tests added by this PR (the Category-B tests are
+un-ignored in step 3; the Category-A tests were never ignored).
 
 → **codex:rescue gate:** parity audit of:
-- `backend.rs:3125` — `did_change_watched_files` child publish path
-- `backend.rs:4152` — sync publish path
-- `crates/raven/benches/lsp_operations.rs:263` — bench harness
-Plus: lock semantics in the watched-files async loop (no fresh locks acquired
-inside `DiagnosticsSnapshot::build`), and confirm the scope_cache reuse
-semantics match what the legacy path provided.
+- `crates/raven/src/backend.rs:4135` — the only direct production caller, inside
+  `Backend::publish_diagnostics`. Watched-file fanout reaches this site
+  indirectly through `publish_diagnostics_via_arc` / `publish_diagnostics`
+  (backend.rs ~3183, ~3196, ~4099).
+- `crates/raven/benches/lsp_operations.rs:263` — bench harness.
+- `handlers::diagnostics_async_standalone` (handlers.rs:3843) is the live async
+  caller in both debounced and sync publish paths; it consumes the `Vec<Diagnostic>`
+  returned by `diagnostics()` and adds async missing-file checks. After Phase 3
+  the input `Vec<Diagnostic>` comes from the snapshot path; behavior should be
+  unchanged because `diagnostics_async_standalone` does not introspect the
+  passed diagnostics.
+Plus: confirm `DiagnosticsSnapshot::build` acquires no fresh `state.write()`
+or `state.read()` locks (verified at handlers.rs:115, 147, 198 — it takes
+`&WorldState` and reads from already-borrowed fields).
 
 #### Phase 4 — Re-run benchmarks; confirm no regression
 
 Re-run `cargo bench --bench lsp_operations -- lsp_diagnostics`. Append results
 to the baseline doc with a delta column.
 
-**Acceptance threshold:** any per-fixture mean increase >15% on `medium_50` (or
-the new `large` fixture if added) blocks Phase 5; investigate before
-proceeding. Smaller workspaces are noisier and a sub-1ms increase is not
-load-bearing — the absolute numbers are recorded for reference but not gated.
+**Acceptance threshold (compound; ALL conditions must hold to proceed):**
 
-If a regression is found, options:
-- Investigate whether the snapshot build is dominated by cycle detection or
-  neighborhood collection; tune cache shapes if needed.
+1. **Confidence-interval gate, not point-estimate.** Use Criterion's
+   `change.lower_bound` and `change.upper_bound` from its noise-detection
+   output. The 95% CI's lower bound on percent change must be `<= 15%` on
+   `medium_50` (or the new `large` fixture, if added in Phase 2). Mean-only
+   comparisons at sample size 20 are too noisy to gate on.
+2. **Absolute floor.** Per-iteration mean increase must be `<= 5 ms` on every
+   fixture, regardless of the percentage. This catches scenarios where a small
+   workspace's `+30%` is meaningless (200µs → 260µs) but a `medium_50`'s `+10%`
+   is meaningful (40ms → 44ms).
+3. **No regression on a fanout-shaped fixture.** If Phase 2 added a `large`
+   fixture or new bench targeting the watched-files cascade, that fixture is
+   subject to (1) and (2) too.
+
+If any gate fails, investigate before proceeding:
+- Profile the snapshot build: cycle detection (`detect_cycle`) and neighborhood
+  collection (`cached_neighborhood_subgraph`) are the candidates.
 - Determine if a sync caller can hold a `DiagnosticsSnapshot` and reuse it
-  across multiple `diagnostics()` calls (only relevant if many calls happen for
+  across multiple `diagnostics()` calls (relevant only if many calls happen for
   the same URI back-to-back, which is unlikely in production).
 - Worst case: revert Phase 3 and re-scope the issue.
 
-→ **codex:rescue gate:** review delta and the absolute numbers; recommend
-whether to proceed to Phase 5 or investigate further.
+→ **codex:rescue gate:** review CI bounds and absolute deltas against all three
+gates; recommend proceed-to-5 or investigate.
 
 #### Phase 5 — Delete legacy collectors and migrate tests
 
-Delete:
+Delete (and remove their `#[allow(dead_code)]` annotations from Phase 3):
 - `collect_out_of_scope_diagnostics` (handlers.rs:5609)
 - `collect_undefined_variables_position_aware` (handlers.rs:8196)
 - `collect_max_depth_diagnostics` (handlers.rs:4471)
@@ -161,6 +199,16 @@ Delete:
 - `collect_redundant_directive_diagnostics` (handlers.rs:4651)
 - Any helpers exclusively used by the above (e.g. legacy `get_cross_file_scope`
   shapes if no snapshot caller). Use `cargo build` warnings to find them.
+
+**Do NOT delete:**
+- `collect_syntax_errors`, `collect_else_newline_errors`,
+  `collect_invalid_line_param_diagnostics` — shared by both paths.
+- The async missing-file helpers around handlers.rs:3867 (e.g. the body
+  consumed by `diagnostics_async_standalone`). Despite the name overlap, these
+  are distinct from `collect_missing_file_diagnostics` and remain live.
+- `diagnostics_async_standalone` itself (handlers.rs:3843) — live async caller.
+  `diagnostics_async` (handlers.rs ~3796) is dead code and a candidate for
+  deletion, but is OUT OF SCOPE for this PR.
 
 Migrate or delete the ~57 in-file tests that call these legacy collectors
 directly. The migration target is one of:
@@ -212,26 +260,47 @@ variants except shared ones: `collect_syntax_errors`, `collect_else_newline_erro
 | File | Change |
 |---|---|
 | `crates/raven/src/handlers.rs` | Replace `diagnostics()` body, lift `diagnostics_via_snapshot` cfg, delete six legacy collectors, migrate ~57 in-file tests. |
-| `crates/raven/src/backend.rs` | No code changes expected. Audit only. |
+| `crates/raven/src/backend.rs` | No code changes expected. Audit only — confirm the single direct caller at `:4135` continues to work and that watched-file fanout via `publish_diagnostics_via_arc` is unaffected. |
 | `crates/raven/benches/lsp_operations.rs` | No code changes expected (bench already calls `diagnostics()` which now routes through the snapshot path). Optional: add `large` fixture variant in Phase 2. |
 | `CLAUDE.md` | Drop the "BOTH must be fixed" Learning; add a brief replacement entry. |
 | `docs/superpowers/specs/2026-04-30-issue-135-bench-baseline.md` | New file — pre/post bench numbers. |
 
 ### Data flow
 
-`diagnostics()` is called synchronously from two sites:
-- `backend.rs:3125` — `did_change_watched_files` child publish path. Iterates
-  affected URIs and publishes diagnostics for each. Inside an async task that
-  holds `state.read().await`. After the change, each iteration builds a
-  `DiagnosticsSnapshot` (which already takes `&WorldState` and does no fresh
-  lock acquisition).
-- `backend.rs:4152` — sync publish path called from `Backend::publish_diagnostics`.
-  Same pattern.
+`diagnostics()` has exactly one direct production caller and one bench caller:
 
-Both callers are outside the per-keystroke hot path (debounced pipeline uses
-`run_debounced_diagnostics` which already calls `diagnostics_from_snapshot`).
+- `crates/raven/src/backend.rs:4135` — inside `Backend::publish_diagnostics`,
+  computes sync diagnostics under `state.read().await` and hands them to
+  `diagnostics_async_standalone` (which adds async missing-file checks).
+  Watched-file fanout reaches this function indirectly through
+  `publish_diagnostics_via_arc` (backend.rs ~3183, ~3196) and
+  `publish_diagnostics` (backend.rs ~4099).
+- `crates/raven/benches/lsp_operations.rs:263` — `bench_diagnostics`.
+
+After Phase 3, each call builds a `DiagnosticsSnapshot` (which takes
+`&WorldState` and acquires no fresh locks; verified at handlers.rs:115, 147,
+198) and threads it through `diagnostics_from_snapshot`. The debounced
+per-keystroke pipeline (`run_debounced_diagnostics`) already uses the
+snapshot path directly; this PR does not affect that path.
+
 The snapshot build cost is therefore paid once per affected file per
 revalidation event, not per keystroke.
+
+### Behavioral parity vs structural parity
+
+The legacy and snapshot paths share a `HashMap<(u32, u32), ScopeAtPosition>`
+between the out-of-scope and undefined-variable collectors, but they populate
+it differently. The legacy path primes per-usage scopes before the source
+loops and passes the cache forward (handlers.rs:3733, 5643). The snapshot
+path uses `ScopeStream` and materializes only source-site/fallback/slow-path
+entries (handlers.rs:349, 5096, 5120, 5451).
+
+**The required parity is behavioral, not structural.** Both paths must emit
+the same set of `Diagnostic` shapes for the same input; they need not
+populate the same cache entries in the same order. Phase 1 tests assert on
+emitted diagnostics (`Vec<Diagnostic>`), not on cache state. Phase 4's bench
+covers performance; behavioral divergence flowing from cache-priming
+differences would surface as test failures, not bench regressions.
 
 ### Error / cancellation handling
 
@@ -259,8 +328,8 @@ full suite (`cargo test -p raven`) must be green at the end of every phase.
 
 | Risk | Mitigation |
 |---|---|
-| Snapshot build cost regresses sync callers (watched-files cascade). | Phase 2 baseline + Phase 4 comparison; >15% block. |
-| Subtle behavioral drift not caught by Phase 1 tests. | codex:rescue gate after Phase 3 specifically audits parity, not just compilation. |
+| Snapshot build cost regresses sync callers (watched-files cascade). | Phase 2 baseline + Phase 4 comparison; CI lower-bound + absolute floor + fanout-fixture gates. |
+| Subtle behavioral drift not caught by Phase 1 tests. | codex:rescue gate after Phase 3 specifically audits parity, not just compilation. The cache-priming difference (legacy primes-per-usage, snapshot uses `ScopeStream`) is behavioral parity territory — Phase 1 tests assert on emitted `Diagnostic` shapes, which is the right level. |
 | Lock semantics change in watched-files async loop. | Audit confirms `DiagnosticsSnapshot::build` takes `&WorldState` and does no fresh `state.write()` acquisition. |
 | Test migration introduces shape mismatches (snapshot collector signatures differ from legacy). | One test at a time; full suite after each batch. |
 | CLAUDE.md edit removes a Learning that's still load-bearing for other code. | The Learning is specifically about dual-path drift, which is what we're eliminating. Replace with a single-line entry noting the consolidation. |
