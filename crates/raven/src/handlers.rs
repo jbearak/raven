@@ -34040,6 +34040,108 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
+    /// Phase 1 Category B for issue #135 — failing on legacy until Phase 3.
+    ///
+    /// Deviation #5: snapshot has source-call-site defense-in-depth that
+    /// verifies the symbol at the source position actually comes from another
+    /// URI before emitting "used before sourced". Legacy doesn't, so the
+    /// `xyz <- xyz` self-leak shape produces a false positive: the queried
+    /// URI defines `xyz` at top-level AND a sourced file ALSO defines `xyz`,
+    /// and legacy emits the diagnostic without checking that `xyz` resolves
+    /// to a DIFFERENT URI than the queried one.
+    #[ignore = "legacy parity gap; un-ignored in Phase 3 (issue #135)"]
+    #[test]
+    fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let data_path = workspace_path.join("data.R");
+        let indices_path = workspace_path.join("indices.R");
+
+        // data.R has a self-referential `xyz <- xyz` (the RHS is a USE of `xyz`,
+        // not a def — `visible_from` semantics ensure the LHS binding isn't
+        // installed until the end of the assignment) and ALSO sources indices.R,
+        // which ALSO defines `xyz`. The naive legacy path sees that `xyz` is
+        // defined in indices.R (sourced after the use) and emits "used before
+        // sourced." The snapshot path's source-call-site defense-in-depth verifies
+        // the symbol at the source position actually comes from a DIFFERENT URI
+        // before emitting; `xyz` resolves to data.R itself (the self-leak), so
+        // the diagnostic is suppressed.
+        //
+        // Expected snapshot behavior: NO "used before sourced" for xyz; the RHS
+        // remains a genuine "Undefined variable: xyz" because no outer `xyz`
+        // exists at that point in the timeline.
+        let data_code = "xyz <- xyz\nsource(\"indices.R\")\n";
+        let indices_code = "xyz <- 99\n";
+        std::fs::write(&data_path, data_code).unwrap();
+        std::fs::write(&indices_path, indices_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let data_url = Url::from_file_path(&data_path).unwrap();
+        let indices_url = Url::from_file_path(&indices_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [(&data_url, data_code), (&indices_url, indices_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                Some(&workspace_url),
+                |_| None,
+            );
+        }
+
+        let diags = diagnostics(&state, &data_url, &DiagCancelToken::never());
+
+        // No "used before sourced" for xyz: the symbol resolves to data.R
+        // itself (self-leak), not to indices.R. The snapshot path's source-site
+        // defense-in-depth catches this; legacy does not.
+        let used_before_xyz: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'xyz'") || d.message.contains("Symbol 'xyz'"))
+                    && d.message.contains("used before")
+            })
+            .collect();
+        assert!(
+            used_before_xyz.is_empty(),
+            "Expected NO 'used before sourced' for xyz: self-referential \
+             assignment, source-site defense-in-depth must verify source_uri \
+             differs from queried URI. Got: {:?}",
+            used_before_xyz
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // The RHS `xyz` is genuinely undefined (no outer binding exists when
+        // the RHS is evaluated, before the LHS is installed). Expect exactly
+        // one undefined-variable diagnostic on line 0.
+        let undefined_xyz: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .filter(|d| d.range.start.line == 0)
+            .collect();
+        assert_eq!(
+            undefined_xyz.len(),
+            1,
+            "Expected exactly one 'Undefined variable: xyz' on line 0; got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_out_of_scope_ignores_locally_scoped_names() {
         use tempfile::TempDir;
