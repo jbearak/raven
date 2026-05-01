@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, tree-sitter-r, tower-lsp, Criterion (for benchmarks), tempfile (for filesystem-backed tests).
 
-**Spec:** `/Users/jmb/repos/raven/docs/superpowers/specs/2026-04-30-issue-135-route-diagnostics-through-snapshot-design.md`
+**Spec:** `docs/superpowers/specs/2026-04-30-issue-135-route-diagnostics-through-snapshot-design.md`
 
 **Branch:** `refactor/issue-135-route-diagnostics-through-snapshot` (already created off `main`; spec and this plan are on this branch)
 
