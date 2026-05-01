@@ -4935,8 +4935,6 @@ fn collect_undefined_variables_from_snapshot(
                     .or_insert_with(|| {
                         // Use `live_top_level_exports` (timeline replay with
                         // rm() applied), not `exported_interface.keys()`.
-                        // See the matching comment in
-                        // `collect_undefined_variables_position_aware`.
                         if let Some(artifacts) = snapshot.artifacts_map.get(source_uri) {
                             return crate::cross_file::scope::live_top_level_exports(artifacts);
                         }
@@ -22790,7 +22788,6 @@ mod proptests {
             reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with just the reserved word as a standalone identifier
             let code = reserved_word.to_string();
@@ -22802,18 +22799,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -22846,7 +22839,6 @@ mod proptests {
             var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with reserved word used in an expression (e.g., x <- else)
             // This is syntactically invalid R, but the undefined variable checker
@@ -22860,18 +22852,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -22903,7 +22891,6 @@ mod proptests {
             reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with reserved word used as a function argument
             // e.g., print(else) - syntactically invalid but tests the checker
@@ -22916,18 +22903,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -22959,7 +22942,6 @@ mod proptests {
             var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !super::is_builtin(s))
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create code with just the non-reserved identifier (undefined)
             let code = var_name.clone();
@@ -22971,18 +22953,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -23885,7 +23863,6 @@ mod proptests {
             lines_between in 0usize..5
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with declaration directive followed by usage
             // Pattern: # @lsp-var varname\n[blank_lines]\nvarname
@@ -23901,18 +23878,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -23948,7 +23921,6 @@ mod proptests {
             lines_between in 0usize..5
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with declaration directive followed by function call
             // Pattern: # @lsp-func funcname\n[blank_lines]\nfuncname()
@@ -23964,18 +23936,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24008,7 +23976,6 @@ mod proptests {
             lines_between in 0usize..3
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with usage BEFORE declaration directive
             // Pattern: symbolname\n[blank_lines]\n# @lsp-var symbolname
@@ -24030,18 +23997,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24081,7 +24044,6 @@ mod proptests {
             is_function in any::<bool>()
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Create a mixed-case version of the name
             let mixed_case_name = {
@@ -24116,18 +24078,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24182,7 +24140,6 @@ mod proptests {
             prop_assume!(var1 != var2);
 
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate code with:
             // - var1 used before its declaration (should emit diagnostic)
@@ -24203,18 +24160,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24297,7 +24250,6 @@ mod proptests {
             is_function in any::<bool>()
         ) {
             use crate::state::{WorldState, Document};
-            use crate::cross_file::directive::parse_directives;
 
             // Generate directive based on syntax variant
             let directive_base = if is_function { "@lsp-func" } else { "@lsp-var" };
@@ -24325,18 +24277,14 @@ mod proptests {
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
-            let directive_meta = parse_directives(&code);
             let mut diagnostics = Vec::new();
 
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 tree.root_node(),
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -31935,6 +31883,10 @@ result <- helper_with_spaces(42)"#;
         state
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, None, |_| None);
 
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
@@ -31948,11 +31900,13 @@ result <- helper_with_spaces(42)"#;
         assert_eq!(
             diagnostics.len(),
             1,
-            "Should emit one diagnostic for redundant directive"
+            "Should emit one diagnostic for redundant directive: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        assert!(diagnostics[0].message.contains("redundant"));
+        // Snapshot path message: "Redundant @lsp-source directive: 'utils.R' is already sourced by a source() call"
+        // Use path-agnostic substring matching to stay robust to message rewording.
+        assert!(diagnostics[0].message.to_lowercase().contains("redundant"));
         assert!(diagnostics[0].message.contains("utils.R"));
-        assert!(diagnostics[0].message.contains("line 6")); // 1-based display
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
         assert_eq!(diagnostics[0].range.start.line, 10); // Directive line
     }
@@ -32979,9 +32933,14 @@ result <- helper_with_spaces(42)"#;
         state
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, None, |_| None);
 
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+
         let mut diagnostics = Vec::new();
         collect_out_of_scope_diagnostics_from_snapshot(
             &snapshot,
@@ -32993,9 +32952,13 @@ result <- helper_with_spaces(42)"#;
             &DiagCancelToken::never(),
         );
 
+        // Snapshot-path message format: "'j' is used before it's available (sourced on line N)".
+        // Match the symbol name in a path-agnostic way (the legacy collector
+        // wrote a different prefix; this assertion should remain stable across
+        // both phrasings).
         let j_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Symbol 'j' used before source()"))
+            .filter(|d| d.message.contains("'j'") && d.message.contains("source"))
             .collect();
         assert_eq!(
             j_diags.len(),
@@ -34097,7 +34060,7 @@ y <- x"#;
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
     use crate::handlers::{
-        collect_undefined_variables_position_aware, diagnostics_from_snapshot, goto_definition,
+        collect_undefined_variables_from_snapshot, diagnostics_from_snapshot, goto_definition,
         DiagCancelToken, DiagnosticsSnapshot,
     };
     use crate::state::{Document, WorldState};
@@ -34170,18 +34133,14 @@ x <- 1
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[], // deprecated loaded_packages
-            &[], // workspace_imports
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34242,18 +34201,14 @@ x <- 1
 
         let tree = parse_r_code(impute_code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(impute_code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &impute_uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &impute_uri,
             root,
             impute_code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34311,18 +34266,14 @@ x
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34345,18 +34296,14 @@ x <- 2
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34383,18 +34330,14 @@ myvar
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34420,18 +34363,14 @@ myfunc()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34457,18 +34396,14 @@ myfunc()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34498,18 +34433,14 @@ MyVar
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34538,18 +34469,14 @@ MyVar
             let uri = add_document(&mut state, "file:///test.R", &code);
             let tree = parse_r_code(&code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(&code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -34578,18 +34505,14 @@ MyVar
             let uri = add_document(&mut state, "file:///test.R", &code);
             let tree = parse_r_code(&code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(&code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 &code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -34617,18 +34540,14 @@ myvar
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34721,18 +34640,14 @@ mysymbol
         let uri1 = add_document(&mut state, "file:///test1.R", code1);
         let tree1 = parse_r_code(code1);
         let root1 = tree1.root_node();
-        let directive_meta1 = parse_directives(code1);
 
         let mut diagnostics1 = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri1).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri1,
             root1,
             code1,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta1,
             &mut diagnostics1,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34752,18 +34667,14 @@ mysymbol
         let uri2 = add_document(&mut state, "file:///test2.R", code2);
         let tree2 = parse_r_code(code2);
         let root2 = tree2.root_node();
-        let directive_meta2 = parse_directives(code2);
 
         let mut diagnostics2 = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri2).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri2,
             root2,
             code2,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta2,
             &mut diagnostics2,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36556,8 +36467,9 @@ source(\"helpers.R\")
 
 #[cfg(test)]
 mod function_parameter_tests {
-    use crate::cross_file::directive::parse_directives;
-    use crate::handlers::{collect_undefined_variables_position_aware, DiagCancelToken};
+    use crate::handlers::{
+        collect_undefined_variables_from_snapshot, DiagCancelToken, DiagnosticsSnapshot,
+    };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::Url;
 
@@ -36594,18 +36506,14 @@ add <- function(a, b) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36655,18 +36563,14 @@ outer_func <- function(x) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36715,18 +36619,14 @@ my_func <- function(a = undefined_var) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36775,18 +36675,14 @@ my_func()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36819,18 +36715,14 @@ my_func(1)
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36863,18 +36755,14 @@ my_func()
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36908,18 +36796,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -36966,18 +36850,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37018,25 +36898,14 @@ my_func <- function(a = default_value) {
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
         state
             .cross_file_graph
-            .update_file(&main_uri, &parse_directives(main_code), None, |_| None);
+            .update_file(&main_uri, &main_meta, None, |_| None);
 
-        let tree = parse_r_code(main_code);
-        let directive_meta = parse_directives(main_code);
-        let mut diagnostics = Vec::new();
-
-        collect_undefined_variables_position_aware(
+        let diagnostics = crate::handlers::diagnostics_via_snapshot(
             &state,
             &main_uri,
-            tree.root_node(),
-            main_code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
-            &mut diagnostics,
-            &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
 
@@ -37054,6 +36923,13 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn test_direct_source_export_suppresses_undefined_variable_from_disk_fallback() {
+        // Migrated to the snapshot path (issue #135): the snapshot pipeline does
+        // NOT perform synchronous disk I/O during diagnostics, so a child file
+        // that exists only on disk is no longer auto-discovered. To preserve the
+        // intent of this test (suppression when a sourced file's exports are
+        // available cross-file), the child file is now seeded into the legacy
+        // `workspace_index` AND the workspace-root fallback is exercised via
+        // `state.workspace_folders`.
         let mut state = create_test_state();
         let workspace_dir = tempfile::tempdir().expect("tempdir should be created");
         let workspace_url =
@@ -37063,30 +36939,30 @@ my_func <- function(a = default_value) {
         let main_path = workspace_dir.path().join("main.R");
         let child_path = workspace_dir.path().join("helpers.R");
         let main_uri = Url::from_file_path(&main_path).expect("main uri should be valid");
+        let child_uri = Url::from_file_path(&child_path).expect("child uri should be valid");
 
-        std::fs::write(&child_path, "summary_table <- data.frame(x = 1)\n")
-            .expect("child file should be written");
+        let child_code = "summary_table <- data.frame(x = 1)\n";
+        // Seed both disk and the in-memory workspace_index. The disk write is
+        // retained to keep the workspace-root fallback resolution legitimate;
+        // the workspace_index entry is what enables snapshot-path artifact
+        // lookup without synchronous disk I/O.
+        std::fs::write(&child_path, child_code).expect("child file should be written");
+        state
+            .workspace_index
+            .insert(child_uri.clone(), Document::new(child_code, None));
 
         let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state
             .documents
             .insert(main_uri.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_uri, &main_meta, None, |_| None);
 
-        let tree = parse_r_code(main_code);
-        let directive_meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-        let mut diagnostics = Vec::new();
-
-        collect_undefined_variables_position_aware(
+        let diagnostics = crate::handlers::diagnostics_via_snapshot(
             &state,
             &main_uri,
-            tree.root_node(),
-            main_code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
-            &mut diagnostics,
-            &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
         );
 
@@ -37094,7 +36970,7 @@ my_func <- function(a = default_value) {
             !diagnostics
                 .iter()
                 .any(|d| d.message == "Undefined variable: summary_table"),
-            "Symbol exported by sourced on-disk file should not be flagged as undefined: {:?}",
+            "Symbol exported by sourced file (workspace-root fallback resolution) should not be flagged as undefined: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
@@ -37111,18 +36987,14 @@ my_func <- function(a = default_value) {
         let code = "library(openxlsx)\nwb <- createWorkbook()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37169,18 +37041,14 @@ my_func <- function(a = default_value) {
         let code = "library(__raven_pending_pkg__)\n__pending_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37240,18 +37108,14 @@ my_func <- function(a = default_value) {
         let code = "library(lme4)\nlmer()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &state.workspace_imports,
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37303,19 +37167,15 @@ my_func <- function(a = default_value) {
         let code = "library(lme4)\nlmer()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         // Cold-start: scan in progress, all undefined-variable diagnostics deferred.
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37334,15 +37194,12 @@ my_func <- function(a = default_value) {
         // Post-scan: full dep graph available, deferral lifts.
         state.workspace_scan_complete = true;
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37376,18 +37233,14 @@ my_func <- function(a = default_value) {
         let code = "library(__raven_fake_pkg__)\n__raven_fake_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37434,18 +37287,14 @@ my_func <- function(a = default_value) {
         let code = "library(__raven_installed_pkg__)\n__installed_fn__()\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             tree.root_node(),
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37487,18 +37336,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37538,18 +37383,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37620,18 +37461,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", case.code);
             let tree = parse_r_code(case.code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(case.code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 case.code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37683,18 +37520,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37740,18 +37573,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37785,18 +37614,14 @@ my_func <- function(a = default_value) {
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
-        let directive_meta = parse_directives(code);
 
         let mut diagnostics = Vec::new();
-        collect_undefined_variables_position_aware(
-            &state,
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
             &uri,
             root,
             code,
-            &[],
-            &[],
-            &state.package_library,
-            &directive_meta,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37846,18 +37671,14 @@ my_func <- function(a = default_value) {
             let uri = add_document(&mut state, "file:///test.R", code);
             let tree = parse_r_code(code);
             let root = tree.root_node();
-            let directive_meta = parse_directives(code);
 
             let mut diagnostics = Vec::new();
-            collect_undefined_variables_position_aware(
-                &state,
+            let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &__snapshot,
                 &uri,
                 root,
                 code,
-                &[],
-                &[],
-                &state.package_library,
-                &directive_meta,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
