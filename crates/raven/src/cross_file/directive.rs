@@ -229,6 +229,20 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 explicit_line: has_explicit_line,
                 directive_line: line_num,
                 user_line_zero: is_line_zero,
+                // `@lsp-source` directives are treated as load-time sources
+                // and are never function-scoped. Note: unlike backward
+                // (`@lsp-sourced-by`) and working-directory (`@lsp-cd`)
+                // directives, forward directives (`@lsp-source`,
+                // `@lsp-run`, `@lsp-include`) are NOT strictly header-only
+                // in this parser — see the parse_directives docstring above
+                // and the "Backward directives and working directory
+                // directives are header-only" learning in AGENTS.md. The
+                // load-time semantics here come from the parser, not from
+                // a header-only restriction: this branch runs in the full-
+                // file pass, and `is_directive: true` (combined with this
+                // `is_function_scoped: false`) is what tags the resulting
+                // ForwardSource as a load-time ordering constraint.
+                is_function_scoped: false,
             });
             continue;
         }

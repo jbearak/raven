@@ -137,7 +137,24 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
         explicit_line: false,  // AST-detected sources never have explicit line=N
         directive_line: 0,     // Not applicable for AST-detected sources
         user_line_zero: false, // Not applicable for AST-detected sources
+        is_function_scoped: has_function_definition_ancestor(node),
     })
+}
+
+/// Walk up the AST from `node` to determine whether any ancestor is a
+/// `function_definition`. Used to mark source() calls that only execute
+/// when their enclosing function is invoked, so they are not load-time
+/// ordering constraints. Tree-sitter normalizes R 4.1+ lambdas (`\(x) ...`)
+/// into `function_definition` nodes too, so no separate handling is needed.
+fn has_function_definition_ancestor(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "function_definition" {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
 }
 
 /// Check if the envir argument is globalenv() or .GlobalEnv
@@ -810,6 +827,41 @@ source("b.R")"#;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].line, 1);
         assert_eq!(sources[0].column, 0);
+    }
+
+    /// Regression coverage for issue #138: source() at top level must be
+    /// flagged as not function-scoped.
+    #[test]
+    fn test_source_top_level_is_not_function_scoped() {
+        let code = "source(\"utils.R\")\n";
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(!sources[0].is_function_scoped);
+    }
+
+    /// Regression coverage for issue #138: source() inside a function body
+    /// is deferred-evaluation and must be flagged as function-scoped.
+    #[test]
+    fn test_source_in_function_body_is_function_scoped() {
+        let code = "f <- function() {\n  source(\"utils.R\")\n}\n";
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_function_scoped);
+    }
+
+    /// Regression coverage for issue #138: walking ancestors must catch
+    /// source() inside nested function bodies, not just the immediate
+    /// parent function. Also covers R 4.1+ lambda syntax (`\(...)`),
+    /// which tree-sitter-r normalizes to `function_definition`.
+    #[test]
+    fn test_source_in_nested_function_body_is_function_scoped() {
+        let code = "outer <- function() {\n  inner <- \\() {\n    source(\"utils.R\")\n  }\n}\n";
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_function_scoped);
     }
 
     #[test]
