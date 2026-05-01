@@ -33884,6 +33884,81 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
+    /// Regression lock for issue #135 (Phase 1, Category A).
+    ///
+    /// `sys.source("helper.R", envir=globalenv())` DOES inherit symbols into
+    /// the global environment. Confirms the `inherits_symbols()` filter
+    /// correctly distinguishes global from non-global env.
+    #[test]
+    fn test_out_of_scope_includes_sys_source_global_env() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        // Use `globalenv()` so the source IS inheriting. Use BEFORE the source
+        // call to trigger "used before sourced".
+        let main_code =
+            "result <- helper(1)\nsys.source(\"helper.R\", envir=globalenv())\n";
+        let helper_code = "helper <- function(x) x + 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+
+        // Expect exactly one "used before sourced" diagnostic on line 0.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+                    && d.range.start.line == 0
+            })
+            .collect();
+        assert_eq!(
+            used_before_helper.len(),
+            1,
+            "Expected 1 'used before sourced' for helper() on line 0: \
+             sys.source with globalenv() DOES inherit. Got: {:?}",
+            diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_out_of_scope_ignores_locally_scoped_names() {
         use tempfile::TempDir;
