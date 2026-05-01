@@ -4432,7 +4432,15 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    let source_calls: Vec<_> = snapshot.directive_meta.sources.iter().collect();
+    // Filter out function-body source() calls: they only execute when the
+    // enclosing function is invoked, so they are not load-time ordering
+    // constraints for usages elsewhere in the file. See issue #138.
+    let source_calls: Vec<_> = snapshot
+        .directive_meta
+        .sources
+        .iter()
+        .filter(|s| !s.is_function_scoped)
+        .collect();
     if source_calls.is_empty() {
         return;
     }
@@ -32965,6 +32973,278 @@ result <- helper_with_spaces(42)"#;
             1,
             "Expected one deduplicated diagnostic for j usage, got: {:?}",
             j_diags
+        );
+    }
+
+    /// Regression lock for issue #138.
+    ///
+    /// `source()` calls inside a function body only execute when the
+    /// enclosing function is invoked, so they must NOT be treated as
+    /// load-time ordering constraints for top-level usages. The diagnostic
+    /// loop previously walked every detected `source()` call regardless
+    /// of scope, producing a false-positive "used before it's available"
+    /// when a function-body source() happened to bring in the same name.
+    #[test]
+    fn test_out_of_scope_skips_function_body_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        // Top-level usage of `x` plus a function-body `source("helper.R")`.
+        // The source() runs only when defer_load() is called, so it is not
+        // a load-time ordering constraint for the top-level `x` usage.
+        let main_code = "x\ndefer_load <- function() {\n  source(\"helper.R\")\n}\n";
+        let helper_code = "x <- 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, Some(&workspace_url), |_| None);
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("'x'") && d.message.contains("used before"))
+            .collect();
+        assert!(
+            used_before_x.is_empty(),
+            "Function-body source() must not blame top-level usage of `x`: {:?}",
+            used_before_x
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression lock for issue #138.
+    ///
+    /// Same shape as the prior test, but the source() is buried in a closure
+    /// inside an outer function. The function-scope filter must walk all
+    /// ancestors, not just the immediate parent: any `function_definition`
+    /// ancestor means the source() is deferred-evaluation.
+    #[test]
+    fn test_out_of_scope_skips_nested_function_body_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        let main_code = "x\nouter <- function() {\n  inner <- function() {\n    source(\"helper.R\")\n  }\n  inner()\n}\n";
+        let helper_code = "x <- 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, Some(&workspace_url), |_| None);
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("'x'") && d.message.contains("used before"))
+            .collect();
+        assert!(
+            used_before_x.is_empty(),
+            "Nested function-body source() must not blame top-level usage of `x`: {:?}",
+            used_before_x
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression guard for issue #138: top-level source() that runs at
+    /// load time after a top-level usage MUST still produce the
+    /// "used before sourced" diagnostic. The function-scope filter is
+    /// scoped — it only suppresses sources inside function bodies.
+    #[test]
+    fn test_out_of_scope_top_level_source_after_top_level_usage_still_fires() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        // Top-level usage of `x` on line 1, top-level source() on line 2.
+        let main_code = "x\nsource(\"helper.R\")\n";
+        let helper_code = "x <- 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, Some(&workspace_url), |_| None);
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("'x'") && d.message.contains("used before"))
+            .collect();
+        assert_eq!(
+            used_before_x.len(),
+            1,
+            "Top-level source() after top-level usage should still emit \
+             the 'used before' diagnostic; got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Companion to issue #138: a usage and a source() in the same function
+    /// body produce no "used before sourced" diagnostic. R late-binds names
+    /// inside function bodies, so a function-body source() is not an
+    /// ordering constraint for any usage in the file (function-body or
+    /// top-level). Locks in that the filter is unconditional, not scoped
+    /// to top-level usages.
+    #[test]
+    fn test_out_of_scope_skips_same_function_body_usage_and_source() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        // Usage of `x` and source() are both inside the same function body.
+        let main_code = "f <- function() {\n  x\n  source(\"helper.R\")\n}\n";
+        let helper_code = "x <- 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        state
+            .cross_file_graph
+            .update_file(&main_url, &main_meta, Some(&workspace_url), |_| None);
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let used_before_x: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("'x'") && d.message.contains("used before"))
+            .collect();
+        assert!(
+            used_before_x.is_empty(),
+            "Function-body source() must not blame a function-body usage \
+             in the same function: {:?}",
+            used_before_x
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
         );
     }
 

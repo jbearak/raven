@@ -229,6 +229,8 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 explicit_line: has_explicit_line,
                 directive_line: line_num,
                 user_line_zero: is_line_zero,
+                // @lsp-source directives are header-only and always run at load time.
+                is_function_scoped: false,
             });
             continue;
         }
