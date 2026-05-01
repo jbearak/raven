@@ -3554,30 +3554,6 @@ fn collect_workspace_symbols_from_artifacts(
 // Diagnostics
 // ============================================================================
 
-/// Compute diagnostics for the document at the given URI.
-///
-/// Performs a full set of checks for the specified open document and returns collected diagnostics.
-/// Reported issues include syntax errors, circular dependency and max-depth problems, missing or ambiguous
-/// sourced files, out-of-scope symbol usage, missing package warnings, and (when enabled) undefined-variable
-/// diagnostics that account for cross-file and package scope.
-///
-/// # Returns
-///
-/// `Vec<Diagnostic>` containing diagnostics for the document at `uri`, which may be empty if no issues were found.
-///
-/// # Examples
-///
-/// ```no_run
-/// use raven::handlers::{diagnostics, DiagCancelToken};
-/// use raven::state::WorldState;
-/// use url::Url;
-///
-/// // Given a prepared `WorldState` and a `Url` referring to an open document:
-/// # let state: WorldState = todo!();
-/// # let uri: Url = todo!();
-/// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
-/// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
-/// ```
 /// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
 /// pipeline. This is the production entry point for sync diagnostic
 /// computation (called by `pub fn diagnostics`), and is also the bench
@@ -3625,6 +3601,35 @@ pub fn diagnostics_via_snapshot_profile(
     (t_build, t_diag, outcome)
 }
 
+/// Compute diagnostics for the document at the given URI.
+///
+/// Performs a full set of checks for the specified open document and returns collected diagnostics.
+/// Reported issues include syntax errors, circular dependency and max-depth problems, missing or ambiguous
+/// sourced files, out-of-scope symbol usage, missing package warnings, and (when enabled) undefined-variable
+/// diagnostics that account for cross-file and package scope.
+///
+/// # Returns
+///
+/// `Vec<Diagnostic>` containing diagnostics for the document at `uri`, which may be empty if no issues were found.
+///
+/// # Cancellation
+///
+/// On cancel the snapshot pipeline returns an empty `Vec` (legacy returned partial accumulated
+/// diagnostics). All production callers use `DiagCancelToken::never()` so behavior is unchanged.
+///
+/// # Examples
+///
+/// ```no_run
+/// use raven::handlers::{diagnostics, DiagCancelToken};
+/// use raven::state::WorldState;
+/// use url::Url;
+///
+/// // Given a prepared `WorldState` and a `Url` referring to an open document:
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
+/// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
+/// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
+/// ```
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
