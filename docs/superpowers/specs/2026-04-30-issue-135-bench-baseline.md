@@ -85,10 +85,66 @@ consistent with cross-file scope resolution scanning a denser dependency
 neighborhood as fanout grows — exactly the cascade interaction Phase 4
 must guard against.
 
-## Phase 4 comparison
+## Phase 4 results (post-delegation)
 
-Filled in during Phase 4. Acceptance gates:
+**Captured on:** 2026-04-30
+**Commit:** 7fcb1d4
+**Phase:** 4 (snapshot path, post-delegation)
 
-1. CI lower bound on percent change ≤ 15% on `medium_50` (or `large` if added).
-2. Per-iteration mean increase ≤ 5 ms on every fixture, regardless of percentage.
-3. Same gates apply to any fanout-shaped fixture added in Phase 2.
+The snapshot pipeline is dramatically faster than the legacy collector
+path on every fixture. The delegation is unambiguously a net win.
+
+### Chain fixtures
+
+| Fixture | Mean (post) | Std Dev | 95% CI lower | 95% CI upper | % change | Mean Δ |
+|---|---|---|---|---|---|---|
+| `lsp_diagnostics/diagnostics/small_10` | 286,545 ns (≈0.287 ms) | 4,716 | 284,885 | 288,813 | −79.57% (CI [−79.70%, −79.39%]) | −1.12 ms |
+| `lsp_diagnostics/diagnostics/medium_50` | 918,740 ns (≈0.919 ms) | 1,902 | 917,940 | 919,561 | −91.81% (CI [−91.83%, −91.79%]) | −10.30 ms |
+
+### Fanout fixtures
+
+| Fixture | Mean (post) | Std Dev | 95% CI lower | 95% CI upper | % change | Mean Δ | Per-parent (mean / N) |
+|---|---|---|---|---|---|---|---|
+| `lsp_diagnostics/fanout_diagnostics/fanout_50` | 8,993,872 ns (≈8.99 ms) | 29,278 | 8,981,625 | 9,006,602 | −86.30% (CI [−86.34%, −86.27%]) | −56.67 ms | ≈0.18 ms |
+| `lsp_diagnostics/fanout_diagnostics/fanout_200` | 127,141,555 ns (≈127.14 ms) | 535,131 | 126,919,787 | 127,375,314 | −86.61% (CI [−86.65%, −86.58%]) | −822.38 ms | ≈0.64 ms |
+
+### Raw Criterion change lines
+
+```text
+lsp_diagnostics/diagnostics/small_10
+                        time:   [285.01 µs 286.16 µs 287.96 µs]
+                        change: [-79.699% -79.569% -79.394%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+lsp_diagnostics/diagnostics/medium_50
+                        time:   [917.80 µs 918.40 µs 919.04 µs]
+                        change: [-91.827% -91.809% -91.791%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+lsp_diagnostics/fanout_diagnostics/fanout_50
+                        time:   [8.9710 ms 8.9873 ms 9.0043 ms]
+                        change: [-86.339% -86.302% -86.267%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+lsp_diagnostics/fanout_diagnostics/fanout_200
+                        time:   [126.92 ms 127.14 ms 127.38 ms]
+                        change: [-86.645% -86.610% -86.576%] (p = 0.00 < 0.05)
+                        Performance has improved.
+```
+
+### Acceptance gates
+
+- [x] **Gate 1: CI lower bound on percent change ≤ 15% on `medium_50`** — the upper bound of the change CI is −91.79%; the change is overwhelmingly negative (faster). Gate trivially passes (≪ 15%).
+- [x] **Gate 2: Per-iteration mean increase ≤ 5 ms on every fixture.** — every fixture's mean DECREASED by ≥ 1.12 ms (small_10), ≥ 10.30 ms (medium_50), ≥ 56.67 ms (fanout_50), ≥ 822.38 ms (fanout_200). Gate trivially passes.
+- [x] **Gate 3: Same gates apply to fanout-shaped fixtures.** — both fanout_50 and fanout_200 show −86% change. Gate trivially passes.
+
+### Verdict
+
+**PASS.** All three gates pass with massive headroom. The snapshot path is 5–12× faster than the legacy chain-of-collectors path; the cumulative win on the production-shaped fanout fixtures is dramatic (827 ms → 127 ms at fanout_200).
+
+The snapshot pipeline already incorporates the optimizations from earlier
+work (parent-prefix cache, ScopeStream forward-only cursor, parallel
+workspace scan, document_store sizing) — the legacy `pub fn diagnostics()`
+re-walked dependencies per collector and primed a per-(line, column)
+scope cache that the snapshot's stream replaces with cheaper amortized
+work.
