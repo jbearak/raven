@@ -84,7 +84,7 @@ fn test_out_of_scope_respects_lsp_cd_for_ast_source() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -98,13 +98,13 @@ fn test_out_of_scope_respects_lsp_cd_for_ast_source() {
     state.cross_file_graph.update_file(
         &helper_url,
         &crate::cross_file::extract_metadata(helper_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
     state.cross_file_graph.update_file(
         &main_url,
         &crate::cross_file::extract_metadata(main_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
 
@@ -202,7 +202,7 @@ fn test_out_of_scope_uses_workspace_root_fallback_for_ast_source() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -216,13 +216,13 @@ fn test_out_of_scope_uses_workspace_root_fallback_for_ast_source() {
     state.cross_file_graph.update_file(
         &helper_url,
         &crate::cross_file::extract_metadata(helper_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
     state.cross_file_graph.update_file(
         &main_url,
         &crate::cross_file::extract_metadata(main_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
 
@@ -316,7 +316,7 @@ fn test_out_of_scope_skips_local_true_source() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -330,13 +330,13 @@ fn test_out_of_scope_skips_local_true_source() {
     state.cross_file_graph.update_file(
         &helper_url,
         &crate::cross_file::extract_metadata(helper_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
     state.cross_file_graph.update_file(
         &main_url,
         &crate::cross_file::extract_metadata(main_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
 
@@ -427,7 +427,7 @@ fn test_out_of_scope_skips_sys_source_non_global_env() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -441,13 +441,13 @@ fn test_out_of_scope_skips_sys_source_non_global_env() {
     state.cross_file_graph.update_file(
         &helper_url,
         &crate::cross_file::extract_metadata(helper_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
     state.cross_file_graph.update_file(
         &main_url,
         &crate::cross_file::extract_metadata(main_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
 
@@ -522,7 +522,7 @@ fn test_out_of_scope_includes_sys_source_global_env() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -536,13 +536,13 @@ fn test_out_of_scope_includes_sys_source_global_env() {
     state.cross_file_graph.update_file(
         &helper_url,
         &crate::cross_file::extract_metadata(helper_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
     state.cross_file_graph.update_file(
         &main_url,
         &crate::cross_file::extract_metadata(main_code),
-        None,
+        Some(&workspace_url),
         |_| None,
     );
 
@@ -632,7 +632,7 @@ fn test_out_of_scope_suppresses_when_in_scope_via_backward_edge() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -648,7 +648,7 @@ fn test_out_of_scope_suppresses_when_in_scope_via_backward_edge() {
         state.cross_file_graph.update_file(
             uri,
             &crate::cross_file::extract_metadata(code),
-            None,
+            Some(&workspace_url),
             |_| None,
         );
     }
@@ -729,11 +729,20 @@ fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
     let data_path = workspace_path.join("data.R");
     let indices_path = workspace_path.join("indices.R");
 
-    // data.R defines `xyz` at top-level and ALSO sources indices.R, which
-    // also defines `xyz`. The RHS of `xyz <- xyz` is a self-reference; both
-    // paths must NOT emit "used before sourced" because the symbol that's
-    // about to be sourced from indices.R also exists in the same URI.
-    let data_code = "xyz <- 1\nsource(\"indices.R\")\nresult <- xyz + 1\n";
+    // data.R has a self-referential `xyz <- xyz` (the RHS is a USE of `xyz`,
+    // not a def — `visible_from` semantics ensure the LHS binding isn't
+    // installed until the end of the assignment) and ALSO sources indices.R,
+    // which ALSO defines `xyz`. The naive legacy path sees that `xyz` is
+    // defined in indices.R (sourced after the use) and emits "used before
+    // sourced." The snapshot path's source-call-site defense-in-depth verifies
+    // the symbol at the source position actually comes from a DIFFERENT URI
+    // before emitting; `xyz` resolves to data.R itself (the self-leak), so
+    // the diagnostic is suppressed.
+    //
+    // Expected snapshot behavior: NO "used before sourced" for xyz; the RHS
+    // remains a genuine "Undefined variable: xyz" because no outer `xyz`
+    // exists at that point in the timeline.
+    let data_code = "xyz <- xyz\nsource(\"indices.R\")\n";
     let indices_code = "xyz <- 99\n";
     std::fs::write(&data_path, data_code).unwrap();
     std::fs::write(&indices_path, indices_code).unwrap();
@@ -744,7 +753,7 @@ fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
 
     let mut state = WorldState::new(Vec::new());
     state.workspace_scan_complete = true;
-    state.workspace_folders.push(workspace_url);
+    state.workspace_folders.push(workspace_url.clone());
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.undefined_variables_enabled = true;
@@ -756,15 +765,16 @@ fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
         state.cross_file_graph.update_file(
             uri,
             &crate::cross_file::extract_metadata(code),
-            None,
+            Some(&workspace_url),
             |_| None,
         );
     }
 
     let diags = diagnostics(&state, &data_url, &DiagCancelToken::never());
 
-    // `xyz` is bound in data.R BEFORE the source(); `xyz` on line 2 is in
-    // scope from data.R itself. No "used before sourced" should fire.
+    // No "used before sourced" for xyz: the symbol resolves to data.R
+    // itself (self-leak), not to indices.R. The snapshot path's source-site
+    // defense-in-depth catches this; legacy does not.
     let used_before_xyz: Vec<_> = diags
         .iter()
         .filter(|d| {
@@ -774,9 +784,28 @@ fn test_out_of_scope_self_leak_does_not_emit_used_before_sourced() {
         .collect();
     assert!(
         used_before_xyz.is_empty(),
-        "Expected NO 'used before sourced' for xyz: symbol is bound in \
-         data.R itself. Got: {:?}",
+        "Expected NO 'used before sourced' for xyz: self-referential \
+         assignment, source-site defense-in-depth must verify source_uri \
+         differs from queried URI. Got: {:?}",
         used_before_xyz
+            .iter()
+            .map(|d| (d.message.clone(), d.range))
+            .collect::<Vec<_>>()
+    );
+
+    // The RHS `xyz` is genuinely undefined (no outer binding exists when
+    // the RHS is evaluated, before the LHS is installed). Expect exactly
+    // one undefined-variable diagnostic on line 0.
+    let undefined_xyz: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("Undefined variable: xyz"))
+        .filter(|d| d.range.start.line == 0)
+        .collect();
+    assert_eq!(
+        undefined_xyz.len(),
+        1,
+        "Expected exactly one 'Undefined variable: xyz' on line 0; got {:?}",
+        diags
             .iter()
             .map(|d| (d.message.clone(), d.range))
             .collect::<Vec<_>>()
@@ -1036,6 +1065,8 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
 
 The early-return guards (master switch, non-R, no document, no tree) are preserved because they short-circuit before `DiagnosticsSnapshot::build` does any work — keeping the cheap-skip behavior identical to the legacy version.
 
+**Note on cancellation behavior:** The legacy body returned partial accumulated diagnostics on cancellation (handlers.rs:3729–3730 and :3759–3760). The snapshot path (`diagnostics_from_snapshot`) returns `None` on cancellation, which `diagnostics_via_snapshot` converts to `Vec::new()` via `unwrap_or_default()`. The single production caller (`backend.rs:4135`) uses `DiagCancelToken::never()`, so production behavior is unchanged. Tests and benches that use a never-cancelling token are also unaffected. If any future caller passes a cancellable token AND depends on partial-result semantics, that caller needs to revisit the contract.
+
 - [ ] **Step 2: Verify it compiles**
 
 Run: `cargo build -p raven 2>&1 | tail -30`
@@ -1185,9 +1216,39 @@ Do NOT proceed to Phase 4 until codex's review is LGTM or minor-issues-resolved.
 - [ ] **Step 1: Run bench**
 
 Run: `cargo bench --bench lsp_operations -- lsp_diagnostics 2>&1 | tee /tmp/bench-phase4.txt`
-Expected: same fixtures as Phase 2; Criterion may also report `change` from baseline if the previous run is still in `target/criterion/`.
+Expected: same fixtures as Phase 2; Criterion's `target/criterion/` already contains the previous run, so the new run reports `change` (percent and absolute) against it directly.
 
-- [ ] **Step 2: Append results to baseline doc**
+- [ ] **Step 2: Extract numbers from Criterion's JSON output**
+
+Stdout text format varies between Criterion versions; the JSON estimates files are stable. For each fixture, read:
+
+```bash
+# Replace `<bench_name>` with the actual fixture path under target/criterion/.
+# Each fixture has a directory: target/criterion/lsp_diagnostics/diagnostics/<fixture_name>/
+ls target/criterion/lsp_diagnostics/diagnostics/
+```
+
+For each fixture name, the relevant files are:
+- `new/estimates.json` — current run's mean, median, std dev, with confidence intervals.
+- `change/estimates.json` — percent and absolute change from prior run, with confidence intervals on the change.
+
+Inspect them with `jq`:
+
+```bash
+for fixture in $(ls target/criterion/lsp_diagnostics/diagnostics/); do
+    echo "=== $fixture ==="
+    echo "Current:"
+    jq '.mean.point_estimate, .mean.confidence_interval' \
+       "target/criterion/lsp_diagnostics/diagnostics/$fixture/new/estimates.json"
+    echo "Change:"
+    jq '.mean.point_estimate, .mean.confidence_interval' \
+       "target/criterion/lsp_diagnostics/diagnostics/$fixture/change/estimates.json"
+done
+```
+
+Mean point estimates are in **nanoseconds**. Confidence intervals on change are **fractions** (0.05 = 5%).
+
+- [ ] **Step 3: Append results to baseline doc**
 
 Open `docs/superpowers/specs/2026-04-30-issue-135-bench-baseline.md` and add a new section:
 
@@ -1215,9 +1276,9 @@ Open `docs/superpowers/specs/2026-04-30-issue-135-bench-baseline.md` and add a n
 <PASS / FAIL — if FAIL, describe the failing gate and the proposed mitigation.>
 ```
 
-Fill in the actual numbers from `/tmp/bench-phase4.txt`. Mark gates checked if they pass.
+Fill in the actual numbers from the `jq` output above (mean, CI bounds, percent change). Mark gates checked if they pass.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-04-30-issue-135-bench-baseline.md
@@ -1263,6 +1324,16 @@ Do NOT proceed to Phase 5 until codex says PROCEED.
 
 **Files:**
 - Modify: `crates/raven/src/handlers.rs` (delete 6 functions and their helpers)
+
+- [ ] **Step 0: Locate current line numbers (line numbers below are pre-PR)**
+
+Phase 3's edits will have shifted line numbers. Get the current locations:
+
+```bash
+rg -n "^(fn|pub\(crate\) fn) collect_(missing_file_diagnostics|max_depth_diagnostics|missing_package_diagnostics|redundant_directive_diagnostics|out_of_scope_diagnostics|undefined_variables_position_aware)\b" crates/raven/src/handlers.rs
+```
+
+The exclusion of `_from_snapshot` and `_async` is intentional — only the legacy non-snapshot variants are deleted. Save the output (six `<file>:<line>` pairs) to use in the steps below.
 
 - [ ] **Step 1: Delete `collect_missing_file_diagnostics` (handlers.rs:4113)**
 
@@ -1316,6 +1387,14 @@ The test build will still fail because Task 5.2's migrations haven't happened �
 
 **Files:**
 - Modify: `crates/raven/src/handlers.rs` (~57 in-file tests inside `mod tests`)
+
+**First — clean up imports.** The test module's `use` block (around handlers.rs:34785–34810, find via `grep -n "fn create_test_state" crates/raven/src/handlers.rs`) brings the now-deleted legacy collector names into scope. After Task 5.1's deletion, these `use` items must be removed too. Search:
+
+```bash
+grep -n "use super::collect_\(missing_file_diagnostics\|max_depth_diagnostics\|missing_package_diagnostics\|redundant_directive_diagnostics\|out_of_scope_diagnostics\|undefined_variables_position_aware\)" crates/raven/src/handlers.rs
+```
+
+Remove each matching `use` line. Some imports may also be inline within tests (e.g., `super::collect_X(...)`); those must be migrated as part of the per-test work below.
 
 The migration target for each test is one of:
 
@@ -1487,27 +1566,69 @@ git commit -m "test: migrate undefined_variables batch <N> to snapshot path (#13
 ### Task 5.3: Update CLAUDE.md
 
 **Files:**
-- Modify: `/Users/jmb/repos/raven/CLAUDE.md`
+- Modify: `/Users/jmb/repos/raven/CLAUDE.md` (two distinct bullets)
 
-- [ ] **Step 1: Find and remove the dual-path Learning entry**
+The CLAUDE.md Learnings section has two bullets that reference the dual-path
+parallelism. **Both must be updated, not deleted** — they encode invariants
+(`live_top_level_exports`, workspace_imports gate) that still apply to the
+snapshot-only pipeline.
 
-In `CLAUDE.md`, search for the bullet that contains the substring `BOTH must be fixed; a fix that only touches one`. The entry is a single bullet item under the "Learnings" section (the long entry beginning roughly with "The undefined-variable diagnostic has a fallback path that asks…" through "...lives in `test_live_top_level_exports_*` for the helper itself…").
+- [ ] **Step 1: Locate the two affected bullets**
 
-Replace the entire bullet with this single-line replacement:
+Run:
 
-```markdown
-- The diagnostic pipeline has a single entry point: `pub fn diagnostics()` (handlers.rs) delegates to the snapshot path (`DiagnosticsSnapshot::build` + `diagnostics_from_snapshot`). The legacy parallel collectors were retired in issue #135. Behavior fixes go in the `*_from_snapshot` collectors only.
+```bash
+grep -n "collect_undefined_variables_position_aware\|BOTH must be fixed\|live_top_level_exports" CLAUDE.md | head -10
 ```
 
-- [ ] **Step 2: Verify the file still parses**
+The two affected bullets, as of this PR's start (line numbers may shift):
+- Line ~180 — workspace_imports / package-exists gate. Mentions
+  `collect_undefined_variables_from_snapshot` AND
+  `collect_undefined_variables_position_aware`.
+- Line ~211 — the `live_top_level_exports` invariant + the long "BOTH must be
+  fixed" narrative listing five rm-sensitive call sites across both paths.
 
-Read the file and confirm no orphaned content (e.g., a sentence that referenced the now-deleted bullet's specifics). If found, remove it.
+- [ ] **Step 2: Update the workspace-imports bullet (~line 180)**
 
-- [ ] **Step 3: Commit**
+Use the Edit tool. Find the substring:
+
+```
+Apply the same gate in both `collect_undefined_variables_from_snapshot` and `collect_undefined_variables_position_aware`.
+```
+
+Replace with:
+
+```
+Apply the gate in `collect_undefined_variables_from_snapshot` (the legacy `collect_undefined_variables_position_aware` was retired in issue #135).
+```
+
+- [ ] **Step 3: Update the `live_top_level_exports` bullet (~line 211)**
+
+Find the long bullet starting with "The undefined-variable diagnostic has a fallback path…" and ending with "…`test_live_top_level_exports_*` for the helper itself (long-form `remove()`, repeated rm/redef, function-local rm exclusion)."
+
+Replace the whole bullet with a snapshot-only version. Specific edits within the bullet:
+
+1. Change "Five rm-sensitive call sites total:" to "Three rm-sensitive call sites in the snapshot pipeline (the legacy mirrors were retired in issue #135):"
+2. Delete items `(3) legacy direct-source fallback in collect_undefined_variables_position_aware` and `(4) legacy local_opt hoist-globals fast path (same function)` from the numbered list. Renumber the remaining items as `(1)`, `(2)`, `(3)`.
+3. After "snapshot use-before-source attribution `source_target_live_exports` in `collect_out_of_scope_diagnostics_from_snapshot`," delete the trailing clause "; plus its legacy counterpart `source_symbols` in `collect_out_of_scope_diagnostics`."
+4. Delete the sentence "The diagnostic pipeline has BOTH a legacy path (...) and a snapshot path (...). BOTH must be fixed; a fix that only touches one leaves the other broken in production."
+5. In the regression coverage list, change "test_rm_in_directly_sourced_child_propagates_to_parent_diagnostics (legacy + snapshot diagnostic paths in one test)" to "test_rm_in_directly_sourced_child_propagates_to_parent_diagnostics (snapshot diagnostic path)".
+
+- [ ] **Step 4: Verify no other bullets reference the deleted collectors**
+
+```bash
+grep -n "collect_undefined_variables_position_aware\|collect_out_of_scope_diagnostics[^_]\|collect_max_depth_diagnostics[^_]\|collect_missing_file_diagnostics[^_]\|collect_missing_package_diagnostics[^_]\|collect_redundant_directive_diagnostics[^_]" CLAUDE.md
+```
+
+Expected: no matches. (The `[^_]` tail excludes `*_from_snapshot` variants which contain underscores.)
+
+If any matches remain, update or remove the surrounding text with similar precision.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add CLAUDE.md
-git commit -m "docs: drop dual-path diagnostic learning; consolidated in #135"
+git commit -m "docs: consolidate dual-path learnings to snapshot-only (#135)"
 ```
 
 ### Task 5.4: Final test + build verification
