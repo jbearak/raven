@@ -32325,22 +32325,14 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
 
-        let tree = {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .unwrap();
-            parser.parse(main_code, None).unwrap()
-        };
-        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_out_of_scope_diagnostics(
-            &state,
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
             &main_url,
-            tree.root_node(),
-            main_code,
-            &meta,
+            snapshot.tree.root_node(),
+            &snapshot.text,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -32994,22 +32986,14 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
 
-        let tree = {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .unwrap();
-            parser.parse(main_code, None).unwrap()
-        };
-        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_out_of_scope_diagnostics(
-            &state,
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
             &main_url,
-            tree.root_node(),
-            main_code,
-            &meta,
+            snapshot.tree.root_node(),
+            &snapshot.text,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -33067,22 +33051,14 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
 
-        let tree = {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .unwrap();
-            parser.parse(main_code, None).unwrap()
-        };
-        let meta = crate::cross_file::extract_metadata_with_tree(main_code, Some(&tree));
-
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_out_of_scope_diagnostics(
-            &state,
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
             &main_url,
-            tree.root_node(),
-            main_code,
-            &meta,
+            snapshot.tree.root_node(),
+            &snapshot.text,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
