@@ -31684,14 +31684,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_emitted() {
         // Test that a diagnostic is emitted for a non-installed package
         // Validates: Requirement 15.1
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -31701,9 +31695,14 @@ result <- helper_with_spaces(42)"#;
         state.package_library = std::sync::Arc::new(
             crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
         );
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -31721,14 +31720,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_not_emitted_for_base_package() {
         // Test that no diagnostic is emitted for base packages
         // Validates: Requirement 15.1 (base packages are always available)
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "base".to_string(),
-                line: 0,
-                column: 15,
-                function_scope: None,
-            });
+        let code = "library(base)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -31737,11 +31730,19 @@ result <- helper_with_spaces(42)"#;
         base_packages.insert("base".to_string());
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_base_packages(base_packages);
+        // Provide a non-empty lib_paths so suppression doesn't kick in based on
+        // "no information about installed packages". A bogus path is fine because
+        // the test only checks the base-package short-circuit.
+        pkg_lib.set_lib_paths(vec![std::path::PathBuf::from("/nonexistent")]);
         state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -31754,16 +31755,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_ignored_line() {
         // Test that diagnostics are not emitted for ignored lines
         // Validates: Requirement 15.1 with @lsp-ignore support
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 5,
-                column: 30,
-                function_scope: None,
-            });
-        // Mark line 5 as ignored
-        meta.ignored_lines.insert(5);
+        let code = "library(__nonexistent_package_xyz__) # @lsp-ignore";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -31773,9 +31766,14 @@ result <- helper_with_spaces(42)"#;
         state.package_library = std::sync::Arc::new(
             crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
         );
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -31788,21 +31786,8 @@ result <- helper_with_spaces(42)"#;
     fn test_missing_package_diagnostic_multiple_packages() {
         // Test that diagnostics are emitted for multiple missing packages
         // Validates: Requirement 15.1
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__missing_pkg1__".to_string(),
-                line: 0,
-                column: 20,
-                function_scope: None,
-            });
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__missing_pkg2__".to_string(),
-                line: 1,
-                column: 20,
-                function_scope: None,
-            });
+        let code = "library(__missing_pkg1__)\nlibrary(__missing_pkg2__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
@@ -31812,9 +31797,14 @@ result <- helper_with_spaces(42)"#;
         state.package_library = std::sync::Arc::new(
             crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
         );
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -31827,20 +31817,19 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_missing_package_diagnostic_suppressed_while_package_library_not_ready() {
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = false;
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -31851,22 +31840,21 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_missing_package_diagnostic_suppressed_without_r_subprocess() {
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
         state.package_library =
             std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty());
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
@@ -31890,23 +31878,22 @@ result <- helper_with_spaces(42)"#;
         let tmp = std::env::temp_dir().join("raven_test_no_subprocess_lib_paths");
         fs::create_dir_all(&tmp).expect("create tmp lib_path");
 
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__raven_not_installed__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__raven_not_installed__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.package_library_ready = true;
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![tmp.clone()]);
         state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         let _ = fs::remove_dir_all(&tmp);
 
@@ -32116,20 +32103,19 @@ result <- helper_with_spaces(42)"#;
 
     #[test]
     fn test_missing_package_diagnostic_not_emitted_when_severity_off() {
-        let mut meta = crate::cross_file::CrossFileMetadata::default();
-        meta.library_calls
-            .push(crate::cross_file::source_detect::LibraryCall {
-                package: "__nonexistent_package_xyz__".to_string(),
-                line: 0,
-                column: 30,
-                function_scope: None,
-            });
+        let code = "library(__nonexistent_package_xyz__)";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
         let mut state = WorldState::new(Vec::new());
         state.cross_file_config.packages_missing_package_severity = None;
-        let mut diagnostics = Vec::new();
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
 
-        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
 
         assert_eq!(
             diagnostics.len(),
