@@ -33959,6 +33959,87 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
+    /// Phase 1 Category B for issue #135 — failing on legacy until Phase 3.
+    ///
+    /// Deviation #4: snapshot suppresses "used before sourced" when the symbol
+    /// is already in scope via a non-source mechanism (e.g., backward edge).
+    /// Legacy only checks usages resolving to the queried URI and so flags
+    /// the symbol even though it's available another way.
+    ///
+    /// Setup: `main.R` declares `helper` and sources `child.R`. `child.R` is
+    /// queried for diagnostics. `child.R` calls `helper()` and ALSO sources
+    /// `redef.R` AFTER the call. `redef.R` defines `helper` again (a redefinition).
+    /// The use of `helper()` is in-scope from `main.R` (via backward edge), so
+    /// the snapshot path suppresses the "used before sourced" diagnostic;
+    /// the legacy path emits it.
+    #[ignore = "legacy parity gap; un-ignored in Phase 3 (issue #135)"]
+    #[test]
+    fn test_out_of_scope_suppresses_when_in_scope_via_backward_edge() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let child_path = workspace_path.join("child.R");
+        let redef_path = workspace_path.join("redef.R");
+
+        let main_code = "helper <- function(x) x + 1\nsource(\"child.R\")\n";
+        let child_code = "result <- helper(1)\nsource(\"redef.R\")\n";
+        let redef_code = "helper <- function(x) x * 2\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&child_path, child_code).unwrap();
+        std::fs::write(&redef_path, redef_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let child_url = Url::from_file_path(&child_path).unwrap();
+        let redef_url = Url::from_file_path(&redef_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variables_enabled = true;
+
+        for (uri, code) in [
+            (&main_url, main_code),
+            (&child_url, child_code),
+            (&redef_url, redef_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                Some(&workspace_url),
+                |_| None,
+            );
+        }
+
+        let diags = diagnostics(&state, &child_url, &DiagCancelToken::never());
+
+        // `helper` at child.R line 0 is in-scope via backward edge from main.R.
+        // The snapshot path suppresses; assert no "used before sourced" diagnostic.
+        let used_before_helper: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                (d.message.contains("'helper'") || d.message.contains("Symbol 'helper'"))
+                    && d.message.contains("used before")
+            })
+            .collect();
+        assert!(
+            used_before_helper.is_empty(),
+            "Expected NO 'used before sourced' for helper(): symbol is in \
+             scope via backward edge from main.R. Got: {:?}",
+            used_before_helper
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_out_of_scope_ignores_locally_scoped_names() {
         use tempfile::TempDir;
