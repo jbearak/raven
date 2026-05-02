@@ -42,25 +42,31 @@ classification cannot drift.
 Goal: stand up the file with an empty resolver that always returns `None`,
 wire it into `lib.rs` / `main.rs`, and confirm nothing breaks.
 
-- Create `crates/raven/src/qualified_resolve.rs`:
+- Create `crates/raven/src/qualified_resolve.rs`. Note that `lhs_name` and
+  `rhs_name` are pre-computed by the dispatcher (using the cursor file's
+  text) and passed in as `&str` — the resolver never re-extracts the LHS text
+  from the cursor file:
   ```rust
   use crate::extract_op::ExtractOp;
   use crate::state::WorldState;
   use tower_lsp::lsp_types::{Location, Position, Url};
-  use tree_sitter::Node;
 
   pub fn resolve_qualified_member(
       _state: &WorldState,
       _uri: &Url,
       _position: Position,
-      _lhs_node: Node,
-      _rhs_name: &str,
+      _lhs_node_kind: &str,   // kind of the LHS AST node — used for the shape gate
+      _lhs_name: &str,         // text of the LHS, e.g. "foo"
+      _rhs_name: &str,         // text of the RHS, e.g. "bar"
       _op: ExtractOp,
   ) -> Option<Location> {
       None
   }
   ```
 - Declare in both `lib.rs` and `main.rs`.
+- Make `get_cross_file_scope` (`handlers.rs:~2678`) `pub(crate)` so the new
+  module can call it. (The function is currently file-private; without this
+  change Step 5 will not compile.)
 - `cargo build -p raven` and `cargo test -p raven` — must remain green.
 
 ## Step 3 — Dispatcher in `goto_definition`
@@ -71,12 +77,21 @@ free-identifier path.
 - In `handlers.rs::goto_definition`, immediately after the `node.kind() != "identifier"` early-return (~line 10704), add:
   ```rust
   if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node) {
-      let name = node_text(node, &text);
+      let rhs_name = node_text(node, &text);
+      let lhs_name = node_text(lhs_node, &text);
       return crate::qualified_resolve::resolve_qualified_member(
-          state, uri, position, lhs_node, name, op,
+          state,
+          uri,
+          position,
+          lhs_node.kind(),
+          lhs_name,
+          rhs_name,
+          op,
       ).map(GotoDefinitionResponse::Scalar);
   }
   ```
+  (Both names are derived from the *cursor file's* `text`, so we never need
+  to re-extract them from the defining file.)
 - This unconditionally returns from `goto_definition` for the `$`/`@` RHS case,
   honoring spec point "No fallback to free-identifier lookup".
 
@@ -98,10 +113,9 @@ Goal: when LHS is not a bare identifier, return `None`.
 
 - In `resolve_qualified_member`:
   ```rust
-  if lhs_node.kind() != "identifier" {
+  if lhs_node_kind != "identifier" {
       return None;
   }
-  let lhs_name = node_text_owned(lhs_node, &cursor_text);
   ```
 - Add tests that `(foo)$bar`, `pkg::obj$bar`, and `make()$bar` all return
   `None` (Required test #11).
@@ -119,16 +133,23 @@ already-existing position-aware machinery.
 
 ## Step 6 — Fetch the defining file's tree
 
-Goal: get a `Tree` and `text` for the defining file, identical to the pattern
-`goto_definition` already uses for the cursor's file.
+Goal: get a `Tree` and `text` for the defining file using the same priority
+chain that `parameter_resolver::get_text_and_tree` already uses
+(`crates/raven/src/parameter_resolver.rs:397-450`):
 
-- ```rust
-  let defining_doc = state.get_document(&defining_uri)
-      .or_else(|| state.workspace_index.get(&defining_uri))?;
-  let defining_tree = defining_doc.tree.as_ref()?;
-  let defining_text = defining_doc.text();
-  ```
-- If either fetch fails → `None`.
+1. `state.document_store.get_without_touch(uri)` — enriched open documents.
+2. `state.documents.get(uri)` — legacy open documents.
+3. `state.workspace_index_new.get(uri)` — new workspace index.
+4. `state.workspace_index.get(uri)` — legacy workspace index.
+5. `state.cross_file_file_cache.get(uri)` + parse-on-demand via
+   `parser_pool::with_parser`.
+
+To avoid duplicating the function, **promote `get_text_and_tree` to
+`pub(crate)`** in `parameter_resolver.rs` (single-line visibility change) and
+call it from `qualified_resolve`. If the helper returns `None`, the resolver
+returns `None`. The returned tree is owned, so any nodes we extract for the
+returned `Location` must be converted to ranges *before* the tree drops out
+of scope.
 
 ## Step 7 — Member-assignment candidates
 
@@ -136,13 +157,17 @@ Goal: collect all `foo$bar <- …` and `foo@bar <- …` (matching `op` and
 `lhs_name`/`rhs_name`) in the defining file.
 
 - Walk `defining_tree.root_node()` recursively, looking for `binary_operator`
-  nodes whose:
-  - Operator child text is one of `<-`, `=`, `<<-` (left-assignment), OR `->`
-    / `->>` (right-assignment, with target on the *third* child).
-  - The assignment **target** is an `extract_operator` whose:
-    - `lhs` is an identifier with text `lhs_name`.
-    - `rhs` is an identifier with text `rhs_name`.
-    - operator (Dollar/At) matches `op`.
+  nodes. Use the named fields exposed by tree-sitter-r (see
+  `cross_file/scope.rs:2416-2425` for the existing precedent that uses
+  `non_extra_children` rather than positional indexing):
+  - `child_by_field_name("operator")` — read its text. If it is one of
+    `<-`, `=`, `<<-` (left-assignment) the *target* is the `lhs` field. If it
+    is `->` / `->>` (right-assignment) the *target* is the `rhs` field.
+  - The chosen target is an `extract_operator` node whose own field-name
+    children must satisfy:
+    - `child_by_field_name("lhs")` is an identifier with text `lhs_name`.
+    - `child_by_field_name("rhs")` is an identifier with text `rhs_name`.
+    - The operator child text matches `op` (`$` for `Dollar`, `@` for `At`).
 - For each match, record:
   - `effect_position`: the (end_line, end_column) of the *full assignment*
     `binary_operator` node — mirrors `assignment_visible_from_position` in
@@ -174,15 +199,29 @@ constructors, look for a named argument matching `rhs_name`.
       "environment", "list2env", "new",
   ];
   ```
-- Locate `foo`'s defining assignment by walking from `(defined_line,
-  defined_column)` in `defining_tree` up to a `binary_operator` whose target
-  is the `foo` identifier and operator is `<-`/`=`/`<<-`/`->`/`->>`.
-  - If we cannot find this (defensive), skip — no constructor candidate.
+- Locate `foo`'s defining assignment by descending into `defining_tree` at
+  the symbol's position, then walking up to its enclosing `binary_operator`.
+  Important: `symbol.defined_column` is a **UTF-16 unit** (per LSP
+  semantics), but tree-sitter's `Point.column` is a **byte offset**. Convert
+  using the existing helper `crate::utf16::utf16_column_to_byte_offset`
+  (`crates/raven/src/utf16.rs:4`):
+  ```rust
+  let line_text = defining_text.lines().nth(symbol.defined_line as usize)?;
+  let byte_col = utf16_column_to_byte_offset(line_text, symbol.defined_column);
+  let point = tree_sitter::Point::new(symbol.defined_line as usize, byte_col);
+  let id_node = defining_tree.root_node().descendant_for_point_range(point, point)?;
+  // Walk up to the enclosing binary_operator whose target identifier is `foo`.
+  ```
+  If the walk fails to reach an assignment whose target identifier matches
+  `lhs_name`, skip — no constructor candidate.
 - Look at the assignment's RHS:
   - If it is a `call` whose `function` field is a *bare identifier* in
-    `CONSTRUCTOR_ALLOWLIST`, walk its `arguments`:
-    - For each `argument` whose `child_by_field_name("name")` is an identifier
-      with text `rhs_name`, record a candidate:
+    `CONSTRUCTOR_ALLOWLIST`, get its `arguments` field and iterate the
+    children — but **filter for `child.kind() == "argument"`** because
+    `arguments` also contains anonymous delimiter (`(`, `)`) and `,` nodes.
+    For each `argument` child:
+    - If `child_by_field_name("name")` is an identifier with text
+      `rhs_name`, record a candidate:
       - `effect_position`: end of the *outer* assignment (so the binding is
         not visible inside its own RHS, matching member-assignment semantics).
       - `name_range`: the range of that name identifier.
