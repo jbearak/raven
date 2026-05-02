@@ -90,9 +90,42 @@ under R's evaluation semantics — `new()` covers S4 construction, the rest cove
 list/frame construction. Dynamic constructions like `setNames(list(...), ...)`
 are explicitly out of scope; they require dataflow we do not have.
 
-A "named argument" is an `argument` AST node of the shape `name = value` whose
-name identifier matches `bar`. The returned `Location` is the range of that
-name identifier.
+A "named argument" is an `argument` AST node whose
+`child_by_field_name("name")` is an identifier that matches `bar`. The
+returned `Location` is the range of that name identifier. (This is the same
+field-name shape that `is_structural_non_reference` already keys on at
+`handlers.rs:5083-5089`.)
+
+## LHS shape restriction
+
+In Step 1, the resolver only fires when the LHS of the `extract_operator` is a
+bare `identifier` node. All of the following return `None`:
+
+- `(foo)$bar` — parenthesized LHS
+- `pkg::obj$bar` — namespaced LHS
+- `make()$bar` — call-result LHS
+- `foo$bar$baz` — nested extract on the LHS (already covered by the chained-access
+  rule, repeated here for clarity)
+
+Broader LHS shapes are explicit follow-up work.
+
+## Where the defining file's AST comes from
+
+`ScopeArtifacts` (`cross_file/scope.rs`) does not carry AST or text — it carries
+exported symbols, a timeline, an interface hash, and per-function scope trees.
+The resolver therefore obtains the defining file's tree directly from
+`WorldState`:
+
+```rust
+let defining_uri = symbol.source_uri.clone();
+let doc = state.get_document(&defining_uri)
+    .or_else(|| state.workspace_index.get(&defining_uri))?;
+let tree = doc.tree.as_ref()?;
+let text = doc.text();
+```
+
+This is the same pattern `goto_definition` already uses for the cursor's file
+(`handlers.rs:10618-10622`).
 
 ## Module / file layout
 
@@ -140,26 +173,52 @@ Per the design decision (option C from brainstorming), the candidate search
 runs in `foo`'s defining scope — not the cursor's file:
 
 - **Member-assignments**: walk the AST of `foo`'s defining file and collect
-  `foo$bar <- …` (and `foo@bar <- …`) nodes. The defining file's tree is
-  reachable through the existing content-provider / artifact path that
-  `get_cross_file_scope` already uses.
+  `foo$bar <- …` (and `foo@bar <- …`) nodes. The tree is fetched directly from
+  `WorldState` (see "Where the defining file's AST comes from" above), since
+  `ScopeArtifacts` does not carry it.
 - **Constructor-literals**: only the single assignment that defined `foo`
   matters. We already have its line/column from the resolved symbol; re-fetch
-  its RHS in the defining file's tree.
+  its RHS in the defining file's tree, then look for an `argument` node whose
+  `child_by_field_name("name")` matches `rhs_name`. This is the same field
+  shape `is_structural_non_reference` already uses (`handlers.rs:5083-5089`).
 
 This avoids the false-positive risk where an unrelated `other_foo$bar <- …` in
 a random file would match.
 
+**Limitation acknowledged**: forward-source merging (where another file
+sourced *after* `foo`'s defining file mutates `foo`) is not searched in
+Step 1. The full scope-resolution machinery does merge parent and forward
+contributions (`cross_file/scope.rs` `parent_prefix_at` ~3053-3245, forward
+source merge ~3592-3773); applying that merge model to qualified-member
+candidates is in scope for a follow-up. For Step 1 we only walk the defining
+file's own AST. This is a deliberate trade-off: covers the common case at
+modest implementation cost, with no incorrect *positive* results — only
+missed targets.
+
 ## Position-aware tie-breaking
 
-Candidates are gathered into a `Vec<(Position, Location)>` then sorted by
-(line, column) within their containing file. Selection:
+Each candidate carries an **effect position** — the position at which its
+binding becomes visible — not the position of the `bar` token itself. This
+mirrors `assignment_visible_from_position` in `cross_file/scope.rs`
+(~2569-2596), which uses the *end* of the full assignment so that the new
+binding is not visible inside its own RHS.
 
-- Cursor in `foo`'s defining file → latest candidate with `(line, col)`
-  strictly before the cursor.
-- Cursor in a different file → latest candidate in the defining file
-  (cursor-relative filtering does not apply across files; the defining file's
-  evaluation order is what matters).
+- **Member-assignment candidate** (`foo$bar <- expr`): effect position = end of
+  the assignment statement (after `expr`).
+- **Constructor-literal candidate** (`bar = …` inside `foo <- list(bar = …)`):
+  effect position = end of the enclosing assignment that defines `foo`.
+
+Selection:
+
+- Cursor in `foo`'s defining file → candidate with the latest effect position
+  that is `<= (cursor_line, cursor_col)`. (Equality is fine: by construction
+  every effect position lies on a syntactically-prior statement.)
+- Cursor in a different file → candidate with the latest effect position in
+  the defining file. Cursor-relative filtering does not apply across files.
+
+Returned `Location` is still the range of the `bar` *identifier token* (so the
+editor highlight lands on the name); only the *ranking* uses the effect
+position.
 
 ## Error handling
 
@@ -192,6 +251,12 @@ Required cases:
    match for `foo$bar`.
 10. Package object: `foo` resolves with `source_uri` of `package:…` → returns
     `None`.
+11. LHS-shape rejection: `(foo)$bar`, `pkg::obj$bar`, `make()$bar` → returns
+    `None` (does not crash, does not fall through to free-identifier lookup).
+12. Effect-position correctness: `foo <- list(bar = 1); use(foo$bar); foo$bar <- 2`
+    with cursor on the *middle* `foo$bar` → jumps to the `bar = 1` literal,
+    not the later `foo$bar <- 2` (which has an effect position after the
+    cursor).
 
 ## Risk & rollback
 
