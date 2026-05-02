@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 concurrency:
   group: release-build-${{ github.ref_name }}
   cancel-in-progress: false
@@ -234,6 +237,7 @@ jobs:
     needs: github-release
     runs-on: ubuntu-latest
     environment: marketplace
+    permissions: {}
     steps:
       - name: Download VSIX artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
