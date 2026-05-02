@@ -453,7 +453,7 @@ fn is_c_call(node: Node, content: &str) -> bool {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// // Given a Tree-sitter `Node` for `c("a", "b")`:
 /// let strings = extract_c_string_args(node, r#"c("a", "b")"#);
 /// assert_eq!(strings, vec!["a".to_string(), "b".to_string()]);
@@ -665,7 +665,7 @@ fn has_character_only_true(args_node: &Node, content: &str) -> bool {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// // Parse an R call, obtain its arguments node, then:
 /// let pkg = extract_package_name(&args_node, source_text);
 /// assert_eq!(pkg, Some("dplyr".to_string()));

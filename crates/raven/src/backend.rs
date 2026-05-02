@@ -79,7 +79,7 @@ struct ActiveDocumentsChangedParams {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use serde_json::json;
 /// let settings = json!({
 ///     "crossFile": {
@@ -477,7 +477,7 @@ pub(crate) fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use serde_json::json;
 /// let settings = json!({
 ///     "symbols": {
@@ -3270,7 +3270,7 @@ impl LanguageServer for Backend {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// // Call from an async context with a prepared `backend` and params:
     /// let params = lsp_types::WorkspaceSymbolParams { query: "my_fn".into(), ..Default::default() };
     /// let symbols_opt = backend.symbol(params).await?;

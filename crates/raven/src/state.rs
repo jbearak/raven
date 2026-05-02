@@ -78,7 +78,7 @@ impl SymbolConfig {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// let config = SymbolConfig::with_max_results(500);
     /// assert_eq!(config.workspace_max_results, 500);
     ///
