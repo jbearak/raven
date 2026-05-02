@@ -402,7 +402,7 @@ pub fn detect_parent_wd_change_affected_children(
 /// Returns an empty vector if the working directory hasn't changed.
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// // When parent's @lsp-cd changes, invalidate affected children
 /// let affected = invalidate_children_on_parent_wd_change(
 ///     &parent_uri,

@@ -1342,7 +1342,7 @@ impl<'a> SymbolExtractor<'a> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// assert!(is_all_caps_constant("MAX_VALUE")); // constant
     /// assert!(is_all_caps_constant("PI"));        // constant (2 chars)
     /// assert!(is_all_caps_constant("API_KEY"));   // constant

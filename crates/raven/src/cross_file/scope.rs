@@ -1019,7 +1019,7 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// // Given a parser-produced `tree`, file `content`, and `uri`:
 /// let artifacts = compute_artifacts(&uri, &tree, content);
 /// // `artifacts.timeline` contains the extracted scope events in source order.
@@ -1171,7 +1171,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// // Given a parser-produced `tree`, file `content`, `uri`, and `metadata`:
 /// let artifacts = compute_artifacts_with_metadata(&uri, &tree, content, Some(&metadata));
 /// // `artifacts.timeline` contains both AST-detected and directive sources.
@@ -1826,7 +1826,7 @@ where
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use lsp_types::Url;
 /// use std::collections::HashSet;
 ///

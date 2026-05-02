@@ -604,7 +604,7 @@ impl DocumentStore {
     /// * `uri` - Document URI to wait for
     ///
     /// # Example
-    /// ```ignore
+    /// ```text
     /// // Wait for an update to complete before reading
     /// store.wait_for_update(&uri).await;
     /// let doc = store.get(&uri);
