@@ -400,7 +400,10 @@ pub fn resolve(
 /// 3. New workspace index (`state.workspace_index_new`)
 /// 4. Legacy workspace index (`state.workspace_index`)
 /// 5. File cache (`state.cross_file_file_cache`) — parse on demand
-fn get_text_and_tree(state: &WorldState, uri: &Url) -> Option<(String, tree_sitter::Tree)> {
+pub(crate) fn get_text_and_tree(
+    state: &WorldState,
+    uri: &Url,
+) -> Option<(String, tree_sitter::Tree)> {
     // 1. Enriched open documents (authoritative for open files)
     if let Some(doc) = state.document_store.get_without_touch(uri) {
         if let Some(tree) = &doc.tree {

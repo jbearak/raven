@@ -2675,7 +2675,7 @@ fn get_cross_file_symbols(
 ///
 /// A `scope::ScopeAtPosition` containing the resolved symbols, `loaded_packages`, `inherited_packages`, and scope depth metadata for the specified location.
 ///
-fn get_cross_file_scope(
+pub(crate) fn get_cross_file_scope(
     state: &WorldState,
     uri: &Url,
     line: u32,
@@ -5114,12 +5114,10 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
     }
 
     // RHS of `extract_operator` (`obj$X`, `obj@slot`) — member-name string.
-    if parent.kind() == "extract_operator" {
-        if let Some(rhs_node) = parent.child_by_field_name("rhs") {
-            if rhs_node.id() == node.id() {
-                return true;
-            }
-        }
+    // Centralized in `crate::extract_op` so go-to-def's qualified-member
+    // resolver and this predicate cannot drift on the AST shape.
+    if crate::extract_op::extract_operator_rhs(node).is_some() {
+        return true;
     }
 
     false
@@ -10703,6 +10701,26 @@ pub fn goto_definition(
 
     if node.kind() != "identifier" {
         return None;
+    }
+
+    // RHS of `extract_operator` (`foo$bar` / `foo@bar`) is a structural
+    // member-name, not a free-variable reference. Dispatch to the qualified
+    // resolver and return its result unconditionally — no fallback to free
+    // identifier lookup. See
+    // `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md`.
+    if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node) {
+        let rhs_name = node_text(node, &text);
+        let lhs_name = node_text(lhs_node, &text);
+        return crate::qualified_resolve::resolve_qualified_member(
+            state,
+            uri,
+            position,
+            lhs_node.kind(),
+            lhs_name,
+            rhs_name,
+            op,
+        )
+        .map(GotoDefinitionResponse::Scalar);
     }
 
     let name = node_text(node, &text);

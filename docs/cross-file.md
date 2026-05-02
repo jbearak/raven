@@ -372,3 +372,31 @@ helper_func <- function(x) {
 The LSP only uses backward relationships explicitly declared via `@lsp-sourced-by` directives. Forward-created backward edges from workspace scanning are not used for scope resolution.
 
 **Rationale:** Use this mode if you prefer full manual control over cross-file relationships, or if your workspace has complex sourcing patterns where automatic inference produces unwanted results (e.g., a file is sourced by multiple parents with conflicting scopes). Diagnostics are not deferred for the workspace scan.
+
+
+## Go-to-definition for `$` and `@` member names
+
+When you cmd-click on the RHS identifier of an `extract_operator` (`bar` in
+`foo$bar`, or in `foo@bar`), Raven resolves it as a *member of `foo`*, not as
+a free variable. This avoids the surprise where a same-named top-level
+binding (e.g. `bar <- ...`) was previously chosen as the target.
+
+Concretely, after resolving `foo` with the existing position-aware scope,
+Raven looks for two kinds of candidates inside the file where `foo` is
+defined:
+
+- **Member assignments** — any `foo$bar <- …` (or `foo@bar <- …`) statement.
+- **Constructor-literal members** — when `foo`'s defining assignment's RHS
+  is a call to one of `list`, `c`, `data.frame`, `tibble`, `data.table`,
+  `environment`, `list2env`, or `new`, the named argument matching `bar` is a
+  candidate.
+
+The candidate with the latest *effect position* (the end of the assignment
+that introduces it) before the cursor wins. Across files, the latest
+candidate in `foo`'s defining file wins. If no qualified candidate exists,
+go-to-definition returns nothing — Raven does not fall back to a free-variable
+lookup for the RHS of `$`/`@`.
+
+Out of scope today: S4 slot resolution from `setClass`, R6 fields/methods,
+aliasing (`foo <- bar; foo$x`), function-return inference, package-data
+introspection, and chained access (`foo$bar$baz` returns nothing).
