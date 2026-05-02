@@ -403,7 +403,17 @@ pub fn spawn_watcher(
         // listing) fire events we can turn into `touched`. See the module-level
         // docstring for the Linux inotify cost tradeoff.
         match watcher.watch(p, RecursiveMode::Recursive) {
-            Ok(()) => attached.push(p.canonicalize().unwrap_or_else(|_| p.clone())),
+            Ok(()) => {
+                // Canonicalize so that `attached` stores the same symlink-resolved
+                // form that the OS (FSEvents on macOS, inotify on Linux) uses when
+                // reporting event paths. `touched_from_events` strips these roots as
+                // a prefix from incoming event paths; if the stored root and the event
+                // path use different representations (e.g. `/var/...` vs
+                // `/private/var/...` on macOS where `/var -> /private/var`),
+                // strip_prefix always fails and in-place package upgrades are silently
+                // missed. Removing canonicalize() here breaks that matching invariant.
+                attached.push(p.canonicalize().unwrap_or_else(|_| p.clone()));
+            }
             Err(e) => {
                 // A libpath directory may not exist yet (e.g. empty renv); log and continue.
                 log::warn!("LibpathWatcher: cannot watch {}: {e}", p.display());
