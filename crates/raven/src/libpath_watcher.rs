@@ -403,7 +403,17 @@ pub fn spawn_watcher(
         // listing) fire events we can turn into `touched`. See the module-level
         // docstring for the Linux inotify cost tradeoff.
         match watcher.watch(p, RecursiveMode::Recursive) {
-            Ok(()) => attached.push(p.clone()),
+            Ok(()) => {
+                // Canonicalize so that `attached` stores the same symlink-resolved
+                // form that the OS (FSEvents on macOS, inotify on Linux) uses when
+                // reporting event paths. `touched_from_events` strips these roots as
+                // a prefix from incoming event paths; if the stored root and the event
+                // path use different representations (e.g. `/var/...` vs
+                // `/private/var/...` on macOS where `/var -> /private/var`),
+                // strip_prefix always fails and in-place package upgrades are silently
+                // missed. Removing canonicalize() here breaks that matching invariant.
+                attached.push(p.canonicalize().unwrap_or_else(|_| p.clone()));
+            }
             Err(e) => {
                 // A libpath directory may not exist yet (e.g. empty renv); log and continue.
                 log::warn!("LibpathWatcher: cannot watch {}: {e}", p.display());
@@ -596,8 +606,14 @@ mod watcher_tests {
     async fn watcher_emits_touched_on_in_place_upgrade() {
         // Regression for the NonRecursive → Recursive switch: rewriting files
         // inside an existing package directory must report it as `touched`.
+        //
+        // Start the watcher on an empty libpath, then install the package and
+        // drain the resulting `added` event. Once that event has arrived we
+        // know FSEvents is fully settled and delivering recursive events for
+        // `foo/` — only then do we trigger the in-place overwrite. This
+        // avoids the flakiness that came from using a fixed sleep as the
+        // only readiness barrier.
         let t = tempdir().unwrap();
-        make_pkg(t.path(), "foo");
 
         let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
         let _handle = spawn_watcher(
@@ -607,7 +623,20 @@ mod watcher_tests {
         )
         .expect("watcher attached");
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Create the package and wait for the watcher to confirm it via an
+        // `added` event. This is the readiness signal: once the debounce loop
+        // has delivered a Changed event, recursive watching for `foo/` is live.
+        make_pkg(t.path(), "foo");
+        let added_evt = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("added event arrived in time")
+            .expect("channel not closed");
+        match added_evt {
+            LibpathEvent::Changed { added, .. } => {
+                assert!(added.contains("foo"), "expected foo in added: {:?}", added);
+            }
+            LibpathEvent::Dropped => panic!("expected Changed for add, got Dropped"),
+        }
 
         // Rewrite files inside the existing package directory — no listing
         // delta, so only recursive watching surfaces this as a signal.
@@ -622,9 +651,9 @@ mod watcher_tests {
         )
         .unwrap();
 
-        let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        let evt = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
-            .expect("event arrived in time")
+            .expect("touched event arrived in time")
             .expect("channel not closed");
 
         match evt {
