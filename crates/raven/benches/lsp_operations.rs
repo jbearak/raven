@@ -50,10 +50,9 @@ fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
         // version aligned across stores so cross-store consistency checks
         // see the same value the runtime would after the first open.
         rt.block_on(state.document_store.open(uri.clone(), &content, 1));
-        state.documents.insert(
-            uri.clone(),
-            Document::new_with_uri(&content, Some(1), &uri),
-        );
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
     }
 
     // Run workspace scan and apply index (populates cross-file state)

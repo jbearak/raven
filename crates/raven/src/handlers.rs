@@ -323,7 +323,10 @@ pub(crate) fn diagnostics_from_snapshot(
                 .unwrap_or_default();
             let closing_line_1based = close.call_site_line.map(|l| l + 1);
 
-            let message = match (closing_line_1based, snapshot.cycle_closing_snippet.as_deref()) {
+            let message = match (
+                closing_line_1based,
+                snapshot.cycle_closing_snippet.as_deref(),
+            ) {
                 (Some(cl), Some(code)) => {
                     format!(
                         "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
@@ -3985,7 +3988,6 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
         .await
 }
 
-
 /// Async version of missing file diagnostics that checks disk existence
 ///
 /// This version uses `AsyncContentProvider::check_existence_batch` to perform
@@ -4178,9 +4180,6 @@ pub async fn collect_missing_file_diagnostics_async(
 
     diagnostics
 }
-
-
-
 
 /// Emit diagnostics for forward directives with invalid `line=0` parameter.
 ///
@@ -4429,7 +4428,6 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
     }
 }
 
-
 fn collect_out_of_scope_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -4544,9 +4542,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
-    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-        snapshot.metadata_map.get(target_uri).cloned()
-    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            snapshot.metadata_map.get(target_uri).cloned()
+        };
     let is_cancelled_fn = || cancel.is_cancelled();
 
     let mut stream_opt = scope::ScopeStream::new(
@@ -4829,9 +4828,10 @@ fn collect_undefined_variables_from_snapshot(
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         snapshot.artifacts_map.get(target_uri).cloned()
     };
-    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-        snapshot.metadata_map.get(target_uri).cloned()
-    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            snapshot.metadata_map.get(target_uri).cloned()
+        };
     let is_cancelled_fn = || cancel.is_cancelled();
 
     let mut stream_opt = scope::ScopeStream::new(
@@ -5039,7 +5039,6 @@ fn collect_undefined_variables_from_snapshot(
     }
 }
 
-
 /// Returns true if the given identifier node is a *structural non-reference*:
 /// an identifier that exists in the AST but never refers to a value at runtime,
 /// regardless of which diagnostic pipeline is consuming it.
@@ -5160,7 +5159,10 @@ fn references_formal_from_default_expression(node: Node, text: &str) -> bool {
         return false;
     }
 
-    let Some(parameters) = default_parameter.parent().filter(|n| n.kind() == "parameters") else {
+    let Some(parameters) = default_parameter
+        .parent()
+        .filter(|n| n.kind() == "parameters")
+    else {
         return false;
     };
 
@@ -7409,7 +7411,6 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 
     last_brace_line
 }
-
 
 /// True when an identifier is textually followed by `(` (ignoring whitespace),
 /// indicating call-target usage.
@@ -32524,10 +32525,7 @@ result <- helper_with_spaces(42)"#;
             !undefined_helper.is_empty(),
             "Expected 'Undefined variable: helper' diagnostic — local=TRUE \
              doesn't inherit. Got: {:?}",
-            diags
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
         );
     }
 
@@ -32548,8 +32546,7 @@ result <- helper_with_spaces(42)"#;
         let main_path = workspace_path.join("main.R");
         let helper_path = workspace_path.join("helper.R");
 
-        let main_code =
-            "result <- helper(1)\nsys.source(\"helper.R\", envir=new.env())\n";
+        let main_code = "result <- helper(1)\nsys.source(\"helper.R\", envir=new.env())\n";
         let helper_code = "helper <- function(x) x + 1\n";
         std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&helper_path, helper_code).unwrap();
@@ -32620,8 +32617,7 @@ result <- helper_with_spaces(42)"#;
 
         // Use `globalenv()` so the source IS inheriting. Use BEFORE the source
         // call to trigger "used before sourced".
-        let main_code =
-            "result <- helper(1)\nsys.source(\"helper.R\", envir=globalenv())\n";
+        let main_code = "result <- helper(1)\nsys.source(\"helper.R\", envir=globalenv())\n";
         let helper_code = "helper <- function(x) x + 1\n";
         std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&helper_path, helper_code).unwrap();
@@ -34012,18 +34008,12 @@ y <- x"#;
 
         let meta_a = crate::cross_file::extract_metadata(a_initial);
         let meta_b = crate::cross_file::extract_metadata(b_code);
-        state.cross_file_graph.update_file(
-            &a_url,
-            &meta_a,
-            Some(&workspace_url),
-            |_| None,
-        );
-        state.cross_file_graph.update_file(
-            &b_url,
-            &meta_b,
-            Some(&workspace_url),
-            |_| None,
-        );
+        state
+            .cross_file_graph
+            .update_file(&a_url, &meta_a, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&b_url, &meta_b, Some(&workspace_url), |_| None);
 
         // Pre-condition: B should NOT report `x` as undefined — A defines it.
         let pre_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
@@ -34043,12 +34033,9 @@ y <- x"#;
             .documents
             .insert(a_url.clone(), Document::new(a_after, None));
         let meta_a_after = crate::cross_file::extract_metadata(a_after);
-        state.cross_file_graph.update_file(
-            &a_url,
-            &meta_a_after,
-            Some(&workspace_url),
-            |_| None,
-        );
+        state
+            .cross_file_graph
+            .update_file(&a_url, &meta_a_after, Some(&workspace_url), |_| None);
 
         // Post-condition: B SHOULD now report "Undefined variable: x".
         let post_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
@@ -34129,18 +34116,12 @@ y <- x"#;
         let child_meta = crate::cross_file::extract_metadata(child_code);
         let grandchild_meta = crate::cross_file::extract_metadata(grandchild_code);
 
-        state.cross_file_graph.update_file(
-            &parent_url,
-            &parent_meta,
-            Some(&workspace_url),
-            |_| None,
-        );
-        state.cross_file_graph.update_file(
-            &child_url,
-            &child_meta,
-            Some(&workspace_url),
-            |_| None,
-        );
+        state
+            .cross_file_graph
+            .update_file(&parent_url, &parent_meta, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&child_url, &child_meta, Some(&workspace_url), |_| None);
         state.cross_file_graph.update_file(
             &grandchild_url,
             &grandchild_meta,
@@ -34185,15 +34166,18 @@ y <- x"#;
             &DiagCancelToken::never(),
         )
         .unwrap_or_default();
-        let snapshot_messages: Vec<_> =
-            snapshot_diags.iter().map(|d| d.message.clone()).collect();
+        let snapshot_messages: Vec<_> = snapshot_diags.iter().map(|d| d.message.clone()).collect();
         assert!(
-            snapshot_messages.iter().any(|m| m == "Undefined variable: z"),
+            snapshot_messages
+                .iter()
+                .any(|m| m == "Undefined variable: z"),
             "snapshot path: z should be flagged as undefined; got: {:?}",
             snapshot_messages
         );
         assert!(
-            snapshot_messages.iter().any(|m| m == "Undefined variable: x"),
+            snapshot_messages
+                .iter()
+                .any(|m| m == "Undefined variable: x"),
             "snapshot path: x should be flagged as undefined; got: {:?}",
             snapshot_messages
         );
@@ -34245,24 +34229,15 @@ y <- x"#;
         let child1_meta = crate::cross_file::extract_metadata(child1_code);
         let child2_meta = crate::cross_file::extract_metadata(child2_code);
 
-        state.cross_file_graph.update_file(
-            &parent_url,
-            &parent_meta,
-            Some(&workspace_url),
-            |_| None,
-        );
-        state.cross_file_graph.update_file(
-            &child1_url,
-            &child1_meta,
-            Some(&workspace_url),
-            |_| None,
-        );
-        state.cross_file_graph.update_file(
-            &child2_url,
-            &child2_meta,
-            Some(&workspace_url),
-            |_| None,
-        );
+        state
+            .cross_file_graph
+            .update_file(&parent_url, &parent_meta, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&child1_url, &child1_meta, Some(&workspace_url), |_| None);
+        state
+            .cross_file_graph
+            .update_file(&child2_url, &child2_meta, Some(&workspace_url), |_| None);
 
         // Diagnose parent.R — x must be undefined at the implicit usage site
         // inside child2.R when computed as part of the parent's neighborhood.
@@ -35294,8 +35269,7 @@ source(\"helpers.R\")
         let used_before_x: Vec<_> = diagnostics
             .iter()
             .filter(|d| {
-                d.message.contains("is used before it's available")
-                    && d.message.contains("'x'")
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
             })
             .collect();
 
@@ -35354,8 +35328,7 @@ source(\"helpers.R\")
         let used_before_y: Vec<_> = diagnostics
             .iter()
             .filter(|d| {
-                d.message.contains("is used before it's available")
-                    && d.message.contains("'y'")
+                d.message.contains("is used before it's available") && d.message.contains("'y'")
             })
             .collect();
 
@@ -35428,8 +35401,7 @@ source(\"failure.R\")
         let used_before_x: Vec<_> = diagnostics
             .iter()
             .filter(|d| {
-                d.message.contains("is used before it's available")
-                    && d.message.contains("'X'")
+                d.message.contains("is used before it's available") && d.message.contains("'X'")
             })
             .collect();
         assert!(
@@ -35992,11 +35964,9 @@ source(\"helpers.R\")
         state.workspace_scan_complete = true;
         // undefined_variables_enabled and diagnostics_enabled default to true;
         // out_of_scope_severity just needs to be non-None to enable that collector.
-        state.cross_file_config.out_of_scope_severity =
-            Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
-        let workspace_url =
-            url::Url::from_file_path(fixture._dir.path()).expect("workspace url");
+        let workspace_url = url::Url::from_file_path(fixture._dir.path()).expect("workspace url");
         // workspace_folders must be set so workspace-root fallback resolution works.
         state.workspace_folders = vec![workspace_url.clone()];
 
@@ -36014,8 +35984,7 @@ source(\"helpers.R\")
             );
         }
 
-        let snapshot =
-            DiagnosticsSnapshot::build(&state, &fixture.mid_file_uri).expect("snapshot");
+        let snapshot = DiagnosticsSnapshot::build(&state, &fixture.mid_file_uri).expect("snapshot");
         let diags =
             diagnostics_from_snapshot(&snapshot, &fixture.mid_file_uri, &DiagCancelToken::never())
                 .expect("diagnostics");
@@ -36057,7 +36026,9 @@ source(\"helpers.R\")
 
         // 4. Diagnostic: the pipeline must also report "Undefined variable: xyz".
         assert!(
-            diags.iter().any(|d| d.message.contains("Undefined variable: xyz")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: xyz")),
             "Expected 'Undefined variable: xyz' diagnostic; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -36350,10 +36321,9 @@ source(\"helpers.R\")
 
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
 
-        let get_artifacts =
-            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
-                snapshot.artifacts_map.get(target_uri).cloned()
-            };
+        let get_artifacts = |target_uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
+        > { snapshot.artifacts_map.get(target_uri).cloned() };
         let get_metadata =
             |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                 snapshot.metadata_map.get(target_uri).cloned()
@@ -36392,10 +36362,8 @@ source(\"helpers.R\")
                 &|| false,
             );
 
-            let cached_keys: BTreeSet<&str> =
-                cached.symbols.keys().map(|n| n.as_ref()).collect();
-            let direct_keys: BTreeSet<&str> =
-                direct.symbols.keys().map(|n| n.as_ref()).collect();
+            let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
+            let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
             assert_eq!(
                 cached_keys, direct_keys,
                 "symbol set differs at ({line}, {col}) for fixture:\n{text}"
@@ -36422,14 +36390,24 @@ source(\"helpers.R\")
                 .symbols
                 .iter()
                 .map(|(name, sym)| {
-                    (name.as_ref(), &sym.source_uri, sym.defined_line, sym.defined_column)
+                    (
+                        name.as_ref(),
+                        &sym.source_uri,
+                        sym.defined_line,
+                        sym.defined_column,
+                    )
                 })
                 .collect();
             let direct_provenance: BTreeSet<(&str, &Url, u32, u32)> = direct
                 .symbols
                 .iter()
                 .map(|(name, sym)| {
-                    (name.as_ref(), &sym.source_uri, sym.defined_line, sym.defined_column)
+                    (
+                        name.as_ref(),
+                        &sym.source_uri,
+                        sym.defined_line,
+                        sym.defined_column,
+                    )
                 })
                 .collect();
             assert_eq!(
@@ -36584,10 +36562,9 @@ source(\"helpers.R\")
 
         let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
 
-        let get_artifacts =
-            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
-                snapshot.artifacts_map.get(target_uri).cloned()
-            };
+        let get_artifacts = |target_uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
+        > { snapshot.artifacts_map.get(target_uri).cloned() };
         let get_metadata =
             |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                 snapshot.metadata_map.get(target_uri).cloned()
@@ -36641,16 +36618,8 @@ source(\"helpers.R\")
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
         );
-        let cached_keys: BTreeSet<&str> = cached
-            .symbols
-            .keys()
-            .map(|n| n.as_ref())
-            .collect();
-        let direct_keys: BTreeSet<&str> = direct
-            .symbols
-            .keys()
-            .map(|n| n.as_ref())
-            .collect();
+        let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
+        let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
         assert_eq!(
             cached_keys, direct_keys,
             "Cached and uncached scopes differ at xyz <- xyz RHS"
@@ -36677,7 +36646,8 @@ source(\"helpers.R\")
         let main_code = "source(\"data.R\")\n";
         // Wrap `xyz <- xyz` in a function body so the query at the RHS
         // resolves with `query_inside_function = true`.
-        let data_code = "source(\"covariates.R\")\nf <- function() {\n  xyz <- xyz\n}\nsource(\"indices.R\")\n";
+        let data_code =
+            "source(\"covariates.R\")\nf <- function() {\n  xyz <- xyz\n}\nsource(\"indices.R\")\n";
         let covariates_code = "cov_a <- 1\ncov_b <- 2\n";
         let indices_code = "idx_a <- 10\n";
 
@@ -36703,10 +36673,9 @@ source(\"helpers.R\")
 
         let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
 
-        let get_artifacts =
-            |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
-                snapshot.artifacts_map.get(target_uri).cloned()
-            };
+        let get_artifacts = |target_uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>,
+        > { snapshot.artifacts_map.get(target_uri).cloned() };
         let get_metadata =
             |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
                 snapshot.metadata_map.get(target_uri).cloned()
@@ -36757,10 +36726,8 @@ source(\"helpers.R\")
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
         );
-        let cached_keys: BTreeSet<&str> =
-            cached.symbols.keys().map(|n| n.as_ref()).collect();
-        let direct_keys: BTreeSet<&str> =
-            direct.symbols.keys().map(|n| n.as_ref()).collect();
+        let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
+        let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
         assert_eq!(
             cached_keys, direct_keys,
             "Cached and uncached scopes differ inside function body at xyz <- xyz RHS"
@@ -37206,11 +37173,8 @@ my_func <- function(a = default_value) {
             .cross_file_graph
             .update_file(&main_uri, &main_meta, None, |_| None);
 
-        let diagnostics = crate::handlers::diagnostics_via_snapshot(
-            &state,
-            &main_uri,
-            &DiagCancelToken::never(),
-        );
+        let diagnostics =
+            crate::handlers::diagnostics_via_snapshot(&state, &main_uri, &DiagCancelToken::never());
 
         assert!(
             !diagnostics
@@ -37263,11 +37227,8 @@ my_func <- function(a = default_value) {
             .cross_file_graph
             .update_file(&main_uri, &main_meta, None, |_| None);
 
-        let diagnostics = crate::handlers::diagnostics_via_snapshot(
-            &state,
-            &main_uri,
-            &DiagCancelToken::never(),
-        );
+        let diagnostics =
+            crate::handlers::diagnostics_via_snapshot(&state, &main_uri, &DiagCancelToken::never());
 
         assert!(
             !diagnostics

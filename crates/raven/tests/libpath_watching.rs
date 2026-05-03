@@ -29,12 +29,8 @@ async fn install_triggers_cache_invalidation() {
     assert!(lib.is_cached("foo").await);
 
     let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
-    let _handle = spawn_watcher(
-        vec![t.path().to_path_buf()],
-        Duration::from_millis(300),
-        tx,
-    )
-    .expect("watcher attached");
+    let _handle = spawn_watcher(vec![t.path().to_path_buf()], Duration::from_millis(300), tx)
+        .expect("watcher attached");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     make_pkg(t.path(), "foo");
@@ -67,12 +63,8 @@ async fn in_place_upgrade_triggers_cache_invalidation() {
     assert!(lib.is_cached("foo").await);
 
     let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
-    let _handle = spawn_watcher(
-        vec![t.path().to_path_buf()],
-        Duration::from_millis(300),
-        tx,
-    )
-    .expect("watcher attached");
+    let _handle = spawn_watcher(vec![t.path().to_path_buf()], Duration::from_millis(300), tx)
+        .expect("watcher attached");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -83,11 +75,7 @@ async fn in_place_upgrade_triggers_cache_invalidation() {
         "Package: foo\nVersion: 2.0\n",
     )
     .unwrap();
-    std::fs::write(
-        t.path().join("foo").join("NAMESPACE"),
-        "export(new_fn)\n",
-    )
-    .unwrap();
+    std::fs::write(t.path().join("foo").join("NAMESPACE"), "export(new_fn)\n").unwrap();
 
     let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
         .await

@@ -212,10 +212,7 @@ impl WorkspaceIndex {
 
     /// Returns true if the URI is currently pinned.
     pub fn is_pinned(&self, uri: &Url) -> bool {
-        self.pinned
-            .read()
-            .map(|p| p.contains(uri))
-            .unwrap_or(false)
+        self.pinned.read().map(|p| p.contains(uri)).unwrap_or(false)
     }
 
     // ========================================================================
@@ -1078,7 +1075,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn test_cap_shrinks_back_when_max_files_is_zero_and_runtime_cap_is_default() {

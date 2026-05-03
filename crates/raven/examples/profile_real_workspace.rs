@@ -84,8 +84,7 @@ fn main() {
             data_uri.clone(),
             Document::new_with_uri(&data_content, None, &data_uri),
         );
-        let result =
-            diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
+        let result = diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
         eprintln!("  snapshot build:      {:?}", result.0);
         eprintln!("  diagnostics compute: {:?}", result.1);
         eprintln!("  diagnostic count:    {:?}", result.2);

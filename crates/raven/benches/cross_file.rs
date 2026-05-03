@@ -170,7 +170,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
                     &base_exports,
                     true,
                     raven::cross_file::config::BackwardDependencyMode::Explicit,
-                    &|| false
+                    &|| false,
                 ))
             })
         });
@@ -232,7 +232,7 @@ fn bench_scope_hotspots(c: &mut Criterion) {
                         &base_exports,
                         true,
                         raven::cross_file::config::BackwardDependencyMode::Explicit,
-                        &|| false
+                        &|| false,
                     ))
                 })
             },

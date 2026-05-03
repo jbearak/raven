@@ -108,8 +108,7 @@ fn build_state(workspace: &Path) -> WorldState {
             .documents
             .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
     }
-    let (index, imports, cross_file_entries, new_index_entries) =
-        scan_workspace(&[folder_url], 20);
+    let (index, imports, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
     state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
     state
 }
@@ -166,13 +165,21 @@ fn main() {
     let state = build_state(dir.path());
     measure("  file_0.R (root)", &state, &uri_of(dir.path(), "file_0.R"));
     measure("  file_7.R (mid)", &state, &uri_of(dir.path(), "file_7.R"));
-    measure("  file_14.R (leaf)", &state, &uri_of(dir.path(), "file_14.R"));
+    measure(
+        "  file_14.R (leaf)",
+        &state,
+        &uri_of(dir.path(), "file_14.R"),
+    );
 
     println!("\nTopology: fanout_30");
     let dir = TempDir::new().unwrap();
     write_fanout(dir.path(), 30);
     let state = build_state(dir.path());
-    measure("  utility.R (hub)", &state, &uri_of(dir.path(), "utility.R"));
+    measure(
+        "  utility.R (hub)",
+        &state,
+        &uri_of(dir.path(), "utility.R"),
+    );
     measure("  leaf_0.R", &state, &uri_of(dir.path(), "leaf_0.R"));
     measure("  leaf_15.R", &state, &uri_of(dir.path(), "leaf_15.R"));
 
@@ -180,16 +187,28 @@ fn main() {
     let dir = TempDir::new().unwrap();
     write_mixed(dir.path(), 20, 5);
     let state = build_state(dir.path());
-    measure("  utility.R (hub)", &state, &uri_of(dir.path(), "utility.R"));
+    measure(
+        "  utility.R (hub)",
+        &state,
+        &uri_of(dir.path(), "utility.R"),
+    );
     measure("  leaf_0.R", &state, &uri_of(dir.path(), "leaf_0.R"));
     measure("  chain_0_0.R", &state, &uri_of(dir.path(), "chain_0_0.R"));
-    measure("  chain_0_4.R (tail)", &state, &uri_of(dir.path(), "chain_0_4.R"));
+    measure(
+        "  chain_0_4.R (tail)",
+        &state,
+        &uri_of(dir.path(), "chain_0_4.R"),
+    );
 
     println!("\nTopology: fanout_100");
     let dir = TempDir::new().unwrap();
     write_fanout(dir.path(), 100);
     let state = build_state(dir.path());
-    measure("  utility.R (hub)", &state, &uri_of(dir.path(), "utility.R"));
+    measure(
+        "  utility.R (hub)",
+        &state,
+        &uri_of(dir.path(), "utility.R"),
+    );
     measure("  leaf_0.R", &state, &uri_of(dir.path(), "leaf_0.R"));
     measure("  leaf_99.R", &state, &uri_of(dir.path(), "leaf_99.R"));
 
@@ -197,8 +216,20 @@ fn main() {
     let dir = TempDir::new().unwrap();
     write_mixed(dir.path(), 50, 10);
     let state = build_state(dir.path());
-    measure("  utility.R (hub)", &state, &uri_of(dir.path(), "utility.R"));
+    measure(
+        "  utility.R (hub)",
+        &state,
+        &uri_of(dir.path(), "utility.R"),
+    );
     measure("  leaf_0.R", &state, &uri_of(dir.path(), "leaf_0.R"));
-    measure("  chain_0_5.R (mid)", &state, &uri_of(dir.path(), "chain_0_5.R"));
-    measure("  chain_0_9.R (tail)", &state, &uri_of(dir.path(), "chain_0_9.R"));
+    measure(
+        "  chain_0_5.R (mid)",
+        &state,
+        &uri_of(dir.path(), "chain_0_5.R"),
+    );
+    measure(
+        "  chain_0_9.R (tail)",
+        &state,
+        &uri_of(dir.path(), "chain_0_9.R"),
+    );
 }

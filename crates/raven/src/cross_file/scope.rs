@@ -3298,8 +3298,7 @@ where
                 {
                     // Only propagate packages loaded before the effective call site
                     // Requirement 5.1: Package loaded before source() call is available in sourced file
-                    if (*pkg_line, *pkg_col)
-                        <= (effective_call_site_line, effective_call_site_col)
+                    if (*pkg_line, *pkg_col) <= (effective_call_site_line, effective_call_site_col)
                     {
                         // Requirement 5.3: Respect function scope - only propagate global packages
                         // or packages in the same function scope as the source() call
@@ -3314,10 +3313,7 @@ where
                                         effective_call_site_line,
                                         effective_call_site_col,
                                     ));
-                                is_same_or_descendant_function_scope(
-                                    call_site_scope,
-                                    *pkg_scope,
-                                )
+                                is_same_or_descendant_function_scope(call_site_scope, *pkg_scope)
                             }
                         };
 
@@ -3325,11 +3321,7 @@ where
                             prefix.inherited_packages.insert(package.clone());
                             // Record the parent file as origin so downstream
                             // merge sites can apply the same-file leak filter.
-                            record_package_origin(
-                                &mut prefix.package_origins,
-                                package,
-                                &edge.from,
-                            );
+                            record_package_origin(&mut prefix.package_origins, package, &edge.from);
                         }
                     }
                 }
@@ -3353,7 +3345,11 @@ where
                 continue;
             }
             prefix.inherited_packages.insert(pkg.clone());
-            propagate_package_origins(&parent_scope.package_origins, pkg, &mut prefix.package_origins);
+            propagate_package_origins(
+                &parent_scope.package_origins,
+                pkg,
+                &mut prefix.package_origins,
+            );
         }
 
         // Also propagate packages that are loaded in the parent at the call site.
@@ -3366,7 +3362,11 @@ where
                 continue;
             }
             prefix.inherited_packages.insert(pkg.clone());
-            propagate_package_origins(&parent_scope.package_origins, pkg, &mut prefix.package_origins);
+            propagate_package_origins(
+                &parent_scope.package_origins,
+                pkg,
+                &mut prefix.package_origins,
+            );
         }
     }
 
@@ -3785,11 +3785,7 @@ where
                             .iter()
                             .chain(child_scope.inherited_packages.iter())
                         {
-                            if package_only_origin_is_uri(
-                                &child_scope.package_origins,
-                                pkg,
-                                uri,
-                            ) {
+                            if package_only_origin_is_uri(&child_scope.package_origins, pkg, uri) {
                                 continue;
                             }
                             scope.loaded_packages.insert(pkg.clone());
@@ -4725,18 +4721,16 @@ where
                         .extend(origins);
                 }
             }
-            ScopeEvent::Declaration { symbol, .. } => {
-                match frame.symbols.get_mut(&symbol.name) {
-                    Some(existing) if existing.is_declared => {
-                        *existing = symbol.clone();
-                    }
-                    Some(_) => {}
-                    None => {
-                        frame.removed_names.remove(&symbol.name);
-                        frame.symbols.insert(symbol.name.clone(), symbol.clone());
-                    }
+            ScopeEvent::Declaration { symbol, .. } => match frame.symbols.get_mut(&symbol.name) {
+                Some(existing) if existing.is_declared => {
+                    *existing = symbol.clone();
                 }
-            }
+                Some(_) => {}
+                None => {
+                    frame.removed_names.remove(&symbol.name);
+                    frame.symbols.insert(symbol.name.clone(), symbol.clone());
+                }
+            },
         }
     }
 
@@ -4900,7 +4894,11 @@ where
                 continue;
             }
             contrib.packages.insert(pkg.clone());
-            propagate_package_origins(&child_scope.package_origins, pkg, &mut contrib.package_origins);
+            propagate_package_origins(
+                &child_scope.package_origins,
+                pkg,
+                &mut contrib.package_origins,
+            );
         }
 
         contrib
@@ -5412,7 +5410,7 @@ mod tests {
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -5590,13 +5588,14 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
-            if uri == &parent_uri {
-                Some(std::sync::Arc::new(parent_meta.clone()))
-            } else {
-                None
-            }
-        };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                if uri == &parent_uri {
+                    Some(std::sync::Arc::new(parent_meta.clone()))
+                } else {
+                    None
+                }
+            };
 
         let scope_inside_function = scope_at_position_with_graph(
             &parent_uri,
@@ -5610,7 +5609,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -5636,7 +5635,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_after_function.symbols.contains_key("child_var"),
@@ -5689,13 +5688,14 @@ outside_var <- 2"#;
             }
         };
 
-        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
-            if uri == &parent_uri {
-                Some(std::sync::Arc::new(parent_meta.clone()))
-            } else {
-                None
-            }
-        };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                if uri == &parent_uri {
+                    Some(std::sync::Arc::new(parent_meta.clone()))
+                } else {
+                    None
+                }
+            };
 
         // Inside the function: child_var should be visible (source is before this point)
         let scope_inside_function = scope_at_position_with_graph(
@@ -5710,7 +5710,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -5738,7 +5738,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_after_function.symbols.contains_key("child_var"),
@@ -5850,7 +5850,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -5928,7 +5928,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -6048,7 +6048,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -6191,7 +6191,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -6360,7 +6360,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         // Should have depth_exceeded entry
@@ -6556,7 +6556,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -6646,7 +6646,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -7132,10 +7132,8 @@ outside_var <- 2"#;
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let inner_call =
-            find_recursive_self_call(tree.root_node(), code, "f").unwrap_or_else(|| {
-                panic!("Test setup error: could not find inner `f()` call via AST")
-            });
+        let inner_call = find_recursive_self_call(tree.root_node(), code, "f")
+            .unwrap_or_else(|| panic!("Test setup error: could not find inner `f()` call via AST"));
         let inner_call_pos = inner_call.start_position();
         // `start_position().column` is a byte column; `scope_at_position`
         // expects a UTF-16 column. Convert via the line text so this test
@@ -7212,9 +7210,7 @@ outside_var <- 2"#;
         let now_inside_function = inside_function || node.kind() == "function_definition";
         if now_inside_function && node.kind() == "call" {
             if let Some(func_node) = node.child_by_field_name("function") {
-                if func_node.kind() == "identifier"
-                    && &content[func_node.byte_range()] == name
-                {
+                if func_node.kind() == "identifier" && &content[func_node.byte_range()] == name {
                     return Some(node);
                 }
             }
@@ -8922,7 +8918,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -8942,7 +8938,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -8962,7 +8958,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -9041,7 +9037,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -9069,7 +9065,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -9301,7 +9297,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -9392,7 +9388,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -9476,7 +9472,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -9496,7 +9492,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -9516,7 +9512,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -9602,7 +9598,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -9688,7 +9684,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -9708,7 +9704,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -9811,7 +9807,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -9831,7 +9827,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -9944,7 +9940,7 @@ outside_var <- 2"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -11654,7 +11650,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         // Child should have inherited dplyr from parent
@@ -11733,7 +11729,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -11812,7 +11808,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         // Child should have both packages
@@ -11896,7 +11892,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -11970,7 +11966,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -12054,7 +12050,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -12135,7 +12131,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -12254,7 +12250,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -12278,7 +12274,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -12360,7 +12356,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -12384,7 +12380,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -12542,7 +12538,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -12646,7 +12642,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -12669,7 +12665,7 @@ x <- 1"#;
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
-            &|| false
+            &|| false,
         );
 
         assert!(
@@ -13126,9 +13122,10 @@ y <- filter(df)"#;
 
             // Detect main's source() calls (only literal-string sources
             // are detected; that's what our fixtures use).
-            let main_meta = std::sync::Arc::new(
-                crate::cross_file::extract_metadata_with_tree(main_code, Some(&main_tree)),
-            );
+            let main_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                main_code,
+                Some(&main_tree),
+            ));
             let helper_meta = std::sync::Arc::new(CrossFileMetadata::default());
 
             let mut graph = DependencyGraph::new();
@@ -13572,9 +13569,10 @@ y <- filter(df)"#;
             let helper2_artifacts =
                 Arc::new(compute_artifacts(&helper2_uri, &helper2_tree, helper2_code));
 
-            let main_meta = std::sync::Arc::new(
-                crate::cross_file::extract_metadata_with_tree(main_code, Some(&main_tree)),
-            );
+            let main_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                main_code,
+                Some(&main_tree),
+            ));
             let helper1_meta = std::sync::Arc::new(CrossFileMetadata::default());
             let helper2_meta = std::sync::Arc::new(CrossFileMetadata::default());
 
@@ -13968,8 +13966,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata =
-                |_u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+            let get_metadata = |_u: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
             let base_exports = HashSet::new();
 
@@ -13985,7 +13984,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true, // hoisting ON
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14006,7 +14005,7 @@ y <- filter(df)"#;
                 &base_exports,
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14039,8 +14038,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata =
-                |_u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+            let get_metadata = |_u: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { None };
             let graph = crate::cross_file::dependency::DependencyGraph::new();
             let base_exports = HashSet::new();
 
@@ -14057,7 +14057,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14160,7 +14160,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
@@ -14185,7 +14187,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14254,8 +14256,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata =
-                |_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+            let get_metadata = |_uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { None };
 
             let base_exports = HashSet::new();
 
@@ -14272,7 +14275,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14391,7 +14394,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &middle_uri {
@@ -14418,7 +14423,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14531,7 +14536,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
@@ -14556,7 +14563,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14659,7 +14666,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &a_uri {
                     Some(std::sync::Arc::new(a_meta.clone()))
                 } else if uri == &b_uri {
@@ -14684,7 +14693,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14794,7 +14803,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &sibling_uri {
@@ -14820,7 +14831,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -14910,7 +14921,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
@@ -14936,7 +14949,7 @@ y <- filter(df)"#;
                 &base_exports,
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15042,7 +15055,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
@@ -15067,7 +15082,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15146,7 +15161,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
@@ -15170,7 +15187,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15258,7 +15275,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &child_uri {
@@ -15283,7 +15302,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true, // hoisting ON, but query is at global level
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             // At global level, parent is queried at call site (line 0 col 0),
@@ -15406,7 +15425,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &grandparent_uri {
                     Some(std::sync::Arc::new(grandparent_meta.clone()))
                 } else if uri == &parent_uri {
@@ -15432,7 +15453,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15543,7 +15564,9 @@ y <- filter(df)"#;
                     None
                 }
             };
-            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+            let get_metadata = |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
                 if uri == &parent_uri {
                     Some(std::sync::Arc::new(parent_meta.clone()))
                 } else if uri == &helper_uri {
@@ -15569,7 +15592,7 @@ y <- filter(df)"#;
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15661,7 +15684,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15785,7 +15808,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -15870,7 +15893,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -16005,7 +16028,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -16032,7 +16055,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -16117,7 +16140,7 @@ y <- filter(df)"#;
                 &HashSet::new(),
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
-                &|| false
+                &|| false,
             );
 
             assert!(
@@ -16155,16 +16178,14 @@ y <- filter(df)"#;
 
         let parent_code = "library(stats)\nhelper <- function() 1\n";
         let parent_tree = parse_r(parent_code);
-        let parent_artifacts =
-            Arc::new(compute_artifacts(&parent_uri, &parent_tree, parent_code));
+        let parent_artifacts = Arc::new(compute_artifacts(&parent_uri, &parent_tree, parent_code));
         let parent_meta = std::sync::Arc::new(CrossFileMetadata::default());
 
         // Child sources parent at line 0 col 0, then defines a function that
         // uses `helper`, then uses `helper` at top-level too.
         let child_code = "source(\"parent.R\")\nf <- function() {\n  helper()\n}\nx <- helper()\n";
         let child_tree = parse_r(child_code);
-        let child_artifacts =
-            Arc::new(compute_artifacts(&child_uri, &child_tree, child_code));
+        let child_artifacts = Arc::new(compute_artifacts(&child_uri, &child_tree, child_code));
         let child_meta = std::sync::Arc::new(CrossFileMetadata {
             sources: vec![ForwardSource {
                 path: "parent.R".to_string(),
@@ -16386,16 +16407,10 @@ y <- filter(df)"#;
 
             // Compare key fields. Symbol HashMap, package sets, package
             // origins, chain, and depth_exceeded must all match.
-            let cached_syms: std::collections::BTreeSet<&str> = cached
-                .symbols
-                .keys()
-                .map(|n| n.as_ref())
-                .collect();
-            let direct_syms: std::collections::BTreeSet<&str> = direct
-                .symbols
-                .keys()
-                .map(|n| n.as_ref())
-                .collect();
+            let cached_syms: std::collections::BTreeSet<&str> =
+                cached.symbols.keys().map(|n| n.as_ref()).collect();
+            let direct_syms: std::collections::BTreeSet<&str> =
+                direct.symbols.keys().map(|n| n.as_ref()).collect();
             assert_eq!(
                 cached_syms, direct_syms,
                 "symbol set mismatch at ({line}, {col})"
@@ -16453,15 +16468,14 @@ y <- filter(df)"#;
         };
         let uri_for_meta = uri.clone();
         let meta_for_closure = meta.clone();
-        let get_metadata = move |u: &Url| -> Option<
-            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
-        > {
-            if u == &uri_for_meta {
-                Some(meta_for_closure.clone())
-            } else {
-                None
-            }
-        };
+        let get_metadata =
+            move |u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                if u == &uri_for_meta {
+                    Some(meta_for_closure.clone())
+                } else {
+                    None
+                }
+            };
 
         let graph = crate::cross_file::dependency::DependencyGraph::new();
         let base_exports: HashSet<String> = HashSet::new();
@@ -16563,9 +16577,10 @@ y <- filter(df)"#;
         let helper_tree = parse_r(helper_code);
         let helper_artifacts = Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
 
-        let main_meta = std::sync::Arc::new(
-            crate::cross_file::extract_metadata_with_tree(main_code, Some(&main_tree)),
-        );
+        let main_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+            main_code,
+            Some(&main_tree),
+        ));
         let helper_meta = std::sync::Arc::new(CrossFileMetadata::default());
 
         let mut graph = DependencyGraph::new();
@@ -16649,15 +16664,14 @@ y <- filter(df)"#;
         };
         let uri_for_meta = uri.clone();
         let meta_for_closure = meta.clone();
-        let get_metadata = move |u: &Url| -> Option<
-            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
-        > {
-            if u == &uri_for_meta {
-                Some(meta_for_closure.clone())
-            } else {
-                None
-            }
-        };
+        let get_metadata =
+            move |u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                if u == &uri_for_meta {
+                    Some(meta_for_closure.clone())
+                } else {
+                    None
+                }
+            };
 
         let graph = crate::cross_file::dependency::DependencyGraph::new();
         let base_exports: HashSet<String> = HashSet::new();
@@ -16722,15 +16736,14 @@ y <- filter(df)"#;
         };
         let uri_for_meta = uri.clone();
         let meta_for_closure = meta.clone();
-        let get_metadata = move |u: &Url| -> Option<
-            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
-        > {
-            if u == &uri_for_meta {
-                Some(meta_for_closure.clone())
-            } else {
-                None
-            }
-        };
+        let get_metadata =
+            move |u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                if u == &uri_for_meta {
+                    Some(meta_for_closure.clone())
+                } else {
+                    None
+                }
+            };
 
         let graph = crate::cross_file::dependency::DependencyGraph::new();
         let base_exports: HashSet<String> = HashSet::new();
@@ -16754,7 +16767,10 @@ y <- filter(df)"#;
 
         // After the second `x <- 2` (line 2), x must be visible.
         stream.advance_to(3, 0);
-        assert!(stream.is_visible("x"), "x must be visible after resurrection");
+        assert!(
+            stream.is_visible("x"),
+            "x must be visible after resurrection"
+        );
 
         // Compare against the cached path.
         let mut throwaway = ParentPrefixCache::new();
@@ -16809,15 +16825,14 @@ y <- filter(df)"#;
         };
         let uri_for_meta = uri.clone();
         let meta_for_closure = meta.clone();
-        let get_metadata = move |u: &Url| -> Option<
-            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
-        > {
-            if u == &uri_for_meta {
-                Some(meta_for_closure.clone())
-            } else {
-                None
-            }
-        };
+        let get_metadata =
+            move |u: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                if u == &uri_for_meta {
+                    Some(meta_for_closure.clone())
+                } else {
+                    None
+                }
+            };
 
         let graph = crate::cross_file::dependency::DependencyGraph::new();
         let base_exports: HashSet<String> = HashSet::new();

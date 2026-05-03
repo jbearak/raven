@@ -223,12 +223,10 @@ fn percent(d: Duration, total: Duration) -> f64 {
 }
 
 fn main() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .format_timestamp(None)
-    .try_init()
-    .ok();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format_timestamp(None)
+        .try_init()
+        .ok();
 
     let workspace = std::env::args()
         .nth(1)
@@ -262,7 +260,10 @@ fn main() {
         phases.files,
         phases.bytes / 1024
     );
-    println!("    discover (read_dir tree): {:>7.1}ms", ms(phases.discover));
+    println!(
+        "    discover (read_dir tree): {:>7.1}ms",
+        ms(phases.discover)
+    );
     println!(
         "    fs::read_to_string:        {:>7.1}ms ({:>4.1}%)",
         ms(phases.read),
@@ -340,7 +341,10 @@ fn main() {
     }
     apply_runs.sort();
     let median_apply = apply_runs[apply_runs.len() / 2];
-    println!("    median apply_workspace_index: {:>7.1}ms", ms(median_apply));
+    println!(
+        "    median apply_workspace_index: {:>7.1}ms",
+        ms(median_apply)
+    );
     println!(
         "    runs: {:?}",
         apply_runs.iter().map(|d| ms(*d)).collect::<Vec<_>>()
@@ -397,9 +401,7 @@ fn main() {
         println!("(skipping phases 5/6: {} does not exist)", target.display());
         return;
     }
-    println!(
-        "[5] scripts/data.r diagnostics — COLD start (workspace_scan_complete=false):"
-    );
+    println!("[5] scripts/data.r diagnostics — COLD start (workspace_scan_complete=false):");
     let mut state = make_state(&workspace);
     state.package_library = lib.clone();
     state.package_library_ready = true;
@@ -439,9 +441,7 @@ fn main() {
     // ------------------------------------------------------------------
     // Phase 6: scripts/data.r diagnostics — POST-scan (workspace index applied)
     // ------------------------------------------------------------------
-    println!(
-        "[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):"
-    );
+    println!("[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):");
     let (index, imports, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
     state.apply_workspace_index(index, imports, cf, new_idx);
     // Warmup
@@ -478,9 +478,7 @@ fn main() {
     // Summary
     // ------------------------------------------------------------------
     println!("=== Cold-start lag attribution ===\n");
-    println!(
-        "Wall-clock from did_open(data.r) to first non-deferred diagnostic publish ≈"
-    );
+    println!("Wall-clock from did_open(data.r) to first non-deferred diagnostic publish ≈");
     println!("  scan_workspace          : {:>7.1}ms", ms(median));
     println!("  apply_workspace_index   : {:>7.1}ms", ms(median_apply));
     println!(
@@ -489,8 +487,7 @@ fn main() {
         ms(median_build_warm),
         ms(median_diag_warm)
     );
-    let cold_total =
-        median + median_apply + median_build_warm + median_diag_warm;
+    let cold_total = median + median_apply + median_build_warm + median_diag_warm;
     println!(
         "  --------------------------- {:>7.1}ms (lower bound; ignores prefetch + lock contention)",
         ms(cold_total)
@@ -543,10 +540,9 @@ fn main() {
     let mut b_runs = Vec::new();
     for _ in 0..3 {
         let t_a = measure_scan_inner_loop(&paths, |_p, text, _doc| extract_metadata(text));
-        let t_b =
-            measure_scan_inner_loop(&paths, |_p, text, doc| {
-                extract_metadata_with_tree(text, doc.tree.as_ref())
-            });
+        let t_b = measure_scan_inner_loop(&paths, |_p, text, doc| {
+            extract_metadata_with_tree(text, doc.tree.as_ref())
+        });
         a_runs.push(t_a);
         b_runs.push(t_b);
     }
@@ -617,9 +613,10 @@ fn main() {
                             } else {
                                 scope::ScopeArtifacts::default()
                             });
-                            let snap = raven::cross_file::file_cache::FileSnapshot::with_content_hash(
-                                &fs_meta, &text,
-                            );
+                            let snap =
+                                raven::cross_file::file_cache::FileSnapshot::with_content_hash(
+                                    &fs_meta, &text,
+                                );
                             let xf_meta_arc: Arc<CrossFileMetadata> = Arc::new(xf_meta);
                             local_cf.insert(
                                 uri.clone(),
@@ -680,7 +677,10 @@ fn main() {
     println!("=== Summary of fix candidates ===\n");
     println!("Cold-start path BEFORE fixes (measured):");
     println!("  scan_workspace                : {:>7.1}ms", ms(median));
-    println!("  apply_workspace_index         : {:>7.1}ms", ms(median_apply));
+    println!(
+        "  apply_workspace_index         : {:>7.1}ms",
+        ms(median_apply)
+    );
     println!(
         "  post-scan diagnostics (data.r): {:>7.1}ms",
         ms(median_build_warm + median_diag_warm)

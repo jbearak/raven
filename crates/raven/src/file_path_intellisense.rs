@@ -933,8 +933,7 @@ pub fn file_path_definition(
             }
             DirectiveType::Source => {
                 // Forward directives respect @lsp-cd but do not use workspace-root fallback.
-                let path_context =
-                    PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+                let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
                 resolve_path(&normalized_path, &path_context)?
             }
         },
@@ -1391,8 +1390,7 @@ pub fn resolve_base_directory(
             }
             DirectiveType::Source => {
                 // Forward directives respect @lsp-cd but do not use workspace-root fallback.
-                let path_context =
-                    PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+                let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
                 if partial_dir.is_empty() {
                     Some(path_context.effective_working_directory())
                 } else {
@@ -1528,8 +1526,7 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
                 r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
             )
             .unwrap(),
-            forward: Regex::new(r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#)
-                .unwrap(),
+            forward: Regex::new(r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#).unwrap(),
         }
     })
 }
