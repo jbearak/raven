@@ -40283,6 +40283,32 @@ mod issue_149_utf16_handlers {
     }
 
     #[test]
+    fn goto_definition_qualified_member_with_non_bmp_before_cursor_on_cursor_line() {
+        let mut state = create_state();
+        // Mirrors the issue #149 repro shape: the cursor is on the RHS of
+        // `foo$bar`, and the cursor line has `🦀` before `bar`. UTF-16 col
+        // 10 is `b`; the corresponding tree-sitter byte column is 12.
+        // Without UTF-16 -> byte conversion, the cursor lands in `foo`
+        // instead of `bar`, bypassing the qualified-member resolver.
+        let code = "foo <- list(bar = 1)\n\"🦀\"; foo$bar\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        let result = goto_definition(&state, &uri, Position::new(1, 10));
+
+        let location = match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar response, got {:?}", other),
+        };
+        assert_eq!(location.uri, uri);
+        assert_eq!(
+            location.range.start,
+            Position::new(0, 12),
+            "`bar` in `foo <- list(bar = 1)` starts at UTF-16 col 12"
+        );
+        assert_eq!(location.range.end, Position::new(0, 15));
+    }
+
+    #[test]
     fn goto_definition_fallback_reports_utf16_columns_on_non_bmp_definition_line() {
         let mut state = create_state();
         let use_uri = add_doc(&mut state, "file:///use.R", "abc\n");
