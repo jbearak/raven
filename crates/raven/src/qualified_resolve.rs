@@ -15,10 +15,18 @@
 //!      resolves to the *same* binding are kept. This handles the very
 //!      common pattern of "skeleton object defined in helpers.R, members
 //!      attached in main.R".
-//! 3. Tie-break: cursor-file candidates win over defining-file candidates;
-//!    among cursor-file candidates, the one with the latest effect position
-//!    not after the cursor wins; among defining-file candidates, the one
-//!    with the latest effect position wins.
+//! 3. Tie-break: `pick_winner` partitions all candidates by whether their
+//!    `uri` equals the cursor's. The in-cursor-file partition is filtered
+//!    by `effect <= cursor`, then the candidate with the latest effect
+//!    wins. If no in-cursor-file candidate qualifies, the other-file
+//!    partition's max-effect candidate wins as a fallback.
+//!
+//!    In the **same-file case** (cursor file = defining file), Phase 2 is
+//!    skipped, so every candidate lives in the cursor's own file and the
+//!    partition has only one non-empty side — both the `effect <= cursor`
+//!    filter and the max-effect rule apply once over the merged set.
+//!    There is no separate "defining-file tier" to fall back to in this
+//!    case; the two-tier story only kicks in when the files differ.
 //! 4. Never fall back to free-identifier lookup.
 //!
 //! Limitation (step 2): only the cursor file and the defining file are
@@ -1017,6 +1025,129 @@ print(foo$bar)
         assert_eq!(
             l.range.start.character, 12,
             "CRLF should not shift the resolved column"
+        );
+    }
+
+    /// Multiple imports of the same name from different sourced files: pin
+    /// the deterministic "first source() wins" behavior. Cross-file scope
+    /// merging uses `entry(name).or_insert(symbol)`, so whichever sourced
+    /// file the timeline visits first owns `foo`, and qualified resolution
+    /// follows that into its defining file. A regression that flipped to
+    /// last-wins (or non-deterministic) would silently change which file
+    /// cmd-click jumps into.
+    #[test]
+    fn dollar_rhs_multiple_imports_first_source_wins() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"a.R\")
+source(\"b.R\")
+use(foo$bar)
+";
+        let a_code = "foo <- list(bar = 1)\n";
+        let b_code = "foo <- list(bar = 999)\n";
+
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&a_uri, a_code),
+            (&b_uri, b_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 2 col 8 = `bar` in `use(foo$bar)`
+        let pos = Position::new(2, 8);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        assert_eq!(
+            l.uri, a_uri,
+            "first-sourced file (`a.R`) should win — `or_insert` in scope merging",
+        );
+        assert_ne!(
+            l.uri, b_uri,
+            "second-sourced file (`b.R`) must NOT win under or_insert semantics",
+        );
+        assert_eq!(l.range.start.line, 0);
+        // `bar = 1` lives at col 12 of `foo <- list(bar = 1)`.
+        assert_eq!(l.range.start.character, 12);
+    }
+
+    /// Documented "third-file gap": `foo` is defined in `a.R`, the
+    /// `foo$bar <- 1` lives in the *middle* file `b.R`, and the cursor is
+    /// in `c.R`. Today we scan only the cursor file (c.R) and the defining
+    /// file (a.R), so the candidate in b.R is invisible. Neither file has
+    /// a qualifying candidate, so the resolver returns `None`. Pin this so
+    /// extending scanning to the full connected component (issue #148) has
+    /// a clean before/after.
+    #[test]
+    fn dollar_rhs_third_file_member_assignment_returns_none() {
+        let mut state = fresh_state();
+
+        let c_code = "\
+source(\"b.R\")
+print(foo$bar)
+";
+        let b_code = "\
+source(\"a.R\")
+foo$bar <- 1
+";
+        let a_code = "foo <- list()\n";
+
+        let c_uri = add_doc(&mut state, "file:///workspace/c.R", c_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+
+        for (uri, code) in [(&c_uri, c_code), (&b_uri, b_code), (&a_uri, a_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 1 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(1, 10);
+        let result = goto_definition(&state, &c_uri, pos);
+        assert!(
+            result.is_none(),
+            "third-file `foo$bar <- 1` is invisible to current scanning — \
+             a.R (defining) has no member-assignment or matching constructor \
+             arg, c.R (cursor) has none either, so no candidate qualifies. \
+             Tracked by issue #148.",
+        );
+    }
+
+    /// Chained-LHS rejection: `collect_member_assignments` requires the
+    /// extract's LHS to be a bare identifier, so `foo$inner$bar <- 99` is
+    /// silently skipped. With the cursor on `inner` in `foo$inner`, today's
+    /// behavior is `None` — we don't treat the chained assignment as a
+    /// definition of `foo$inner`. Pin this so a future relaxation that
+    /// recognizes the deeper LHS as also defining `foo$inner` has a clear
+    /// breaking point.
+    #[test]
+    fn chained_lhs_member_assignment_not_collected() {
+        let mut state = fresh_state();
+        let code = "\
+foo <- list()
+foo$inner$bar <- 99
+use(foo$inner)
+";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // line 2 col 8 = `inner` in `use(foo$inner)`
+        let pos = Position::new(2, 8);
+        assert!(
+            goto_definition(&state, &uri, pos).is_none(),
+            "chained `foo$inner$bar <- 99` (outer extract's LHS is itself \
+             an extract, not a bare identifier) must not be collected as a \
+             candidate for `foo$inner`",
         );
     }
 }
