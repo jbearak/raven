@@ -127,10 +127,7 @@ impl CrossFileWorkspaceIndex {
 
     /// Returns true if the URI is currently pinned.
     pub fn is_pinned(&self, uri: &Url) -> bool {
-        self.pinned
-            .read()
-            .map(|p| p.contains(uri))
-            .unwrap_or(false)
+        self.pinned.read().map(|p| p.contains(uri)).unwrap_or(false)
     }
 
     /// Get current version
@@ -250,11 +247,7 @@ impl CrossFileWorkspaceIndex {
     /// May exceed the user-configured capacity after an all-pinned
     /// overflow has forced the underlying LRU to grow.
     pub fn cap(&self) -> usize {
-        self.inner
-            .read()
-            .ok()
-            .map(|g| g.cap().get())
-            .unwrap_or(0)
+        self.inner.read().ok().map(|g| g.cap().get()).unwrap_or(0)
     }
 
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.

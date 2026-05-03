@@ -990,10 +990,7 @@ mod tests {
         let doc = store.get_without_touch(&uri).unwrap();
         let arc1: Arc<CrossFileMetadata> = doc.metadata.clone();
         let arc2 = arc1.clone();
-        assert!(
-            Arc::ptr_eq(&arc1, &arc2),
-            "Arc clones must share storage"
-        );
+        assert!(Arc::ptr_eq(&arc1, &arc2), "Arc clones must share storage");
     }
 
     #[tokio::test]

@@ -2248,7 +2248,8 @@ mod integration_tests {
         // Create closures for scope resolution
         let get_artifacts =
             |uri: &Url| -> Option<Arc<ScopeArtifacts>> { provider.get_artifacts(uri) };
-        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> { provider.get_metadata(uri) };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> { provider.get_metadata(uri) };
 
         // Query scope at end of parent file
         let scope = scope_at_position_with_graph(

@@ -464,10 +464,15 @@ impl PackageLibrary {
             loop {
                 let new_dependents: HashSet<String> = cache
                     .iter()
-                    .filter(|(k, _)| !frontier.contains(k.as_str()) && !dependents.contains(k.as_str()))
+                    .filter(|(k, _)| {
+                        !frontier.contains(k.as_str()) && !dependents.contains(k.as_str())
+                    })
                     .filter(|(_, info)| {
                         info.depends.iter().any(|dep| frontier.contains(dep))
-                            || info.attached_packages.iter().any(|dep| frontier.contains(dep))
+                            || info
+                                .attached_packages
+                                .iter()
+                                .any(|dep| frontier.contains(dep))
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -3468,8 +3473,7 @@ mod tests {
             .await;
         assert_eq!(lib.cached_count().await, 3);
 
-        let to_invalidate: HashSet<String> =
-            ["dplyr".into(), "readr".into()].into_iter().collect();
+        let to_invalidate: HashSet<String> = ["dplyr".into(), "readr".into()].into_iter().collect();
         lib.invalidate_many(&to_invalidate).await;
 
         assert_eq!(lib.cached_count().await, 1);
@@ -3485,12 +3489,8 @@ mod tests {
         let lib = PackageLibrary::new_empty();
         // Seed packages cache too so invalidate_many can discover dependent
         // combined keys from cached PackageInfo.attached_packages.
-        let tidyverse_info = PackageInfo::with_details(
-            "tidyverse".into(),
-            HashSet::new(),
-            vec![],
-            vec![],
-        );
+        let tidyverse_info =
+            PackageInfo::with_details("tidyverse".into(), HashSet::new(), vec![], vec![]);
         {
             let mut packages = lib.packages.write().await;
             packages.insert("tidyverse".into(), std::sync::Arc::new(tidyverse_info));
@@ -3542,8 +3542,11 @@ mod tests {
     async fn invalidate_many_returns_empty_for_names_not_in_combined_exports() {
         use std::collections::HashSet;
         let lib = PackageLibrary::new_empty();
-        lib.insert_package(PackageInfo::new("uncached_meta_child".into(), HashSet::new()))
-            .await;
+        lib.insert_package(PackageInfo::new(
+            "uncached_meta_child".into(),
+            HashSet::new(),
+        ))
+        .await;
 
         // combined_exports is empty for this package name — invalidate_many
         // must not claim it was dropped.

@@ -56,8 +56,8 @@ pub(crate) fn pin_aware_push<V>(
             if let Some(victim) = lru_unpinned {
                 guard.pop(&victim);
             } else {
-                let new_cap = NonZeroUsize::new(guard.len() + 1)
-                    .expect("len() + 1 is always non-zero");
+                let new_cap =
+                    NonZeroUsize::new(guard.len() + 1).expect("len() + 1 is always non-zero");
                 guard.resize(new_cap);
             }
         }

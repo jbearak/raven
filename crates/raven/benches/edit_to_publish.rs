@@ -194,14 +194,26 @@ fn bench_single_file(c: &mut Criterion) {
         BenchmarkId::new("linear_chain_15", "root"),
         &(&lc_state, &lc_root, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
     group.bench_with_input(
         BenchmarkId::new("linear_chain_15", "leaf"),
         &(&lc_state, &lc_leaf, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
 
@@ -216,14 +228,26 @@ fn bench_single_file(c: &mut Criterion) {
         BenchmarkId::new("fanout_30", "hub"),
         &(&fan_state, &fan_hub, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
     group.bench_with_input(
         BenchmarkId::new("fanout_30", "leaf"),
         &(&fan_state, &fan_leaf, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
 
@@ -239,21 +263,39 @@ fn bench_single_file(c: &mut Criterion) {
         BenchmarkId::new("mixed_20x5", "hub"),
         &(&mix_state, &mix_hub, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
     group.bench_with_input(
         BenchmarkId::new("mixed_20x5", "leaf"),
         &(&mix_state, &mix_leaf, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
     group.bench_with_input(
         BenchmarkId::new("mixed_20x5", "chain_tail"),
         &(&mix_state, &mix_chain_tail, &cancel),
         |b, &(state, uri, c)| {
-            b.iter(|| black_box(diagnostics_via_snapshot(black_box(state), black_box(uri), black_box(c))))
+            b.iter(|| {
+                black_box(diagnostics_via_snapshot(
+                    black_box(state),
+                    black_box(uri),
+                    black_box(c),
+                ))
+            })
         },
     );
 

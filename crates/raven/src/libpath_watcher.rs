@@ -113,10 +113,7 @@ impl LibpathSnapshot {
     ///   effective on-disk package differs even though the name persists.
     ///
     /// Consumers should treat all three as invalidation triggers.
-    pub(crate) fn diff(
-        &self,
-        other: &Self,
-    ) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    pub(crate) fn diff(&self, other: &Self) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
         let prev = self.winning_roots();
         let next = other.winning_roots();
         let mut added = HashSet::new();
@@ -270,15 +267,11 @@ mod snapshot_tests {
         let t_high = tempdir().unwrap();
         let t_low = tempdir().unwrap();
         make_pkg(t_low.path(), "foo");
-        let prev = LibpathSnapshot::capture(&[
-            t_high.path().to_path_buf(),
-            t_low.path().to_path_buf(),
-        ]);
+        let prev =
+            LibpathSnapshot::capture(&[t_high.path().to_path_buf(), t_low.path().to_path_buf()]);
         make_pkg(t_high.path(), "foo");
-        let next = LibpathSnapshot::capture(&[
-            t_high.path().to_path_buf(),
-            t_low.path().to_path_buf(),
-        ]);
+        let next =
+            LibpathSnapshot::capture(&[t_high.path().to_path_buf(), t_low.path().to_path_buf()]);
 
         let (added, removed, moved) = prev.diff(&next);
         assert!(added.is_empty(), "name is in union both times");
@@ -311,12 +304,7 @@ mod snapshot_tests {
             t.path().join("foo").join("help").join("aliases.rds"),
         ];
 
-        let touched = touched_from_events(
-            &event_paths,
-            &[t.path().to_path_buf()],
-            &prev,
-            &next,
-        );
+        let touched = touched_from_events(&event_paths, &[t.path().to_path_buf()], &prev, &next);
         assert_eq!(touched, ["foo".to_string()].into_iter().collect());
     }
 
@@ -331,15 +319,14 @@ mod snapshot_tests {
 
         let event_paths = vec![
             t.path().join("00LOCK-foo").join("DESCRIPTION"),
-            t.path().join("00LOCK-foo").join("foo").join("R").join("foo.R"),
+            t.path()
+                .join("00LOCK-foo")
+                .join("foo")
+                .join("R")
+                .join("foo.R"),
         ];
 
-        let touched = touched_from_events(
-            &event_paths,
-            &[t.path().to_path_buf()],
-            &snap,
-            &snap,
-        );
+        let touched = touched_from_events(&event_paths, &[t.path().to_path_buf()], &snap, &snap);
         assert!(touched.is_empty(), "expected no touched, got {:?}", touched);
     }
 }
@@ -431,8 +418,7 @@ pub fn spawn_watcher(
     // events queued between watcher.watch() and task startup are correctly
     // detected as deltas. block_in_place signals tokio that this thread is
     // about to block, allowing it to move other tasks off this worker.
-    let initial_snap =
-        tokio::task::block_in_place(|| LibpathSnapshot::capture(&attached));
+    let initial_snap = tokio::task::block_in_place(|| LibpathSnapshot::capture(&attached));
 
     let raw_rx = Arc::new(StdMutex::new(raw_rx));
     let task = tokio::spawn(async move {
@@ -574,12 +560,8 @@ mod watcher_tests {
         let t = tempdir().unwrap();
         let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
 
-        let _handle = spawn_watcher(
-            vec![t.path().to_path_buf()],
-            Duration::from_millis(300),
-            tx,
-        )
-        .expect("watcher attached");
+        let _handle = spawn_watcher(vec![t.path().to_path_buf()], Duration::from_millis(300), tx)
+            .expect("watcher attached");
 
         // Give the watcher a moment to register.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -616,12 +598,8 @@ mod watcher_tests {
         let t = tempdir().unwrap();
 
         let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
-        let _handle = spawn_watcher(
-            vec![t.path().to_path_buf()],
-            Duration::from_millis(300),
-            tx,
-        )
-        .expect("watcher attached");
+        let _handle = spawn_watcher(vec![t.path().to_path_buf()], Duration::from_millis(300), tx)
+            .expect("watcher attached");
 
         // Create the package and wait for the watcher to confirm it via an
         // `added` event. This is the readiness signal: once the debounce loop
@@ -645,11 +623,7 @@ mod watcher_tests {
             "Package: foo\nVersion: 2.0\n",
         )
         .unwrap();
-        std::fs::write(
-            t.path().join("foo").join("NAMESPACE"),
-            "export(new_fn)\n",
-        )
-        .unwrap();
+        std::fs::write(t.path().join("foo").join("NAMESPACE"), "export(new_fn)\n").unwrap();
 
         let evt = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -681,12 +655,8 @@ mod watcher_tests {
         make_pkg(t.path(), "foo");
 
         let (tx, mut rx) = mpsc::channel::<LibpathEvent>(16);
-        let _handle = spawn_watcher(
-            vec![t.path().to_path_buf()],
-            Duration::from_millis(300),
-            tx,
-        )
-        .expect("watcher attached");
+        let _handle = spawn_watcher(vec![t.path().to_path_buf()], Duration::from_millis(300), tx)
+            .expect("watcher attached");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 

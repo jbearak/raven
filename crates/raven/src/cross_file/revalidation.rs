@@ -496,16 +496,15 @@ where
 
     let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
     let mut result: Vec<Url> = Vec::new();
-    let push_if_new = |dep: Url,
-                       seen: &mut std::collections::HashSet<Url>,
-                       result: &mut Vec<Url>| {
-        if dep == *edited_uri || !is_open(&dep) {
-            return;
-        }
-        if seen.insert(dep.clone()) {
-            result.push(dep);
-        }
-    };
+    let push_if_new =
+        |dep: Url, seen: &mut std::collections::HashSet<Url>, result: &mut Vec<Url>| {
+            if dep == *edited_uri || !is_open(&dep) {
+                return;
+            }
+            if seen.insert(dep.clone()) {
+                result.push(dep);
+            }
+        };
 
     // (1) Backward ancestors of edited_uri.
     let backward = graph.get_transitive_dependents(edited_uri, max_depth, max_visited);
@@ -697,9 +696,7 @@ mod tests {
         // section). Behavioral assertion: after the bulk mark, each URI's
         // gate allows a same-version republish.
         let gate = CrossFileDiagnosticsGate::new();
-        let uris: Vec<Url> = (0..5)
-            .map(|i| test_uri(&format!("file_{i}.R")))
-            .collect();
+        let uris: Vec<Url> = (0..5).map(|i| test_uri(&format!("file_{i}.R"))).collect();
 
         for u in &uris {
             gate.record_publish(u, 1);
@@ -1524,8 +1521,15 @@ mod tests {
         open.insert(parent.clone());
         open.insert(child.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&parent, false, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            false,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert!(affected.is_empty());
     }
 
@@ -1547,8 +1551,15 @@ mod tests {
         open.insert(parent.clone());
         open.insert(child.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&child, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &child,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert_eq!(affected.len(), 1);
         assert!(affected.contains(&parent));
     }
@@ -1576,8 +1587,15 @@ mod tests {
         open.insert(parent.clone());
         open.insert(child.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert_eq!(affected.len(), 1);
         assert!(
             affected.contains(&child),
@@ -1612,8 +1630,15 @@ mod tests {
         open.insert(child.clone());
         open.insert(grandchild.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert!(affected.contains(&child));
         assert!(affected.contains(&grandchild));
         assert_eq!(affected.len(), 2);
@@ -1647,8 +1672,15 @@ mod tests {
         open.insert(parent.clone());
         open.insert(child.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert_eq!(affected, vec![child]);
     }
 
@@ -1670,8 +1702,15 @@ mod tests {
         open.insert(parent.clone());
         open.insert(child.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&parent, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert!(!affected.contains(&parent));
     }
 
@@ -1731,8 +1770,15 @@ mod tests {
         open.insert(child.clone());
         open.insert(grandchild.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&child, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &child,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert!(affected.contains(&parent), "parent must be revalidated");
         assert!(
             affected.contains(&grandchild),
@@ -1800,8 +1846,15 @@ mod tests {
         open.insert(child.clone());
         open.insert(auntie.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&child, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &child,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert!(affected.contains(&grandparent));
         assert!(affected.contains(&parent));
         assert!(
@@ -1866,8 +1919,15 @@ mod tests {
         open.insert(c.clone());
         open.insert(d.clone());
 
-        let affected =
-            compute_affected_dependents_after_edit(&a, true, false, &graph, |u| open.contains(u), 10, 200);
+        let affected = compute_affected_dependents_after_edit(
+            &a,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         let mut sorted = affected.clone();
         sorted.sort_by_key(|u| u.path().to_string());
         assert_eq!(sorted, vec![b, c, d], "diamond must yield deduped URIs");
@@ -1895,8 +1955,15 @@ mod tests {
 
         // child edited; only edges changed (e.g. it added a new source()
         // line), but its exported interface is unchanged.
-        let affected_from_child =
-            compute_affected_dependents_after_edit(&child, false, true, &graph, |u| open.contains(u), 10, 200);
+        let affected_from_child = compute_affected_dependents_after_edit(
+            &child,
+            false,
+            true,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert_eq!(affected_from_child.len(), 1);
         assert!(
             affected_from_child.contains(&parent),
@@ -1904,8 +1971,15 @@ mod tests {
         );
 
         // parent edited; only edges changed.
-        let affected_from_parent =
-            compute_affected_dependents_after_edit(&parent, false, true, &graph, |u| open.contains(u), 10, 200);
+        let affected_from_parent = compute_affected_dependents_after_edit(
+            &parent,
+            false,
+            true,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
         assert_eq!(affected_from_parent.len(), 1);
         assert!(
             affected_from_parent.contains(&child),

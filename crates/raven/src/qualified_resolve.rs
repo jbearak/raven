@@ -201,8 +201,7 @@ pub fn resolve_qualified_member(
                 op,
                 &mut cursor_candidates,
             );
-            cursor_candidates
-                .retain(|c| candidate_lhs_matches_symbol(state, c, lhs_name, symbol));
+            cursor_candidates.retain(|c| candidate_lhs_matches_symbol(state, c, lhs_name, symbol));
         }
     }
 
@@ -233,7 +232,11 @@ fn candidate_lhs_matches_symbol(
         c.lhs_pos.character,
         &DiagCancelToken::never(),
     );
-    scope.symbols.get(lhs_name).map(|s| s == symbol).unwrap_or(false)
+    scope
+        .symbols
+        .get(lhs_name)
+        .map(|s| s == symbol)
+        .unwrap_or(false)
 }
 
 fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
@@ -265,9 +268,8 @@ fn pick_winner(
     let (mut in_cursor_file, other): (Vec<_>, Vec<_>) =
         candidates.into_iter().partition(|c| &c.uri == cursor_uri);
     // Cursor file: filter to effect <= cursor (unit-consistent UTF-16 cmp).
-    in_cursor_file.retain(|c| {
-        (c.effect.line, c.effect.utf16_column) <= (cursor.line, cursor.character)
-    });
+    in_cursor_file
+        .retain(|c| (c.effect.line, c.effect.utf16_column) <= (cursor.line, cursor.character));
     if let Some(c) = in_cursor_file
         .into_iter()
         .max_by_key(|c| (c.effect.line, c.effect.utf16_column))
@@ -296,13 +298,19 @@ fn symbol_visible_from_position(
         line: defined_line,
         utf16_column: defined_column_utf16,
     };
-    let Some(line_text) = nth_line(text, defined_line as usize) else { return fallback };
+    let Some(line_text) = nth_line(text, defined_line as usize) else {
+        return fallback;
+    };
     let byte_col = utf16_column_to_byte_offset(line_text, defined_column_utf16);
     let line_byte_len = line_text.len();
     let start = tree_sitter::Point::new(defined_line as usize, byte_col);
     let end = tree_sitter::Point::new(defined_line as usize, (byte_col + 1).min(line_byte_len));
-    let Some(id_node) = tree.root_node().descendant_for_point_range(start, end) else { return fallback };
-    let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else { return fallback };
+    let Some(id_node) = tree.root_node().descendant_for_point_range(start, end) else {
+        return fallback;
+    };
+    let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else {
+        return fallback;
+    };
     EffectPos::from_node_end(assignment, text)
 }
 
@@ -355,7 +363,9 @@ fn collect_member_assignments(
         if node.kind() != "binary_operator" {
             continue;
         }
-        let Some(op_node) = node.child_by_field_name("operator") else { continue };
+        let Some(op_node) = node.child_by_field_name("operator") else {
+            continue;
+        };
         let op_text = node_text(op_node, text);
         let target = match op_text {
             "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
@@ -366,7 +376,9 @@ fn collect_member_assignments(
         if target.kind() != "extract_operator" {
             continue;
         }
-        let Some(target_op) = target.child_by_field_name("operator") else { continue };
+        let Some(target_op) = target.child_by_field_name("operator") else {
+            continue;
+        };
         let target_op_kind = match (target_op.kind(), op) {
             ("$", ExtractOp::Dollar) => true,
             ("@", ExtractOp::At) => true,
@@ -375,8 +387,12 @@ fn collect_member_assignments(
         if !target_op_kind {
             continue;
         }
-        let Some(t_lhs) = target.child_by_field_name("lhs") else { continue };
-        let Some(t_rhs) = target.child_by_field_name("rhs") else { continue };
+        let Some(t_lhs) = target.child_by_field_name("lhs") else {
+            continue;
+        };
+        let Some(t_rhs) = target.child_by_field_name("rhs") else {
+            continue;
+        };
         if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
             continue;
         }
@@ -449,7 +465,9 @@ fn collect_constructor_candidate(
         if child.kind() != "argument" {
             continue;
         }
-        let Some(name_node) = child.child_by_field_name("name") else { continue };
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
         if name_node.kind() != "identifier" {
             continue;
         }
@@ -546,7 +564,9 @@ mod tests {
 
     fn add_doc(state: &mut WorldState, uri: &str, text: &str) -> Url {
         let url = Url::parse(uri).expect("uri");
-        state.documents.insert(url.clone(), Document::new(text, None));
+        state
+            .documents
+            .insert(url.clone(), Document::new(text, None));
         url
     }
 
@@ -600,7 +620,10 @@ mod tests {
         let uri = add_doc(&mut state, "file:///t.R", code);
         let pos = Position::new(2, 8);
         let l = loc(goto_definition(&state, &uri, pos));
-        assert_eq!(l.range.start.line, 1, "expected member-assignment on line 1");
+        assert_eq!(
+            l.range.start.line, 1,
+            "expected member-assignment on line 1"
+        );
     }
 
     /// Cursor between literal and a later member-assignment → literal wins
@@ -969,8 +992,7 @@ g <- function() {
 print(foo$bar)
 ";
         let helpers_code = "foo <- list(bar = 1)\n";
-        let (main_uri, helpers_uri) =
-            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let (main_uri, helpers_uri) = setup_two_file_workspace(&mut state, main_code, helpers_code);
 
         // line 5 col 10 = `bar` in `print(foo$bar)`
         let pos = Position::new(5, 10);
@@ -998,8 +1020,7 @@ source(\"helpers.R\")
 print(foo$bar)
 ";
         let helpers_code = "foo <- list(bar = 1)\n";
-        let (main_uri, helpers_uri) =
-            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let (main_uri, helpers_uri) = setup_two_file_workspace(&mut state, main_code, helpers_code);
 
         // line 2 col 10 = `bar` in `print(foo$bar)`
         let pos = Position::new(2, 10);
@@ -1050,11 +1071,7 @@ use(foo$bar)
         let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
         let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
 
-        for (uri, code) in [
-            (&main_uri, main_code),
-            (&a_uri, a_code),
-            (&b_uri, b_code),
-        ] {
+        for (uri, code) in [(&main_uri, main_code), (&a_uri, a_code), (&b_uri, b_code)] {
             state.cross_file_graph.update_file(
                 uri,
                 &crate::cross_file::extract_metadata(code),
@@ -1151,4 +1168,3 @@ use(foo$inner)
         );
     }
 }
-

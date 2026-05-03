@@ -758,9 +758,10 @@ fn get_scope(
         content_provider.get_artifacts(target_uri)
     };
 
-    let get_metadata = |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-        content_provider.get_metadata(target_uri)
-    };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            content_provider.get_metadata(target_uri)
+        };
 
     let max_depth = state.cross_file_config.max_chain_depth;
 

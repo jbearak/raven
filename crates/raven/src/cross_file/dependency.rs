@@ -647,8 +647,7 @@ pub struct DependencyGraph {
     /// Cache of `detect_cycle` results keyed by `uri` (and gated by
     /// `edge_revision` per slot). Bounded LRU so long-lived sessions
     /// don't accumulate entries for files that never get queried again.
-    cycle_cache:
-        std::sync::RwLock<lru::LruCache<Url, (u64, Option<CycleDetection>)>>,
+    cycle_cache: std::sync::RwLock<lru::LruCache<Url, (u64, Option<CycleDetection>)>>,
     /// Counter of cache hits — exposed for tests; not used in production.
     cycle_cache_hits: std::sync::atomic::AtomicU64,
     /// Cache of `(neighborhood, extract_subgraph)` results keyed by
@@ -669,13 +668,15 @@ impl Default for DependencyGraph {
             forward: HashMap::new(),
             backward: HashMap::new(),
             edge_revision: std::sync::atomic::AtomicU64::new(0),
-            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
-                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
-            )),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                CYCLE_CACHE_CAPACITY,
+                CYCLE_CACHE_CAPACITY,
+            ))),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
-            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
-                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
-            )),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                SUBGRAPH_CACHE_CAPACITY,
+                SUBGRAPH_CACHE_CAPACITY,
+            ))),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -691,13 +692,15 @@ impl Clone for DependencyGraph {
             forward: self.forward.clone(),
             backward: self.backward.clone(),
             edge_revision: std::sync::atomic::AtomicU64::new(0),
-            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
-                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
-            )),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                CYCLE_CACHE_CAPACITY,
+                CYCLE_CACHE_CAPACITY,
+            ))),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
-            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
-                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
-            )),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                SUBGRAPH_CACHE_CAPACITY,
+                SUBGRAPH_CACHE_CAPACITY,
+            ))),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -710,7 +713,9 @@ impl std::fmt::Debug for DependencyGraph {
             .field("backward", &self.backward)
             .field(
                 "edge_revision",
-                &self.edge_revision.load(std::sync::atomic::Ordering::Relaxed),
+                &self
+                    .edge_revision
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
             .finish_non_exhaustive()
     }
@@ -1136,13 +1141,15 @@ impl DependencyGraph {
             forward,
             backward,
             edge_revision: std::sync::atomic::AtomicU64::new(0),
-            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(
-                super::cache::non_zero_or(CYCLE_CACHE_CAPACITY, CYCLE_CACHE_CAPACITY),
-            )),
+            cycle_cache: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                CYCLE_CACHE_CAPACITY,
+                CYCLE_CACHE_CAPACITY,
+            ))),
             cycle_cache_hits: std::sync::atomic::AtomicU64::new(0),
-            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(
-                super::cache::non_zero_or(SUBGRAPH_CACHE_CAPACITY, SUBGRAPH_CACHE_CAPACITY),
-            )),
+            subgraph_cache: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                SUBGRAPH_CACHE_CAPACITY,
+                SUBGRAPH_CACHE_CAPACITY,
+            ))),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1669,9 +1676,7 @@ impl DependencyGraph {
         let revision = self.edge_revision.load(Ordering::Acquire);
 
         if let Ok(guard) = self.subgraph_cache.read() {
-            if let Some((cached_rev, cached)) =
-                guard.peek(&(uri.clone(), max_depth, max_visited))
-            {
+            if let Some((cached_rev, cached)) = guard.peek(&(uri.clone(), max_depth, max_visited)) {
                 if *cached_rev == revision {
                     self.subgraph_cache_hits.fetch_add(1, Ordering::Relaxed);
                     return std::sync::Arc::clone(cached);
@@ -2055,7 +2060,10 @@ mod tests {
         // beyond max). With shortest-depth tracking, z must be in result
         // regardless of edge iteration order.
         let deps = graph.get_transitive_dependencies(&root, 5, 1000);
-        assert!(deps.contains(&z), "z must be reachable via the short path; deps={deps:?}");
+        assert!(
+            deps.contains(&z),
+            "z must be reachable via the short path; deps={deps:?}"
+        );
         assert!(deps.contains(&y), "y must be reachable; deps={deps:?}");
         assert!(deps.contains(&x), "x must be in deps; deps={deps:?}");
     }
@@ -2100,7 +2108,10 @@ mod tests {
         // max_depth = 2. Querying x's transitive dependents must yield
         // {mid (depth 1), short_anc (depth 1), root_anc (depth 2)}.
         let dependents = graph.get_transitive_dependents(&x, 2, 1000);
-        assert!(dependents.contains(&mid), "mid must be reachable; dependents={dependents:?}");
+        assert!(
+            dependents.contains(&mid),
+            "mid must be reachable; dependents={dependents:?}"
+        );
         assert!(
             dependents.contains(&short_anc),
             "short_anc must be reachable; dependents={dependents:?}"
@@ -2279,7 +2290,12 @@ mod tests {
 
         let meta_v1 = make_meta_with_source("child.R", 5);
         graph.update_file(&parent, &meta_v1, Some(&workspace_root()), |_| None);
-        graph.update_file(&child, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+        graph.update_file(
+            &child,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root()),
+            |_| None,
+        );
 
         let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
         let hits_before = graph.subgraph_cache_hits();
@@ -2310,8 +2326,18 @@ mod tests {
         let child = Url::parse("file:///project/child.R").unwrap();
 
         // Establish baseline (no backward directive).
-        graph.update_file(&parent, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
-        graph.update_file(&child, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+        graph.update_file(
+            &parent,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &child,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root()),
+            |_| None,
+        );
 
         let _ = graph.cached_neighborhood_subgraph(&parent, 10, 100);
         let _ = graph.detect_cycle(&parent);
@@ -2328,8 +2354,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result =
-            graph.update_file(&child, &child_meta_with_backward, Some(&workspace_root()), |_| None);
+        let result = graph.update_file(
+            &child,
+            &child_meta_with_backward,
+            Some(&workspace_root()),
+            |_| None,
+        );
         assert!(
             result.edges_changed,
             "adding @lsp-sourced-by must mark edges_changed"
@@ -2353,7 +2383,12 @@ mod tests {
         let b = url("b.R");
         let meta_a = make_meta_with_source("b.R", 1);
         graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
-        graph.update_file(&b, &CrossFileMetadata::default(), Some(&workspace_root()), |_| None);
+        graph.update_file(
+            &b,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root()),
+            |_| None,
+        );
 
         let _ = graph.cached_neighborhood_subgraph(&a, 10, 100);
         let _ = graph.detect_cycle(&a);
@@ -2468,7 +2503,10 @@ mod tests {
         // Mutate edges → cache invalidated for this URI.
         let meta_a_no_source = CrossFileMetadata::default();
         let result = graph.update_file(&a, &meta_a_no_source, Some(&workspace_root()), |_| None);
-        assert!(result.edges_changed, "removing source() must mark edges_changed");
+        assert!(
+            result.edges_changed,
+            "removing source() must mark edges_changed"
+        );
 
         let hits_before_third = graph.cycle_cache_hits();
         // Third call: edge revision bumped, cache invalidated → recomputes.

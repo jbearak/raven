@@ -317,16 +317,10 @@ pub(crate) fn parse_cross_file_config(
         {
             config.packages_missing_package_severity = parse_severity(sev);
         }
-        if let Some(v) = packages
-            .get("watchLibraryPaths")
-            .and_then(|v| v.as_bool())
-        {
+        if let Some(v) = packages.get("watchLibraryPaths").and_then(|v| v.as_bool()) {
             config.packages_watch_library_paths = v;
         }
-        if let Some(v) = packages
-            .get("watchDebounceMs")
-            .and_then(|v| v.as_u64())
-        {
+        if let Some(v) = packages.get("watchDebounceMs").and_then(|v| v.as_u64()) {
             config.packages_watch_debounce_ms = v.clamp(100, 5000);
         }
     }
@@ -984,12 +978,10 @@ impl LanguageServer for Backend {
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
                 ),
-                execute_command_provider: Some(
-                    tower_lsp::lsp_types::ExecuteCommandOptions {
-                        commands: vec![],
-                        ..Default::default()
-                    },
-                ),
+                execute_command_provider: Some(tower_lsp::lsp_types::ExecuteCommandOptions {
+                    commands: vec![],
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1116,8 +1108,7 @@ impl LanguageServer for Backend {
                         // swapped `state.package_library` with a fresh Arc. Re-read
                         // the live library so prefetch warms the right cache instead
                         // of an orphaned one.
-                        let (effective_pkg_lib, effective_packages_enabled) = if packages_enabled
-                        {
+                        let (effective_pkg_lib, effective_packages_enabled) = if packages_enabled {
                             (pkg_lib, true)
                         } else {
                             let state = state_clone.read().await;
@@ -1133,11 +1124,8 @@ impl LanguageServer for Backend {
                             (live, enabled)
                         };
                         if effective_packages_enabled {
-                            prefetch_packages_for_open_documents(
-                                &state_clone,
-                                &effective_pkg_lib,
-                            )
-                            .await;
+                            prefetch_packages_for_open_documents(&state_clone, &effective_pkg_lib)
+                                .await;
                         }
 
                         // Revalidate all open documents to pick up auto-detected backward edges
@@ -1279,8 +1267,7 @@ impl LanguageServer for Backend {
                 // fresh empty library whose `cached_count()` starts at 0.
                 // We compute the user-visible delta against the pre-rebuild
                 // count instead.
-                let before_count =
-                    self.state.read().await.package_library.cached_count().await;
+                let before_count = self.state.read().await.package_library.cached_count().await;
 
                 // Rebuild the PackageLibrary first — this re-runs `.libPaths()`
                 // so mid-session libpath changes (renv switched projects,
@@ -1288,9 +1275,8 @@ impl LanguageServer for Backend {
                 // up. `clear_cache` alone would leave the stale libpath
                 // snapshot in place and the refresh would re-populate with the
                 // same wrong paths.
-                let packages_enabled = {
-                    self.state.read().await.cross_file_config.packages_enabled
-                };
+                let packages_enabled =
+                    { self.state.read().await.cross_file_config.packages_enabled };
                 if packages_enabled {
                     let (new_lib, ready) = rebuild_package_library(&self.state).await;
                     let mut state = self.state.write().await;
@@ -1589,15 +1575,16 @@ impl LanguageServer for Backend {
             // need revalidation because their inherited scope is taken from
             // `uri`'s symbols at the source() call site.
             if interface_changed || result.edges_changed {
-                let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                    &uri,
-                    interface_changed,
-                    result.edges_changed,
-                    &state.cross_file_graph,
-                    |u| state.documents.contains_key(u),
-                    state.cross_file_config.max_chain_depth,
-                    state.cross_file_config.max_transitive_dependents_visited,
-                );
+                let neighbors =
+                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                        &uri,
+                        interface_changed,
+                        result.edges_changed,
+                        &state.cross_file_graph,
+                        |u| state.documents.contains_key(u),
+                        state.cross_file_config.max_chain_depth,
+                        state.cross_file_config.max_transitive_dependents_visited,
+                    );
                 for dep in neighbors {
                     affected.insert(dep);
                 }
@@ -1847,24 +1834,21 @@ impl LanguageServer for Backend {
                 // (their inherited scope is taken from this file's symbols at
                 // the source() call site).
                 if second_result.edges_changed {
-                    let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                        &uri,
-                        false,
-                        true,
-                        &state.cross_file_graph,
-                        |u| state.documents.contains_key(u),
-                        state.cross_file_config.max_chain_depth,
-                        state.cross_file_config.max_transitive_dependents_visited,
-                    );
+                    let neighbors =
+                        crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                            &uri,
+                            false,
+                            true,
+                            &state.cross_file_graph,
+                            |u| state.documents.contains_key(u),
+                            state.cross_file_config.max_chain_depth,
+                            state.cross_file_config.max_transitive_dependents_visited,
+                        );
                     // Re-enrichment changed work_items; force-republish marking
                     // is deferred until after both re-enrichment paths complete
                     // so evicted URIs don't carry orphaned force counters.
-                    work_items = rebuild_work_items_after_reenrichment(
-                        &uri,
-                        &work_items,
-                        neighbors,
-                        &state,
-                    );
+                    work_items =
+                        rebuild_work_items_after_reenrichment(&uri, &work_items, neighbors, &state);
                     // Re-enrichment moved edges; refresh pins so the open-doc
                     // neighborhood matches the post-update graph.
                     state.recompute_open_neighborhood_pins();
@@ -1958,24 +1942,21 @@ impl LanguageServer for Backend {
             );
 
             if second_result.edges_changed {
-                let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                    &uri,
-                    false,
-                    true,
-                    &state.cross_file_graph,
-                    |u| state.documents.contains_key(u),
-                    state.cross_file_config.max_chain_depth,
-                    state.cross_file_config.max_transitive_dependents_visited,
-                );
+                let neighbors =
+                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                        &uri,
+                        false,
+                        true,
+                        &state.cross_file_graph,
+                        |u| state.documents.contains_key(u),
+                        state.cross_file_config.max_chain_depth,
+                        state.cross_file_config.max_transitive_dependents_visited,
+                    );
                 // Re-enrichment changed work_items; force-republish marking
                 // is deferred until after both re-enrichment paths complete
                 // so evicted URIs don't carry orphaned force counters.
-                work_items = rebuild_work_items_after_reenrichment(
-                    &uri,
-                    &work_items,
-                    neighbors,
-                    &state,
-                );
+                work_items =
+                    rebuild_work_items_after_reenrichment(&uri, &work_items, neighbors, &state);
                 // Re-enrichment moved edges; refresh pins so the open-doc
                 // neighborhood matches the post-update graph.
                 state.recompute_open_neighborhood_pins();
@@ -1996,9 +1977,12 @@ impl LanguageServer for Backend {
                         .get(&uri)
                         .map(|d| d.text().lines().count().saturating_sub(1) as u32)
                         .unwrap_or(0);
-                    let snapshot =
-                        state.build_package_scope_snapshot(&[(uri.clone(), last_line)]);
-                    (snapshot, state.package_library.clone(), state.package_library_ready)
+                    let snapshot = state.build_package_scope_snapshot(&[(uri.clone(), last_line)]);
+                    (
+                        snapshot,
+                        state.package_library.clone(),
+                        state.package_library_ready,
+                    )
                 }; // read lock released
 
                 let empty_base_exports = std::collections::HashSet::new();
@@ -2056,7 +2040,7 @@ impl LanguageServer for Backend {
         {
             let state = self.state.read().await;
             state.diagnostics_gate.mark_force_republish_many(
-                work_items.iter().map(|(u, _, _)| u).filter(|u| **u != uri)
+                work_items.iter().map(|(u, _, _)| u).filter(|u| **u != uri),
             );
         }
 
@@ -2297,15 +2281,16 @@ impl LanguageServer for Backend {
             // Bulk-mark all dependents/children under a single write-lock to
             // skip per-URI lock churn on large fan-outs (Requirement 0.8).
             if interface_changed || edges_changed {
-                let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                    &uri,
-                    interface_changed,
-                    edges_changed,
-                    &state.cross_file_graph,
-                    |u| state.documents.contains_key(u),
-                    state.cross_file_config.max_chain_depth,
-                    state.cross_file_config.max_transitive_dependents_visited,
-                );
+                let neighbors =
+                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                        &uri,
+                        interface_changed,
+                        edges_changed,
+                        &state.cross_file_graph,
+                        |u| state.documents.contains_key(u),
+                        state.cross_file_config.max_chain_depth,
+                        state.cross_file_config.max_transitive_dependents_visited,
+                    );
                 for dep in neighbors {
                     affected.insert(dep);
                 }
@@ -2456,10 +2441,7 @@ impl LanguageServer for Backend {
                 if packages_vec.is_empty() {
                     return;
                 }
-                log::trace!(
-                    "Background prefetching {} packages",
-                    packages_vec.len()
-                );
+                log::trace!("Background prefetching {} packages", packages_vec.len());
                 pkg_lib.prefetch_packages(&packages_vec).await;
 
                 // After prefetch completes, trigger diagnostic revalidation
@@ -3186,12 +3168,8 @@ impl LanguageServer for Backend {
                         .mark_force_republish_many(affected_for_async.iter());
                 }
                 for uri in affected_for_async {
-                    Backend::publish_diagnostics_via_arc(
-                        state_arc.clone(),
-                        client.clone(),
-                        &uri,
-                    )
-                    .await;
+                    Backend::publish_diagnostics_via_arc(state_arc.clone(), client.clone(), &uri)
+                        .await;
                 }
             });
         } else {
@@ -4488,9 +4466,7 @@ pub(crate) struct ScopeProbeSnapshot {
 ///
 /// Split out of the consumer body to keep the state invariants unit-testable
 /// without needing a tower-lsp `Client`.
-pub(crate) async fn prepare_dropped_recovery(
-    state_arc: &Arc<RwLock<WorldState>>,
-) -> Vec<Url> {
+pub(crate) async fn prepare_dropped_recovery(state_arc: &Arc<RwLock<WorldState>>) -> Vec<Url> {
     let pkg_lib = { state_arc.read().await.package_library.clone() };
     pkg_lib.clear_cache().await;
 
@@ -4610,13 +4586,15 @@ async fn run_libpath_consumer(
                     state.build_package_scope_snapshot(&docs)
                 };
 
-                let get_artifacts = |target_uri: &Url| -> Option<
-                    Arc<crate::cross_file::scope::ScopeArtifacts>,
-                > { probe.artifacts_map.get(target_uri).cloned() };
-                let get_metadata =
-                    |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-                        probe.metadata_map.get(target_uri).cloned()
+                let get_artifacts =
+                    |target_uri: &Url| -> Option<Arc<crate::cross_file::scope::ScopeArtifacts>> {
+                        probe.artifacts_map.get(target_uri).cloned()
                     };
+                let get_metadata = |target_uri: &Url| -> Option<
+                    std::sync::Arc<crate::cross_file::CrossFileMetadata>,
+                > {
+                    probe.metadata_map.get(target_uri).cloned()
+                };
                 let empty_base_exports: HashSet<String> = HashSet::new();
                 let affected_uris: Vec<Url> = probe
                     .docs
@@ -4851,8 +4829,7 @@ mod tests {
             let mut activity = CrossFileActivityState::new();
             activity.update(Some(active_post_update.clone()), vec![], 1);
 
-            let prev_uris: HashSet<Url> =
-                [stale_a.clone(), stale_b.clone()].into_iter().collect();
+            let prev_uris: HashSet<Url> = [stale_a.clone(), stale_b.clone()].into_iter().collect();
             let new_neighbors = vec![active_post_update.clone()];
 
             let final_uris = merge_and_cap_reenrichment_revalidations(
@@ -4889,13 +4866,8 @@ mod tests {
 
             let prev_uris: HashSet<Url> = [edited.clone(), active.clone()].into_iter().collect();
 
-            let final_uris = merge_and_cap_reenrichment_revalidations(
-                &edited,
-                prev_uris,
-                vec![],
-                10,
-                &activity,
-            );
+            let final_uris =
+                merge_and_cap_reenrichment_revalidations(&edited, prev_uris, vec![], 10, &activity);
 
             assert_eq!(final_uris[0], edited);
             assert_eq!(final_uris[1], active);
@@ -5139,7 +5111,9 @@ mod tests {
                     "watchDebounceMs": 250
                 }
             });
-            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            let cfg = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
             assert!(!cfg.packages_watch_library_paths);
             assert_eq!(cfg.packages_watch_debounce_ms, 250);
         }
@@ -5149,13 +5123,17 @@ mod tests {
             let settings = json!({
                 "packages": { "watchDebounceMs": 50 }  // below floor
             });
-            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            let cfg = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
             assert_eq!(cfg.packages_watch_debounce_ms, 100);
 
             let settings = json!({
                 "packages": { "watchDebounceMs": 99999 } // above ceiling
             });
-            let cfg = crate::backend::parse_cross_file_config(&settings).unwrap().unwrap();
+            let cfg = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
             assert_eq!(cfg.packages_watch_debounce_ms, 5000);
         }
     }
@@ -5940,10 +5918,8 @@ mod refresh_packages_tests {
 
         {
             let mut s = state.write().await;
-            s.cross_file_config.packages_additional_library_paths = vec![
-                t_old.path().to_path_buf(),
-                t_new.path().to_path_buf(),
-            ];
+            s.cross_file_config.packages_additional_library_paths =
+                vec![t_old.path().to_path_buf(), t_new.path().to_path_buf()];
         }
         let (lib_v2, _ready_v2) = rebuild_package_library(&state).await;
         assert!(
@@ -6104,14 +6080,12 @@ mod refresh_packages_tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         let parent_tree = parser.parse(parent_code, None).unwrap();
-        let parent_artifacts = Arc::new(
-            crate::cross_file::scope::compute_artifacts_with_metadata(
-                &parent_uri,
-                &parent_tree,
-                parent_code,
-                Some(&parent_meta),
-            ),
-        );
+        let parent_artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            parent_code,
+            Some(&parent_meta),
+        ));
         let parent_entry = IndexEntry {
             contents: ropey::Rope::from_str(parent_code),
             tree: Some(parent_tree),
@@ -6131,18 +6105,14 @@ mod refresh_packages_tests {
 
         // Child is an OPEN document that sources the parent
         let child_meta = crate::cross_file::extract_metadata(child_code);
-        world.documents.insert(
-            child_uri.clone(),
-            Document::new(child_code, Some(1)),
-        );
+        world
+            .documents
+            .insert(child_uri.clone(), Document::new(child_code, Some(1)));
 
         // Add forward edge: child -> parent
-        world.cross_file_graph.update_file(
-            &child_uri,
-            &child_meta,
-            Some(&workspace_root),
-            |_| None,
-        );
+        world
+            .cross_file_graph
+            .update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
 
         // Build snapshot for the child only
         let docs = vec![(child_uri.clone(), 1u32)];
@@ -6167,12 +6137,20 @@ mod refresh_packages_tests {
 
         // Debug: check child artifacts have source() in timeline
         let child_arts = snapshot.artifacts_map.get(&child_uri);
-        assert!(child_arts.is_some(), "child must have artifacts in snapshot");
+        assert!(
+            child_arts.is_some(),
+            "child must have artifacts in snapshot"
+        );
         let child_arts = child_arts.unwrap();
-        let has_source_event = child_arts.timeline.iter().any(|e| {
-            matches!(e, crate::cross_file::scope::ScopeEvent::Source { .. })
-        });
-        assert!(has_source_event, "child artifacts must have Source event in timeline; timeline has {} events", child_arts.timeline.len());
+        let has_source_event = child_arts
+            .timeline
+            .iter()
+            .any(|e| matches!(e, crate::cross_file::scope::ScopeEvent::Source { .. }));
+        assert!(
+            has_source_event,
+            "child artifacts must have Source event in timeline; timeline has {} events",
+            child_arts.timeline.len()
+        );
 
         // Debug: check graph has forward edge from child to parent
         let child_deps = snapshot.graph.get_dependencies(&child_uri);
@@ -6190,9 +6168,10 @@ mod refresh_packages_tests {
         // Debug: check parent artifacts have PackageLoad event
         let parent_arts = snapshot.artifacts_map.get(&parent_uri).unwrap();
         assert!(
-            parent_arts.timeline.iter().any(|e| {
-                matches!(e, crate::cross_file::scope::ScopeEvent::PackageLoad { .. })
-            }),
+            parent_arts
+                .timeline
+                .iter()
+                .any(|e| { matches!(e, crate::cross_file::scope::ScopeEvent::PackageLoad { .. }) }),
             "parent must have PackageLoad event"
         );
         let scope = crate::cross_file::scope::scope_at_position_with_graph(
@@ -6422,14 +6401,12 @@ mod refresh_packages_tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         let parent_tree = parser.parse(parent_code, None).unwrap();
-        let parent_artifacts = Arc::new(
-            crate::cross_file::scope::compute_artifacts_with_metadata(
-                &parent_uri,
-                &parent_tree,
-                parent_code,
-                Some(&parent_meta),
-            ),
-        );
+        let parent_artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            parent_code,
+            Some(&parent_meta),
+        ));
         let parent_entry = IndexEntry {
             contents: ropey::Rope::from_str(parent_code),
             tree: Some(parent_tree),
