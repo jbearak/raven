@@ -10826,13 +10826,7 @@ pub fn goto_definition(
 
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: symbol.source_uri.clone(),
-            range: Range {
-                start: Position::new(symbol.defined_line, symbol.defined_column),
-                end: Position::new(
-                    symbol.defined_line,
-                    symbol.defined_column + name.chars().map(|c| c.len_utf16() as u32).sum::<u32>(),
-                ),
-            },
+            range: scoped_symbol_range(symbol, name),
         }));
     }
 
@@ -10849,13 +10843,7 @@ pub fn goto_definition(
                 }
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: symbol.source_uri.clone(),
-                    range: Range {
-                        start: Position::new(symbol.defined_line, symbol.defined_column),
-                        end: Position::new(
-                            symbol.defined_line,
-                            symbol.defined_column + name.len() as u32,
-                        ),
-                    },
+                    range: scoped_symbol_range(symbol, name),
                 }));
             }
         }
@@ -10874,13 +10862,7 @@ pub fn goto_definition(
                 }
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: symbol.source_uri.clone(),
-                    range: Range {
-                        start: Position::new(symbol.defined_line, symbol.defined_column),
-                        end: Position::new(
-                            symbol.defined_line,
-                            symbol.defined_column + name.len() as u32,
-                        ),
-                    },
+                    range: scoped_symbol_range(symbol, name),
                 }));
             }
         }
@@ -10951,6 +10933,13 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
     }
 
     None
+}
+
+fn scoped_symbol_range(symbol: &ScopedSymbol, name: &str) -> Range {
+    Range {
+        start: Position::new(symbol.defined_line, symbol.defined_column),
+        end: Position::new(symbol.defined_line, symbol.defined_column + utf16_len(name)),
+    }
 }
 
 // ============================================================================
@@ -40312,6 +40301,31 @@ mod issue_149_utf16_handlers {
             "`abc` starts at UTF-16 col 6, not byte col 8"
         );
         assert_eq!(location.range.end, Position::new(0, 9));
+    }
+
+    #[tokio::test]
+    async fn goto_definition_artifact_fallback_reports_utf16_identifier_length() {
+        let mut state = create_state();
+        let use_uri = add_doc(&mut state, "file:///use.R", "éclair\n");
+        let def_uri = Url::parse("file:///def.R").unwrap();
+        state
+            .document_store
+            .open(def_uri.clone(), "éclair <- 1\n", 1)
+            .await;
+
+        let result = goto_definition(&state, &use_uri, Position::new(0, 1));
+
+        let location = match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar response, got {:?}", other),
+        };
+        assert_eq!(location.uri, def_uri);
+        assert_eq!(location.range.start, Position::new(0, 0));
+        assert_eq!(
+            location.range.end,
+            Position::new(0, 6),
+            "`éclair` is 6 UTF-16 code units but 7 UTF-8 bytes"
+        );
     }
 
     #[test]
