@@ -11,3 +11,16 @@ pub fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
     }
     line.len()
 }
+
+/// Convert a byte offset (e.g. tree-sitter `Point.column`) to a UTF-16 column
+/// offset within the given line, suitable for an LSP `Position.character`.
+pub fn byte_offset_to_utf16_column(line: &str, byte_offset: usize) -> u32 {
+    let mut utf16_count: u32 = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if byte_idx >= byte_offset {
+            return utf16_count;
+        }
+        utf16_count += ch.len_utf16() as u32;
+    }
+    utf16_count
+}

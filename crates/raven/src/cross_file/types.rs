@@ -172,11 +172,12 @@ pub enum CallSiteSpec {
 }
 
 /// Convert a byte offset to UTF-16 column for a given line.
-/// Handles multi-byte UTF-8 characters correctly for LSP position conversion.
-pub fn byte_offset_to_utf16_column(line_text: &str, byte_offset_in_line: usize) -> u32 {
-    let prefix = &line_text[..byte_offset_in_line.min(line_text.len())];
-    prefix.encode_utf16().count() as u32
-}
+///
+/// Re-export of [`crate::utf16::byte_offset_to_utf16_column`] for backward
+/// compatibility with existing imports under `crate::cross_file::types`.
+/// Keep one implementation so the two callers cannot drift on edge cases
+/// (non-boundary byte offsets, surrogate pairs, etc.).
+pub use crate::utf16::byte_offset_to_utf16_column;
 
 /// Convert a tree-sitter Point to LSP Position with correct UTF-16 column.
 /// Ensures proper handling of multi-byte characters in LSP protocol communication.
