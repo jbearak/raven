@@ -8498,6 +8498,17 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
     CompletionResponse::Array(items)
 }
 
+/// Convert an LSP `Position` (UTF-16 column) into a tree-sitter `Point`
+/// (byte column) by indexing into the file's text. Necessary because
+/// `Position.character` and `Point.column` use different units, so passing
+/// the LSP column as-is misplaces the cursor on lines containing multi-byte
+/// UTF-8 characters before the cursor.
+fn lsp_position_to_ts_point(text: &str, position: Position) -> Point {
+    let line_text = text.lines().nth(position.line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
+    Point::new(position.line as usize, byte_col)
+}
+
 pub fn completion(
     state: &WorldState,
     uri: &Url,
@@ -8558,7 +8569,7 @@ pub fn completion(
         return Some(CompletionResponse::Array(items));
     }
 
-    let point = Point::new(position.line as usize, position.character as usize);
+    let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
     let mut items = Vec::new();
@@ -10429,7 +10440,7 @@ pub fn prepare_signature_help(
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
-    let point = Point::new(position.line as usize, position.character as usize);
+    let point = lsp_position_to_ts_point(&text, position);
 
     // Find enclosing call
     let mut node = tree.root_node().descendant_for_point_range(point, point)?;
@@ -10714,7 +10725,7 @@ pub fn goto_definition(
     }
 
     // Continue with normal identifier-based go-to-definition
-    let point = Point::new(position.line as usize, position.character as usize);
+    let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
     if node.kind() != "identifier" {
@@ -11113,7 +11124,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
     let tree = doc.tree.as_ref()?;
 
-    let point = Point::new(position.line as usize, position.character as usize);
+    let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
     if node.kind() != "identifier" {
@@ -40215,5 +40226,142 @@ generated quantities {
         // function body is found). This tests actual behavior.
         let syms = BlockDetector::detect_jags("model <- function() { }");
         assert_eq!(syms.len(), 1);
+    }
+}
+
+/// Regression tests for issue #149: LSP request handlers passed
+/// `position.character` (UTF-16 column) directly as the byte column to
+/// `tree_sitter::Point::new`. On lines containing a multi-byte UTF-8
+/// character before the cursor, that misplaces the cursor and tree-sitter
+/// descends into the wrong AST node. Each test puts a non-BMP character
+/// (`🦀`, 4 bytes / 2 UTF-16 units) on the cursor line before the cursor.
+#[cfg(test)]
+mod issue_149_utf16_handlers {
+    use super::{
+        completion, goto_definition, lsp_position_to_ts_point, prepare_signature_help, references,
+    };
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{CompletionResponse, GotoDefinitionResponse, Position, Url};
+    use tree_sitter::Point;
+
+    fn create_state() -> WorldState {
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state
+    }
+
+    fn add_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        state
+            .documents
+            .insert(uri.clone(), Document::new(content, None));
+        uri
+    }
+
+    #[test]
+    fn helper_converts_utf16_position_to_byte_point() {
+        // Line: `"🦀"; abc`. UTF-16 col of `a` = 6, byte col = 8.
+        let text = "abc <- 1\n\"🦀\"; abc\n";
+        let point = lsp_position_to_ts_point(text, Position::new(1, 6));
+        assert_eq!(point, Point::new(1, 8));
+    }
+
+    #[test]
+    fn helper_pure_ascii_passes_through() {
+        // Pure ASCII: UTF-16 column equals byte column, so the helper is
+        // identity on the column.
+        let text = "abc <- 1\nuse(abc)\n";
+        let point = lsp_position_to_ts_point(text, Position::new(1, 4));
+        assert_eq!(point, Point::new(1, 4));
+    }
+
+    #[test]
+    fn goto_definition_with_non_bmp_before_cursor_on_cursor_line() {
+        let mut state = create_state();
+        // Line 1 cursor line has `🦀` (2 UTF-16 units / 4 bytes) before `abc`.
+        // UTF-16 col of `a` of `abc` on line 1 = 6, byte col = 8.
+        let code = "abc <- 1\n\"🦀\"; abc\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        let result = goto_definition(&state, &uri, Position::new(1, 6));
+
+        let location = match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar response, got {:?}", other),
+        };
+        assert_eq!(location.uri, uri);
+        assert_eq!(
+            location.range.start.line, 0,
+            "definition lives on line 0 (`abc <- 1`)"
+        );
+        assert_eq!(location.range.start.character, 0);
+    }
+
+    #[test]
+    fn references_with_non_bmp_before_cursor_on_cursor_line() {
+        let mut state = create_state();
+        let code = "abc <- 1\n\"🦀\"; abc\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        // UTF-16 col 6 on line 1 = `a` of `abc`. With the bug, byte col 6
+        // lands on `;` (not an identifier) so the handler returns None.
+        let locations =
+            references(&state, &uri, Position::new(1, 6)).expect("expected Some(references)");
+
+        // Two occurrences: the LHS of `abc <- 1` on line 0 and the use on
+        // line 1. NB: the second reference's `character` field is currently
+        // reported as a byte column (8), not a UTF-16 column. That's a
+        // separate output-direction bug in `find_references_in_tree` and is
+        // out of scope for issue #149 (input-direction conversion). The
+        // important regression here is that the handler resolved the
+        // identifier at all.
+        let lines: Vec<u32> = locations.iter().map(|l| l.range.start.line).collect();
+        assert_eq!(lines, vec![0, 1], "expected references on lines 0 and 1");
+    }
+
+    #[tokio::test]
+    async fn signature_help_active_parameter_with_non_bmp_before_cursor() {
+        let mut state = create_state();
+        // Line 1: `"🦀"; add(1, 2)`.
+        // UTF-16 col 13 = `2` (the second arg). Byte col = 15.
+        // Comma is at byte col 13. With the bug, cursor.column = 13 is taken
+        // as a byte column; detect_active_parameter requires the comma's
+        // end (14) to be `<= cursor.column`, so 14 <= 13 is false and the
+        // comma is not counted, yielding active_parameter = 0.
+        let code = "add <- function(x, y) x + y\n\"🦀\"; add(1, 2)\n";
+        let uri = Url::parse("file:///t.R").unwrap();
+        state.open_document(uri.clone(), code, None);
+
+        let ctx =
+            prepare_signature_help(&state, &uri, Position::new(1, 13)).expect("ctx must be Some");
+        assert_eq!(ctx.active_parameter, Some(1));
+    }
+
+    #[test]
+    fn completion_outside_namespace_with_non_bmp_before_cursor() {
+        let mut state = create_state();
+        // Line 1: `"🦀"; pkg::foo + 1`.
+        // UTF-16 col 15 = `+` (logically OUTSIDE the namespace expression).
+        // Byte col = 17. With the bug, cursor.column = 15 is taken as byte,
+        // landing inside `foo`; tree-sitter descends into the
+        // `namespace_operator` parent and `find_namespace_context` returns
+        // `Some("pkg")`, causing completion to short-circuit with an empty
+        // list. With the fix, the cursor lands on `+` and completion
+        // produces the normal list including the local `my_local`.
+        let code = "my_local <- 1\n\"🦀\"; pkg::foo + 1\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        let response = completion(&state, &uri, Position::new(1, 15), None)
+            .expect("expected Some(completion response)");
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            other => panic!("expected Array response, got {:?}", other),
+        };
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"my_local"),
+            "expected `my_local` in completions; cursor on `+` is outside the namespace expression. got {:?}",
+            labels
+        );
     }
 }
