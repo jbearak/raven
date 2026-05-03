@@ -69,11 +69,13 @@ When the cursor is on the RHS identifier `bar` of an `extract_operator` node
    - If the cursor file has a visible candidate, the latest cursor-file
      candidate wins. This includes defining-file candidates when the cursor is
      in the file where `foo` is defined.
-   - Otherwise, `pick_winner` considers the non-cursor candidate set by
-     contributor-chain rank: prefer the earliest/closest contributor file, then
-     take that file's latest-effect candidate. This includes the defining-file
-     candidate when appropriate and deliberately avoids choosing a globally
-     latest non-cursor candidate from the whole connected component.
+   - Otherwise, `pick_winner` ranks non-cursor candidates by shortest
+     contributor-chain (forward-edge) distance from the cursor file. Within the
+     winning file, it takes that file's latest-effect candidate. Contributor-chain
+     rank and URI are used only to break equal-distance or unavailable-distance
+     ties. This includes the defining-file candidate when appropriate and
+     deliberately avoids choosing a globally latest non-cursor candidate from
+     the whole connected component.
    - This mirrors the existing resolver's local-position preference and aligns
      `pick_winner` with the cursor file / defining-file behavior pinned by the
      `a.R`/`b.R` regression tests.
@@ -222,11 +224,13 @@ Selection:
   `<= (cursor_line, cursor_col)`, then the latest cursor-file candidate wins.
   (Equality is fine: by construction every effect position lies on a
   syntactically-prior statement.)
-- If no cursor-file candidate qualifies, `pick_winner` prefers the
-  earliest/closest contributor file, then takes that file's latest-effect
-  candidate. This avoids comparing file-local effect positions across the
-  connected component and matches the defining-file / cursor file behavior
-  covered by the `a.R`/`b.R` regression tests.
+- If no cursor-file candidate qualifies, `pick_winner` prefers the candidate
+  file with the shortest contributor-chain (forward-edge) distance from the
+  cursor file, then takes that file's latest-effect candidate. Contributor-chain
+  rank and URI are only deterministic fallback tiebreakers. This avoids comparing
+  file-local effect positions across the connected component and matches the
+  defining-file / cursor file behavior covered by the `a.R`/`b.R` regression
+  tests.
 
 Returned `Location` is still the range of the `bar` *identifier token* (so the
 editor highlight lands on the name); only the *ranking* uses the effect
@@ -275,6 +279,10 @@ Required cases:
     unrelated function in an intermediate file does not match, and a
     matching-looking assignment in a document outside the cursor file's
     connected component does not match.
+15. Graph-distance tiebreak: if traversal reaches an indirect contributing file
+    before a directly sourced file, the directly sourced file wins even when the
+    indirect file appears earlier in the contributor chain or has a later local
+    line number.
 
 ## Risk & rollback
 
