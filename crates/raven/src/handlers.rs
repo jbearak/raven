@@ -11217,17 +11217,21 @@ fn find_references_in_tree(
     locations: &mut Vec<Location>,
 ) {
     if node.kind() == "identifier" && node_text(node, text) == name {
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+        let start_line = text.lines().nth(start_pos.row).unwrap_or("");
+        let end_line = if end_pos.row == start_pos.row {
+            start_line
+        } else {
+            text.lines().nth(end_pos.row).unwrap_or("")
+        };
+        let start_char = crate::utf16::byte_offset_to_utf16_column(start_line, start_pos.column);
+        let end_char = crate::utf16::byte_offset_to_utf16_column(end_line, end_pos.column);
         locations.push(Location {
             uri: uri.clone(),
             range: Range {
-                start: Position::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u32,
-                ),
-                end: Position::new(
-                    node.end_position().row as u32,
-                    node.end_position().column as u32,
-                ),
+                start: Position::new(start_pos.row as u32, start_char),
+                end: Position::new(end_pos.row as u32, end_char),
             },
         });
     }
@@ -40309,14 +40313,6 @@ mod issue_149_utf16_handlers {
         // lands on `;` (not an identifier) so the handler returns None.
         let locations =
             references(&state, &uri, Position::new(1, 6)).expect("expected Some(references)");
-
-        // Two occurrences: the LHS of `abc <- 1` on line 0 and the use on
-        // line 1. NB: the second reference's `character` field is currently
-        // reported as a byte column (8), not a UTF-16 column. That's a
-        // separate output-direction bug in `find_references_in_tree` and is
-        // out of scope for issue #149 (input-direction conversion). The
-        // important regression here is that the handler resolved the
-        // identifier at all.
         let lines: Vec<u32> = locations.iter().map(|l| l.range.start.line).collect();
         assert_eq!(lines, vec![0, 1], "expected references on lines 0 and 1");
     }
@@ -40365,6 +40361,38 @@ mod issue_149_utf16_handlers {
             "expected `my_local` in completions; cursor on `+` is outside the namespace expression. got {:?}",
             labels
         );
+    }
+
+    /// Output-direction sibling of the #149 bug: `find_references_in_tree`
+    /// reports tree-sitter byte columns directly as `Position.character`,
+    /// which is supposed to be a UTF-16 column. On lines with multi-byte
+    /// UTF-8 characters before the reference, the reported column is
+    /// off by the difference between byte and UTF-16 widths.
+    ///
+    /// Cursor here sits on the pure-ASCII LHS so no input-direction
+    /// conversion is needed — only the output direction is exercised.
+    #[test]
+    fn references_report_utf16_columns_on_non_bmp_line() {
+        let mut state = create_state();
+        let code = "abc <- 1\n\"🦀\"; abc\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        let locations =
+            references(&state, &uri, Position::new(0, 1)).expect("expected Some(references)");
+        let mut found: Vec<_> = locations
+            .iter()
+            .map(|l| {
+                (
+                    l.range.start.line,
+                    l.range.start.character,
+                    l.range.end.character,
+                )
+            })
+            .collect();
+        found.sort();
+        // `abc` on line 0 cols 0..3, and on line 1 cols 6..9 (UTF-16).
+        // With the bug, the line-1 entry is reported as 8..11 (bytes).
+        assert_eq!(found, vec![(0, 0, 3), (1, 6, 9)]);
     }
 
     /// Same input-direction bug pattern as the four sites in #149, but in
