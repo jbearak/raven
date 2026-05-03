@@ -25,8 +25,10 @@
 //!    `uri` equals the cursor's. The in-cursor-file partition is filtered
 //!    by `effect <= cursor`, then the candidate with the latest effect
 //!    wins. If no in-cursor-file candidate qualifies, the other-file
-//!    partition falls back to the earliest file in the cursor scope's
-//!    contributor chain, then chooses that file's latest-effect candidate.
+//!    partition first chooses the file with the shortest dependency-graph
+//!    distance from the cursor file, then chooses that file's latest-effect
+//!    candidate. Contributor-chain order and URI only break ties where graph
+//!    distance is equal or unavailable.
 //!
 //!    In the **same-file case** (cursor file = defining file), defining-file
 //!    candidates live in the cursor partition and are filtered by
@@ -34,7 +36,7 @@
 //!    be used as a fallback if no cursor-file candidate qualifies.
 //! 4. Never fall back to free-identifier lookup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
@@ -223,7 +225,19 @@ pub fn resolve_qualified_member(
 
     let mut all_candidates = defining_candidates;
     all_candidates.extend(cross_file_candidates);
-    pick_winner(all_candidates, &cursor_uri, position, &contributor_ranks).map(|c| Location {
+    let contributor_distances = contributor_file_distances(
+        &state.cross_file_graph,
+        &cursor_uri,
+        all_candidates.iter().map(|candidate| &candidate.uri),
+    );
+    pick_winner(
+        all_candidates,
+        &cursor_uri,
+        position,
+        &contributor_ranks,
+        &contributor_distances,
+    )
+    .map(|c| Location {
         uri: c.uri,
         range: c.name_range,
     })
@@ -235,6 +249,58 @@ fn contributor_file_ranks(chain: &[Url]) -> HashMap<Url, usize> {
         ranks.entry(uri.clone()).or_insert(idx);
     }
     ranks
+}
+/// Compute shortest undirected dependency-graph distances from the cursor file
+/// to candidate files. `scope.chain` remains the source of truth for which
+/// files are allowed to contribute; these distances only rank already-retained
+/// candidates so that file-local effect positions are never compared across
+/// files.
+fn contributor_file_distances<'a, I>(
+    graph: &crate::cross_file::dependency::DependencyGraph,
+    cursor_uri: &Url,
+    candidate_uris: I,
+) -> HashMap<Url, usize>
+where
+    I: IntoIterator<Item = &'a Url>,
+{
+    let mut remaining: HashSet<Url> = candidate_uris
+        .into_iter()
+        .filter(|uri| *uri != cursor_uri)
+        .cloned()
+        .collect();
+    let mut distances = HashMap::new();
+    if remaining.is_empty() {
+        return distances;
+    }
+
+    let mut visited: HashSet<Url> = HashSet::new();
+    let mut queue: VecDeque<(Url, usize)> = VecDeque::from([(cursor_uri.clone(), 0)]);
+
+    while let Some((uri, distance)) = queue.pop_front() {
+        if !visited.insert(uri.clone()) {
+            continue;
+        }
+
+        if remaining.remove(&uri) {
+            distances.insert(uri.clone(), distance);
+            if remaining.is_empty() {
+                break;
+            }
+        }
+
+        for edge in graph.get_dependencies(&uri) {
+            if !visited.contains(&edge.to) {
+                queue.push_back((edge.to.clone(), distance + 1));
+            }
+        }
+        for edge in graph.get_dependents(&uri) {
+            if !visited.contains(&edge.from) {
+                queue.push_back((edge.from.clone(), distance + 1));
+            }
+        }
+    }
+
+    distances
 }
 
 fn candidate_effect_visible_in_scope(
@@ -291,14 +357,17 @@ fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
 /// at-or-before the cursor (you can't "see" an assignment that hasn't
 /// happened yet) and pick the one with the latest effect position.
 ///
-/// If no cursor-file candidate qualifies, fall back to the earliest file in
-/// the cursor scope's contributor chain, then pick that file's latest effect
-/// position. Effect positions are only compared within a single file.
+/// If no cursor-file candidate qualifies, fall back to the nearest candidate
+/// file by dependency-graph distance from the cursor file, then pick that
+/// file's latest effect position. Contributor-chain rank and URI break
+/// equal-distance or unavailable-distance ties. Effect positions are only
+/// compared within a single file.
 fn pick_winner(
     candidates: Vec<Candidate>,
     cursor_uri: &Url,
     cursor: Position,
     contributor_ranks: &HashMap<Url, usize>,
+    contributor_distances: &HashMap<Url, usize>,
 ) -> Option<Candidate> {
     let (mut in_cursor_file, other): (Vec<_>, Vec<_>) =
         candidates.into_iter().partition(|c| &c.uri == cursor_uri);
@@ -329,17 +398,22 @@ fn pick_winner(
     best_per_file
         .into_values()
         .filter_map(|candidate| {
-            contributor_ranks
+            let rank = contributor_ranks.get(&candidate.uri).copied()?;
+            let distance = contributor_distances
                 .get(&candidate.uri)
                 .copied()
-                .map(|rank| (rank, candidate))
+                .unwrap_or(usize::MAX);
+            Some((distance, rank, candidate))
         })
-        .min_by(|(rank_a, candidate_a), (rank_b, candidate_b)| {
-            rank_a
-                .cmp(rank_b)
-                .then_with(|| candidate_a.uri.as_str().cmp(candidate_b.uri.as_str()))
-        })
-        .map(|(_, candidate)| candidate)
+        .min_by(
+            |(distance_a, rank_a, candidate_a), (distance_b, rank_b, candidate_b)| {
+                distance_a
+                    .cmp(distance_b)
+                    .then_with(|| rank_a.cmp(rank_b))
+                    .then_with(|| candidate_a.uri.as_str().cmp(candidate_b.uri.as_str()))
+            },
+        )
+        .map(|(_, _, candidate)| candidate)
 }
 
 /// Compute the resolved symbol's *visible-from* position: the end of its
@@ -1312,6 +1386,70 @@ foo$bar <- 1
         assert_ne!(
             l.uri, a_uri,
             "must not compare file-local line numbers across files"
+        );
+        assert_eq!(l.range.start.line, 1);
+        assert_eq!(l.range.start.character, 4);
+    }
+
+    /// Regression for issue #154: contributor-chain order can visit an
+    /// indirect branch before a directly sourced file. Non-cursor fallback
+    /// ranking must prefer the graph-closer file, not whichever contributor
+    /// appeared first and not whichever file has the later local line number.
+    #[test]
+    fn dollar_rhs_prefers_graph_closer_file_over_earlier_contributor_rank() {
+        let mut state = fresh_state();
+
+        let d_code = "\
+source(\"x.R\")
+source(\"b.R\")
+print(foo$bar)
+";
+        let x_code = "source(\"c.R\")\n";
+        let c_code = "\
+source(\"a.R\")
+
+
+
+
+foo$bar <- 2
+";
+        let b_code = "\
+source(\"a.R\")
+foo$bar <- 1
+";
+        let a_code = "foo <- list()\n";
+
+        let d_uri = add_doc(&mut state, "file:///workspace/d.R", d_code);
+        let x_uri = add_doc(&mut state, "file:///workspace/x.R", x_code);
+        let c_uri = add_doc(&mut state, "file:///workspace/c.R", c_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+
+        for (uri, code) in [
+            (&d_uri, d_code),
+            (&x_uri, x_code),
+            (&c_uri, c_code),
+            (&b_uri, b_code),
+            (&a_uri, a_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 2 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(2, 10);
+        let l = loc(goto_definition(&state, &d_uri, pos));
+        assert_eq!(
+            l.uri, b_uri,
+            "directly sourced b.R should beat indirectly reached c.R"
+        );
+        assert_ne!(
+            l.uri, c_uri,
+            "must not use contributor-chain rank or cross-file line numbers as the primary tiebreak",
         );
         assert_eq!(l.range.start.line, 1);
         assert_eq!(l.range.start.character, 4);
