@@ -180,6 +180,10 @@ pub fn resolve_qualified_member(
         defining_candidates.retain(|c| {
             c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
         });
+        defining_candidates.retain(|c| {
+            candidate_effect_visible_in_scope(c, &scope.visible_positions)
+                && candidate_lhs_matches_symbol(state, c, lhs_name, symbol)
+        });
     }
 
     // Phase 2: collect from every non-defining file that contributed to the
@@ -525,17 +529,18 @@ fn collect_constructor_candidate(
         if node_text(name_node, text) != rhs_name {
             continue;
         }
-        // Constructor candidates always live in the defining file. The
-        // `lhs_pos` field is unused for them (cross-file scope-check only
-        // applies to non-defining-file member-assignment candidates), so we
-        // anchor it at the constructor's named-arg position.
         let name_range = node_range_in_text(name_node, text);
+        let effect = EffectPos::from_node_end(assignment, text);
+        // Constructor candidates become visible only after the defining
+        // assignment completes, so use the effect position for the shared
+        // symbol identity check.
+        let lhs_pos = Position::new(effect.line, effect.utf16_column);
         return Some(Candidate {
             uri: file_uri.clone(),
-            effect: EffectPos::from_node_end(assignment, text),
+            effect,
             name_range,
             fn_scope: enclosing_function_id(assignment),
-            lhs_pos: name_range.start,
+            lhs_pos,
         });
     }
     None

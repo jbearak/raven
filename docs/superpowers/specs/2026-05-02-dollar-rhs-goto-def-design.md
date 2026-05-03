@@ -55,11 +55,12 @@ When the cursor is on the RHS identifier `bar` of an `extract_operator` node
 1. **Resolve `foo`** using the existing position-aware scope
    (`get_cross_file_scope`). If unresolved → return `None`.
 2. **Build a candidate set** of qualified definitions of `bar` against this
-   `foo`, drawn from `foo`'s defining file and from non-defining files in the
-   cursor file's cross-file connected component. Non-defining-file member
-   assignment sites are retained only when a per-site `get_cross_file_scope`
-   check resolves their LHS `foo` to the same `ScopedSymbol`. Two candidate
-   kinds:
+   `foo`, drawn from `foo`'s defining file and the resolved scope's contributor
+   chain, not every non-defining file in the cursor file's cross-file connected
+   component. Per-file `visible_positions` cutoffs are applied, and
+   non-defining-file member assignment sites are retained only when a per-site
+   `get_cross_file_scope` check resolves their LHS `foo` to the same
+   `ScopedSymbol`. The contributor-chain scan yields two candidate kinds:
    - **Member-assignment** — any `foo$bar <- …` (or `foo@bar <- …`) statement.
    - **Constructor-literal** — when `foo`'s defining assignment's RHS is a
      call to an allowlisted constructor, find the named argument whose name
@@ -68,10 +69,14 @@ When the cursor is on the RHS identifier `bar` of an `extract_operator` node
    - If the cursor file has a visible candidate, the latest cursor-file
      candidate wins. This includes defining-file candidates when the cursor is
      in the file where `foo` is defined.
-   - Otherwise, the latest candidate among `foo`'s defining file and the
-     cursor file's cross-file connected component wins.
-   - This mirrors the existing resolver's local-position preference while
-     keeping non-cursor cross-file ordering best-effort.
+   - Otherwise, `pick_winner` considers the non-cursor candidate set by
+     contributor-chain rank: prefer the earliest/closest contributor file, then
+     take that file's latest-effect candidate. This includes the defining-file
+     candidate when appropriate and deliberately avoids choosing a globally
+     latest non-cursor candidate from the whole connected component.
+   - This mirrors the existing resolver's local-position preference and aligns
+     `pick_winner` with the cursor file / defining-file behavior pinned by the
+     `a.R`/`b.R` regression tests.
 4. **No fallback to free-identifier lookup.** If no qualified candidate exists,
    return `None`. The whole point of this fix is that the RHS of `$`/`@` is not
    a reference to a free variable; reintroducing that lookup as a fallback would
@@ -183,12 +188,11 @@ Candidate search has two tiers:
   via `parameter_resolver::get_text_and_tree` (see "Where the defining file's
   AST comes from" above), since `ScopeArtifacts` does not carry it. These
   candidates use same-tree function-scope and effect-position checks.
-- **Connected-component member-assignments**: walk every non-defining file in
-  the cursor file's cross-file neighborhood (`DependencyGraph::collect_neighborhood`,
-  which follows both forward and backward edges). Each matching text site is
-  validated by re-resolving `foo` at the assignment's LHS position via
-  `get_cross_file_scope`; only sites where `foo` resolves to the exact same
-  `ScopedSymbol` are retained.
+- **Contributor-chain member-assignments**: walk every non-defining file in the
+  resolved scope's contributor chain. Each matching text site is filtered by
+  that file's `visible_positions` cutoff and validated by re-resolving `foo` at
+  the assignment's LHS position via `get_cross_file_scope`; only sites where
+  `foo` resolves to the exact same `ScopedSymbol` are retained.
 - **Constructor-literals**: only the single assignment that defined `foo`
   matters. We already have its line/column from the resolved symbol; re-fetch
   its RHS in the defining file's tree, then look for an `argument` node whose
@@ -218,10 +222,11 @@ Selection:
   `<= (cursor_line, cursor_col)`, then the latest cursor-file candidate wins.
   (Equality is fine: by construction every effect position lies on a
   syntactically-prior statement.)
-- If no cursor-file candidate qualifies, fall back to the latest effect
-  position among non-cursor candidates. Cross-file effect-position ordering is
-  only a best-effort tie-break; if this becomes observable, prefer candidates
-  whose file is closer to the cursor in the dependency graph.
+- If no cursor-file candidate qualifies, `pick_winner` prefers the
+  earliest/closest contributor file, then takes that file's latest-effect
+  candidate. This avoids comparing file-local effect positions across the
+  connected component and matches the defining-file / cursor file behavior
+  covered by the `a.R`/`b.R` regression tests.
 
 Returned `Location` is still the range of the `bar` *identifier token* (so the
 editor highlight lands on the name); only the *ranking* uses the effect
