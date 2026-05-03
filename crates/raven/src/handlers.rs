@@ -8161,6 +8161,9 @@ fn collect_jags_document_completions(
         for candidate in std::iter::once(code).chain(code.rsplit_once('{').map(|(_, tail)| tail)) {
             if let Some(captures) = symbol_re.captures(candidate) {
                 if let Some(name) = captures.get(1) {
+                    if is_r_only_jags_completion_name(name.as_str()) {
+                        break;
+                    }
                     push_local_symbol_completion(
                         items,
                         seen_names,
@@ -8432,6 +8435,15 @@ fn jags_completion(text: &str, uri: &Url) -> CompletionResponse {
     collect_jags_document_completions(text, uri, &mut items, &mut seen_names);
 
     CompletionResponse::Array(items)
+}
+
+fn is_r_only_jags_completion_name(name: &str) -> bool {
+    // These names are valid R keywords/constants or common R functions but
+    // are not JAGS built-ins. If malformed/random JAGS text contains lines
+    // like `NA<-`, do not promote those R-specific names into JAGS completion.
+    (crate::reserved_words::is_reserved_word(name)
+        && !crate::jags_builtins::JAGS_KEYWORDS.contains(&name))
+        || matches!(name, "library" | "require")
 }
 
 fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
@@ -39233,6 +39245,7 @@ mod file_type_tests {
         fn prop_jags_completions_include_local_symbols(
             varname in "[a-zA-Z][a-zA-Z0-9_]{0,10}"
         ) {
+            prop_assume!(!is_r_only_jags_completion_name(&varname));
             let content = format!("model {{ {} ~ dnorm(0, 1) }}\n", varname);
             let uri = Url::parse("file:///test/model.jags").unwrap();
             let mut state = crate::state::WorldState::new(vec![]);

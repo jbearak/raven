@@ -743,6 +743,10 @@ impl Default for ScopeArtifacts {
 pub struct ScopeAtPosition {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
     pub chain: Vec<Url>,
+    /// Widest query position from each contributing file that was visible when
+    /// this scope was computed. Forward-sourced files typically contribute at
+    /// EOF; backward-parent files contribute only up to their call site.
+    pub visible_positions: HashMap<Url, (u32, u32)>,
     /// URIs where max depth was exceeded, with the source call position (line, col)
     pub depth_exceeded: Vec<(Url, u32, u32)>,
     /// Packages inherited from parent files (loaded before the source() call site)
@@ -766,6 +770,30 @@ pub struct ScopeAtPosition {
     /// Origins are stored as `Arc<Url>` so cross-file propagation between
     /// scopes is a refcount bump rather than a Url-internals string clone.
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
+}
+
+fn record_visible_position(
+    visible_positions: &mut HashMap<Url, (u32, u32)>,
+    uri: &Url,
+    line: u32,
+    column: u32,
+) {
+    match visible_positions.entry(uri.clone()) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if (line, column) > *entry.get() {
+                entry.insert((line, column));
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert((line, column));
+        }
+    }
+}
+
+fn extend_visible_positions(dst: &mut HashMap<Url, (u32, u32)>, src: &HashMap<Url, (u32, u32)>) {
+    for (uri, &(line, column)) in src {
+        record_visible_position(dst, uri, line, column);
+    }
 }
 
 /// Record that `package` was loaded by `origin_uri`. Idempotent.
@@ -1868,6 +1896,7 @@ where
     }
     visited.insert(uri.clone());
     scope.chain.push(uri.clone());
+    record_visible_position(&mut scope.visible_positions, uri, line, column);
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
@@ -1958,6 +1987,10 @@ where
                             max_depth,
                             current_depth + 1,
                             visited,
+                        );
+                        extend_visible_positions(
+                            &mut scope.visible_positions,
+                            &child_scope.visible_positions,
                         );
                         // Merge child symbols (local definitions take precedence)
                         //
@@ -3039,6 +3072,7 @@ where
 pub(crate) struct ParentPrefix {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
     pub chain: Vec<Url>,
+    pub visible_positions: HashMap<Url, (u32, u32)>,
     pub depth_exceeded: Vec<(Url, u32, u32)>,
     // All parent-loaded packages flow into `inherited_packages` here —
     // `parent_prefix_at` never writes to `loaded_packages`. Both the
@@ -3272,6 +3306,10 @@ where
             }
         }
         prefix.chain.extend(parent_scope.chain);
+        extend_visible_positions(
+            &mut prefix.visible_positions,
+            &parent_scope.visible_positions,
+        );
         prefix.depth_exceeded.extend(parent_scope.depth_exceeded);
 
         // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
@@ -3464,6 +3502,7 @@ where
     if !is_revisit {
         scope.chain.push(uri.clone());
     }
+    record_visible_position(&mut scope.visible_positions, uri, line, column);
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
@@ -3503,6 +3542,7 @@ where
                         .or_insert_with(|| symbol.clone());
                 }
                 scope.chain.extend(prefix.chain.iter().cloned());
+                extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
                 scope
                     .depth_exceeded
                     .extend(prefix.depth_exceeded.iter().cloned());
@@ -3541,6 +3581,7 @@ where
                     scope.symbols.entry(name).or_insert(symbol);
                 }
                 scope.chain.extend(prefix.chain);
+                extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
                 scope.depth_exceeded.extend(prefix.depth_exceeded);
                 for pkg in prefix.inherited_packages {
                     scope.inherited_packages.insert(pkg);
@@ -3755,6 +3796,10 @@ where
                             is_cancelled,
                             None,
                         );
+                        extend_visible_positions(
+                            &mut scope.visible_positions,
+                            &child_scope.visible_positions,
+                        );
                         // Merge child symbols (local definitions take precedence)
                         //
                         // Filter out symbols whose `source_uri` is the current
@@ -3948,6 +3993,7 @@ pub(crate) struct ChildSourceContribution {
     pub packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
     pub chain: Vec<Url>,
+    pub visible_positions: HashMap<Url, (u32, u32)>,
     pub depth_exceeded: Vec<(Url, u32, u32)>,
 }
 
@@ -4432,9 +4478,17 @@ where
         let mut chain = Vec::with_capacity(1 + prefix.chain.len());
         chain.push(self.queried_uri.clone());
         chain.extend(prefix.chain.iter().cloned());
+        let mut visible_positions = prefix.visible_positions.clone();
+        record_visible_position(
+            &mut visible_positions,
+            self.queried_uri,
+            self.cursor.0,
+            self.cursor.1,
+        );
         let mut scope = ScopeAtPosition {
             symbols: prefix.symbols.clone(),
             chain,
+            visible_positions,
             depth_exceeded: prefix.depth_exceeded.clone(),
             inherited_packages: prefix.inherited_packages.clone(),
             // `ParentPrefix` no longer has a `loaded_packages` field —
@@ -4540,6 +4594,7 @@ where
             let effect_col = src_col.saturating_add(1);
             if (src_line, effect_col) <= self.cursor {
                 scope.chain.extend(contrib.chain.iter().cloned());
+                extend_visible_positions(&mut scope.visible_positions, &contrib.visible_positions);
                 scope
                     .depth_exceeded
                     .extend(contrib.depth_exceeded.iter().cloned());
@@ -4882,6 +4937,10 @@ where
             contrib.symbols.entry(name).or_insert(symbol);
         }
         contrib.chain.extend(child_scope.chain);
+        extend_visible_positions(
+            &mut contrib.visible_positions,
+            &child_scope.visible_positions,
+        );
         contrib.depth_exceeded.extend(child_scope.depth_exceeded);
 
         // Same-file leak filter for packages (mirrors `scope.rs:3632-3650`).

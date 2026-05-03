@@ -55,19 +55,28 @@ When the cursor is on the RHS identifier `bar` of an `extract_operator` node
 1. **Resolve `foo`** using the existing position-aware scope
    (`get_cross_file_scope`). If unresolved → return `None`.
 2. **Build a candidate set** of qualified definitions of `bar` against this
-   `foo`, drawn only from `foo`'s scope chain (the file where `foo` is defined,
-   plus whatever files that scope already pulls in via the cross-file scope
-   resolver). Two candidate kinds:
+   `foo`, drawn from `foo`'s defining file and the resolved scope's contributor
+   chain, not every non-defining file in the cursor file's cross-file connected
+   component. Per-file `visible_positions` cutoffs are applied, and
+   non-defining-file member assignment sites are retained only when a per-site
+   `get_cross_file_scope` check resolves their LHS `foo` to the same
+   `ScopedSymbol`. The contributor-chain scan yields two candidate kinds:
    - **Member-assignment** — any `foo$bar <- …` (or `foo@bar <- …`) statement.
    - **Constructor-literal** — when `foo`'s defining assignment's RHS is a
      call to an allowlisted constructor, find the named argument whose name
      is `bar`.
 3. **Pick a winner**: position-aware single result.
-   - If the cursor's file is the same as `foo`'s defining file: the latest
-     candidate whose effect position is `<=` the cursor.
-   - If different files: the latest candidate in `foo`'s defining file.
-   - This mirrors how the position-aware scope resolver decides among
-     redefinitions of plain identifiers.
+   - If the cursor file has a visible candidate, the latest cursor-file
+     candidate wins. This includes defining-file candidates when the cursor is
+     in the file where `foo` is defined.
+   - Otherwise, `pick_winner` considers the non-cursor candidate set by
+     contributor-chain rank: prefer the earliest/closest contributor file, then
+     take that file's latest-effect candidate. This includes the defining-file
+     candidate when appropriate and deliberately avoids choosing a globally
+     latest non-cursor candidate from the whole connected component.
+   - This mirrors the existing resolver's local-position preference and aligns
+     `pick_winner` with the cursor file / defining-file behavior pinned by the
+     `a.R`/`b.R` regression tests.
 4. **No fallback to free-identifier lookup.** If no qualified candidate exists,
    return `None`. The whole point of this fix is that the RHS of `$`/`@` is not
    a reference to a free variable; reintroducing that lookup as a fallback would
@@ -172,31 +181,27 @@ that.
 
 ## Cross-file behavior
 
-Per the design decision (option C from brainstorming), the candidate search
-runs in `foo`'s defining scope — not the cursor's file:
+Candidate search has two tiers:
 
-- **Member-assignments**: walk the AST of `foo`'s defining file and collect
-  `foo$bar <- …` (and `foo@bar <- …`) nodes. The tree is obtained via
-  `parameter_resolver::get_text_and_tree` (see "Where the defining file's AST
-  comes from" above), since `ScopeArtifacts` does not carry it.
+- **Defining-file member-assignments**: walk the AST of `foo`'s defining file
+  and collect `foo$bar <- …` (and `foo@bar <- …`) nodes. The tree is obtained
+  via `parameter_resolver::get_text_and_tree` (see "Where the defining file's
+  AST comes from" above), since `ScopeArtifacts` does not carry it. These
+  candidates use same-tree function-scope and effect-position checks.
+- **Contributor-chain member-assignments**: walk every non-defining file in the
+  resolved scope's contributor chain. Each matching text site is filtered by
+  that file's `visible_positions` cutoff and validated by re-resolving `foo` at
+  the assignment's LHS position via `get_cross_file_scope`; only sites where
+  `foo` resolves to the exact same `ScopedSymbol` are retained.
 - **Constructor-literals**: only the single assignment that defined `foo`
   matters. We already have its line/column from the resolved symbol; re-fetch
   its RHS in the defining file's tree, then look for an `argument` node whose
   `child_by_field_name("name")` matches `rhs_name`. This is the same field
   shape `is_structural_non_reference` already uses (`handlers.rs:5083-5089`).
 
-This avoids the false-positive risk where an unrelated `other_foo$bar <- …` in
-a random file would match.
-
-**Limitation acknowledged**: forward-source merging (where another file
-sourced *after* `foo`'s defining file mutates `foo`) is not searched in
-Step 1. The full scope-resolution machinery does merge parent and forward
-contributions (`cross_file/scope.rs` `parent_prefix_at` ~3053-3245, forward
-source merge ~3592-3773); applying that merge model to qualified-member
-candidates is in scope for a follow-up. For Step 1 we only walk the defining
-file's own AST. This is a deliberate trade-off: covers the common case at
-modest implementation cost, with no incorrect *positive* results — only
-missed targets.
+The per-site scope gate avoids the false-positive risk where a same-looking
+`foo$bar <- …` in a random file, or inside a function that shadows `foo`, would
+match the symbol the user navigated from.
 
 ## Position-aware tie-breaking
 
@@ -213,11 +218,15 @@ binding is not visible inside its own RHS.
 
 Selection:
 
-- Cursor in `foo`'s defining file → candidate with the latest effect position
-  that is `<= (cursor_line, cursor_col)`. (Equality is fine: by construction
-  every effect position lies on a syntactically-prior statement.)
-- Cursor in a different file → candidate with the latest effect position in
-  the defining file. Cursor-relative filtering does not apply across files.
+- Candidates in the cursor file are filtered to effect positions
+  `<= (cursor_line, cursor_col)`, then the latest cursor-file candidate wins.
+  (Equality is fine: by construction every effect position lies on a
+  syntactically-prior statement.)
+- If no cursor-file candidate qualifies, `pick_winner` prefers the
+  earliest/closest contributor file, then takes that file's latest-effect
+  candidate. This avoids comparing file-local effect positions across the
+  connected component and matches the defining-file / cursor file behavior
+  covered by the `a.R`/`b.R` regression tests.
 
 Returned `Location` is still the range of the `bar` *identifier token* (so the
 editor highlight lands on the name); only the *ranking* uses the effect
@@ -260,13 +269,20 @@ Required cases:
     with cursor on the *middle* `foo$bar` → jumps to the `bar = 1` literal,
     not the later `foo$bar <- 2` (which has an effect position after the
     cursor).
+13. Three-file chain: `c.R` sources `b.R`, `b.R` sources `a.R`, `a.R` defines
+    `foo`, and `b.R` attaches `foo$bar <- 1` → cursor in `c.R` jumps to `b.R`.
+14. Connected-component negatives: a shadowed `foo$bar <- 99` inside an
+    unrelated function in an intermediate file does not match, and a
+    matching-looking assignment in a document outside the cursor file's
+    connected component does not match.
 
 ## Risk & rollback
 
 - **Users who relied on the wrong jump** lose it. This is the exact bug the user
   reported; release-notes mention is sufficient.
-- **Same-named member in an unrelated `foo`** cannot leak in: candidates are
-  collected only from `foo`'s defining scope.
+- **Same-named member in an unrelated `foo`** cannot leak in: non-defining-file
+  candidates are validated against the exact `foo` binding the user navigated
+  from.
 - **Rollback**: revert the dispatcher branch in `goto_definition`. The new
   module becomes dead code with no external callers; safe to leave or delete.
 
