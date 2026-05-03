@@ -5,14 +5,26 @@
 //! For `foo$bar` (or `foo@bar`) where the cursor is on `bar`:
 //!
 //! 1. Resolve `foo` via the existing position-aware scope.
-//! 2. In `foo`'s defining file, collect candidates:
-//!    - `foo$bar <- ...` member-assignments (matching the operator).
-//!    - Named arguments inside `foo`'s defining call when the call is one of
-//!      a small allowlist of constructors.
-//! 3. Position-aware tie-break by *effect position* (end of the assignment
-//!    that introduces the candidate), not the identifier token position.
-//! 4. Return the candidate with the latest effect position; never fall back
-//!    to free-identifier lookup.
+//! 2. Collect candidates from two scopes:
+//!    - **Defining file**: `foo$bar <- ...` member-assignments and any
+//!      constructor-call named argument from the allowlist. Filtered by
+//!      same-function-scope and "effect position at or after the binding".
+//!    - **Cursor file** (when different from the defining file): each
+//!      `foo$bar <- ...` site is validated by re-resolving `foo` at that
+//!      site's position via cross-file scope; only sites where `foo`
+//!      resolves to the *same* binding are kept. This handles the very
+//!      common pattern of "skeleton object defined in helpers.R, members
+//!      attached in main.R".
+//! 3. Tie-break: cursor-file candidates win over defining-file candidates;
+//!    among cursor-file candidates, the one with the latest effect position
+//!    not after the cursor wins; among defining-file candidates, the one
+//!    with the latest effect position wins.
+//! 4. Never fall back to free-identifier lookup.
+//!
+//! Limitation (step 2): only the cursor file and the defining file are
+//! scanned. A `foo$bar <- ...` in some *third* file in the middle of a
+//! `source()` chain is not currently found. Extending to the cursor's
+//! cross-file connected component is a follow-up.
 
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
@@ -60,11 +72,22 @@ impl EffectPos {
 
 #[derive(Debug, Clone)]
 struct Candidate {
+    /// File the candidate lives in. For defining-file candidates this is
+    /// `defining_uri`; for cursor-file candidates this is the cursor's URI.
+    uri: Url,
     effect: EffectPos,
     name_range: Range,
     /// `None` for top-level, else the `function_definition` node id of the
-    /// closest enclosing function scope.
+    /// closest enclosing function scope. Tree-local — only meaningful when
+    /// comparing candidates collected from the *same* tree (i.e. defining
+    /// file vs the binding's `symbol_fn_scope`). For cursor-file candidates
+    /// this is recorded but unused (a per-site scope-resolve replaces the
+    /// `fn_scope` correctness gate across files).
     fn_scope: FunctionScopeId,
+    /// Position of the LHS identifier (`foo` in `foo$bar <- ...`). Used as
+    /// the query position when re-resolving `foo` for cursor-file
+    /// candidates; ignored for defining-file candidates.
+    lhs_pos: Position,
 }
 
 pub fn resolve_qualified_member(
@@ -97,88 +120,153 @@ pub fn resolve_qualified_member(
     }
 
     let defining_uri = symbol.source_uri.clone();
+    let cursor_uri = uri.clone();
 
-    // Get the defining file's tree + text via the same priority chain
-    // `parameter_resolver::get_text_and_tree` uses (covers open documents,
-    // workspace index, and the cross-file file cache).
-    let (defining_text, defining_tree) =
-        crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
+    // Phase 1: collect from the defining file. Tree-local correctness gates
+    // (`fn_scope`, `effect_at_or_after`) apply because all candidates and
+    // the resolved `foo` come from the same AST.
+    let mut defining_candidates: Vec<Candidate> = Vec::new();
+    {
+        let (defining_text, defining_tree) =
+            crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
+        let symbol_fn_scope = function_scope_at(
+            &defining_tree,
+            &defining_text,
+            symbol.defined_line,
+            symbol.defined_column,
+        );
+        // A symbol's *visible-from* position is the end of its defining
+        // assignment, not the position of the LHS identifier — so a member
+        // assignment that occurs inside the RHS of `foo <- {...}` was binding
+        // the *previous* `foo` and must not match the new one. Falls back to
+        // the LHS anchor for non-assignment-defined symbols (parameters,
+        // for-variables, declared symbols).
+        let symbol_effect = symbol_visible_from_position(
+            &defining_tree,
+            &defining_text,
+            symbol.defined_line,
+            symbol.defined_column,
+            lhs_name,
+        );
 
-    // Identify the function scope that owns the resolved `foo` binding. Only
-    // candidates in the same scope (i.e. would be reachable from the same
-    // `foo`) are kept.
-    let symbol_fn_scope = function_scope_at(
-        &defining_tree,
-        &defining_text,
-        symbol.defined_line,
-        symbol.defined_column,
-    );
-    // A symbol's *visible-from* position is the end of its defining
-    // assignment, not the position of the LHS identifier — so a member
-    // assignment that occurs inside the RHS of `foo <- {...}` was binding the
-    // *previous* `foo` and must not match the new one.
-    //
-    // Fall back to the LHS anchor for non-assignment-defined symbols
-    // (parameters, for-variables, declared symbols).
-    let symbol_effect = symbol_visible_from_position(
-        &defining_tree,
-        &defining_text,
-        symbol.defined_line,
-        symbol.defined_column,
-        lhs_name,
-    );
+        collect_member_assignments(
+            defining_tree.root_node(),
+            &defining_text,
+            &defining_uri,
+            lhs_name,
+            rhs_name,
+            op,
+            &mut defining_candidates,
+        );
+        if let Some(c) = collect_constructor_candidate(
+            &defining_tree,
+            &defining_text,
+            &defining_uri,
+            symbol.defined_line,
+            symbol.defined_column,
+            lhs_name,
+            rhs_name,
+        ) {
+            defining_candidates.push(c);
+        }
 
-    let mut candidates: Vec<Candidate> = Vec::new();
-    collect_member_assignments(
-        defining_tree.root_node(),
-        &defining_text,
-        lhs_name,
-        rhs_name,
-        op,
-        &mut candidates,
-    );
-    if let Some(c) = collect_constructor_candidate(
-        &defining_tree,
-        &defining_text,
-        symbol.defined_line,
-        symbol.defined_column,
-        lhs_name,
-        rhs_name,
-    ) {
-        candidates.push(c);
+        defining_candidates.retain(|c| {
+            c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
+        });
     }
 
-    // Filter candidates to those that belong to the resolved `foo`'s scope:
-    // - Same enclosing function (or both top-level).
-    // - Effect position not before the resolved binding's defined position
-    //   (a candidate before the binding cannot have applied to *this* `foo`).
-    candidates.retain(|c| {
-        c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
-    });
+    // Phase 2: collect from the cursor file (if distinct). Tree-local IDs
+    // are not comparable to those in the defining tree, so we replace the
+    // `fn_scope` gate with a per-site scope-resolve: at the LHS identifier's
+    // position, does `foo` resolve to the *same* binding we navigated from?
+    let mut cursor_candidates: Vec<Candidate> = Vec::new();
+    if cursor_uri != defining_uri {
+        if let Some((cursor_text, cursor_tree)) =
+            crate::parameter_resolver::get_text_and_tree(state, &cursor_uri)
+        {
+            collect_member_assignments(
+                cursor_tree.root_node(),
+                &cursor_text,
+                &cursor_uri,
+                lhs_name,
+                rhs_name,
+                op,
+                &mut cursor_candidates,
+            );
+            cursor_candidates
+                .retain(|c| candidate_lhs_matches_symbol(state, c, lhs_name, symbol));
+        }
+    }
 
-    pick_winner(candidates, uri == &defining_uri, position).map(|c| Location {
-        uri: defining_uri,
+    let mut all_candidates = defining_candidates;
+    all_candidates.extend(cursor_candidates);
+    pick_winner(all_candidates, &cursor_uri, position).map(|c| Location {
+        uri: c.uri,
         range: c.name_range,
     })
+}
+
+/// Re-resolve `lhs_name` at the candidate's LHS-identifier position via the
+/// position-aware cross-file scope, and check it points to the same binding
+/// as the one the user navigated from. This is the cross-file replacement
+/// for the same-tree `fn_scope` gate: it correctly excludes candidates inside
+/// unrelated function bodies (where `foo` shadows the imported one) and
+/// candidates appearing before the import is in scope.
+fn candidate_lhs_matches_symbol(
+    state: &WorldState,
+    c: &Candidate,
+    lhs_name: &str,
+    symbol: &crate::cross_file::scope::ScopedSymbol,
+) -> bool {
+    let scope = crate::handlers::get_cross_file_scope(
+        state,
+        &c.uri,
+        c.lhs_pos.line,
+        c.lhs_pos.character,
+        &DiagCancelToken::never(),
+    );
+    scope.symbols.get(lhs_name).map(|s| s == symbol).unwrap_or(false)
 }
 
 fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
     (a.line, a.utf16_column) >= (b.line, b.utf16_column)
 }
 
+/// Pick the best candidate.
+///
+/// Partitions by `uri`: candidates in the cursor's own file always beat
+/// candidates in any other file. When the user is in `main.R` and there's
+/// a `foo$bar <- ...` right above the cursor, that's almost always what
+/// they meant — even if `helpers.R` (where `foo` was defined) has its own
+/// `foo$bar <- ...` somewhere.
+///
+/// Among cursor-file candidates, filter to those whose effect position is
+/// at-or-before the cursor (you can't "see" an assignment that hasn't
+/// happened yet) and pick the one with the latest effect position.
+///
+/// If no cursor-file candidate qualifies, fall back to the
+/// non-cursor-file candidate with the latest effect position. (Effect
+/// positions across different non-cursor files are not directly
+/// comparable, but in practice all such candidates come from the same
+/// defining file, so the comparison is well-defined.)
 fn pick_winner(
-    mut candidates: Vec<Candidate>,
-    same_file: bool,
+    candidates: Vec<Candidate>,
+    cursor_uri: &Url,
     cursor: Position,
 ) -> Option<Candidate> {
-    if same_file {
-        // Both `cursor` and `effect` use UTF-16 columns, so this comparison
-        // is unit-consistent.
-        candidates.retain(|c| {
-            (c.effect.line, c.effect.utf16_column) <= (cursor.line, cursor.character)
-        });
+    let (mut in_cursor_file, other): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|c| &c.uri == cursor_uri);
+    // Cursor file: filter to effect <= cursor (unit-consistent UTF-16 cmp).
+    in_cursor_file.retain(|c| {
+        (c.effect.line, c.effect.utf16_column) <= (cursor.line, cursor.character)
+    });
+    if let Some(c) = in_cursor_file
+        .into_iter()
+        .max_by_key(|c| (c.effect.line, c.effect.utf16_column))
+    {
+        return Some(c);
     }
-    candidates
+    other
         .into_iter()
         .max_by_key(|c| (c.effect.line, c.effect.utf16_column))
 }
@@ -238,10 +326,13 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 }
 
 /// Walk `root` recursively, recording every `binary_operator` whose target
-/// is `extract_operator` matching `(lhs_name, op, rhs_name)`.
+/// is `extract_operator` matching `(lhs_name, op, rhs_name)`. Each candidate
+/// records the position of its LHS identifier (`foo` in `foo$bar <- ...`)
+/// for use as a query position when validating cross-file candidates.
 fn collect_member_assignments(
     root: Node,
     text: &str,
+    file_uri: &Url,
     lhs_name: &str,
     rhs_name: &str,
     op: ExtractOp,
@@ -284,10 +375,13 @@ fn collect_member_assignments(
         if node_text(t_lhs, text) != lhs_name || node_text(t_rhs, text) != rhs_name {
             continue;
         }
+        let lhs_range = node_range_in_text(t_lhs, text);
         out.push(Candidate {
+            uri: file_uri.clone(),
             effect: EffectPos::from_node_end(node, text),
             name_range: node_range_in_text(t_rhs, text),
             fn_scope: enclosing_function_id(node),
+            lhs_pos: lhs_range.start,
         });
     }
 }
@@ -297,14 +391,17 @@ fn collect_member_assignments(
 /// named argument matching `rhs_name`.
 ///
 /// We use the position only as a hint to find the *intended* defining
-/// assignment — descend to the smallest node containing `(defined_line,
-/// defined_col + 1)` (a 1-byte-wide range, since a zero-width range at the
-/// very start of the line does not reliably descend into a leaf), then
-/// ascend to the enclosing `binary_operator` whose target identifier matches
-/// `lhs_name`.
+/// assignment — convert `defined_column_utf16` to a byte offset and descend
+/// to the smallest node containing `(defined_line, byte_col .. byte_col+1)`
+/// (a 1-byte-wide range, since a zero-width range at the very start of the
+/// line does not reliably descend into a leaf), then ascend to the enclosing
+/// `binary_operator` whose target identifier matches `lhs_name`. R
+/// identifiers are ASCII (`[A-Za-z_.][A-Za-z0-9_.]*`) so a 1-byte step is
+/// always inside the identifier.
 fn collect_constructor_candidate(
     tree: &Tree,
     text: &str,
+    file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
     lhs_name: &str,
@@ -351,10 +448,17 @@ fn collect_constructor_candidate(
         if node_text(name_node, text) != rhs_name {
             continue;
         }
+        // Constructor candidates always live in the defining file. The
+        // `lhs_pos` field is unused for them (cross-file scope-check only
+        // applies to cursor-file member-assignment candidates), so we
+        // anchor it at the constructor's named-arg position.
+        let name_range = node_range_in_text(name_node, text);
         return Some(Candidate {
+            uri: file_uri.clone(),
             effect: EffectPos::from_node_end(assignment, text),
-            name_range: node_range_in_text(name_node, text),
+            name_range,
             fn_scope: enclosing_function_id(assignment),
+            lhs_pos: name_range.start,
         });
     }
     None
@@ -408,8 +512,16 @@ fn node_range_in_text(node: Node, text: &str) -> Range {
     }
 }
 
+/// Return the n-th line of `text`, with any trailing `\r` stripped.
+///
+/// Uses `lines()` (not `split('\n')`) so CRLF line endings produce the same
+/// `\r`-stripped slice that the rest of the codebase (e.g. `LineIndex`) sees.
+/// Tree-sitter byte columns are measured against the unstripped buffer, but
+/// any byte offset *before* the trailing `\r` is unaffected by the strip, so
+/// converting via `byte_offset_to_utf16_column` against the stripped slice is
+/// safe and consistent.
 fn nth_line(text: &str, n: usize) -> Option<&str> {
-    text.split('\n').nth(n)
+    text.lines().nth(n)
 }
 
 #[cfg(test)]
@@ -741,6 +853,171 @@ use(foo$bar)
         let uri = add_doc(&mut state, "file:///t.R", code);
         let pos = Position::new(1, 9);
         assert!(goto_definition(&state, &uri, pos).is_none());
+    }
+
+    /// Helper: wire up a two-file workspace with `source()` from `main.R` to
+    /// `helpers.R`, returning both URIs.
+    fn setup_two_file_workspace(
+        state: &mut WorldState,
+        main_code: &str,
+        helpers_code: &str,
+    ) -> (Url, Url) {
+        let main_uri = add_doc(state, "file:///workspace/main.R", main_code);
+        let helpers_uri = add_doc(state, "file:///workspace/helpers.R", helpers_code);
+        state.cross_file_graph.update_file(
+            &main_uri,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &helpers_uri,
+            &crate::cross_file::extract_metadata(helpers_code),
+            None,
+            |_| None,
+        );
+        (main_uri, helpers_uri)
+    }
+
+    /// The "skeleton-and-attach" pattern: `foo` is defined as an empty
+    /// `list()` in `helpers.R`, and a member is attached in `main.R`. Cmd-click
+    /// on `$bar` in `print(foo$bar)` (also in `main.R`) must resolve to the
+    /// `foo$bar <- 1` line in `main.R`, NOT return None.
+    #[test]
+    fn dollar_rhs_member_assignment_in_cursor_file_cross_file_foo() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+foo$bar <- 1
+print(foo$bar)
+";
+        let helpers_code = "foo <- list()\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        // line 2 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(2, 10);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        assert_eq!(l.uri, main_uri, "must resolve to the cursor's own file");
+        assert_eq!(l.range.start.line, 1, "expected `foo$bar <- 1` on line 1");
+        // `bar` in `foo$bar <- 1` is at col 4.
+        assert_eq!(l.range.start.character, 4);
+    }
+
+    /// Same as above but using `@`-slot assignment.
+    #[test]
+    fn at_rhs_member_assignment_in_cursor_file_cross_file_foo() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+foo@bar <- 1
+print(foo@bar)
+";
+        let helpers_code = "foo <- list()\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        let pos = Position::new(2, 10);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        assert_eq!(l.uri, main_uri);
+        assert_eq!(l.range.start.line, 1);
+    }
+
+    /// Cursor-file candidate beats defining-file candidate: prefer the local
+    /// member-assignment over a constructor literal in the imported file.
+    #[test]
+    fn cursor_file_member_assignment_beats_defining_file_constructor() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+foo$bar <- 99
+print(foo$bar)
+";
+        let helpers_code = "foo <- list(bar = 1)\n";
+        let (main_uri, _) = setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        let pos = Position::new(2, 10);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        assert_eq!(
+            l.uri, main_uri,
+            "cursor-file candidate should win over defining-file candidate"
+        );
+        assert_eq!(l.range.start.line, 1);
+    }
+
+    /// Negative: `foo$bar <- 99` inside an unrelated function in the cursor
+    /// file (where `foo` is shadowed by a local) must NOT match. The per-site
+    /// scope-resolve should reject it because `foo` there resolves to the
+    /// local, not the imported one.
+    #[test]
+    fn cursor_file_member_assignment_in_shadowing_function_does_not_match() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+g <- function() {
+  foo <- list()
+  foo$bar <- 99
+}
+print(foo$bar)
+";
+        let helpers_code = "foo <- list(bar = 1)\n";
+        let (main_uri, helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        // line 5 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(5, 10);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        // The cursor-file `foo$bar <- 99` lives inside g(), where `foo` is a
+        // local (different binding) — so it must NOT win. The defining-file
+        // constructor literal is the correct fallback.
+        assert_eq!(
+            l.uri, helpers_uri,
+            "must not jump to shadowed `foo$bar <- 99` inside g()"
+        );
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Negative: `foo$bar <- 99` in the cursor file appears *before* the
+    /// `source()` that brings `foo` into scope. The per-site scope-resolve at
+    /// the assignment site sees no `foo` (the import hasn't happened yet) and
+    /// must reject the candidate.
+    #[test]
+    fn cursor_file_member_assignment_before_source_does_not_match() {
+        let mut state = fresh_state();
+        let main_code = "\
+foo$bar <- 99
+source(\"helpers.R\")
+print(foo$bar)
+";
+        let helpers_code = "foo <- list(bar = 1)\n";
+        let (main_uri, helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        // line 2 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(2, 10);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        // Cursor-file candidate is rejected by per-site scope-check; defining
+        // file's constructor literal wins.
+        assert_eq!(l.uri, helpers_uri);
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// CRLF regression: with `\r\n` line endings, position columns must
+    /// remain correct (no off-by-one). The resolved range should match the
+    /// LF-equivalent test exactly.
+    #[test]
+    fn dollar_rhs_crlf_line_endings_preserve_columns() {
+        let mut state = fresh_state();
+        let code = "foo <- list(bar = 1)\r\nuse(foo$bar)\r\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // line 1 col 9 = `bar` in `foo$bar`
+        let pos = Position::new(1, 9);
+        let l = loc(goto_definition(&state, &uri, pos));
+        assert_eq!(l.range.start.line, 0);
+        assert_eq!(
+            l.range.start.character, 12,
+            "CRLF should not shift the resolved column"
+        );
     }
 }
 
