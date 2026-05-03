@@ -69,8 +69,8 @@ When the cursor is on the RHS identifier `bar` of an `extract_operator` node
    - If the cursor file has a visible candidate, the latest cursor-file
      candidate wins. This includes defining-file candidates when the cursor is
      in the file where `foo` is defined.
-   - Otherwise, `pick_winner` considers the non-cursor candidate set by shortest
-     undirected dependency-graph distance from the cursor file. Within the
+   - Otherwise, `pick_winner` ranks non-cursor candidates by shortest
+     contributor-chain (forward-edge) distance from the cursor file. Within the
      winning file, it takes that file's latest-effect candidate. Contributor-chain
      rank and URI are used only to break equal-distance or unavailable-distance
      ties. This includes the defining-file candidate when appropriate and
@@ -225,9 +225,9 @@ Selection:
   (Equality is fine: by construction every effect position lies on a
   syntactically-prior statement.)
 - If no cursor-file candidate qualifies, `pick_winner` prefers the candidate
-  file with the shortest undirected dependency-graph distance from the cursor
-  file, then takes that file's latest-effect candidate. Contributor-chain rank
-  and URI are only deterministic fallback tiebreakers. This avoids comparing
+  file with the shortest contributor-chain (forward-edge) distance from the
+  cursor file, then takes that file's latest-effect candidate. Contributor-chain
+  rank and URI are only deterministic fallback tiebreakers. This avoids comparing
   file-local effect positions across the connected component and matches the
   defining-file / cursor file behavior covered by the `a.R`/`b.R` regression
   tests.

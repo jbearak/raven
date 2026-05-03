@@ -252,17 +252,22 @@ fn contributor_file_ranks(chain: &[Url]) -> HashMap<Url, usize> {
     }
     ranks
 }
-/// Compute shortest undirected dependency-graph distances from the cursor file
-/// to candidate files, walking only through forward source edges that are visible in
-/// the cursor scope's contributor chain. `scope.chain` remains the source of
-/// truth for which files are allowed to contribute; `visible_positions`
-/// constrains which outgoing edges from those files were in effect at the
-/// positions that contributed. These distances only rank already-retained
-/// candidates so that file-local effect positions are never compared across
-/// files. Restricting intermediate nodes and edges, and never walking through
-/// dependents, prevents unrelated parents/aggregators from creating shortcut
-/// paths that do not correspond to files the cursor executes to build its
-/// contributing scope.
+/// Compute shortest directed contributor-chain distances from the cursor file
+/// to candidate files. The traversal follows only forward dependency edges
+/// (`edge.from -> edge.to`) that are both in the cursor scope's contributor
+/// chain and visible at the contributing position recorded in
+/// `visible_positions`.
+///
+/// `scope.chain` remains the source of truth for which files are allowed to
+/// contribute, so both intermediate nodes and traversed edges are restricted to
+/// files that can contribute to the cursor's resolved scope. The walk never
+/// enters dependents or aggregators and intentionally has no dependent-file
+/// shortcuts; otherwise an unrelated parent that sources both the cursor file
+/// and a candidate file could create a path that does not correspond to files
+/// the cursor executes to build its contributing scope.
+///
+/// These distances only rank already-retained candidates so that file-local
+/// effect positions are never compared across files.
 fn contributor_file_distances<'a, I>(
     graph: &crate::cross_file::dependency::DependencyGraph,
     cursor_uri: &Url,
