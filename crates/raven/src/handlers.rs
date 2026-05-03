@@ -11198,19 +11198,11 @@ fn find_references_in_tree(
     if node.kind() == "identifier" && node_text(node, text) == name {
         let start_pos = node.start_position();
         let end_pos = node.end_position();
-        let start_line = text.lines().nth(start_pos.row).unwrap_or("");
-        let end_line = if end_pos.row == start_pos.row {
-            start_line
-        } else {
-            text.lines().nth(end_pos.row).unwrap_or("")
-        };
-        let start_char = crate::utf16::byte_offset_to_utf16_column(start_line, start_pos.column);
-        let end_char = crate::utf16::byte_offset_to_utf16_column(end_line, end_pos.column);
         locations.push(Location {
             uri: uri.clone(),
             range: Range {
-                start: Position::new(start_pos.row as u32, start_char),
-                end: Position::new(end_pos.row as u32, end_char),
+                start: ts_point_to_lsp_position(text, start_pos),
+                end: ts_point_to_lsp_position(text, end_pos),
             },
         });
     }
