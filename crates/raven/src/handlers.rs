@@ -2801,7 +2801,7 @@ pub fn selection_range(
     let mut results = Vec::new();
     for pos in positions {
         let point = lsp_position_to_ts_point(&text, pos);
-        if let Some(range) = build_selection_range(tree.root_node(), point) {
+        if let Some(range) = build_selection_range(tree.root_node(), point, &text) {
             results.push(range);
         }
     }
@@ -2809,20 +2809,14 @@ pub fn selection_range(
     Some(results)
 }
 
-fn build_selection_range(root: Node, point: Point) -> Option<SelectionRange> {
+fn build_selection_range(root: Node, point: Point, text: &str) -> Option<SelectionRange> {
     let mut node = root.descendant_for_point_range(point, point)?;
     let mut ranges: Vec<Range> = Vec::new();
 
     loop {
         let range = Range {
-            start: Position::new(
-                node.start_position().row as u32,
-                node.start_position().column as u32,
-            ),
-            end: Position::new(
-                node.end_position().row as u32,
-                node.end_position().column as u32,
-            ),
+            start: ts_point_to_lsp_position(text, node.start_position()),
+            end: ts_point_to_lsp_position(text, node.end_position()),
         };
 
         if ranges.last() != Some(&range) {
@@ -8508,6 +8502,14 @@ fn lsp_position_to_ts_point(text: &str, position: Position) -> Point {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     Point::new(position.line as usize, byte_col)
+}
+
+/// Convert a tree-sitter `Point` (byte column) into an LSP `Position`
+/// (UTF-16 column) by indexing into the file's text.
+fn ts_point_to_lsp_position(text: &str, point: Point) -> Position {
+    let line_text = text.lines().nth(point.row).unwrap_or("");
+    let character = crate::utf16::byte_offset_to_utf16_column(line_text, point.column);
+    Position::new(point.row as u32, character)
 }
 
 pub fn completion(
@@ -40401,9 +40403,6 @@ mod issue_149_utf16_handlers {
     /// into the wrong node and the returned chain doesn't contain the
     /// identifier's range.
     ///
-    /// NB: the columns reported in the response are still tree-sitter byte
-    /// columns; the byte→UTF-16 output-direction conversion in
-    /// `build_selection_range` is a separate bug.
     #[test]
     fn selection_range_with_non_bmp_before_cursor_on_cursor_line() {
         let mut state = create_state();
@@ -40415,13 +40414,13 @@ mod issue_149_utf16_handlers {
         assert_eq!(result.len(), 1, "one position in, one chain out");
 
         // Walk the chain and assert the cursor's identifier (`abc` on
-        // line 1, bytes 8..11) is reachable. With the input-direction
+        // line 1, UTF-16 columns 6..9) is reachable. With the input-direction
         // bug the cursor lands on a different node and that range is
         // missing from the chain.
         let mut node = Some(&result[0]);
         let mut found_identifier = false;
         while let Some(sr) = node {
-            if sr.range.start == Position::new(1, 8) && sr.range.end == Position::new(1, 11) {
+            if sr.range.start == Position::new(1, 6) && sr.range.end == Position::new(1, 9) {
                 found_identifier = true;
                 break;
             }
