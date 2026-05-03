@@ -64,7 +64,7 @@ When the cursor is on the RHS identifier `bar` of an `extract_operator` node
      is `bar`.
 3. **Pick a winner**: position-aware single result.
    - If the cursor's file is the same as `foo`'s defining file: the latest
-     candidate strictly before the cursor.
+     candidate whose effect position is `<=` the cursor.
    - If different files: the latest candidate in `foo`'s defining file.
    - This mirrors how the position-aware scope resolver decides among
      redefinitions of plain identifiers.
@@ -176,9 +176,9 @@ Per the design decision (option C from brainstorming), the candidate search
 runs in `foo`'s defining scope — not the cursor's file:
 
 - **Member-assignments**: walk the AST of `foo`'s defining file and collect
-  `foo$bar <- …` (and `foo@bar <- …`) nodes. The tree is fetched directly from
-  `WorldState` (see "Where the defining file's AST comes from" above), since
-  `ScopeArtifacts` does not carry it.
+  `foo$bar <- …` (and `foo@bar <- …`) nodes. The tree is obtained via
+  `parameter_resolver::get_text_and_tree` (see "Where the defining file's AST
+  comes from" above), since `ScopeArtifacts` does not carry it.
 - **Constructor-literals**: only the single assignment that defined `foo`
   matters. We already have its line/column from the resolved symbol; re-fetch
   its RHS in the defining file's tree, then look for an `argument` node whose
