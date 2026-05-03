@@ -228,6 +228,8 @@ pub fn resolve_qualified_member(
     let contributor_distances = contributor_file_distances(
         &state.cross_file_graph,
         &cursor_uri,
+        &scope.chain,
+        &scope.visible_positions,
         all_candidates.iter().map(|candidate| &candidate.uri),
     );
     pick_winner(
@@ -251,18 +253,27 @@ fn contributor_file_ranks(chain: &[Url]) -> HashMap<Url, usize> {
     ranks
 }
 /// Compute shortest undirected dependency-graph distances from the cursor file
-/// to candidate files. `scope.chain` remains the source of truth for which
-/// files are allowed to contribute; these distances only rank already-retained
+/// to candidate files, walking only through forward source edges that are visible in
+/// the cursor scope's contributor chain. `scope.chain` remains the source of
+/// truth for which files are allowed to contribute; `visible_positions`
+/// constrains which outgoing edges from those files were in effect at the
+/// positions that contributed. These distances only rank already-retained
 /// candidates so that file-local effect positions are never compared across
-/// files.
+/// files. Restricting intermediate nodes and edges, and never walking through
+/// dependents, prevents unrelated parents/aggregators from creating shortcut
+/// paths that do not correspond to files the cursor executes to build its
+/// contributing scope.
 fn contributor_file_distances<'a, I>(
     graph: &crate::cross_file::dependency::DependencyGraph,
     cursor_uri: &Url,
+    contributor_chain: &[Url],
+    visible_positions: &HashMap<Url, (u32, u32)>,
     candidate_uris: I,
 ) -> HashMap<Url, usize>
 where
     I: IntoIterator<Item = &'a Url>,
 {
+    let contributor_files: HashSet<Url> = contributor_chain.iter().cloned().collect();
     let mut remaining: HashSet<Url> = candidate_uris
         .into_iter()
         .filter(|uri| *uri != cursor_uri)
@@ -289,18 +300,29 @@ where
         }
 
         for edge in graph.get_dependencies(&uri) {
-            if !visited.contains(&edge.to) {
+            if contributor_files.contains(&edge.to)
+                && !visited.contains(&edge.to)
+                && edge_call_site_visible(edge, visible_positions)
+            {
                 queue.push_back((edge.to.clone(), distance + 1));
-            }
-        }
-        for edge in graph.get_dependents(&uri) {
-            if !visited.contains(&edge.from) {
-                queue.push_back((edge.from.clone(), distance + 1));
             }
         }
     }
 
     distances
+}
+
+fn edge_call_site_visible(
+    edge: &crate::cross_file::dependency::DependencyEdge,
+    visible_positions: &HashMap<Url, (u32, u32)>,
+) -> bool {
+    match (edge.call_site_line, edge.call_site_column) {
+        (Some(line), Some(column)) => visible_positions
+            .get(&edge.from)
+            .map(|&cutoff| (line, column) <= cutoff)
+            .unwrap_or(false),
+        _ => true,
+    }
 }
 
 fn candidate_effect_visible_in_scope(
@@ -1450,6 +1472,78 @@ foo$bar <- 1
         assert_ne!(
             l.uri, c_uri,
             "must not use contributor-chain rank or cross-file line numbers as the primary tiebreak",
+        );
+        assert_eq!(l.range.start.line, 1);
+        assert_eq!(l.range.start.character, 4);
+    }
+
+    /// Regression: an unrelated runner that sources both the cursor file and a
+    /// farther contributor must not create an undirected shortcut path that
+    /// makes the farther contributor appear as close as the actually-nearer
+    /// file in the cursor's contributing scope.
+    #[test]
+    fn dollar_rhs_distance_ignores_unrelated_runner_shortcut_paths() {
+        let mut state = fresh_state();
+
+        let d_code = "\
+source(\"y.R\")
+source(\"v.R\")
+print(foo$bar)
+";
+        let y_code = "source(\"z.R\")\n";
+        let z_code = "source(\"c.R\")\n";
+        let c_code = "\
+source(\"a.R\")
+foo$bar <- 2
+";
+        let v_code = "source(\"b.R\")\n";
+        let b_code = "\
+source(\"a.R\")
+foo$bar <- 1
+";
+        let a_code = "foo <- list()\n";
+        let runner_code = "\
+source(\"d.R\")
+source(\"c.R\")
+";
+
+        let d_uri = add_doc(&mut state, "file:///workspace/d.R", d_code);
+        let y_uri = add_doc(&mut state, "file:///workspace/y.R", y_code);
+        let z_uri = add_doc(&mut state, "file:///workspace/z.R", z_code);
+        let c_uri = add_doc(&mut state, "file:///workspace/c.R", c_code);
+        let v_uri = add_doc(&mut state, "file:///workspace/v.R", v_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+        let runner_uri = add_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&d_uri, d_code),
+            (&y_uri, y_code),
+            (&z_uri, z_code),
+            (&c_uri, c_code),
+            (&v_uri, v_code),
+            (&b_uri, b_code),
+            (&a_uri, a_code),
+            (&runner_uri, runner_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 2 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(2, 10);
+        let l = loc(goto_definition(&state, &d_uri, pos));
+        assert_eq!(
+            l.uri, b_uri,
+            "b.R is closer in d.R's contributing scope; runner.R must not shorten c.R"
+        );
+        assert_ne!(
+            l.uri, c_uri,
+            "must not rank through unrelated non-contributing runner.R"
         );
         assert_eq!(l.range.start.line, 1);
         assert_eq!(l.range.start.character, 4);
