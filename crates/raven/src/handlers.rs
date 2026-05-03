@@ -2797,9 +2797,10 @@ pub fn selection_range(
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
 
+    let text = doc.text();
     let mut results = Vec::new();
     for pos in positions {
-        let point = Point::new(pos.line as usize, pos.character as usize);
+        let point = lsp_position_to_ts_point(&text, pos);
         if let Some(range) = build_selection_range(tree.root_node(), point) {
             results.push(range);
         }
@@ -40239,6 +40240,7 @@ generated quantities {
 mod issue_149_utf16_handlers {
     use super::{
         completion, goto_definition, lsp_position_to_ts_point, prepare_signature_help, references,
+        selection_range,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{CompletionResponse, GotoDefinitionResponse, Position, Url};
@@ -40362,6 +40364,45 @@ mod issue_149_utf16_handlers {
             labels.contains(&"my_local"),
             "expected `my_local` in completions; cursor on `+` is outside the namespace expression. got {:?}",
             labels
+        );
+    }
+
+    /// Same input-direction bug pattern as the four sites in #149, but in
+    /// `selection_range`. With the bug, the cursor on `abc` lands at byte
+    /// col 6 (`;`) instead of byte col 8 (`a`), so tree-sitter descends
+    /// into the wrong node and the returned chain doesn't contain the
+    /// identifier's range.
+    ///
+    /// NB: the columns reported in the response are still tree-sitter byte
+    /// columns; the byte→UTF-16 output-direction conversion in
+    /// `build_selection_range` is a separate bug.
+    #[test]
+    fn selection_range_with_non_bmp_before_cursor_on_cursor_line() {
+        let mut state = create_state();
+        let code = "abc <- 1\n\"🦀\"; abc\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        let result = selection_range(&state, &uri, vec![Position::new(1, 6)])
+            .expect("expected Some(selection ranges)");
+        assert_eq!(result.len(), 1, "one position in, one chain out");
+
+        // Walk the chain and assert the cursor's identifier (`abc` on
+        // line 1, bytes 8..11) is reachable. With the input-direction
+        // bug the cursor lands on a different node and that range is
+        // missing from the chain.
+        let mut node = Some(&result[0]);
+        let mut found_identifier = false;
+        while let Some(sr) = node {
+            if sr.range.start == Position::new(1, 8) && sr.range.end == Position::new(1, 11) {
+                found_identifier = true;
+                break;
+            }
+            node = sr.parent.as_deref();
+        }
+        assert!(
+            found_identifier,
+            "expected the chain to contain the `abc` identifier range; got {:#?}",
+            result[0]
         );
     }
 }
