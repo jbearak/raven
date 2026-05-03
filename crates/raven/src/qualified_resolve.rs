@@ -671,6 +671,67 @@ use(foo$bar)
         );
     }
 
+    /// Cross-file regression: the defining `foo <- list(bar = 1)` lives in
+    /// `helpers.R`, sourced from the cursor's file. Goto-def must resolve to a
+    /// `Location` whose `uri` is the *defining* document, exercising the
+    /// `same_file = false` branch in `pick_winner`.
+    #[test]
+    fn dollar_rhs_cross_file_resolves_to_defining_uri() {
+        let mut state = fresh_state();
+
+        let main_code = "source(\"helpers.R\")\nuse(foo$bar)\n";
+        let helpers_code = "foo <- list(bar = 1)\n";
+
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let helpers_uri = add_doc(&mut state, "file:///workspace/helpers.R", helpers_code);
+
+        // Wire up the cross-file graph so `source("helpers.R")` is resolved.
+        state.cross_file_graph.update_file(
+            &main_uri,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &helpers_uri,
+            &crate::cross_file::extract_metadata(helpers_code),
+            None,
+            |_| None,
+        );
+
+        // Cursor on `bar` in `foo$bar` (line 1, col 8 in main.R).
+        let pos = Position::new(1, 8);
+        let l = loc(goto_definition(&state, &main_uri, pos));
+        assert_eq!(l.uri, helpers_uri, "must resolve to the defining document");
+        assert_eq!(l.range.start.line, 0);
+        // `bar = 1` lives at col 12 of `foo <- list(bar = 1)`.
+        assert_eq!(l.range.start.character, 12);
+    }
+
+    /// UTF-16 regression: a non-BMP character (🦀, 4 bytes / 2 UTF-16 units)
+    /// precedes the `bar` token on the defining line, so byte-column ≠
+    /// UTF-16-column. Confirms `EffectPos` / `node_range_in_text` correctly
+    /// convert tree-sitter byte offsets into UTF-16 LSP columns.
+    #[test]
+    fn dollar_rhs_utf16_non_bmp_on_defining_line() {
+        let mut state = fresh_state();
+        // `foo <- list("🦀", bar = 1)` — `🦀` sits before `bar`.
+        // Byte offsets: `foo <- list("` = 13, `🦀` = +4 bytes, `", ` = +3,
+        //   so `bar` starts at byte 20.
+        // UTF-16 cols:  13 + 2 + 3 = 18.
+        let code = "foo <- list(\"🦀\", bar = 1)\nuse(foo$bar)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on `bar` in `foo$bar` (line 1 has no non-BMP chars, so col 9).
+        let pos = Position::new(1, 9);
+        let l = loc(goto_definition(&state, &uri, pos));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+        assert_eq!(
+            l.range.start.character, 18,
+            "expected UTF-16 column of `bar` after the non-BMP `🦀` literal"
+        );
+    }
+
     /// Non-allowlisted constructor: arbitrary `make_thing(bar = 1)` is not
     /// resolved, returns None (we cannot know its semantics).
     #[test]

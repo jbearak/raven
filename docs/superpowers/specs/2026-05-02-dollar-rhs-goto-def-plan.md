@@ -250,20 +250,20 @@ Implement all 12 required cases from the spec, in a new module file
 that fits the existing pattern better — choice made at implementation time
 based on what matches surrounding tests in `handlers.rs`).
 
-| # | Scenario                                                      | Expected           |
-|---|---------------------------------------------------------------|--------------------|
-| 1 | `foo <- list(bar = 1); foo$bar`                               | jumps to `bar = 1` |
-| 2 | `foo$bar <- 1; foo$bar`                                       | jumps to assignment|
-| 3 | literal then member-assignment, cursor after both             | member-assignment  |
-| 4 | literal *after* cursor, member-assignment before cursor       | member-assignment  |
-| 5 | bare `bar <- 1` only, no `foo` definition, `foo$bar`          | `None`             |
-| 6 | `@` parity for cases 1, 2, 5                                  | parallel           |
-| 7 | `foo$bar$baz` chained access (cursor on `baz`)                | `None`             |
-| 8 | cross-file: `foo` and `foo$bar <- …` in `helpers.R`           | jumps to helpers.R |
-| 9 | cross-file negative: unrelated `other$bar <- …` elsewhere     | `None`             |
-| 10| `foo` is `package:…` export                                   | `None`             |
-| 11| `(foo)$bar`, `pkg::obj$bar`, `make()$bar`                     | `None`             |
-| 12| literal + later member-assignment, cursor *between* them      | jumps to literal   |
+| #  | Scenario                                                  | Expected            |
+|----|-----------------------------------------------------------|---------------------|
+| 1  | `foo <- list(bar = 1); foo$bar`                           | jumps to `bar = 1`  |
+| 2  | `foo$bar <- 1; foo$bar`                                   | jumps to assignment |
+| 3  | literal then member-assignment, cursor after both         | member-assignment   |
+| 4  | literal *after* cursor, member-assignment before cursor   | member-assignment   |
+| 5  | bare `bar <- 1` only, no `foo` definition, `foo$bar`      | `None`              |
+| 6  | `@` parity for cases 1, 2, 5                              | parallel            |
+| 7  | `foo$bar$baz` chained access (cursor on `baz`)            | `None`              |
+| 8  | cross-file: `foo` and `foo$bar <- …` in `helpers.R`       | jumps to helpers.R  |
+| 9  | cross-file negative: unrelated `other$bar <- …` elsewhere | `None`              |
+| 10 | `foo` is `package:…` export                               | `None`              |
+| 11 | `(foo)$bar`, `pkg::obj$bar`, `make()$bar`                 | `None`              |
+| 12 | literal + later member-assignment, cursor *between* them  | jumps to literal    |
 
 For cross-file cases, use the existing test fixture / `WorldState` setup
 patterns already used by `test_goto_definition_*` tests in `handlers.rs`.

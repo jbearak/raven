@@ -113,32 +113,35 @@ Broader LHS shapes are explicit follow-up work.
 
 `ScopeArtifacts` (`cross_file/scope.rs`) does not carry AST or text — it carries
 exported symbols, a timeline, an interface hash, and per-function scope trees.
-The resolver therefore obtains the defining file's tree directly from
-`WorldState`:
+The resolver therefore obtains the defining file's tree via the shared helper
+`parameter_resolver::get_text_and_tree`, which already encapsulates the priority
+chain (enriched/legacy open documents → workspace indexes → cross-file file
+cache, parsing on demand):
 
 ```rust
 let defining_uri = symbol.source_uri.clone();
-let doc = state.get_document(&defining_uri)
-    .or_else(|| state.workspace_index.get(&defining_uri))?;
-let tree = doc.tree.as_ref()?;
-let text = doc.text();
+let (defining_text, defining_tree) =
+    crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
 ```
 
-This is the same pattern `goto_definition` already uses for the cursor's file
-(`handlers.rs:10618-10622`).
+Reusing this helper keeps the lookup path consistent with parameter resolution
+and avoids reaching into `WorldState`'s document/workspace fields directly.
 
 ## Module / file layout
 
 New file: `crates/raven/src/qualified_resolve.rs`. Public surface:
 
 ```rust
-pub enum ExtractOp { Dollar, At }
+// `ExtractOp` lives in its own module (`crate::extract_op`) and is shared
+// with the structural-detection helpers in `handlers.rs`.
+use crate::extract_op::ExtractOp;
 
 pub fn resolve_qualified_member(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node: tree_sitter::Node,
+    lhs_node_kind: &str,
+    lhs_name: &str,
     rhs_name: &str,
     op: ExtractOp,
 ) -> Option<Location>;

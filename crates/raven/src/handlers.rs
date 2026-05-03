@@ -2671,6 +2671,18 @@ fn get_cross_file_symbols(
 ///
 /// This returns a position-aware ScopeAtPosition that reflects symbols visible at (line, column) in `uri`, along with loaded and inherited package lists and depth information for cross-file resolution.
 ///
+/// # Locking precondition
+///
+/// Callers must already hold a `WorldState` read guard when invoking
+/// `get_cross_file_scope` — it reads artifacts, metadata, and the dependency
+/// graph through `&WorldState` and does not take any locks itself. To respect
+/// the project-wide locking discipline (see CLAUDE.md "Locking discipline in
+/// cross-file work"), callers should snapshot any inputs they need from
+/// `WorldState` while holding that read guard and **release the guard before
+/// performing further cross-file iteration or resolution** — `get_cross_file_scope`
+/// can be expensive, and holding a `WorldState` read lock across it starves
+/// concurrent `did_change` writers.
+///
 /// # Returns
 ///
 /// A `scope::ScopeAtPosition` containing the resolved symbols, `loaded_packages`, `inherited_packages`, and scope depth metadata for the specified location.
