@@ -5,34 +5,28 @@
 //! For `foo$bar` (or `foo@bar`) where the cursor is on `bar`:
 //!
 //! 1. Resolve `foo` via the existing position-aware scope.
-//! 2. Collect candidates from two scopes:
+//! 2. Collect candidates from the defining file and the cursor's cross-file
+//!    neighborhood:
 //!    - **Defining file**: `foo$bar <- ...` member-assignments and any
 //!      constructor-call named argument from the allowlist. Filtered by
 //!      same-function-scope and "effect position at or after the binding".
-//!    - **Cursor file** (when different from the defining file): each
-//!      `foo$bar <- ...` site is validated by re-resolving `foo` at that
-//!      site's position via cross-file scope; only sites where `foo`
-//!      resolves to the *same* binding are kept. This handles the very
-//!      common pattern of "skeleton object defined in helpers.R, members
-//!      attached in main.R".
+//!    - **Every non-defining file in the cursor's cross-file neighborhood**:
+//!      each `foo$bar <- ...` site is validated by re-resolving `foo` at
+//!      that site's position via cross-file scope; only sites where `foo`
+//!      resolves to the *same* binding are kept. This handles both the common
+//!      "skeleton object defined in helpers.R, members attached in main.R"
+//!      pattern and intermediate-file attachments in longer `source()` chains.
 //! 3. Tie-break: `pick_winner` partitions all candidates by whether their
 //!    `uri` equals the cursor's. The in-cursor-file partition is filtered
 //!    by `effect <= cursor`, then the candidate with the latest effect
 //!    wins. If no in-cursor-file candidate qualifies, the other-file
 //!    partition's max-effect candidate wins as a fallback.
 //!
-//!    In the **same-file case** (cursor file = defining file), Phase 2 is
-//!    skipped, so every candidate lives in the cursor's own file and the
-//!    partition has only one non-empty side — both the `effect <= cursor`
-//!    filter and the max-effect rule apply once over the merged set.
-//!    There is no separate "defining-file tier" to fall back to in this
-//!    case; the two-tier story only kicks in when the files differ.
+//!    In the **same-file case** (cursor file = defining file), defining-file
+//!    candidates live in the cursor partition and are filtered by
+//!    `effect <= cursor`. Non-defining neighborhood candidates can still be
+//!    used as a fallback if no cursor-file candidate qualifies.
 //! 4. Never fall back to free-identifier lookup.
-//!
-//! Limitation (step 2): only the cursor file and the defining file are
-//! scanned. A `foo$bar <- ...` in some *third* file in the middle of a
-//! `source()` chain is not currently found. Extending to the cursor's
-//! cross-file connected component is a follow-up.
 
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
@@ -81,19 +75,20 @@ impl EffectPos {
 #[derive(Debug, Clone)]
 struct Candidate {
     /// File the candidate lives in. For defining-file candidates this is
-    /// `defining_uri`; for cursor-file candidates this is the cursor's URI.
+    /// `defining_uri`; for cross-file candidates this is the file containing
+    /// the validated member-assignment site.
     uri: Url,
     effect: EffectPos,
     name_range: Range,
     /// `None` for top-level, else the `function_definition` node id of the
     /// closest enclosing function scope. Tree-local — only meaningful when
     /// comparing candidates collected from the *same* tree (i.e. defining
-    /// file vs the binding's `symbol_fn_scope`). For cursor-file candidates
-    /// this is recorded but unused (a per-site scope-resolve replaces the
-    /// `fn_scope` correctness gate across files).
+    /// file vs the binding's `symbol_fn_scope`). For non-defining-file
+    /// candidates this is recorded but unused (a per-site scope-resolve
+    /// replaces the `fn_scope` correctness gate across files).
     fn_scope: FunctionScopeId,
     /// Position of the LHS identifier (`foo` in `foo$bar <- ...`). Used as
-    /// the query position when re-resolving `foo` for cursor-file
+    /// the query position when re-resolving `foo` for non-defining-file
     /// candidates; ignored for defining-file candidates.
     lhs_pos: Position,
 }
@@ -183,30 +178,41 @@ pub fn resolve_qualified_member(
         });
     }
 
-    // Phase 2: collect from the cursor file (if distinct). Tree-local IDs
-    // are not comparable to those in the defining tree, so we replace the
-    // `fn_scope` gate with a per-site scope-resolve: at the LHS identifier's
-    // position, does `foo` resolve to the *same* binding we navigated from?
-    let mut cursor_candidates: Vec<Candidate> = Vec::new();
-    if cursor_uri != defining_uri {
-        if let Some((cursor_text, cursor_tree)) =
-            crate::parameter_resolver::get_text_and_tree(state, &cursor_uri)
+    // Phase 2: collect from every non-defining file in the cursor's cross-file
+    // neighborhood. Tree-local IDs are not comparable to those in the defining
+    // tree, so we replace the `fn_scope` gate with a per-site scope-resolve:
+    // at the LHS identifier's position, does `foo` resolve to the *same*
+    // binding we navigated from?
+    let mut cross_file_candidates: Vec<Candidate> = Vec::new();
+    let mut scanned_uris = state.cross_file_graph.collect_neighborhood(
+        &cursor_uri,
+        state.cross_file_config.max_chain_depth,
+        state.cross_file_config.max_transitive_dependents_visited,
+    );
+    scanned_uris.insert(cursor_uri.clone());
+    scanned_uris.remove(&defining_uri);
+    let mut scanned_uris: Vec<Url> = scanned_uris.into_iter().collect();
+    scanned_uris.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+    for candidate_uri in scanned_uris {
+        if let Some((candidate_text, candidate_tree)) =
+            crate::parameter_resolver::get_text_and_tree(state, &candidate_uri)
         {
             collect_member_assignments(
-                cursor_tree.root_node(),
-                &cursor_text,
-                &cursor_uri,
+                candidate_tree.root_node(),
+                &candidate_text,
+                &candidate_uri,
                 lhs_name,
                 rhs_name,
                 op,
-                &mut cursor_candidates,
+                &mut cross_file_candidates,
             );
-            cursor_candidates.retain(|c| candidate_lhs_matches_symbol(state, c, lhs_name, symbol));
         }
     }
+    cross_file_candidates.retain(|c| candidate_lhs_matches_symbol(state, c, lhs_name, symbol));
 
     let mut all_candidates = defining_candidates;
-    all_candidates.extend(cursor_candidates);
+    all_candidates.extend(cross_file_candidates);
     pick_winner(all_candidates, &cursor_uri, position).map(|c| Location {
         uri: c.uri,
         range: c.name_range,
@@ -255,11 +261,11 @@ fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
 /// at-or-before the cursor (you can't "see" an assignment that hasn't
 /// happened yet) and pick the one with the latest effect position.
 ///
-/// If no cursor-file candidate qualifies, fall back to the
-/// non-cursor-file candidate with the latest effect position. (Effect
-/// positions across different non-cursor files are not directly
-/// comparable, but in practice all such candidates come from the same
-/// defining file, so the comparison is well-defined.)
+/// If no cursor-file candidate qualifies, fall back to the non-cursor-file
+/// candidate with the latest effect position. Effect positions across
+/// different non-cursor files are not directly comparable; if that becomes
+/// observable, prefer candidates whose file is closer to the cursor in the
+/// dependency graph.
 fn pick_winner(
     candidates: Vec<Candidate>,
     cursor_uri: &Url,
@@ -476,7 +482,7 @@ fn collect_constructor_candidate(
         }
         // Constructor candidates always live in the defining file. The
         // `lhs_pos` field is unused for them (cross-file scope-check only
-        // applies to cursor-file member-assignment candidates), so we
+        // applies to non-defining-file member-assignment candidates), so we
         // anchor it at the constructor's named-arg position.
         let name_range = node_range_in_text(name_node, text);
         return Some(Candidate {
@@ -1096,15 +1102,12 @@ use(foo$bar)
         assert_eq!(l.range.start.character, 12);
     }
 
-    /// Documented "third-file gap": `foo` is defined in `a.R`, the
-    /// `foo$bar <- 1` lives in the *middle* file `b.R`, and the cursor is
-    /// in `c.R`. Today we scan only the cursor file (c.R) and the defining
-    /// file (a.R), so the candidate in b.R is invisible. Neither file has
-    /// a qualifying candidate, so the resolver returns `None`. Pin this so
-    /// extending scanning to the full connected component (issue #148) has
-    /// a clean before/after.
+    /// `foo` is defined in `a.R`, `foo$bar <- 1` lives in the middle file
+    /// `b.R`, and the cursor is in `c.R`. The connected-component scan must
+    /// find the b.R member assignment even though it is neither the cursor
+    /// file nor the defining file.
     #[test]
-    fn dollar_rhs_third_file_member_assignment_returns_none() {
+    fn dollar_rhs_third_file_member_assignment_resolves_to_intermediate_file() {
         let mut state = fresh_state();
 
         let c_code = "\
@@ -1132,13 +1135,94 @@ foo$bar <- 1
 
         // line 1 col 10 = `bar` in `print(foo$bar)`
         let pos = Position::new(1, 10);
-        let result = goto_definition(&state, &c_uri, pos);
+        let l = loc(goto_definition(&state, &c_uri, pos));
+        assert_eq!(l.uri, b_uri, "must resolve to the intermediate file");
+        assert_eq!(l.range.start.line, 1);
+        assert_eq!(l.range.start.character, 4);
+    }
+
+    /// Negative: the connected-component scan sees `b.R`, but the only
+    /// `foo$bar <- 99` candidate there is inside a function where `foo` is
+    /// shadowed. The per-site scope-resolve must reject it.
+    #[test]
+    fn dollar_rhs_third_file_shadowed_assignment_does_not_match() {
+        let mut state = fresh_state();
+
+        let c_code = "\
+source(\"b.R\")
+print(foo$bar)
+";
+        let b_code = "\
+source(\"a.R\")
+g <- function() {
+  foo <- list()
+  foo$bar <- 99
+}
+";
+        let a_code = "foo <- list()\n";
+
+        let c_uri = add_doc(&mut state, "file:///workspace/c.R", c_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+
+        for (uri, code) in [(&c_uri, c_code), (&b_uri, b_code), (&a_uri, a_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 1 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(1, 10);
         assert!(
-            result.is_none(),
-            "third-file `foo$bar <- 1` is invisible to current scanning — \
-             a.R (defining) has no member-assignment or matching constructor \
-             arg, c.R (cursor) has none either, so no candidate qualifies. \
-             Tracked by issue #148.",
+            goto_definition(&state, &c_uri, pos).is_none(),
+            "must not match `foo$bar <- 99` inside g(); that's a different `foo`",
+        );
+    }
+
+    /// Negative: a matching-looking `foo$bar <- 99` in a document outside the
+    /// cursor's cross-file connected component is not scanned.
+    #[test]
+    fn dollar_rhs_member_assignment_outside_connected_component_does_not_match() {
+        let mut state = fresh_state();
+
+        let c_code = "\
+source(\"b.R\")
+print(foo$bar)
+";
+        let b_code = "source(\"a.R\")\n";
+        let a_code = "foo <- list()\n";
+        let unrelated_code = "\
+foo <- list()
+foo$bar <- 99
+";
+
+        let c_uri = add_doc(&mut state, "file:///workspace/c.R", c_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+        let unrelated_uri = add_doc(&mut state, "file:///workspace/unrelated.R", unrelated_code);
+
+        for (uri, code) in [
+            (&c_uri, c_code),
+            (&b_uri, b_code),
+            (&a_uri, a_code),
+            (&unrelated_uri, unrelated_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 1 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(1, 10);
+        assert!(
+            goto_definition(&state, &c_uri, pos).is_none(),
+            "must not scan unrelated.R outside c.R's connected component",
         );
     }
 
