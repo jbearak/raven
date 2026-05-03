@@ -9750,14 +9750,8 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     };
 
     let node_range = Range {
-        start: Position::new(
-            node.start_position().row as u32,
-            node.start_position().column as u32,
-        ),
-        end: Position::new(
-            node.end_position().row as u32,
-            node.end_position().column as u32,
-        ),
+        start: ts_point_to_lsp_position(&text, node.start_position()),
+        end: ts_point_to_lsp_position(&text, node.end_position()),
     };
 
     // Try cross-file symbols (includes local scope with definition extraction)
@@ -10942,14 +10936,8 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
                 && node_text(lhs, text) == name
             {
                 return Some(Range {
-                    start: Position::new(
-                        lhs.start_position().row as u32,
-                        lhs.start_position().column as u32,
-                    ),
-                    end: Position::new(
-                        lhs.end_position().row as u32,
-                        lhs.end_position().column as u32,
-                    ),
+                    start: ts_point_to_lsp_position(text, lhs.start_position()),
+                    end: ts_point_to_lsp_position(text, lhs.end_position()),
                 });
             }
         }
@@ -40245,8 +40233,8 @@ generated quantities {
 #[cfg(test)]
 mod issue_149_utf16_handlers {
     use super::{
-        completion, goto_definition, lsp_position_to_ts_point, prepare_signature_help, references,
-        selection_range,
+        completion, goto_definition, hover, lsp_position_to_ts_point, prepare_signature_help,
+        references, selection_range,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{CompletionResponse, GotoDefinitionResponse, Position, Url};
@@ -40303,6 +40291,27 @@ mod issue_149_utf16_handlers {
             "definition lives on line 0 (`abc <- 1`)"
         );
         assert_eq!(location.range.start.character, 0);
+    }
+
+    #[test]
+    fn goto_definition_fallback_reports_utf16_columns_on_non_bmp_definition_line() {
+        let mut state = create_state();
+        let use_uri = add_doc(&mut state, "file:///use.R", "abc\n");
+        let def_uri = add_doc(&mut state, "file:///def.R", "\"🦀\"; abc <- 1\n");
+
+        let result = goto_definition(&state, &use_uri, Position::new(0, 1));
+
+        let location = match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar response, got {:?}", other),
+        };
+        assert_eq!(location.uri, def_uri);
+        assert_eq!(
+            location.range.start,
+            Position::new(0, 6),
+            "`abc` starts at UTF-16 col 6, not byte col 8"
+        );
+        assert_eq!(location.range.end, Position::new(0, 9));
     }
 
     #[test]
@@ -40395,6 +40404,19 @@ mod issue_149_utf16_handlers {
         // `abc` on line 0 cols 0..3, and on line 1 cols 6..9 (UTF-16).
         // With the bug, the line-1 entry is reported as 8..11 (bytes).
         assert_eq!(found, vec![(0, 0, 3), (1, 6, 9)]);
+    }
+    #[tokio::test]
+    async fn hover_reports_utf16_range_on_non_bmp_cursor_line() {
+        let mut state = create_state();
+        let code = "abc <- 1\n\"🦀\"; abc\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        let result = hover(&state, &uri, Position::new(1, 6))
+            .await
+            .expect("expected Some(hover)");
+        let range = result.range.expect("hover should include identifier range");
+        assert_eq!(range.start, Position::new(1, 6));
+        assert_eq!(range.end, Position::new(1, 9));
     }
 
     /// Same input-direction bug pattern as the four sites in #149, but in
