@@ -8445,6 +8445,7 @@ fn is_r_only_jags_completion_name(name: &str) -> bool {
         && !crate::jags_builtins::JAGS_KEYWORDS.contains(&name))
         || matches!(name, "library" | "require")
 }
+
 fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
     let mut items = Vec::new();
     let mut seen_names = std::collections::HashSet::new();

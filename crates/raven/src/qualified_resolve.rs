@@ -189,7 +189,6 @@ pub fn resolve_qualified_member(
         state.cross_file_config.max_chain_depth,
         state.cross_file_config.max_transitive_dependents_visited,
     );
-    scanned_uris.insert(cursor_uri.clone());
     scanned_uris.remove(&defining_uri);
     let mut scanned_uris: Vec<Url> = scanned_uris.into_iter().collect();
     scanned_uris.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -385,12 +384,10 @@ fn collect_member_assignments(
         let Some(target_op) = target.child_by_field_name("operator") else {
             continue;
         };
-        let target_op_kind = match (target_op.kind(), op) {
-            ("$", ExtractOp::Dollar) => true,
-            ("@", ExtractOp::At) => true,
-            _ => false,
-        };
-        if !target_op_kind {
+        if !matches!(
+            (target_op.kind(), op),
+            ("$", ExtractOp::Dollar) | ("@", ExtractOp::At)
+        ) {
             continue;
         }
         let Some(t_lhs) = target.child_by_field_name("lhs") else {
