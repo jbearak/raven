@@ -382,20 +382,24 @@ a free variable. This avoids the surprise where a same-named top-level
 binding (e.g. `bar <- ...`) was previously chosen as the target.
 
 Concretely, after resolving `foo` with the existing position-aware scope,
-Raven looks for two kinds of candidates inside the file where `foo` is
-defined:
+Raven looks for candidates in the file where `foo` is defined and in any other
+file that actually contributes to the cursor's cross-file scope:
 
-- **Member assignments** — any `foo$bar <- …` (or `foo@bar <- …`) statement.
+- **Member assignments** — any `foo$bar <- …` (or `foo@bar <- …`) statement in
+  the defining file or a contributing cross-file source/parent file, as long
+  as re-resolving `foo` at that assignment site still points to the same
+  binding.
 - **Constructor-literal members** — when `foo`'s defining assignment's RHS
   is a call to one of `list`, `c`, `data.frame`, `tibble`, `data.table`,
   `environment`, `list2env`, or `new`, the named argument matching `bar` is a
   candidate.
 
 The candidate with the latest *effect position* (the end of the assignment
-that introduces it) before the cursor wins. Across files, the latest
-candidate in `foo`'s defining file wins. If no qualified candidate exists,
-go-to-definition returns nothing — Raven does not fall back to a free-variable
-lookup for the RHS of `$`/`@`.
+that introduces it) before the cursor wins within the cursor file. If the best
+match lives in another file, Raven prefers the file closest to the cursor in
+the contributing cross-file chain, then chooses that file's latest matching
+assignment. If no qualified candidate exists, go-to-definition returns nothing
+— Raven does not fall back to a free-variable lookup for the RHS of `$`/`@`.
 
 Out of scope today: S4 slot resolution from `setClass`, R6 fields/methods,
 aliasing (`foo <- bar; foo$x`), function-return inference, package-data
