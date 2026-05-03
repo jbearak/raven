@@ -2687,10 +2687,13 @@ fn get_cross_file_symbols(
 /// release it, and only then resolve scopes. See CLAUDE.md "Locking
 /// discipline in cross-file work".
 ///
-/// **Interactive request handlers** — `goto_definition` (including
-/// `qualified_resolve::resolve_qualified_member`), `hover`, `completion`,
-/// `signature_help` — resolve a single position per request and may hold
-/// the guard for the call's duration.
+/// **Interactive request handlers** — `goto_definition`, `hover`,
+/// `completion`, `signature_help` — generally resolve a single position per
+/// request and may hold the guard for the call's duration. Interactive paths
+/// that resolve many related positions under one request (for example
+/// `qualified_resolve::resolve_qualified_member` candidate validation) should
+/// use `get_cross_file_scope_with_cache` with a request-local
+/// `ParentPrefixCache` so repeated parent walks are shared.
 ///
 /// # Returns
 ///
@@ -2744,6 +2747,67 @@ pub(crate) fn get_cross_file_scope(
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
+    )
+}
+
+/// Cached counterpart of `get_cross_file_scope` for request-local batches.
+///
+/// Use this when one interactive request needs to resolve multiple related
+/// positions while holding the same `WorldState` read guard. The caller owns
+/// the `ParentPrefixCache`; do not share it across independent requests or
+/// state snapshots.
+pub(crate) fn get_cross_file_scope_with_cache(
+    state: &WorldState,
+    uri: &Url,
+    line: u32,
+    column: u32,
+    cancel: &DiagCancelToken,
+    prefix_cache: &mut scope::ParentPrefixCache,
+) -> scope::ScopeAtPosition {
+    // Use ContentProvider for unified access
+    let content_provider = state.content_provider();
+
+    // Closure to get artifacts for a URI
+    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+        content_provider.get_artifacts(target_uri)
+    };
+
+    // Closure to get metadata for a URI
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            content_provider.get_metadata(target_uri)
+        };
+
+    let max_depth = state.cross_file_config.max_chain_depth;
+
+    // Get base_exports from package_library if ready, otherwise empty set.
+    // This ensures base R functions (stop, sprintf, exists, etc.) are available
+    // in cross-file scope resolution for hover, completions, and go-to-definition.
+    let base_exports = if state.package_library_ready {
+        state.package_library.base_exports().clone()
+    } else {
+        empty_base_exports().clone()
+    };
+
+    let is_cancelled = || cancel.is_cancelled();
+
+    // Use the graph-aware cached scope resolution with PathContext. The cache
+    // only memoizes the position-invariant parent-prefix walk; local STEP 2
+    // still runs for every queried candidate position.
+    scope::scope_at_position_with_graph_cached(
+        uri,
+        line,
+        column,
+        &get_artifacts,
+        &get_metadata,
+        &state.cross_file_graph,
+        state.workspace_folders.first(),
+        max_depth,
+        &base_exports,
+        state.cross_file_config.hoist_globals_in_functions,
+        state.cross_file_config.backward_dependencies,
+        &is_cancelled,
+        prefix_cache,
     )
 }
 

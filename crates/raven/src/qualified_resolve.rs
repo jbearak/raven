@@ -116,14 +116,20 @@ pub fn resolve_qualified_member(
     if lhs_node_kind != "identifier" {
         return None;
     }
+    // Reuse parent-prefix work across the initial cursor lookup and the
+    // per-candidate validation loop. A single qualified-member request can
+    // resolve many candidate positions, but all of them see the same state
+    // snapshot under the caller's read guard.
+    let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
     // Resolve the LHS via the existing position-aware cross-file scope.
-    let scope = crate::handlers::get_cross_file_scope(
+    let scope = crate::handlers::get_cross_file_scope_with_cache(
         state,
         uri,
         position.line,
         position.character,
         &DiagCancelToken::never(),
+        &mut prefix_cache,
     );
     let symbol = scope.symbols.get(lhs_name)?;
 
@@ -188,7 +194,7 @@ pub fn resolve_qualified_member(
         });
         defining_candidates.retain(|c| {
             candidate_effect_visible_in_scope(c, &scope.visible_positions)
-                && candidate_lhs_matches_symbol(state, c, lhs_name, symbol)
+                && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, &mut prefix_cache)
         });
     }
 
@@ -220,7 +226,7 @@ pub fn resolve_qualified_member(
     }
     cross_file_candidates.retain(|c| {
         candidate_effect_visible_in_scope(c, &scope.visible_positions)
-            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol)
+            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, &mut prefix_cache)
     });
 
     let mut all_candidates = defining_candidates;
@@ -353,13 +359,15 @@ fn candidate_lhs_matches_symbol(
     c: &Candidate,
     lhs_name: &str,
     symbol: &crate::cross_file::scope::ScopedSymbol,
+    prefix_cache: &mut crate::cross_file::scope::ParentPrefixCache,
 ) -> bool {
-    let scope = crate::handlers::get_cross_file_scope(
+    let scope = crate::handlers::get_cross_file_scope_with_cache(
         state,
         &c.uri,
         c.lhs_pos.line,
         c.lhs_pos.character,
         &DiagCancelToken::never(),
+        prefix_cache,
     );
     scope
         .symbols
