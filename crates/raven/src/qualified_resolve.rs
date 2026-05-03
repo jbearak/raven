@@ -10,6 +10,10 @@
 //!    - **Defining file**: `foo$bar <- ...` member-assignments and any
 //!      constructor-call named argument from the allowlist. Filtered by
 //!      same-function-scope and "effect position at or after the binding".
+//!      Defining-file candidates are also filtered by
+//!      `candidate_effect_visible_in_scope` and `candidate_lhs_matches_symbol`,
+//!      which excludes candidates past the parent file's `source()` site that
+//!      made the cursor file visible.
 //!    - **Every non-defining file in the cursor scope's contributor chain**:
 //!      each `foo$bar <- ...` site is validated by re-resolving `foo` at
 //!      that site's position via cross-file scope; only sites where `foo`
@@ -1085,6 +1089,38 @@ print(foo$bar)
         // file's constructor literal wins.
         assert_eq!(l.uri, helpers_uri);
         assert_eq!(l.range.start.line, 0);
+    }
+    /// Regression: a defining-file member assignment after the `source()` site
+    /// that brought the cursor file into scope is not visible to that child.
+    #[test]
+    fn dollar_rhs_defining_file_visibility_cutoff() {
+        let mut state = fresh_state();
+
+        let a_code = "\
+foo <- list()
+source(\"b.R\")
+foo$bar <- 1
+";
+        let b_code = "print(foo$bar)\n";
+
+        let a_uri = add_doc(&mut state, "file:///workspace/a.R", a_code);
+        let b_uri = add_doc(&mut state, "file:///workspace/b.R", b_code);
+
+        for (uri, code) in [(&a_uri, a_code), (&b_uri, b_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // line 0 col 10 = `bar` in `print(foo$bar)`
+        let pos = Position::new(0, 10);
+        assert!(
+            goto_definition(&state, &b_uri, pos).is_none(),
+            "must not see `foo$bar <- 1` after the `source(\"b.R\")` cutoff in a.R",
+        );
     }
 
     /// CRLF regression: with `\r\n` line endings, position columns must
