@@ -2675,13 +2675,19 @@ fn get_cross_file_symbols(
 ///
 /// Callers must already hold a `WorldState` read guard when invoking
 /// `get_cross_file_scope` — it reads artifacts, metadata, and the dependency
-/// graph through `&WorldState` and does not take any locks itself. To respect
-/// the project-wide locking discipline (see CLAUDE.md "Locking discipline in
-/// cross-file work"), callers should snapshot any inputs they need from
-/// `WorldState` while holding that read guard and **release the guard before
-/// performing further cross-file iteration or resolution** — `get_cross_file_scope`
-/// can be expensive, and holding a `WorldState` read lock across it starves
-/// concurrent `did_change` writers.
+/// graph through `&WorldState` and does not take any locks itself.
+///
+/// **Recurring/batch consumers** — diagnostic computation and the libpath
+/// consumer's "which docs are affected" filter — must NOT hold the read
+/// guard across this call. They iterate over many documents and would
+/// starve concurrent `did_change` writers; snapshot inputs under the guard,
+/// release it, and only then resolve scopes. See CLAUDE.md "Locking
+/// discipline in cross-file work".
+///
+/// **Interactive request handlers** — `goto_definition` (including
+/// `qualified_resolve::resolve_qualified_member`), `hover`, `completion`,
+/// `signature_help` — resolve a single position per request and may hold
+/// the guard for the call's duration.
 ///
 /// # Returns
 ///
