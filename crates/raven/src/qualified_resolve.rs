@@ -112,7 +112,11 @@ struct Candidate {
 /// (as `goto_definition` does) while calling this function so
 /// `get_cross_file_scope_with_cache` and subsequent scope lookups, including
 /// `candidate_lhs_matches_symbol`, observe the same graph/artifacts snapshot.
-#[allow(dead_code)]
+///
+/// This stable convenience API delegates to
+/// [`resolve_qualified_member_with_cancel`] with [`DiagCancelToken::never`],
+/// so callers that do not have a request-scoped cancellation token keep the
+/// same uncancelled behavior.
 pub fn resolve_qualified_member(
     state: &WorldState,
     uri: &Url,

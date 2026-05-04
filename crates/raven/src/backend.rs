@@ -3557,7 +3557,10 @@ impl LanguageServer for Backend {
         if cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
         }
-        let state = self.state.read().await;
+        let state = tokio::select! {
+            state = self.state.read() => state,
+            _ = cancel.cancelled() => return Err(JsonRpcError::request_cancelled()),
+        };
         if cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
         }
@@ -4900,9 +4903,56 @@ async fn run_libpath_consumer(
 mod tests {
     mod request_cancellation {
         use super::super::{
-            CancellableRequestKind, RequestCancellationRegistry, CURRENT_LSP_REQUEST_ID,
+            CancellableRequestKind, RequestCancellationRegistry, RequestCancellationService,
+            CURRENT_LSP_REQUEST_ID,
         };
-        use tower_lsp::jsonrpc::Id as JsonRpcId;
+        use std::convert::Infallible;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use tokio::sync::oneshot;
+        use tower::Service;
+        use tower_lsp::jsonrpc::{
+            Id as JsonRpcId, Request as JsonRpcRequest, Response as JsonRpcResponse,
+        };
+
+        struct ObservingService {
+            registry: Arc<RequestCancellationRegistry>,
+            observed: Option<oneshot::Sender<bool>>,
+            release: Option<oneshot::Receiver<()>>,
+        }
+
+        impl Service<JsonRpcRequest> for ObservingService {
+            type Response = Option<JsonRpcResponse>;
+            type Error = Infallible;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
+                let method = req.method().to_string();
+                let id = req.id().cloned();
+                if method != "textDocument/definition" {
+                    return Box::pin(async { Ok(None) });
+                }
+
+                let registry = Arc::clone(&self.registry);
+                let observed = self.observed.take().expect("single observed request");
+                let release = self.release.take().expect("single observed request");
+                Box::pin(async move {
+                    let token_visible = registry
+                        .token_for_current_request(CancellableRequestKind::GotoDefinition)
+                        .is_some_and(|token| !token.is_cancelled());
+                    observed.send(token_visible).ok();
+                    release.await.ok();
+                    Ok(id.map(|id| JsonRpcResponse::from_ok(id, serde_json::Value::Null)))
+                })
+            }
+        }
 
         #[test]
         fn superseding_same_kind_cancels_older_request() {
@@ -4972,6 +5022,57 @@ mod tests {
                 .await;
 
             assert!(missing.is_none());
+        }
+
+        #[tokio::test]
+        async fn service_registers_scopes_cancels_and_completes_request_tokens() {
+            let registry = Arc::new(RequestCancellationRegistry::new());
+            let request_id = JsonRpcId::from(99_i64);
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let inner = ObservingService {
+                registry: Arc::clone(&registry),
+                observed: Some(observed_tx),
+                release: Some(release_rx),
+            };
+            let mut service = RequestCancellationService::new(inner, Arc::clone(&registry));
+
+            let request = JsonRpcRequest::build("textDocument/definition")
+                .id(request_id.clone())
+                .finish();
+            let request_fut = service.call(request);
+
+            let token = registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .expect("request token registered on service call");
+            assert!(!token.is_cancelled());
+
+            let request_task = tokio::spawn(request_fut);
+            assert!(
+                observed_rx.await.expect("inner future observed request"),
+                "inner future should see the task-local request token"
+            );
+
+            let cancel = JsonRpcRequest::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 99 }))
+                .finish();
+            service.call(cancel).await.expect("cancel request handled");
+
+            assert!(token.is_cancelled());
+            assert!(registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .is_some_and(|token| token.is_cancelled()));
+
+            release_tx.send(()).expect("release observed request");
+            let response = request_task
+                .await
+                .expect("request task completes")
+                .expect("inner service succeeds")
+                .expect("request has a response");
+            assert!(response.is_ok());
+            assert!(registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .is_none());
         }
     }
     /// Tests for saturating arithmetic used in priority scoring
