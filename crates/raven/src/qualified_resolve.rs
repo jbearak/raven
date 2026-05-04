@@ -7,20 +7,23 @@
 //! 1. Resolve `foo` via the existing position-aware scope.
 //! 2. Collect candidates from the defining file and the files that actually
 //!    contribute to the cursor's resolved cross-file scope:
-//!    - **Defining file**: `foo$bar <- ...` member-assignments and any
-//!      constructor-call named argument from the allowlist. Filtered by
-//!      same-function-scope and "effect position at or after the binding".
+//!    - **Defining file**: `foo$bar <- ...` member-assignments,
+//!      statically named string-subscript assignments like
+//!      `foo[["bar"]] <- ...`, and any constructor-call named argument
+//!      from the allowlist. Filtered by same-function-scope and
+//!      "effect position at or after the binding".
 //!      Defining-file candidates are also filtered by
 //!      `candidate_effect_visible_in_scope` and `candidate_lhs_matches_symbol`,
 //!      which excludes candidates past the parent file's `source()` site that
 //!      made the cursor file visible.
 //!    - **Every non-defining file in the cursor scope's contributor chain**:
-//!      each `foo$bar <- ...` site is validated by re-resolving `foo` at
-//!      that site's position via cross-file scope; only sites where `foo`
-//!      resolves to the *same* binding are kept. Using the resolved scope's
-//!      `chain` and per-file visible cutoffs avoids false positives from files
-//!      that merely depend on the cursor file or from parent files past the
-//!      `source()` call site that brought the cursor file into scope.
+//!      each `foo$bar <- ...` or statically named string-subscript site is
+//!      validated by re-resolving `foo` at that site's position via cross-file
+//!      scope; only sites where `foo` resolves to the *same* binding are kept.
+//!      Using the resolved scope's `chain` and per-file visible cutoffs avoids
+//!      false positives from files that merely depend on the cursor file or
+//!      from parent files past the `source()` call site that brought the cursor
+//!      file into scope.
 //! 3. Tie-break: `pick_winner` partitions all candidates by whether their
 //!    `uri` equals the cursor's. The in-cursor-file partition is filtered
 //!    by `effect <= cursor`, then the candidate with the latest effect
@@ -80,6 +83,114 @@ impl EffectPos {
             utf16_column: byte_offset_to_utf16_column(line_text, p.column),
         }
     }
+}
+
+fn member_assignment_candidate_from_extract(
+    assignment: Node,
+    target: Node,
+    text: &str,
+    file_uri: &Url,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+) -> Option<Candidate> {
+    if target.kind() != "extract_operator" {
+        return None;
+    }
+    let target_op = target.child_by_field_name("operator")?;
+    if !matches!(
+        (target_op.kind(), op),
+        ("$", ExtractOp::Dollar) | ("@", ExtractOp::At)
+    ) {
+        return None;
+    }
+    let t_lhs = target.child_by_field_name("lhs")?;
+    let t_rhs = target.child_by_field_name("rhs")?;
+    if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
+        return None;
+    }
+    let member_name = node_text(t_rhs, text);
+    if node_text(t_lhs, text) != lhs_name
+        || rhs_name.is_some_and(|rhs_name| member_name != rhs_name)
+    {
+        return None;
+    }
+    let lhs_range = node_range_in_text(t_lhs, text);
+    Some(Candidate {
+        name: member_name.to_string(),
+        uri: file_uri.clone(),
+        effect: EffectPos::from_node_end(assignment, text),
+        name_range: node_range_in_text(t_rhs, text),
+        fn_scope: enclosing_function_id(assignment),
+        lhs_pos: lhs_range.start,
+    })
+}
+
+fn member_assignment_candidate_from_string_subscript(
+    assignment: Node,
+    target: Node,
+    text: &str,
+    file_uri: &Url,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+) -> Option<Candidate> {
+    if op != ExtractOp::Dollar || !matches!(target.kind(), "subset" | "subset2") {
+        return None;
+    }
+    let t_lhs = target.child_by_field_name("function")?;
+    if t_lhs.kind() != "identifier" || node_text(t_lhs, text) != lhs_name {
+        return None;
+    }
+    let args = target.child_by_field_name("arguments")?;
+    let string_node = first_direct_string_argument(args)?;
+    let member_name = simple_string_literal_value(string_node, text)?;
+    if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
+        return None;
+    }
+    let lhs_range = node_range_in_text(t_lhs, text);
+    Some(Candidate {
+        name: member_name.to_string(),
+        uri: file_uri.clone(),
+        effect: EffectPos::from_node_end(assignment, text),
+        name_range: node_range_in_text(string_node, text),
+        fn_scope: enclosing_function_id(assignment),
+        lhs_pos: lhs_range.start,
+    })
+}
+
+fn first_direct_string_argument(args: Node) -> Option<Node> {
+    let mut walker = args.walk();
+    for child in args.children(&mut walker) {
+        if child.kind() == "string" {
+            return Some(child);
+        }
+        if child.kind() == "argument" {
+            if let Some(value) = child.child_by_field_name("value") {
+                if value.kind() == "string" {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn simple_string_literal_value<'a>(node: Node, text: &'a str) -> Option<&'a str> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(node, text);
+    let bytes = raw.as_bytes();
+    let (&quote, rest) = bytes.split_first()?;
+    if !matches!(quote, b'\'' | b'"') || rest.last().copied()? != quote || raw.len() < 2 {
+        return None;
+    }
+    let value = &raw[1..raw.len() - 1];
+    if value.is_empty() || value.contains('\\') || value.contains('\n') || value.contains('\r') {
+        return None;
+    }
+    Some(value)
 }
 
 #[derive(Debug, Clone)]
@@ -835,10 +946,13 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 }
 
 /// Walk `root` recursively, recording every `binary_operator` whose target
-/// is `extract_operator` matching `(lhs_name, op, rhs_name)` when `rhs_name`
-/// is provided, otherwise every RHS member. Each candidate
-/// records the position of its LHS identifier (`foo` in `foo$bar <- ...`)
-/// for use as a query position when validating cross-file candidates.
+/// is either an `extract_operator` (`foo$bar <- ...`, `foo@bar <- ...`) or,
+/// for dollar-member lookup, a statically named string subscript
+/// (`foo[["bar"]] <- ...`, `foo["bar"] <- ...`) matching
+/// `(lhs_name, op, rhs_name)` when `rhs_name` is provided, otherwise every
+/// RHS member. Each candidate records the position of its LHS identifier
+/// (`foo` in `foo$bar <- ...`) for use as a query position when validating
+/// cross-file candidates.
 fn collect_member_assignments(
     root: Node,
     text: &str,
@@ -867,42 +981,17 @@ fn collect_member_assignments(
             _ => continue,
         };
         let Some(target) = target else { continue };
-        if target.kind() != "extract_operator" {
-            continue;
-        }
-        let Some(target_op) = target.child_by_field_name("operator") else {
-            continue;
-        };
-        if !matches!(
-            (target_op.kind(), op),
-            ("$", ExtractOp::Dollar) | ("@", ExtractOp::At)
+        if let Some(candidate) = member_assignment_candidate_from_extract(
+            node, target, text, file_uri, lhs_name, rhs_name, op,
         ) {
+            out.push(candidate);
             continue;
         }
-        let Some(t_lhs) = target.child_by_field_name("lhs") else {
-            continue;
-        };
-        let Some(t_rhs) = target.child_by_field_name("rhs") else {
-            continue;
-        };
-        if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
-            continue;
+        if let Some(candidate) = member_assignment_candidate_from_string_subscript(
+            node, target, text, file_uri, lhs_name, rhs_name, op,
+        ) {
+            out.push(candidate);
         }
-        let member_name = node_text(t_rhs, text);
-        if node_text(t_lhs, text) != lhs_name
-            || rhs_name.is_some_and(|rhs_name| member_name != rhs_name)
-        {
-            continue;
-        }
-        let lhs_range = node_range_in_text(t_lhs, text);
-        out.push(Candidate {
-            name: member_name.to_string(),
-            uri: file_uri.clone(),
-            effect: EffectPos::from_node_end(node, text),
-            name_range: node_range_in_text(t_rhs, text),
-            fn_scope: enclosing_function_id(node),
-            lhs_pos: lhs_range.start,
-        });
     }
 }
 
@@ -1088,6 +1177,8 @@ fn nth_line(text: &str, n: usize) -> Option<&str> {
 mod tests {
     use crate::handlers::{goto_definition, goto_definition_with_cancel, DiagCancelToken};
     use crate::state::{Document, WorldState};
+    use std::sync::Arc;
+    use std::time::SystemTime;
     use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
 
     fn fresh_state() -> WorldState {
@@ -1101,6 +1192,38 @@ mod tests {
         state
             .documents
             .insert(url.clone(), Document::new(text, None));
+        url
+    }
+
+    fn add_indexed_doc(state: &mut WorldState, uri: &str, text: &str) -> Url {
+        let url = Url::parse(uri).expect("uri");
+        let doc = Document::new_with_uri(text, None, &url);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(text));
+        let artifacts = Arc::new(if let Some(tree) = doc.tree.as_ref() {
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                &url,
+                tree,
+                text,
+                Some(&metadata),
+            )
+        } else {
+            crate::cross_file::scope::ScopeArtifacts::default()
+        });
+        let snapshot = crate::cross_file::file_cache::FileSnapshot {
+            mtime: SystemTime::UNIX_EPOCH,
+            size: text.len() as u64,
+            content_hash: None,
+        };
+        let entry = crate::workspace_index::IndexEntry {
+            contents: doc.contents.clone(),
+            tree: doc.tree.clone(),
+            loaded_packages: doc.loaded_packages.clone(),
+            snapshot,
+            metadata,
+            artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(url.clone(), entry));
         url
     }
 
@@ -1192,6 +1315,27 @@ mod tests {
         assert_eq!(
             completion_names(&state, &uri, Position::new(2, 4), "foo"),
             vec!["alpha", "beta"]
+        );
+    }
+
+    /// Completion enumeration treats statically named string-subscript
+    /// assignments as list-member definitions too. Large R projects often mix
+    /// `foo$bar <- ...` with `foo[["baz"]] <- ...`; both create members that
+    /// should be offered after `foo$`.
+    #[test]
+    fn dollar_member_completion_includes_string_subscript_assignments() {
+        let mut state = fresh_state();
+        let code = "\
+foo <- list(alpha = 1)
+foo[[\"beta\"]] <- 2
+foo['gamma'] <- 3
+foo$
+";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        assert_eq!(
+            completion_names(&state, &uri, Position::new(3, 4), "foo"),
+            vec!["alpha", "beta", "gamma"]
         );
     }
 
@@ -1526,6 +1670,334 @@ foo$remote <- 1
         assert_eq!(
             completion_names(&state, &main_uri, Position::new(2, 4), "foo"),
             vec!["alpha", "local", "remote"]
+        );
+    }
+
+    /// Completion enumeration must also work when the sourced file is closed
+    /// and available only through the unified workspace index. This mirrors
+    /// the normal editor runtime more closely than tests that put every file
+    /// in the open-document map.
+    #[test]
+    fn dollar_member_completion_includes_closed_indexed_sourced_file_candidates() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$c.oos <- 1
+ww$seeds <- 2
+ww$
+";
+        let data_code = "\
+ww <- list()
+ww$name.w <- 1
+ww$income.group.i <- 2
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+
+        for (uri, code) in [(&main_uri, main_code), (&data_uri, data_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["c.oos", "income.group.i", "name.w", "seeds"]
+        );
+    }
+    /// Regression for workspaces where another file sources the cursor file:
+    /// parent-prefix symbols are available at the start of `main.R`, but a
+    /// direct `source()` inside `main.R` executes later and should become the
+    /// binding used for `$` member completion.
+    #[test]
+    fn dollar_member_completion_direct_source_overrides_inherited_parent_binding() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$c.oos <- 1
+ww$seeds <- 2
+ww$
+";
+        let data_code = "\
+ww <- list()
+ww$name.w <- 1
+ww$income.group.i <- 2
+";
+        let runner_code = "\
+make_parent_ww <- function() list()
+ww <- make_parent_ww()
+source(\"main.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&runner_uri, runner_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["c.oos", "income.group.i", "name.w", "seeds"]
+        );
+    }
+
+    /// Regression for workspaces where `main.R` first sources an unrelated
+    /// helper before the file that actually defines `ww`. The helper inherits a
+    /// parent-prefix `ww` through the graph, but sourcing it should not consume
+    /// the opportunity for a later direct source to override that inherited
+    /// binding.
+    #[test]
+    fn dollar_member_completion_direct_source_override_survives_unrelated_prior_source() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let helpers_code = "helper <- function() NULL\n";
+        let data_code = "\
+ww <- list()
+ww$remote <- 1
+";
+        let runner_code = "\
+ww <- list()
+ww$parent <- 1
+source(\"helpers.R\")
+source(\"main.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let helpers_uri = add_indexed_doc(&mut state, "file:///workspace/helpers.R", helpers_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&helpers_uri, helpers_code),
+            (&data_uri, data_code),
+            (&runner_uri, runner_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["local", "remote"]
+        );
+    }
+
+    /// Regression: resolving an earlier sibling source can recursively visit a
+    /// later direct source target at EOF. That path-local cycle guard must not
+    /// poison the later sibling source; `source("scripts/data.R")` in
+    /// `main.R` still has to execute and provide the `ww` binding used for
+    /// completion.
+    #[test]
+    fn dollar_member_completion_later_direct_source_survives_prior_recursive_sibling_visit() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let helpers_code = "helper <- function() NULL\n";
+        let data_code = "\
+ww <- list()
+ww$remote <- 1
+";
+        let runner_code = "\
+source(\"main.R\")
+source(\"helpers.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let helpers_uri = add_indexed_doc(&mut state, "file:///workspace/helpers.R", helpers_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&runner_uri, runner_code),
+            (&main_uri, main_code),
+            (&helpers_uri, helpers_code),
+            (&data_uri, data_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["local", "remote"]
+        );
+    }
+
+    /// Regression for a nested sourced file that later sources a helper which
+    /// is also sourced by an unrelated report/runner file. The helper does not
+    /// define `ww`; its unrelated parent-prefix `ww` must not replace the
+    /// `ww` from `scripts/data.R` or member completions lose earlier data
+    /// assignments.
+    #[test]
+    fn dollar_member_completion_ignores_unrelated_child_parent_prefix_binding() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let data_code = "\
+ww <- list()
+source(\"data/outcomes.R\")
+";
+        let outcomes_code = "\
+ww$early <- 1
+source(\"outcomes/late_helper.R\")
+ww$late <- 2
+";
+        let helper_code = "helper <- function() NULL\n";
+        let report_code = "\
+ww <- list()
+ww$report <- 1
+source(\"scripts/data/outcomes/late_helper.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let outcomes_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes.R",
+            outcomes_code,
+        );
+        let helper_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/late_helper.R",
+            helper_code,
+        );
+        let report_uri = add_indexed_doc(&mut state, "file:///workspace/report.R", report_code);
+
+        // Update the unrelated report first so its backward edge is present
+        // before the real caller edge from `outcomes.R`, reproducing the
+        // parent-selection shape from larger workspaces.
+        for (uri, code) in [
+            (&report_uri, report_code),
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&outcomes_uri, outcomes_code),
+            (&helper_uri, helper_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 3), "ww"),
+            vec!["early", "late", "local"]
+        );
+    }
+    /// A sourced file can itself source setup/data files before and between
+    /// many `ww$... <-` assignments. Completion should keep all direct member
+    /// assignments in that file, not only the final assignments after the last
+    /// nested `source()` call.
+    #[test]
+    fn dollar_member_completion_keeps_sourced_file_assignments_around_nested_sources() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let data_code = "\
+ww <- list()
+source(\"data/outcomes.R\")
+";
+        let outcomes_code = "\
+source(\"outcomes/abortions.R\")
+source(\"outcomes/intention.R\")
+ww$N <- 1
+ww$c.n <- 2
+source(\"outcomes/failure.R\")
+ww$H <- 3
+ww$point.h <- 4
+source(\"outcomes/intention.bias.terms.R\")
+ww$e.q <- 5
+ww$name.e <- 6
+";
+        let abortions_code = "abortions <- data.frame()\n";
+        let intention_code = "intention <- data.frame()\n";
+        let failure_code = "failure.points <- data.frame()\n";
+        let bias_code = "bias.terms <- list()\n";
+
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let outcomes_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes.R",
+            outcomes_code,
+        );
+        let abortions_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/abortions.R",
+            abortions_code,
+        );
+        let intention_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/intention.R",
+            intention_code,
+        );
+        let failure_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/failure.R",
+            failure_code,
+        );
+        let bias_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/intention.bias.terms.R",
+            bias_code,
+        );
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&outcomes_uri, outcomes_code),
+            (&abortions_uri, abortions_code),
+            (&intention_uri, intention_code),
+            (&failure_uri, failure_code),
+            (&bias_uri, bias_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 3), "ww"),
+            vec!["H", "N", "c.n", "e.q", "local", "name.e", "point.h"]
         );
     }
 
