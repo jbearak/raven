@@ -112,9 +112,7 @@ struct Candidate {
 /// (as `goto_definition` does) while calling this function so
 /// `get_cross_file_scope_with_cache` and subsequent scope lookups, including
 /// `candidate_lhs_matches_symbol`, observe the same graph/artifacts snapshot.
-/// The current implementation uses `DiagCancelToken::never()`; if
-/// request-cancellation is threaded through this path later, pass the request's
-/// token through these lookups while preserving the same snapshot invariant.
+#[allow(dead_code)]
 pub fn resolve_qualified_member(
     state: &WorldState,
     uri: &Url,
@@ -124,8 +122,31 @@ pub fn resolve_qualified_member(
     rhs_name: &str,
     op: ExtractOp,
 ) -> Option<Location> {
+    resolve_qualified_member_with_cancel(
+        state,
+        uri,
+        position,
+        lhs_node_kind,
+        lhs_name,
+        rhs_name,
+        op,
+        &DiagCancelToken::never(),
+    )
+}
+
+/// Cancellation-aware variant of [`resolve_qualified_member`].
+pub fn resolve_qualified_member_with_cancel(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    rhs_name: &str,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Option<Location> {
     // LHS shape gate — only bare `identifier` LHS is supported in Step 1.
-    if lhs_node_kind != "identifier" {
+    if lhs_node_kind != "identifier" || cancel.is_cancelled() {
         return None;
     }
     // Reuse parent-prefix work across the initial cursor lookup and the
@@ -134,19 +155,17 @@ pub fn resolve_qualified_member(
     // snapshot under the caller's read guard.
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
-    // The cancel token is `never()` until raven gains a backend-level
-    // request-cancellation registry (tracked in issue #158). Once that
-    // exists, thread the request's token through here and through
-    // `candidate_lhs_matches_symbol` so a superseded goto-def can bail
-    // out of the retain loop early.
     let scope = crate::handlers::get_cross_file_scope_with_cache(
         state,
         uri,
         position.line,
         position.character,
-        &DiagCancelToken::never(),
+        cancel,
         &mut prefix_cache,
     );
+    if cancel.is_cancelled() {
+        return None;
+    }
     let symbol = scope.symbols.get(lhs_name)?;
 
     // Package exports (pseudo-URIs like `package:dplyr`) are not navigable.
@@ -210,8 +229,18 @@ pub fn resolve_qualified_member(
         });
         defining_candidates.retain(|c| {
             candidate_effect_visible_in_scope(c, &scope.visible_positions)
-                && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, &mut prefix_cache)
+                && candidate_lhs_matches_symbol(
+                    state,
+                    c,
+                    lhs_name,
+                    symbol,
+                    cancel,
+                    &mut prefix_cache,
+                )
         });
+        if cancel.is_cancelled() {
+            return None;
+        }
     }
 
     // Phase 2: collect from every non-defining file that contributed to the
@@ -226,6 +255,9 @@ pub fn resolve_qualified_member(
         .iter()
         .filter(|candidate_uri| **candidate_uri != defining_uri)
     {
+        if cancel.is_cancelled() {
+            return None;
+        }
         if let Some((candidate_text, candidate_tree)) =
             crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
         {
@@ -242,8 +274,11 @@ pub fn resolve_qualified_member(
     }
     cross_file_candidates.retain(|c| {
         candidate_effect_visible_in_scope(c, &scope.visible_positions)
-            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, &mut prefix_cache)
+            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, cancel, &mut prefix_cache)
     });
+    if cancel.is_cancelled() {
+        return None;
+    }
 
     let mut all_candidates = defining_candidates;
     all_candidates.extend(cross_file_candidates);
@@ -375,16 +410,23 @@ fn candidate_lhs_matches_symbol(
     c: &Candidate,
     lhs_name: &str,
     symbol: &crate::cross_file::scope::ScopedSymbol,
+    cancel: &DiagCancelToken,
     prefix_cache: &mut crate::cross_file::scope::ParentPrefixCache,
 ) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
     let scope = crate::handlers::get_cross_file_scope_with_cache(
         state,
         &c.uri,
         c.lhs_pos.line,
         c.lhs_pos.character,
-        &DiagCancelToken::never(),
+        cancel,
         prefix_cache,
     );
+    if cancel.is_cancelled() {
+        return false;
+    }
     scope
         .symbols
         .get(lhs_name)
@@ -737,7 +779,7 @@ fn nth_line(text: &str, n: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::handlers::goto_definition;
+    use crate::handlers::{goto_definition, goto_definition_with_cancel, DiagCancelToken};
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
 
@@ -760,6 +802,21 @@ mod tests {
             Some(GotoDefinitionResponse::Scalar(l)) => l,
             other => panic!("expected Scalar location, got {:?}", other),
         }
+    }
+    /// Request-scoped cancellation short-circuits qualified-member lookup before
+    /// cross-file scope resolution returns a location.
+    #[test]
+    fn dollar_rhs_cancelled_request_returns_none() {
+        let mut state = fresh_state();
+        let code = "foo <- list(bar = 1)\nuse(foo$bar)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let cancel = DiagCancelToken::from_token(token);
+
+        let result = goto_definition_with_cancel(&state, &uri, Position::new(1, 9), &cancel);
+
+        assert!(result.is_none());
     }
 
     /// Cmd-click on the RHS of `$` in `foo$bar` finds the constructor-literal
