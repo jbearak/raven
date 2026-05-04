@@ -5,11 +5,20 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock as StdRwLock};
+use std::task::{Context, Poll};
 
 use serde::Deserialize;
 use tokio::sync::RwLock;
-use tower_lsp::jsonrpc::Result;
+use tokio_util::sync::CancellationToken;
+use tower::Service;
+use tower_lsp::jsonrpc::{
+    Error as JsonRpcError, Id as JsonRpcId, Request as JsonRpcRequest, Response as JsonRpcResponse,
+    Result,
+};
 use tower_lsp::lsp_types::*;
 use tower_lsp::Client;
 use tower_lsp::LanguageServer;
@@ -21,6 +30,9 @@ use crate::indentation;
 use crate::r_env;
 use crate::state::{scan_workspace, IndentationSettings, SymbolConfig, WorldState};
 use crate::utf16::utf16_column_to_byte_offset;
+tokio::task_local! {
+    static CURRENT_LSP_REQUEST_ID: JsonRpcId;
+}
 
 /// Category of files for on-demand indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,10 +573,174 @@ fn build_completion_trigger_chars(trigger_on_open_paren: bool) -> Vec<String> {
     chars
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancellableRequestKind {
+    GotoDefinition,
+}
+
+impl CancellableRequestKind {
+    fn from_method(method: &str) -> Option<Self> {
+        match method {
+            "textDocument/definition" => Some(Self::GotoDefinition),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveCancellableRequest {
+    kind: CancellableRequestKind,
+    token: CancellationToken,
+}
+
+/// Request-scoped cooperative cancellation registry for interactive LSP work.
+///
+/// `tower-lsp` only runs the built-in `$/cancelRequest` handler when that
+/// notification's future is polled. Raven keeps `Server::concurrency_level(1)`
+/// to preserve ordered text-sync handling, so cancellation notifications can sit
+/// behind an in-flight request. `RequestCancellationService` therefore updates
+/// this registry synchronously in `Service::call`, before tower-lsp queues the
+/// notification future, and request handlers poll the matching token while doing
+/// CPU-bound work under the `WorldState` read guard.
+#[derive(Debug, Default)]
+struct RequestCancellationRegistry {
+    active: StdRwLock<HashMap<JsonRpcId, ActiveCancellableRequest>>,
+}
+
+impl RequestCancellationRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(&self, id: JsonRpcId, kind: CancellableRequestKind) -> CancellationToken {
+        let token = CancellationToken::new();
+        let mut active = self.active.write().unwrap();
+
+        // Treat a newer request of the same interactive kind as superseding
+        // older ones. Editors usually send `$/cancelRequest`, but this keeps
+        // cursor-move storms responsive even when they do not.
+        for (active_id, request) in active.iter() {
+            if *active_id != id && request.kind == kind {
+                request.token.cancel();
+            }
+        }
+
+        if let Some(previous) = active.insert(
+            id,
+            ActiveCancellableRequest {
+                kind,
+                token: token.clone(),
+            },
+        ) {
+            previous.token.cancel();
+        }
+
+        token
+    }
+
+    fn cancel(&self, id: &JsonRpcId) {
+        let active = self.active.read().unwrap();
+        if let Some(request) = active.get(id) {
+            request.token.cancel();
+        }
+    }
+
+    fn complete(&self, id: &JsonRpcId) {
+        let mut active = self.active.write().unwrap();
+        active.remove(id);
+    }
+
+    fn token_for_current_request(
+        &self,
+        kind: CancellableRequestKind,
+    ) -> Option<handlers::DiagCancelToken> {
+        CURRENT_LSP_REQUEST_ID
+            .try_with(|id| self.token_for_id(id, kind))
+            .ok()
+            .flatten()
+            .map(handlers::DiagCancelToken::from_token)
+    }
+
+    fn token_for_id(
+        &self,
+        id: &JsonRpcId,
+        kind: CancellableRequestKind,
+    ) -> Option<CancellationToken> {
+        let active = self.active.read().unwrap();
+        let request = active.get(id)?;
+        (request.kind == kind).then(|| request.token.clone())
+    }
+}
+
+type RequestCancellationFuture<E> =
+    Pin<Box<dyn Future<Output = std::result::Result<Option<JsonRpcResponse>, E>> + Send + 'static>>;
+
+struct RequestCancellationService<S> {
+    inner: S,
+    registry: Arc<RequestCancellationRegistry>,
+}
+
+impl<S> RequestCancellationService<S> {
+    fn new(inner: S, registry: Arc<RequestCancellationRegistry>) -> Self {
+        Self { inner, registry }
+    }
+
+    fn cancel_from_params(&self, params: Option<&serde_json::Value>) {
+        let Some(params) = params else {
+            log::trace!("Received $/cancelRequest without params");
+            return;
+        };
+        match serde_json::from_value::<CancelParams>(params.clone()) {
+            Ok(params) => self.registry.cancel(&JsonRpcId::from(params.id)),
+            Err(err) => log::trace!("Ignoring malformed $/cancelRequest params: {err}"),
+        }
+    }
+}
+
+impl<S> Service<JsonRpcRequest> for RequestCancellationService<S>
+where
+    S: Service<JsonRpcRequest, Response = Option<JsonRpcResponse>> + Send + 'static,
+    S::Error: Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Option<JsonRpcResponse>;
+    type Error = S::Error;
+    type Future = RequestCancellationFuture<S::Error>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
+        if req.method() == "$/cancelRequest" {
+            self.cancel_from_params(req.params());
+        }
+
+        let kind = CancellableRequestKind::from_method(req.method());
+        let id = req.id().cloned();
+
+        if let (Some(kind), Some(id)) = (kind, id) {
+            self.registry.register(id.clone(), kind);
+            let fut = self.inner.call(req);
+            let registry = Arc::clone(&self.registry);
+            let scope_id = id.clone();
+
+            Box::pin(CURRENT_LSP_REQUEST_ID.scope(scope_id, async move {
+                let result = fut.await;
+                registry.complete(&id);
+                result
+            }))
+        } else {
+            Box::pin(self.inner.call(req))
+        }
+    }
+}
+
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<WorldState>>,
     background_indexer: Arc<crate::cross_file::BackgroundIndexer>,
+    request_cancellation: Arc<RequestCancellationRegistry>,
 }
 
 impl Backend {
@@ -625,7 +801,15 @@ impl Backend {
         }
         state.package_library_ready
     }
+    #[allow(dead_code)]
     pub fn new(client: Client) -> Self {
+        Self::new_with_request_cancellation(client, Arc::new(RequestCancellationRegistry::new()))
+    }
+
+    fn new_with_request_cancellation(
+        client: Client,
+        request_cancellation: Arc<RequestCancellationRegistry>,
+    ) -> Self {
         let library_paths = r_env::find_library_paths();
         log::info!("Discovered R library paths: {:?}", library_paths);
 
@@ -636,6 +820,7 @@ impl Backend {
             client,
             state,
             background_indexer,
+            request_cancellation,
         }
     }
 }
@@ -3365,12 +3550,32 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let state = self.state.read().await;
-        Ok(handlers::goto_definition(
+        let cancel = self
+            .request_cancellation
+            .token_for_current_request(CancellableRequestKind::GotoDefinition)
+            .unwrap_or_else(handlers::DiagCancelToken::never);
+        if cancel.is_cancelled() {
+            return Err(JsonRpcError::request_cancelled());
+        }
+        let state = tokio::select! {
+            state = self.state.read() => state,
+            _ = cancel.cancelled() => return Err(JsonRpcError::request_cancelled()),
+        };
+        if cancel.is_cancelled() {
+            return Err(JsonRpcError::request_cancelled());
+        }
+
+        let result = handlers::goto_definition_with_cancel(
             &state,
             &params.text_document_position_params.text_document.uri,
             params.text_document_position_params.position,
-        ))
+            &cancel,
+        );
+        if cancel.is_cancelled() {
+            return Err(JsonRpcError::request_cancelled());
+        }
+
+        Ok(result)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -4205,13 +4410,17 @@ impl Backend {
 pub async fn start_lsp() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-
-    let (service, socket) = LspService::build(Backend::new)
-        .custom_method(
-            "raven/activeDocumentsChanged",
-            Backend::handle_active_documents_changed,
-        )
-        .finish();
+    let request_cancellation = Arc::new(RequestCancellationRegistry::new());
+    let backend_request_cancellation = Arc::clone(&request_cancellation);
+    let (service, socket) = LspService::build(move |client| {
+        Backend::new_with_request_cancellation(client, Arc::clone(&backend_request_cancellation))
+    })
+    .custom_method(
+        "raven/activeDocumentsChanged",
+        Backend::handle_active_documents_changed,
+    )
+    .finish();
+    let service = RequestCancellationService::new(service, request_cancellation);
     // Force sequential message processing to prevent out-of-order did_change
     // notifications from corrupting incremental text sync.
     // tower-lsp 0.20 defaults to buffer_unordered(4) which can reorder messages.
@@ -4692,6 +4901,311 @@ async fn run_libpath_consumer(
 
 #[cfg(test)]
 mod tests {
+    mod request_cancellation {
+        use super::super::{
+            Backend, CancellableRequestKind, RequestCancellationRegistry,
+            RequestCancellationService, CURRENT_LSP_REQUEST_ID,
+        };
+        use std::convert::Infallible;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tower::Service;
+        use tower_lsp::jsonrpc::{
+            Id as JsonRpcId, Request as JsonRpcRequest, Response as JsonRpcResponse,
+        };
+        use tower_lsp::lsp_types::{GotoDefinitionParams, InitializeParams, InitializeResult};
+        use tower_lsp::{LanguageServer, LspService};
+
+        #[derive(Debug)]
+        struct DummyLanguageServer;
+
+        #[tower_lsp::async_trait]
+        impl LanguageServer for DummyLanguageServer {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+
+            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct ObservingService {
+            registry: Arc<RequestCancellationRegistry>,
+            observed: Option<oneshot::Sender<bool>>,
+            release: Option<oneshot::Receiver<()>>,
+        }
+
+        impl Service<JsonRpcRequest> for ObservingService {
+            type Response = Option<JsonRpcResponse>;
+            type Error = Infallible;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
+                let method = req.method().to_string();
+                let id = req.id().cloned();
+                if method != "textDocument/definition" {
+                    return Box::pin(async { Ok(None) });
+                }
+
+                let registry = Arc::clone(&self.registry);
+                let observed = self.observed.take().expect("single observed request");
+                let release = self.release.take().expect("single observed request");
+                Box::pin(async move {
+                    let token_visible = registry
+                        .token_for_current_request(CancellableRequestKind::GotoDefinition)
+                        .is_some_and(|token| !token.is_cancelled());
+                    observed.send(token_visible).ok();
+                    release.await.ok();
+                    Ok(id.map(|id| JsonRpcResponse::from_ok(id, serde_json::Value::Null)))
+                })
+            }
+        }
+
+        struct BackendGotoDefinitionService {
+            backend: Arc<Backend>,
+            registry: Arc<RequestCancellationRegistry>,
+            observed: Option<oneshot::Sender<bool>>,
+        }
+
+        impl Service<JsonRpcRequest> for BackendGotoDefinitionService {
+            type Response = Option<JsonRpcResponse>;
+            type Error = Infallible;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: JsonRpcRequest) -> Self::Future {
+                if req.method() != "textDocument/definition" {
+                    return Box::pin(async { Ok(None) });
+                }
+
+                let id = req.id().cloned().expect("definition request has id");
+                let params: GotoDefinitionParams = serde_json::from_value(
+                    req.params()
+                        .cloned()
+                        .expect("definition request has params"),
+                )
+                .expect("valid definition params");
+                let backend = Arc::clone(&self.backend);
+                let registry = Arc::clone(&self.registry);
+                let observed = self.observed.take().expect("single observed request");
+
+                Box::pin(async move {
+                    let token_visible = registry
+                        .token_for_current_request(CancellableRequestKind::GotoDefinition)
+                        .is_some_and(|token| !token.is_cancelled());
+                    observed.send(token_visible).ok();
+
+                    let body = Backend::goto_definition(&backend, params)
+                        .await
+                        .map(|result| serde_json::to_value(result).expect("serializable result"));
+                    Ok(Some(JsonRpcResponse::from_parts(id, body)))
+                })
+            }
+        }
+
+        #[test]
+        fn superseding_same_kind_cancels_older_request() {
+            let registry = RequestCancellationRegistry::new();
+            let first = registry.register(
+                JsonRpcId::from(1_i64),
+                CancellableRequestKind::GotoDefinition,
+            );
+            let second = registry.register(
+                JsonRpcId::from(2_i64),
+                CancellableRequestKind::GotoDefinition,
+            );
+
+            assert!(first.is_cancelled());
+            assert!(!second.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn current_request_token_tracks_registered_id() {
+            let registry = RequestCancellationRegistry::new();
+            let id = JsonRpcId::from("definition-1");
+            let token = registry.register(id.clone(), CancellableRequestKind::GotoDefinition);
+
+            let cancel = CURRENT_LSP_REQUEST_ID
+                .scope(id.clone(), async {
+                    registry
+                        .token_for_current_request(CancellableRequestKind::GotoDefinition)
+                        .expect("current request has token")
+                })
+                .await;
+
+            assert!(!cancel.is_cancelled());
+            registry.cancel(&id);
+            assert!(token.is_cancelled());
+            assert!(cancel.is_cancelled());
+
+            registry.complete(&id);
+            let missing = CURRENT_LSP_REQUEST_ID
+                .scope(id, async {
+                    registry.token_for_current_request(CancellableRequestKind::GotoDefinition)
+                })
+                .await;
+            assert!(missing.is_none());
+        }
+
+        #[test]
+        fn completed_request_has_no_token() {
+            let registry = RequestCancellationRegistry::new();
+            let id = JsonRpcId::from(7_i64);
+            registry.register(id.clone(), CancellableRequestKind::GotoDefinition);
+            registry.complete(&id);
+
+            assert!(registry
+                .token_for_id(&id, CancellableRequestKind::GotoDefinition)
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn unregistered_current_request_has_no_token() {
+            let registry = RequestCancellationRegistry::new();
+            let id = JsonRpcId::from("definition-1");
+
+            let missing = CURRENT_LSP_REQUEST_ID
+                .scope(id, async {
+                    registry.token_for_current_request(CancellableRequestKind::GotoDefinition)
+                })
+                .await;
+
+            assert!(missing.is_none());
+        }
+
+        #[tokio::test]
+        async fn service_registers_scopes_cancels_and_completes_request_tokens() {
+            let registry = Arc::new(RequestCancellationRegistry::new());
+            let request_id = JsonRpcId::from(99_i64);
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let inner = ObservingService {
+                registry: Arc::clone(&registry),
+                observed: Some(observed_tx),
+                release: Some(release_rx),
+            };
+            let mut service = RequestCancellationService::new(inner, Arc::clone(&registry));
+
+            let request = JsonRpcRequest::build("textDocument/definition")
+                .id(request_id.clone())
+                .finish();
+            let request_fut = service.call(request);
+
+            let token = registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .expect("request token registered on service call");
+            assert!(!token.is_cancelled());
+
+            let request_task = tokio::spawn(request_fut);
+            assert!(
+                observed_rx.await.expect("inner future observed request"),
+                "inner future should see the task-local request token"
+            );
+
+            let cancel = JsonRpcRequest::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 99 }))
+                .finish();
+            service.call(cancel).await.expect("cancel request handled");
+
+            assert!(token.is_cancelled());
+            assert!(registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .is_some_and(|token| token.is_cancelled()));
+
+            release_tx.send(()).expect("release observed request");
+            let response = request_task
+                .await
+                .expect("request task completes")
+                .expect("inner service succeeds")
+                .expect("request has a response");
+            assert!(response.is_ok());
+            assert!(registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn goto_definition_cancels_while_waiting_for_state_read_lock() {
+            let registry = Arc::new(RequestCancellationRegistry::new());
+            let (client_tx, client_rx) = std::sync::mpsc::channel();
+            let (_service, _socket) = LspService::new(|client| {
+                client_tx.send(client).expect("capture client");
+                DummyLanguageServer
+            });
+            let client = client_rx.recv().expect("client captured");
+            let backend = Arc::new(Backend::new_with_request_cancellation(
+                client,
+                Arc::clone(&registry),
+            ));
+
+            let _state_write_guard = backend.state.write().await;
+            let request_id = JsonRpcId::from(321_i64);
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let inner = BackendGotoDefinitionService {
+                backend: Arc::clone(&backend),
+                registry: Arc::clone(&registry),
+                observed: Some(observed_tx),
+            };
+            let mut service = RequestCancellationService::new(inner, Arc::clone(&registry));
+
+            let request = JsonRpcRequest::build("textDocument/definition")
+                .id(request_id.clone())
+                .params(serde_json::json!({
+                    "textDocument": { "uri": "file:///tmp/goto-definition-cancel.R" },
+                    "position": { "line": 0, "character": 0 }
+                }))
+                .finish();
+            let request_fut = service.call(request);
+
+            let token = registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .expect("request token registered on service call");
+            assert!(!token.is_cancelled());
+
+            let request_task = tokio::spawn(request_fut);
+            assert!(
+                observed_rx.await.expect("backend future observed request"),
+                "Backend::goto_definition should see the CURRENT_LSP_REQUEST_ID token"
+            );
+
+            let cancel = JsonRpcRequest::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 321 }))
+                .finish();
+            service.call(cancel).await.expect("cancel request handled");
+
+            assert!(token.is_cancelled());
+            let response = tokio::time::timeout(Duration::from_secs(1), request_task)
+                .await
+                .expect("Backend::goto_definition should cancel without acquiring state read lock")
+                .expect("request task completes")
+                .expect("inner service succeeds")
+                .expect("request has a response");
+            assert_eq!(
+                response.error(),
+                Some(&tower_lsp::jsonrpc::Error::request_cancelled())
+            );
+            assert!(registry
+                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                .is_none());
+        }
+    }
     /// Tests for saturating arithmetic used in priority scoring
     /// Validates Requirements 1.1, 1.2
     mod saturating_arithmetic {

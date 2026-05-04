@@ -48,6 +48,19 @@ impl DiagCancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.as_ref().is_some_and(|t| t.is_cancelled())
     }
+    /// Returns `true` for the no-op token created by [`DiagCancelToken::never`].
+    #[inline]
+    pub(crate) fn is_never(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Resolves when the computation should stop.
+    pub async fn cancelled(&self) {
+        match &self.0 {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
 }
 
 // ============================================================================
@@ -10687,11 +10700,25 @@ fn build_fallback_signature(
 /// let result = goto_definition(&state, &uri, pos);
 /// // `result` will be `Some(...)` when a navigable definition exists, otherwise `None`.
 /// ```
+#[allow(dead_code)]
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
+    goto_definition_with_cancel(state, uri, position, &DiagCancelToken::never())
+}
+
+/// Variant of [`goto_definition`] that cooperates with request-scoped cancellation.
+pub fn goto_definition_with_cancel(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    cancel: &DiagCancelToken,
+) -> Option<GotoDefinitionResponse> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     // Use ContentProvider for unified access
     let content_provider = state.content_provider();
 
@@ -10734,6 +10761,9 @@ pub fn goto_definition(
     }
 
     if doc.file_type == FileType::Stan {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let occurrences = collect_stan_identifier_occurrences(&text);
         let target = stan_identifier_at_position(&occurrences, position)?;
         let definition = find_stan_definition(&text, &target.name, position)?;
@@ -10748,6 +10778,9 @@ pub fn goto_definition(
     }
 
     if doc.file_type == FileType::Jags {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let occurrences = collect_jags_identifier_occurrences(&text);
         let target = stan_identifier_at_position(&occurrences, position)?;
 
@@ -10794,16 +10827,29 @@ pub fn goto_definition(
     if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node) {
         let rhs_name = node_text(node, &text);
         let lhs_name = node_text(lhs_node, &text);
-        return crate::qualified_resolve::resolve_qualified_member(
-            state,
-            uri,
-            position,
-            lhs_node.kind(),
-            lhs_name,
-            rhs_name,
-            op,
-        )
-        .map(GotoDefinitionResponse::Scalar);
+        let location = if cancel.is_never() {
+            crate::qualified_resolve::resolve_qualified_member(
+                state,
+                uri,
+                position,
+                lhs_node.kind(),
+                lhs_name,
+                rhs_name,
+                op,
+            )
+        } else {
+            crate::qualified_resolve::resolve_qualified_member_with_cancel(
+                state,
+                uri,
+                position,
+                lhs_node.kind(),
+                lhs_name,
+                rhs_name,
+                op,
+                cancel,
+            )
+        };
+        return location.map(GotoDefinitionResponse::Scalar);
     }
 
     let name = node_text(node, &text);
@@ -10813,13 +10859,7 @@ pub fn goto_definition(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(
-        state,
-        uri,
-        position.line,
-        position.character,
-        &DiagCancelToken::never(),
-    );
+    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel);
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
@@ -10889,6 +10929,9 @@ pub fn goto_definition(
 
     // Search all open documents using ContentProvider
     for file_uri in state.document_store.uris() {
+        if cancel.is_cancelled() {
+            return None;
+        }
         if &file_uri == uri {
             continue;
         }
@@ -10908,6 +10951,9 @@ pub fn goto_definition(
 
     // Search workspace index using ContentProvider
     for (file_uri, _) in state.workspace_index_new.iter() {
+        if cancel.is_cancelled() {
+            return None;
+        }
         if &file_uri == uri {
             continue;
         }
@@ -10927,6 +10973,9 @@ pub fn goto_definition(
 
     // Fallback: Search legacy open documents
     for (file_uri, doc) in &state.documents {
+        if cancel.is_cancelled() {
+            return None;
+        }
         if file_uri == uri {
             continue;
         }
@@ -10943,6 +10992,9 @@ pub fn goto_definition(
 
     // Fallback: Search legacy workspace index
     for (file_uri, doc) in &state.workspace_index {
+        if cancel.is_cancelled() {
+            return None;
+        }
         if file_uri == uri {
             continue;
         }
