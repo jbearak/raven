@@ -235,8 +235,8 @@ struct CandidateBatch {
 /// Resolves go-to-definition for a qualified member RHS (`bar` in `foo$bar` or
 /// `foo@bar`).
 ///
-/// Snapshot-scope invariant: this creates one `ParentPrefixCache` per
-/// `resolve_qualified_member` call and reuses it for the initial cursor lookup
+/// Snapshot-scope invariant: the shared candidate collector creates one
+/// `ParentPrefixCache` per request and reuses it for the initial cursor lookup
 /// plus all candidate validations. Callers must hold a `WorldState` read guard
 /// (as `goto_definition` does) while calling this function so
 /// `get_cross_file_scope_with_cache` and subsequent scope lookups, including
@@ -270,10 +270,10 @@ pub fn resolve_qualified_member(
 /// Cancellation-aware variant of [`resolve_qualified_member`].
 ///
 /// Same snapshot-scope invariant: callers must hold a `WorldState` read guard
-/// (as `goto_definition_with_cancel` does) so the single `ParentPrefixCache`
-/// created here, the initial `get_cross_file_scope_with_cache` lookup, and
-/// every per-candidate `candidate_lhs_matches_symbol` re-resolve all observe
-/// the same graph/artifacts snapshot.
+/// (as `goto_definition_with_cancel` does) so the shared collector's single
+/// `ParentPrefixCache`, the initial `get_cross_file_scope_with_cache` lookup,
+/// and every per-candidate `candidate_lhs_matches_symbol` re-resolve all
+/// observe the same graph/artifacts snapshot.
 ///
 /// `cancel` is polled cooperatively at scope-lookup and loop boundaries.
 /// Returns `None` on cancellation; passing [`DiagCancelToken::never`] yields
@@ -288,156 +288,22 @@ pub fn resolve_qualified_member_with_cancel(
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Option<Location> {
-    // LHS shape gate — only bare `identifier` LHS is supported in Step 1.
-    if lhs_node_kind != "identifier" || cancel.is_cancelled() {
-        return None;
-    }
-    // Reuse parent-prefix work across the initial cursor lookup and the
-    // per-candidate validation loop. A single qualified-member request can
-    // resolve many candidate positions, but all of them see the same state
-    // snapshot under the caller's read guard.
-    let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
-
-    let scope = crate::handlers::get_cross_file_scope_with_cache(
+    let batch = collect_qualified_member_candidates_with_cancel(
         state,
         uri,
-        position.line,
-        position.character,
-        cancel,
-        &mut prefix_cache,
-    );
-    if cancel.is_cancelled() {
-        return None;
-    }
-    let symbol = scope.symbols.get(lhs_name)?;
-
-    // Package exports (pseudo-URIs like `package:dplyr`) are not navigable.
-    if symbol.source_uri.as_str().starts_with("package:") {
-        return None;
-    }
-
-    let defining_uri = symbol.source_uri.clone();
-    let cursor_uri = uri.clone();
-
-    // Phase 1: collect from the defining file. Tree-local correctness gates
-    // (`fn_scope`, `effect_at_or_after`) apply because all candidates and
-    // the resolved `foo` come from the same AST.
-    let mut defining_candidates: Vec<Candidate> = Vec::new();
-    {
-        let (defining_text, defining_tree) =
-            crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
-        let symbol_fn_scope = function_scope_at(
-            &defining_tree,
-            &defining_text,
-            symbol.defined_line,
-            symbol.defined_column,
-        );
-        // A symbol's *visible-from* position is the end of its defining
-        // assignment, not the position of the LHS identifier — so a member
-        // assignment that occurs inside the RHS of `foo <- {...}` was binding
-        // the *previous* `foo` and must not match the new one. Falls back to
-        // the LHS anchor for non-assignment-defined symbols (parameters,
-        // for-variables, declared symbols).
-        let symbol_effect = symbol_visible_from_position(
-            &defining_tree,
-            &defining_text,
-            symbol.defined_line,
-            symbol.defined_column,
-            lhs_name,
-        );
-
-        collect_member_assignments(
-            defining_tree.root_node(),
-            &defining_text,
-            &defining_uri,
-            lhs_name,
-            Some(rhs_name),
-            op,
-            &mut defining_candidates,
-        );
-        if let Some(c) = collect_constructor_candidate(
-            &defining_tree,
-            &defining_text,
-            &defining_uri,
-            symbol.defined_line,
-            symbol.defined_column,
-            lhs_name,
-            rhs_name,
-        ) {
-            defining_candidates.push(c);
-        }
-
-        defining_candidates.retain(|c| {
-            c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
-        });
-        defining_candidates.retain(|c| {
-            candidate_effect_visible_in_scope(c, &scope.visible_positions)
-                && candidate_lhs_matches_symbol(
-                    state,
-                    c,
-                    lhs_name,
-                    symbol,
-                    cancel,
-                    &mut prefix_cache,
-                )
-        });
-        if cancel.is_cancelled() {
-            return None;
-        }
-    }
-
-    // Phase 2: collect from every non-defining file that contributed to the
-    // cursor's resolved scope. Tree-local IDs are not comparable to those in
-    // the defining tree, so we replace the `fn_scope` gate with a per-site
-    // scope-resolve: at the LHS identifier's position, does `foo` resolve to
-    // the *same* binding we navigated from?
-    let mut cross_file_candidates: Vec<Candidate> = Vec::new();
-    let contributor_ranks = contributor_file_ranks(&scope.chain);
-    for candidate_uri in scope
-        .chain
-        .iter()
-        .filter(|candidate_uri| **candidate_uri != defining_uri)
-    {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        if let Some((candidate_text, candidate_tree)) =
-            crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
-        {
-            collect_member_assignments(
-                candidate_tree.root_node(),
-                &candidate_text,
-                candidate_uri,
-                lhs_name,
-                Some(rhs_name),
-                op,
-                &mut cross_file_candidates,
-            );
-        }
-    }
-    cross_file_candidates.retain(|c| {
-        candidate_effect_visible_in_scope(c, &scope.visible_positions)
-            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, cancel, &mut prefix_cache)
-    });
-    if cancel.is_cancelled() {
-        return None;
-    }
-
-    let mut all_candidates = defining_candidates;
-    all_candidates.extend(cross_file_candidates);
-    let contributor_distances = contributor_file_distances(
-        &state.cross_file_graph,
-        &cursor_uri,
-        &scope.chain,
-        &scope.visible_positions,
-        all_candidates.iter().map(|candidate| &candidate.uri),
-    );
-    pick_winner(
-        all_candidates,
-        &cursor_uri,
         position,
-        &contributor_ranks,
-        &contributor_distances,
+        lhs_node_kind,
+        lhs_name,
+        Some(rhs_name),
+        op,
+        cancel,
+    )?;
+    pick_winner(
+        batch.candidates,
+        &batch.cursor_uri,
+        batch.cursor,
+        &batch.contributor_ranks,
+        &batch.contributor_distances,
     )
     .map(|c| Location {
         uri: c.uri,
@@ -597,16 +463,30 @@ fn collect_qualified_member_candidates_with_cancel(
             op,
             &mut defining_candidates,
         );
-        collect_constructor_candidates(
-            &defining_tree,
-            &defining_text,
-            &defining_uri,
-            symbol.defined_line,
-            symbol.defined_column,
-            lhs_name,
-            rhs_name,
-            &mut defining_candidates,
-        );
+        if let Some(rhs_name) = rhs_name {
+            if let Some(candidate) = collect_constructor_candidate(
+                &defining_tree,
+                &defining_text,
+                &defining_uri,
+                symbol.defined_line,
+                symbol.defined_column,
+                lhs_name,
+                rhs_name,
+            ) {
+                defining_candidates.push(candidate);
+            }
+        } else {
+            collect_constructor_candidates(
+                &defining_tree,
+                &defining_text,
+                &defining_uri,
+                symbol.defined_line,
+                symbol.defined_column,
+                lhs_name,
+                rhs_name,
+                &mut defining_candidates,
+            );
+        }
 
         defining_candidates.retain(|c| {
             c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
@@ -1240,7 +1120,7 @@ mod tests {
         position: Position,
         lhs_name: &str,
     ) -> Vec<String> {
-        let mut names = super::complete_qualified_members(
+        super::complete_qualified_members(
             state,
             uri,
             position,
@@ -1250,9 +1130,7 @@ mod tests {
         )
         .into_iter()
         .map(|completion| completion.name)
-        .collect::<Vec<_>>();
-        names.sort();
-        names
+        .collect::<Vec<_>>()
     }
     /// Request-scoped cancellation short-circuits qualified-member lookup before
     /// cross-file scope resolution returns a location.

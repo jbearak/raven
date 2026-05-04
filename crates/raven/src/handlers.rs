@@ -8625,7 +8625,7 @@ fn detect_dollar_member_completion_context(
     if lhs_start == dollar_byte || !is_r_identifier_start_byte(bytes[lhs_start]) {
         return None;
     }
-    if lhs_start > 0 && matches!(bytes[lhs_start - 1], b':' | b'$' | b'@') {
+    if lhs_start > 0 && matches!(bytes[lhs_start - 1], b':' | b'@') {
         return None;
     }
 
@@ -38679,6 +38679,17 @@ mod dollar_member_completion_tests {
             }
             other => panic!("expected text edit for beta completion, got {:?}", other),
         }
+    }
+    #[test]
+    fn dollar_member_completion_detects_lhs_after_dollar_chain() {
+        let (code, position) = code_and_position("foo$bar$|");
+        let doc = Document::new(&code, None);
+        let context =
+            detect_dollar_member_completion_context(doc.tree.as_ref().unwrap(), &code, position)
+                .expect("dollar-chain completion context");
+
+        assert_eq!(context.lhs_name, "bar");
+        assert_eq!(context.typed_prefix, "");
     }
 
     #[test]
