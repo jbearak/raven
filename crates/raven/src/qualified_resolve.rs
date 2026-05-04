@@ -139,6 +139,16 @@ pub fn resolve_qualified_member(
 }
 
 /// Cancellation-aware variant of [`resolve_qualified_member`].
+///
+/// Same snapshot-scope invariant: callers must hold a `WorldState` read guard
+/// (as `goto_definition_with_cancel` does) so the single `ParentPrefixCache`
+/// created here, the initial `get_cross_file_scope_with_cache` lookup, and
+/// every per-candidate `candidate_lhs_matches_symbol` re-resolve all observe
+/// the same graph/artifacts snapshot.
+///
+/// `cancel` is polled cooperatively at scope-lookup and loop boundaries.
+/// Returns `None` on cancellation; passing [`DiagCancelToken::never`] yields
+/// the same behavior as [`resolve_qualified_member`].
 pub fn resolve_qualified_member_with_cancel(
     state: &WorldState,
     uri: &Url,
