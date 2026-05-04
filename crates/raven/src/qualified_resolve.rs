@@ -103,6 +103,18 @@ struct Candidate {
     lhs_pos: Position,
 }
 
+/// Resolves go-to-definition for a qualified member RHS (`bar` in `foo$bar` or
+/// `foo@bar`).
+///
+/// Snapshot-scope invariant: this creates one `ParentPrefixCache` per
+/// `resolve_qualified_member` call and reuses it for the initial cursor lookup
+/// plus all candidate validations. Callers must hold a `WorldState` read guard
+/// (as `goto_definition` does) while calling this function so
+/// `get_cross_file_scope_with_cache` and subsequent scope lookups, including
+/// `candidate_lhs_matches_symbol`, observe the same graph/artifacts snapshot.
+/// The current implementation uses `DiagCancelToken::never()`; if
+/// request-cancellation is threaded through this path later, pass the request's
+/// token through these lookups while preserving the same snapshot invariant.
 pub fn resolve_qualified_member(
     state: &WorldState,
     uri: &Url,
