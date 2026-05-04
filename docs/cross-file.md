@@ -388,7 +388,9 @@ file that actually contributes to the cursor's cross-file scope:
 - **Member assignments** — any `foo$bar <- …` (or `foo@bar <- …`) statement in
   the defining file or a contributing cross-file source/parent file, as long
   as re-resolving `foo` at that assignment site still points to the same
-  binding.
+  binding. For `$`, statically named string-subscript assignments such as
+  `foo[["bar"]] <- …` and `foo["bar"] <- …` are treated as member assignments
+  too.
 - **Constructor-literal members** — when `foo`'s defining assignment's RHS
   is a call to one of `list`, `c`, `data.frame`, `tibble`, `data.table`,
   `environment`, `list2env`, or `new`, the named argument matching `bar` is a
@@ -401,6 +403,21 @@ the contributing cross-file chain, then chooses that file's latest matching
 assignment. If no qualified candidate exists, go-to-definition returns nothing
 — Raven does not fall back to a free-variable lookup for the RHS of `$`/`@`.
 
+Raven also provides scope-aware completions after `$` when the left-hand side
+is a bare identifier, such as `foo$` or `foo$ba`. Completion uses the same
+position-aware binding and cross-file candidate rules as `$` go-to-definition:
+named arguments from the allowlisted constructors above, visible
+`foo$bar <- ...` assignments, and visible static string-subscript assignments
+such as `foo[["bar"]] <- ...` are offered as field completions. When a partial
+member name is already typed, the completion edit replaces only that member
+token and does not insert another `$`.
+
+If the object before `$` cannot be resolved, or if the access shape is outside
+the supported bare-identifier form, Raven returns an empty member-completion
+list for that `$` context instead of falling back to unrelated normal R
+completions.
+
 Out of scope today: S4 slot resolution from `setClass`, R6 fields/methods,
-aliasing (`foo <- bar; foo$x`), function-return inference, package-data
-introspection, and chained access (`foo$bar$baz` returns nothing).
+`@` completions, aliasing (`foo <- bar; foo$x`), function-return inference,
+package-data introspection, non-bare left-hand sides, completions inside
+`[[`/`[` syntax itself, and chained access (`foo$bar$baz` returns nothing).

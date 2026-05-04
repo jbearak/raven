@@ -132,6 +132,12 @@ For **AST-detected `source()` calls only**, Raven attempts:
 
 This fallback must **not** apply to backward directives.
 
+### Parent-prefix scope and forward-source traversal
+
+Scope resolution has two distinct graph traversals:
+- **Parent prefix**: when resolving a file, Raven first walks backward edges to model symbols available at the start of that file. Symbols introduced only by this prefix are tracked separately so they can be filtered when a child is re-exported through a forward `source()` edge.
+- **Forward sources**: Raven then applies the file's local timeline. When following `source()` calls, real forward-source execution uses a path-local copy of the visited map so one sourced sibling's recursive walk cannot make a later sibling source look already visited. Parent-prefix discovery keeps shared visited pruning to avoid expanding every possible parent/forward path while collecting inherited context.
+
 ### Interface hash + selective invalidation
 
 `ScopeArtifacts` includes an `interface_hash` used to avoid cascading revalidation when edits don’t change a file’s “exported interface”.

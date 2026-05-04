@@ -8582,6 +8582,210 @@ fn ts_point_to_lsp_position(text: &str, point: Point) -> Position {
     Position::new(point.row as u32, character)
 }
 
+#[derive(Debug, Clone)]
+struct DollarMemberCompletionContext {
+    lhs_name: String,
+    typed_prefix: String,
+    replace_range: Range,
+}
+
+fn detect_dollar_member_completion_context(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    position: Position,
+) -> Option<DollarMemberCompletionContext> {
+    let line_idx = position.line as usize;
+    let line = text.lines().nth(line_idx)?;
+    let cursor_byte = utf16_column_to_byte_offset(line, position.character).min(line.len());
+
+    if position_in_string_or_comment(tree, line_idx, cursor_byte) {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let mut token_start = cursor_byte;
+    while token_start > 0 && is_r_identifier_continue_byte(bytes[token_start - 1]) {
+        token_start -= 1;
+    }
+
+    let mut token_end = cursor_byte;
+    while token_end < bytes.len() && is_r_identifier_continue_byte(bytes[token_end]) {
+        token_end += 1;
+    }
+
+    if token_start == 0 || bytes[token_start - 1] != b'$' {
+        return None;
+    }
+
+    let dollar_byte = token_start - 1;
+    let mut lhs_start = dollar_byte;
+    while lhs_start > 0 && is_r_identifier_continue_byte(bytes[lhs_start - 1]) {
+        lhs_start -= 1;
+    }
+    if lhs_start == dollar_byte || !is_r_identifier_start_byte(bytes[lhs_start]) {
+        return None;
+    }
+    if lhs_start > 0 && matches!(bytes[lhs_start - 1], b':' | b'@') {
+        return None;
+    }
+
+    let lhs_name = line[lhs_start..dollar_byte].to_string();
+    let typed_prefix = line[token_start..cursor_byte].to_string();
+    let start_character = crate::utf16::byte_offset_to_utf16_column(line, token_start);
+    let end_character = crate::utf16::byte_offset_to_utf16_column(line, token_end);
+
+    Some(DollarMemberCompletionContext {
+        lhs_name,
+        typed_prefix,
+        replace_range: Range {
+            start: Position::new(position.line, start_character),
+            end: Position::new(position.line, end_character),
+        },
+    })
+}
+
+fn position_in_string_or_comment(
+    tree: &tree_sitter::Tree,
+    line_idx: usize,
+    cursor_byte: usize,
+) -> bool {
+    let check_byte = cursor_byte.saturating_sub(1);
+    let point = Point::new(line_idx, check_byte);
+    let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return false;
+    };
+    loop {
+        let kind = node.kind();
+        if kind == "comment" || kind.contains("string") {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn is_r_identifier_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'.' || byte == b'_'
+}
+
+fn is_r_identifier_continue_byte(byte: u8) -> bool {
+    is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
+}
+
+fn dollar_member_completion_items(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    context: &DollarMemberCompletionContext,
+) -> Vec<CompletionItem> {
+    crate::qualified_resolve::complete_qualified_members(
+        state,
+        uri,
+        position,
+        "identifier",
+        &context.lhs_name,
+        crate::extract_op::ExtractOp::Dollar,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        context.typed_prefix.is_empty() || candidate.name.starts_with(&context.typed_prefix)
+    })
+    .map(|candidate| {
+        let detail = if candidate.uri == *uri {
+            format!("member of {}", context.lhs_name)
+        } else {
+            let relative_path =
+                compute_relative_path(&candidate.uri, state.workspace_folders.first());
+            format!("member of {} from {}", context.lhs_name, relative_path)
+        };
+        CompletionItem {
+            label: candidate.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(detail),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, candidate.name)),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: context.replace_range,
+                new_text: candidate.name,
+            })),
+            ..Default::default()
+        }
+    })
+    .collect()
+}
+
+fn push_scoped_symbol_completion(
+    state: &WorldState,
+    request_uri: &Url,
+    name: &str,
+    symbol: &ScopedSymbol,
+    items: &mut Vec<CompletionItem>,
+    seen_names: &mut std::collections::HashSet<String>,
+) {
+    if symbol.source_uri.as_str().starts_with("package:") || seen_names.contains(name) {
+        return;
+    }
+
+    let name_string = name.to_string();
+    seen_names.insert(name_string.clone());
+
+    // Align with R-LS: use FIELD for variables/parameters, FUNCTION for functions.
+    let kind = match symbol.kind {
+        crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
+        crate::cross_file::SymbolKind::Variable => CompletionItemKind::FIELD,
+        crate::cross_file::SymbolKind::Parameter => CompletionItemKind::FIELD,
+    };
+
+    let is_cross_file = symbol.source_uri.as_str() != request_uri.as_str();
+    let sort_prefix = if is_cross_file {
+        SORT_PREFIX_WORKSPACE
+    } else {
+        SORT_PREFIX_SCOPE
+    };
+
+    // Use signature if available, otherwise show source file for cross-file symbols.
+    let relative_path = if is_cross_file {
+        Some(compute_relative_path(
+            &symbol.source_uri,
+            state.workspace_folders.first(),
+        ))
+    } else {
+        None
+    };
+    let detail = match (&symbol.signature, is_cross_file) {
+        (Some(sig), _) => Some(sig.clone()),
+        (None, true) => Some(format!("from {}", relative_path.as_ref().unwrap())),
+        (None, false) => None,
+    };
+
+    // For user-defined functions from scope, include data for
+    // completionItem/resolve to locate the roxygen block for documentation.
+    let data = if kind == CompletionItemKind::FUNCTION {
+        let mut json = serde_json::json!({
+            "type": "user_function",
+            "function_name": name_string.clone(),
+            "uri": symbol.source_uri.to_string(),
+            "func_line": symbol.defined_line,
+        });
+        if let Some(rel) = &relative_path {
+            json["relative_path"] = serde_json::Value::String(rel.clone());
+        }
+        Some(json)
+    } else {
+        None
+    };
+
+    items.push(CompletionItem {
+        label: name_string.clone(),
+        kind: Some(kind),
+        detail,
+        sort_text: Some(format!("{}{}", sort_prefix, name_string)),
+        data,
+        ..Default::default()
+    });
+}
+
 pub fn completion(
     state: &WorldState,
     uri: &Url,
@@ -8642,6 +8846,10 @@ pub fn completion(
         return Some(CompletionResponse::Array(items));
     }
 
+    if let Some(member_context) = detect_dollar_member_completion_context(tree, &text, position) {
+        let items = dollar_member_completion_items(state, uri, position, &member_context);
+        return Some(CompletionResponse::Array(items));
+    }
     let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
@@ -8681,10 +8889,7 @@ pub fn completion(
         seen_names.insert(constant.to_string());
     }
 
-    // Add symbols from current document (local definitions take precedence)
-    collect_document_completions(tree.root_node(), &text, uri, &mut items, &mut seen_names);
-
-    // Get scope at cursor position for package exports
+    // Get scope at cursor position for visible local/cross-file symbols and package exports.
     // Requirements 9.1, 9.2: Add package exports to completions with package attribution
     let scope = get_cross_file_scope(
         state,
@@ -8693,6 +8898,23 @@ pub fn completion(
         position.character,
         &DiagCancelToken::never(),
     );
+
+    // Add visible same-file symbols first so local definitions take precedence
+    // over package exports without leaking future or out-of-scope assignments.
+    for (name, symbol) in scope
+        .symbols
+        .iter()
+        .filter(|(_, symbol)| symbol.source_uri.as_str() == uri.as_str())
+    {
+        push_scoped_symbol_completion(
+            state,
+            uri,
+            name.as_ref(),
+            symbol,
+            &mut items,
+            &mut seen_names,
+        );
+    }
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
@@ -8752,75 +8974,22 @@ pub fn completion(
         }
     }
 
-    // Add cross-file symbols (from scope resolution)
+    // Add visible cross-file symbols after package exports.
     // Requirement 9.5: Package exports > cross-file symbols
     // Requirement 9.6: Function signatures SHALL appear in completion detail field
-    for (name, symbol) in scope.symbols {
-        if seen_names.contains(name.as_ref()) {
-            continue; // Local definitions and package exports take precedence
-        }
-        let name_string = name.to_string();
-        seen_names.insert(name_string.clone());
-
-        // Align with R-LS: use FIELD for variables/parameters, FUNCTION for functions
-        let kind = match symbol.kind {
-            crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
-            crate::cross_file::SymbolKind::Variable => CompletionItemKind::FIELD,
-            crate::cross_file::SymbolKind::Parameter => CompletionItemKind::FIELD,
-        };
-
-        // Determine sort prefix: same file (scope) vs other files (workspace)
-        let sort_prefix = if symbol.source_uri == *uri {
-            SORT_PREFIX_SCOPE
-        } else {
-            SORT_PREFIX_WORKSPACE
-        };
-
-        // Use signature if available, otherwise show source file for cross-file symbols.
-        // For cross-file functions, the file location is shown in the documentation
-        // field (via resolve) since VS Code renders `detail` as a single line.
-        let is_cross_file = symbol.source_uri != *uri;
-        let relative_path = if is_cross_file {
-            Some(compute_relative_path(
-                &symbol.source_uri,
-                state.workspace_folders.first(),
-            ))
-        } else {
-            None
-        };
-
-        let detail = match (&symbol.signature, is_cross_file) {
-            (Some(sig), _) => Some(sig.clone()),
-            (None, true) => Some(format!("from {}", relative_path.as_ref().unwrap())),
-            (None, false) => None,
-        };
-
-        // For user-defined functions from cross-file scope, include data for
-        // completionItem/resolve to locate the roxygen block for documentation.
-        // Cross-file functions also include the relative path for the documentation panel.
-        let data = if kind == CompletionItemKind::FUNCTION {
-            let mut json = serde_json::json!({
-                "type": "user_function",
-                "function_name": name_string,
-                "uri": symbol.source_uri.to_string(),
-                "func_line": symbol.defined_line,
-            });
-            if let Some(rel) = &relative_path {
-                json["relative_path"] = serde_json::Value::String(rel.clone());
-            }
-            Some(json)
-        } else {
-            None
-        };
-
-        items.push(CompletionItem {
-            label: name_string.clone(),
-            kind: Some(kind),
-            detail,
-            sort_text: Some(format!("{}{}", sort_prefix, name_string)),
-            data,
-            ..Default::default()
-        });
+    for (name, symbol) in scope
+        .symbols
+        .iter()
+        .filter(|(_, symbol)| symbol.source_uri.as_str() != uri.as_str())
+    {
+        push_scoped_symbol_completion(
+            state,
+            uri,
+            name.as_ref(),
+            symbol,
+            &mut items,
+            &mut seen_names,
+        );
     }
 
     // Filter out reserved words from identifier completions
@@ -9041,122 +9210,6 @@ fn find_namespace_context<'a>(node: &Node<'a>, text: &'a str) -> Option<&'a str>
             }
         }
         current = current.parent()?;
-    }
-}
-
-/// Extract function signature for completion detail field.
-/// Returns a string like "function_name(x, y = 10)".
-fn extract_function_signature_for_completion(func_node: Node, name: &str, text: &str) -> String {
-    let mut cursor = func_node.walk();
-    for child in func_node.children(&mut cursor) {
-        if child.kind() == "parameters" {
-            let params: String = node_text(child, text)
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            return format!("{}{}", name, params);
-        }
-    }
-    format!("{}()", name)
-}
-
-fn collect_document_completions(
-    node: Node,
-    text: &str,
-    uri: &Url,
-    items: &mut Vec<CompletionItem>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    if node.kind() == "binary_operator" {
-        let mut cursor = node.walk();
-        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-
-        if children.len() >= 3 {
-            let lhs = children[0];
-            let op = children[1];
-            let rhs = children[2];
-
-            let op_text = node_text(op, text);
-
-            // Handle left-arrow assignments: name <- value
-            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
-                let name = node_text(lhs, text).to_string();
-                if !seen.contains(&name) {
-                    seen.insert(name.clone());
-                    // Align with R-LS: use FIELD for variables, FUNCTION for functions
-                    let (kind, detail) = if rhs.kind() == "function_definition" {
-                        // Extract function signature for detail field
-                        let sig = extract_function_signature_for_completion(rhs, &name, text);
-                        (CompletionItemKind::FUNCTION, Some(sig))
-                    } else {
-                        (CompletionItemKind::FIELD, None)
-                    };
-
-                    // For user-defined functions, include data for completionItem/resolve
-                    // to locate the roxygen block for documentation
-                    let data = if kind == CompletionItemKind::FUNCTION {
-                        Some(serde_json::json!({
-                            "type": "user_function",
-                            "function_name": name,
-                            "uri": uri.to_string(),
-                            "func_line": lhs.start_position().row as u32,
-                        }))
-                    } else {
-                        None
-                    };
-
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(kind),
-                        detail,
-                        sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
-                        data,
-                        ..Default::default()
-                    });
-                }
-            }
-
-            // Handle right-arrow assignments: value -> name
-            if matches!(op_text, "->" | "->>") && rhs.kind() == "identifier" {
-                let name = node_text(rhs, text).to_string();
-                if !seen.contains(&name) {
-                    seen.insert(name.clone());
-                    let (kind, detail) = if lhs.kind() == "function_definition" {
-                        let sig = extract_function_signature_for_completion(lhs, &name, text);
-                        (CompletionItemKind::FUNCTION, Some(sig))
-                    } else {
-                        (CompletionItemKind::FIELD, None)
-                    };
-
-                    let data = if kind == CompletionItemKind::FUNCTION {
-                        Some(serde_json::json!({
-                            "type": "user_function",
-                            "function_name": name,
-                            "uri": uri.to_string(),
-                            "func_line": lhs.start_position().row as u32,
-                        }))
-                    } else {
-                        None
-                    };
-
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(kind),
-                        detail,
-                        sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, name)),
-                        data,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_document_completions(child, text, uri, items, seen);
     }
 }
 
@@ -11758,7 +11811,7 @@ mod tests {
         let tree = parse_r_code(code);
 
         let func_node = find_function_definition(tree.root_node()).unwrap();
-        let signature = extract_function_signature_for_completion(func_node, "f", code);
+        let signature = extract_function_signature(func_node, "f", code);
         assert_eq!(signature, "f(a, b, c = 1)");
     }
 
@@ -38499,6 +38552,372 @@ result <- undefined_var
         );
 
         // If we reached here without panicking, the utility works correctly.
+    }
+}
+#[cfg(test)]
+mod dollar_member_completion_tests {
+    use super::*;
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{
+        CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Position, Url,
+    };
+
+    fn completion_items(marked_code: &str) -> Vec<CompletionItem> {
+        let (code, position) = code_and_position(marked_code);
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(&code, None));
+
+        match completion(&state, &uri, position, None) {
+            Some(CompletionResponse::Array(items)) => items,
+            other => panic!("expected completion array, got {:?}", other),
+        }
+    }
+
+    fn completion_items_in_workspace(
+        main_marked_code: &str,
+        helper_code: &str,
+    ) -> Vec<CompletionItem> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+        let (main_code, position) = code_and_position(main_marked_code);
+        std::fs::write(&main_path, &main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_uri = Url::from_file_path(workspace_path).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_uri.clone());
+        state
+            .documents
+            .insert(helper_uri.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(&main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_uri,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_uri),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_uri,
+            &crate::cross_file::extract_metadata(&main_code),
+            Some(&workspace_uri),
+            |_| None,
+        );
+
+        match completion(&state, &main_uri, position, None) {
+            Some(CompletionResponse::Array(items)) => items,
+            other => panic!("expected completion array, got {:?}", other),
+        }
+    }
+
+    fn code_and_position(marked_code: &str) -> (String, Position) {
+        let marker = marked_code.find('|').expect("cursor marker");
+        let prefix = &marked_code[..marker];
+        let line = prefix.chars().filter(|&ch| ch == '\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        let mut code = marked_code.to_string();
+        code.remove(marker);
+        (code, Position::new(line, character))
+    }
+
+    fn sorted_labels(items: &[CompletionItem]) -> Vec<String> {
+        let mut labels = items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    }
+
+    #[test]
+    fn dollar_member_completion_lists_constructor_members() {
+        let items = completion_items("foo <- list(alpha = 1, beta = 2)\nfoo$|");
+
+        assert_eq!(sorted_labels(&items), vec!["alpha", "beta"]);
+        assert!(items
+            .iter()
+            .all(|item| item.kind == Some(CompletionItemKind::FIELD)));
+    }
+
+    #[test]
+    fn dollar_member_completion_lists_data_frame_members() {
+        let items = completion_items("df <- data.frame(age = 1, sex = \"F\")\ndf$|");
+
+        assert_eq!(sorted_labels(&items), vec!["age", "sex"]);
+    }
+
+    #[test]
+    fn dollar_member_completion_lists_member_assignments() {
+        let items = completion_items("foo <- list()\nfoo$bar <- 1\nfoo$|");
+
+        assert_eq!(sorted_labels(&items), vec!["bar"]);
+    }
+
+    #[test]
+    fn dollar_member_completion_filters_prefix_and_replaces_rhs_token() {
+        let items = completion_items("foo <- list(alpha = 1, beta = 2)\nfoo$b|eta");
+
+        assert_eq!(sorted_labels(&items), vec!["beta"]);
+        let item = items.iter().find(|item| item.label == "beta").unwrap();
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range.start, Position::new(1, 4));
+                assert_eq!(edit.range.end, Position::new(1, 8));
+                assert_eq!(edit.new_text, "beta");
+            }
+            other => panic!("expected text edit for beta completion, got {:?}", other),
+        }
+    }
+    #[test]
+    fn dollar_member_completion_detects_lhs_after_dollar_chain() {
+        let (code, position) = code_and_position("foo$bar$|");
+        let doc = Document::new(&code, None);
+        let context =
+            detect_dollar_member_completion_context(doc.tree.as_ref().unwrap(), &code, position)
+                .expect("dollar-chain completion context");
+
+        assert_eq!(context.lhs_name, "bar");
+        assert_eq!(context.typed_prefix, "");
+    }
+
+    #[test]
+    fn dollar_member_completion_excludes_later_assignments() {
+        let items = completion_items("foo <- list()\nfoo$|\nfoo$late <- 1\n");
+
+        assert!(
+            items.is_empty(),
+            "later member assignment should be invisible, got {:?}",
+            sorted_labels(&items)
+        );
+    }
+
+    #[test]
+    fn dollar_member_completion_respects_source_order() {
+        let helper_code = "foo <- list(from_helper = 1)\n";
+
+        let before_source =
+            completion_items_in_workspace("foo$|\nsource(\"helper.R\")\n", helper_code);
+        assert!(
+            before_source.is_empty(),
+            "future source() should not make dollar members visible, got {:?}",
+            sorted_labels(&before_source)
+        );
+
+        let after_source =
+            completion_items_in_workspace("source(\"helper.R\")\nfoo$|", helper_code);
+        assert_eq!(sorted_labels(&after_source), vec!["from_helper"]);
+    }
+
+    #[test]
+    fn dollar_member_completion_does_not_fallback_to_normal_completions() {
+        let items = completion_items("bar <- 1\nfoo$|");
+
+        assert!(
+            items.is_empty(),
+            "unresolvable dollar LHS should not return normal completions, got {:?}",
+            sorted_labels(&items)
+        );
+    }
+
+    #[test]
+    fn dollar_member_completion_text_edit_uses_utf16_columns() {
+        let items = completion_items("foo <- list(beta = 1)\n\"💜\"; foo$b|eta");
+        let item = items.iter().find(|item| item.label == "beta").unwrap();
+
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range.start, Position::new(1, 10));
+                assert_eq!(edit.range.end, Position::new(1, 14));
+            }
+            other => panic!("expected text edit for beta completion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_dollar_completion_still_returns_normal_items() {
+        let items = completion_items("foo <- list(alpha = 1)\nfo|");
+        let labels = sorted_labels(&items);
+
+        assert!(labels.contains(&"foo".to_string()));
+        assert!(labels.contains(&"if".to_string()));
+    }
+}
+#[cfg(test)]
+mod completion_visibility_tests {
+    use super::*;
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{CompletionItem, CompletionResponse, Position, Url};
+
+    fn completion_items(marked_code: &str) -> Vec<CompletionItem> {
+        let (code, position) = code_and_position(marked_code);
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(&code, None));
+
+        match completion(&state, &uri, position, None) {
+            Some(CompletionResponse::Array(items)) => items,
+            other => panic!("expected completion array, got {:?}", other),
+        }
+    }
+
+    fn completion_items_in_workspace(
+        main_marked_code: &str,
+        helper_code: &str,
+    ) -> Vec<CompletionItem> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+        let (main_code, position) = code_and_position(main_marked_code);
+        std::fs::write(&main_path, &main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_uri = Url::from_file_path(workspace_path).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_uri.clone());
+        state
+            .documents
+            .insert(helper_uri.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(&main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_uri,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_uri),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_uri,
+            &crate::cross_file::extract_metadata(&main_code),
+            Some(&workspace_uri),
+            |_| None,
+        );
+
+        match completion(&state, &main_uri, position, None) {
+            Some(CompletionResponse::Array(items)) => items,
+            other => panic!("expected completion array, got {:?}", other),
+        }
+    }
+
+    fn code_and_position(marked_code: &str) -> (String, Position) {
+        let marker = marked_code.find('|').expect("cursor marker");
+        let prefix = &marked_code[..marker];
+        let line = prefix.chars().filter(|&ch| ch == '\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        let mut code = marked_code.to_string();
+        code.remove(marker);
+        (code, Position::new(line, character))
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn variable_completion_excludes_future_same_file_assignment() {
+        let labels = labels(&completion_items(
+            "visible_value <- 1\n|\nfuture_value <- 2\n",
+        ));
+
+        assert!(labels.contains(&"visible_value".to_string()));
+        assert!(
+            !labels.contains(&"future_value".to_string()),
+            "future same-file assignment should be invisible"
+        );
+    }
+
+    #[test]
+    fn variable_completion_excludes_function_local_symbols_at_top_level() {
+        let labels = labels(&completion_items(
+            "fn <- function(param_value) {\n  local_value <- 1\n}\n|\n",
+        ));
+
+        assert!(labels.contains(&"fn".to_string()));
+        assert!(
+            !labels.contains(&"param_value".to_string()),
+            "function parameter should not be visible at top level"
+        );
+        assert!(
+            !labels.contains(&"local_value".to_string()),
+            "function local should not be visible at top level"
+        );
+    }
+
+    #[test]
+    fn variable_completion_includes_function_scope_symbols_inside_function() {
+        let labels = labels(&completion_items(
+            "fn <- function(param_value) {\n  local_value <- 1\n  |\n}\n",
+        ));
+
+        assert!(labels.contains(&"param_value".to_string()));
+        assert!(labels.contains(&"local_value".to_string()));
+    }
+
+    #[test]
+    fn variable_completion_excludes_symbols_removed_by_rm() {
+        let labels = labels(&completion_items(
+            "removed_value <- 1\nrm(removed_value)\n|\n",
+        ));
+
+        assert!(
+            !labels.contains(&"removed_value".to_string()),
+            "rm() should remove the symbol from visible completions"
+        );
+    }
+
+    #[test]
+    fn variable_completion_excludes_self_assignment_lhs_on_rhs() {
+        let labels = labels(&completion_items("outer_value <- 1\nself_value <- |\n"));
+
+        assert!(labels.contains(&"outer_value".to_string()));
+        assert!(
+            !labels.contains(&"self_value".to_string()),
+            "assignment LHS should not be visible on its own RHS"
+        );
+    }
+
+    #[test]
+    fn variable_completion_respects_source_order() {
+        let helper_code = "from_helper <- 1\n";
+
+        let before_source = labels(&completion_items_in_workspace(
+            "|\nsource(\"helper.R\")\n",
+            helper_code,
+        ));
+        assert!(
+            !before_source.contains(&"from_helper".to_string()),
+            "future source() should not make variables visible"
+        );
+
+        let after_source = labels(&completion_items_in_workspace(
+            "source(\"helper.R\")\n|\n",
+            helper_code,
+        ));
+        assert!(after_source.contains(&"from_helper".to_string()));
     }
 }
 

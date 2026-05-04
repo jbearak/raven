@@ -1,4 +1,4 @@
-//! Resolve go-to-definition for the RHS identifier of `$` and `@`.
+//! Resolve and enumerate candidates for the RHS identifier of `$` and `@`.
 //!
 //! See `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md`.
 //!
@@ -7,20 +7,23 @@
 //! 1. Resolve `foo` via the existing position-aware scope.
 //! 2. Collect candidates from the defining file and the files that actually
 //!    contribute to the cursor's resolved cross-file scope:
-//!    - **Defining file**: `foo$bar <- ...` member-assignments and any
-//!      constructor-call named argument from the allowlist. Filtered by
-//!      same-function-scope and "effect position at or after the binding".
+//!    - **Defining file**: `foo$bar <- ...` member-assignments,
+//!      statically named string-subscript assignments like
+//!      `foo[["bar"]] <- ...`, and any constructor-call named argument
+//!      from the allowlist. Filtered by same-function-scope and
+//!      "effect position at or after the binding".
 //!      Defining-file candidates are also filtered by
 //!      `candidate_effect_visible_in_scope` and `candidate_lhs_matches_symbol`,
 //!      which excludes candidates past the parent file's `source()` site that
 //!      made the cursor file visible.
 //!    - **Every non-defining file in the cursor scope's contributor chain**:
-//!      each `foo$bar <- ...` site is validated by re-resolving `foo` at
-//!      that site's position via cross-file scope; only sites where `foo`
-//!      resolves to the *same* binding are kept. Using the resolved scope's
-//!      `chain` and per-file visible cutoffs avoids false positives from files
-//!      that merely depend on the cursor file or from parent files past the
-//!      `source()` call site that brought the cursor file into scope.
+//!      each `foo$bar <- ...` or statically named string-subscript site is
+//!      validated by re-resolving `foo` at that site's position via cross-file
+//!      scope; only sites where `foo` resolves to the *same* binding are kept.
+//!      Using the resolved scope's `chain` and per-file visible cutoffs avoids
+//!      false positives from files that merely depend on the cursor file or
+//!      from parent files past the `source()` call site that brought the cursor
+//!      file into scope.
 //! 3. Tie-break: `pick_winner` partitions all candidates by whether their
 //!    `uri` equals the cursor's. The in-cursor-file partition is filtered
 //!    by `effect <= cursor`, then the candidate with the latest effect
@@ -82,8 +85,119 @@ impl EffectPos {
     }
 }
 
+fn member_assignment_candidate_from_extract(
+    assignment: Node,
+    target: Node,
+    text: &str,
+    file_uri: &Url,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+) -> Option<Candidate> {
+    if target.kind() != "extract_operator" {
+        return None;
+    }
+    let target_op = target.child_by_field_name("operator")?;
+    if !matches!(
+        (target_op.kind(), op),
+        ("$", ExtractOp::Dollar) | ("@", ExtractOp::At)
+    ) {
+        return None;
+    }
+    let t_lhs = target.child_by_field_name("lhs")?;
+    let t_rhs = target.child_by_field_name("rhs")?;
+    if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
+        return None;
+    }
+    let member_name = node_text(t_rhs, text);
+    if node_text(t_lhs, text) != lhs_name
+        || rhs_name.is_some_and(|rhs_name| member_name != rhs_name)
+    {
+        return None;
+    }
+    let lhs_range = node_range_in_text(t_lhs, text);
+    Some(Candidate {
+        name: member_name.to_string(),
+        uri: file_uri.clone(),
+        effect: EffectPos::from_node_end(assignment, text),
+        name_range: node_range_in_text(t_rhs, text),
+        fn_scope: enclosing_function_id(assignment),
+        lhs_pos: lhs_range.start,
+    })
+}
+
+fn member_assignment_candidate_from_string_subscript(
+    assignment: Node,
+    target: Node,
+    text: &str,
+    file_uri: &Url,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+) -> Option<Candidate> {
+    if op != ExtractOp::Dollar || !matches!(target.kind(), "subset" | "subset2") {
+        return None;
+    }
+    let t_lhs = target.child_by_field_name("function")?;
+    if t_lhs.kind() != "identifier" || node_text(t_lhs, text) != lhs_name {
+        return None;
+    }
+    let args = target.child_by_field_name("arguments")?;
+    let string_node = first_direct_string_argument(args)?;
+    let member_name = simple_string_literal_value(string_node, text)?;
+    if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
+        return None;
+    }
+    let lhs_range = node_range_in_text(t_lhs, text);
+    Some(Candidate {
+        name: member_name.to_string(),
+        uri: file_uri.clone(),
+        effect: EffectPos::from_node_end(assignment, text),
+        name_range: node_range_in_text(string_node, text),
+        fn_scope: enclosing_function_id(assignment),
+        lhs_pos: lhs_range.start,
+    })
+}
+
+fn first_direct_string_argument(args: Node) -> Option<Node> {
+    let mut walker = args.walk();
+    for child in args.children(&mut walker) {
+        if child.kind() == "string" {
+            return Some(child);
+        }
+        if child.kind() == "argument" {
+            if let Some(value) = child.child_by_field_name("value") {
+                if value.kind() == "string" {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn simple_string_literal_value<'a>(node: Node, text: &'a str) -> Option<&'a str> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(node, text);
+    let bytes = raw.as_bytes();
+    let (&quote, rest) = bytes.split_first()?;
+    if !matches!(quote, b'\'' | b'"') || rest.last().copied()? != quote || raw.len() < 2 {
+        return None;
+    }
+    let value = &raw[1..raw.len() - 1];
+    if value.is_empty() || value.contains('\\') || value.contains('\n') || value.contains('\r') {
+        return None;
+    }
+    Some(value)
+}
+
 #[derive(Debug, Clone)]
 struct Candidate {
+    /// Member/slot name (`bar` in `foo$bar <- ...`, or the named argument in
+    /// `foo <- list(bar = ...)`).
+    name: String,
     /// File the candidate lives in. For defining-file candidates this is
     /// `defining_uri`; for cross-file candidates this is the file containing
     /// the validated member-assignment site.
@@ -103,11 +217,26 @@ struct Candidate {
     lhs_pos: Position,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedMemberCompletion {
+    pub name: String,
+    pub uri: Url,
+    pub name_range: Range,
+}
+
+struct CandidateBatch {
+    candidates: Vec<Candidate>,
+    cursor_uri: Url,
+    cursor: Position,
+    contributor_ranks: HashMap<Url, usize>,
+    contributor_distances: HashMap<Url, usize>,
+}
+
 /// Resolves go-to-definition for a qualified member RHS (`bar` in `foo$bar` or
 /// `foo@bar`).
 ///
-/// Snapshot-scope invariant: this creates one `ParentPrefixCache` per
-/// `resolve_qualified_member` call and reuses it for the initial cursor lookup
+/// Snapshot-scope invariant: the shared candidate collector creates one
+/// `ParentPrefixCache` per request and reuses it for the initial cursor lookup
 /// plus all candidate validations. Callers must hold a `WorldState` read guard
 /// (as `goto_definition` does) while calling this function so
 /// `get_cross_file_scope_with_cache` and subsequent scope lookups, including
@@ -141,10 +270,10 @@ pub fn resolve_qualified_member(
 /// Cancellation-aware variant of [`resolve_qualified_member`].
 ///
 /// Same snapshot-scope invariant: callers must hold a `WorldState` read guard
-/// (as `goto_definition_with_cancel` does) so the single `ParentPrefixCache`
-/// created here, the initial `get_cross_file_scope_with_cache` lookup, and
-/// every per-candidate `candidate_lhs_matches_symbol` re-resolve all observe
-/// the same graph/artifacts snapshot.
+/// (as `goto_definition_with_cancel` does) so the shared collector's single
+/// `ParentPrefixCache`, the initial `get_cross_file_scope_with_cache` lookup,
+/// and every per-candidate `candidate_lhs_matches_symbol` re-resolve all
+/// observe the same graph/artifacts snapshot.
 ///
 /// `cancel` is polled cooperatively at scope-lookup and loop boundaries.
 /// Returns `None` on cancellation; passing [`DiagCancelToken::never`] yields
@@ -159,14 +288,132 @@ pub fn resolve_qualified_member_with_cancel(
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Option<Location> {
-    // LHS shape gate — only bare `identifier` LHS is supported in Step 1.
+    let batch = collect_qualified_member_candidates_with_cancel(
+        state,
+        uri,
+        position,
+        lhs_node_kind,
+        lhs_name,
+        Some(rhs_name),
+        op,
+        cancel,
+    )?;
+    pick_winner(
+        batch.candidates,
+        &batch.cursor_uri,
+        batch.cursor,
+        &batch.contributor_ranks,
+        &batch.contributor_distances,
+    )
+    .map(|c| Location {
+        uri: c.uri,
+        range: c.name_range,
+    })
+}
+
+/// Enumerate visible `$`/`@` member candidates for completion.
+///
+/// This stable convenience API delegates to
+/// [`complete_qualified_members_with_cancel`] with [`DiagCancelToken::never`].
+pub fn complete_qualified_members(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    op: ExtractOp,
+) -> Vec<QualifiedMemberCompletion> {
+    complete_qualified_members_with_cancel(
+        state,
+        uri,
+        position,
+        lhs_node_kind,
+        lhs_name,
+        op,
+        &DiagCancelToken::never(),
+    )
+}
+
+/// Cancellation-aware variant of [`complete_qualified_members`].
+///
+/// Candidates are de-duplicated by member label. For duplicate visible
+/// definitions of the same label, the chosen candidate is the same winner that
+/// [`resolve_qualified_member_with_cancel`] would use at the cursor.
+pub fn complete_qualified_members_with_cancel(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Vec<QualifiedMemberCompletion> {
+    let Some(batch) = collect_qualified_member_candidates_with_cancel(
+        state,
+        uri,
+        position,
+        lhs_node_kind,
+        lhs_name,
+        None,
+        op,
+        cancel,
+    ) else {
+        return Vec::new();
+    };
+
+    let mut by_name: HashMap<String, Vec<Candidate>> = HashMap::new();
+    for candidate in batch.candidates {
+        by_name
+            .entry(candidate.name.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut completions = Vec::new();
+    for candidates in by_name.into_values() {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        if let Some(winner) = pick_winner(
+            candidates,
+            &batch.cursor_uri,
+            batch.cursor,
+            &batch.contributor_ranks,
+            &batch.contributor_distances,
+        ) {
+            completions.push(QualifiedMemberCompletion {
+                name: winner.name,
+                uri: winner.uri,
+                name_range: winner.name_range,
+            });
+        }
+    }
+
+    completions.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.uri.as_str().cmp(b.uri.as_str()))
+            .then_with(|| {
+                (a.name_range.start.line, a.name_range.start.character)
+                    .cmp(&(b.name_range.start.line, b.name_range.start.character))
+            })
+    });
+    completions
+}
+
+fn collect_qualified_member_candidates_with_cancel(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Option<CandidateBatch> {
     if lhs_node_kind != "identifier" || cancel.is_cancelled() {
         return None;
     }
-    // Reuse parent-prefix work across the initial cursor lookup and the
-    // per-candidate validation loop. A single qualified-member request can
-    // resolve many candidate positions, but all of them see the same state
-    // snapshot under the caller's read guard.
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
     let scope = crate::handlers::get_cross_file_scope_with_cache(
@@ -182,7 +429,6 @@ pub fn resolve_qualified_member_with_cancel(
     }
     let symbol = scope.symbols.get(lhs_name)?;
 
-    // Package exports (pseudo-URIs like `package:dplyr`) are not navigable.
     if symbol.source_uri.as_str().starts_with("package:") {
         return None;
     }
@@ -190,9 +436,6 @@ pub fn resolve_qualified_member_with_cancel(
     let defining_uri = symbol.source_uri.clone();
     let cursor_uri = uri.clone();
 
-    // Phase 1: collect from the defining file. Tree-local correctness gates
-    // (`fn_scope`, `effect_at_or_after`) apply because all candidates and
-    // the resolved `foo` come from the same AST.
     let mut defining_candidates: Vec<Candidate> = Vec::new();
     {
         let (defining_text, defining_tree) =
@@ -203,12 +446,6 @@ pub fn resolve_qualified_member_with_cancel(
             symbol.defined_line,
             symbol.defined_column,
         );
-        // A symbol's *visible-from* position is the end of its defining
-        // assignment, not the position of the LHS identifier — so a member
-        // assignment that occurs inside the RHS of `foo <- {...}` was binding
-        // the *previous* `foo` and must not match the new one. Falls back to
-        // the LHS anchor for non-assignment-defined symbols (parameters,
-        // for-variables, declared symbols).
         let symbol_effect = symbol_visible_from_position(
             &defining_tree,
             &defining_text,
@@ -226,16 +463,29 @@ pub fn resolve_qualified_member_with_cancel(
             op,
             &mut defining_candidates,
         );
-        if let Some(c) = collect_constructor_candidate(
-            &defining_tree,
-            &defining_text,
-            &defining_uri,
-            symbol.defined_line,
-            symbol.defined_column,
-            lhs_name,
-            rhs_name,
-        ) {
-            defining_candidates.push(c);
+        if let Some(rhs_name) = rhs_name {
+            if let Some(candidate) = collect_constructor_candidate(
+                &defining_tree,
+                &defining_text,
+                &defining_uri,
+                symbol.defined_line,
+                symbol.defined_column,
+                lhs_name,
+                rhs_name,
+            ) {
+                defining_candidates.push(candidate);
+            }
+        } else {
+            collect_constructor_candidates(
+                &defining_tree,
+                &defining_text,
+                &defining_uri,
+                symbol.defined_line,
+                symbol.defined_column,
+                lhs_name,
+                rhs_name,
+                &mut defining_candidates,
+            );
         }
 
         defining_candidates.retain(|c| {
@@ -257,11 +507,6 @@ pub fn resolve_qualified_member_with_cancel(
         }
     }
 
-    // Phase 2: collect from every non-defining file that contributed to the
-    // cursor's resolved scope. Tree-local IDs are not comparable to those in
-    // the defining tree, so we replace the `fn_scope` gate with a per-site
-    // scope-resolve: at the LHS identifier's position, does `foo` resolve to
-    // the *same* binding we navigated from?
     let mut cross_file_candidates: Vec<Candidate> = Vec::new();
     let contributor_ranks = contributor_file_ranks(&scope.chain);
     for candidate_uri in scope
@@ -303,16 +548,13 @@ pub fn resolve_qualified_member_with_cancel(
         &scope.visible_positions,
         all_candidates.iter().map(|candidate| &candidate.uri),
     );
-    pick_winner(
-        all_candidates,
-        &cursor_uri,
-        position,
-        &contributor_ranks,
-        &contributor_distances,
-    )
-    .map(|c| Location {
-        uri: c.uri,
-        range: c.name_range,
+
+    Some(CandidateBatch {
+        candidates: all_candidates,
+        cursor_uri,
+        cursor: position,
+        contributor_ranks,
+        contributor_distances,
     })
 }
 
@@ -584,15 +826,19 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 }
 
 /// Walk `root` recursively, recording every `binary_operator` whose target
-/// is `extract_operator` matching `(lhs_name, op, rhs_name)`. Each candidate
-/// records the position of its LHS identifier (`foo` in `foo$bar <- ...`)
-/// for use as a query position when validating cross-file candidates.
+/// is either an `extract_operator` (`foo$bar <- ...`, `foo@bar <- ...`) or,
+/// for dollar-member lookup, a statically named string subscript
+/// (`foo[["bar"]] <- ...`, `foo["bar"] <- ...`) matching
+/// `(lhs_name, op, rhs_name)` when `rhs_name` is provided, otherwise every
+/// RHS member. Each candidate records the position of its LHS identifier
+/// (`foo` in `foo$bar <- ...`) for use as a query position when validating
+/// cross-file candidates.
 fn collect_member_assignments(
     root: Node,
     text: &str,
     file_uri: &Url,
     lhs_name: &str,
-    rhs_name: &str,
+    rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
 ) {
@@ -615,53 +861,20 @@ fn collect_member_assignments(
             _ => continue,
         };
         let Some(target) = target else { continue };
-        if target.kind() != "extract_operator" {
-            continue;
-        }
-        let Some(target_op) = target.child_by_field_name("operator") else {
-            continue;
-        };
-        if !matches!(
-            (target_op.kind(), op),
-            ("$", ExtractOp::Dollar) | ("@", ExtractOp::At)
+        if let Some(candidate) = member_assignment_candidate_from_extract(
+            node, target, text, file_uri, lhs_name, rhs_name, op,
         ) {
+            out.push(candidate);
             continue;
         }
-        let Some(t_lhs) = target.child_by_field_name("lhs") else {
-            continue;
-        };
-        let Some(t_rhs) = target.child_by_field_name("rhs") else {
-            continue;
-        };
-        if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
-            continue;
+        if let Some(candidate) = member_assignment_candidate_from_string_subscript(
+            node, target, text, file_uri, lhs_name, rhs_name, op,
+        ) {
+            out.push(candidate);
         }
-        if node_text(t_lhs, text) != lhs_name || node_text(t_rhs, text) != rhs_name {
-            continue;
-        }
-        let lhs_range = node_range_in_text(t_lhs, text);
-        out.push(Candidate {
-            uri: file_uri.clone(),
-            effect: EffectPos::from_node_end(node, text),
-            name_range: node_range_in_text(t_rhs, text),
-            fn_scope: enclosing_function_id(node),
-            lhs_pos: lhs_range.start,
-        });
     }
 }
 
-/// If the assignment that defines `lhs_name` at `(defined_line, defined_col)`
-/// has a constructor-call RHS in the allowlist, return a candidate for the
-/// named argument matching `rhs_name`.
-///
-/// We use the position only as a hint to find the *intended* defining
-/// assignment — convert `defined_column_utf16` to a byte offset and descend
-/// to the smallest node containing `(defined_line, byte_col .. byte_col+1)`
-/// (a 1-byte-wide range, since a zero-width range at the very start of the
-/// line does not reliably descend into a leaf), then ascend to the enclosing
-/// `binary_operator` whose target identifier matches `lhs_name`. R
-/// identifiers are ASCII (`[A-Za-z_.][A-Za-z0-9_.]*`) so a 1-byte step is
-/// always inside the identifier.
 fn collect_constructor_candidate(
     tree: &Tree,
     text: &str,
@@ -671,8 +884,46 @@ fn collect_constructor_candidate(
     lhs_name: &str,
     rhs_name: &str,
 ) -> Option<Candidate> {
+    let mut candidates = Vec::new();
+    collect_constructor_candidates(
+        tree,
+        text,
+        file_uri,
+        defined_line,
+        defined_column_utf16,
+        lhs_name,
+        Some(rhs_name),
+        &mut candidates,
+    );
+    candidates.into_iter().next()
+}
+
+/// If the assignment that defines `lhs_name` at `(defined_line, defined_col)`
+/// has a constructor-call RHS in the allowlist, collect candidates for named
+/// arguments matching `rhs_name` when provided, otherwise all named arguments.
+///
+/// We use the position only as a hint to find the *intended* defining
+/// assignment — convert `defined_column_utf16` to a byte offset and descend
+/// to the smallest node containing `(defined_line, byte_col .. byte_col+1)`
+/// (a 1-byte-wide range, since a zero-width range at the very start of the
+/// line does not reliably descend into a leaf), then ascend to the enclosing
+/// `binary_operator` whose target identifier matches `lhs_name`. R
+/// identifiers are ASCII (`[A-Za-z_.][A-Za-z0-9_.]*`) so a 1-byte step is
+/// always inside the identifier.
+fn collect_constructor_candidates(
+    tree: &Tree,
+    text: &str,
+    file_uri: &Url,
+    defined_line: u32,
+    defined_column_utf16: u32,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    out: &mut Vec<Candidate>,
+) {
     // LSP columns are UTF-16 units; tree-sitter Point columns are byte offsets.
-    let line_text = nth_line(text, defined_line as usize)?;
+    let Some(line_text) = nth_line(text, defined_line as usize) else {
+        return;
+    };
     let byte_col = utf16_column_to_byte_offset(line_text, defined_column_utf16);
     let line_byte_len = line_text.len();
     let start = tree_sitter::Point::new(defined_line as usize, byte_col);
@@ -680,26 +931,36 @@ fn collect_constructor_candidate(
     // when the symbol sits at column 0 of its line.
     let end_col = (byte_col + 1).min(line_byte_len);
     let end = tree_sitter::Point::new(defined_line as usize, end_col);
-    let id_node = tree.root_node().descendant_for_point_range(start, end)?;
+    let Some(id_node) = tree.root_node().descendant_for_point_range(start, end) else {
+        return;
+    };
 
     // Walk up to the enclosing `binary_operator` whose target identifier is
     // `lhs_name`, then look at its RHS.
-    let assignment = ascend_to_assignment_for(id_node, text, lhs_name)?;
-    let value_node = assignment_value_node(assignment, text)?;
+    let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else {
+        return;
+    };
+    let Some(value_node) = assignment_value_node(assignment, text) else {
+        return;
+    };
 
     if value_node.kind() != "call" {
-        return None;
+        return;
     }
-    let func_node = value_node.child_by_field_name("function")?;
+    let Some(func_node) = value_node.child_by_field_name("function") else {
+        return;
+    };
     if func_node.kind() != "identifier" {
-        return None;
+        return;
     }
     let func_name = node_text(func_node, text);
     if !CONSTRUCTOR_ALLOWLIST.contains(&func_name) {
-        return None;
+        return;
     }
 
-    let args_node = value_node.child_by_field_name("arguments")?;
+    let Some(args_node) = value_node.child_by_field_name("arguments") else {
+        return;
+    };
     let mut walker = args_node.walk();
     for child in args_node.children(&mut walker) {
         if child.kind() != "argument" {
@@ -711,7 +972,8 @@ fn collect_constructor_candidate(
         if name_node.kind() != "identifier" {
             continue;
         }
-        if node_text(name_node, text) != rhs_name {
+        let member_name = node_text(name_node, text);
+        if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
         let name_range = node_range_in_text(name_node, text);
@@ -720,7 +982,8 @@ fn collect_constructor_candidate(
         // assignment completes, so use the effect position for the shared
         // symbol identity check.
         let lhs_pos = Position::new(effect.line, effect.utf16_column);
-        return Some(Candidate {
+        out.push(Candidate {
+            name: member_name.to_string(),
             uri: file_uri.clone(),
             effect,
             name_range,
@@ -728,7 +991,6 @@ fn collect_constructor_candidate(
             lhs_pos,
         });
     }
-    None
 }
 
 fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> Option<Node<'a>> {
@@ -795,6 +1057,8 @@ fn nth_line(text: &str, n: usize) -> Option<&str> {
 mod tests {
     use crate::handlers::{goto_definition, goto_definition_with_cancel, DiagCancelToken};
     use crate::state::{Document, WorldState};
+    use std::sync::Arc;
+    use std::time::SystemTime;
     use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
 
     fn fresh_state() -> WorldState {
@@ -811,11 +1075,62 @@ mod tests {
         url
     }
 
+    fn add_indexed_doc(state: &mut WorldState, uri: &str, text: &str) -> Url {
+        let url = Url::parse(uri).expect("uri");
+        let doc = Document::new_with_uri(text, None, &url);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(text));
+        let artifacts = Arc::new(if let Some(tree) = doc.tree.as_ref() {
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                &url,
+                tree,
+                text,
+                Some(&metadata),
+            )
+        } else {
+            crate::cross_file::scope::ScopeArtifacts::default()
+        });
+        let snapshot = crate::cross_file::file_cache::FileSnapshot {
+            mtime: SystemTime::UNIX_EPOCH,
+            size: text.len() as u64,
+            content_hash: None,
+        };
+        let entry = crate::workspace_index::IndexEntry {
+            contents: doc.contents.clone(),
+            tree: doc.tree.clone(),
+            loaded_packages: doc.loaded_packages.clone(),
+            snapshot,
+            metadata,
+            artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(url.clone(), entry));
+        url
+    }
+
     fn loc(result: Option<GotoDefinitionResponse>) -> tower_lsp::lsp_types::Location {
         match result {
             Some(GotoDefinitionResponse::Scalar(l)) => l,
             other => panic!("expected Scalar location, got {:?}", other),
         }
+    }
+
+    fn completion_names(
+        state: &WorldState,
+        uri: &Url,
+        position: Position,
+        lhs_name: &str,
+    ) -> Vec<String> {
+        super::complete_qualified_members(
+            state,
+            uri,
+            position,
+            "identifier",
+            lhs_name,
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        .into_iter()
+        .map(|completion| completion.name)
+        .collect::<Vec<_>>()
     }
     /// Request-scoped cancellation short-circuits qualified-member lookup before
     /// cross-file scope resolution returns a location.
@@ -865,6 +1180,52 @@ mod tests {
         assert_eq!(l.range.start.line, 1);
         // `bar` in `foo$bar <- 99` is at col 4
         assert_eq!(l.range.start.character, 4);
+    }
+
+    /// Completion enumeration returns all visible constructor and member
+    /// assignment names for the resolved object.
+    #[test]
+    fn dollar_member_completion_enumerates_constructor_and_assignment_names() {
+        let mut state = fresh_state();
+        let code = "foo <- list(alpha = 1)\nfoo$beta <- 2\nfoo$\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        assert_eq!(
+            completion_names(&state, &uri, Position::new(2, 4), "foo"),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    /// Completion enumeration treats statically named string-subscript
+    /// assignments as list-member definitions too. Large R projects often mix
+    /// `foo$bar <- ...` with `foo[["baz"]] <- ...`; both create members that
+    /// should be offered after `foo$`.
+    #[test]
+    fn dollar_member_completion_includes_string_subscript_assignments() {
+        let mut state = fresh_state();
+        let code = "\
+foo <- list(alpha = 1)
+foo[[\"beta\"]] <- 2
+foo['gamma'] <- 3
+foo$
+";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        assert_eq!(
+            completion_names(&state, &uri, Position::new(3, 4), "foo"),
+            vec!["alpha", "beta", "gamma"]
+        );
+    }
+
+    /// Completion enumeration is position-aware: a member assignment after the
+    /// cursor is not a visible candidate.
+    #[test]
+    fn dollar_member_completion_excludes_future_assignment() {
+        let mut state = fresh_state();
+        let code = "foo <- list()\nfoo$\nfoo$late <- 1\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        assert!(completion_names(&state, &uri, Position::new(1, 4), "foo").is_empty());
     }
 
     /// Position-aware tie-break: literal then member-assignment, cursor after both
@@ -1164,6 +1525,381 @@ use(foo$bar)
             |_| None,
         );
         (main_uri, helpers_uri)
+    }
+
+    /// Completion enumeration follows the same cross-file visibility as
+    /// go-to-definition: constructor names from the defining file and validated
+    /// member assignments from the cursor file are both offered.
+    #[test]
+    fn dollar_member_completion_includes_cross_file_candidates() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+foo$local <- 2
+foo$
+";
+        let helpers_code = "\
+foo <- list(alpha = 1)
+foo$remote <- 1
+";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 4), "foo"),
+            vec!["alpha", "local", "remote"]
+        );
+    }
+
+    /// Completion enumeration must also work when the sourced file is closed
+    /// and available only through the unified workspace index. This mirrors
+    /// the normal editor runtime more closely than tests that put every file
+    /// in the open-document map.
+    #[test]
+    fn dollar_member_completion_includes_closed_indexed_sourced_file_candidates() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$c.oos <- 1
+ww$seeds <- 2
+ww$
+";
+        let data_code = "\
+ww <- list()
+ww$name.w <- 1
+ww$income.group.i <- 2
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+
+        for (uri, code) in [(&main_uri, main_code), (&data_uri, data_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["c.oos", "income.group.i", "name.w", "seeds"]
+        );
+    }
+    /// Regression for workspaces where another file sources the cursor file:
+    /// parent-prefix symbols are available at the start of `main.R`, but a
+    /// direct `source()` inside `main.R` executes later and should become the
+    /// binding used for `$` member completion.
+    #[test]
+    fn dollar_member_completion_direct_source_overrides_inherited_parent_binding() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$c.oos <- 1
+ww$seeds <- 2
+ww$
+";
+        let data_code = "\
+ww <- list()
+ww$name.w <- 1
+ww$income.group.i <- 2
+";
+        let runner_code = "\
+make_parent_ww <- function() list()
+ww <- make_parent_ww()
+source(\"main.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&runner_uri, runner_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["c.oos", "income.group.i", "name.w", "seeds"]
+        );
+    }
+
+    /// Regression for workspaces where `main.R` first sources an unrelated
+    /// helper before the file that actually defines `ww`. The helper inherits a
+    /// parent-prefix `ww` through the graph, but sourcing it should not consume
+    /// the opportunity for a later direct source to override that inherited
+    /// binding.
+    #[test]
+    fn dollar_member_completion_direct_source_override_survives_unrelated_prior_source() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let helpers_code = "helper <- function() NULL\n";
+        let data_code = "\
+ww <- list()
+ww$remote <- 1
+";
+        let runner_code = "\
+ww <- list()
+ww$parent <- 1
+source(\"helpers.R\")
+source(\"main.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let helpers_uri = add_indexed_doc(&mut state, "file:///workspace/helpers.R", helpers_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&helpers_uri, helpers_code),
+            (&data_uri, data_code),
+            (&runner_uri, runner_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["local", "remote"]
+        );
+    }
+
+    /// Regression: resolving an earlier sibling source can recursively visit a
+    /// later direct source target at EOF. That path-local cycle guard must not
+    /// poison the later sibling source; `source("scripts/data.R")` in
+    /// `main.R` still has to execute and provide the `ww` binding used for
+    /// completion.
+    #[test]
+    fn dollar_member_completion_later_direct_source_survives_prior_recursive_sibling_visit() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let helpers_code = "helper <- function() NULL\n";
+        let data_code = "\
+ww <- list()
+ww$remote <- 1
+";
+        let runner_code = "\
+source(\"main.R\")
+source(\"helpers.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let helpers_uri = add_indexed_doc(&mut state, "file:///workspace/helpers.R", helpers_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&runner_uri, runner_code),
+            (&main_uri, main_code),
+            (&helpers_uri, helpers_code),
+            (&data_uri, data_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(3, 3), "ww"),
+            vec!["local", "remote"]
+        );
+    }
+
+    /// Regression for a nested sourced file that later sources a helper which
+    /// is also sourced by an unrelated report/runner file. The helper does not
+    /// define `ww`; its unrelated parent-prefix `ww` must not replace the
+    /// `ww` from `scripts/data.R` or member completions lose earlier data
+    /// assignments.
+    #[test]
+    fn dollar_member_completion_ignores_unrelated_child_parent_prefix_binding() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let data_code = "\
+ww <- list()
+source(\"data/outcomes.R\")
+";
+        let outcomes_code = "\
+ww$early <- 1
+source(\"outcomes/late_helper.R\")
+ww$late <- 2
+";
+        let helper_code = "helper <- function() NULL\n";
+        let report_code = "\
+ww <- list()
+ww$report <- 1
+source(\"scripts/data/outcomes/late_helper.R\")
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let outcomes_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes.R",
+            outcomes_code,
+        );
+        let helper_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/late_helper.R",
+            helper_code,
+        );
+        let report_uri = add_indexed_doc(&mut state, "file:///workspace/report.R", report_code);
+
+        // Update the unrelated report first so its backward edge is present
+        // before the real caller edge from `outcomes.R`, reproducing the
+        // parent-selection shape from larger workspaces.
+        for (uri, code) in [
+            (&report_uri, report_code),
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&outcomes_uri, outcomes_code),
+            (&helper_uri, helper_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 3), "ww"),
+            vec!["early", "late", "local"]
+        );
+    }
+    /// A sourced file can itself source setup/data files before and between
+    /// many `ww$... <-` assignments. Completion should keep all direct member
+    /// assignments in that file, not only the final assignments after the last
+    /// nested `source()` call.
+    #[test]
+    fn dollar_member_completion_keeps_sourced_file_assignments_around_nested_sources() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"scripts/data.R\")
+ww$local <- 1
+ww$
+";
+        let data_code = "\
+ww <- list()
+source(\"data/outcomes.R\")
+";
+        let outcomes_code = "\
+source(\"outcomes/abortions.R\")
+source(\"outcomes/intention.R\")
+ww$N <- 1
+ww$c.n <- 2
+source(\"outcomes/failure.R\")
+ww$H <- 3
+ww$point.h <- 4
+source(\"outcomes/intention.bias.terms.R\")
+ww$e.q <- 5
+ww$name.e <- 6
+";
+        let abortions_code = "abortions <- data.frame()\n";
+        let intention_code = "intention <- data.frame()\n";
+        let failure_code = "failure.points <- data.frame()\n";
+        let bias_code = "bias.terms <- list()\n";
+
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/scripts/data.R", data_code);
+        let outcomes_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes.R",
+            outcomes_code,
+        );
+        let abortions_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/abortions.R",
+            abortions_code,
+        );
+        let intention_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/intention.R",
+            intention_code,
+        );
+        let failure_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/failure.R",
+            failure_code,
+        );
+        let bias_uri = add_indexed_doc(
+            &mut state,
+            "file:///workspace/scripts/data/outcomes/intention.bias.terms.R",
+            bias_code,
+        );
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&outcomes_uri, outcomes_code),
+            (&abortions_uri, abortions_code),
+            (&intention_uri, intention_code),
+            (&failure_uri, failure_code),
+            (&bias_uri, bias_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 3), "ww"),
+            vec!["H", "N", "c.n", "e.q", "local", "name.e", "point.h"]
+        );
+    }
+
+    /// Completion enumeration rejects member assignments where the LHS object
+    /// resolves to a shadowing local binding rather than the imported object.
+    #[test]
+    fn dollar_member_completion_rejects_shadowed_cross_file_assignment() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+g <- function() {
+  foo <- list()
+  foo$shadow <- 99
+}
+foo$
+";
+        let helpers_code = "foo <- list(alpha = 1)\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(5, 4), "foo"),
+            vec!["alpha"]
+        );
     }
 
     /// The "skeleton-and-attach" pattern: `foo` is defined as an empty

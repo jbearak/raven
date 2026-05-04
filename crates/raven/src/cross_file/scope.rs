@@ -743,6 +743,12 @@ impl Default for ScopeArtifacts {
 pub struct ScopeAtPosition {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
     pub chain: Vec<Url>,
+    /// Symbols in `symbols` that came only from this scope's parent/backward
+    /// prefix and have not been replaced by local definitions or forward
+    /// sources. Forward-source callers filter these because evaluating a
+    /// child file should export bindings it creates, not unrelated context it
+    /// inherited from other parents in the dependency graph.
+    pub(crate) parent_prefix_symbol_names: HashSet<Arc<str>>,
     /// Widest query position from each contributing file that was visible when
     /// this scope was computed. Forward-sourced files typically contribute at
     /// EOF; backward-parent files contribute only up to their call site.
@@ -2913,6 +2919,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
+        true,
         None,
     )
 }
@@ -3063,6 +3070,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
+        true,
         Some(&prefix_arc),
     )
 }
@@ -3279,6 +3287,7 @@ where
             hoist_globals,
             backward_dep_mode,
             is_cancelled,
+            false,
             None,
         );
 
@@ -3449,6 +3458,13 @@ fn scope_at_position_with_graph_recursive<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    // Whether forward Source branches should receive a path-local copy of
+    // `visited`. Real source execution needs this so one sibling source's
+    // recursive traversal cannot make a later sibling look already visited.
+    // Parent-prefix discovery intentionally keeps the older shared visited
+    // pruning to avoid expanding every possible parent/forward path while
+    // computing inherited context.
+    isolate_forward_source_visits: bool,
     // Optional pre-computed STEP 1 result. When `Some`, the recursive function
     // skips computing `parent_prefix_at` itself and merges the supplied prefix
     // into `scope` directly. The cached entry point uses this to memoize STEP
@@ -3494,6 +3510,11 @@ where
     if current_depth >= max_depth {
         return scope;
     }
+    // Parent/backward-edge symbols model the environment at the start of this
+    // file. Local timeline effects that execute later may replace them. Track
+    // only names actually inserted from STEP 1 so a forward source() can
+    // override inherited bindings without changing first-source-wins among
+    // source() calls in this file.
 
     // Allow re-visiting a file at a strictly wider position. This handles the case where
     // a file is first visited as a parent (backward edge) at a partial position, and later
@@ -3544,10 +3565,13 @@ where
             Some(prefix_arc) => {
                 let prefix = prefix_arc.as_ref();
                 for (name, symbol) in &prefix.symbols {
-                    scope
-                        .symbols
-                        .entry(name.clone())
-                        .or_insert_with(|| symbol.clone());
+                    match scope.symbols.entry(name.clone()) {
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            scope.parent_prefix_symbol_names.insert(entry.key().clone());
+                            entry.insert(symbol.clone());
+                        }
+                    }
                 }
                 scope.chain.extend(prefix.chain.iter().cloned());
                 extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
@@ -3586,7 +3610,13 @@ where
                 // symbols preserves the depth-0 base_exports injection above
                 // and the "first parent wins" semantics within the prefix.
                 for (name, symbol) in prefix.symbols {
-                    scope.symbols.entry(name).or_insert(symbol);
+                    match scope.symbols.entry(name) {
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            scope.parent_prefix_symbol_names.insert(entry.key().clone());
+                            entry.insert(symbol);
+                        }
+                    }
                 }
                 scope.chain.extend(prefix.chain);
                 extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
@@ -3636,6 +3666,7 @@ where
                     query_inside_function,
                 ) {
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    scope.parent_prefix_symbol_names.remove(&symbol.name);
                 }
             }
             ScopeEvent::Source {
@@ -3785,25 +3816,56 @@ where
                             return scope;
                         }
 
-                        let child_scope = scope_at_position_with_graph_recursive(
-                            &child_uri,
-                            u32::MAX, // Include all symbols from sourced file
-                            u32::MAX,
-                            get_artifacts,
-                            get_metadata,
-                            graph,
-                            workspace_root,
-                            child_ctx,
-                            max_depth,
-                            current_depth + 1,
-                            visited,
-                            packages_for_child, // Pass inherited packages to child
-                            base_exports,
-                            hoist_globals,
-                            backward_dep_mode,
-                            is_cancelled,
-                            None,
-                        );
+                        let child_scope = if isolate_forward_source_visits {
+                            // Keep the cycle guard path-local for real
+                            // forward source execution. The current path's
+                            // visits must still be visible to the child so
+                            // cycles short-circuit, but recursive visits from
+                            // one sourced sibling must not mark another later
+                            // sibling as already visited.
+                            let mut child_visited = visited.clone();
+                            scope_at_position_with_graph_recursive(
+                                &child_uri,
+                                u32::MAX, // Include all symbols from sourced file
+                                u32::MAX,
+                                get_artifacts,
+                                get_metadata,
+                                graph,
+                                workspace_root,
+                                child_ctx,
+                                max_depth,
+                                current_depth + 1,
+                                &mut child_visited,
+                                packages_for_child, // Pass inherited packages to child
+                                base_exports,
+                                hoist_globals,
+                                backward_dep_mode,
+                                is_cancelled,
+                                true,
+                                None,
+                            )
+                        } else {
+                            scope_at_position_with_graph_recursive(
+                                &child_uri,
+                                u32::MAX, // Include all symbols from sourced file
+                                u32::MAX,
+                                get_artifacts,
+                                get_metadata,
+                                graph,
+                                workspace_root,
+                                child_ctx,
+                                max_depth,
+                                current_depth + 1,
+                                visited,
+                                packages_for_child, // Pass inherited packages to child
+                                base_exports,
+                                hoist_globals,
+                                backward_dep_mode,
+                                is_cancelled,
+                                false,
+                                None,
+                            )
+                        };
                         extend_visible_positions(
                             &mut scope.visible_positions,
                             &child_scope.visible_positions,
@@ -3818,11 +3880,40 @@ where
                         // our scope at the narrower original query position.
                         // Self-file symbols are always re-entered by STEP 2
                         // with proper `visible_from` filtering.
+                        let child_parent_prefix_symbol_names =
+                            child_scope.parent_prefix_symbol_names.clone();
                         for (name, symbol) in child_scope.symbols {
                             if symbol.source_uri == *uri {
                                 continue;
                             }
-                            scope.symbols.entry(name).or_insert(symbol);
+                            // Parent-prefix-only child symbols are context
+                            // the child inherited from one of its callers,
+                            // not bindings produced by executing the child.
+                            // They must not leak back out through this
+                            // forward source() edge or replace the caller's
+                            // own parent-prefix binding.
+                            if child_parent_prefix_symbol_names.contains(&name) {
+                                continue;
+                            }
+                            // A sourced file's resolved scope includes symbols
+                            // it inherited from its own parents. Re-exporting
+                            // an identical already-visible binding is a no-op
+                            // at runtime and must not consume the marker that
+                            // allows a later real source/local definition to
+                            // override a parent-prefix binding.
+                            if scope
+                                .symbols
+                                .get(&name)
+                                .map(|existing| existing == &symbol)
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            if scope.parent_prefix_symbol_names.remove(&name) {
+                                scope.symbols.insert(name, symbol);
+                            } else {
+                                scope.symbols.entry(name).or_insert(symbol);
+                            }
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
@@ -3867,6 +3958,7 @@ where
                 {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
+                        scope.parent_prefix_symbol_names.remove(&param.name);
                     }
                 }
             }
@@ -4496,6 +4588,7 @@ where
         let mut scope = ScopeAtPosition {
             symbols: prefix.symbols.clone(),
             chain,
+            parent_prefix_symbol_names: prefix.symbols.keys().cloned().collect(),
             visible_positions,
             depth_exceeded: prefix.depth_exceeded.clone(),
             inherited_packages: prefix.inherited_packages.clone(),
@@ -4930,6 +5023,7 @@ where
             self.hoist_globals,
             self.backward_dep_mode,
             self.is_cancelled,
+            true,
             Some(&child_prefix),
         );
 
@@ -4938,8 +5032,12 @@ where
         // the queried URI at (MAX, MAX); without this filter, our own
         // future definitions would leak back into our scope at the
         // narrower original query position. (Mirrors `scope.rs:3617-3622`.)
+        let child_parent_prefix_symbol_names = child_scope.parent_prefix_symbol_names.clone();
         for (name, symbol) in child_scope.symbols {
             if symbol.source_uri == *self.queried_uri {
+                continue;
+            }
+            if child_parent_prefix_symbol_names.contains(&name) {
                 continue;
             }
             contrib.symbols.entry(name).or_insert(symbol);
