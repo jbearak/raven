@@ -13,9 +13,8 @@
 //!      from the allowlist. Filtered by same-function-scope and
 //!      "effect position at or after the binding".
 //!      Defining-file candidates are also filtered by
-//!      `candidate_effect_visible_in_scope` and `candidate_lhs_matches_symbol`,
-//!      which excludes candidates past the parent file's `source()` site that
-//!      made the cursor file visible.
+//!      `candidate_effect_visible_in_scope`, which excludes candidates past
+//!      the parent file's `source()` site that made the cursor file visible.
 //!    - **Every non-defining file in the cursor scope's contributor chain**:
 //!      each `foo$bar <- ...` or statically named string-subscript site is
 //!      validated by re-resolving `foo` at that site's position via cross-file
@@ -39,6 +38,7 @@
 //!    be used as a fallback if no cursor-file candidate qualifies.
 //! 4. Never fall back to free-identifier lookup.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
@@ -242,10 +242,11 @@ struct CandidateBatch {
 ///
 /// Snapshot-scope invariant: the shared candidate collector creates one
 /// `ParentPrefixCache` per request and reuses it for the initial cursor lookup
-/// plus all candidate validations. Callers must hold a `WorldState` read guard
-/// (as `goto_definition` does) while calling this function so
-/// `get_cross_file_scope_with_cache` and subsequent scope lookups, including
-/// `candidate_lhs_matches_symbol`, observe the same graph/artifacts snapshot.
+/// plus all non-defining-file candidate validations. Callers must hold a
+/// `WorldState` read guard (as `goto_definition` does) while calling this
+/// function so `get_cross_file_scope_with_cache` and subsequent scope lookups,
+/// including `candidate_lhs_matches_symbol`, observe the same graph/artifacts
+/// snapshot.
 ///
 /// This stable convenience API delegates to
 /// [`resolve_qualified_member_with_cancel`] with [`DiagCancelToken::never`],
@@ -277,7 +278,7 @@ pub fn resolve_qualified_member(
 /// Same snapshot-scope invariant: callers must hold a `WorldState` read guard
 /// (as `goto_definition_with_cancel` does) so the shared collector's single
 /// `ParentPrefixCache`, the initial `get_cross_file_scope_with_cache` lookup,
-/// and every per-candidate `candidate_lhs_matches_symbol` re-resolve all
+/// and every non-defining-file `candidate_lhs_matches_symbol` re-resolve all
 /// observe the same graph/artifacts snapshot.
 ///
 /// `cancel` is polled cooperatively at scope-lookup and loop boundaries.
@@ -366,34 +367,48 @@ pub fn complete_qualified_members_with_cancel(
         return Vec::new();
     };
 
-    let mut by_name: HashMap<String, Vec<Candidate>> = HashMap::new();
+    let mut best_by_name: HashMap<String, Candidate> = HashMap::new();
     for candidate in batch.candidates {
-        by_name
-            .entry(candidate.name.clone())
-            .or_default()
-            .push(candidate);
-    }
-
-    let mut completions = Vec::new();
-    for candidates in by_name.into_values() {
         if cancel.is_cancelled() {
             return Vec::new();
         }
-        if let Some(winner) = pick_winner(
-            candidates,
+
+        if !completion_candidate_is_eligible(
+            &candidate,
             &batch.cursor_uri,
             batch.cursor,
             &batch.contributor_ranks,
-            &batch.contributor_distances,
         ) {
-            completions.push(QualifiedMemberCompletion {
-                name: winner.name,
-                uri: winner.uri,
-                name_range: winner.name_range,
-            });
+            continue;
+        }
+
+        match best_by_name.entry(candidate.name.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if completion_candidate_wins(
+                    &candidate,
+                    entry.get(),
+                    &batch.cursor_uri,
+                    batch.cursor,
+                    &batch.contributor_ranks,
+                    &batch.contributor_distances,
+                ) {
+                    entry.insert(candidate);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
         }
     }
 
+    let mut completions: Vec<_> = best_by_name
+        .into_values()
+        .map(|winner| QualifiedMemberCompletion {
+            name: winner.name,
+            uri: winner.uri,
+            name_range: winner.name_range,
+        })
+        .collect();
     completions.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
@@ -498,19 +513,19 @@ fn collect_qualified_member_candidates_with_cancel(
             );
         }
 
+        // Defining-file candidates are collected from the same tree that owns
+        // the resolved `lhs_name` binding. The textual LHS match, same-function
+        // check, and effect-after-definition check are the local identity proof;
+        // re-running cross-file scope once per member site is redundant and
+        // makes same-file/defining-file completion scale with N scope queries.
+        //
+        // Non-defining contributor files still go through
+        // `candidate_lhs_matches_symbol` below because their LHS binding can
+        // only be validated by resolving scope at the candidate site.
         defining_candidates.retain(|c| {
-            c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
-        });
-        defining_candidates.retain(|c| {
-            candidate_effect_visible_in_scope(c, &scope.visible_positions)
-                && candidate_lhs_matches_symbol(
-                    state,
-                    c,
-                    lhs_name,
-                    symbol,
-                    cancel,
-                    &mut prefix_cache,
-                )
+            c.fn_scope == symbol_fn_scope
+                && effect_at_or_after(c.effect, symbol_effect)
+                && candidate_effect_visible_in_scope(c, &scope.visible_positions)
         });
         if cancel.is_cancelled() {
             return None;
@@ -704,6 +719,78 @@ fn candidate_lhs_matches_symbol(
 
 fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
     (a.line, a.utf16_column) >= (b.line, b.utf16_column)
+}
+fn completion_candidate_is_eligible(
+    candidate: &Candidate,
+    cursor_uri: &Url,
+    cursor: Position,
+    contributor_ranks: &HashMap<Url, usize>,
+) -> bool {
+    if &candidate.uri == cursor_uri {
+        (candidate.effect.line, candidate.effect.utf16_column) <= (cursor.line, cursor.character)
+    } else {
+        contributor_ranks.contains_key(&candidate.uri)
+    }
+}
+
+fn completion_candidate_wins(
+    candidate: &Candidate,
+    incumbent: &Candidate,
+    cursor_uri: &Url,
+    cursor: Position,
+    contributor_ranks: &HashMap<Url, usize>,
+    contributor_distances: &HashMap<Url, usize>,
+) -> bool {
+    let candidate_in_cursor = &candidate.uri == cursor_uri;
+    let incumbent_in_cursor = &incumbent.uri == cursor_uri;
+
+    match (candidate_in_cursor, incumbent_in_cursor) {
+        (true, true) => effect_at_or_after(candidate.effect, incumbent.effect),
+        (true, false) => {
+            (candidate.effect.line, candidate.effect.utf16_column)
+                <= (cursor.line, cursor.character)
+        }
+        (false, true) => false,
+        (false, false) => {
+            compare_non_cursor_completion_candidates(
+                candidate,
+                incumbent,
+                contributor_ranks,
+                contributor_distances,
+            ) == Ordering::Less
+        }
+    }
+}
+
+fn compare_non_cursor_completion_candidates(
+    a: &Candidate,
+    b: &Candidate,
+    contributor_ranks: &HashMap<Url, usize>,
+    contributor_distances: &HashMap<Url, usize>,
+) -> Ordering {
+    if a.uri == b.uri {
+        return if effect_at_or_after(a.effect, b.effect) {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+
+    let a_distance = contributor_distances
+        .get(&a.uri)
+        .copied()
+        .unwrap_or(usize::MAX);
+    let b_distance = contributor_distances
+        .get(&b.uri)
+        .copied()
+        .unwrap_or(usize::MAX);
+    let a_rank = contributor_ranks.get(&a.uri).copied().unwrap_or(usize::MAX);
+    let b_rank = contributor_ranks.get(&b.uri).copied().unwrap_or(usize::MAX);
+
+    a_distance
+        .cmp(&b_distance)
+        .then_with(|| a_rank.cmp(&b_rank))
+        .then_with(|| a.uri.as_str().cmp(b.uri.as_str()))
 }
 
 /// Pick the best candidate.
@@ -1657,6 +1744,36 @@ foo$remote <- 1
             completion_names(&state, &main_uri, Position::new(2, 4), "foo"),
             vec!["alpha", "local", "remote"]
         );
+    }
+
+    /// Completion de-duplication should use the same winner semantics as
+    /// go-to-definition: a visible cursor-file member assignment beats a
+    /// same-named constructor literal from the defining file.
+    #[test]
+    fn dollar_member_completion_prefers_cursor_file_duplicate_candidate() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+foo$alpha <- 99
+foo$
+";
+        let helpers_code = "foo <- list(alpha = 1)\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        let completions = super::complete_qualified_members(
+            &state,
+            &main_uri,
+            Position::new(2, 4),
+            "identifier",
+            "foo",
+            crate::extract_op::ExtractOp::Dollar,
+        );
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].name, "alpha");
+        assert_eq!(completions[0].uri, main_uri);
+        assert_eq!(completions[0].name_range.start.line, 1);
     }
 
     /// Completion enumeration must also work when the sourced file is closed
