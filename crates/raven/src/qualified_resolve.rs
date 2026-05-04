@@ -44,6 +44,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
 
+use crate::cross_file::scope::LineIndex;
 use crate::extract_op::ExtractOp;
 use crate::handlers::DiagCancelToken;
 use crate::state::WorldState;
@@ -75,9 +76,9 @@ struct EffectPos {
 }
 
 impl EffectPos {
-    fn from_node_end(node: Node, text: &str) -> Self {
+    fn from_node_end(node: Node, line_index: &LineIndex) -> Self {
         let p = node.end_position();
-        let line_text = nth_line(text, p.row).unwrap_or("");
+        let line_text = line_index.get_line(p.row);
         Self {
             line: p.row as u32,
             utf16_column: byte_offset_to_utf16_column(line_text, p.column),
@@ -85,10 +86,12 @@ impl EffectPos {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn member_assignment_candidate_from_extract(
     assignment: Node,
     target: Node,
     text: &str,
+    line_index: &LineIndex,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -115,21 +118,23 @@ fn member_assignment_candidate_from_extract(
     {
         return None;
     }
-    let lhs_range = node_range_in_text(t_lhs, text);
+    let lhs_range = node_range_in_text(t_lhs, line_index);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
-        effect: EffectPos::from_node_end(assignment, text),
-        name_range: node_range_in_text(t_rhs, text),
+        effect: EffectPos::from_node_end(assignment, line_index),
+        name_range: node_range_in_text(t_rhs, line_index),
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn member_assignment_candidate_from_string_subscript(
     assignment: Node,
     target: Node,
     text: &str,
+    line_index: &LineIndex,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -148,12 +153,12 @@ fn member_assignment_candidate_from_string_subscript(
     if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range_in_text(t_lhs, text);
+    let lhs_range = node_range_in_text(t_lhs, line_index);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
-        effect: EffectPos::from_node_end(assignment, text),
-        name_range: node_range_in_text(string_node, text),
+        effect: EffectPos::from_node_end(assignment, line_index),
+        name_range: node_range_in_text(string_node, line_index),
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
@@ -440,6 +445,7 @@ fn collect_qualified_member_candidates_with_cancel(
     {
         let (defining_text, defining_tree) =
             crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
+        let defining_line_index = LineIndex::new(&defining_text);
         let symbol_fn_scope = function_scope_at(
             &defining_tree,
             &defining_text,
@@ -449,6 +455,7 @@ fn collect_qualified_member_candidates_with_cancel(
         let symbol_effect = symbol_visible_from_position(
             &defining_tree,
             &defining_text,
+            &defining_line_index,
             symbol.defined_line,
             symbol.defined_column,
             lhs_name,
@@ -457,6 +464,7 @@ fn collect_qualified_member_candidates_with_cancel(
         collect_member_assignments(
             defining_tree.root_node(),
             &defining_text,
+            &defining_line_index,
             &defining_uri,
             lhs_name,
             rhs_name,
@@ -467,6 +475,7 @@ fn collect_qualified_member_candidates_with_cancel(
             if let Some(candidate) = collect_constructor_candidate(
                 &defining_tree,
                 &defining_text,
+                &defining_line_index,
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
@@ -479,6 +488,7 @@ fn collect_qualified_member_candidates_with_cancel(
             collect_constructor_candidates(
                 &defining_tree,
                 &defining_text,
+                &defining_line_index,
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
@@ -520,9 +530,11 @@ fn collect_qualified_member_candidates_with_cancel(
         if let Some((candidate_text, candidate_tree)) =
             crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
         {
+            let candidate_line_index = LineIndex::new(&candidate_text);
             collect_member_assignments(
                 candidate_tree.root_node(),
                 &candidate_text,
+                &candidate_line_index,
                 candidate_uri,
                 lhs_name,
                 rhs_name,
@@ -774,6 +786,7 @@ fn pick_winner(
 fn symbol_visible_from_position(
     tree: &Tree,
     text: &str,
+    line_index: &LineIndex,
     defined_line: u32,
     defined_column_utf16: u32,
     lhs_name: &str,
@@ -795,7 +808,7 @@ fn symbol_visible_from_position(
     let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else {
         return fallback;
     };
-    EffectPos::from_node_end(assignment, text)
+    EffectPos::from_node_end(assignment, line_index)
 }
 
 /// Return the id of the closest enclosing `function_definition` node at the
@@ -833,9 +846,11 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 /// RHS member. Each candidate records the position of its LHS identifier
 /// (`foo` in `foo$bar <- ...`) for use as a query position when validating
 /// cross-file candidates.
+#[allow(clippy::too_many_arguments)]
 fn collect_member_assignments(
     root: Node,
     text: &str,
+    line_index: &LineIndex,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -862,22 +877,24 @@ fn collect_member_assignments(
         };
         let Some(target) = target else { continue };
         if let Some(candidate) = member_assignment_candidate_from_extract(
-            node, target, text, file_uri, lhs_name, rhs_name, op,
+            node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
         ) {
             out.push(candidate);
             continue;
         }
         if let Some(candidate) = member_assignment_candidate_from_string_subscript(
-            node, target, text, file_uri, lhs_name, rhs_name, op,
+            node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
         ) {
             out.push(candidate);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_constructor_candidate(
     tree: &Tree,
     text: &str,
+    line_index: &LineIndex,
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
@@ -888,6 +905,7 @@ fn collect_constructor_candidate(
     collect_constructor_candidates(
         tree,
         text,
+        line_index,
         file_uri,
         defined_line,
         defined_column_utf16,
@@ -910,9 +928,11 @@ fn collect_constructor_candidate(
 /// `binary_operator` whose target identifier matches `lhs_name`. R
 /// identifiers are ASCII (`[A-Za-z_.][A-Za-z0-9_.]*`) so a 1-byte step is
 /// always inside the identifier.
+#[allow(clippy::too_many_arguments)]
 fn collect_constructor_candidates(
     tree: &Tree,
     text: &str,
+    line_index: &LineIndex,
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
@@ -921,9 +941,11 @@ fn collect_constructor_candidates(
     out: &mut Vec<Candidate>,
 ) {
     // LSP columns are UTF-16 units; tree-sitter Point columns are byte offsets.
-    let Some(line_text) = nth_line(text, defined_line as usize) else {
-        return;
-    };
+    // `defined_line` always points to a valid line in `text` (it comes from
+    // the artifacts' Def event, which was emitted from a real tree-sitter
+    // position); `LineIndex::get_line` returns `""` for out-of-bounds rows,
+    // which falls through to a no-op `descendant_for_point_range`.
+    let line_text = line_index.get_line(defined_line as usize);
     let byte_col = utf16_column_to_byte_offset(line_text, defined_column_utf16);
     let line_byte_len = line_text.len();
     let start = tree_sitter::Point::new(defined_line as usize, byte_col);
@@ -976,8 +998,8 @@ fn collect_constructor_candidates(
         if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
-        let name_range = node_range_in_text(name_node, text);
-        let effect = EffectPos::from_node_end(assignment, text);
+        let name_range = node_range_in_text(name_node, line_index);
+        let effect = EffectPos::from_node_end(assignment, line_index);
         // Constructor candidates become visible only after the defining
         // assignment completes, so use the effect position for the shared
         // symbol identity check.
@@ -1030,11 +1052,11 @@ fn node_text<'a>(node: Node, text: &'a str) -> &'a str {
 
 /// Convert a tree-sitter node's range into an LSP `Range` whose columns are
 /// UTF-16 code units (per the LSP spec / `vscode-languageserver-types`).
-fn node_range_in_text(node: Node, text: &str) -> Range {
+fn node_range_in_text(node: Node, line_index: &LineIndex) -> Range {
     let s = node.start_position();
     let e = node.end_position();
-    let s_line = nth_line(text, s.row).unwrap_or("");
-    let e_line = nth_line(text, e.row).unwrap_or("");
+    let s_line = line_index.get_line(s.row);
+    let e_line = line_index.get_line(e.row);
     Range {
         start: Position::new(s.row as u32, byte_offset_to_utf16_column(s_line, s.column)),
         end: Position::new(e.row as u32, byte_offset_to_utf16_column(e_line, e.column)),
@@ -1132,6 +1154,81 @@ mod tests {
         .map(|completion| completion.name)
         .collect::<Vec<_>>()
     }
+
+    /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
+    /// prints how long `complete_qualified_members` takes. Run with:
+    ///
+    ///     cargo test --release -p raven -- \
+    ///         qualified_resolve::tests::perf_dollar_completion_scaling \
+    ///         --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn perf_dollar_completion_scaling() {
+        for n in [10usize, 50, 100, 200, 400] {
+            let mut code = String::from("df <- list()\n");
+            for k in 0..n {
+                code.push_str(&format!("df$col_{k} <- {k}\n"));
+            }
+            // Cursor after the last assignment, on a fresh `df$` line.
+            code.push_str("df$\n");
+            let cursor_line = (1 + n) as u32;
+
+            let mut state = fresh_state();
+            let uri = add_indexed_doc(&mut state, "file:///perf.R", &code);
+
+            // Warm-up to populate any one-shot caches.
+            let _ = super::complete_qualified_members(
+                &state,
+                &uri,
+                Position::new(cursor_line, 3),
+                "identifier",
+                "df",
+                crate::extract_op::ExtractOp::Dollar,
+            );
+
+            let mut dollar_samples = [std::time::Duration::ZERO; 5];
+            for s in &mut dollar_samples {
+                let start = std::time::Instant::now();
+                let r = super::complete_qualified_members(
+                    &state,
+                    &uri,
+                    Position::new(cursor_line, 3),
+                    "identifier",
+                    "df",
+                    crate::extract_op::ExtractOp::Dollar,
+                );
+                *s = start.elapsed();
+                assert_eq!(r.len(), n, "expected {n} candidates, got {}", r.len());
+            }
+            dollar_samples.sort();
+
+            // Compare against a single full scope query at the same cursor.
+            let mut scope_samples = [std::time::Duration::ZERO; 5];
+            for s in &mut scope_samples {
+                let cancel = DiagCancelToken::never();
+                let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+                let start = std::time::Instant::now();
+                let _scope = crate::handlers::get_cross_file_scope_with_cache(
+                    &state,
+                    &uri,
+                    cursor_line,
+                    3,
+                    &cancel,
+                    &mut cache,
+                );
+                *s = start.elapsed();
+            }
+            scope_samples.sort();
+
+            eprintln!(
+                "perf n={n:>4}  dollar_complete={:?}  one_scope_query={:?}  ratio={:.1}x",
+                dollar_samples[2],
+                scope_samples[2],
+                dollar_samples[2].as_secs_f64() / scope_samples[2].as_secs_f64()
+            );
+        }
+    }
+
     /// Request-scoped cancellation short-circuits qualified-member lookup before
     /// cross-file scope resolution returns a location.
     #[test]
