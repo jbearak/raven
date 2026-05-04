@@ -2924,9 +2924,17 @@ where
 /// Per-snapshot cache for `ParentPrefix` results, keyed by `(target URI,
 /// query_inside_function)`.
 ///
-/// Lives inside `DiagnosticsSnapshot` so it shares the snapshot's lifetime;
-/// never shared across snapshots. Within one diagnostic pass, all scope queries
-/// against the same URI reuse the same prefix entries.
+/// Use one instance per `WorldState` snapshot and never share across
+/// snapshots. Two patterns:
+///
+/// - **Diagnostic pass**: lives inside `DiagnosticsSnapshot` so it shares the
+///   snapshot's lifetime; all scope queries against the same URI reuse the
+///   same prefix entries.
+/// - **Interactive request batch**: a request handler that resolves many
+///   positions under one read guard (for example
+///   `qualified_resolve::resolve_qualified_member`) creates a cache at the
+///   start of the call, threads it through `get_cross_file_scope_with_cache`,
+///   and drops it when the call returns.
 #[derive(Debug, Default)]
 pub struct ParentPrefixCache {
     entries: HashMap<(Url, bool), Arc<ParentPrefix>>,

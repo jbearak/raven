@@ -2706,34 +2706,17 @@ pub(crate) fn get_cross_file_scope(
     column: u32,
     cancel: &DiagCancelToken,
 ) -> scope::ScopeAtPosition {
-    // Use ContentProvider for unified access
     let content_provider = state.content_provider();
-
-    // Closure to get artifacts for a URI
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         content_provider.get_artifacts(target_uri)
     };
-
-    // Closure to get metadata for a URI
     let get_metadata =
         |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
             content_provider.get_metadata(target_uri)
         };
-
-    let max_depth = state.cross_file_config.max_chain_depth;
-
-    // Get base_exports from package_library if ready, otherwise empty set.
-    // This ensures base R functions (stop, sprintf, exists, etc.) are available
-    // in cross-file scope resolution for hover, completions, and go-to-definition.
-    let base_exports = if state.package_library_ready {
-        state.package_library.base_exports().clone()
-    } else {
-        empty_base_exports().clone()
-    };
-
+    let base_exports = cross_file_base_exports(state);
     let is_cancelled = || cancel.is_cancelled();
 
-    // Use the graph-aware scope resolution with PathContext
     scope::scope_at_position_with_graph(
         uri,
         line,
@@ -2742,7 +2725,7 @@ pub(crate) fn get_cross_file_scope(
         &get_metadata,
         &state.cross_file_graph,
         state.workspace_folders.first(),
-        max_depth,
+        state.cross_file_config.max_chain_depth,
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
@@ -2756,6 +2739,11 @@ pub(crate) fn get_cross_file_scope(
 /// positions while holding the same `WorldState` read guard. The caller owns
 /// the `ParentPrefixCache`; do not share it across independent requests or
 /// state snapshots.
+///
+/// Note: this entry point's parent-prefix seeding (`(u32::MAX, u32::MAX)`)
+/// is a slightly wider over-approximation than `get_cross_file_scope`'s
+/// for cyclic dependency graphs. Single-position callers that want the
+/// non-cached behavior must continue to use `get_cross_file_scope`.
 pub(crate) fn get_cross_file_scope_with_cache(
     state: &WorldState,
     uri: &Url,
@@ -2764,36 +2752,17 @@ pub(crate) fn get_cross_file_scope_with_cache(
     cancel: &DiagCancelToken,
     prefix_cache: &mut scope::ParentPrefixCache,
 ) -> scope::ScopeAtPosition {
-    // Use ContentProvider for unified access
     let content_provider = state.content_provider();
-
-    // Closure to get artifacts for a URI
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
         content_provider.get_artifacts(target_uri)
     };
-
-    // Closure to get metadata for a URI
     let get_metadata =
         |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
             content_provider.get_metadata(target_uri)
         };
-
-    let max_depth = state.cross_file_config.max_chain_depth;
-
-    // Get base_exports from package_library if ready, otherwise empty set.
-    // This ensures base R functions (stop, sprintf, exists, etc.) are available
-    // in cross-file scope resolution for hover, completions, and go-to-definition.
-    let base_exports = if state.package_library_ready {
-        state.package_library.base_exports().clone()
-    } else {
-        empty_base_exports().clone()
-    };
-
+    let base_exports = cross_file_base_exports(state);
     let is_cancelled = || cancel.is_cancelled();
 
-    // Use the graph-aware cached scope resolution with PathContext. The cache
-    // only memoizes the position-invariant parent-prefix walk; local STEP 2
-    // still runs for every queried candidate position.
     scope::scope_at_position_with_graph_cached(
         uri,
         line,
@@ -2802,13 +2771,24 @@ pub(crate) fn get_cross_file_scope_with_cache(
         &get_metadata,
         &state.cross_file_graph,
         state.workspace_folders.first(),
-        max_depth,
+        state.cross_file_config.max_chain_depth,
         &base_exports,
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
         prefix_cache,
     )
+}
+
+/// Pick the right `base_exports` for cross-file scope resolution. Returns
+/// the cached empty set during cold start so we don't allocate a fresh Arc
+/// per call when the package library hasn't reported library paths yet.
+fn cross_file_base_exports(state: &WorldState) -> Arc<HashSet<String>> {
+    if state.package_library_ready {
+        state.package_library.base_exports().clone()
+    } else {
+        empty_base_exports().clone()
+    }
 }
 
 // ============================================================================

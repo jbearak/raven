@@ -122,7 +122,11 @@ pub fn resolve_qualified_member(
     // snapshot under the caller's read guard.
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
-    // Resolve the LHS via the existing position-aware cross-file scope.
+    // The cancel token is `never()` until raven gains a backend-level
+    // request-cancellation registry (see issue #155 mitigation #3). Once
+    // that exists, thread the request's token through here and through
+    // `candidate_lhs_matches_symbol` so a superseded goto-def can bail
+    // out of the retain loop early.
     let scope = crate::handlers::get_cross_file_scope_with_cache(
         state,
         uri,
