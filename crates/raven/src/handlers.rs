@@ -8582,6 +8582,139 @@ fn ts_point_to_lsp_position(text: &str, point: Point) -> Position {
     Position::new(point.row as u32, character)
 }
 
+#[derive(Debug, Clone)]
+struct DollarMemberCompletionContext {
+    lhs_name: String,
+    typed_prefix: String,
+    replace_range: Range,
+}
+
+fn detect_dollar_member_completion_context(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    position: Position,
+) -> Option<DollarMemberCompletionContext> {
+    let line_idx = position.line as usize;
+    let line = text.lines().nth(line_idx)?;
+    let cursor_byte = utf16_column_to_byte_offset(line, position.character).min(line.len());
+
+    if position_in_string_or_comment(tree, line_idx, cursor_byte) {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let mut token_start = cursor_byte;
+    while token_start > 0 && is_r_identifier_continue_byte(bytes[token_start - 1]) {
+        token_start -= 1;
+    }
+
+    let mut token_end = cursor_byte;
+    while token_end < bytes.len() && is_r_identifier_continue_byte(bytes[token_end]) {
+        token_end += 1;
+    }
+
+    if token_start == 0 || bytes[token_start - 1] != b'$' {
+        return None;
+    }
+
+    let dollar_byte = token_start - 1;
+    let mut lhs_start = dollar_byte;
+    while lhs_start > 0 && is_r_identifier_continue_byte(bytes[lhs_start - 1]) {
+        lhs_start -= 1;
+    }
+    if lhs_start == dollar_byte || !is_r_identifier_start_byte(bytes[lhs_start]) {
+        return None;
+    }
+    if lhs_start > 0 && matches!(bytes[lhs_start - 1], b':' | b'$' | b'@') {
+        return None;
+    }
+
+    let lhs_name = line[lhs_start..dollar_byte].to_string();
+    let typed_prefix = line[token_start..cursor_byte].to_string();
+    let start_character = crate::utf16::byte_offset_to_utf16_column(line, token_start);
+    let end_character = crate::utf16::byte_offset_to_utf16_column(line, token_end);
+
+    Some(DollarMemberCompletionContext {
+        lhs_name,
+        typed_prefix,
+        replace_range: Range {
+            start: Position::new(position.line, start_character),
+            end: Position::new(position.line, end_character),
+        },
+    })
+}
+
+fn position_in_string_or_comment(
+    tree: &tree_sitter::Tree,
+    line_idx: usize,
+    cursor_byte: usize,
+) -> bool {
+    let check_byte = cursor_byte.saturating_sub(1);
+    let point = Point::new(line_idx, check_byte);
+    let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return false;
+    };
+    loop {
+        let kind = node.kind();
+        if kind == "comment" || kind.contains("string") {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn is_r_identifier_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'.' || byte == b'_'
+}
+
+fn is_r_identifier_continue_byte(byte: u8) -> bool {
+    is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
+}
+
+fn dollar_member_completion_items(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    context: &DollarMemberCompletionContext,
+) -> Vec<CompletionItem> {
+    crate::qualified_resolve::complete_qualified_members(
+        state,
+        uri,
+        position,
+        "identifier",
+        &context.lhs_name,
+        crate::extract_op::ExtractOp::Dollar,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        context.typed_prefix.is_empty() || candidate.name.starts_with(&context.typed_prefix)
+    })
+    .map(|candidate| {
+        let detail = if candidate.uri == *uri {
+            format!("member of {}", context.lhs_name)
+        } else {
+            let relative_path =
+                compute_relative_path(&candidate.uri, state.workspace_folders.first());
+            format!("member of {} from {}", context.lhs_name, relative_path)
+        };
+        CompletionItem {
+            label: candidate.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(detail),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, candidate.name)),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: context.replace_range,
+                new_text: candidate.name,
+            })),
+            ..Default::default()
+        }
+    })
+    .collect()
+}
+
 pub fn completion(
     state: &WorldState,
     uri: &Url,
@@ -8642,6 +8775,10 @@ pub fn completion(
         return Some(CompletionResponse::Array(items));
     }
 
+    if let Some(member_context) = detect_dollar_member_completion_context(tree, &text, position) {
+        let items = dollar_member_completion_items(state, uri, position, &member_context);
+        return Some(CompletionResponse::Array(items));
+    }
     let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
@@ -38499,6 +38636,134 @@ result <- undefined_var
         );
 
         // If we reached here without panicking, the utility works correctly.
+    }
+}
+#[cfg(test)]
+mod dollar_member_completion_tests {
+    use super::*;
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{
+        CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Position, Url,
+    };
+
+    fn completion_items(marked_code: &str) -> Vec<CompletionItem> {
+        let (code, position) = code_and_position(marked_code);
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(&code, None));
+
+        match completion(&state, &uri, position, None) {
+            Some(CompletionResponse::Array(items)) => items,
+            other => panic!("expected completion array, got {:?}", other),
+        }
+    }
+
+    fn code_and_position(marked_code: &str) -> (String, Position) {
+        let marker = marked_code.find('|').expect("cursor marker");
+        let prefix = &marked_code[..marker];
+        let line = prefix.chars().filter(|&ch| ch == '\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        let mut code = marked_code.to_string();
+        code.remove(marker);
+        (code, Position::new(line, character))
+    }
+
+    fn sorted_labels(items: &[CompletionItem]) -> Vec<String> {
+        let mut labels = items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    }
+
+    #[test]
+    fn dollar_member_completion_lists_constructor_members() {
+        let items = completion_items("foo <- list(alpha = 1, beta = 2)\nfoo$|");
+
+        assert_eq!(sorted_labels(&items), vec!["alpha", "beta"]);
+        assert!(items
+            .iter()
+            .all(|item| item.kind == Some(CompletionItemKind::FIELD)));
+    }
+
+    #[test]
+    fn dollar_member_completion_lists_data_frame_members() {
+        let items = completion_items("df <- data.frame(age = 1, sex = \"F\")\ndf$|");
+
+        assert_eq!(sorted_labels(&items), vec!["age", "sex"]);
+    }
+
+    #[test]
+    fn dollar_member_completion_lists_member_assignments() {
+        let items = completion_items("foo <- list()\nfoo$bar <- 1\nfoo$|");
+
+        assert_eq!(sorted_labels(&items), vec!["bar"]);
+    }
+
+    #[test]
+    fn dollar_member_completion_filters_prefix_and_replaces_rhs_token() {
+        let items = completion_items("foo <- list(alpha = 1, beta = 2)\nfoo$b|eta");
+
+        assert_eq!(sorted_labels(&items), vec!["beta"]);
+        let item = items.iter().find(|item| item.label == "beta").unwrap();
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range.start, Position::new(1, 4));
+                assert_eq!(edit.range.end, Position::new(1, 8));
+                assert_eq!(edit.new_text, "beta");
+            }
+            other => panic!("expected text edit for beta completion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dollar_member_completion_excludes_later_assignments() {
+        let items = completion_items("foo <- list()\nfoo$|\nfoo$late <- 1\n");
+
+        assert!(
+            items.is_empty(),
+            "later member assignment should be invisible, got {:?}",
+            sorted_labels(&items)
+        );
+    }
+
+    #[test]
+    fn dollar_member_completion_does_not_fallback_to_normal_completions() {
+        let items = completion_items("bar <- 1\nfoo$|");
+
+        assert!(
+            items.is_empty(),
+            "unresolvable dollar LHS should not return normal completions, got {:?}",
+            sorted_labels(&items)
+        );
+    }
+
+    #[test]
+    fn dollar_member_completion_text_edit_uses_utf16_columns() {
+        let items = completion_items("foo <- list(beta = 1)\n\"💜\"; foo$b|eta");
+        let item = items.iter().find(|item| item.label == "beta").unwrap();
+
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range.start, Position::new(1, 10));
+                assert_eq!(edit.range.end, Position::new(1, 14));
+            }
+            other => panic!("expected text edit for beta completion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_dollar_completion_still_returns_normal_items() {
+        let items = completion_items("foo <- list(alpha = 1)\nfo|");
+        let labels = sorted_labels(&items);
+
+        assert!(labels.contains(&"foo".to_string()));
+        assert!(labels.contains(&"if".to_string()));
     }
 }
 

@@ -1,4 +1,4 @@
-//! Resolve go-to-definition for the RHS identifier of `$` and `@`.
+//! Resolve and enumerate candidates for the RHS identifier of `$` and `@`.
 //!
 //! See `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md`.
 //!
@@ -84,6 +84,9 @@ impl EffectPos {
 
 #[derive(Debug, Clone)]
 struct Candidate {
+    /// Member/slot name (`bar` in `foo$bar <- ...`, or the named argument in
+    /// `foo <- list(bar = ...)`).
+    name: String,
     /// File the candidate lives in. For defining-file candidates this is
     /// `defining_uri`; for cross-file candidates this is the file containing
     /// the validated member-assignment site.
@@ -101,6 +104,21 @@ struct Candidate {
     /// the query position when re-resolving `foo` for non-defining-file
     /// candidates; ignored for defining-file candidates.
     lhs_pos: Position,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedMemberCompletion {
+    pub name: String,
+    pub uri: Url,
+    pub name_range: Range,
+}
+
+struct CandidateBatch {
+    candidates: Vec<Candidate>,
+    cursor_uri: Url,
+    cursor: Position,
+    contributor_ranks: HashMap<Url, usize>,
+    contributor_distances: HashMap<Url, usize>,
 }
 
 /// Resolves go-to-definition for a qualified member RHS (`bar` in `foo$bar` or
@@ -222,7 +240,7 @@ pub fn resolve_qualified_member_with_cancel(
             &defining_text,
             &defining_uri,
             lhs_name,
-            rhs_name,
+            Some(rhs_name),
             op,
             &mut defining_candidates,
         );
@@ -280,7 +298,7 @@ pub fn resolve_qualified_member_with_cancel(
                 &candidate_text,
                 candidate_uri,
                 lhs_name,
-                rhs_name,
+                Some(rhs_name),
                 op,
                 &mut cross_file_candidates,
             );
@@ -313,6 +331,239 @@ pub fn resolve_qualified_member_with_cancel(
     .map(|c| Location {
         uri: c.uri,
         range: c.name_range,
+    })
+}
+
+/// Enumerate visible `$`/`@` member candidates for completion.
+///
+/// This stable convenience API delegates to
+/// [`complete_qualified_members_with_cancel`] with [`DiagCancelToken::never`].
+pub fn complete_qualified_members(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    op: ExtractOp,
+) -> Vec<QualifiedMemberCompletion> {
+    complete_qualified_members_with_cancel(
+        state,
+        uri,
+        position,
+        lhs_node_kind,
+        lhs_name,
+        op,
+        &DiagCancelToken::never(),
+    )
+}
+
+/// Cancellation-aware variant of [`complete_qualified_members`].
+///
+/// Candidates are de-duplicated by member label. For duplicate visible
+/// definitions of the same label, the chosen candidate is the same winner that
+/// [`resolve_qualified_member_with_cancel`] would use at the cursor.
+pub fn complete_qualified_members_with_cancel(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Vec<QualifiedMemberCompletion> {
+    let Some(batch) = collect_qualified_member_candidates_with_cancel(
+        state,
+        uri,
+        position,
+        lhs_node_kind,
+        lhs_name,
+        None,
+        op,
+        cancel,
+    ) else {
+        return Vec::new();
+    };
+
+    let mut by_name: HashMap<String, Vec<Candidate>> = HashMap::new();
+    for candidate in batch.candidates {
+        by_name
+            .entry(candidate.name.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut completions = Vec::new();
+    for candidates in by_name.into_values() {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        if let Some(winner) = pick_winner(
+            candidates,
+            &batch.cursor_uri,
+            batch.cursor,
+            &batch.contributor_ranks,
+            &batch.contributor_distances,
+        ) {
+            completions.push(QualifiedMemberCompletion {
+                name: winner.name,
+                uri: winner.uri,
+                name_range: winner.name_range,
+            });
+        }
+    }
+
+    completions.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.uri.as_str().cmp(b.uri.as_str()))
+            .then_with(|| {
+                (a.name_range.start.line, a.name_range.start.character)
+                    .cmp(&(b.name_range.start.line, b.name_range.start.character))
+            })
+    });
+    completions
+}
+
+fn collect_qualified_member_candidates_with_cancel(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    lhs_node_kind: &str,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Option<CandidateBatch> {
+    if lhs_node_kind != "identifier" || cancel.is_cancelled() {
+        return None;
+    }
+    let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
+
+    let scope = crate::handlers::get_cross_file_scope_with_cache(
+        state,
+        uri,
+        position.line,
+        position.character,
+        cancel,
+        &mut prefix_cache,
+    );
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let symbol = scope.symbols.get(lhs_name)?;
+
+    if symbol.source_uri.as_str().starts_with("package:") {
+        return None;
+    }
+
+    let defining_uri = symbol.source_uri.clone();
+    let cursor_uri = uri.clone();
+
+    let mut defining_candidates: Vec<Candidate> = Vec::new();
+    {
+        let (defining_text, defining_tree) =
+            crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
+        let symbol_fn_scope = function_scope_at(
+            &defining_tree,
+            &defining_text,
+            symbol.defined_line,
+            symbol.defined_column,
+        );
+        let symbol_effect = symbol_visible_from_position(
+            &defining_tree,
+            &defining_text,
+            symbol.defined_line,
+            symbol.defined_column,
+            lhs_name,
+        );
+
+        collect_member_assignments(
+            defining_tree.root_node(),
+            &defining_text,
+            &defining_uri,
+            lhs_name,
+            rhs_name,
+            op,
+            &mut defining_candidates,
+        );
+        collect_constructor_candidates(
+            &defining_tree,
+            &defining_text,
+            &defining_uri,
+            symbol.defined_line,
+            symbol.defined_column,
+            lhs_name,
+            rhs_name,
+            &mut defining_candidates,
+        );
+
+        defining_candidates.retain(|c| {
+            c.fn_scope == symbol_fn_scope && effect_at_or_after(c.effect, symbol_effect)
+        });
+        defining_candidates.retain(|c| {
+            candidate_effect_visible_in_scope(c, &scope.visible_positions)
+                && candidate_lhs_matches_symbol(
+                    state,
+                    c,
+                    lhs_name,
+                    symbol,
+                    cancel,
+                    &mut prefix_cache,
+                )
+        });
+        if cancel.is_cancelled() {
+            return None;
+        }
+    }
+
+    let mut cross_file_candidates: Vec<Candidate> = Vec::new();
+    let contributor_ranks = contributor_file_ranks(&scope.chain);
+    for candidate_uri in scope
+        .chain
+        .iter()
+        .filter(|candidate_uri| **candidate_uri != defining_uri)
+    {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if let Some((candidate_text, candidate_tree)) =
+            crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
+        {
+            collect_member_assignments(
+                candidate_tree.root_node(),
+                &candidate_text,
+                candidate_uri,
+                lhs_name,
+                rhs_name,
+                op,
+                &mut cross_file_candidates,
+            );
+        }
+    }
+    cross_file_candidates.retain(|c| {
+        candidate_effect_visible_in_scope(c, &scope.visible_positions)
+            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, cancel, &mut prefix_cache)
+    });
+    if cancel.is_cancelled() {
+        return None;
+    }
+
+    let mut all_candidates = defining_candidates;
+    all_candidates.extend(cross_file_candidates);
+    let contributor_distances = contributor_file_distances(
+        &state.cross_file_graph,
+        &cursor_uri,
+        &scope.chain,
+        &scope.visible_positions,
+        all_candidates.iter().map(|candidate| &candidate.uri),
+    );
+
+    Some(CandidateBatch {
+        candidates: all_candidates,
+        cursor_uri,
+        cursor: position,
+        contributor_ranks,
+        contributor_distances,
     })
 }
 
@@ -584,7 +835,8 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 }
 
 /// Walk `root` recursively, recording every `binary_operator` whose target
-/// is `extract_operator` matching `(lhs_name, op, rhs_name)`. Each candidate
+/// is `extract_operator` matching `(lhs_name, op, rhs_name)` when `rhs_name`
+/// is provided, otherwise every RHS member. Each candidate
 /// records the position of its LHS identifier (`foo` in `foo$bar <- ...`)
 /// for use as a query position when validating cross-file candidates.
 fn collect_member_assignments(
@@ -592,7 +844,7 @@ fn collect_member_assignments(
     text: &str,
     file_uri: &Url,
     lhs_name: &str,
-    rhs_name: &str,
+    rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
 ) {
@@ -636,11 +888,15 @@ fn collect_member_assignments(
         if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
             continue;
         }
-        if node_text(t_lhs, text) != lhs_name || node_text(t_rhs, text) != rhs_name {
+        let member_name = node_text(t_rhs, text);
+        if node_text(t_lhs, text) != lhs_name
+            || rhs_name.is_some_and(|rhs_name| member_name != rhs_name)
+        {
             continue;
         }
         let lhs_range = node_range_in_text(t_lhs, text);
         out.push(Candidate {
+            name: member_name.to_string(),
             uri: file_uri.clone(),
             effect: EffectPos::from_node_end(node, text),
             name_range: node_range_in_text(t_rhs, text),
@@ -650,18 +906,6 @@ fn collect_member_assignments(
     }
 }
 
-/// If the assignment that defines `lhs_name` at `(defined_line, defined_col)`
-/// has a constructor-call RHS in the allowlist, return a candidate for the
-/// named argument matching `rhs_name`.
-///
-/// We use the position only as a hint to find the *intended* defining
-/// assignment — convert `defined_column_utf16` to a byte offset and descend
-/// to the smallest node containing `(defined_line, byte_col .. byte_col+1)`
-/// (a 1-byte-wide range, since a zero-width range at the very start of the
-/// line does not reliably descend into a leaf), then ascend to the enclosing
-/// `binary_operator` whose target identifier matches `lhs_name`. R
-/// identifiers are ASCII (`[A-Za-z_.][A-Za-z0-9_.]*`) so a 1-byte step is
-/// always inside the identifier.
 fn collect_constructor_candidate(
     tree: &Tree,
     text: &str,
@@ -671,8 +915,46 @@ fn collect_constructor_candidate(
     lhs_name: &str,
     rhs_name: &str,
 ) -> Option<Candidate> {
+    let mut candidates = Vec::new();
+    collect_constructor_candidates(
+        tree,
+        text,
+        file_uri,
+        defined_line,
+        defined_column_utf16,
+        lhs_name,
+        Some(rhs_name),
+        &mut candidates,
+    );
+    candidates.into_iter().next()
+}
+
+/// If the assignment that defines `lhs_name` at `(defined_line, defined_col)`
+/// has a constructor-call RHS in the allowlist, collect candidates for named
+/// arguments matching `rhs_name` when provided, otherwise all named arguments.
+///
+/// We use the position only as a hint to find the *intended* defining
+/// assignment — convert `defined_column_utf16` to a byte offset and descend
+/// to the smallest node containing `(defined_line, byte_col .. byte_col+1)`
+/// (a 1-byte-wide range, since a zero-width range at the very start of the
+/// line does not reliably descend into a leaf), then ascend to the enclosing
+/// `binary_operator` whose target identifier matches `lhs_name`. R
+/// identifiers are ASCII (`[A-Za-z_.][A-Za-z0-9_.]*`) so a 1-byte step is
+/// always inside the identifier.
+fn collect_constructor_candidates(
+    tree: &Tree,
+    text: &str,
+    file_uri: &Url,
+    defined_line: u32,
+    defined_column_utf16: u32,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    out: &mut Vec<Candidate>,
+) {
     // LSP columns are UTF-16 units; tree-sitter Point columns are byte offsets.
-    let line_text = nth_line(text, defined_line as usize)?;
+    let Some(line_text) = nth_line(text, defined_line as usize) else {
+        return;
+    };
     let byte_col = utf16_column_to_byte_offset(line_text, defined_column_utf16);
     let line_byte_len = line_text.len();
     let start = tree_sitter::Point::new(defined_line as usize, byte_col);
@@ -680,26 +962,36 @@ fn collect_constructor_candidate(
     // when the symbol sits at column 0 of its line.
     let end_col = (byte_col + 1).min(line_byte_len);
     let end = tree_sitter::Point::new(defined_line as usize, end_col);
-    let id_node = tree.root_node().descendant_for_point_range(start, end)?;
+    let Some(id_node) = tree.root_node().descendant_for_point_range(start, end) else {
+        return;
+    };
 
     // Walk up to the enclosing `binary_operator` whose target identifier is
     // `lhs_name`, then look at its RHS.
-    let assignment = ascend_to_assignment_for(id_node, text, lhs_name)?;
-    let value_node = assignment_value_node(assignment, text)?;
+    let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else {
+        return;
+    };
+    let Some(value_node) = assignment_value_node(assignment, text) else {
+        return;
+    };
 
     if value_node.kind() != "call" {
-        return None;
+        return;
     }
-    let func_node = value_node.child_by_field_name("function")?;
+    let Some(func_node) = value_node.child_by_field_name("function") else {
+        return;
+    };
     if func_node.kind() != "identifier" {
-        return None;
+        return;
     }
     let func_name = node_text(func_node, text);
     if !CONSTRUCTOR_ALLOWLIST.contains(&func_name) {
-        return None;
+        return;
     }
 
-    let args_node = value_node.child_by_field_name("arguments")?;
+    let Some(args_node) = value_node.child_by_field_name("arguments") else {
+        return;
+    };
     let mut walker = args_node.walk();
     for child in args_node.children(&mut walker) {
         if child.kind() != "argument" {
@@ -711,7 +1003,8 @@ fn collect_constructor_candidate(
         if name_node.kind() != "identifier" {
             continue;
         }
-        if node_text(name_node, text) != rhs_name {
+        let member_name = node_text(name_node, text);
+        if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
         let name_range = node_range_in_text(name_node, text);
@@ -720,7 +1013,8 @@ fn collect_constructor_candidate(
         // assignment completes, so use the effect position for the shared
         // symbol identity check.
         let lhs_pos = Position::new(effect.line, effect.utf16_column);
-        return Some(Candidate {
+        out.push(Candidate {
+            name: member_name.to_string(),
             uri: file_uri.clone(),
             effect,
             name_range,
@@ -728,7 +1022,6 @@ fn collect_constructor_candidate(
             lhs_pos,
         });
     }
-    None
 }
 
 fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> Option<Node<'a>> {
@@ -817,6 +1110,27 @@ mod tests {
             other => panic!("expected Scalar location, got {:?}", other),
         }
     }
+
+    fn completion_names(
+        state: &WorldState,
+        uri: &Url,
+        position: Position,
+        lhs_name: &str,
+    ) -> Vec<String> {
+        let mut names = super::complete_qualified_members(
+            state,
+            uri,
+            position,
+            "identifier",
+            lhs_name,
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        .into_iter()
+        .map(|completion| completion.name)
+        .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
     /// Request-scoped cancellation short-circuits qualified-member lookup before
     /// cross-file scope resolution returns a location.
     #[test]
@@ -865,6 +1179,31 @@ mod tests {
         assert_eq!(l.range.start.line, 1);
         // `bar` in `foo$bar <- 99` is at col 4
         assert_eq!(l.range.start.character, 4);
+    }
+
+    /// Completion enumeration returns all visible constructor and member
+    /// assignment names for the resolved object.
+    #[test]
+    fn dollar_member_completion_enumerates_constructor_and_assignment_names() {
+        let mut state = fresh_state();
+        let code = "foo <- list(alpha = 1)\nfoo$beta <- 2\nfoo$\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        assert_eq!(
+            completion_names(&state, &uri, Position::new(2, 4), "foo"),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    /// Completion enumeration is position-aware: a member assignment after the
+    /// cursor is not a visible candidate.
+    #[test]
+    fn dollar_member_completion_excludes_future_assignment() {
+        let mut state = fresh_state();
+        let code = "foo <- list()\nfoo$\nfoo$late <- 1\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+
+        assert!(completion_names(&state, &uri, Position::new(1, 4), "foo").is_empty());
     }
 
     /// Position-aware tie-break: literal then member-assignment, cursor after both
@@ -1164,6 +1503,53 @@ use(foo$bar)
             |_| None,
         );
         (main_uri, helpers_uri)
+    }
+
+    /// Completion enumeration follows the same cross-file visibility as
+    /// go-to-definition: constructor names from the defining file and validated
+    /// member assignments from the cursor file are both offered.
+    #[test]
+    fn dollar_member_completion_includes_cross_file_candidates() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+foo$local <- 2
+foo$
+";
+        let helpers_code = "\
+foo <- list(alpha = 1)
+foo$remote <- 1
+";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 4), "foo"),
+            vec!["alpha", "local", "remote"]
+        );
+    }
+
+    /// Completion enumeration rejects member assignments where the LHS object
+    /// resolves to a shadowing local binding rather than the imported object.
+    #[test]
+    fn dollar_member_completion_rejects_shadowed_cross_file_assignment() {
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+g <- function() {
+  foo <- list()
+  foo$shadow <- 99
+}
+foo$
+";
+        let helpers_code = "foo <- list(alpha = 1)\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(5, 4), "foo"),
+            vec!["alpha"]
+        );
     }
 
     /// The "skeleton-and-attach" pattern: `foo` is defined as an empty
