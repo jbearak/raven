@@ -1219,6 +1219,17 @@ mod tests {
                 *s = start.elapsed();
             }
             scope_samples.sort();
+            // Single-file cached scope queries can hit the timer floor, so use
+            // a tiny baseline floor before applying the regression factor.
+            let scope_baseline = scope_samples[0].max(std::time::Duration::from_millis(1));
+            const PERF_REGRESSION_FACTOR: f64 = 10.0;
+            assert!(
+                dollar_samples[0] < scope_baseline.mul_f64(PERF_REGRESSION_FACTOR),
+                "best dollar completion sample {:?} exceeded {PERF_REGRESSION_FACTOR}x scope baseline {:?} (best scope sample {:?})",
+                dollar_samples[0],
+                scope_baseline,
+                scope_samples[0]
+            );
 
             eprintln!(
                 "perf n={n:>4}  dollar_complete={:?}  one_scope_query={:?}  ratio={:.1}x",
