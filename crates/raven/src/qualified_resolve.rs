@@ -3129,14 +3129,19 @@ use(foo$inner)
     }
 
     /// Member assignments in a parent (backward-dependency) file must NOT
-    /// appear as completions in the child file. The parent executes *after*
-    /// the child, so its `foo$bar <- 1` is not visible at the child's cursor.
+    /// appear as completions or goto-definition targets in the child file. The
+    /// parent executes *after* the child, so its `foo$bar <- 1` is not visible
+    /// at the child's cursor. `collect_qualified_member_candidates_with_cancel`
+    /// feeds both `complete_qualified_members_with_cancel` and
+    /// `resolve_qualified_member_with_cancel`, so this test asserts both paths
+    /// reject the parent's assignment.
     #[test]
     fn dollar_member_completion_excludes_parent_prefix_assignments() {
         let mut state = fresh_state();
         let child_code = "\
 foo <- list()
 foo$
+foo$bar
 ";
         let parent_code = "\
 source(\"child.R\")
@@ -3154,10 +3159,17 @@ foo$bar <- 1
             );
         }
 
-        // Cursor in child.R at `foo$` — parent's `foo$bar` must not leak.
+        // Cursor in child.R at `foo$` — parent's `foo$bar` must not leak into
+        // the completion list.
         assert!(
             completion_names(&state, &child_uri, Position::new(1, 4), "foo").is_empty(),
             "parent-prefix member assignments must not appear in child completions"
+        );
+        // Cursor on `bar` in child.R's `foo$bar` — parent's `foo$bar <- 1`
+        // must not be reachable via goto-definition either.
+        assert!(
+            goto_definition(&state, &child_uri, Position::new(2, 5)).is_none(),
+            "parent-prefix member assignments must not be reachable via goto-definition"
         );
     }
 
