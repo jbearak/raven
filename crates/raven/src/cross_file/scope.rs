@@ -3436,6 +3436,16 @@ where
 /// Function-scoped visibility, sys.source/local scoping rules, cycle prevention, and `max_depth`
 /// are respected; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
 ///
+/// # Invariants
+///
+/// **`visible_positions[uri]` is pinned to the first-visit position.** A re-visit
+/// happens when a transitive cycle forward-sources `uri` at a wider position
+/// (typically EOF). The *original* visit already recorded the legitimate cap for
+/// `uri`'s role in the cursor's execution chain; expanding it on re-visit lets a
+/// side-trip recursion overwrite the cap and reveal later-than-source definitions
+/// that aren't actually in scope. The re-visit still re-runs STEP 2 to collect any
+/// new symbols — only the visibility cutoff stays put.
+///
 /// # Returns
 ///
 /// A `ScopeAtPosition` containing the merged symbols, provenance chain, recorded depth-exceeded
@@ -3530,13 +3540,8 @@ where
     visited.insert(uri.clone(), (line, column));
     if !is_revisit {
         scope.chain.push(uri.clone());
-        // Skip this on re-visit. A re-visit happens when a transitive cycle
-        // forward-sources `uri` at a wider position (typically EOF). The
-        // *original* visit already recorded the legitimate cap for `uri`'s
-        // role in the cursor's execution chain; expanding it here lets a
-        // side-trip recursion overwrite the cap and reveal later-than-source
-        // definitions that aren't actually in scope. The re-visit still
-        // collects symbols via STEP 2 below — only the cap stays pinned.
+        // First-visit only — see the `visible_positions[uri]` invariant in this
+        // function's doc comment.
         record_visible_position(&mut scope.visible_positions, uri, line, column);
     }
 
