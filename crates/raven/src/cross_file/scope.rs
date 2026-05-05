@@ -3530,8 +3530,15 @@ where
     visited.insert(uri.clone(), (line, column));
     if !is_revisit {
         scope.chain.push(uri.clone());
+        // Skip this on re-visit. A re-visit happens when a transitive cycle
+        // forward-sources `uri` at a wider position (typically EOF). The
+        // *original* visit already recorded the legitimate cap for `uri`'s
+        // role in the cursor's execution chain; expanding it here lets a
+        // side-trip recursion overwrite the cap and reveal later-than-source
+        // definitions that aren't actually in scope. The re-visit still
+        // collects symbols via STEP 2 below — only the cap stays pinned.
+        record_visible_position(&mut scope.visible_positions, uri, line, column);
     }
-    record_visible_position(&mut scope.visible_positions, uri, line, column);
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,

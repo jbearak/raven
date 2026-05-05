@@ -2177,6 +2177,77 @@ source(\"main.R\")
         );
     }
 
+    /// Regression: parent assignments after `source(child)` must stay invisible
+    /// in the child even when a transitive forward-source descendant has a
+    /// dependent that *also* sources the parent. Reproduces the worldwide-repo
+    /// bug:
+    ///
+    /// - cursor file `data.R` is sourced by `main.R` at line 1
+    /// - `main.R` line 2: `ww$c.oos <- 1` (must NOT be visible in `data.R`)
+    /// - `main.R` sources a sibling `helper.R` *before* sourcing `data.R`
+    /// - `helper.R` forward-sources `shared.R`
+    /// - `runner.R` ALSO sources `main.R` and `shared.R`
+    ///
+    /// The diamond means resolving `shared.R`'s parent_prefix re-visits
+    /// `runner.R` at a wider position, whose STEP 2 then forward-sources
+    /// `main.R` at EOF. Without the fix, that re-visit's `visible_positions`
+    /// for `main.R` (= EOF) leaks back through the merge chain and overwrites
+    /// the original `(call_site, 0)` cap, exposing later-than-source
+    /// assignments.
+    #[test]
+    fn dollar_member_completion_excludes_parent_after_source_via_transitive_revisit() {
+        let mut state = fresh_state();
+        let data_code = "\
+ww <- list()
+ww$name.w <- 1
+ww$
+";
+        let main_code = "\
+source(\"helper.R\")
+source(\"data.R\")
+ww$c.oos <- 1
+ww$seeds <- 2
+";
+        let helper_code = "source(\"shared.R\")\n";
+        let shared_code = "shared_value <- 1\n";
+        // `runner.R` sources `main.R` first (line 0) and then `shared.R` later
+        // (line 1). The diamond on `shared.R` is what triggers the wider-position
+        // revisit of `runner.R` during `shared.R`'s parent_prefix walk.
+        let runner_code = "\
+source(\"main.R\")
+source(\"shared.R\")
+";
+
+        let data_uri = add_doc(&mut state, "file:///workspace/data.R", data_code);
+        let main_uri = add_indexed_doc(&mut state, "file:///workspace/main.R", main_code);
+        let helper_uri = add_indexed_doc(&mut state, "file:///workspace/helper.R", helper_code);
+        let shared_uri = add_indexed_doc(&mut state, "file:///workspace/shared.R", shared_code);
+        let runner_uri = add_indexed_doc(&mut state, "file:///workspace/runner.R", runner_code);
+
+        for (uri, code) in [
+            (&data_uri, data_code),
+            (&main_uri, main_code),
+            (&helper_uri, helper_code),
+            (&shared_uri, shared_code),
+            (&runner_uri, runner_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // Cursor is in `data.R` at the `ww$` line.  `c.oos` and `seeds` are
+        // assigned in `main.R` strictly after the `source("data.R")` call,
+        // so they must not leak into `data.R`'s completions.
+        assert_eq!(
+            completion_names(&state, &data_uri, Position::new(2, 3), "ww"),
+            vec!["name.w"]
+        );
+    }
+
     /// Regression for workspaces where `main.R` first sources an unrelated
     /// helper before the file that actually defines `ww`. The helper inherits a
     /// parent-prefix `ww` through the graph, but sourcing it should not consume
