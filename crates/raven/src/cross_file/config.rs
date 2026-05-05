@@ -274,6 +274,12 @@ mod tests {
 
         config2.undefined_variable_severity = None;
         assert!(!config1.scope_settings_changed(&config2));
+
+        // Non-None -> non-None transitions (e.g. WARNING -> ERROR) also do not
+        // affect scope resolution; severity only impacts diagnostic emission.
+        config2 = CrossFileConfig::default();
+        config2.undefined_variable_severity = Some(DiagnosticSeverity::ERROR);
+        assert!(!config1.scope_settings_changed(&config2));
     }
 
     #[test]

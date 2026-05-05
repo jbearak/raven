@@ -3100,7 +3100,16 @@ fn test_undefined_variable_severity_configuration() {
     config2.undefined_variable_severity = None;
     assert!(
         !config1.scope_settings_changed(&config2),
-        "Changing undefined_variable_severity should NOT trigger scope change"
+        "Changing undefined_variable_severity to None should NOT trigger scope change"
+    );
+
+    // Non-None -> non-None transitions (e.g. WARNING -> ERROR) are also not
+    // scope-affecting; severity only impacts diagnostic emission.
+    let mut config3 = CrossFileConfig::default();
+    config3.undefined_variable_severity = Some(DiagnosticSeverity::ERROR);
+    assert!(
+        !config1.scope_settings_changed(&config3),
+        "Changing undefined_variable_severity from WARNING to ERROR should NOT trigger scope change"
     );
 }
 
