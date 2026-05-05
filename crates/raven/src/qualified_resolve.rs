@@ -44,6 +44,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
 
+use crate::content_provider::ContentProvider;
 use crate::cross_file::scope::LineIndex;
 use crate::extract_op::ExtractOp;
 use crate::handlers::DiagCancelToken;
@@ -76,12 +77,42 @@ struct EffectPos {
 }
 
 impl EffectPos {
-    fn from_node_end(node: Node, line_index: &LineIndex) -> Self {
+    fn from_node_end(node: Node, col_mapper: &ColMapper) -> Self {
         let p = node.end_position();
-        let line_text = line_index.get_line(p.row);
         Self {
             line: p.row as u32,
-            utf16_column: byte_offset_to_utf16_column(line_text, p.column),
+            utf16_column: col_mapper.byte_col_to_utf16(p.row, p.column),
+        }
+    }
+}
+
+/// Lightweight column mapper that skips per-line extraction for ASCII-only
+/// files (the common case in R). For non-ASCII files, falls back to
+/// `LineIndex` + `byte_offset_to_utf16_column`.
+enum ColMapper<'a> {
+    /// File is all-ASCII: byte column == UTF-16 column.
+    Ascii,
+    /// File contains non-ASCII: use LineIndex for conversion.
+    NonAscii(LineIndex<'a>),
+}
+
+impl<'a> ColMapper<'a> {
+    fn new(text: &'a str) -> Self {
+        if text.is_ascii() {
+            Self::Ascii
+        } else {
+            Self::NonAscii(LineIndex::new(text))
+        }
+    }
+
+    #[inline]
+    fn byte_col_to_utf16(&self, row: usize, byte_col: usize) -> u32 {
+        match self {
+            Self::Ascii => byte_col as u32,
+            Self::NonAscii(idx) => {
+                let line_text = idx.get_line(row);
+                byte_offset_to_utf16_column(line_text, byte_col)
+            }
         }
     }
 }
@@ -91,7 +122,7 @@ fn member_assignment_candidate_from_extract(
     assignment: Node,
     target: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -118,12 +149,12 @@ fn member_assignment_candidate_from_extract(
     {
         return None;
     }
-    let lhs_range = node_range_in_text(t_lhs, line_index);
+    let lhs_range = node_range(t_lhs, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
-        effect: EffectPos::from_node_end(assignment, line_index),
-        name_range: node_range_in_text(t_rhs, line_index),
+        effect: EffectPos::from_node_end(assignment, col_mapper),
+        name_range: node_range(t_rhs, col_mapper),
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
@@ -134,7 +165,7 @@ fn member_assignment_candidate_from_string_subscript(
     assignment: Node,
     target: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -153,12 +184,12 @@ fn member_assignment_candidate_from_string_subscript(
     if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range_in_text(t_lhs, line_index);
+    let lhs_range = node_range(t_lhs, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
-        effect: EffectPos::from_node_end(assignment, line_index),
-        name_range: node_range_in_text(string_node, line_index),
+        effect: EffectPos::from_node_end(assignment, col_mapper),
+        name_range: node_range(string_node, col_mapper),
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
@@ -460,7 +491,7 @@ fn collect_qualified_member_candidates_with_cancel(
     {
         let (defining_text, defining_tree) =
             crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
-        let defining_line_index = LineIndex::new(&defining_text);
+        let defining_col_mapper = ColMapper::new(&defining_text);
         let symbol_fn_scope = function_scope_at(
             &defining_tree,
             &defining_text,
@@ -470,7 +501,7 @@ fn collect_qualified_member_candidates_with_cancel(
         let symbol_effect = symbol_visible_from_position(
             &defining_tree,
             &defining_text,
-            &defining_line_index,
+            &defining_col_mapper,
             symbol.defined_line,
             symbol.defined_column,
             lhs_name,
@@ -479,18 +510,19 @@ fn collect_qualified_member_candidates_with_cancel(
         collect_member_assignments(
             defining_tree.root_node(),
             &defining_text,
-            &defining_line_index,
+            &defining_col_mapper,
             &defining_uri,
             lhs_name,
             rhs_name,
             op,
             &mut defining_candidates,
+            false, // don't skip functions; fn_scope check handles defining file
         );
         if let Some(rhs_name) = rhs_name {
             if let Some(candidate) = collect_constructor_candidate(
                 &defining_tree,
                 &defining_text,
-                &defining_line_index,
+                &defining_col_mapper,
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
@@ -503,7 +535,7 @@ fn collect_qualified_member_candidates_with_cancel(
             collect_constructor_candidates(
                 &defining_tree,
                 &defining_text,
-                &defining_line_index,
+                &defining_col_mapper,
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
@@ -534,6 +566,9 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let mut cross_file_candidates: Vec<Candidate> = Vec::new();
     let contributor_ranks = contributor_file_ranks(&scope.chain);
+    let content_provider = state.content_provider();
+    let lhs_arc: std::sync::Arc<str> = std::sync::Arc::from(lhs_name);
+    let mut needs_validation: Vec<Candidate> = Vec::new();
     for candidate_uri in scope
         .chain
         .iter()
@@ -542,26 +577,111 @@ fn collect_qualified_member_candidates_with_cancel(
         if cancel.is_cancelled() {
             return None;
         }
+        let file_redefines_lhs = content_provider
+            .get_artifacts(candidate_uri)
+            .map(|art| art.exported_interface.contains_key(&lhs_arc))
+            .unwrap_or(true);
+
         if let Some((candidate_text, candidate_tree)) =
             crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
         {
-            let candidate_line_index = LineIndex::new(&candidate_text);
-            collect_member_assignments(
-                candidate_tree.root_node(),
-                &candidate_text,
-                &candidate_line_index,
-                candidate_uri,
-                lhs_name,
-                rhs_name,
-                op,
-                &mut cross_file_candidates,
-            );
+            let candidate_col_mapper = ColMapper::new(&candidate_text);
+            if file_redefines_lhs {
+                // File redefines lhs_name: walk full tree, per-candidate
+                // scope resolution needed.
+                collect_member_assignments(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    lhs_name,
+                    rhs_name,
+                    op,
+                    &mut needs_validation,
+                    false,
+                );
+            } else {
+                // File doesn't define lhs_name itself, but the visible binding
+                // can still change between top-level positions via `source()`,
+                // `rm(lhs_name)`, or `library()`. Skip function bodies (those
+                // assignments target shadowed locals and would be rejected
+                // anyway), then validate one candidate per stable region
+                // delimited by scope-changing events. With no such events the
+                // entire file is one region and a single scope query suffices
+                // — the common "source upstream once, then assign N members"
+                // case.
+                //
+                // Design note: skipping function bodies is intentional and
+                // correct for R's scoping rules. `<-` inside a function body
+                // targets the function's local environment, not the parent —
+                // so those assignments cannot affect the binding we're
+                // resolving. `<<-` *can* escape, but only at call time, which
+                // is a runtime concern the LSP cannot statically resolve.
+                // IIFEs like `(function() { x$y <<- 1 })()` are theoretically
+                // observable at source time but too rare to justify the cost
+                // of scanning all function bodies on this hot path.
+                let pre_len = cross_file_candidates.len();
+                collect_member_assignments(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    lhs_name,
+                    rhs_name,
+                    op,
+                    &mut cross_file_candidates,
+                    true, // skip function bodies
+                );
+                // Apply visibility cutoff.
+                let mut i = pre_len;
+                while i < cross_file_candidates.len() {
+                    if candidate_effect_visible_in_scope(
+                        &cross_file_candidates[i],
+                        &scope.visible_positions,
+                    ) {
+                        i += 1;
+                    } else {
+                        cross_file_candidates.swap_remove(i);
+                    }
+                }
+                if cross_file_candidates.len() == pre_len {
+                    continue;
+                }
+                let scope_changes = content_provider
+                    .get_artifacts(candidate_uri)
+                    .map(|art| top_level_scope_change_positions_for(&art, lhs_name))
+                    .unwrap_or_default();
+                cross_file_candidates[pre_len..]
+                    .sort_by_key(|c| (c.lhs_pos.line, c.lhs_pos.character));
+                let region_candidates = cross_file_candidates.split_off(pre_len);
+                let mut last_region: Option<usize> = None;
+                let mut last_region_valid = false;
+                for cand in region_candidates {
+                    let cand_pos = (cand.lhs_pos.line, cand.lhs_pos.character);
+                    let region = scope_changes.partition_point(|p| *p <= cand_pos);
+                    if last_region != Some(region) {
+                        last_region_valid = candidate_lhs_matches_symbol(
+                            state,
+                            &cand,
+                            lhs_name,
+                            symbol,
+                            cancel,
+                            &mut prefix_cache,
+                        );
+                        last_region = Some(region);
+                    }
+                    if last_region_valid {
+                        cross_file_candidates.push(cand);
+                    }
+                }
+            }
         }
     }
-    cross_file_candidates.retain(|c| {
+    needs_validation.retain(|c| {
         candidate_effect_visible_in_scope(c, &scope.visible_positions)
             && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, cancel, &mut prefix_cache)
     });
+    cross_file_candidates.extend(needs_validation);
     if cancel.is_cancelled() {
         return None;
     }
@@ -715,6 +835,51 @@ fn candidate_lhs_matches_symbol(
         .get(lhs_name)
         .map(|s| s == symbol)
         .unwrap_or(false)
+}
+
+/// Top-level positions of timeline events that can rebind `lhs_name` between
+/// member-assignment sites within a single contributor file. Used to partition
+/// the file's cross-file candidates into stable regions so the per-region
+/// representative validation (`candidate_lhs_matches_symbol`) is accurate.
+///
+/// Includes any top-level `source()`, top-level `rm(lhs_name)`, and top-level
+/// `library()` event. Function-scoped events are filtered out: they cannot
+/// affect top-level binding. Returns positions sorted ascending.
+fn top_level_scope_change_positions_for(
+    artifacts: &crate::cross_file::scope::ScopeArtifacts,
+    lhs_name: &str,
+) -> Vec<(u32, u32)> {
+    use crate::cross_file::scope::ScopeEvent;
+    let mut positions: Vec<(u32, u32)> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::Source {
+                line,
+                column,
+                function_scope: None,
+                ..
+            } => Some((*line, column.saturating_add(1))),
+            ScopeEvent::Removal {
+                line,
+                column,
+                function_scope: None,
+                symbols,
+                ..
+            } if symbols.iter().any(|s| s == lhs_name) => {
+                Some((*line, column.saturating_add(1)))
+            }
+            ScopeEvent::PackageLoad {
+                line,
+                column,
+                function_scope: None,
+                ..
+            } => Some((*line, *column)),
+            _ => None,
+        })
+        .collect();
+    positions.sort();
+    positions
 }
 
 fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
@@ -873,7 +1038,7 @@ fn pick_winner(
 fn symbol_visible_from_position(
     tree: &Tree,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     defined_line: u32,
     defined_column_utf16: u32,
     lhs_name: &str,
@@ -895,7 +1060,7 @@ fn symbol_visible_from_position(
     let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else {
         return fallback;
     };
-    EffectPos::from_node_end(assignment, line_index)
+    EffectPos::from_node_end(assignment, col_mapper)
 }
 
 /// Return the id of the closest enclosing `function_definition` node at the
@@ -912,14 +1077,23 @@ fn function_scope_at(tree: &Tree, text: &str, line: u32, utf16_col: u32) -> Func
 
 /// Walk up from `node` and return the id of the nearest enclosing
 /// `function_definition`, or `None` if there isn't one.
+///
+/// Fast path: most member assignments are at top level (parent chain is
+/// `binary_operator` → `expression_statement` → `program`). Check the first
+/// few ancestors before entering the general loop.
 fn enclosing_function_id(node: Node) -> FunctionScopeId {
     let mut current = node;
     loop {
-        if current.kind() == "function_definition" {
-            return Some(current.id());
-        }
         match current.parent() {
-            Some(p) => current = p,
+            Some(p) => {
+                if p.kind() == "function_definition" {
+                    return Some(p.id());
+                }
+                if p.kind() == "program" {
+                    return None;
+                }
+                current = p;
+            }
             None => return None,
         }
     }
@@ -933,47 +1107,112 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 /// RHS member. Each candidate records the position of its LHS identifier
 /// (`foo` in `foo$bar <- ...`) for use as a query position when validating
 /// cross-file candidates.
+///
+/// Uses a `TreeCursor` traversal instead of a `Vec<Node>` stack to avoid
+/// per-node allocation and to skip leaf/atomic subtrees that cannot contain
+/// assignment operators.
+///
+/// When `skip_functions` is true, the walk does not descend into
+/// `function_definition` nodes. This is used for cross-file contributor
+/// files that do not redefine `lhs_name` — assignments inside function
+/// bodies there would reference a shadowed local and be rejected by
+/// per-candidate scope resolution anyway.
 #[allow(clippy::too_many_arguments)]
 fn collect_member_assignments(
     root: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
+    file_uri: &Url,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+    out: &mut Vec<Candidate>,
+    skip_functions: bool,
+) {
+    let mut cursor = root.walk();
+    let mut descended = true; // treat root as just-entered
+    loop {
+        if descended {
+            let node = cursor.node();
+            let kind = node.kind();
+            // Skip leaf/atomic subtrees that cannot contain assignments.
+            let skip = matches!(
+                kind,
+                "identifier"
+                    | "string"
+                    | "string_content"
+                    | "comment"
+                    | "integer"
+                    | "float"
+                    | "complex"
+                    | "na"
+                    | "null"
+                    | "inf"
+                    | "nan"
+                    | "true"
+                    | "false"
+                    | "dots"
+                    | "dot_dot_i"
+                    | "special"
+                    | "namespace_operator"
+            ) || (skip_functions && kind == "function_definition");
+            if !skip {
+                if kind == "binary_operator" {
+                    try_extract_member_assignment(
+                        node, text, col_mapper, file_uri, lhs_name, rhs_name, op, out,
+                    );
+                }
+                // Descend into children if this node has any.
+                if cursor.goto_first_child() {
+                    descended = true;
+                    continue;
+                }
+            }
+        }
+        // Try next sibling, or ascend.
+        if cursor.goto_next_sibling() {
+            descended = true;
+        } else if cursor.goto_parent() {
+            descended = false;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Helper: check a single `binary_operator` node for member-assignment
+/// patterns and push a candidate if matched.
+#[allow(clippy::too_many_arguments)]
+fn try_extract_member_assignment(
+    node: Node,
+    text: &str,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
 ) {
-    let mut stack: Vec<Node> = vec![root];
-    while let Some(node) = stack.pop() {
-        let mut walker = node.walk();
-        for child in node.children(&mut walker) {
-            stack.push(child);
-        }
-        if node.kind() != "binary_operator" {
-            continue;
-        }
-        let Some(op_node) = node.child_by_field_name("operator") else {
-            continue;
-        };
-        let op_text = node_text(op_node, text);
-        let target = match op_text {
-            "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
-            "->" | "->>" => node.child_by_field_name("rhs"),
-            _ => continue,
-        };
-        let Some(target) = target else { continue };
-        if let Some(candidate) = member_assignment_candidate_from_extract(
-            node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
-        ) {
-            out.push(candidate);
-            continue;
-        }
-        if let Some(candidate) = member_assignment_candidate_from_string_subscript(
-            node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
-        ) {
-            out.push(candidate);
-        }
+    let Some(op_node) = node.child_by_field_name("operator") else {
+        return;
+    };
+    let op_text = node_text(op_node, text);
+    let target = match op_text {
+        "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
+        "->" | "->>" => node.child_by_field_name("rhs"),
+        _ => return,
+    };
+    let Some(target) = target else { return };
+    if let Some(candidate) = member_assignment_candidate_from_extract(
+        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
+    ) {
+        out.push(candidate);
+        return;
+    }
+    if let Some(candidate) = member_assignment_candidate_from_string_subscript(
+        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
+    ) {
+        out.push(candidate);
     }
 }
 
@@ -981,7 +1220,7 @@ fn collect_member_assignments(
 fn collect_constructor_candidate(
     tree: &Tree,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
@@ -992,7 +1231,7 @@ fn collect_constructor_candidate(
     collect_constructor_candidates(
         tree,
         text,
-        line_index,
+        col_mapper,
         file_uri,
         defined_line,
         defined_column_utf16,
@@ -1019,7 +1258,7 @@ fn collect_constructor_candidate(
 fn collect_constructor_candidates(
     tree: &Tree,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
@@ -1032,7 +1271,7 @@ fn collect_constructor_candidates(
     // the artifacts' Def event, which was emitted from a real tree-sitter
     // position); `LineIndex::get_line` returns `""` for out-of-bounds rows,
     // which falls through to a no-op `descendant_for_point_range`.
-    let line_text = line_index.get_line(defined_line as usize);
+    let line_text = nth_line(text, defined_line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, defined_column_utf16);
     let line_byte_len = line_text.len();
     let start = tree_sitter::Point::new(defined_line as usize, byte_col);
@@ -1085,8 +1324,8 @@ fn collect_constructor_candidates(
         if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
-        let name_range = node_range_in_text(name_node, line_index);
-        let effect = EffectPos::from_node_end(assignment, line_index);
+        let name_range = node_range(name_node, col_mapper);
+        let effect = EffectPos::from_node_end(assignment, col_mapper);
         // Constructor candidates become visible only after the defining
         // assignment completes, so use the effect position for the shared
         // symbol identity check.
@@ -1139,14 +1378,12 @@ fn node_text<'a>(node: Node, text: &'a str) -> &'a str {
 
 /// Convert a tree-sitter node's range into an LSP `Range` whose columns are
 /// UTF-16 code units (per the LSP spec / `vscode-languageserver-types`).
-fn node_range_in_text(node: Node, line_index: &LineIndex) -> Range {
+fn node_range(node: Node, col_mapper: &ColMapper) -> Range {
     let s = node.start_position();
     let e = node.end_position();
-    let s_line = line_index.get_line(s.row);
-    let e_line = line_index.get_line(e.row);
     Range {
-        start: Position::new(s.row as u32, byte_offset_to_utf16_column(s_line, s.column)),
-        end: Position::new(e.row as u32, byte_offset_to_utf16_column(e_line, e.column)),
+        start: Position::new(s.row as u32, col_mapper.byte_col_to_utf16(s.row, s.column)),
+        end: Position::new(e.row as u32, col_mapper.byte_col_to_utf16(e.row, e.column)),
     }
 }
 
@@ -1320,6 +1557,89 @@ mod tests {
 
             eprintln!(
                 "perf n={n:>4}  dollar_complete={:?}  one_scope_query={:?}  ratio={:.1}x",
+                dollar_samples[2],
+                scope_samples[2],
+                dollar_samples[2].as_secs_f64() / scope_samples[2].as_secs_f64()
+            );
+        }
+    }
+
+    /// Cross-file variant of the perf test: `df` is defined in a sourced file
+    /// with N `df$col_K <- ...` assignments. The fast path (file doesn't
+    /// redefine `df`) should avoid N scope resolutions.
+    ///
+    ///     cargo test --release -p raven --lib -- \
+    ///         qualified_resolve::tests::perf_dollar_completion_cross_file_scaling \
+    ///         --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn perf_dollar_completion_cross_file_scaling() {
+        for n in [10usize, 50, 100, 200, 400] {
+            let mut data_code = String::from("df <- list()\n");
+            for k in 0..n {
+                data_code.push_str(&format!("df$col_{k} <- {k}\n"));
+            }
+            let main_code = "source(\"data.R\")\ndf$\n";
+            let cursor_line = 1u32;
+
+            let mut state = fresh_state();
+            let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+            let data_uri = add_indexed_doc(&mut state, "file:///workspace/data.R", &data_code);
+
+            for (uri, code) in [(&main_uri, main_code), (&data_uri, data_code.as_str())] {
+                state.cross_file_graph.update_file(
+                    uri,
+                    &crate::cross_file::extract_metadata(code),
+                    None,
+                    |_| None,
+                );
+            }
+
+            // Warm-up.
+            let _ = super::complete_qualified_members(
+                &state,
+                &main_uri,
+                Position::new(cursor_line, 3),
+                "identifier",
+                "df",
+                crate::extract_op::ExtractOp::Dollar,
+            );
+
+            let mut dollar_samples = [std::time::Duration::ZERO; 5];
+            for s in &mut dollar_samples {
+                let start = std::time::Instant::now();
+                let r = super::complete_qualified_members(
+                    &state,
+                    &main_uri,
+                    Position::new(cursor_line, 3),
+                    "identifier",
+                    "df",
+                    crate::extract_op::ExtractOp::Dollar,
+                );
+                *s = start.elapsed();
+                assert_eq!(r.len(), n, "expected {n} candidates, got {}", r.len());
+            }
+            dollar_samples.sort();
+
+            let mut scope_samples = [std::time::Duration::ZERO; 5];
+            for s in &mut scope_samples {
+                let cancel = DiagCancelToken::never();
+                let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+                let start = std::time::Instant::now();
+                let _scope = crate::handlers::get_cross_file_scope_with_cache(
+                    &state,
+                    &main_uri,
+                    cursor_line,
+                    3,
+                    &cancel,
+                    &mut cache,
+                );
+                *s = start.elapsed();
+            }
+            scope_samples.sort();
+
+            eprintln!(
+                "perf_xfile n={n:>4}  dollar_complete={:?}  one_scope_query={:?}  ratio={:.1}x",
                 dollar_samples[2],
                 scope_samples[2],
                 dollar_samples[2].as_secs_f64() / scope_samples[2].as_secs_f64()
@@ -2101,6 +2421,93 @@ ww$name.e <- 6
         assert_eq!(
             completion_names(&state, &main_uri, Position::new(2, 3), "ww"),
             vec!["H", "N", "c.n", "e.q", "local", "name.e", "point.h"]
+        );
+    }
+
+    /// Regression for the "skip per-candidate scope" fast path: a contributor
+    /// file that does not redefine `df` itself can still mutate the visible
+    /// `df` binding mid-file via `rm(df)`. Member assignments after the rm
+    /// reference a different (or absent) `df` and must not be offered as
+    /// completions for the cursor's `df`.
+    #[test]
+    fn dollar_member_completion_excludes_post_rm_in_non_redefining_contributor() {
+        let mut state = fresh_state();
+        let main_code = "\
+df <- list(alpha = 1)
+source(\"data.R\")
+df$
+";
+        let data_code = "\
+df$beta <- 2
+rm(df)
+df$gamma <- 3
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/data.R", data_code);
+
+        for (uri, code) in [(&main_uri, main_code), (&data_uri, data_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 3), "df"),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    /// Regression for the "skip per-candidate scope" fast path: a nested
+    /// `source()` inside a non-redefining contributor can rebind `df` to a
+    /// different definition. Member assignments after that nested source
+    /// reference a different `df` and must not be offered as completions
+    /// for the cursor's `df`.
+    #[test]
+    fn dollar_member_completion_excludes_post_nested_source_rebinding_in_non_redefining_contributor() {
+        let mut state = fresh_state();
+        let main_code = "\
+df <- list(alpha = 1)
+source(\"data.R\")
+df$
+";
+        let data_code = "\
+df$beta <- 2
+source(\"base.R\")
+df$gamma <- 3
+";
+        let base_code = "df <- list(other = 1)\n";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/data.R", data_code);
+        let base_uri = add_indexed_doc(&mut state, "file:///workspace/base.R", base_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&base_uri, base_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // `df$beta` in data.R targets main.R's `df` (visible before the nested
+        // source); `df$gamma` targets base.R's `df` (after the nested source
+        // rebound it) and so must not appear under main.R's cursor-position
+        // `df`. The cursor's `df` here is main.R's.
+        let names = completion_names(&state, &main_uri, Position::new(2, 3), "df");
+        assert!(
+            names.contains(&"alpha".to_string()) && names.contains(&"beta".to_string()),
+            "expected alpha and beta in {names:?}"
+        );
+        assert!(
+            !names.contains(&"gamma".to_string()),
+            "gamma is from a rebound df after nested source(); got {names:?}"
         );
     }
 
