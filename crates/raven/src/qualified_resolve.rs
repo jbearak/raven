@@ -573,7 +573,6 @@ fn collect_qualified_member_candidates_with_cancel(
         .chain
         .iter()
         .filter(|candidate_uri| **candidate_uri != defining_uri)
-        .filter(|candidate_uri| !scope.parent_prefix_chain_uris.contains(candidate_uri))
     {
         if cancel.is_cancelled() {
             return None;
@@ -3159,6 +3158,47 @@ foo$bar <- 1
         assert!(
             completion_names(&state, &child_uri, Position::new(1, 4), "foo").is_empty(),
             "parent-prefix member assignments must not appear in child completions"
+        );
+    }
+
+    /// Parent-side member assignments before the source() call are visible in
+    /// the child when the parent imported the LHS binding from an upstream file.
+    #[test]
+    fn dollar_member_completion_keeps_parent_prefix_assignments_before_source() {
+        let mut state = fresh_state();
+        let defs_code = "foo <- list()\n";
+        let child_code = "foo$\n";
+        let parent_code = "\
+source(\"defs.R\")
+foo$bar <- 1
+source(\"child.R\")
+foo$baz <- 2
+";
+        let defs_uri = add_doc(&mut state, "file:///workspace/defs.R", defs_code);
+        let child_uri = add_doc(&mut state, "file:///workspace/child.R", child_code);
+        let parent_uri = add_indexed_doc(&mut state, "file:///workspace/parent.R", parent_code);
+
+        for (uri, code) in [
+            (&defs_uri, defs_code),
+            (&child_uri, child_code),
+            (&parent_uri, parent_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let names = completion_names(&state, &child_uri, Position::new(0, 4), "foo");
+        assert!(
+            names.contains(&"bar".to_string()),
+            "parent member assignments before source(child.R) must remain visible"
+        );
+        assert!(
+            !names.contains(&"baz".to_string()),
+            "parent member assignments after source(child.R) must stay hidden"
         );
     }
 }

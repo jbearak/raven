@@ -776,12 +776,6 @@ pub struct ScopeAtPosition {
     /// Origins are stored as `Arc<Url>` so cross-file propagation between
     /// scopes is a refcount bump rather than a Url-internals string clone.
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
-    /// URIs that entered the scope chain via the parent/backward prefix
-    /// (i.e. files that *source* the queried file). These files contribute
-    /// symbols to the child's environment but their own member assignments
-    /// (e.g. `foo$bar <- 1`) should not appear as completions in the child
-    /// because the child executes before the parent's post-source code.
-    pub parent_prefix_chain_uris: HashSet<Url>,
 }
 
 fn record_visible_position(
@@ -3579,9 +3573,6 @@ where
                         }
                     }
                 }
-                scope
-                    .parent_prefix_chain_uris
-                    .extend(prefix.chain.iter().cloned());
                 scope.chain.extend(prefix.chain.iter().cloned());
                 extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
                 scope
@@ -3627,9 +3618,6 @@ where
                         }
                     }
                 }
-                scope
-                    .parent_prefix_chain_uris
-                    .extend(prefix.chain.iter().cloned());
                 scope.chain.extend(prefix.chain);
                 extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
                 scope.depth_exceeded.extend(prefix.depth_exceeded);
@@ -4611,7 +4599,6 @@ where
             // a few lines below.
             loaded_packages: HashSet::new(),
             package_origins: prefix.package_origins.clone(),
-            parent_prefix_chain_uris: prefix.chain.iter().cloned().collect(),
         };
 
         // Layer global frame on top. The global frame contains base exports
