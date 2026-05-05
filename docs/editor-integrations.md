@@ -133,4 +133,5 @@ Create `crush.json` in your project root:
 - **Server not found**: Ensure `raven` is on your PATH, or specify the full path to the binary.
 - **No diagnostics**: Check that files have `.R` or `.r` extension. JAGS/Stan files have diagnostics suppressed by design.
 - **Stale package completions**: Run **Raven: Refresh package cache** from the command palette, or restart the server.
+- **Package watcher issues on Linux**: Raven watches `.libPaths()` recursively (~10–20 watches per installed package). On systems with the legacy 8192 inotify limit, the watcher can fail silently. Raise the limit: `sudo sysctl fs.inotify.max_user_watches=524288` (persist via `/etc/sysctl.conf`).
 - **Cross-file features not working**: Ensure the workspace root is set correctly (Raven uses it for `source()` path resolution). Open the folder containing your R project, not a parent directory.
