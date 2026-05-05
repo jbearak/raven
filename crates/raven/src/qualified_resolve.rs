@@ -610,6 +610,16 @@ fn collect_qualified_member_candidates_with_cancel(
                 // entire file is one region and a single scope query suffices
                 // — the common "source upstream once, then assign N members"
                 // case.
+                //
+                // Design note: skipping function bodies is intentional and
+                // correct for R's scoping rules. `<-` inside a function body
+                // targets the function's local environment, not the parent —
+                // so those assignments cannot affect the binding we're
+                // resolving. `<<-` *can* escape, but only at call time, which
+                // is a runtime concern the LSP cannot statically resolve.
+                // IIFEs like `(function() { x$y <<- 1 })()` are theoretically
+                // observable at source time but too rare to justify the cost
+                // of scanning all function bodies on this hot path.
                 let pre_len = cross_file_candidates.len();
                 collect_member_assignments(
                     candidate_tree.root_node(),
