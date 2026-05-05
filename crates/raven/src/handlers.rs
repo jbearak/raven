@@ -34601,6 +34601,39 @@ x <- 1
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
         assert!(diagnostics[0].message.contains("Undefined variable: x"));
         assert_eq!(diagnostics[0].range.start.line, 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_diagnostics_undefined_uses_configured_severity() {
+        // Verifies that the severity argument flows through to the emitted
+        // Diagnostic. Without this coverage, a regression that hard-coded
+        // WARNING (the old behavior) would slip past the WARNING-only tests.
+        let mut state = create_test_state();
+        let code = "
+x
+x <- 1
+";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::ERROR,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
+        assert!(diagnostics[0].message.contains("Undefined variable: x"));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]
@@ -38236,14 +38269,14 @@ mod diagnostics_master_switch_tests {
         #[test]
         fn prop_master_switch_disabled_suppresses_all_diagnostics(
             code in arbitrary_r_code(),
-            undefined_variable_enabled in any::<bool>(),
+            enable_undefined_variable_diag in any::<bool>(),
         ) {
             // Create a WorldState with diagnostics_enabled = false
             let mut state = WorldState::new(vec![]);
             state.cross_file_config.diagnostics_enabled = false;
 
             // Also vary other diagnostic settings to ensure master switch takes precedence
-            state.cross_file_config.undefined_variable_severity = if undefined_variable_enabled {
+            state.cross_file_config.undefined_variable_severity = if enable_undefined_variable_diag {
                 Some(DiagnosticSeverity::WARNING)
             } else {
                 None

@@ -3065,41 +3065,43 @@ proptest! {
 }
 
 // ============================================================================
-// Property 33: Undefined Variables Configuration
+// Undefined Variables Configuration
 // Validates: Requirements 11.9, 11.10
 // ============================================================================
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+/// Verifies the struct-level contract for `undefined_variable_severity`: the
+/// default is `Some(WARNING)`, it is freely assignable to `None` ("off"), and
+/// toggling it does not trip `scope_settings_changed` (it only affects
+/// diagnostic emission, not scope resolution).
+///
+/// End-to-end "no diagnostics emitted when severity is None" coverage lives in
+/// `handlers.rs` (the gate at the start of `diagnostics_from_snapshot` skips
+/// `collect_undefined_variables_from_snapshot` entirely when severity is None).
+#[test]
+fn test_undefined_variable_severity_configuration() {
+    use tower_lsp::lsp_types::DiagnosticSeverity;
 
-    /// Property 33: For any configuration with `undefined_variable_severity = None`,
-    /// no undefined variable diagnostics SHALL be emitted regardless of symbol resolution.
-    #[test]
-    fn prop_undefined_variables_configuration(
-        _symbol_name in r_identifier()
-    ) {
-        use tower_lsp::lsp_types::DiagnosticSeverity;
+    let mut config = CrossFileConfig::default();
+    assert_eq!(
+        config.undefined_variable_severity,
+        Some(DiagnosticSeverity::WARNING),
+        "Default undefined_variable_severity should be Some(WARNING)"
+    );
 
-        // Test that the configuration field exists and can be toggled
-        let mut config = CrossFileConfig::default();
+    config.undefined_variable_severity = None;
+    assert!(
+        config.undefined_variable_severity.is_none(),
+        "undefined_variable_severity should be settable to None"
+    );
 
-        // Default should be Some(WARNING)
-        prop_assert_eq!(config.undefined_variable_severity, Some(DiagnosticSeverity::WARNING),
-            "Default undefined_variable_severity should be Some(WARNING)");
-
-        // Can be set to None ("off")
-        config.undefined_variable_severity = None;
-        prop_assert!(config.undefined_variable_severity.is_none(),
-            "undefined_variable_severity should be settable to None");
-
-        // Changing this setting should NOT trigger scope re-resolution
-        // (it only affects diagnostics, not scope)
-        let config1 = CrossFileConfig::default();
-        let mut config2 = CrossFileConfig::default();
-        config2.undefined_variable_severity = None;
-        prop_assert!(!config1.scope_settings_changed(&config2),
-            "Changing undefined_variable_severity should NOT trigger scope change");
-    }
+    // Toggling severity is not scope-affecting.
+    let config1 = CrossFileConfig::default();
+    let mut config2 = CrossFileConfig::default();
+    config2.undefined_variable_severity = None;
+    assert!(
+        !config1.scope_settings_changed(&config2),
+        "Changing undefined_variable_severity should NOT trigger scope change"
+    );
 }
 
 // ============================================================================
