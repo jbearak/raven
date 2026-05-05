@@ -29,7 +29,7 @@ Key settings (all under the `raven.*` prefix):
 | Setting | Default | Description |
 |---|---|---|
 | `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
-| `raven.diagnostics.undefinedVariables` | `true` | Enable undefined variable diagnostics |
+| `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
 | `raven.packages.enabled` | `true` | Enable package function awareness |
 | `raven.packages.rPath` | auto-detect | Path to R executable |
 | `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |

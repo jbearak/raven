@@ -62,7 +62,7 @@ export interface RavenInitializationOptions {
     };
     diagnostics?: {
         enabled?: boolean;
-        undefinedVariables?: boolean;
+        undefinedVariableSeverity?: SeverityLevel;
     };
     packages?: {
         enabled?: boolean;
@@ -251,13 +251,13 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     }
 
     const diagnosticsEnabled = config.get<boolean>('diagnostics.enabled', true);
-    const undefinedVariables = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariables');
+    const undefinedVariableSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.undefinedVariableSeverity');
 
     options.diagnostics = {
         enabled: diagnosticsEnabled,
     };
-    if (undefinedVariables !== undefined) {
-        options.diagnostics.undefinedVariables = undefinedVariables;
+    if (undefinedVariableSeverity !== undefined) {
+        options.diagnostics.undefinedVariableSeverity = undefinedVariableSeverity;
     }
 
     const packagesEnabled = getExplicitSetting<boolean>(config, 'packages.enabled');

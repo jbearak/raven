@@ -635,11 +635,11 @@ impl WorldState {
             "  revalidation_debounce_ms: {}",
             config.revalidation_debounce_ms
         );
-        log::info!(
-            "  undefined_variables_enabled: {}",
-            config.undefined_variables_enabled
-        );
         log::info!("  Diagnostic severities:");
+        log::info!(
+            "    undefined_variable: {:?}",
+            config.undefined_variable_severity
+        );
         log::info!("    missing_file: {:?}", config.missing_file_severity);
         log::info!(
             "    circular_dependency: {:?}",

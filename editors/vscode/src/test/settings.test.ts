@@ -105,7 +105,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.cache.workspaceIndexMaxEntries', jsonPath: ['crossFile', 'cache', 'workspaceIndexMaxEntries'], type: 'number' },
     // Diagnostics settings
     { vsCodeKey: 'diagnostics.enabled', jsonPath: ['diagnostics', 'enabled'], type: 'boolean', defaultWhenUnconfigured: true },
-    { vsCodeKey: 'diagnostics.undefinedVariables', jsonPath: ['diagnostics', 'undefinedVariables'], type: 'boolean' },
+    { vsCodeKey: 'diagnostics.undefinedVariableSeverity', jsonPath: ['diagnostics', 'undefinedVariableSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     // Package settings
     { vsCodeKey: 'packages.enabled', jsonPath: ['packages', 'enabled'], type: 'boolean' },
     { vsCodeKey: 'packages.additionalLibraryPaths', jsonPath: ['packages', 'additionalLibraryPaths'], type: 'array' },
@@ -396,12 +396,13 @@ suite('Settings Transmission Unit Tests', () => {
      */
     test('severity settings transmit correctly', () => {
         const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint', 'off'];
-        
+
         for (const severity of severities) {
             const configuredSettings = new Map<string, unknown>([
                 ['crossFile.missingFileSeverity', severity],
                 ['crossFile.circularDependencySeverity', severity],
                 ['packages.missingPackageSeverity', severity],
+                ['diagnostics.undefinedVariableSeverity', severity],
             ]);
 
             const mockConfig = createMockConfig(configuredSettings);
@@ -410,6 +411,7 @@ suite('Settings Transmission Unit Tests', () => {
             assert.strictEqual(options.crossFile?.missingFileSeverity, severity);
             assert.strictEqual(options.crossFile?.circularDependencySeverity, severity);
             assert.strictEqual(options.packages?.missingPackageSeverity, severity);
+            assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, severity);
         }
     });
 
@@ -437,14 +439,14 @@ suite('Settings Transmission Unit Tests', () => {
     test('diagnostics settings transmit correctly', () => {
         const configuredSettings = new Map<string, unknown>([
             ['diagnostics.enabled', false],
-            ['diagnostics.undefinedVariables', false],
+            ['diagnostics.undefinedVariableSeverity', 'error'],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
 
         assert.strictEqual(options.diagnostics?.enabled, false);
-        assert.strictEqual(options.diagnostics?.undefinedVariables, false);
+        assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'error');
     });
 
     /**
@@ -608,6 +610,7 @@ suite('Settings Transmission Unit Tests', () => {
             ['crossFile.ambiguousParentSeverity', 'hint'],
             ['crossFile.maxChainDepthSeverity', 'error'],
             ['packages.missingPackageSeverity', 'warning'],
+            ['diagnostics.undefinedVariableSeverity', 'off'],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
@@ -619,6 +622,7 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.ambiguousParentSeverity, 'hint');
         assert.strictEqual(options.crossFile?.maxChainDepthSeverity, 'error');
         assert.strictEqual(options.packages?.missingPackageSeverity, 'warning');
+        assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'off');
     });
 
     /**
@@ -663,7 +667,6 @@ suite('Settings Transmission Unit Tests', () => {
             ['crossFile.indexWorkspace', false],
             ['crossFile.onDemandIndexing.enabled', false],
             ['diagnostics.enabled', false],
-            ['diagnostics.undefinedVariables', false],
             ['packages.enabled', false],
         ]);
 
@@ -674,7 +677,6 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.indexWorkspace, false);
         assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, false);
         assert.strictEqual(options.diagnostics?.enabled, false);
-        assert.strictEqual(options.diagnostics?.undefinedVariables, false);
         assert.strictEqual(options.packages?.enabled, false);
     });
 

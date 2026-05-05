@@ -63,7 +63,8 @@ fn main() {
     let t1 = Instant::now();
     let mut state = WorldState::new(vec![]);
     state.workspace_folders = vec![workspace_url.clone()];
-    state.cross_file_config.undefined_variables_enabled = true;
+    state.cross_file_config.undefined_variable_severity =
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);

@@ -78,7 +78,7 @@ struct ActiveDocumentsChangedParams {
 ///
 /// Supported top-level keys read:
 /// - `crossFile`: core cross-file behavior and diagnostic severities.
-/// - `diagnostics.enabled` and `diagnostics.undefinedVariables`: diagnostics master switch and undefined variable diagnostics.
+/// - `diagnostics.enabled` and `diagnostics.undefinedVariableSeverity`: diagnostics master switch and undefined variable diagnostic severity.
 /// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`,
 ///   `missingPackageSeverity`, `watchLibraryPaths`, `watchDebounceMs`).
 ///
@@ -106,7 +106,7 @@ struct ActiveDocumentsChangedParams {
 ///         "rPath": "/usr/bin/R",
 ///         "missingPackageSeverity": "information"
 ///     },
-///     "diagnostics": { "enabled": true, "undefinedVariables": false }
+///     "diagnostics": { "enabled": true, "undefinedVariableSeverity": "warning" }
 /// });
 ///
 /// let cfg = raven::backend::parse_cross_file_config(&settings).unwrap();
@@ -296,9 +296,12 @@ pub(crate) fn parse_cross_file_config(
         if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
             config.diagnostics_enabled = v;
         }
-        // Parse diagnostics.undefinedVariables
-        if let Some(v) = diag.get("undefinedVariables").and_then(|v| v.as_bool()) {
-            config.undefined_variables_enabled = v;
+        // Parse diagnostics.undefinedVariableSeverity
+        if let Some(sev) = diag
+            .get("undefinedVariableSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.undefined_variable_severity = parse_severity(sev);
         }
     }
 
@@ -351,10 +354,6 @@ pub(crate) fn parse_cross_file_config(
         "  revalidation_debounce_ms: {}",
         config.revalidation_debounce_ms
     );
-    log::info!(
-        "  undefined_variables_enabled: {}",
-        config.undefined_variables_enabled
-    );
     log::info!("  diagnostics_enabled: {}", config.diagnostics_enabled);
     log::info!(
         "  hoist_globals_in_functions: {}",
@@ -375,6 +374,10 @@ pub(crate) fn parse_cross_file_config(
         config.on_demand_indexing_max_queue_size
     );
     log::info!("  Diagnostic severities:");
+    log::info!(
+        "    undefined_variable: {:?}",
+        config.undefined_variable_severity
+    );
     log::info!("    missing_file: {:?}", config.missing_file_severity);
     log::info!(
         "    circular_dependency: {:?}",
@@ -5501,7 +5504,7 @@ mod tests {
             // JSON with diagnostics section but no enabled key
             let settings = json!({
                 "diagnostics": {
-                    "undefinedVariables": false
+                    "undefinedVariableSeverity": "off"
                 }
             });
 
@@ -5515,6 +5518,69 @@ mod tests {
             assert!(
                 config.diagnostics_enabled,
                 "diagnostics_enabled should default to true when enabled key is absent"
+            );
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_undefined_variable_severity_off() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+
+            let settings = json!({
+                "diagnostics": { "undefinedVariableSeverity": "off" }
+            });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.undefined_variable_severity, None,
+                "'off' should disable the diagnostic"
+            );
+
+            // Sanity: other severities are unaffected by this setting.
+            assert_eq!(
+                config.missing_file_severity,
+                Some(DiagnosticSeverity::WARNING)
+            );
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_undefined_variable_severity_explicit() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+
+            for (input, expected) in [
+                ("error", Some(DiagnosticSeverity::ERROR)),
+                ("warning", Some(DiagnosticSeverity::WARNING)),
+                ("information", Some(DiagnosticSeverity::INFORMATION)),
+                ("hint", Some(DiagnosticSeverity::HINT)),
+            ] {
+                let settings = json!({
+                    "diagnostics": { "undefinedVariableSeverity": input }
+                });
+                let config = crate::backend::parse_cross_file_config(&settings)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    config.undefined_variable_severity, expected,
+                    "{input:?} should parse to {expected:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_cross_file_config_undefined_variable_severity_defaults_to_warning() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+
+            // Diagnostics section present but no undefinedVariableSeverity key
+            let settings = json!({
+                "diagnostics": { "enabled": true }
+            });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.undefined_variable_severity,
+                Some(DiagnosticSeverity::WARNING),
+                "absent key should retain the default warning severity"
             );
         }
 

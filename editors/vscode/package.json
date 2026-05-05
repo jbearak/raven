@@ -345,10 +345,24 @@
           "default": true,
           "description": "Enable or disable all diagnostics. When disabled, no diagnostic messages will be shown regardless of individual severity settings."
         },
-        "raven.diagnostics.undefinedVariables": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable diagnostics for undefined variables. When enabled, Raven reports variables that are used but not defined in the current scope, sourced files, or loaded packages. Disable this setting to suppress undefined variable warnings if they produce too many false positives in your workflow."
+        "raven.diagnostics.undefinedVariableSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report undefined variables as errors",
+            "Report undefined variables as warnings",
+            "Report undefined variables as information",
+            "Report undefined variables as hints",
+            "Disable undefined variable diagnostics"
+          ],
+          "default": "warning",
+          "description": "Severity level for diagnostics when a variable is used but not defined in the current scope, sourced files, or loaded packages. Set to \"off\" to suppress undefined variable diagnostics if they produce too many false positives in your workflow."
         },
         "raven.packages.enabled": {
           "type": "boolean",

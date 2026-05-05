@@ -20,7 +20,7 @@ Diagnostics are deferred until the workspace scan completes (in `auto` backward 
 |---|---|---|
 | Undefined variable | warning | Symbol used that is not defined in scope (local, cross-file, or package) |
 
-Raven checks whether each symbol reference has a visible definition — either in the current file (above the cursor), in a sourced parent/child file (respecting position), or in a loaded package. If not found, it reports an undefined variable warning.
+Raven checks whether each symbol reference has a visible definition — either in the current file (above the cursor), in a sourced parent/child file (respecting position), or in a loaded package. If not found, it reports an undefined variable diagnostic at the configured severity (default `warning`; see `raven.diagnostics.undefinedVariableSeverity` in [Configuration](configuration.md)).
 
 **What suppresses it:**
 - A definition above the usage in the same file
@@ -78,7 +78,7 @@ Each diagnostic category has a severity setting that accepts `"error"`, `"warnin
 
 ```json
 "raven.crossFile.missingFileSeverity": "off",
-"raven.diagnostics.undefinedVariables": false
+"raven.diagnostics.undefinedVariableSeverity": "off"
 ```
 
 See [Configuration](configuration.md) for all severity settings.

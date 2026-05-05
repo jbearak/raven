@@ -7,7 +7,6 @@ All settings can be configured via VS Code settings or LSP initialization option
 | Setting | Default | Description |
 |---|---|---|
 | `raven.diagnostics.enabled` | `true` | Master switch for all diagnostics |
-| `raven.diagnostics.undefinedVariables` | `true` | Enable undefined variable diagnostics |
 
 ## Cross-File Settings
 
@@ -30,6 +29,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 
 | Setting | Default | Description |
 |---|---|---|
+| `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Variable used but not defined in scope, sourced files, or loaded packages |
 | `raven.crossFile.missingFileSeverity` | `"warning"` | Missing file referenced by source() or directive |
 | `raven.crossFile.circularDependencySeverity` | `"error"` | Circular dependency detected |
 | `raven.crossFile.maxChainDepthSeverity` | `"warning"` | Source chain exceeds max depth |
