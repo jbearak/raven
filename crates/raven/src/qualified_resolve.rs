@@ -601,8 +601,15 @@ fn collect_qualified_member_candidates_with_cancel(
                     false,
                 );
             } else {
-                // File doesn't redefine lhs_name: skip function bodies,
-                // resolve scope once per file at the earliest candidate.
+                // File doesn't define lhs_name itself, but the visible binding
+                // can still change between top-level positions via `source()`,
+                // `rm(lhs_name)`, or `library()`. Skip function bodies (those
+                // assignments target shadowed locals and would be rejected
+                // anyway), then validate one candidate per stable region
+                // delimited by scope-changing events. With no such events the
+                // entire file is one region and a single scope query suffices
+                // — the common "source upstream once, then assign N members"
+                // case.
                 let pre_len = cross_file_candidates.len();
                 collect_member_assignments(
                     candidate_tree.root_node(),
@@ -627,20 +634,34 @@ fn collect_qualified_member_candidates_with_cancel(
                         cross_file_candidates.swap_remove(i);
                     }
                 }
-                // Batch validation: resolve scope once at the earliest
-                // candidate position. If lhs_name matches, all candidates
-                // from this file pass (it doesn't redefine lhs_name, so
-                // the binding is the same everywhere at top level).
-                if let Some(earliest) = cross_file_candidates[pre_len..]
-                    .iter()
-                    .min_by_key(|c| (c.lhs_pos.line, c.lhs_pos.character))
-                {
-                    if !candidate_lhs_matches_symbol(
-                        state, earliest, lhs_name, symbol, cancel, &mut prefix_cache,
-                    ) {
-                        // lhs_name resolves to a different binding in this
-                        // file; reject all candidates from it.
-                        cross_file_candidates.truncate(pre_len);
+                if cross_file_candidates.len() == pre_len {
+                    continue;
+                }
+                let scope_changes = content_provider
+                    .get_artifacts(candidate_uri)
+                    .map(|art| top_level_scope_change_positions_for(&art, lhs_name))
+                    .unwrap_or_default();
+                cross_file_candidates[pre_len..]
+                    .sort_by_key(|c| (c.lhs_pos.line, c.lhs_pos.character));
+                let region_candidates = cross_file_candidates.split_off(pre_len);
+                let mut last_region: Option<usize> = None;
+                let mut last_region_valid = false;
+                for cand in region_candidates {
+                    let cand_pos = (cand.lhs_pos.line, cand.lhs_pos.character);
+                    let region = scope_changes.partition_point(|p| *p <= cand_pos);
+                    if last_region != Some(region) {
+                        last_region_valid = candidate_lhs_matches_symbol(
+                            state,
+                            &cand,
+                            lhs_name,
+                            symbol,
+                            cancel,
+                            &mut prefix_cache,
+                        );
+                        last_region = Some(region);
+                    }
+                    if last_region_valid {
+                        cross_file_candidates.push(cand);
                     }
                 }
             }
@@ -804,6 +825,51 @@ fn candidate_lhs_matches_symbol(
         .get(lhs_name)
         .map(|s| s == symbol)
         .unwrap_or(false)
+}
+
+/// Top-level positions of timeline events that can rebind `lhs_name` between
+/// member-assignment sites within a single contributor file. Used to partition
+/// the file's cross-file candidates into stable regions so the per-region
+/// representative validation (`candidate_lhs_matches_symbol`) is accurate.
+///
+/// Includes any top-level `source()`, top-level `rm(lhs_name)`, and top-level
+/// `library()` event. Function-scoped events are filtered out: they cannot
+/// affect top-level binding. Returns positions sorted ascending.
+fn top_level_scope_change_positions_for(
+    artifacts: &crate::cross_file::scope::ScopeArtifacts,
+    lhs_name: &str,
+) -> Vec<(u32, u32)> {
+    use crate::cross_file::scope::ScopeEvent;
+    let mut positions: Vec<(u32, u32)> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::Source {
+                line,
+                column,
+                function_scope: None,
+                ..
+            } => Some((*line, column.saturating_add(1))),
+            ScopeEvent::Removal {
+                line,
+                column,
+                function_scope: None,
+                symbols,
+                ..
+            } if symbols.iter().any(|s| s == lhs_name) => {
+                Some((*line, column.saturating_add(1)))
+            }
+            ScopeEvent::PackageLoad {
+                line,
+                column,
+                function_scope: None,
+                ..
+            } => Some((*line, *column)),
+            _ => None,
+        })
+        .collect();
+    positions.sort();
+    positions
 }
 
 fn effect_at_or_after(a: EffectPos, b: EffectPos) -> bool {
@@ -2345,6 +2411,93 @@ ww$name.e <- 6
         assert_eq!(
             completion_names(&state, &main_uri, Position::new(2, 3), "ww"),
             vec!["H", "N", "c.n", "e.q", "local", "name.e", "point.h"]
+        );
+    }
+
+    /// Regression for the "skip per-candidate scope" fast path: a contributor
+    /// file that does not redefine `df` itself can still mutate the visible
+    /// `df` binding mid-file via `rm(df)`. Member assignments after the rm
+    /// reference a different (or absent) `df` and must not be offered as
+    /// completions for the cursor's `df`.
+    #[test]
+    fn dollar_member_completion_excludes_post_rm_in_non_redefining_contributor() {
+        let mut state = fresh_state();
+        let main_code = "\
+df <- list(alpha = 1)
+source(\"data.R\")
+df$
+";
+        let data_code = "\
+df$beta <- 2
+rm(df)
+df$gamma <- 3
+";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/data.R", data_code);
+
+        for (uri, code) in [(&main_uri, main_code), (&data_uri, data_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            completion_names(&state, &main_uri, Position::new(2, 3), "df"),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    /// Regression for the "skip per-candidate scope" fast path: a nested
+    /// `source()` inside a non-redefining contributor can rebind `df` to a
+    /// different definition. Member assignments after that nested source
+    /// reference a different `df` and must not be offered as completions
+    /// for the cursor's `df`.
+    #[test]
+    fn dollar_member_completion_excludes_post_nested_source_rebinding_in_non_redefining_contributor() {
+        let mut state = fresh_state();
+        let main_code = "\
+df <- list(alpha = 1)
+source(\"data.R\")
+df$
+";
+        let data_code = "\
+df$beta <- 2
+source(\"base.R\")
+df$gamma <- 3
+";
+        let base_code = "df <- list(other = 1)\n";
+        let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+        let data_uri = add_indexed_doc(&mut state, "file:///workspace/data.R", data_code);
+        let base_uri = add_indexed_doc(&mut state, "file:///workspace/base.R", base_code);
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&data_uri, data_code),
+            (&base_uri, base_code),
+        ] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // `df$beta` in data.R targets main.R's `df` (visible before the nested
+        // source); `df$gamma` targets base.R's `df` (after the nested source
+        // rebound it) and so must not appear under main.R's cursor-position
+        // `df`. The cursor's `df` here is main.R's.
+        let names = completion_names(&state, &main_uri, Position::new(2, 3), "df");
+        assert!(
+            names.contains(&"alpha".to_string()) && names.contains(&"beta".to_string()),
+            "expected alpha and beta in {names:?}"
+        );
+        assert!(
+            !names.contains(&"gamma".to_string()),
+            "gamma is from a rebound df after nested source(); got {names:?}"
         );
     }
 
