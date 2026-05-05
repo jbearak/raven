@@ -76,12 +76,42 @@ struct EffectPos {
 }
 
 impl EffectPos {
-    fn from_node_end(node: Node, line_index: &LineIndex) -> Self {
+    fn from_node_end(node: Node, col_mapper: &ColMapper) -> Self {
         let p = node.end_position();
-        let line_text = line_index.get_line(p.row);
         Self {
             line: p.row as u32,
-            utf16_column: byte_offset_to_utf16_column(line_text, p.column),
+            utf16_column: col_mapper.byte_col_to_utf16(p.row, p.column),
+        }
+    }
+}
+
+/// Lightweight column mapper that skips per-line extraction for ASCII-only
+/// files (the common case in R). For non-ASCII files, falls back to
+/// `LineIndex` + `byte_offset_to_utf16_column`.
+enum ColMapper<'a> {
+    /// File is all-ASCII: byte column == UTF-16 column.
+    Ascii,
+    /// File contains non-ASCII: use LineIndex for conversion.
+    NonAscii(LineIndex<'a>),
+}
+
+impl<'a> ColMapper<'a> {
+    fn new(text: &'a str) -> Self {
+        if text.is_ascii() {
+            Self::Ascii
+        } else {
+            Self::NonAscii(LineIndex::new(text))
+        }
+    }
+
+    #[inline]
+    fn byte_col_to_utf16(&self, row: usize, byte_col: usize) -> u32 {
+        match self {
+            Self::Ascii => byte_col as u32,
+            Self::NonAscii(idx) => {
+                let line_text = idx.get_line(row);
+                byte_offset_to_utf16_column(line_text, byte_col)
+            }
         }
     }
 }
@@ -91,7 +121,7 @@ fn member_assignment_candidate_from_extract(
     assignment: Node,
     target: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -118,12 +148,12 @@ fn member_assignment_candidate_from_extract(
     {
         return None;
     }
-    let lhs_range = node_range_in_text(t_lhs, line_index);
+    let lhs_range = node_range(t_lhs, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
-        effect: EffectPos::from_node_end(assignment, line_index),
-        name_range: node_range_in_text(t_rhs, line_index),
+        effect: EffectPos::from_node_end(assignment, col_mapper),
+        name_range: node_range(t_rhs, col_mapper),
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
@@ -134,7 +164,7 @@ fn member_assignment_candidate_from_string_subscript(
     assignment: Node,
     target: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -153,12 +183,12 @@ fn member_assignment_candidate_from_string_subscript(
     if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range_in_text(t_lhs, line_index);
+    let lhs_range = node_range(t_lhs, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
-        effect: EffectPos::from_node_end(assignment, line_index),
-        name_range: node_range_in_text(string_node, line_index),
+        effect: EffectPos::from_node_end(assignment, col_mapper),
+        name_range: node_range(string_node, col_mapper),
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
@@ -460,7 +490,7 @@ fn collect_qualified_member_candidates_with_cancel(
     {
         let (defining_text, defining_tree) =
             crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
-        let defining_line_index = LineIndex::new(&defining_text);
+        let defining_col_mapper = ColMapper::new(&defining_text);
         let symbol_fn_scope = function_scope_at(
             &defining_tree,
             &defining_text,
@@ -470,7 +500,7 @@ fn collect_qualified_member_candidates_with_cancel(
         let symbol_effect = symbol_visible_from_position(
             &defining_tree,
             &defining_text,
-            &defining_line_index,
+            &defining_col_mapper,
             symbol.defined_line,
             symbol.defined_column,
             lhs_name,
@@ -479,7 +509,7 @@ fn collect_qualified_member_candidates_with_cancel(
         collect_member_assignments(
             defining_tree.root_node(),
             &defining_text,
-            &defining_line_index,
+            &defining_col_mapper,
             &defining_uri,
             lhs_name,
             rhs_name,
@@ -490,7 +520,7 @@ fn collect_qualified_member_candidates_with_cancel(
             if let Some(candidate) = collect_constructor_candidate(
                 &defining_tree,
                 &defining_text,
-                &defining_line_index,
+                &defining_col_mapper,
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
@@ -503,7 +533,7 @@ fn collect_qualified_member_candidates_with_cancel(
             collect_constructor_candidates(
                 &defining_tree,
                 &defining_text,
-                &defining_line_index,
+                &defining_col_mapper,
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
@@ -545,11 +575,11 @@ fn collect_qualified_member_candidates_with_cancel(
         if let Some((candidate_text, candidate_tree)) =
             crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
         {
-            let candidate_line_index = LineIndex::new(&candidate_text);
+            let candidate_col_mapper = ColMapper::new(&candidate_text);
             collect_member_assignments(
                 candidate_tree.root_node(),
                 &candidate_text,
-                &candidate_line_index,
+                &candidate_col_mapper,
                 candidate_uri,
                 lhs_name,
                 rhs_name,
@@ -873,7 +903,7 @@ fn pick_winner(
 fn symbol_visible_from_position(
     tree: &Tree,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     defined_line: u32,
     defined_column_utf16: u32,
     lhs_name: &str,
@@ -895,7 +925,7 @@ fn symbol_visible_from_position(
     let Some(assignment) = ascend_to_assignment_for(id_node, text, lhs_name) else {
         return fallback;
     };
-    EffectPos::from_node_end(assignment, line_index)
+    EffectPos::from_node_end(assignment, col_mapper)
 }
 
 /// Return the id of the closest enclosing `function_definition` node at the
@@ -912,14 +942,23 @@ fn function_scope_at(tree: &Tree, text: &str, line: u32, utf16_col: u32) -> Func
 
 /// Walk up from `node` and return the id of the nearest enclosing
 /// `function_definition`, or `None` if there isn't one.
+///
+/// Fast path: most member assignments are at top level (parent chain is
+/// `binary_operator` → `expression_statement` → `program`). Check the first
+/// few ancestors before entering the general loop.
 fn enclosing_function_id(node: Node) -> FunctionScopeId {
     let mut current = node;
     loop {
-        if current.kind() == "function_definition" {
-            return Some(current.id());
-        }
         match current.parent() {
-            Some(p) => current = p,
+            Some(p) => {
+                if p.kind() == "function_definition" {
+                    return Some(p.id());
+                }
+                if p.kind() == "program" {
+                    return None;
+                }
+                current = p;
+            }
             None => return None,
         }
     }
@@ -941,7 +980,7 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 fn collect_member_assignments(
     root: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -973,11 +1012,12 @@ fn collect_member_assignments(
                     | "dots"
                     | "dot_dot_i"
                     | "special"
+                    | "namespace_operator"
             );
             if !dominated {
                 if kind == "binary_operator" {
                     try_extract_member_assignment(
-                        node, text, line_index, file_uri, lhs_name, rhs_name, op, out,
+                        node, text, col_mapper, file_uri, lhs_name, rhs_name, op, out,
                     );
                 }
                 // Descend into children if this node has any.
@@ -1004,7 +1044,7 @@ fn collect_member_assignments(
 fn try_extract_member_assignment(
     node: Node,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     lhs_name: &str,
     rhs_name: Option<&str>,
@@ -1022,13 +1062,13 @@ fn try_extract_member_assignment(
     };
     let Some(target) = target else { return };
     if let Some(candidate) = member_assignment_candidate_from_extract(
-        node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
+        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
     ) {
         out.push(candidate);
         return;
     }
     if let Some(candidate) = member_assignment_candidate_from_string_subscript(
-        node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
+        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
     ) {
         out.push(candidate);
     }
@@ -1038,7 +1078,7 @@ fn try_extract_member_assignment(
 fn collect_constructor_candidate(
     tree: &Tree,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
@@ -1049,7 +1089,7 @@ fn collect_constructor_candidate(
     collect_constructor_candidates(
         tree,
         text,
-        line_index,
+        col_mapper,
         file_uri,
         defined_line,
         defined_column_utf16,
@@ -1076,7 +1116,7 @@ fn collect_constructor_candidate(
 fn collect_constructor_candidates(
     tree: &Tree,
     text: &str,
-    line_index: &LineIndex,
+    col_mapper: &ColMapper,
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
@@ -1089,7 +1129,7 @@ fn collect_constructor_candidates(
     // the artifacts' Def event, which was emitted from a real tree-sitter
     // position); `LineIndex::get_line` returns `""` for out-of-bounds rows,
     // which falls through to a no-op `descendant_for_point_range`.
-    let line_text = line_index.get_line(defined_line as usize);
+    let line_text = nth_line(text, defined_line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, defined_column_utf16);
     let line_byte_len = line_text.len();
     let start = tree_sitter::Point::new(defined_line as usize, byte_col);
@@ -1142,8 +1182,8 @@ fn collect_constructor_candidates(
         if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
-        let name_range = node_range_in_text(name_node, line_index);
-        let effect = EffectPos::from_node_end(assignment, line_index);
+        let name_range = node_range(name_node, col_mapper);
+        let effect = EffectPos::from_node_end(assignment, col_mapper);
         // Constructor candidates become visible only after the defining
         // assignment completes, so use the effect position for the shared
         // symbol identity check.
@@ -1196,14 +1236,12 @@ fn node_text<'a>(node: Node, text: &'a str) -> &'a str {
 
 /// Convert a tree-sitter node's range into an LSP `Range` whose columns are
 /// UTF-16 code units (per the LSP spec / `vscode-languageserver-types`).
-fn node_range_in_text(node: Node, line_index: &LineIndex) -> Range {
+fn node_range(node: Node, col_mapper: &ColMapper) -> Range {
     let s = node.start_position();
     let e = node.end_position();
-    let s_line = line_index.get_line(s.row);
-    let e_line = line_index.get_line(e.row);
     Range {
-        start: Position::new(s.row as u32, byte_offset_to_utf16_column(s_line, s.column)),
-        end: Position::new(e.row as u32, byte_offset_to_utf16_column(e_line, e.column)),
+        start: Position::new(s.row as u32, col_mapper.byte_col_to_utf16(s.row, s.column)),
+        end: Position::new(e.row as u32, col_mapper.byte_col_to_utf16(e.row, e.column)),
     }
 }
 
