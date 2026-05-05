@@ -9,8 +9,8 @@ IMPORTANT: Treat this as a living document, but **prefer code comments over Lear
 User-facing:
 - `README.md`
 - `docs/cross-file.md`
-- `docs/declaration-directives.md`
-- `docs/packages.md`
+- `docs/directives.md`
+- `docs/diagnostics.md`
 - `docs/indentation.md`
 - `docs/document-outline.md`
 - `docs/configuration.md`

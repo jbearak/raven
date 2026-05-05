@@ -1,184 +1,177 @@
-# Cross-File Awareness
+# Cross-File & Package Awareness
 
-Raven understands relationships between R source files through `source()` calls and special comment directives, providing accurate symbol resolution, diagnostics, and navigation across file boundaries.
+Raven builds a dependency graph of your R project and uses it to provide accurate completions, diagnostics, and navigation across file boundaries. This page explains how the system works.
+
+## How It Works
+
+Most R projects consist of multiple files connected by `source()` calls. Raven detects these relationships automatically:
+
+```r
+# main.R
+library(dplyr)
+source("utils.R")
+result <- helper_function(42)  # Raven knows this comes from utils.R
+```
+
+```r
+# utils.R
+helper_function <- function(x) { x * 2 }
+```
+
+When you open any file, Raven:
+1. Scans the workspace for `source()` calls and builds a dependency graph
+2. Resolves which symbols are available at each position in each file
+3. Provides completions, diagnostics, hover, and go-to-definition using the full graph
+
+This happens automatically — no configuration needed for standard `source()` patterns.
 
 ## Automatic source() Detection
 
-The LSP automatically detects `source()` and `sys.source()` calls:
-- Supports both single and double quotes: `source("path.R")` or `source('path.R')`
-- Handles named arguments: `source(file = "path.R")`
-- Detects `local = TRUE` and `chdir = TRUE` parameters
-- Skips dynamic paths (variables, expressions) gracefully
+Raven detects `source()` and `sys.source()` calls:
+- Single and double quotes: `source("path.R")` or `source('path.R')`
+- Named arguments: `source(file = "path.R")`
+- `local = TRUE` and `chdir = TRUE` parameters
+- Dynamic paths (variables, expressions) are skipped gracefully
 
-Inside `source()` strings and path-taking directives, Raven also provides file path intellisense:
-- Completion for `.R` / `.r` files and directories
-- Cmd-click / go-to-definition on resolvable paths
-- Path resolution that matches cross-file analysis rules (`@lsp-cd`, inherited working directories, and workspace-root fallback for AST-detected `source()` calls only)
+Raven also provides **file path intellisense** inside `source()` strings and path-taking directives: completion for `.R` files and directories, and cmd-click navigation to the target file.
 
-## LSP Directives
+For dynamic or conditional paths that Raven can't detect, use [directives](directives.md) to declare relationships explicitly.
 
-All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The one exception is `@lsp-ignore`, which can be used as a trailing comment to suppress diagnostics on the same line (e.g., `x <- foo # @lsp-ignore`).
+## Package Awareness
 
-All directives support optional colon and quotes: `# @lsp-sourced-by: "../main.R"` is equivalent to `# @lsp-sourced-by ../main.R`.
+Raven recognizes `library()`, `require()`, and `loadNamespace()` calls and makes package exports available for completions, hover, and diagnostics.
 
-**Header-only directives:** Backward directives (`@lsp-sourced-by` and synonyms) and working directory directives (`@lsp-cd` and synonyms) must appear in the **file header** — the region of consecutive blank and comment lines at the top of the file, before any code. They are ignored if they appear after the first line of code. This matches the Sight reference implementation. Forward directives, declaration directives, and ignore directives can appear anywhere in the file.
+### How It Works
 
-### Backward Directives
+When you write `library(dplyr)`, Raven:
+1. Detects the call and extracts the package name
+2. Queries R (via subprocess) for the package's exported symbols
+3. Makes those symbols available with `{dplyr}` attribution in completions
+4. Suppresses "undefined variable" warnings for package exports
 
-Declare that this file is sourced by another file:
-```r
-# @lsp-sourced-by ../main.R
-# @lsp-run-by ../main.R        # synonym
-# @lsp-included-by ../main.R   # synonym
-```
+### Base Packages
 
-Optional parameters:
-- `line=N` - Specify 1-based line number in parent where source() call occurs
-- `line=eof` or `line=end` - Use scope at end of parent file (after all sources complete)
-- `match="pattern"` - Specify text pattern to find source() call in parent
+Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. At startup, Raven queries R for the default search path. If R is unavailable, it falls back to a hardcoded list.
 
-Example with line number:
-```r
-# @lsp-sourced-by ../main.R line=15
-my_function <- function(x) { x + 1 }
-```
+### Position-Aware Loading
 
-Example with end-of-file (useful when parent sources multiple files):
-```r
-# @lsp-sourced-by ../main.R line=eof
-# This function sees all symbols defined in main.R, including those from other sourced files
-my_function <- function(x) { helper_from_other_file(x) }
-```
-
-**Note:** `line=eof` currently works for symbols defined directly in the parent file and for packages loaded by the parent. For symbols from files sourced by the parent (multi-level resolution), you may need to add explicit `@lsp-source` directives or use `@lsp-var`/`@lsp-func` declarations to suppress false positives.
-
-Example with match pattern:
-```r
-# @lsp-sourced-by ../main.R match="source("
-# The LSP will search for "source(" in main.R and use the first match
-# on a line containing a source() call to this file
-```
-
-**Call-site inference:** When neither `line=` nor `match=` is specified, the LSP will scan the parent file for `source()` or `sys.source()` calls that reference this file and use the first match as the call site. If no match is found, the configured default (`assumeCallSite`) is used.
-
-### Forward Directives
-
-Explicitly declare that this file sources another file (useful for dynamic or conditional paths):
-```r
-# @lsp-source utils/helpers.R
-# @lsp-run utils/helpers.R        # synonym
-# @lsp-include utils/helpers.R    # synonym
-```
-
-All syntax variations are supported:
-- With or without colon: `@lsp-source: path` or `@lsp-source path`
-- With quotes: `@lsp-source "path/with spaces.R"` or `@lsp-source 'path.R'`
-- Without quotes: `@lsp-source path.R`
-
-Optional `line=` parameter specifies the call-site:
-```r
-# @lsp-source utils/helpers.R line=25
-# Symbols from helpers.R become available at line 25 (not at this directive's line)
-```
+Package exports are only available after the `library()` call:
 
 ```r
-# @lsp-source utils/helpers.R line=eof
-# Symbols from helpers.R become available at end of file
+mutate(df, x = 1)  # Warning: undefined variable 'mutate'
+library(dplyr)
+mutate(df, y = 2)  # OK: dplyr is now loaded
 ```
 
-When `line=` is omitted, symbols become available after the directive's own line. Use `line=eof` or `line=end` to make symbols available at the end of the file.
+### Function-Scoped Loading
 
-**Path resolution:** Forward directives use `@lsp-cd` for path resolution (unlike backward directives which ignore it). This matches the behavior of `source()` calls, since forward directives are semantically equivalent to `source()` calls.
-
-### Working Directory Directives
-
-Set working directory context for path resolution:
-```r
-# @lsp-working-directory /data/scripts
-# @lsp-working-dir /data/scripts     # synonym
-# @lsp-current-directory /data/scripts  # synonym
-# @lsp-current-dir /data/scripts     # synonym
-# @lsp-wd /data/scripts              # synonym
-# @lsp-cd /data/scripts              # synonym
-```
-
-Path resolution:
-- Paths starting with `/` are workspace-root-relative (e.g., `/data` -> `<workspace>/data`)
-- Other paths are file-relative (e.g., `../shared` -> parent directory's `shared`)
-
-#### Critical: @lsp-cd Affects Forward Directives and source() Only
-
-| Directive Type | Examples | Uses @lsp-cd? | Rationale |
-|----------------|----------|---------------|-----------|
-| **Forward** | `@lsp-source`, `@lsp-run`, `@lsp-include` | **YES** | Semantically equivalent to `source()` calls |
-| **Backward** | `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by` | **NO** | Describes static file relationships |
-| **source() calls** | `source("file.R")` | **YES** | Runtime behavior affected by working directory |
-
-**Why this distinction?**
-- **Forward directives** and **source() calls** describe runtime execution behavior. They are semantically equivalent to R's `source()` function, which is affected by the current working directory at runtime.
-- **Backward directives** describe static file relationships from the child's perspective. They declare "this file is sourced by that parent file" - a relationship that should NOT change based on runtime working directory.
-
-**Example:**
-```r
-# File: subdir/child.R
-# @lsp-cd /some/other/directory
-# @lsp-run-by ../parent.R      # Resolves to parent.R in workspace root (ignores @lsp-cd)
-# @lsp-source utils.R          # Resolves to /some/other/directory/utils.R (uses @lsp-cd)
-
-source("helpers.R")            # Resolves to /some/other/directory/helpers.R (uses @lsp-cd)
-```
-
-### Working Directory Inheritance
-
-When a child file uses a backward directive (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) without its own explicit `@lsp-cd`, it inherits the working directory from its parent file. This enables accurate `source()` path resolution in child files that are run from a parent's working directory context.
-
-**Precedence rules:**
-1. Explicit `@lsp-cd` in the child file takes precedence (no inheritance)
-2. If no explicit `@lsp-cd`, the child inherits from its parent's effective working directory
-3. Inheritance is transitive: if the parent also inherits, the chain is followed
-
-**Example:**
-```r
-# parent.R
-# @lsp-cd /data/project
-source("child.R")  # Resolves to /data/project/child.R
-```
+When `library()` is called inside a function, exports are only available within that function's scope:
 
 ```r
-# child.R
-# @lsp-run-by ../parent.R
-# No explicit @lsp-cd, so inherits /data/project from parent
-source("utils.R")  # Resolves to /data/project/utils.R (not relative to child.R's directory)
+my_analysis <- function(data) {
+  library(dplyr)
+  mutate(data, x = 1)  # OK: dplyr available inside function
+}
+mutate(df, y = 2)  # Warning: dplyr not available at global scope
 ```
 
-**Effect on source() resolution:** The inherited working directory affects how `source()` calls in the child file resolve their paths. This matches R's runtime behavior when a parent script sets the working directory before sourcing a child.
+### Meta-Package Support
 
-### Diagnostic Suppression
+Raven recognizes meta-packages that attach multiple packages:
+
+- **tidyverse** attaches: dplyr, readr, forcats, stringr, ggplot2, tibble, lubridate, tidyr, purrr
+- **tidymodels** attaches: broom, dials, dplyr, ggplot2, infer, modeldata, parsnip, purrr, recipes, rsample, tibble, tidyr, tune, workflows, workflowsets, yardstick
+
+### Cross-File Package Propagation
+
+Packages loaded in parent files are available in sourced children:
 
 ```r
-# @lsp-ignore           # Suppress diagnostics on current line
-# @lsp-ignore-next      # Suppress diagnostics on next line
-x <- foo # @lsp-ignore  # Also works as a trailing comment
+# main.R
+library(dplyr)
+source("analysis.R")  # dplyr available in analysis.R
+library(ggplot2)      # NOT available in analysis.R (loaded after source)
 ```
 
-`@lsp-ignore` is the only directive that can appear as a trailing comment. All other directives must be on their own comment line.
+Packages loaded in child files do NOT propagate back to parents (forward-only).
 
-### Declaration Directives
+### Supported Call Patterns
 
-See [Declaration Directives](declaration-directives.md) for declaring dynamically-created symbols (`@lsp-var`, `@lsp-func`). Declaration directives work in any R file, not just cross-file contexts.
+| Pattern | Supported |
+|---|---|
+| `library(pkgname)` | Yes |
+| `library("pkgname")` | Yes |
+| `require(pkgname)` | Yes |
+| `loadNamespace("pkgname")` | Yes |
+| `library(pkg, character.only = TRUE)` | No (dynamic) |
 
-## Position-Aware Symbol Availability
+### Keeping Packages in Sync
 
-Symbols from sourced files are only available AFTER the source() call site:
+Raven watches `.libPaths()` directories and invalidates caches when packages are installed, upgraded, or removed. If the watcher misses a change (e.g., after `renv::activate()`), run **Raven: Refresh package cache** from the command palette.
+
+See [Configuration](configuration.md) for watcher settings (`packages.watchLibraryPaths`, `packages.watchDebounceMs`).
+
+## Position-Aware Scope
+
+Symbols from sourced files are only available **after** the `source()` call:
+
 ```r
 x <- 1
 source("a.R")  # Symbols from a.R available after this line
 y <- foo()     # foo() from a.R is now in scope
 ```
 
-## Global Symbol Hoisting
+This applies to both `source()` calls and forward directives. The scope model ensures that completions and diagnostics reflect what would actually be available at runtime.
 
-R has late-binding semantics — a function can reference another function or variable that hasn't been defined yet at the time of the function's *definition*, as long as it exists by the time the function is *called*. This is idiomatic R:
+## Symbol Recognition
+
+Raven recognizes these R constructs as definitions:
+
+- `name <- expr` / `name <<- expr` / `expr -> name` / `expr ->> name`
+- `name = expr` (in assignment context)
+- `assign("name", expr)` (string-literal only)
+
+For dynamically-created symbols (`eval()`, `load()`, dynamic `assign()`), use [declaration directives](directives.md#declaration-directives).
+
+### Symbol Removal (rm/remove)
+
+Raven tracks `rm()` and `remove()` calls to maintain accurate scope:
+
+```r
+x <- 1
+rm(x)
+x  # Warning: undefined variable
+```
+
+Supported: `rm(x)`, `rm(x, y)`, `rm(list = c("x", "y"))`. Dynamic patterns like `rm(list = ls())` are skipped.
+
+## How This Feeds Into Features
+
+The dependency graph and scope model power several features:
+
+- **[Diagnostics](diagnostics.md)** — undefined variable warnings respect cross-file scope and loaded packages
+- **[Completions](completion.md)** — symbols from sourced files and packages appear with source attribution
+- **[Find References](find-references.md)** — locates usages across the dependency graph
+- **Go-to-definition** — navigates to definitions in other files
+- **Hover** — shows where a symbol is defined and which package it comes from
+
+## Advanced
+
+### Backward Dependency Modes
+
+The `raven.crossFile.backwardDependencies` setting controls how Raven discovers which files source the current file.
+
+**`"auto"` (default):** Raven scans the workspace for `source()` calls and infers backward relationships automatically. No `@lsp-sourced-by` directives needed. Diagnostics are deferred until the workspace scan completes to avoid false positives.
+
+**`"explicit"`:** Only relationships declared via `@lsp-sourced-by` directives are used. Use this if auto-inference produces unwanted results (e.g., a file sourced by multiple parents with conflicting scopes).
+
+**Per-file opt-out:** Adding an explicit `@lsp-sourced-by` directive to a file disables auto-inference for that file.
+
+See [Configuration](configuration.md) for the setting.
+
+### Global Symbol Hoisting
+
+R has late-binding semantics — a function can reference another function that hasn't been defined yet at the time of the function's *definition*, as long as it exists by the time the function is *called*:
 
 ```r
 main <- function() {
@@ -188,236 +181,14 @@ helper <- function() { 42 }
 main()  # works fine
 ```
 
-Raven supports this by hoisting global (top-level) definitions inside function bodies. When the cursor is inside a function body, all global definitions, `source()` calls, `library()` calls, and `rm()` calls are visible regardless of their position in the file. Function-local variables remain strictly positional.
+Raven supports this by hoisting global definitions inside function bodies. When the cursor is inside a function body, all global definitions are visible regardless of position. Function-local variables remain strictly positional.
 
-This means:
-- **Inside a function body**: hover, go-to-definition, and completions resolve globals defined anywhere in the file
-- **At the global level**: behavior is unchanged — only definitions above the cursor are visible
-- **`rm()` calls**: a global `rm(x)` after a function will correctly exclude `x` from that function's scope
+This is enabled by default. Disable with `raven.crossFile.hoistGlobalsInFunctions: false` (see [Configuration](configuration.md)).
 
-This behavior is enabled by default and can be disabled with `raven.crossFile.hoistGlobalsInFunctions: false` (see [Configuration](configuration.md)).
+### $ and @ Member Resolution
 
-## Symbol Recognition (v1 Model)
+When you cmd-click on `foo$bar`, Raven resolves `bar` as a member of `foo` — not as a free variable. It looks for:
+- Member assignments: `foo$bar <- …`, `foo[["bar"]] <- …`
+- Constructor-literal members: named arguments in `list()`, `data.frame()`, `tibble()`, etc.
 
-The LSP recognizes the following R constructs as symbol definitions:
-
-**Function definitions:**
-- `name <- function(...) ...`
-- `name = function(...) ...`
-- `name <<- function(...) ...`
-
-**Variable definitions:**
-- `name <- <expr>`
-- `name = <expr>`
-- `name <<- <expr>`
-
-**String-literal assign():**
-- `assign("name", <expr>)` - only when the name is a string literal
-
-**Limitations:**
-- Dynamic `assign()` calls (e.g., `assign(varname, value)`) are not recognized
-- `set()` calls are not recognized
-- Only top-level assignments are tracked for cross-file scope
-
-Undefined variable diagnostics are only suppressed for symbols recognized by this model.
-
-## Symbol Removal Tracking (rm/remove)
-
-The LSP tracks when variables are removed from scope via `rm()` or `remove()` calls. This enables accurate undefined variable diagnostics when code uses `rm()` to delete variables.
-
-**Supported Patterns:**
-
-| Pattern | Extracted Symbols |
-|---------|-------------------|
-| `rm(x)` | `["x"]` |
-| `rm(x, y, z)` | `["x", "y", "z"]` |
-| `rm(list = "x")` | `["x"]` |
-| `rm(list = c("x", "y"))` | `["x", "y"]` |
-| `remove(x)` | `["x"]` |
-| `rm(x, list = c("y", "z"))` | `["x", "y", "z"]` |
-
-**Unsupported Patterns (No Symbols Extracted):**
-
-| Pattern | Reason |
-|---------|--------|
-| `rm(list = var)` | Dynamic variable - cannot determine symbols at static analysis time |
-| `rm(list = ls())` | Dynamic expression - result depends on runtime state |
-| `rm(list = ls(pattern = "..."))` | Pattern-based removal - cannot determine matching symbols statically |
-| `rm(x, envir = my_env)` | Non-default environment - removal doesn't affect global scope tracking |
-
-**Behavior:**
-- `rm()` and `remove()` are treated identically (they are aliases in R)
-- Removals inside functions only affect that function's local scope
-- Removals at the top-level affect global scope
-- Symbols can be re-defined after removal and will be back in scope
-- The `envir=` argument is checked: calls with `envir = globalenv()` or `envir = .GlobalEnv` are processed normally, but any other `envir=` value causes the call to be ignored for scope tracking
-
-**Example:**
-```r
-x <- 1
-y <- 2
-rm(x)
-# x is no longer in scope here - using x would trigger undefined variable diagnostic
-# y is still in scope
-x <- 3  # x is back in scope after re-definition
-```
-
-## Usage Examples
-
-### Basic Cross-File Setup
-```r
-# main.R
-source("utils.R")
-result <- helper_function(42)  # helper_function from utils.R
-```
-
-```r
-# utils.R
-helper_function <- function(x) { x * 2 }
-```
-
-### Backward Directive with Call-Site
-```r
-# child.R
-# @lsp-sourced-by ../main.R line=10
-# Symbols from main.R (lines 1-9) are available here
-my_var <- parent_var + 1
-```
-
-### Working Directory Override
-```r
-# scripts/analysis.R
-# @lsp-working-directory /data
-source("helpers.R")  # Resolves to <workspace>/data/helpers.R
-```
-
-### Forward Directive for Dynamic Paths
-```r
-# main.R
-# When source() path is computed dynamically, use @lsp-source to tell the LSP
-config_file <- paste0(env, "_config.R")
-source(config_file)  # LSP can't resolve this dynamically
-
-# @lsp-source configs/dev_config.R
-# Now the LSP knows about symbols from dev_config.R
-```
-
-### Forward Directive with Working Directory
-```r
-# scripts/runner.R
-# @lsp-cd /data/project
-# @lsp-source utils.R
-# utils.R resolves to <workspace>/data/project/utils.R (uses @lsp-cd)
-```
-
-### Forward Directive with Explicit Call-Site
-```r
-# main.R
-# @lsp-source helpers.R line=50
-# Symbols from helpers.R become available at line 50
-# This is useful when the actual source() call is later in the file
-```
-
-### Circular Dependency Detection
-```r
-# a.R
-source("b.R")  # ERROR: Circular dependency if b.R sources a.R
-```
-
-```r
-# b.R
-source("a.R")  # Creates cycle back to a.R
-```
-
-## Backward Dependency Modes
-
-The `raven.crossFile.backwardDependencies` setting controls how the LSP discovers which files source the current file. This affects undefined variable diagnostics, completions, hover, and go-to-definition.
-
-**Why this matters:** In multi-file R projects, a child file (e.g., `helpers.R`) often references symbols defined in its parent (e.g., `main.R`). For Raven to resolve these symbols, it needs to know the backward relationship — that `helpers.R` is sourced by `main.R`. This setting controls how those relationships are discovered.
-
-### `"auto"` (default)
-
-The LSP automatically infers backward relationships by scanning the workspace for files that contain `source()` calls or `@lsp-source` directives pointing to the current file. No `@lsp-sourced-by` directives are needed.
-
-**How it works:**
-1. On startup, Raven scans the workspace and builds a dependency graph from all `source()` calls and forward directives.
-2. Undefined variable diagnostics are deferred for files without explicit `@lsp-sourced-by` directives until the workspace scan completes. This prevents false positives during startup — symbols from parent files are not yet discoverable until the graph is built.
-3. After the scan, all open files are revalidated with the complete dependency graph.
-4. As files are added or modified, the dependency graph is updated in real time.
-
-**Rationale:** `@lsp-sourced-by` directives are Raven-specific — without auto mode, you'd have to annotate your entire codebase before cross-file diagnostics become useful. Auto mode provides cross-file intelligence out of the box for any workspace where files are connected via `source()` calls. The startup deferral ensures diagnostics are accurate rather than prematurely flagging symbols that come from parent files.
-
-**Per-file opt-out:** If a file has explicit `@lsp-sourced-by` directives, only those declared parents are used — auto-inference is disabled for that file. This gives you full control when needed, and means adding a directive is never additive — it replaces auto-detection entirely for that file.
-
-**Performance:** Helper files where all symbols are defined locally do not incur graph traversal costs — a local-first optimization skips cross-file scope resolution when the symbol is found in the file's own definitions. This means self-contained files — utilities, function libraries, or any file where all referenced symbols are defined locally — have zero overhead from the backward dependency graph.
-
-**`local=TRUE` is respected:** If a parent sources a child with `source("child.R", local = TRUE)`, the child does not inherit the parent's global scope through that edge. This matches R's runtime behavior where `local = TRUE` evaluates the sourced file in a local environment.
-
-**Example:**
-```r
-# main.R
-source("helpers.R")
-result <- helper_func(42)
-```
-
-```r
-# helpers.R (no @lsp-sourced-by needed in auto mode)
-helper_func <- function(x) {
-  parent_var + x  # parent_var from main.R is in scope
-}
-```
-
-### `"explicit"`
-
-The LSP only uses backward relationships explicitly declared via `@lsp-sourced-by` directives. Forward-created backward edges from workspace scanning are not used for scope resolution.
-
-**Rationale:** Use this mode if you prefer full manual control over cross-file relationships, or if your workspace has complex sourcing patterns where automatic inference produces unwanted results (e.g., a file is sourced by multiple parents with conflicting scopes). Diagnostics are not deferred for the workspace scan.
-
-
-## Go-to-definition for `$` and `@` member names
-
-When you cmd-click on the RHS identifier of an `extract_operator` (`bar` in
-`foo$bar`, or in `foo@bar`), Raven resolves it as a *member of `foo`*, not as
-a free variable. This avoids the surprise where a same-named top-level
-binding (e.g. `bar <- ...`) was previously chosen as the target.
-
-Concretely, after resolving `foo` with the existing position-aware scope,
-Raven looks for candidates in the file where `foo` is defined and in any other
-file that actually contributes to the cursor's cross-file scope:
-
-- **Member assignments** — any `foo$bar <- …` (or `foo@bar <- …`) statement in
-  the defining file or a contributing cross-file source/parent file, as long
-  as re-resolving `foo` at that assignment site still points to the same
-  binding. For `$`, statically named string-subscript assignments such as
-  `foo[["bar"]] <- …` and `foo["bar"] <- …` are treated as member assignments
-  too.
-- **Constructor-literal members** — when `foo`'s defining assignment's RHS
-  is a call to one of `list`, `c`, `data.frame`, `tibble`, `data.table`,
-  `environment`, `list2env`, or `new`, the named argument matching `bar` is a
-  candidate.
-
-The candidate with the latest *effect position* (the end of the assignment
-that introduces it) before the cursor wins within the cursor file. If the best
-match lives in another file, Raven prefers the file closest to the cursor in
-the contributing cross-file chain, then chooses that file's latest matching
-assignment. If no qualified candidate exists, go-to-definition returns nothing
-— Raven does not fall back to a free-variable lookup for the RHS of `$`/`@`.
-
-Raven also provides scope-aware completions after `$` when the left-hand side
-is a bare identifier, such as `foo$` or `foo$ba`. Completion uses the same
-position-aware binding and cross-file candidate rules as `$` go-to-definition:
-named arguments from the allowlisted constructors above, visible
-`foo$bar <- ...` assignments, and visible static string-subscript assignments
-such as `foo[["bar"]] <- ...` are offered as field completions. When a partial
-member name is already typed, the completion edit replaces only that member
-token and does not insert another `$`.
-
-If the object before `$` cannot be resolved, or if the access shape is outside
-the supported bare-identifier form, Raven returns an empty member-completion
-list for that `$` context instead of falling back to unrelated normal R
-completions.
-
-Out of scope today: S4 slot resolution from `setClass`, R6 fields/methods,
-`@` completions, aliasing (`foo <- bar; foo$x`), function-return inference,
-package-data introspection, non-bare left-hand sides, completions inside
-`[[`/`[` syntax itself, and chained access (`foo$bar$baz` returns nothing).
+Scope-aware completions after `$` use the same rules: typing `foo$` offers known members of `foo`.

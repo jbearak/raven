@@ -7,8 +7,9 @@ This document is for contributors/maintainers (and LLMs) working on Raven’s Ru
 User-facing docs:
 - `README.md`
 - `docs/cross-file.md`
-- `docs/declaration-directives.md`
-- `docs/packages.md`
+- `docs/directives.md`
+- `docs/diagnostics.md`
+- `docs/completion.md`
 - `docs/configuration.md`
 
 Key code entry points:

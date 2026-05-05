@@ -1,16 +1,14 @@
 # Raven - Language Server for R
 
-An open-source [Language Server Protocol (LSP)](https://github.com/Microsoft/language-server-protocol) implementation for the R statistical programming language, with a corresponding extension for [VS Code](https://github.com/Microsoft/vscode).
+An open-source [Language Server Protocol (LSP)](https://github.com/Microsoft/language-server-protocol) implementation for R, with a corresponding extension for [VS Code](https://github.com/Microsoft/vscode).
 
-> **tl;dr**: Raven brings **cross-file intelligence** to R coding. Unlike language servers that treat each file in isolation, Raven follows `source()` chains to provide **workspace-wide completions**, **go-to-definition across files**, **position-aware scope resolution**, and **diagnostics that understand your project structure**.
->
-> **Development Status:** Raven is an early-stage implementation. While functional, it requires substantial testing and code review. Contributions and feedback are welcome!
->
-> **Quick Start:** Download from the [releases page](https://github.com/jbearak/raven/releases), or clone the repo and build from source (`cargo build --release -p raven`). See [Installation](#installation) for details.
+> **tl;dr**: Raven brings **cross-file intelligence** to R coding. It follows `source()` chains to provide **workspace-wide completions**, **go-to-definition across files**, **position-aware scope resolution**, and **diagnostics that understand your project structure** — all without running R.
 
-Raven works with VS Code, its forks (Antigravity, Cursor, Kiro, Positron, and Windsurf), and any editor with an LSP client. This repository contains the language server and a VS Code extension that activates it. Raven can run alongside existing R extensions like [vscode-R](https://github.com/REditorSupport/vscode-R) — see [Raven vs Ark vs R Language Server](#raven-vs-ark-vs-r-language-server) for how they compare and coexist.
+> **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
 
-Raven’s sister project [Sight](https://github.com/jbearak/sight) implements a language server, syntax highlighting, and code execution for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
+> **Quick Start:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r), or download from the [releases page](https://github.com/jbearak/raven/releases). See [Installation](#installation) for details.
+
+Raven works with VS Code, its forks, and any editor with an LSP client. Raven's sister project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
 
 ## Quick Start
 
@@ -33,126 +31,59 @@ When you open `main.R`, Raven:
 3. Provides completions, hover, and go-to-definition for `helper_function`
 4. Only shows `helper_function` as available *after* the `source()` line
 
-And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it (by scanning the workspace) and resolves the full chain in both directions — no configuration needed.
-
-For complex setups or when you want explicit control, you can add directives:
-
-```r
-# utils.R
-# @lsp-sourced-by main.R
-helper_function <- function(x) { x * 2 }
-```
-
-See [Cross-File Awareness](docs/cross-file.md) for directives, dynamic-path handling, and [backward dependency modes](docs/cross-file.md#backward-dependency-modes).
-
-## Installation
-
-### Download from Releases
-
-Pre-built binaries are available from the [releases page](https://github.com/jbearak/raven/releases).
-
-### Editor Setup
-
-Raven runs over stdio (`raven --stdio`) and works with any LSP-capable editor.
-
-**VS Code:** Install the extension (which bundles the binary) from the [releases page](../../releases). Marketplace and OpenVSX publishing is planned but not yet available.
-
-**Zed:** Add to your `settings.json`:
-
-```json
-"languages": {
-  "R": {
-    "language_servers": ["r_language_server"],
-    "enable_language_server": true
-  }
-},
-"lsp": {
-  "r_language_server": {
-    "binary": {
-      "path": "/path/to/raven",
-      "arguments": ["--stdio"]
-    }
-  }
-}
-```
-
-**Other editors:** Run `raven --stdio` and connect via your editor's LSP client.
-
-## Raven vs Ark vs R Language Server
-
-- **[R Language Server](https://github.com/REditorSupport/languageserver)** is the most established general-purpose R LSP.
-- **[Ark](https://github.com/posit-dev/ark)** is the R LSP used by **Positron**.
-
-Raven is an alternative focused on cross-file scope, diagnostics, and navigation for multi-file R projects.
-
-### VS Code with the vscode-R extension
-
-The [vscode-R](https://github.com/REditorSupport/vscode-R) extension provides useful features beyond its bundled language server (running R code, viewing plots, etc.). You can leave vscode-R's language server enabled alongside Raven (vscode-R provides formatting diagnostics, Raven provides code diagnostics), or disable it to avoid duplicate completions:
-
-```json
-"r.lsp.enabled": false
-```
-
-You may also want to push snippets below LSP completions to reduce duplicate entries:
-
-```json
-"editor.snippetSuggestions": "bottom"
-```
+And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it and resolves the full chain in both directions — no configuration needed.
 
 ## Features
 
-- **Cross-file awareness** - Symbol resolution across `source()` chains with position-aware scope
-- **Declaration directives** - Suppress diagnostics for dynamically-created symbols (`@lsp-var`, `@lsp-func`) that cannot be statically detected
-- **Diagnostics** - Scope-aware undefined variable detection that understands sourced files
-- **Go-to-definition** - Navigate to symbol definitions across file boundaries
-- **File path intellisense** - Complete and cmd-click paths in `source()` calls and `@lsp-*source*` / `@lsp-*-by` directives
-- **Find references** - Locate all symbol usages project-wide
-- **Completions** - Workspace-aware completion including symbols from sourced files and loaded packages
-- **Function signatures** - Parameter completion and richer function signature hovers
-- **Hover** - Symbol information on hover
-- **Document symbols** - Hierarchical outline view with R sections, JAGS/Stan blocks plus decorative headings and loops, S4/R6 class detection, and nested function display
-- **Workspace symbols** - Fast project-wide symbol search (Ctrl+T) with configurable result limits
-- **Workspace indexing** - Background indexing of your entire project
-- **Smart indentation** - AST-aware auto-indentation with RStudio-style alignment on Enter
-- **Package awareness** - Recognition of `library()` calls and package exports
+- **[Completions](docs/completion.md)** — Symbols, packages, and function parameters — across files
+- **Go-to-definition** — Jump to definitions across file boundaries
+- **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
+- **Hover** — Symbol info including source file and package origin
+- **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
+- **[Document outline](docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
+- **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
+- **File path intellisense** — Completions and cmd-click inside `source()` paths
+- **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
+- **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
+- **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
+- **Syntax highlighting** — R, JAGS, and Stan
+- **Bundled binary** — No separate installation needed in VS Code
 
-### JAGS and Stan Support
-
-Raven provides lightweight language support for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files:
-
-- **Syntax highlighting** - Keyword, type, distribution, and comment highlighting
-- **Completions** - Language-specific keywords, types, distributions, and file-local symbols
-- **Go-to-definition** - Jump to variable definitions within the file
-- **Find references** - Locate all usages of a variable within the file
-- **Document outline** - Navigate model structure with blocks, decorative headings, and loops (see [Document Outline](docs/document-outline.md#jags-and-stan-model-structure))
-
-Diagnostics are suppressed for JAGS and Stan files because Raven cannot statically determine what is in scope in these languages.
+> [!NOTE]
+> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation. See [Document Outline](docs/document-outline.md#jags-and-stan-model-structure).
 
 ## Documentation
 
-- [Cross-File Awareness](docs/cross-file.md) - Directives, `source()` detection, symbol resolution
-- [Document Outline](docs/document-outline.md) - Hierarchical outline view, R code sections, symbol types
-- [Declaration Directives](docs/declaration-directives.md) - `@lsp-var`, `@lsp-func` for dynamically-created symbols
-- [Package Function Awareness](docs/packages.md) - `library()` support, meta-packages, base packages
-- [Smart Indentation](docs/indentation.md) - AST-aware auto-indentation styles and configuration
-- [Configuration](docs/configuration.md) - All settings and options
+- [Cross-File & Package Awareness](docs/cross-file.md) — How Raven understands multi-file projects
+- [Directives](docs/directives.md) — All `@lsp-*` directive syntax
+- [Diagnostics](docs/diagnostics.md) — What's reported and how to suppress
+- [Completions](docs/completion.md) — What's offered and scope rules
+- [Find References](docs/find-references.md) — Cross-file reference finding
+- [Document Outline](docs/document-outline.md) — Hierarchical symbol view
+- [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
+- [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
+- [Configuration](docs/configuration.md) — All settings and options
+- [Comparison](docs/comparison.md) — How Raven compares to other R tools
+
+## Installation
+
+**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r).
+
+**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
+
+**Build from source:** See [Development Notes](docs/development.md).
+
+## How Raven Compares
+
+Raven is a static analysis tool that provides scope-aware intelligence for R — without requiring a running R session. For a detailed feature comparison with RStudio, Positron (Ark), and REditorSupport/languageserver, see [docs/comparison.md](docs/comparison.md).
 
 ## Development
 
-See [Development Notes](docs/development.md) for build/test, profiling, and internal architecture notes.
+See [Development Notes](docs/development.md) for build/test, profiling, and internal architecture.
 
 ## Provenance
 
-Raven includes code derived from two sources:
-
-- **[Ark](https://github.com/posit-dev/ark)** (MIT License, Posit Software, PBC)
-  - Raven began as a fork of Ark’s static R language server (`ark-lsp`), inheriting the initial LSP server wiring and tree-sitter-based parsing/handler scaffolding (since modified).
-  - See [NOTICE](NOTICE) for the Ark attribution and license text.
-
-- **[Sight](https://github.com/jbearak/sight)** (GPL-3.0)
-  - Raven’s cross-file awareness system (directives + position-aware timeline/scope model) was ported from Sight, a Stata language server with similar goals.
-
-Raven and Sight are complementary projects addressing the same problem — navigating large, multi-file scientific codebases — across two languages widely used in social science research.
+Raven includes code derived from [Ark](https://github.com/posit-dev/ark) (MIT License, Posit Software, PBC) — initial LSP wiring and tree-sitter scaffolding — and [Sight](https://github.com/jbearak/sight) (GPL-3.0) — the cross-file awareness system (directives + position-aware scope model). See [NOTICE](NOTICE) for full attribution.
 
 ## License
 
