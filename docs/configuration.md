@@ -7,7 +7,6 @@ All settings can be configured via VS Code settings or LSP initialization option
 | Setting | Default | Description |
 |---|---|---|
 | `raven.diagnostics.enabled` | `true` | Master switch for all diagnostics |
-| `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
 
 ## Cross-File Settings
 
