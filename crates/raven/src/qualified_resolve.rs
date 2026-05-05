@@ -573,6 +573,7 @@ fn collect_qualified_member_candidates_with_cancel(
         .chain
         .iter()
         .filter(|candidate_uri| **candidate_uri != defining_uri)
+        .filter(|candidate_uri| !scope.parent_prefix_chain_uris.contains(candidate_uri))
     {
         if cancel.is_cancelled() {
             return None;
@@ -3125,6 +3126,39 @@ use(foo$inner)
             "chained `foo$inner$bar <- 99` (outer extract's LHS is itself \
              an extract, not a bare identifier) must not be collected as a \
              candidate for `foo$inner`",
+        );
+    }
+
+    /// Member assignments in a parent (backward-dependency) file must NOT
+    /// appear as completions in the child file. The parent executes *after*
+    /// the child, so its `foo$bar <- 1` is not visible at the child's cursor.
+    #[test]
+    fn dollar_member_completion_excludes_parent_prefix_assignments() {
+        let mut state = fresh_state();
+        let child_code = "\
+foo <- list()
+foo$
+";
+        let parent_code = "\
+source(\"child.R\")
+foo$bar <- 1
+";
+        let child_uri = add_doc(&mut state, "file:///workspace/child.R", child_code);
+        let parent_uri = add_indexed_doc(&mut state, "file:///workspace/parent.R", parent_code);
+
+        for (uri, code) in [(&child_uri, child_code), (&parent_uri, parent_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // Cursor in child.R at `foo$` — parent's `foo$bar` must not leak.
+        assert!(
+            completion_names(&state, &child_uri, Position::new(1, 4), "foo").is_empty(),
+            "parent-prefix member assignments must not appear in child completions"
         );
     }
 }
