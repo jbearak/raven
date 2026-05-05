@@ -396,12 +396,13 @@ suite('Settings Transmission Unit Tests', () => {
      */
     test('severity settings transmit correctly', () => {
         const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint', 'off'];
-        
+
         for (const severity of severities) {
             const configuredSettings = new Map<string, unknown>([
                 ['crossFile.missingFileSeverity', severity],
                 ['crossFile.circularDependencySeverity', severity],
                 ['packages.missingPackageSeverity', severity],
+                ['diagnostics.undefinedVariableSeverity', severity],
             ]);
 
             const mockConfig = createMockConfig(configuredSettings);
@@ -410,6 +411,7 @@ suite('Settings Transmission Unit Tests', () => {
             assert.strictEqual(options.crossFile?.missingFileSeverity, severity);
             assert.strictEqual(options.crossFile?.circularDependencySeverity, severity);
             assert.strictEqual(options.packages?.missingPackageSeverity, severity);
+            assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, severity);
         }
     });
 
@@ -608,6 +610,7 @@ suite('Settings Transmission Unit Tests', () => {
             ['crossFile.ambiguousParentSeverity', 'hint'],
             ['crossFile.maxChainDepthSeverity', 'error'],
             ['packages.missingPackageSeverity', 'warning'],
+            ['diagnostics.undefinedVariableSeverity', 'off'],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
@@ -619,6 +622,7 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.ambiguousParentSeverity, 'hint');
         assert.strictEqual(options.crossFile?.maxChainDepthSeverity, 'error');
         assert.strictEqual(options.packages?.missingPackageSeverity, 'warning');
+        assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'off');
     });
 
     /**
