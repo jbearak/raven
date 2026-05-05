@@ -54,8 +54,8 @@ pub struct CrossFileConfig {
     /// Debounce delay for the actively-edited file in milliseconds.
     /// Lower than revalidation_debounce_ms for near-instant feedback.
     pub edited_file_debounce_ms: u64,
-    /// Whether undefined variable diagnostics are enabled
-    pub undefined_variables_enabled: bool,
+    /// Severity for undefined variable diagnostics (None = disabled)
+    pub undefined_variable_severity: Option<DiagnosticSeverity>,
     /// Severity for missing file diagnostics (None = disabled)
     pub missing_file_severity: Option<DiagnosticSeverity>,
     /// Severity for circular dependency diagnostics (None = disabled)
@@ -143,7 +143,7 @@ impl Default for CrossFileConfig {
             max_revalidations_per_trigger: 10,
             revalidation_debounce_ms: 200,
             edited_file_debounce_ms: 50,
-            undefined_variables_enabled: true,
+            undefined_variable_severity: Some(DiagnosticSeverity::WARNING),
             missing_file_severity: Some(DiagnosticSeverity::WARNING),
             circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
             out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
@@ -198,7 +198,10 @@ mod tests {
         assert_eq!(config.max_revalidations_per_trigger, 10);
         assert_eq!(config.revalidation_debounce_ms, 200);
         assert_eq!(config.edited_file_debounce_ms, 50);
-        assert!(config.undefined_variables_enabled);
+        assert_eq!(
+            config.undefined_variable_severity,
+            Some(DiagnosticSeverity::WARNING)
+        );
         // On-demand indexing defaults
         assert!(config.on_demand_indexing_enabled);
         assert_eq!(config.on_demand_indexing_max_transitive_depth, 2);
@@ -269,7 +272,7 @@ mod tests {
         config2.revalidation_debounce_ms = 500;
         assert!(!config1.scope_settings_changed(&config2));
 
-        config2.undefined_variables_enabled = false;
+        config2.undefined_variable_severity = None;
         assert!(!config1.scope_settings_changed(&config2));
     }
 

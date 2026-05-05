@@ -78,7 +78,7 @@ Each diagnostic category has a severity setting that accepts `"error"`, `"warnin
 
 ```json
 "raven.crossFile.missingFileSeverity": "off",
-"raven.diagnostics.undefinedVariables": false
+"raven.diagnostics.undefinedVariableSeverity": "off"
 ```
 
 See [Configuration](configuration.md) for all severity settings.

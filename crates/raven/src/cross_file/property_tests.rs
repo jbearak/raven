@@ -3072,31 +3072,33 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Property 33: For any configuration with diagnostics.undefinedVariables = false,
+    /// Property 33: For any configuration with `undefined_variable_severity = None`,
     /// no undefined variable diagnostics SHALL be emitted regardless of symbol resolution.
     #[test]
     fn prop_undefined_variables_configuration(
         _symbol_name in r_identifier()
     ) {
-        // Test that the configuration flag exists and can be toggled
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // Test that the configuration field exists and can be toggled
         let mut config = CrossFileConfig::default();
 
-        // Default should be true
-        prop_assert!(config.undefined_variables_enabled,
-            "Default undefined_variables_enabled should be true");
+        // Default should be Some(WARNING)
+        prop_assert_eq!(config.undefined_variable_severity, Some(DiagnosticSeverity::WARNING),
+            "Default undefined_variable_severity should be Some(WARNING)");
 
-        // Can be set to false
-        config.undefined_variables_enabled = false;
-        prop_assert!(!config.undefined_variables_enabled,
-            "undefined_variables_enabled should be settable to false");
+        // Can be set to None ("off")
+        config.undefined_variable_severity = None;
+        prop_assert!(config.undefined_variable_severity.is_none(),
+            "undefined_variable_severity should be settable to None");
 
         // Changing this setting should NOT trigger scope re-resolution
         // (it only affects diagnostics, not scope)
         let config1 = CrossFileConfig::default();
         let mut config2 = CrossFileConfig::default();
-        config2.undefined_variables_enabled = false;
+        config2.undefined_variable_severity = None;
         prop_assert!(!config1.scope_settings_changed(&config2),
-            "Changing undefined_variables_enabled should NOT trigger scope change");
+            "Changing undefined_variable_severity should NOT trigger scope change");
     }
 }
 

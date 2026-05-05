@@ -413,12 +413,13 @@ pub(crate) fn diagnostics_from_snapshot(
     }
 
     // Undefined variable diagnostics
-    if snapshot.cross_file_config.undefined_variables_enabled {
+    if let Some(severity) = snapshot.cross_file_config.undefined_variable_severity {
         collect_undefined_variables_from_snapshot(
             snapshot,
             uri,
             snapshot.tree.root_node(),
             &snapshot.text,
+            severity,
             &mut diagnostics,
             &mut scope_cache,
             cancel,
@@ -4754,6 +4755,7 @@ fn collect_undefined_variables_from_snapshot(
     uri: &Url,
     node: Node,
     text: &str,
+    severity: DiagnosticSeverity,
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
@@ -5089,7 +5091,7 @@ fn collect_undefined_variables_from_snapshot(
                 start: Position::new(usage_node.start_position().row as u32, start_col),
                 end: Position::new(usage_node.end_position().row as u32, end_col),
             },
-            severity: Some(DiagnosticSeverity::WARNING),
+            severity: Some(severity),
             message: format!("Undefined variable: {}", name),
             ..Default::default()
         });
@@ -22988,7 +22990,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -23000,6 +23002,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -23041,7 +23044,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -23053,6 +23056,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -23092,7 +23096,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -23104,6 +23108,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -23142,7 +23147,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -23154,6 +23159,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24067,7 +24073,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -24079,6 +24085,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24125,7 +24132,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -24137,6 +24144,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24186,7 +24194,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -24198,6 +24206,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24267,7 +24276,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -24279,6 +24288,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24349,7 +24359,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -24361,6 +24371,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -24466,7 +24477,7 @@ mod proptests {
 
             let mut state = WorldState::new(vec![]);
             state.workspace_scan_complete = true;
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -24478,6 +24489,7 @@ mod proptests {
                 &uri,
                 tree.root_node(),
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -32458,7 +32470,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         state
             .documents
@@ -32546,7 +32558,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         state
             .documents
@@ -32634,7 +32646,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         state
             .documents
@@ -32721,7 +32733,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         state
             .documents
@@ -32792,7 +32804,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         state
             .documents
@@ -32876,7 +32888,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [
             (&main_url, main_code),
@@ -32961,7 +32973,7 @@ result <- helper_with_spaces(42)"#;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [(&data_url, data_code), (&indices_url, indices_code)] {
             state
@@ -34503,7 +34515,7 @@ mod position_aware_tests {
         DiagCancelToken, DiagnosticsSnapshot,
     };
     use crate::state::{Document, WorldState};
-    use tower_lsp::lsp_types::{Position, Url};
+    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Url};
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
@@ -34580,6 +34592,7 @@ x <- 1
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34648,6 +34661,7 @@ x <- 1
             &impute_uri,
             root,
             impute_code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34713,6 +34727,7 @@ x
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34743,6 +34758,7 @@ x <- 2
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34777,6 +34793,7 @@ myvar
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34810,6 +34827,7 @@ myfunc()
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34843,6 +34861,7 @@ myfunc()
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34880,6 +34899,7 @@ MyVar
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -34916,6 +34936,7 @@ MyVar
                 &uri,
                 root,
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -34952,6 +34973,7 @@ MyVar
                 &uri,
                 root,
                 &code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -34987,6 +35009,7 @@ myvar
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35087,6 +35110,7 @@ mysymbol
             &uri1,
             root1,
             code1,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics1,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35114,6 +35138,7 @@ mysymbol
             &uri2,
             root2,
             code2,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics2,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -35325,7 +35350,7 @@ x
         let mut state = create_test_state();
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         let data_uri = Url::parse("file:///workspace/data.R").unwrap();
         let indices_uri = Url::parse("file:///workspace/indices.R").unwrap();
@@ -35396,7 +35421,7 @@ x
         let mut state = create_test_state();
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = false;
+        state.cross_file_config.undefined_variable_severity = None;
 
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
         let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
@@ -35455,7 +35480,7 @@ source(\"helpers.R\")
         let mut state = create_test_state();
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = false;
+        state.cross_file_config.undefined_variable_severity = None;
 
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
         let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
@@ -35522,7 +35547,7 @@ source(\"helpers.R\")
         let mut state = create_test_state();
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         let outcomes_uri = Url::parse("file:///workspace/outcomes.R").unwrap();
         let failure_uri = Url::parse("file:///workspace/failure.R").unwrap();
@@ -35591,7 +35616,7 @@ source(\"failure.R\")
         let mut state = create_test_state();
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
         let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
@@ -35866,7 +35891,7 @@ source(\"helpers.R\")
             state.workspace_scan_complete = workspace_scan_complete;
             state.cross_file_config.out_of_scope_severity =
                 Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-            state.cross_file_config.undefined_variables_enabled = true;
+            state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
             for (uri, code) in [
                 (&main_uri, main_code),
@@ -35967,7 +35992,7 @@ source(\"helpers.R\")
         state.workspace_scan_complete = true;
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [
             (&main_uri, main_code),
@@ -36057,7 +36082,7 @@ source(\"helpers.R\")
         state.workspace_scan_complete = true;
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [(&main_uri, main_code), (&a_uri, a_code), (&b_uri, b_code)] {
             state
@@ -36123,7 +36148,7 @@ source(\"helpers.R\")
 
         let mut state = WorldState::new(vec![]);
         state.workspace_scan_complete = true;
-        // undefined_variables_enabled and diagnostics_enabled default to true;
+        // undefined_variable_severity and diagnostics_enabled default to enabled;
         // out_of_scope_severity just needs to be non-None to enable that collector.
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -36242,7 +36267,7 @@ source(\"helpers.R\")
 
         let mut state = WorldState::new(vec![]);
         state.workspace_scan_complete = true;
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [
             (&data_uri, data_code),
@@ -36471,7 +36496,7 @@ source(\"helpers.R\")
         use std::collections::BTreeSet;
 
         let mut state = create_test_state();
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
         let uri = add_document(&mut state, "file:///test/cache.R", text);
         state.cross_file_graph.update_file(
             &uri,
@@ -36702,7 +36727,7 @@ source(\"helpers.R\")
         let indices_code = "idx_a <- 10\n";
 
         let mut state = create_test_state();
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [
             (&main_uri, main_code),
@@ -36813,7 +36838,7 @@ source(\"helpers.R\")
         let indices_code = "idx_a <- 10\n";
 
         let mut state = create_test_state();
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
         for (uri, code) in [
             (&main_uri, main_code),
@@ -36902,7 +36927,7 @@ mod function_parameter_tests {
         collect_undefined_variables_from_snapshot, DiagCancelToken, DiagnosticsSnapshot,
     };
     use crate::state::{Document, WorldState};
-    use tower_lsp::lsp_types::Url;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, Url};
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
@@ -36945,6 +36970,7 @@ add <- function(a, b) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37002,6 +37028,7 @@ outer_func <- function(x) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37058,6 +37085,7 @@ my_func <- function(a = undefined_var) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37114,6 +37142,7 @@ my_func()
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37154,6 +37183,7 @@ my_func(1)
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37194,6 +37224,7 @@ my_func()
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37235,6 +37266,7 @@ my_func <- function(a = default_value) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37289,6 +37321,7 @@ my_func <- function(a = default_value) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37420,6 +37453,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37474,6 +37508,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37541,6 +37576,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37601,6 +37637,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37625,6 +37662,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37666,6 +37704,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37720,6 +37759,7 @@ my_func <- function(a = default_value) {
             &uri,
             tree.root_node(),
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -37769,6 +37809,7 @@ my_func <- function(a = default_value) {
                 &uri,
                 root,
                 code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37816,6 +37857,7 @@ my_func <- function(a = default_value) {
                 &uri,
                 root,
                 code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37894,6 +37936,7 @@ my_func <- function(a = default_value) {
                 &uri,
                 root,
                 case.code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -37953,6 +37996,7 @@ my_func <- function(a = default_value) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38006,6 +38050,7 @@ my_func <- function(a = default_value) {
                 &uri,
                 root,
                 code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -38047,6 +38092,7 @@ my_func <- function(a = default_value) {
             &uri,
             root,
             code,
+            DiagnosticSeverity::WARNING,
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
@@ -38104,6 +38150,7 @@ my_func <- function(a = default_value) {
                 &uri,
                 root,
                 code,
+                DiagnosticSeverity::WARNING,
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
@@ -38137,7 +38184,7 @@ mod diagnostics_master_switch_tests {
     use crate::handlers::{diagnostics, DiagCancelToken};
     use crate::state::{Document, WorldState};
     use proptest::prelude::*;
-    use tower_lsp::lsp_types::Url;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, Url};
 
     /// Strategy to generate arbitrary R code content.
     /// Includes valid R code, syntax errors, and edge cases.
@@ -38189,14 +38236,18 @@ mod diagnostics_master_switch_tests {
         #[test]
         fn prop_master_switch_disabled_suppresses_all_diagnostics(
             code in arbitrary_r_code(),
-            undefined_variables_enabled in any::<bool>(),
+            undefined_variable_enabled in any::<bool>(),
         ) {
             // Create a WorldState with diagnostics_enabled = false
             let mut state = WorldState::new(vec![]);
             state.cross_file_config.diagnostics_enabled = false;
 
             // Also vary other diagnostic settings to ensure master switch takes precedence
-            state.cross_file_config.undefined_variables_enabled = undefined_variables_enabled;
+            state.cross_file_config.undefined_variable_severity = if undefined_variable_enabled {
+                Some(DiagnosticSeverity::WARNING)
+            } else {
+                None
+            };
 
             // Create a document with the generated code
             let uri = Url::parse("file:///test.R").unwrap();
@@ -38246,7 +38297,7 @@ mod diagnostics_master_switch_tests {
         // Even code with undefined variables should produce no diagnostics when disabled
         let mut state = WorldState::new(vec![]);
         state.cross_file_config.diagnostics_enabled = false;
-        state.cross_file_config.undefined_variables_enabled = true; // Would normally produce diagnostics
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING); // Would normally produce diagnostics
 
         let uri = Url::parse("file:///test.R").unwrap();
         // Code with undefined variable
@@ -38270,7 +38321,7 @@ mod diagnostics_master_switch_tests {
         state.cross_file_config.diagnostics_enabled = false;
 
         // Enable all individual diagnostic settings
-        state.cross_file_config.undefined_variables_enabled = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
         // Severity settings are already set to non-None values by default
 
         let uri = Url::parse("file:///test.R").unwrap();
