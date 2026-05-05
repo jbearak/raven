@@ -933,6 +933,10 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 /// RHS member. Each candidate records the position of its LHS identifier
 /// (`foo` in `foo$bar <- ...`) for use as a query position when validating
 /// cross-file candidates.
+///
+/// Uses a `TreeCursor` traversal instead of a `Vec<Node>` stack to avoid
+/// per-node allocation and to skip leaf/atomic subtrees that cannot contain
+/// assignment operators.
 #[allow(clippy::too_many_arguments)]
 fn collect_member_assignments(
     root: Node,
@@ -944,36 +948,89 @@ fn collect_member_assignments(
     op: ExtractOp,
     out: &mut Vec<Candidate>,
 ) {
-    let mut stack: Vec<Node> = vec![root];
-    while let Some(node) = stack.pop() {
-        let mut walker = node.walk();
-        for child in node.children(&mut walker) {
-            stack.push(child);
+    let mut cursor = root.walk();
+    let mut descended = true; // treat root as just-entered
+    loop {
+        if descended {
+            let node = cursor.node();
+            let kind = node.kind();
+            // Skip leaf/atomic subtrees that cannot contain assignments.
+            let dominated = matches!(
+                kind,
+                "identifier"
+                    | "string"
+                    | "string_content"
+                    | "comment"
+                    | "integer"
+                    | "float"
+                    | "complex"
+                    | "na"
+                    | "null"
+                    | "inf"
+                    | "nan"
+                    | "true"
+                    | "false"
+                    | "dots"
+                    | "dot_dot_i"
+                    | "special"
+            );
+            if !dominated {
+                if kind == "binary_operator" {
+                    try_extract_member_assignment(
+                        node, text, line_index, file_uri, lhs_name, rhs_name, op, out,
+                    );
+                }
+                // Descend into children if this node has any.
+                if cursor.goto_first_child() {
+                    descended = true;
+                    continue;
+                }
+            }
         }
-        if node.kind() != "binary_operator" {
-            continue;
+        // Try next sibling, or ascend.
+        if cursor.goto_next_sibling() {
+            descended = true;
+        } else if cursor.goto_parent() {
+            descended = false;
+        } else {
+            break;
         }
-        let Some(op_node) = node.child_by_field_name("operator") else {
-            continue;
-        };
-        let op_text = node_text(op_node, text);
-        let target = match op_text {
-            "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
-            "->" | "->>" => node.child_by_field_name("rhs"),
-            _ => continue,
-        };
-        let Some(target) = target else { continue };
-        if let Some(candidate) = member_assignment_candidate_from_extract(
-            node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
-        ) {
-            out.push(candidate);
-            continue;
-        }
-        if let Some(candidate) = member_assignment_candidate_from_string_subscript(
-            node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
-        ) {
-            out.push(candidate);
-        }
+    }
+}
+
+/// Helper: check a single `binary_operator` node for member-assignment
+/// patterns and push a candidate if matched.
+#[allow(clippy::too_many_arguments)]
+fn try_extract_member_assignment(
+    node: Node,
+    text: &str,
+    line_index: &LineIndex,
+    file_uri: &Url,
+    lhs_name: &str,
+    rhs_name: Option<&str>,
+    op: ExtractOp,
+    out: &mut Vec<Candidate>,
+) {
+    let Some(op_node) = node.child_by_field_name("operator") else {
+        return;
+    };
+    let op_text = node_text(op_node, text);
+    let target = match op_text {
+        "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
+        "->" | "->>" => node.child_by_field_name("rhs"),
+        _ => return,
+    };
+    let Some(target) = target else { return };
+    if let Some(candidate) = member_assignment_candidate_from_extract(
+        node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
+    ) {
+        out.push(candidate);
+        return;
+    }
+    if let Some(candidate) = member_assignment_candidate_from_string_subscript(
+        node, target, text, line_index, file_uri, lhs_name, rhs_name, op,
+    ) {
+        out.push(candidate);
     }
 }
 
