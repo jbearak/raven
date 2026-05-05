@@ -44,6 +44,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
 
+use crate::content_provider::ContentProvider;
 use crate::cross_file::scope::LineIndex;
 use crate::extract_op::ExtractOp;
 use crate::handlers::DiagCancelToken;
@@ -515,6 +516,7 @@ fn collect_qualified_member_candidates_with_cancel(
             rhs_name,
             op,
             &mut defining_candidates,
+            false, // don't skip functions; fn_scope check handles defining file
         );
         if let Some(rhs_name) = rhs_name {
             if let Some(candidate) = collect_constructor_candidate(
@@ -564,6 +566,9 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let mut cross_file_candidates: Vec<Candidate> = Vec::new();
     let contributor_ranks = contributor_file_ranks(&scope.chain);
+    let content_provider = state.content_provider();
+    let lhs_arc: std::sync::Arc<str> = std::sync::Arc::from(lhs_name);
+    let mut needs_validation: Vec<Candidate> = Vec::new();
     for candidate_uri in scope
         .chain
         .iter()
@@ -572,26 +577,80 @@ fn collect_qualified_member_candidates_with_cancel(
         if cancel.is_cancelled() {
             return None;
         }
+        let file_redefines_lhs = content_provider
+            .get_artifacts(candidate_uri)
+            .map(|art| art.exported_interface.contains_key(&lhs_arc))
+            .unwrap_or(true);
+
         if let Some((candidate_text, candidate_tree)) =
             crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
         {
             let candidate_col_mapper = ColMapper::new(&candidate_text);
-            collect_member_assignments(
-                candidate_tree.root_node(),
-                &candidate_text,
-                &candidate_col_mapper,
-                candidate_uri,
-                lhs_name,
-                rhs_name,
-                op,
-                &mut cross_file_candidates,
-            );
+            if file_redefines_lhs {
+                // File redefines lhs_name: walk full tree, per-candidate
+                // scope resolution needed.
+                collect_member_assignments(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    lhs_name,
+                    rhs_name,
+                    op,
+                    &mut needs_validation,
+                    false,
+                );
+            } else {
+                // File doesn't redefine lhs_name: skip function bodies,
+                // resolve scope once per file at the earliest candidate.
+                let pre_len = cross_file_candidates.len();
+                collect_member_assignments(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    lhs_name,
+                    rhs_name,
+                    op,
+                    &mut cross_file_candidates,
+                    true, // skip function bodies
+                );
+                // Apply visibility cutoff.
+                let mut i = pre_len;
+                while i < cross_file_candidates.len() {
+                    if candidate_effect_visible_in_scope(
+                        &cross_file_candidates[i],
+                        &scope.visible_positions,
+                    ) {
+                        i += 1;
+                    } else {
+                        cross_file_candidates.swap_remove(i);
+                    }
+                }
+                // Batch validation: resolve scope once at the earliest
+                // candidate position. If lhs_name matches, all candidates
+                // from this file pass (it doesn't redefine lhs_name, so
+                // the binding is the same everywhere at top level).
+                if let Some(earliest) = cross_file_candidates[pre_len..]
+                    .iter()
+                    .min_by_key(|c| (c.lhs_pos.line, c.lhs_pos.character))
+                {
+                    if !candidate_lhs_matches_symbol(
+                        state, earliest, lhs_name, symbol, cancel, &mut prefix_cache,
+                    ) {
+                        // lhs_name resolves to a different binding in this
+                        // file; reject all candidates from it.
+                        cross_file_candidates.truncate(pre_len);
+                    }
+                }
+            }
         }
     }
-    cross_file_candidates.retain(|c| {
+    needs_validation.retain(|c| {
         candidate_effect_visible_in_scope(c, &scope.visible_positions)
             && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, cancel, &mut prefix_cache)
     });
+    cross_file_candidates.extend(needs_validation);
     if cancel.is_cancelled() {
         return None;
     }
@@ -976,6 +1035,12 @@ fn enclosing_function_id(node: Node) -> FunctionScopeId {
 /// Uses a `TreeCursor` traversal instead of a `Vec<Node>` stack to avoid
 /// per-node allocation and to skip leaf/atomic subtrees that cannot contain
 /// assignment operators.
+///
+/// When `skip_functions` is true, the walk does not descend into
+/// `function_definition` nodes. This is used for cross-file contributor
+/// files that do not redefine `lhs_name` — assignments inside function
+/// bodies there would reference a shadowed local and be rejected by
+/// per-candidate scope resolution anyway.
 #[allow(clippy::too_many_arguments)]
 fn collect_member_assignments(
     root: Node,
@@ -986,6 +1051,7 @@ fn collect_member_assignments(
     rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
+    skip_functions: bool,
 ) {
     let mut cursor = root.walk();
     let mut descended = true; // treat root as just-entered
@@ -994,7 +1060,7 @@ fn collect_member_assignments(
             let node = cursor.node();
             let kind = node.kind();
             // Skip leaf/atomic subtrees that cannot contain assignments.
-            let dominated = matches!(
+            let skip = matches!(
                 kind,
                 "identifier"
                     | "string"
@@ -1013,8 +1079,8 @@ fn collect_member_assignments(
                     | "dot_dot_i"
                     | "special"
                     | "namespace_operator"
-            );
-            if !dominated {
+            ) || (skip_functions && kind == "function_definition");
+            if !skip {
                 if kind == "binary_operator" {
                     try_extract_member_assignment(
                         node, text, col_mapper, file_uri, lhs_name, rhs_name, op, out,
@@ -1415,6 +1481,89 @@ mod tests {
 
             eprintln!(
                 "perf n={n:>4}  dollar_complete={:?}  one_scope_query={:?}  ratio={:.1}x",
+                dollar_samples[2],
+                scope_samples[2],
+                dollar_samples[2].as_secs_f64() / scope_samples[2].as_secs_f64()
+            );
+        }
+    }
+
+    /// Cross-file variant of the perf test: `df` is defined in a sourced file
+    /// with N `df$col_K <- ...` assignments. The fast path (file doesn't
+    /// redefine `df`) should avoid N scope resolutions.
+    ///
+    ///     cargo test --release -p raven --lib -- \
+    ///         qualified_resolve::tests::perf_dollar_completion_cross_file_scaling \
+    ///         --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn perf_dollar_completion_cross_file_scaling() {
+        for n in [10usize, 50, 100, 200, 400] {
+            let mut data_code = String::from("df <- list()\n");
+            for k in 0..n {
+                data_code.push_str(&format!("df$col_{k} <- {k}\n"));
+            }
+            let main_code = "source(\"data.R\")\ndf$\n";
+            let cursor_line = 1u32;
+
+            let mut state = fresh_state();
+            let main_uri = add_doc(&mut state, "file:///workspace/main.R", main_code);
+            let data_uri = add_indexed_doc(&mut state, "file:///workspace/data.R", &data_code);
+
+            for (uri, code) in [(&main_uri, main_code), (&data_uri, data_code.as_str())] {
+                state.cross_file_graph.update_file(
+                    uri,
+                    &crate::cross_file::extract_metadata(code),
+                    None,
+                    |_| None,
+                );
+            }
+
+            // Warm-up.
+            let _ = super::complete_qualified_members(
+                &state,
+                &main_uri,
+                Position::new(cursor_line, 3),
+                "identifier",
+                "df",
+                crate::extract_op::ExtractOp::Dollar,
+            );
+
+            let mut dollar_samples = [std::time::Duration::ZERO; 5];
+            for s in &mut dollar_samples {
+                let start = std::time::Instant::now();
+                let r = super::complete_qualified_members(
+                    &state,
+                    &main_uri,
+                    Position::new(cursor_line, 3),
+                    "identifier",
+                    "df",
+                    crate::extract_op::ExtractOp::Dollar,
+                );
+                *s = start.elapsed();
+                assert_eq!(r.len(), n, "expected {n} candidates, got {}", r.len());
+            }
+            dollar_samples.sort();
+
+            let mut scope_samples = [std::time::Duration::ZERO; 5];
+            for s in &mut scope_samples {
+                let cancel = DiagCancelToken::never();
+                let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
+                let start = std::time::Instant::now();
+                let _scope = crate::handlers::get_cross_file_scope_with_cache(
+                    &state,
+                    &main_uri,
+                    cursor_line,
+                    3,
+                    &cancel,
+                    &mut cache,
+                );
+                *s = start.elapsed();
+            }
+            scope_samples.sort();
+
+            eprintln!(
+                "perf_xfile n={n:>4}  dollar_complete={:?}  one_scope_query={:?}  ratio={:.1}x",
                 dollar_samples[2],
                 scope_samples[2],
                 dollar_samples[2].as_secs_f64() / scope_samples[2].as_secs_f64()
