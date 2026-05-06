@@ -32,11 +32,6 @@ function advance_cursor(
     editor.revealRange(new vscode.Range(pos, pos));
 }
 
-function is_radian(): boolean {
-    const config = vscode.workspace.getConfiguration('raven.rTerminal');
-    return config.get<string>('program', 'R') === 'radian';
-}
-
 async function handle_send(mode: SendMode): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
