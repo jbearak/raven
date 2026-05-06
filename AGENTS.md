@@ -12,6 +12,7 @@ User-facing:
 - `docs/directives.md`
 - `docs/diagnostics.md`
 - `docs/indentation.md`
+- `docs/send-to-r.md`
 - `docs/document-outline.md`
 - `docs/configuration.md`
 

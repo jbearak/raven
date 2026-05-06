@@ -18,7 +18,8 @@
   "activationEvents": [
     "onLanguage:r",
     "onLanguage:jags",
-    "onLanguage:stan"
+    "onLanguage:stan",
+    "onTerminalProfile:raven.rTerminal"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -30,8 +31,80 @@
       {
         "command": "raven.refreshPackages",
         "title": "Raven: Refresh package cache"
+      },
+      {
+        "command": "raven.runLineOrSelection",
+        "title": "Raven: Run Line or Selection"
+      },
+      {
+        "command": "raven.runUpwardLines",
+        "title": "Raven: Run Upward Lines"
+      },
+      {
+        "command": "raven.runDownwardLines",
+        "title": "Raven: Run Downward Lines"
+      },
+      {
+        "command": "raven.sourceFile",
+        "title": "Raven: Source File"
       }
     ],
+    "keybindings": [
+      {
+        "command": "raven.runLineOrSelection",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == r"
+      },
+      {
+        "command": "raven.sourceFile",
+        "key": "shift+ctrl+enter",
+        "mac": "shift+cmd+enter",
+        "when": "editorTextFocus && editorLangId == r"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "raven.sendToR",
+        "label": "Send to R",
+        "icon": "$(play)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "submenu": "raven.sendToR",
+          "when": "editorLangId == r",
+          "group": "navigation"
+        }
+      ],
+      "raven.sendToR": [
+        {
+          "command": "raven.runLineOrSelection",
+          "group": "1_run@1"
+        },
+        {
+          "command": "raven.runUpwardLines",
+          "group": "1_run@2"
+        },
+        {
+          "command": "raven.runDownwardLines",
+          "group": "1_run@3"
+        },
+        {
+          "command": "raven.sourceFile",
+          "group": "2_file@1"
+        }
+      ]
+    },
+    "terminal": {
+      "profiles": [
+        {
+          "id": "raven.rTerminal",
+          "title": "R"
+        }
+      ]
+    },
     "languages": [
       {
         "id": "r",
@@ -99,6 +172,20 @@
       "type": "object",
       "title": "Raven",
       "properties": {
+        "raven.rTerminal.program": {
+          "type": "string",
+          "enum": [
+            "R",
+            "radian"
+          ],
+          "default": "R",
+          "description": "Program to use for the R terminal. 'R' uses the standard R console, 'radian' uses the radian console (must be installed separately)."
+        },
+        "raven.sendToR.advanceCursorOnSend": {
+          "type": "boolean",
+          "default": true,
+          "description": "Advance cursor to the next line after sending a single statement to R."
+        },
         "raven.server.path": {
           "type": "string",
           "default": "",

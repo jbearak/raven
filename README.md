@@ -44,6 +44,7 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
+- **[Send to R](docs/send-to-r.md)** — Interactive R console with statement detection and radian support
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **Syntax highlighting** — JAGS and Stan (R highlighting is built into VS Code)

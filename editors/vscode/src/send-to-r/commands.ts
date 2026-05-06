@@ -1,0 +1,117 @@
+import * as vscode from 'vscode';
+import {
+    detect_r_statement,
+    get_upward_bounds,
+    get_downward_bounds,
+} from './statement-detector';
+import { get_or_create_r_terminal } from './r-terminal-manager';
+
+type SendMode = 'statement' | 'upward' | 'downward' | 'file';
+
+function get_lines(document: vscode.TextDocument): string[] {
+    const lines: string[] = [];
+    for (let i = 0; i < document.lineCount; i++) {
+        lines.push(document.lineAt(i).text);
+    }
+    return lines;
+}
+
+function advance_cursor(
+    editor: vscode.TextEditor,
+    end_line: number
+): void {
+    const config = vscode.workspace.getConfiguration('raven.sendToR');
+    if (!config.get<boolean>('advanceCursorOnSend', true)) return;
+
+    const next = end_line + 1;
+    if (next >= editor.document.lineCount) return;
+
+    const pos = new vscode.Position(next, 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos));
+}
+
+function is_radian(): boolean {
+    const config = vscode.workspace.getConfiguration('raven.rTerminal');
+    return config.get<string>('program', 'R') === 'radian';
+}
+
+function send_to_terminal(terminal: vscode.Terminal, code: string): void {
+    if (is_radian() && code.includes('\n')) {
+        // Bracketed paste mode for radian multi-line support
+        terminal.sendText(`\x1b[200~${code}\x1b[201~`, false);
+    } else {
+        terminal.sendText(code);
+    }
+}
+
+async function handle_send(mode: SendMode): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return;
+
+    const document = editor.document;
+    let code: string;
+    let statement_end_line: number | null = null;
+
+    if (mode === 'file') {
+        if (document.isDirty) {
+            await document.save();
+        }
+        const fsPath = document.uri.fsPath.replace(/\\/g, '/').replace(/"/g, '\\"');
+        code = `source("${fsPath}", echo = TRUE)`;
+    } else if (mode === 'statement') {
+        if (!editor.selection.isEmpty) {
+            code = document.getText(editor.selection);
+        } else {
+            const lines = get_lines(document);
+            const bounds = detect_r_statement(lines, editor.selection.active.line);
+            const selected: string[] = [];
+            for (let i = bounds.start_line; i <= bounds.end_line; i++) {
+                selected.push(lines[i]);
+            }
+            code = selected.join('\n');
+            statement_end_line = bounds.end_line;
+        }
+    } else if (mode === 'upward') {
+        const lines = get_lines(document);
+        const bounds = get_upward_bounds(lines, editor.selection.active.line);
+        const selected: string[] = [];
+        for (let i = bounds.start_line; i <= bounds.end_line; i++) {
+            selected.push(lines[i]);
+        }
+        code = selected.join('\n');
+    } else {
+        const lines = get_lines(document);
+        const bounds = get_downward_bounds(lines, editor.selection.active.line);
+        const selected: string[] = [];
+        for (let i = bounds.start_line; i <= bounds.end_line; i++) {
+            selected.push(lines[i]);
+        }
+        code = selected.join('\n');
+    }
+
+    const terminal = await get_or_create_r_terminal();
+    terminal.show(true);
+    send_to_terminal(terminal, code);
+
+    if (statement_end_line !== null) {
+        advance_cursor(editor, statement_end_line);
+    }
+}
+
+export function register_send_to_r_commands(
+    context: vscode.ExtensionContext
+): void {
+    const commands: Array<[string, SendMode]> = [
+        ['raven.runLineOrSelection', 'statement'],
+        ['raven.runUpwardLines', 'upward'],
+        ['raven.runDownwardLines', 'downward'],
+        ['raven.sourceFile', 'file'],
+    ];
+
+    for (const [id, mode] of commands) {
+        context.subscriptions.push(
+            vscode.commands.registerCommand(id, () => handle_send(mode))
+        );
+    }
+}
