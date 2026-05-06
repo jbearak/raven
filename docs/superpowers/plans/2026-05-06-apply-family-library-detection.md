@@ -1191,9 +1191,9 @@ In `docs/cross-file.md`, extend the "Supported Call Patterns" table (currently a
 | `sapply(paste0(...), library, character.only = TRUE)` | No (dynamic vector) |
 ```
 
-Then add a short subsection right after the table, before "Keeping Packages in Sync":
+Then add a short subsection right after the table, before "Keeping Packages in Sync" (note the outer fence uses four backticks so the inner triple-backtick `r` block doesn't close it prematurely):
 
-```markdown
+````markdown
 ### Apply-Family Loads
 
 Raven also recognises package loads expressed through apply-family calls when
@@ -1212,9 +1212,7 @@ literal vector. `character.only = TRUE` must be present (without it, R itself
 would not load the strings as packages). Dynamic constructions such as
 `paste0(...)`, `tolower(x)`, `c(libs1, libs2)`, or values defined in another
 file are silently ignored.
-```
-
-(Note: the inner code fence in the second markdown block uses the same triple-backtick depth as the other code fences in the file — re-check that it's not nested inside another fence.)
+````
 
 - [ ] **Step 2: Lint check**
 

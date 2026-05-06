@@ -533,17 +533,21 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     library_calls
 }
 
-/// Recursively traverses an AST subtree and collects statically determinable `library`/`require`/`loadNamespace` calls.
-///
-/// This function walks `node` and its descendants in document order. When a call node representing a
-/// statically resolvable package load is found, a `LibraryCall` describing that call (package and end
-/// position) is pushed into `library_calls`.
+/// Recursively traverses an AST subtree and collects statically determinable
+/// package loads — both direct `library`/`require`/`loadNamespace` calls and
+/// apply-family calls whose FUN is `library`/`require`. Direct calls push at
+/// most one `LibraryCall`; apply calls may push one entry per package, all
+/// sharing the apply call's end position.
 ///
 /// # Parameters
 ///
 /// - `node`: the current AST node to visit (will recurse into its children).
 /// - `content`: source text for extracting node-local values when parsing calls.
-/// - `library_calls`: mutable collector that receives discovered `LibraryCall` entries in document order.
+/// - `var_lookup`: name→binding map (built once via [`collect_var_bindings`])
+///   used by apply detection to resolve same-file variable references like
+///   `libs <- c(...); sapply(libs, library, character.only = TRUE)`.
+/// - `library_calls`: mutable collector that receives discovered `LibraryCall`
+///   entries in document order.
 ///
 /// # Examples
 ///
@@ -552,7 +556,8 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 /// ```text
 /// let mut library_calls = Vec::new();
 /// let root = tree.root_node();
-/// visit_node_for_library(root, source_text, &mut library_calls);
+/// let var_lookup = collect_var_bindings(root, source_text);
+/// visit_node_for_library(root, source_text, &var_lookup, &mut library_calls);
 /// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
 /// ```
 fn visit_node_for_library(
