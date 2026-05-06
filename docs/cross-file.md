@@ -104,6 +104,29 @@ Packages loaded in child files do NOT propagate back to parents (forward-only).
 | `require(pkgname)` | Yes |
 | `loadNamespace("pkgname")` | Yes |
 | `library(pkg, character.only = TRUE)` | No (dynamic) |
+| `sapply(c("a","b"), library, character.only = TRUE)` | Yes (apply family) |
+| `sapply(libs, library, character.only = TRUE)` where `libs <- c("a","b")` | Yes (same-file variable) |
+| `purrr::map(c("a","b"), library, character.only = TRUE)` | Yes (purrr family) |
+| `sapply(paste0(...), library, character.only = TRUE)` | No (dynamic vector) |
+
+### Apply-Family Loads
+
+Raven also recognizes package loads expressed through apply-family calls when
+all the package names are statically determinable:
+
+```r
+libs <- c("dplyr", "tidyr")
+sapply(libs, require, character.only = TRUE)
+```
+
+This works for `sapply`, `lapply`, `vapply`, `mapply`, and the purrr forms
+(`map`, `walk`, `map_chr`, etc., bare or `purrr::`-qualified). The package
+vector must be either an inline `c("a","b",...)` of string literals, or a
+same-file variable assigned exactly once via `<-`, `=`, or `assign()` to such
+a literal vector. `character.only = TRUE` must be present (without it, R
+itself would not load the strings as packages). Dynamic constructions such as
+`paste0(...)`, `tolower(x)`, `c(libs1, libs2)`, function-parameter origins,
+or values defined in another file are silently ignored.
 
 ### Keeping Packages in Sync
 

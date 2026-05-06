@@ -483,11 +483,21 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 // Library Call Detection
 // ============================================================================
 
-/// Detects `library()`, `require()`, and `loadNamespace()` calls that specify a static package name.
+/// Detects package loads in the file: direct `library()`/`require()`/`loadNamespace()`
+/// calls, plus apply-family calls whose FUN argument is a bare reference to
+/// `library` or `require`.
 ///
-/// This returns entries for calls where the package can be determined from a bare identifier
-/// (e.g., `library(dplyr)`) or a string literal (e.g., `library("dplyr")`). Calls that use
-/// `character.only = TRUE` or whose package argument is an expression or variable are skipped.
+/// For direct calls, the package must be a bare identifier (`library(dplyr)`)
+/// or a string literal (`library("dplyr")`); direct calls with
+/// `character.only = TRUE` or a dynamic package argument are skipped.
+///
+/// For apply-family calls (`sapply`, `lapply`, `vapply`, `mapply`, plus the
+/// bare and `purrr::`-qualified `map`/`walk`/`map_chr`/etc.), `character.only =
+/// TRUE` is *required* and the X argument must resolve statically to a vector
+/// of string literals — either an inline `c("a","b",...)` or a same-file
+/// variable assigned exactly once via `<-`, `=`, or `assign("name", c(...))`.
+/// Each apply emits one `LibraryCall` per package, all sharing the apply
+/// call's end position.
 ///
 /// # Examples
 ///
@@ -506,7 +516,8 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     log::trace!("Starting tree-sitter parsing for library() call detection");
     let mut library_calls = Vec::new();
     let root = tree.root_node();
-    visit_node_for_library(root, content, &mut library_calls);
+    let var_lookup = collect_var_bindings(root, content);
+    visit_node_for_library(root, content, &var_lookup, &mut library_calls);
     log::trace!(
         "Completed library() call detection, found {} calls",
         library_calls.len()
@@ -522,17 +533,21 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     library_calls
 }
 
-/// Recursively traverses an AST subtree and collects statically determinable `library`/`require`/`loadNamespace` calls.
-///
-/// This function walks `node` and its descendants in document order. When a call node representing a
-/// statically resolvable package load is found, a `LibraryCall` describing that call (package and end
-/// position) is pushed into `library_calls`.
+/// Recursively traverses an AST subtree and collects statically determinable
+/// package loads — both direct `library`/`require`/`loadNamespace` calls and
+/// apply-family calls whose FUN is `library`/`require`. Direct calls push at
+/// most one `LibraryCall`; apply calls may push one entry per package, all
+/// sharing the apply call's end position.
 ///
 /// # Parameters
 ///
 /// - `node`: the current AST node to visit (will recurse into its children).
 /// - `content`: source text for extracting node-local values when parsing calls.
-/// - `library_calls`: mutable collector that receives discovered `LibraryCall` entries in document order.
+/// - `var_lookup`: name→binding map (built once via [`collect_var_bindings`])
+///   used by apply detection to resolve same-file variable references like
+///   `libs <- c(...); sapply(libs, library, character.only = TRUE)`.
+/// - `library_calls`: mutable collector that receives discovered `LibraryCall`
+///   entries in document order.
 ///
 /// # Examples
 ///
@@ -541,10 +556,16 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 /// ```text
 /// let mut library_calls = Vec::new();
 /// let root = tree.root_node();
-/// visit_node_for_library(root, source_text, &mut library_calls);
+/// let var_lookup = collect_var_bindings(root, source_text);
+/// visit_node_for_library(root, source_text, &var_lookup, &mut library_calls);
 /// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
 /// ```
-fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<LibraryCall>) {
+fn visit_node_for_library(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+    library_calls: &mut Vec<LibraryCall>,
+) {
     // Skip identifier nodes - they have no children
     if node.kind() == "identifier" {
         return;
@@ -552,11 +573,15 @@ fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<Lib
     if node.kind() == "call" {
         if let Some(lib_call) = try_parse_library_call(node, content) {
             library_calls.push(lib_call);
+        } else {
+            // Not a direct library/require/loadNamespace call; try the
+            // apply-family form (sapply/map/etc. of bare library/require).
+            library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
         }
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_node_for_library(child, content, library_calls);
+        visit_node_for_library(child, content, var_lookup, library_calls);
     }
 }
 
@@ -717,6 +742,461 @@ fn extract_package_value(node: Node, content: &str) -> Option<String> {
             None
         }
     }
+}
+
+// ============================================================================
+// Apply-Family Library Detection (issue #172)
+// ============================================================================
+
+use std::collections::HashMap;
+
+/// Information collected for an identifier appearing on the LHS of any
+/// binding form (assignment operator, `assign("name", ...)` call, or function
+/// parameter) anywhere in the file. Used by apply-family detection to resolve
+/// X arguments that are variable references.
+///
+/// `assignment_count` increments for *every* binding form: `<-`, `=`, `<<-`,
+/// `->`, `->>`, `assign(...)`, and function parameters. Only `<-`, `=`, or
+/// `assign("name", ...)` whose RHS is a `c(...)` of string literals populates
+/// `static_packages`.
+#[derive(Debug, Default)]
+struct VarBinding {
+    assignment_count: u32,
+    /// `(packages, byte_offset_of_assignment_node)` from the first supported,
+    /// statically-resolved assignment.
+    static_packages: Option<(Vec<String>, usize)>,
+}
+
+impl VarBinding {
+    /// Return packages iff `count == 1`, we extracted a static c-of-strings,
+    /// and that assignment started before `before_byte`.
+    fn resolved_before(&self, before_byte: usize) -> Option<&[String]> {
+        if self.assignment_count != 1 {
+            return None;
+        }
+        let (pkgs, off) = self.static_packages.as_ref()?;
+        if *off < before_byte {
+            Some(pkgs.as_slice())
+        } else {
+            None
+        }
+    }
+}
+
+fn collect_var_bindings(root: Node, content: &str) -> HashMap<String, VarBinding> {
+    let mut map: HashMap<String, VarBinding> = HashMap::new();
+    visit_var_bindings(root, content, &mut map);
+    map
+}
+
+fn visit_var_bindings(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    match node.kind() {
+        "binary_operator" => record_binary_assignment(node, content, map),
+        "call" => record_assign_call(node, content, map),
+        "function_definition" => record_function_params(node, content, map),
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_var_bindings(child, content, map);
+    }
+}
+
+fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    let mut cursor = node.walk();
+    let named: Vec<Node> = node
+        .children(&mut cursor)
+        .filter(|c| c.is_named())
+        .collect();
+    if named.len() != 2 {
+        return;
+    }
+    let mut op_walker = node.walk();
+    let op_text = node.children(&mut op_walker).find_map(|c| {
+        let t = node_text(c, content);
+        if matches!(t, "<-" | "=" | "<<-" | "->" | "->>") {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    });
+    drop(op_walker);
+    let Some(op) = op_text else { return };
+
+    let (name_node, value_node) = match op.as_str() {
+        "<-" | "=" | "<<-" => (named[0], named[1]),
+        "->" | "->>" => (named[1], named[0]),
+        _ => return,
+    };
+    if name_node.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(name_node, content).to_string();
+    let entry = map.entry(name).or_default();
+    entry.assignment_count = entry.assignment_count.saturating_add(1);
+
+    if matches!(op.as_str(), "<-" | "=") {
+        if let Some(packages) = extract_c_strings_strict(value_node, content) {
+            if entry.static_packages.is_none() {
+                entry.static_packages = Some((packages, node.start_byte()));
+            }
+        }
+    }
+}
+
+/// Returns true if `name` is a non-empty prefix of `assign()`'s `value`
+/// formal that is *not* also a prefix of any other formal — i.e. an
+/// unambiguous partial match for `value`. Excludes the exact name "value"
+/// itself; that's handled by the exact-match pass.
+fn is_partial_prefix_of_value(name: &str) -> bool {
+    if name.is_empty() || name == "value" {
+        return false;
+    }
+    if !"value".starts_with(name) {
+        return false;
+    }
+    // assign()'s other formals: x, pos, envir, inherits, immediate.
+    // (`x` is a single character so partial-matching `x` just means name == "x".)
+    !"x".starts_with(name)
+        && !"pos".starts_with(name)
+        && !"envir".starts_with(name)
+        && !"inherits".starts_with(name)
+        && !"immediate".starts_with(name)
+}
+
+fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return;
+    };
+    if node_text(func_node, content) != "assign" {
+        return;
+    }
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    if args_node.has_error() {
+        return;
+    }
+
+    // Bucketize args. R argument matching is two passes (exact, then partial)
+    // followed by positional fill. We only track the `x` and `value` formals
+    // — other formals (`pos`/`envir`/`inherits`/`immediate`) and unknown
+    // names are ignored and don't consume positional slots.
+    let mut exact_x: Vec<Node> = Vec::new();
+    let mut exact_value: Vec<Node> = Vec::new();
+    let mut partial_to_value: Vec<Node> = Vec::new();
+    let mut positional: Vec<Node> = Vec::new();
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        let Some(value) = child.child_by_field_name("value") else {
+            continue;
+        };
+        if let Some(name_node) = child.child_by_field_name("name") {
+            let arg_name = node_text(name_node, content);
+            if arg_name == "x" {
+                exact_x.push(value);
+            } else if arg_name == "value" {
+                exact_value.push(value);
+            } else if is_partial_prefix_of_value(arg_name) {
+                partial_to_value.push(value);
+            }
+        } else {
+            positional.push(value);
+        }
+    }
+
+    // If any of the rules R uses would error — duplicate exact, multiple
+    // partials matching the same formal, or a partial colliding with an exact
+    // — the call itself errors and never assigns. Skip the call entirely so
+    // we don't record a static binding R never produced.
+    let value_collision = (exact_value.len() == 1 && !partial_to_value.is_empty())
+        || exact_value.len() > 1
+        || partial_to_value.len() > 1;
+    if exact_x.len() > 1 || value_collision {
+        return;
+    }
+
+    // Resolve x (exact > positional[0]) and value (exact > partial > next
+    // positional after x).
+    let x_value = exact_x
+        .first()
+        .copied()
+        .or_else(|| positional.first().copied());
+    let value_node = exact_value
+        .first()
+        .copied()
+        .or_else(|| partial_to_value.first().copied())
+        .or_else(|| {
+            let next_idx = if exact_x.is_empty() { 1 } else { 0 };
+            positional.get(next_idx).copied()
+        });
+
+    let Some(x_value) = x_value else { return };
+    let Some(name) = extract_string_literal(x_value, content) else {
+        return;
+    };
+
+    let entry = map.entry(name).or_default();
+    entry.assignment_count = entry.assignment_count.saturating_add(1);
+    if let Some(value_node) = value_node {
+        if let Some(packages) = extract_c_strings_strict(value_node, content) {
+            if entry.static_packages.is_none() {
+                entry.static_packages = Some((packages, node.start_byte()));
+            }
+        }
+    }
+}
+
+fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    let parameters = match node.child_by_field_name("parameters") {
+        Some(n) => n,
+        None => return,
+    };
+    let mut cursor = parameters.walk();
+    for child in parameters.children(&mut cursor) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let mut param_cursor = child.walk();
+        let Some(ident) = child
+            .children(&mut param_cursor)
+            .find(|c| c.kind() == "identifier")
+        else {
+            continue;
+        };
+        let name = node_text(ident, content).to_string();
+        let entry = map.entry(name).or_default();
+        entry.assignment_count = entry.assignment_count.saturating_add(1);
+    }
+}
+
+/// Apply-family functions whose bare-identifier form may load packages
+/// dynamically when paired with `library`/`require` and `character.only = TRUE`.
+///
+/// Restricted to functions with a clean `(X, FUN, ...)` shape (or `(FUN, ...)`
+/// for `mapply`). Excluded:
+/// - `map2`/`walk2`/`map2_*` — two parallel X vectors with FUN at position 2.
+/// - `pmap`/`pwalk` — X is a list of vectors, not a single vector.
+/// - `map_if`/`map_at` — `(X, predicate-or-selector, FUN, ...)`, FUN at position 2.
+const APPLY_BARE_NAMES: &[&str] = &[
+    "sapply",
+    "lapply",
+    "vapply",
+    "mapply",
+    "map",
+    "walk",
+    "imap",
+    "iwalk",
+    "map_chr",
+    "map_int",
+    "map_dbl",
+    "map_lgl",
+    "map_raw",
+    "map_dfr",
+    "map_dfc",
+    "map_vec",
+];
+
+/// Apply-family functions accepted under the `purrr::` namespace.
+const APPLY_PURRR_NAMES: &[&str] = &[
+    "map",
+    "walk",
+    "imap",
+    "iwalk",
+    "map_chr",
+    "map_int",
+    "map_dbl",
+    "map_lgl",
+    "map_raw",
+    "map_dfr",
+    "map_dfc",
+    "map_vec",
+];
+
+/// Return `(x_position, fun_position)` describing where in the call's
+/// positional argument list the X (vector) and FUN (mapped function) values
+/// are expected, for a supported apply-family function. Returns `None` when
+/// the function isn't one we recognise.
+///
+/// Most apply functions (`sapply`, `lapply`, `vapply`, the purrr `map`/`walk`
+/// family) take `(X, FUN, ...)`, so X is at position 0 and FUN at position 1.
+/// `mapply`'s signature is `(FUN, ...)`, so FUN is at position 0 and the
+/// first vector at position 1.
+fn apply_arg_positions(func_node: Node, content: &str) -> Option<(usize, usize)> {
+    let name = match func_node.kind() {
+        "identifier" => {
+            let n = node_text(func_node, content);
+            if !APPLY_BARE_NAMES.contains(&n) {
+                return None;
+            }
+            n
+        }
+        "namespace_operator" => {
+            let mut cursor = func_node.walk();
+            let named_children: Vec<Node> = func_node
+                .children(&mut cursor)
+                .filter(|c| c.is_named())
+                .collect();
+            if named_children.len() != 2 {
+                return None;
+            }
+            if node_text(named_children[0], content) != "purrr" {
+                return None;
+            }
+            let n = node_text(named_children[1], content);
+            if !APPLY_PURRR_NAMES.contains(&n) {
+                return None;
+            }
+            n
+        }
+        _ => return None,
+    };
+    match name {
+        "mapply" => Some((1, 0)),
+        _ => Some((0, 1)),
+    }
+}
+
+/// Strict variant of `extract_c_string_args`: returns `Some(packages)` only
+/// when `node` is `c(arg1, arg2, ...)` where every argument is a positional
+/// string literal and at least one argument is present. Returns `None` for any
+/// non-string element, named argument, or empty `c()` — anything but a fully
+/// static character vector is treated as dynamic.
+fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
+    if !is_c_call(node, content) {
+        return None;
+    }
+    let args_node = node.child_by_field_name("arguments")?;
+    if args_node.has_error() {
+        return None;
+    }
+    let mut strings = Vec::new();
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if child.child_by_field_name("name").is_some() {
+            return None;
+        }
+        let value_node = child.child_by_field_name("value")?;
+        if value_node.kind() != "string" {
+            return None;
+        }
+        let s = extract_string_literal(value_node, content)?;
+        strings.push(s);
+    }
+    if strings.is_empty() {
+        None
+    } else {
+        Some(strings)
+    }
+}
+
+/// Try to interpret `node` as an apply-family call that loads a static vector
+/// of packages — e.g. `sapply(c("dplyr","tidyr"), library, character.only = TRUE)`.
+///
+/// Returns one `LibraryCall` per package when, given the call's
+/// `(x_position, fun_position)` from [`apply_arg_positions`]:
+/// - `character.only = TRUE` (or `T`) is present,
+/// - the positional arg at `fun_position` is the bare identifier `library`
+///   or `require` (so we don't match calls like
+///   `sapply(c("dplyr"), identity, library, ...)` where library is just a
+///   `...`-passthrough),
+/// - the positional arg at `x_position` resolves to a static `Vec<String>`
+///   via inline `c(...)` or a same-file variable in `var_lookup`.
+///
+/// All emitted entries share the apply call's end position.
+fn try_parse_apply_library_call(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+) -> Vec<LibraryCall> {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let Some((x_pos, fun_pos)) = apply_arg_positions(func_node, content) else {
+        return Vec::new();
+    };
+
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    if args_node.has_error() {
+        return Vec::new();
+    }
+    if !has_character_only_true(&args_node, content) {
+        return Vec::new();
+    }
+
+    // Positional argument values, in source order. Named args (including
+    // `character.only =`, `simplify =`, `FUN =`, `X =`, etc.) are excluded
+    // here — see `test_apply_with_named_x_arg_skipped` for the limitation.
+    let mut positional_values: Vec<Node> = Vec::new();
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if child.child_by_field_name("name").is_some() {
+            continue;
+        }
+        if let Some(value) = child.child_by_field_name("value") {
+            positional_values.push(value);
+        }
+    }
+
+    // FUN must sit at the position dictated by the apply's signature and be a
+    // bare `library`/`require` identifier — not just appear *somewhere* among
+    // the positional args.
+    let Some(&fun_value) = positional_values.get(fun_pos) else {
+        return Vec::new();
+    };
+    if fun_value.kind() != "identifier" {
+        return Vec::new();
+    }
+    let fun_text = node_text(fun_value, content);
+    if fun_text != "library" && fun_text != "require" {
+        return Vec::new();
+    }
+
+    let Some(&x_value) = positional_values.get(x_pos) else {
+        return Vec::new();
+    };
+    let packages: Vec<String> = match x_value.kind() {
+        "identifier" => {
+            let text = node_text(x_value, content);
+            match var_lookup
+                .get(text)
+                .and_then(|b| b.resolved_before(node.start_byte()))
+            {
+                Some(pkgs) => pkgs.to_vec(),
+                None => return Vec::new(),
+            }
+        }
+        _ => match extract_c_strings_strict(x_value, content) {
+            Some(v) => v,
+            None => return Vec::new(),
+        },
+    };
+
+    let end = node.end_position();
+    let line_text = content.lines().nth(end.row).unwrap_or("");
+    let column = byte_offset_to_utf16_column(line_text, end.column);
+    let line = end.row as u32;
+
+    packages
+        .into_iter()
+        .map(|package| LibraryCall {
+            package,
+            line,
+            column,
+            function_scope: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1657,6 +2137,379 @@ library(ggplot2)"#;
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 1);
         assert!(lib_calls[0].function_scope.is_none());
+    }
+
+    // ==================== apply-family library detection (#172) ====================
+
+    #[test]
+    fn test_apply_inline_c_with_library() {
+        // sapply(c("dplyr","tidyr"), library, character.only = TRUE)
+        // Validates issue #172 — the "inline c()" path.
+        let code = r#"sapply(c("dplyr", "tidyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+        // Both share the apply call's end position.
+        assert_eq!(lib_calls[0].line, 0);
+        assert_eq!(lib_calls[1].line, 0);
+        assert_eq!(lib_calls[0].column, lib_calls[1].column);
+        assert!(lib_calls[0].function_scope.is_none());
+    }
+
+    #[test]
+    fn test_apply_lapply_inline_c_with_require() {
+        let code = r#"lapply(c("dplyr"), require, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 1);
+        assert_eq!(lib_calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_apply_vapply_inline_c() {
+        // vapply has extra signature args; library FUN + c() X still detects.
+        let code = r#"vapply(c("dplyr","tidyr"), require, logical(1), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_mapply_inline_c() {
+        // mapply puts FUN first; we're position-agnostic so it still matches.
+        let code = r#"mapply(library, c("dplyr","tidyr"), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_with_named_x_arg_skipped() {
+        // A c() inside a *named* arg is not picked up — only positional X args
+        // are considered. Documents the limitation.
+        let code = r#"sapply(X = c("dplyr"), FUN = require, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_purrr_bare_walk() {
+        let code = r#"walk(c("dplyr","tidyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_purrr_qualified_map() {
+        let code = r#"purrr::map(c("dplyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 1);
+        assert_eq!(lib_calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_apply_purrr_qualified_map_chr() {
+        let code = r#"purrr::map_chr(c("dplyr","tidyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_other_namespace_not_detected() {
+        // foo::map(...) is not purrr — skip.
+        let code = r#"foo::map(c("dplyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_single_arrow_assignment() {
+        // Same-file variable assigned exactly once via `<-` to a c() of strings.
+        let code =
+            "libs <- c(\"dplyr\", \"tidyr\")\nsapply(libs, require, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+        assert_eq!(lib_calls[0].line, 1);
+        assert_eq!(lib_calls[1].line, 1);
+    }
+
+    #[test]
+    fn test_apply_var_equals_assignment() {
+        let code =
+            "libs = c(\"dplyr\", \"tidyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assign_call() {
+        let code = "assign(\"libs\", c(\"dplyr\", \"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assignment_after_apply_call_skipped() {
+        // Variable assigned *after* the apply call must not resolve.
+        let code = "sapply(libs, library, character.only = TRUE)\nlibs <- c(\"dplyr\")";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_multiple_assignments_skipped() {
+        let code = "libs <- c(\"dplyr\")\nlibs <- c(\"tidyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_super_assignment_disqualifies() {
+        // <<- alone counts but doesn't extract — single-assignment but no
+        // static packages means the binding doesn't resolve.
+        let code = "libs <<- c(\"dplyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_function_param_shadow_disqualifies() {
+        // A function parameter named `libs` increments the count and
+        // disqualifies the global binding.
+        let code = "libs <- c(\"dplyr\")\nf <- function(libs) {}\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_dynamic_x_paste0_skipped() {
+        let code = r#"sapply(paste0("dp", "lyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_dynamic_x_setdiff_skipped() {
+        let code = r#"sapply(setdiff(c("a","b"), "b"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_dynamic_x_c_with_var_skipped() {
+        // c() containing a non-string argument disqualifies the X arg.
+        let code = "libs1 <- c(\"a\")\nsapply(c(libs1, \"b\"), library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_anonymous_fun_skipped() {
+        // \(x) library(x) — FUN is not a bare identifier so the apply must not
+        // pick up "dplyr". The inner `library(x)` may still be detected with
+        // package="x" by the existing direct-library detector — that's
+        // pre-existing loose behavior; we only assert the apply path didn't
+        // fire by checking that no LibraryCall mentions "dplyr".
+        let code = r#"sapply(c("dplyr"), \(x) library(x), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert!(
+            lib_calls.iter().all(|c| c.package != "dplyr"),
+            "apply path should not emit dplyr; got {:?}",
+            lib_calls
+        );
+    }
+
+    #[test]
+    fn test_apply_no_character_only_skipped() {
+        let code = r#"sapply(c("dplyr"), library)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_character_only_false_skipped() {
+        let code = r#"sapply(c("dplyr"), library, character.only = FALSE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_loadnamespace_fun_skipped() {
+        // loadNamespace is intentionally not in the FUN allowlist.
+        let code = r#"sapply(c("dplyr"), loadNamespace, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_position_at_call_end_utf16() {
+        // 🎉 is 4 UTF-8 bytes / 2 UTF-16 code units.
+        let code = "🎉; sapply(c(\"dplyr\",\"tidyr\"), library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        let total_utf16 = code.encode_utf16().count() as u32;
+        for call in &lib_calls {
+            assert_eq!(call.line, 0);
+            assert_eq!(call.column, total_utf16);
+        }
+    }
+
+    #[test]
+    fn test_apply_issue_172_exact_example() {
+        // Issue #172 — exact pattern from the report.
+        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 3);
+        assert_eq!(lib_calls[0].package, "lib1");
+        assert_eq!(lib_calls[1].package, "lib2");
+        assert_eq!(lib_calls[2].package, "lib3");
+        for call in &lib_calls {
+            assert_eq!(call.line, 1);
+        }
+    }
+
+    #[test]
+    fn test_apply_issue_172_via_extract_metadata() {
+        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
+        let meta = crate::cross_file::extract_metadata(code);
+        let pkgs: Vec<&str> = meta
+            .library_calls
+            .iter()
+            .map(|c| c.package.as_str())
+            .collect();
+        assert_eq!(pkgs, vec!["lib1", "lib2", "lib3"]);
+    }
+
+    #[test]
+    fn test_apply_library_in_extra_position_skipped() {
+        // FUN is `identity`; `library` is just an extra positional arg passed
+        // through `...` to identity, which doesn't load anything.
+        let code = r#"sapply(c("dplyr"), identity, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_library_at_x_position_skipped() {
+        // For sapply/lapply/etc., X is at position 0 and FUN at position 1.
+        // Swapping them is not a real library load.
+        let code = r#"sapply(library, c("dplyr"), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_call_named_args() {
+        // assign(x = "libs", value = c(...)) — the named-arg form should
+        // count and resolve just like the positional form.
+        let code = "assign(x = \"libs\", value = c(\"dplyr\", \"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assign_named_overrides_disqualifies() {
+        // libs is assigned twice — once via `<-`, once via named-arg assign().
+        // The named assign() must count toward the multi-assignment rule.
+        let code = "libs <- c(\"dplyr\")\nassign(x = \"libs\", value = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_map_if_library_in_predicate_slot_not_detected() {
+        // map_if has signature (.x, .p, .f) — the predicate is at position 1,
+        // not the FUN. Putting `library` in the predicate slot doesn't load
+        // anything; we should not match it. Drop map_if/map_at from the
+        // supported apply set rather than guessing positions per signature.
+        let code = r#"map_if(c("dplyr"), library, is.character, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_partial_named() {
+        // R does partial matching after exact: `val` is a unique prefix of
+        // `value` among assign()'s formals, so `val = ...` binds `value`.
+        let code = "assign(x = \"libs\", val = c(\"dplyr\", \"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assign_partial_named_overrides_disqualifies() {
+        // Same as test_apply_var_assign_named_overrides_disqualifies but the
+        // second assign uses partial-match `val` for `value`.
+        let code = "libs <- c(\"dplyr\")\nassign(x = \"libs\", val = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_exact_and_partial_value_skipped() {
+        // R does exact-name matching first, then partial. With both an exact
+        // `value = ...` and a partial `val = ...` present, R errors with
+        // "matched by multiple actual arguments" and the assignment never
+        // happens; we must not record a static binding from it.
+        let code = "assign(x = \"libs\", val = c(\"dplyr\"), value = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_duplicate_exact_value_skipped() {
+        // Same idea: two exact `value =` args also error in R.
+        let code = "assign(x = \"libs\", value = c(\"dplyr\"), value = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
     }
 }
 
