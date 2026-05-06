@@ -123,12 +123,13 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
 
 function send_via_tempfile(terminal: vscode.Terminal, code: string): void {
     const tmp = create_temp_file(code);
-    // Have R unlink the file as part of consuming it, so cleanup is tied to
-    // execution rather than a wall-clock timer. The JS fallback below only
-    // runs if R never reaches the source() line (e.g. session crashed).
+    // Have R unlink the script's per-call directory as part of consuming it,
+    // so cleanup is tied to execution rather than a wall-clock timer. The JS
+    // fallback below only runs if R never reaches the source() line (e.g.
+    // session crashed).
     const path_literal = JSON.stringify(tmp);
     terminal.sendText(
-        `local({ .raven_src <- ${path_literal}; on.exit(unlink(.raven_src)); source(.raven_src, echo = TRUE) })`
+        `local({ .raven_src <- ${path_literal}; on.exit(unlink(dirname(.raven_src), recursive = TRUE)); source(.raven_src, echo = TRUE) })`
     );
     schedule_temp_file_cleanup(tmp);
 }

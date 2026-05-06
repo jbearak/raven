@@ -22,6 +22,18 @@
     "onTerminalProfile:raven.rTerminal"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Executable-path settings are read from user/global settings only in untrusted workspaces.",
+      "restrictedConfigurations": [
+        "raven.rTerminal.program",
+        "raven.server.path",
+        "raven.packages.rPath",
+        "raven.packages.additionalLibraryPaths"
+      ]
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -222,6 +234,7 @@
             "radian"
           ],
           "default": "R",
+          "scope": "machine-overridable",
           "description": "Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately)."
         },
         "raven.sendToR.advanceCursorOnSend": {
@@ -232,6 +245,7 @@
         "raven.server.path": {
           "type": "string",
           "default": "",
+          "scope": "machine-overridable",
           "description": "Path to raven binary. If empty, uses bundled binary."
         },
         "raven.trace.server": {
@@ -505,11 +519,13 @@
             "type": "string"
           },
           "default": [],
+          "scope": "machine-overridable",
           "description": "Additional library paths to search for R packages. These paths are searched in addition to the default R library paths. Useful for projects with packages installed in non-standard locations or custom library directories."
         },
         "raven.packages.rPath": {
           "type": "string",
           "default": "",
+          "scope": "machine-overridable",
           "description": "Path to the R executable. If empty, Raven searches for R in the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation."
         },
         "raven.packages.missingPackageSeverity": {
