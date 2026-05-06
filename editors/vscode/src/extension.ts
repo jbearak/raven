@@ -300,7 +300,7 @@ function checkRExtensionConflict(context: vscode.ExtensionContext) {
     if (!rExt) return;
 
     vscode.window.showInformationMessage(
-        'Both Raven and REditorSupport (R) are installed. They share the Cmd+Enter / Ctrl+Enter keybinding for sending code to R. You may want to disable one extension\'s keybindings to avoid conflicts.',
+        'Both Raven and REditorSupport (R) are installed with the same Cmd+Enter / Ctrl+Enter keybinding. Only one will handle the shortcut, but which one depends on load order. You can control this in the Keybindings editor.',
         'Got it',
         'Don\'t show again'
     ).then(choice => {
