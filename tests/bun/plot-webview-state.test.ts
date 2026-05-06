@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { initial_state, reduce, ViewerAction } from '../../editors/vscode/src/plot/webview/state';
+import { initial_state, reduce } from '../../editors/vscode/src/plot/webview/state';
 
 describe('webview state reducer', () => {
     test('initial state is loading with no active session', () => {
