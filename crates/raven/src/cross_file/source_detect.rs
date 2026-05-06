@@ -1898,6 +1898,47 @@ library(ggplot2)"#;
         assert_eq!(lib_calls[0].column, lib_calls[1].column);
         assert!(lib_calls[0].function_scope.is_none());
     }
+
+    #[test]
+    fn test_apply_lapply_inline_c_with_require() {
+        let code = r#"lapply(c("dplyr"), require, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 1);
+        assert_eq!(lib_calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_apply_vapply_inline_c() {
+        // vapply has extra signature args; library FUN + c() X still detects.
+        let code = r#"vapply(c("dplyr","tidyr"), require, logical(1), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_mapply_inline_c() {
+        // mapply puts FUN first; we're position-agnostic so it still matches.
+        let code = r#"mapply(library, c("dplyr","tidyr"), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_with_named_x_arg_skipped() {
+        // A c() inside a *named* arg is not picked up — only positional X args
+        // are considered. Documents the limitation.
+        let code = r#"sapply(X = c("dplyr"), FUN = require, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
 }
 
 // ============================================================================
