@@ -839,6 +839,37 @@ fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String,
     }
 }
 
+/// Formals of `assign()` other than `x` and `value`. Used to filter partial
+/// matches so we don't accept ambiguous prefixes.
+const ASSIGN_OTHER_FORMALS: &[&str] = &["pos", "envir", "inherits", "immediate"];
+
+/// Decide which `assign()` formal a named arg binds, emulating R's matching:
+/// exact match first, then unique partial-prefix match. Returns `Some("x")`
+/// or `Some("value")` for the names we care about, `None` otherwise (the
+/// other formals or an ambiguous prefix).
+fn match_assign_formal(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return None;
+    }
+    if name == "x" {
+        return Some("x");
+    }
+    if name == "value" {
+        return Some("value");
+    }
+    // Partial: accept iff `name` is a prefix of exactly one formal we track.
+    let prefix_of_value = "value".starts_with(name);
+    let prefix_of_other =
+        ASSIGN_OTHER_FORMALS.iter().any(|f| f.starts_with(name)) || "x".starts_with(name);
+    match (prefix_of_value, prefix_of_other) {
+        (true, false) => Some("value"),
+        // `x` is a single character so partial-matching it means name == "x",
+        // which we handled above. Anything else is either ambiguous or
+        // matches an unrelated formal — ignore.
+        _ => None,
+    }
+}
+
 fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
@@ -853,11 +884,12 @@ fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBi
         return;
     }
 
-    // R argument matching: exact-named args bind first, then any remaining
-    // positional args fill `assign(x, value, ...)` in declaration order.
-    // We only care about `x` (the name) and `value` (the assigned expression);
-    // other params (`pos`, `envir`, `inherits`, `immediate`) are ignored but
-    // do not consume positional slots.
+    // R argument matching: exact-named args bind first, then unambiguous
+    // partial matches, then any remaining positional args fill the unbound
+    // formals (`x`, `value`) in declaration order. We only care about `x`
+    // (the name) and `value` (the assigned expression); other formals
+    // (`pos`/`envir`/`inherits`/`immediate`) and unrecognised names don't
+    // consume positional slots.
     let mut named_x: Option<Node> = None;
     let mut named_value: Option<Node> = None;
     let mut positional: Vec<Node> = Vec::new();
@@ -870,9 +902,10 @@ fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBi
             continue;
         };
         if let Some(name_node) = child.child_by_field_name("name") {
-            match node_text(name_node, content) {
-                "x" => named_x = Some(value),
-                "value" => named_value = Some(value),
+            let arg_name = node_text(name_node, content);
+            match match_assign_formal(arg_name) {
+                Some("x") if named_x.is_none() => named_x = Some(value),
+                Some("value") if named_value.is_none() => named_value = Some(value),
                 _ => {}
             }
         } else {
@@ -927,9 +960,10 @@ fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, V
 /// dynamically when paired with `library`/`require` and `character.only = TRUE`.
 ///
 /// Restricted to functions with a clean `(X, FUN, ...)` shape (or `(FUN, ...)`
-/// for `mapply`). `map2`/`walk2`/`pmap`/`pwalk` and their typed variants are
-/// excluded because their X argument is a list of vectors or two parallel
-/// vectors, which doesn't match the simple static-vector model.
+/// for `mapply`). Excluded:
+/// - `map2`/`walk2`/`map2_*` — two parallel X vectors with FUN at position 2.
+/// - `pmap`/`pwalk` — X is a list of vectors, not a single vector.
+/// - `map_if`/`map_at` — `(X, predicate-or-selector, FUN, ...)`, FUN at position 2.
 const APPLY_BARE_NAMES: &[&str] = &[
     "sapply",
     "lapply",
@@ -947,8 +981,6 @@ const APPLY_BARE_NAMES: &[&str] = &[
     "map_dfr",
     "map_dfc",
     "map_vec",
-    "map_if",
-    "map_at",
 ];
 
 /// Apply-family functions accepted under the `purrr::` namespace.
@@ -965,8 +997,6 @@ const APPLY_PURRR_NAMES: &[&str] = &[
     "map_dfr",
     "map_dfc",
     "map_vec",
-    "map_if",
-    "map_at",
 ];
 
 /// Return `(x_position, fun_position)` describing where in the call's
@@ -2405,6 +2435,40 @@ library(ggplot2)"#;
         // libs is assigned twice — once via `<-`, once via named-arg assign().
         // The named assign() must count toward the multi-assignment rule.
         let code = "libs <- c(\"dplyr\")\nassign(x = \"libs\", value = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_map_if_library_in_predicate_slot_not_detected() {
+        // map_if has signature (.x, .p, .f) — the predicate is at position 1,
+        // not the FUN. Putting `library` in the predicate slot doesn't load
+        // anything; we should not match it. Drop map_if/map_at from the
+        // supported apply set rather than guessing positions per signature.
+        let code = r#"map_if(c("dplyr"), library, is.character, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_partial_named() {
+        // R does partial matching after exact: `val` is a unique prefix of
+        // `value` among assign()'s formals, so `val = ...` binds `value`.
+        let code = "assign(x = \"libs\", val = c(\"dplyr\", \"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assign_partial_named_overrides_disqualifies() {
+        // Same as test_apply_var_assign_named_overrides_disqualifies but the
+        // second assign uses partial-match `val` for `value`.
+        let code = "libs <- c(\"dplyr\")\nassign(x = \"libs\", val = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
