@@ -506,7 +506,8 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     log::trace!("Starting tree-sitter parsing for library() call detection");
     let mut library_calls = Vec::new();
     let root = tree.root_node();
-    visit_node_for_library(root, content, &mut library_calls);
+    let var_lookup = collect_var_bindings(root, content);
+    visit_node_for_library(root, content, &var_lookup, &mut library_calls);
     log::trace!(
         "Completed library() call detection, found {} calls",
         library_calls.len()
@@ -544,7 +545,12 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 /// visit_node_for_library(root, source_text, &mut library_calls);
 /// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
 /// ```
-fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<LibraryCall>) {
+fn visit_node_for_library(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+    library_calls: &mut Vec<LibraryCall>,
+) {
     // Skip identifier nodes - they have no children
     if node.kind() == "identifier" {
         return;
@@ -555,12 +561,12 @@ fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<Lib
         } else {
             // Not a direct library/require/loadNamespace call; try the
             // apply-family form (sapply/map/etc. of bare library/require).
-            library_calls.extend(try_parse_apply_library_call(node, content));
+            library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
         }
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_node_for_library(child, content, library_calls);
+        visit_node_for_library(child, content, var_lookup, library_calls);
     }
 }
 
@@ -727,6 +733,169 @@ fn extract_package_value(node: Node, content: &str) -> Option<String> {
 // Apply-Family Library Detection (issue #172)
 // ============================================================================
 
+use std::collections::HashMap;
+
+/// Information collected for an identifier appearing on the LHS of any
+/// binding form (assignment operator, `assign("name", ...)` call, or function
+/// parameter) anywhere in the file. Used by apply-family detection to resolve
+/// X arguments that are variable references.
+///
+/// `assignment_count` increments for *every* binding form: `<-`, `=`, `<<-`,
+/// `->`, `->>`, `assign(...)`, and function parameters. Only `<-`, `=`, or
+/// `assign("name", ...)` whose RHS is a `c(...)` of string literals populates
+/// `static_packages`.
+#[derive(Debug, Default)]
+struct VarBinding {
+    assignment_count: u32,
+    /// `(packages, byte_offset_of_assignment_node)` from the first supported,
+    /// statically-resolved assignment.
+    static_packages: Option<(Vec<String>, usize)>,
+}
+
+impl VarBinding {
+    /// Return packages iff `count == 1`, we extracted a static c-of-strings,
+    /// and that assignment started before `before_byte`.
+    fn resolved_before(&self, before_byte: usize) -> Option<&[String]> {
+        if self.assignment_count != 1 {
+            return None;
+        }
+        let (pkgs, off) = self.static_packages.as_ref()?;
+        if *off < before_byte {
+            Some(pkgs.as_slice())
+        } else {
+            None
+        }
+    }
+}
+
+fn collect_var_bindings(root: Node, content: &str) -> HashMap<String, VarBinding> {
+    let mut map: HashMap<String, VarBinding> = HashMap::new();
+    visit_var_bindings(root, content, &mut map);
+    map
+}
+
+fn visit_var_bindings(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    match node.kind() {
+        "binary_operator" => record_binary_assignment(node, content, map),
+        "call" => record_assign_call(node, content, map),
+        "function_definition" => record_function_params(node, content, map),
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_var_bindings(child, content, map);
+    }
+}
+
+fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    let mut cursor = node.walk();
+    let named: Vec<Node> = node
+        .children(&mut cursor)
+        .filter(|c| c.is_named())
+        .collect();
+    if named.len() != 2 {
+        return;
+    }
+    let mut op_walker = node.walk();
+    let op_text = node.children(&mut op_walker).find_map(|c| {
+        let t = node_text(c, content);
+        if matches!(t, "<-" | "=" | "<<-" | "->" | "->>") {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    });
+    drop(op_walker);
+    let Some(op) = op_text else { return };
+
+    let (name_node, value_node) = match op.as_str() {
+        "<-" | "=" | "<<-" => (named[0], named[1]),
+        "->" | "->>" => (named[1], named[0]),
+        _ => return,
+    };
+    if name_node.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(name_node, content).to_string();
+    let entry = map.entry(name).or_default();
+    entry.assignment_count = entry.assignment_count.saturating_add(1);
+
+    if matches!(op.as_str(), "<-" | "=") {
+        if let Some(packages) = extract_c_strings_strict(value_node, content) {
+            if entry.static_packages.is_none() {
+                entry.static_packages = Some((packages, node.start_byte()));
+            }
+        }
+    }
+}
+
+fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    let func_node = match node.child_by_field_name("function") {
+        Some(n) => n,
+        None => return,
+    };
+    if node_text(func_node, content) != "assign" {
+        return;
+    }
+    let args_node = match node.child_by_field_name("arguments") {
+        Some(n) => n,
+        None => return,
+    };
+    if args_node.has_error() {
+        return;
+    }
+    let mut cursor = args_node.walk();
+    let positional: Vec<Node> = args_node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "argument" && c.child_by_field_name("name").is_none())
+        .collect();
+    if positional.len() < 2 {
+        return;
+    }
+    let name_value = match positional[0].child_by_field_name("value") {
+        Some(n) => n,
+        None => return,
+    };
+    let name = match extract_string_literal(name_value, content) {
+        Some(s) => s,
+        None => return,
+    };
+    let value_node = match positional[1].child_by_field_name("value") {
+        Some(n) => n,
+        None => return,
+    };
+    let entry = map.entry(name).or_default();
+    entry.assignment_count = entry.assignment_count.saturating_add(1);
+    if let Some(packages) = extract_c_strings_strict(value_node, content) {
+        if entry.static_packages.is_none() {
+            entry.static_packages = Some((packages, node.start_byte()));
+        }
+    }
+}
+
+fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
+    let parameters = match node.child_by_field_name("parameters") {
+        Some(n) => n,
+        None => return,
+    };
+    let mut cursor = parameters.walk();
+    for child in parameters.children(&mut cursor) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let mut param_cursor = child.walk();
+        let Some(ident) = child
+            .children(&mut param_cursor)
+            .find(|c| c.kind() == "identifier")
+        else {
+            continue;
+        };
+        let name = node_text(ident, content).to_string();
+        let entry = map.entry(name).or_default();
+        entry.assignment_count = entry.assignment_count.saturating_add(1);
+    }
+}
+
 /// Apply-family functions whose bare-identifier form may load packages
 /// dynamically when paired with `library`/`require` and `character.only = TRUE`.
 const APPLY_BARE_NAMES: &[&str] = &[
@@ -863,7 +1032,11 @@ fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
 ///
 /// All emitted entries share the apply call's end position. Returns an empty
 /// vec for every other case (the caller continues recursion into children).
-fn try_parse_apply_library_call(node: Node, content: &str) -> Vec<LibraryCall> {
+fn try_parse_apply_library_call(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+) -> Vec<LibraryCall> {
     let func_node = match node.child_by_field_name("function") {
         Some(n) => n,
         None => return Vec::new(),
@@ -884,6 +1057,7 @@ fn try_parse_apply_library_call(node: Node, content: &str) -> Vec<LibraryCall> {
         return Vec::new();
     }
 
+    let call_start = node.start_byte();
     let mut has_library_fun = false;
     let mut packages: Option<Vec<String>> = None;
     let mut ambiguous = false;
@@ -904,6 +1078,15 @@ fn try_parse_apply_library_call(node: Node, content: &str) -> Vec<LibraryCall> {
             let text = node_text(value_node, content);
             if text == "library" || text == "require" {
                 has_library_fun = true;
+                continue;
+            }
+            if let Some(binding) = var_lookup.get(text) {
+                if let Some(pkgs) = binding.resolved_before(call_start) {
+                    if packages.is_some() {
+                        ambiguous = true;
+                    }
+                    packages = Some(pkgs.to_vec());
+                }
             }
             continue;
         }
@@ -1975,6 +2158,21 @@ library(ggplot2)"#;
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
     }
+
+    #[test]
+    fn test_apply_var_single_arrow_assignment() {
+        // Same-file variable assigned exactly once via `<-` to a c() of strings.
+        let code =
+            "libs <- c(\"dplyr\", \"tidyr\")\nsapply(libs, require, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+        assert_eq!(lib_calls[0].line, 1);
+        assert_eq!(lib_calls[1].line, 1);
+    }
+
 }
 
 // ============================================================================
