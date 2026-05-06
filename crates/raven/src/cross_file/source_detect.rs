@@ -2297,6 +2297,47 @@ library(ggplot2)"#;
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
     }
+
+    #[test]
+    fn test_apply_position_at_call_end_utf16() {
+        // 🎉 is 4 UTF-8 bytes / 2 UTF-16 code units.
+        let code = "🎉; sapply(c(\"dplyr\",\"tidyr\"), library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        let total_utf16 = code.encode_utf16().count() as u32;
+        for call in &lib_calls {
+            assert_eq!(call.line, 0);
+            assert_eq!(call.column, total_utf16);
+        }
+    }
+
+    #[test]
+    fn test_apply_issue_172_exact_example() {
+        // Issue #172 — exact pattern from the report.
+        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 3);
+        assert_eq!(lib_calls[0].package, "lib1");
+        assert_eq!(lib_calls[1].package, "lib2");
+        assert_eq!(lib_calls[2].package, "lib3");
+        for call in &lib_calls {
+            assert_eq!(call.line, 1);
+        }
+    }
+
+    #[test]
+    fn test_apply_issue_172_via_extract_metadata() {
+        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
+        let meta = crate::cross_file::extract_metadata(code);
+        let pkgs: Vec<&str> = meta
+            .library_calls
+            .iter()
+            .map(|c| c.package.as_str())
+            .collect();
+        assert_eq!(pkgs, vec!["lib1", "lib2", "lib3"]);
+    }
 }
 
 // ============================================================================
