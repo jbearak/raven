@@ -30,12 +30,12 @@ export type WebviewToExtensionMessage =
     | { type: 'request-open-externally'; payload: { plotId: string } }
     | { type: 'report-error'; payload: { message: string } };
 
-const EXTENSION_TO_WEBVIEW_TYPES = new Set<string>([
+const EXTENSION_TO_WEBVIEW_TYPES = new Set<ExtensionToWebviewMessage['type']>([
     'state-update',
     'theme-changed',
 ]);
 
-const WEBVIEW_TO_EXTENSION_TYPES = new Set<string>([
+const WEBVIEW_TO_EXTENSION_TYPES = new Set<WebviewToExtensionMessage['type']>([
     'webview-ready',
     'request-save-plot',
     'request-open-externally',
@@ -45,11 +45,11 @@ const WEBVIEW_TO_EXTENSION_TYPES = new Set<string>([
 export function isExtensionToWebviewMessage(value: unknown): value is ExtensionToWebviewMessage {
     if (!value || typeof value !== 'object') return false;
     const t = (value as { type?: unknown }).type;
-    return typeof t === 'string' && EXTENSION_TO_WEBVIEW_TYPES.has(t);
+    return typeof t === 'string' && EXTENSION_TO_WEBVIEW_TYPES.has(t as ExtensionToWebviewMessage['type']);
 }
 
 export function isWebviewToExtensionMessage(value: unknown): value is WebviewToExtensionMessage {
     if (!value || typeof value !== 'object') return false;
     const t = (value as { type?: unknown }).type;
-    return typeof t === 'string' && WEBVIEW_TO_EXTENSION_TYPES.has(t);
+    return typeof t === 'string' && WEBVIEW_TO_EXTENSION_TYPES.has(t as WebviewToExtensionMessage['type']);
 }

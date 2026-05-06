@@ -63,4 +63,20 @@ describe('plot messages', () => {
     test('rejects unknown webview-to-extension type', () => {
         expect(isWebviewToExtensionMessage({ type: 'bogus', payload: {} })).toBe(false);
     });
+
+    test('rejects null', () => {
+        expect(isExtensionToWebviewMessage(null)).toBe(false);
+        expect(isWebviewToExtensionMessage(null)).toBe(false);
+    });
+
+    test('rejects non-object primitives', () => {
+        expect(isExtensionToWebviewMessage(42)).toBe(false);
+        expect(isExtensionToWebviewMessage('webview-ready')).toBe(false);
+        expect(isWebviewToExtensionMessage(undefined)).toBe(false);
+    });
+
+    test('rejects objects with non-string type', () => {
+        expect(isExtensionToWebviewMessage({ type: 42, payload: {} })).toBe(false);
+        expect(isWebviewToExtensionMessage({ type: null, payload: {} })).toBe(false);
+    });
 });
