@@ -1,22 +1,23 @@
 # Send to R
 
-The extension provides an interactive R console and commands to send R code directly from the editor to R for execution. It supports both the standard R console and [radian](https://github.com/randy3k/radian) (a modern R console with syntax highlighting, multiline editing, and full mouse support).
+The extension provides an interactive R console and commands to send R code directly from the editor to R for execution. It supports the standard R console as well as [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) — modern third-party R consoles with syntax highlighting and richer interactive features.
 
 ## R Terminal Profile
 
 The extension registers an "R" terminal profile in VS Code's terminal dropdown. You can open an R terminal manually from the terminal profile picker at any time.
 
-### Choosing Between R and radian
+### Choosing the R program
 
 The `raven.rTerminal.program` setting controls which program is launched:
 
 | Value | Description |
 |-------|-------------|
 | **R** (default) | Standard R console |
-| **radian** | Modern R console with syntax highlighting, multiline editing, and mouse support |
+| **arf** | Rust-based R console with syntax highlighting, fuzzy history search (`Ctrl+R`), interactive help, and rig integration |
+| **radian** | Python-based R console with syntax highlighting, multiline editing, and mouse support |
 
 > [!TIP]
-> [radian](https://github.com/randy3k/radian) provides a significantly better interactive experience: syntax highlighting, multiline editing, tab completion with a popup menu, and full mouse support (click to position cursor, scroll through history). Install it with `pip install radian`.
+> Both `arf` and `radian` provide a significantly better interactive experience than the standard R console. `radian` is no longer under active development, and its author [recommends](https://github.com/randy3k/radian) `arf` as the successor — new users should pick `arf`. Install arf via the [shell installer](https://github.com/eitsupi/arf#shell-installer-linuxmacos), or install radian with `pip install radian`.
 
 The selected program must be available on your PATH.
 
@@ -86,5 +87,5 @@ By default, the cursor advances to the next line after sending a single statemen
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"` or `"radian"` |
+| `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"`, `"arf"`, or `"radian"` |
 | `raven.sendToR.advanceCursorOnSend` | boolean | `true` | Advance cursor to next line after sending a single statement |
