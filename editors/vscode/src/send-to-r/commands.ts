@@ -37,15 +37,6 @@ function is_radian(): boolean {
     return config.get<string>('program', 'R') === 'radian';
 }
 
-function send_to_terminal(terminal: vscode.Terminal, code: string): void {
-    if (is_radian() && code.includes('\n')) {
-        // Bracketed paste mode for radian multi-line support
-        terminal.sendText(`\x1b[200~${code}\x1b[201~`, false);
-    } else {
-        terminal.sendText(code);
-    }
-}
-
 async function handle_send(mode: SendMode): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
@@ -93,7 +84,12 @@ async function handle_send(mode: SendMode): Promise<void> {
 
     const terminal = await get_or_create_r_terminal();
     terminal.show(true);
-    send_to_terminal(terminal, code);
+
+    if (code.includes('\n')) {
+        send_via_tempfile(terminal, code);
+    } else {
+        terminal.sendText(code);
+    }
 
     if (statement_end_line !== null) {
         advance_cursor(editor, statement_end_line);
