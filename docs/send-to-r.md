@@ -41,7 +41,12 @@ The selected program must be available on your PATH.
 
 ## Editor Toolbar
 
-A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands.
+A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands. The menu is organized into two sections:
+
+- **Main commands** — Send code to the managed R (Raven) terminal. If no R terminal is open, one is created automatically.
+- **Terminal submenu** — Send code to whatever terminal is currently active in VS Code, regardless of type. This is useful for sending commands to R running inside `tmux`, a Docker container, or any other terminal session that isn't the extension's built-in R terminal.
+
+The Terminal submenu uses a temporary file and `source()` to send code, which avoids issues with large pastes over SSH or slow connections.
 
 ## Statement Detection
 

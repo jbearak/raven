@@ -47,6 +47,22 @@
       {
         "command": "raven.sourceFile",
         "title": "Raven: Source File"
+      },
+      {
+        "command": "raven.terminal.runLineOrSelection",
+        "title": "Raven: Terminal - Run Line or Selection"
+      },
+      {
+        "command": "raven.terminal.runUpwardLines",
+        "title": "Raven: Terminal - Run Upward Lines"
+      },
+      {
+        "command": "raven.terminal.runDownwardLines",
+        "title": "Raven: Terminal - Run Downward Lines"
+      },
+      {
+        "command": "raven.terminal.sourceFile",
+        "title": "Raven: Terminal - Source File"
       }
     ],
     "keybindings": [
@@ -68,6 +84,10 @@
         "id": "raven.sendToR",
         "label": "Send to R",
         "icon": "$(play)"
+      },
+      {
+        "id": "raven.sendToR.terminal",
+        "label": "Terminal"
       }
     ],
     "menus": {
@@ -93,6 +113,28 @@
         },
         {
           "command": "raven.sourceFile",
+          "group": "2_file@1"
+        },
+        {
+          "submenu": "raven.sendToR.terminal",
+          "group": "3_terminal"
+        }
+      ],
+      "raven.sendToR.terminal": [
+        {
+          "command": "raven.terminal.runLineOrSelection",
+          "group": "1_run@1"
+        },
+        {
+          "command": "raven.terminal.runUpwardLines",
+          "group": "1_run@2"
+        },
+        {
+          "command": "raven.terminal.runDownwardLines",
+          "group": "1_run@3"
+        },
+        {
+          "command": "raven.terminal.sourceFile",
           "group": "2_file@1"
         }
       ]
