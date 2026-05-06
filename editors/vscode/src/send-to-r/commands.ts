@@ -35,13 +35,15 @@ function advance_cursor(
 async function compute_send_payload(
     editor: vscode.TextEditor,
     mode: SendMode,
-): Promise<{ code: string; advance_to_line: number | null }> {
+): Promise<{ code: string; advance_to_line: number | null } | null> {
     const document = editor.document;
 
     if (mode === 'file') {
-        if (document.isDirty) {
-            await document.save();
+        if (document.isUntitled || document.isDirty) {
+            const saved = await document.save();
+            if (!saved) return null;
         }
+        if (document.isUntitled) return null;
         return {
             code: `source(${JSON.stringify(document.uri.fsPath)}, echo = TRUE)`,
             advance_to_line: null,
@@ -74,7 +76,9 @@ async function handle_send(mode: SendMode): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
 
-    const { code, advance_to_line } = await compute_send_payload(editor, mode);
+    const payload = await compute_send_payload(editor, mode);
+    if (!payload) return;
+    const { code, advance_to_line } = payload;
 
     const terminal = await get_or_create_r_terminal();
     terminal.show(true);
@@ -100,15 +104,17 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
         return;
     }
 
-    const { code, advance_to_line } = await compute_send_payload(editor, mode);
+    const payload = await compute_send_payload(editor, mode);
+    if (!payload) return;
+    const { code, advance_to_line } = payload;
+
+    terminal.show(true);
 
     if (mode === 'file') {
         terminal.sendText(code);
     } else {
         send_via_tempfile(terminal, code);
     }
-
-    terminal.show(true);
 
     if (advance_to_line !== null) {
         advance_cursor(editor, advance_to_line);
