@@ -33,9 +33,15 @@ describe('POST /session-ready', () => {
             httpgdToken: 'plot-tok',
             ended: false,
         });
-        expect(events).toContainEqual(
-            expect.objectContaining({ type: 'session-ready' })
-        );
+        expect(events).toContainEqual({
+            type: 'session-ready',
+            session: {
+                sessionId: 'sid-1',
+                httpgdBaseUrl: 'http://127.0.0.1:7777',
+                httpgdToken: 'plot-tok',
+                ended: false,
+            },
+        });
     });
 
     test('rejects malformed body with 400', async () => {
@@ -60,5 +66,18 @@ describe('POST /session-ready', () => {
             body: JSON.stringify({ httpgdHost: '127.0.0.1', httpgdPort: 1, httpgdToken: 't' }),
         });
         expect(r.status).toBe(400);
+    });
+
+    test('rejects oversized body with 413', async () => {
+        const huge = JSON.stringify({ sessionId: 'x', pad: 'a'.repeat(70_000) });
+        const r = await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-raven-session-token': server.token,
+            },
+            body: huge,
+        });
+        expect(r.status).toBe(413);
     });
 });

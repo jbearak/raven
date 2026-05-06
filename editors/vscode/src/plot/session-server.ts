@@ -1,6 +1,8 @@
 import * as crypto from 'crypto';
 import * as http from 'http';
 
+const MAX_BODY_BYTES = 64 * 1024;
+
 export type SessionInfo = {
     sessionId: string;
     httpgdBaseUrl: string;
@@ -102,16 +104,31 @@ export class PlotSessionServer {
         cb: (body: unknown) => void,
     ): void {
         const chunks: Buffer[] = [];
-        req.on('data', c => chunks.push(Buffer.from(c)));
+        let total = 0;
+        let aborted = false;
+        req.on('data', c => {
+            if (aborted) return;
+            total += c.length;
+            if (total > MAX_BODY_BYTES) {
+                aborted = true;
+                if (!res.headersSent) res.writeHead(413).end();
+                req.destroy();
+                return;
+            }
+            chunks.push(Buffer.from(c));
+        });
         req.on('end', () => {
+            if (aborted) return;
             try {
                 const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
                 cb(parsed);
             } catch {
-                res.writeHead(400).end();
+                if (!res.headersSent) res.writeHead(400).end();
             }
         });
-        req.on('error', () => res.writeHead(400).end());
+        req.on('error', () => {
+            if (!res.headersSent) res.writeHead(400).end();
+        });
     }
 
     private handle_session_ready(body: unknown, res: http.ServerResponse): void {
