@@ -48,14 +48,18 @@ export function register_r_terminal(
 ): void {
     const provider: vscode.TerminalProfileProvider = {
         async provideTerminalProfile(
-            _token: vscode.CancellationToken
+            token: vscode.CancellationToken
         ): Promise<vscode.TerminalProfile> {
-            pending_profile_creation_count++;
-            return new vscode.TerminalProfile({
+            if (token.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
+            const profile = new vscode.TerminalProfile({
                 name: TERMINAL_NAME,
                 shellPath: get_program(),
                 shellArgs: ['--no-save', '--no-restore'],
             });
+            pending_profile_creation_count++;
+            return profile;
         }
     };
 
@@ -66,7 +70,10 @@ export function register_r_terminal(
         vscode.window.onDidChangeActiveTerminal(handle_active_terminal_changed),
         vscode.workspace.onDidChangeConfiguration(event => {
             if (event.affectsConfiguration('raven.rTerminal.program')) {
-                // Clear tracked terminal so next send creates one with the new program
+                // Untrack existing terminals so the next send spawns one with the
+                // new program. Terminals are left alive so the user can finish
+                // whatever they were doing in them.
+                profile_terminals.clear();
                 last_active_terminal = null;
             }
         }),
