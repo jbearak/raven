@@ -137,7 +137,6 @@ local({
         httpgd::hgd(host = "127.0.0.1", port = 0, token = TRUE, silent = TRUE)
     }, error = function(e) {
         .raven_log(paste0("could not start httpgd: ", conditionMessage(e)))
-        return(invisible(NULL))
     })
 
     .raven_details <- tryCatch(httpgd::hgd_details(), error = function(e) NULL)
@@ -161,25 +160,36 @@ local({
         "}"
     ))
 
-    # 5. addTaskCallback to push plot-available on hgd_state changes.
+    # 5. addTaskCallback to push plot-available on state changes.
+    #    The hgd state function was removed in httpgd 2.0; query the /state
+    #    HTTP endpoint via httpgd::hgd_url(endpoint = "state") instead.
     .raven_state <- list(hsize = -1L, upid = -1L)
     addTaskCallback(function(...) {
         tryCatch({
-            s <- httpgd::hgd_state()
-            hsize <- as.integer(s$hsize)
-            upid <- as.integer(s$upid)
-            if (!is.null(hsize) && !is.null(upid) &&
-                (hsize != .raven_state$hsize || upid != .raven_state$upid)) {
-                .raven_state$hsize <<- hsize
-                .raven_state$upid <<- upid
-                if (hsize > 0L) {
-                    .raven_post("/plot-available", paste0(
-                        "{",
-                        "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
-                        "\\"hsize\\":", hsize, ",",
-                        "\\"upid\\":", upid,
-                        "}"
-                    ))
+            state_url <- httpgd::hgd_url(endpoint = "state")
+            body <- tryCatch({
+                con <- url(state_url, open = "r")
+                on.exit(close(con), add = TRUE)
+                paste(readLines(con, warn = FALSE), collapse = "")
+            }, error = function(e) "")
+            hsize_match <- regmatches(body, regexpr('"hsize"\\\\s*:\\\\s*-?\\\\d+', body))
+            upid_match  <- regmatches(body, regexpr('"upid"\\\\s*:\\\\s*-?\\\\d+',  body))
+            if (length(hsize_match) == 1L && length(upid_match) == 1L) {
+                hsize <- as.integer(sub('.*:\\\\s*', '', hsize_match))
+                upid  <- as.integer(sub('.*:\\\\s*', '', upid_match))
+                if (!is.na(hsize) && !is.na(upid) &&
+                    (hsize != .raven_state$hsize || upid != .raven_state$upid)) {
+                    .raven_state$hsize <<- hsize
+                    .raven_state$upid  <<- upid
+                    if (hsize > 0L) {
+                        .raven_post("/plot-available", paste0(
+                            "{",
+                            "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+                            "\\"hsize\\":", hsize, ",",
+                            "\\"upid\\":", upid,
+                            "}"
+                        ))
+                    }
                 }
             }
         }, error = function(e) {

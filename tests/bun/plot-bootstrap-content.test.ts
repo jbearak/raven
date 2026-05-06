@@ -34,6 +34,12 @@ describe('generate_profile_source', () => {
     test('installs an addTaskCallback that POSTs plot-available', () => {
         expect(src).toMatch(/addTaskCallback/);
         expect(src).toMatch(/plot-available/);
+        expect(src).toMatch(/httpgd::hgd_url\(endpoint = "state"\)/);
+    });
+
+    test('uses httpgd::hgd_url for state polling (not hgd_state which was removed in httpgd 2.0)', () => {
+        expect(src).toMatch(/httpgd::hgd_url\(endpoint = "state"\)/);
+        expect(src).not.toMatch(/hgd_state/);
     });
 
     test('POSTs session-ready', () => {
