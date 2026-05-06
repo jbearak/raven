@@ -5683,10 +5683,15 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     if node.is_error() {
+        let message = if has_unclosed_quote_child(node) {
+            "Unclosed string literal".to_string()
+        } else {
+            "Syntax error".to_string()
+        };
         diagnostics.push(Diagnostic {
             range: minimize_error_range(node, text),
             severity: Some(DiagnosticSeverity::ERROR),
-            message: "Syntax error".to_string(),
+            message,
             ..Default::default()
         });
         // Don't recurse into ERROR children — the minimized range already
@@ -5699,13 +5704,18 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
         let row = node.start_position().row as u32;
         let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
         let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+        let message = if is_string_quote_kind(node.kind()) {
+            "Unclosed string literal".to_string()
+        } else {
+            format!("Missing {}", node.kind())
+        };
         diagnostics.push(Diagnostic {
             range: Range {
                 start: Position::new(row, col),
                 end: Position::new(row, col.saturating_add(1)),
             },
             severity: Some(DiagnosticSeverity::ERROR),
-            message: format!("Missing {}", node.kind()),
+            message,
             ..Default::default()
         });
     }
@@ -5714,6 +5724,27 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
     for child in node.children(&mut cursor) {
         collect_syntax_errors(child, text, diagnostics);
     }
+}
+
+/// Returns true if `kind` is a string-delimiter token in tree-sitter-r
+/// (i.e. a literal `"` or `'`). Backticks delimit identifiers, not strings,
+/// so they are intentionally excluded.
+fn is_string_quote_kind(kind: &str) -> bool {
+    matches!(kind, "\"" | "'")
+}
+
+/// Returns true if `node` has a direct child that is a lone string-quote
+/// token. Tree-sitter-r wraps complete strings in a `string` node, so a
+/// `"` or `'` appearing directly under an ERROR is the opener of an
+/// unclosed string literal.
+fn has_unclosed_quote_child(node: Node) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if is_string_quote_kind(child.kind()) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -6359,6 +6390,47 @@ mod syntax_error_range_tests {
                 d.range.start.character
             );
         }
+    }
+
+    #[test]
+    fn unclosed_string_in_call_emits_descriptive_message() {
+        // `libs <- c("lib1", "lib2", "lib3)` — an unclosed string literal
+        // inside a function call. Tree-sitter wraps the call body in an
+        // ERROR node containing a lone `"` token; the message should explain
+        // *why* it's an error rather than just "Syntax error".
+        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3)";
+        let diags = collect(code);
+        assert!(
+            diags.iter().any(|d| d.message == "Unclosed string literal"),
+            "should emit 'Unclosed string literal' instead of 'Syntax error', got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unclosed_string_simple_emits_descriptive_message() {
+        // `x <- "unclosed string` — the unclosed string sits in a `string`
+        // node with a MISSING closing quote child. Should also be reported
+        // as an "Unclosed string literal" rather than a generic `Missing "`.
+        let code = "x <- \"unclosed string";
+        let diags = collect(code);
+        assert!(
+            diags.iter().any(|d| d.message == "Unclosed string literal"),
+            "should emit 'Unclosed string literal' instead of 'Missing \"', got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unclosed_single_quoted_string_emits_descriptive_message() {
+        // R also accepts single-quoted strings; same treatment.
+        let code = "x <- 'unclosed";
+        let diags = collect(code);
+        assert!(
+            diags.iter().any(|d| d.message == "Unclosed string literal"),
+            "should emit 'Unclosed string literal' for single-quoted strings, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
