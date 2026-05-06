@@ -615,7 +615,7 @@
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
     "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/plot/webview"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
