@@ -2202,6 +2202,101 @@ library(ggplot2)"#;
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
     }
+
+    #[test]
+    fn test_apply_var_multiple_assignments_skipped() {
+        let code = "libs <- c(\"dplyr\")\nlibs <- c(\"tidyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_super_assignment_disqualifies() {
+        // <<- alone counts but doesn't extract — single-assignment but no
+        // static packages means the binding doesn't resolve.
+        let code = "libs <<- c(\"dplyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_function_param_shadow_disqualifies() {
+        // A function parameter named `libs` increments the count and
+        // disqualifies the global binding.
+        let code = "libs <- c(\"dplyr\")\nf <- function(libs) {}\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_dynamic_x_paste0_skipped() {
+        let code = r#"sapply(paste0("dp", "lyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_dynamic_x_setdiff_skipped() {
+        let code = r#"sapply(setdiff(c("a","b"), "b"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_dynamic_x_c_with_var_skipped() {
+        // c() containing a non-string argument disqualifies the X arg.
+        let code = "libs1 <- c(\"a\")\nsapply(c(libs1, \"b\"), library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_anonymous_fun_skipped() {
+        // \(x) library(x) — FUN is not a bare identifier so the apply must not
+        // pick up "dplyr". The inner `library(x)` may still be detected with
+        // package="x" by the existing direct-library detector — that's
+        // pre-existing loose behavior; we only assert the apply path didn't
+        // fire by checking that no LibraryCall mentions "dplyr".
+        let code = r#"sapply(c("dplyr"), \(x) library(x), character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert!(
+            lib_calls.iter().all(|c| c.package != "dplyr"),
+            "apply path should not emit dplyr; got {:?}",
+            lib_calls
+        );
+    }
+
+    #[test]
+    fn test_apply_no_character_only_skipped() {
+        let code = r#"sapply(c("dplyr"), library)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_character_only_false_skipped() {
+        let code = r#"sapply(c("dplyr"), library, character.only = FALSE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_loadnamespace_fun_skipped() {
+        // loadNamespace is intentionally not in the FUN allowlist.
+        let code = r#"sapply(c("dplyr"), loadNamespace, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
 }
 
 // ============================================================================
