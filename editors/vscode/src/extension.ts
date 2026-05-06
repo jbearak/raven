@@ -19,6 +19,7 @@ import {
     shouldTriggerDirectivePathSuggest,
     shouldTriggerNestedPathSuggest,
 } from './pathCompletionTriggers';
+import { register_r_terminal, register_send_to_r_commands } from './send-to-r';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -162,6 +163,13 @@ export function activate(context: vscode.ExtensionContext) {
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
 
+    // Register R terminal and send-to-R commands
+    register_r_terminal(context);
+    register_send_to_r_commands(context);
+
+    // Warn if REditorSupport is also installed (keybinding conflict)
+    checkRExtensionConflict(context);
+
     // Register activity signal listeners for cross-file revalidation prioritization
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(() => {
@@ -281,6 +289,25 @@ async function ensureWordSeparators(wordSeparators: string) {
             await config.update(`[${languageId}]`, updatedLanguageConfig, vscode.ConfigurationTarget.Global);
         }
     }
+}
+
+const R_EXTENSION_CONFLICT_DISMISSED = 'raven.rExtensionConflictDismissed';
+
+function checkRExtensionConflict(context: vscode.ExtensionContext) {
+    if (context.globalState.get<boolean>(R_EXTENSION_CONFLICT_DISMISSED)) return;
+
+    const rExt = vscode.extensions.getExtension('REditorSupport.r');
+    if (!rExt) return;
+
+    vscode.window.showInformationMessage(
+        'Both Raven and REditorSupport (R) are installed with the same Cmd+Enter / Ctrl+Enter keybinding. Only one will handle the shortcut, but which one depends on load order. You can control this in the Keybindings editor.',
+        'Got it',
+        'Don\'t show again'
+    ).then(choice => {
+        if (choice === 'Don\'t show again') {
+            context.globalState.update(R_EXTENSION_CONFLICT_DISMISSED, true);
+        }
+    });
 }
 
 export function deactivate(): Thenable<void> | undefined {
