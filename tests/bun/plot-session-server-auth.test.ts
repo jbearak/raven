@@ -67,7 +67,6 @@ describe('PlotSessionServer auth + lifecycle', () => {
         // privileged-ish port? Better: simulate by injecting a fake http server
         // that immediately errors. Since we can't easily inject from outside,
         // we test the recovery path by stopping and restarting.
-        const port = server.port;
         const token = server.token;
         await server.stop();
         expect(server.port).toBe(0);
