@@ -50,15 +50,41 @@ describe('POST /plot-available', () => {
     });
 
     test('switches active session to the most recent caller', async () => {
+        const events: { type: string; sessionId?: string }[] = [];
+        server.onEvent(e => events.push(e));
         await register('s1');
         await register('s2');
         await plotAvailable('s1');
         await plotAvailable('s2');
         expect(server.activeSessionId).toBe('s2');
+        const plotEvents = events.filter(e => e.type === 'plot-available');
+        expect(plotEvents).toHaveLength(2);
+        expect(plotEvents[0]).toMatchObject({ type: 'plot-available', sessionId: 's1' });
+        expect(plotEvents[1]).toMatchObject({ type: 'plot-available', sessionId: 's2' });
     });
 
     test('rejects unknown session with 400', async () => {
         const r = await plotAvailable('does-not-exist');
+        expect(r.status).toBe(400);
+    });
+
+    test('rejects body missing hsize with 400', async () => {
+        await register('s1');
+        const r = await fetch(`http://127.0.0.1:${server.port}/plot-available`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-raven-session-token': server.token },
+            body: JSON.stringify({ sessionId: 's1', upid: 1 }),
+        });
+        expect(r.status).toBe(400);
+    });
+
+    test('rejects body missing upid with 400', async () => {
+        await register('s1');
+        const r = await fetch(`http://127.0.0.1:${server.port}/plot-available`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-raven-session-token': server.token },
+            body: JSON.stringify({ sessionId: 's1', hsize: 1 }),
+        });
         expect(r.status).toBe(400);
     });
 });
