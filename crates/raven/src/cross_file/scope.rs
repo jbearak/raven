@@ -3436,6 +3436,19 @@ where
 /// Function-scoped visibility, sys.source/local scoping rules, cycle prevention, and `max_depth`
 /// are respected; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
 ///
+/// # Invariants
+///
+/// **`visible_positions[uri]` is pinned to the first-visit position.** A
+/// re-visit happens when the recursion re-enters `uri` at a strictly wider
+/// position than the first-visit cap (typically a transitive forward
+/// `source()` reaching `uri` at EOF). The *original* visit already recorded
+/// the legitimate cap for `uri`'s role in the cursor's execution chain;
+/// expanding it on re-visit lets a side-trip recursion overwrite the cap and
+/// reveal later-than-source definitions that aren't actually in scope. The
+/// re-visit still re-runs STEP 2 to collect any new symbols — only the
+/// visibility cutoff stays put. Regression coverage:
+/// `qualified_resolve::tests::dollar_member_completion_excludes_parent_after_source_via_transitive_revisit`.
+///
 /// # Returns
 ///
 /// A `ScopeAtPosition` containing the merged symbols, provenance chain, recorded depth-exceeded
@@ -3530,8 +3543,10 @@ where
     visited.insert(uri.clone(), (line, column));
     if !is_revisit {
         scope.chain.push(uri.clone());
+        // First-visit only — see the `visible_positions[uri]` invariant in this
+        // function's doc comment.
+        record_visible_position(&mut scope.visible_positions, uri, line, column);
     }
-    record_visible_position(&mut scope.visible_positions, uri, line, column);
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
