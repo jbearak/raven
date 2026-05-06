@@ -839,35 +839,24 @@ fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String,
     }
 }
 
-/// Formals of `assign()` other than `x` and `value`. Used to filter partial
-/// matches so we don't accept ambiguous prefixes.
-const ASSIGN_OTHER_FORMALS: &[&str] = &["pos", "envir", "inherits", "immediate"];
-
-/// Decide which `assign()` formal a named arg binds, emulating R's matching:
-/// exact match first, then unique partial-prefix match. Returns `Some("x")`
-/// or `Some("value")` for the names we care about, `None` otherwise (the
-/// other formals or an ambiguous prefix).
-fn match_assign_formal(name: &str) -> Option<&'static str> {
-    if name.is_empty() {
-        return None;
+/// Returns true if `name` is a non-empty prefix of `assign()`'s `value`
+/// formal that is *not* also a prefix of any other formal — i.e. an
+/// unambiguous partial match for `value`. Excludes the exact name "value"
+/// itself; that's handled by the exact-match pass.
+fn is_partial_prefix_of_value(name: &str) -> bool {
+    if name.is_empty() || name == "value" {
+        return false;
     }
-    if name == "x" {
-        return Some("x");
+    if !"value".starts_with(name) {
+        return false;
     }
-    if name == "value" {
-        return Some("value");
-    }
-    // Partial: accept iff `name` is a prefix of exactly one formal we track.
-    let prefix_of_value = "value".starts_with(name);
-    let prefix_of_other =
-        ASSIGN_OTHER_FORMALS.iter().any(|f| f.starts_with(name)) || "x".starts_with(name);
-    match (prefix_of_value, prefix_of_other) {
-        (true, false) => Some("value"),
-        // `x` is a single character so partial-matching it means name == "x",
-        // which we handled above. Anything else is either ambiguous or
-        // matches an unrelated formal — ignore.
-        _ => None,
-    }
+    // assign()'s other formals: x, pos, envir, inherits, immediate.
+    // (`x` is a single character so partial-matching `x` just means name == "x".)
+    !"x".starts_with(name)
+        && !"pos".starts_with(name)
+        && !"envir".starts_with(name)
+        && !"inherits".starts_with(name)
+        && !"immediate".starts_with(name)
 }
 
 fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
@@ -884,14 +873,13 @@ fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBi
         return;
     }
 
-    // R argument matching: exact-named args bind first, then unambiguous
-    // partial matches, then any remaining positional args fill the unbound
-    // formals (`x`, `value`) in declaration order. We only care about `x`
-    // (the name) and `value` (the assigned expression); other formals
-    // (`pos`/`envir`/`inherits`/`immediate`) and unrecognised names don't
-    // consume positional slots.
-    let mut named_x: Option<Node> = None;
-    let mut named_value: Option<Node> = None;
+    // Bucketize args. R argument matching is two passes (exact, then partial)
+    // followed by positional fill. We only track the `x` and `value` formals
+    // — other formals (`pos`/`envir`/`inherits`/`immediate`) and unknown
+    // names are ignored and don't consume positional slots.
+    let mut exact_x: Vec<Node> = Vec::new();
+    let mut exact_value: Vec<Node> = Vec::new();
+    let mut partial_to_value: Vec<Node> = Vec::new();
     let mut positional: Vec<Node> = Vec::new();
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
@@ -903,19 +891,43 @@ fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBi
         };
         if let Some(name_node) = child.child_by_field_name("name") {
             let arg_name = node_text(name_node, content);
-            match match_assign_formal(arg_name) {
-                Some("x") if named_x.is_none() => named_x = Some(value),
-                Some("value") if named_value.is_none() => named_value = Some(value),
-                _ => {}
+            if arg_name == "x" {
+                exact_x.push(value);
+            } else if arg_name == "value" {
+                exact_value.push(value);
+            } else if is_partial_prefix_of_value(arg_name) {
+                partial_to_value.push(value);
             }
         } else {
             positional.push(value);
         }
     }
 
-    let mut pos_iter = positional.into_iter();
-    let x_value = named_x.or_else(|| pos_iter.next());
-    let value_node = named_value.or_else(|| pos_iter.next());
+    // If any of the rules R uses would error — duplicate exact, multiple
+    // partials matching the same formal, or a partial colliding with an exact
+    // — the call itself errors and never assigns. Skip the call entirely so
+    // we don't record a static binding R never produced.
+    let value_collision = (exact_value.len() == 1 && !partial_to_value.is_empty())
+        || exact_value.len() > 1
+        || partial_to_value.len() > 1;
+    if exact_x.len() > 1 || value_collision {
+        return;
+    }
+
+    // Resolve x (exact > positional[0]) and value (exact > partial > next
+    // positional after x).
+    let x_value = exact_x
+        .first()
+        .copied()
+        .or_else(|| positional.first().copied());
+    let value_node = exact_value
+        .first()
+        .copied()
+        .or_else(|| partial_to_value.first().copied())
+        .or_else(|| {
+            let next_idx = if exact_x.is_empty() { 1 } else { 0 };
+            positional.get(next_idx).copied()
+        });
 
     let Some(x_value) = x_value else { return };
     let Some(name) = extract_string_literal(x_value, content) else {
@@ -2469,6 +2481,27 @@ library(ggplot2)"#;
         // Same as test_apply_var_assign_named_overrides_disqualifies but the
         // second assign uses partial-match `val` for `value`.
         let code = "libs <- c(\"dplyr\")\nassign(x = \"libs\", val = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_exact_and_partial_value_skipped() {
+        // R does exact-name matching first, then partial. With both an exact
+        // `value = ...` and a partial `val = ...` present, R errors with
+        // "matched by multiple actual arguments" and the assignment never
+        // happens; we must not record a static binding from it.
+        let code = "assign(x = \"libs\", val = c(\"dplyr\"), value = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_duplicate_exact_value_skipped() {
+        // Same idea: two exact `value =` args also error in R.
+        let code = "assign(x = \"libs\", value = c(\"dplyr\"), value = c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
