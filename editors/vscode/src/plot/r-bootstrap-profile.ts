@@ -37,6 +37,11 @@ export async function write_profile_file(
     const profile_path = path.join(global_storage_dir, RAVEN_PROFILE_FILENAME);
     const tmp_path = `${profile_path}.tmp.${process.pid}`;
     await fs.writeFile(tmp_path, content, { encoding: 'utf8' });
-    await fs.rename(tmp_path, profile_path);
+    try {
+        await fs.rename(tmp_path, profile_path);
+    } catch (err) {
+        await fs.unlink(tmp_path).catch(() => undefined);
+        throw err;
+    }
     return profile_path;
 }
