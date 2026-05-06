@@ -48,7 +48,6 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **Syntax highlighting** — JAGS and Stan (R highlighting is built into VS Code)
-- **Bundled binary** — No separate installation needed in VS Code
 
 > [!NOTE]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation. See [Document Outline](docs/document-outline.md#jags-and-stan-model-structure).
