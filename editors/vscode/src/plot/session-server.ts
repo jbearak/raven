@@ -31,15 +31,22 @@ export class PlotSessionServer {
     async start(): Promise<void> {
         if (this.server) return;
         this._token = crypto.randomBytes(32).toString('hex');
-        this.server = http.createServer((req, res) => this.handle(req, res));
-        await new Promise<void>((resolve, reject) => {
-            this.server!.once('error', reject);
-            this.server!.listen({ host: '127.0.0.1', port: 0 }, () => {
-                const addr = this.server!.address();
-                this._port = typeof addr === 'object' && addr ? addr.port : 0;
-                resolve();
+        const s = http.createServer((req, res) => this.handle(req, res));
+        this.server = s;
+        try {
+            await new Promise<void>((resolve, reject) => {
+                s.once('error', reject);
+                s.listen({ host: '127.0.0.1', port: 0 }, () => {
+                    const addr = s.address();
+                    this._port = typeof addr === 'object' && addr ? addr.port : 0;
+                    resolve();
+                });
             });
-        });
+        } catch (err) {
+            this.server = null;
+            this._token = '';
+            throw err;
+        }
     }
 
     async stop(): Promise<void> {
