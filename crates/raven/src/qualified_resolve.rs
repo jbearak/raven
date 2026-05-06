@@ -2193,7 +2193,9 @@ source(\"main.R\")
     /// `main.R` at EOF. Without the fix, that re-visit's `visible_positions`
     /// for `main.R` (= EOF) leaks back through the merge chain and overwrites
     /// the original `(call_site, 0)` cap, exposing later-than-source
-    /// assignments.
+    /// assignments. See the `visible_positions[uri]` invariant on
+    /// `cross_file::scope::scope_at_position_with_graph_recursive` for the
+    /// pinning rule this exercises.
     #[test]
     fn dollar_member_completion_excludes_parent_after_source_via_transitive_revisit() {
         let mut state = fresh_state();
@@ -2218,6 +2220,9 @@ source(\"main.R\")
 source(\"shared.R\")
 ";
 
+        // Cursor file goes through `add_doc` (open document); the rest are
+        // closed/indexed via `add_indexed_doc` to mirror the editor runtime
+        // where only the active buffer is open.
         let data_uri = add_doc(&mut state, "file:///workspace/data.R", data_code);
         let main_uri = add_indexed_doc(&mut state, "file:///workspace/main.R", main_code);
         let helper_uri = add_indexed_doc(&mut state, "file:///workspace/helper.R", helper_code);

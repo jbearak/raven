@@ -3438,13 +3438,16 @@ where
 ///
 /// # Invariants
 ///
-/// **`visible_positions[uri]` is pinned to the first-visit position.** A re-visit
-/// happens when a transitive cycle forward-sources `uri` at a wider position
-/// (typically EOF). The *original* visit already recorded the legitimate cap for
-/// `uri`'s role in the cursor's execution chain; expanding it on re-visit lets a
-/// side-trip recursion overwrite the cap and reveal later-than-source definitions
-/// that aren't actually in scope. The re-visit still re-runs STEP 2 to collect any
-/// new symbols — only the visibility cutoff stays put.
+/// **`visible_positions[uri]` is pinned to the first-visit position.** A
+/// re-visit happens when the recursion re-enters `uri` at a strictly wider
+/// position than the first-visit cap (typically a transitive forward
+/// `source()` reaching `uri` at EOF). The *original* visit already recorded
+/// the legitimate cap for `uri`'s role in the cursor's execution chain;
+/// expanding it on re-visit lets a side-trip recursion overwrite the cap and
+/// reveal later-than-source definitions that aren't actually in scope. The
+/// re-visit still re-runs STEP 2 to collect any new symbols — only the
+/// visibility cutoff stays put. Regression coverage:
+/// `qualified_resolve::tests::dollar_member_completion_excludes_parent_after_source_via_transitive_revisit`.
 ///
 /// # Returns
 ///
