@@ -95,6 +95,10 @@ export class PlotSessionServer {
             this.read_json_body(req, res, body => this.handle_session_ready(body, res));
             return;
         }
+        if (url === '/plot-available') {
+            this.read_json_body(req, res, body => this.handle_plot_available(body, res));
+            return;
+        }
         res.writeHead(404).end();
     }
 
@@ -129,6 +133,24 @@ export class PlotSessionServer {
         req.on('error', () => {
             if (!res.headersSent) res.writeHead(400).end();
         });
+    }
+
+    private handle_plot_available(body: unknown, res: http.ServerResponse): void {
+        if (!body || typeof body !== 'object') {
+            res.writeHead(400).end();
+            return;
+        }
+        const b = body as Record<string, unknown>;
+        const sessionId = typeof b.sessionId === 'string' ? b.sessionId : '';
+        const hsize = typeof b.hsize === 'number' ? b.hsize : NaN;
+        const upid = typeof b.upid === 'number' ? b.upid : NaN;
+        if (!sessionId || !this.sessions.has(sessionId) || Number.isNaN(hsize) || Number.isNaN(upid)) {
+            res.writeHead(400).end();
+            return;
+        }
+        this.active_session_id = sessionId;
+        this.emit({ type: 'plot-available', sessionId, hsize, upid });
+        res.writeHead(200).end();
     }
 
     private handle_session_ready(body: unknown, res: http.ServerResponse): void {
