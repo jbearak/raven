@@ -483,11 +483,21 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 // Library Call Detection
 // ============================================================================
 
-/// Detects `library()`, `require()`, and `loadNamespace()` calls that specify a static package name.
+/// Detects package loads in the file: direct `library()`/`require()`/`loadNamespace()`
+/// calls, plus apply-family calls whose FUN argument is a bare reference to
+/// `library` or `require`.
 ///
-/// This returns entries for calls where the package can be determined from a bare identifier
-/// (e.g., `library(dplyr)`) or a string literal (e.g., `library("dplyr")`). Calls that use
-/// `character.only = TRUE` or whose package argument is an expression or variable are skipped.
+/// For direct calls, the package must be a bare identifier (`library(dplyr)`)
+/// or a string literal (`library("dplyr")`); direct calls with
+/// `character.only = TRUE` or a dynamic package argument are skipped.
+///
+/// For apply-family calls (`sapply`, `lapply`, `vapply`, `mapply`, plus the
+/// bare and `purrr::`-qualified `map`/`walk`/`map_chr`/etc.), `character.only =
+/// TRUE` is *required* and the X argument must resolve statically to a vector
+/// of string literals — either an inline `c("a","b",...)` or a same-file
+/// variable assigned exactly once via `<-`, `=`, or `assign("name", c(...))`.
+/// Each apply emits one `LibraryCall` per package, all sharing the apply
+/// call's end position.
 ///
 /// # Examples
 ///
