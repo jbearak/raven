@@ -2173,6 +2173,35 @@ library(ggplot2)"#;
         assert_eq!(lib_calls[1].line, 1);
     }
 
+    #[test]
+    fn test_apply_var_equals_assignment() {
+        let code =
+            "libs = c(\"dplyr\", \"tidyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assign_call() {
+        let code = "assign(\"libs\", c(\"dplyr\", \"tidyr\"))\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_assignment_after_apply_call_skipped() {
+        // Variable assigned *after* the apply call must not resolve.
+        let code = "sapply(libs, library, character.only = TRUE)\nlibs <- c(\"dplyr\")";
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
 }
 
 // ============================================================================
