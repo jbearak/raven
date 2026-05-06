@@ -1939,6 +1939,42 @@ library(ggplot2)"#;
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
     }
+
+    #[test]
+    fn test_apply_purrr_bare_walk() {
+        let code = r#"walk(c("dplyr","tidyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_purrr_qualified_map() {
+        let code = r#"purrr::map(c("dplyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 1);
+        assert_eq!(lib_calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_apply_purrr_qualified_map_chr() {
+        let code = r#"purrr::map_chr(c("dplyr","tidyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_other_namespace_not_detected() {
+        // foo::map(...) is not purrr — skip.
+        let code = r#"foo::map(c("dplyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 0);
+    }
 }
 
 // ============================================================================
