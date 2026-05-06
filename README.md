@@ -46,7 +46,7 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **Syntax highlighting** — R, JAGS, and Stan
+- **Syntax highlighting** — JAGS and Stan (R highlighting is built into VS Code)
 - **Bundled binary** — No separate installation needed in VS Code
 
 > [!NOTE]
