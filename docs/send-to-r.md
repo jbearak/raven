@@ -17,7 +17,7 @@ The `raven.rTerminal.program` setting controls which program is launched:
 | **radian** | Python-based R console with syntax highlighting, multiline editing, and mouse support |
 
 > [!TIP]
-> Both [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) provide a significantly better interactive experience than the standard R console: syntax highlighting, multiline editing, and richer history. Note that radian is no longer under active development; its author [recommends arf](https://github.com/randy3k/radian) as the successor.
+> Both [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) provide a significantly better interactive experience than the standard R console: syntax highlighting, multiline editing, and `Ctrl+R` history search. Note that radian is no longer under active development; its author [recommends arf](https://github.com/randy3k/radian) as the successor.
 
 The selected program must be available on your PATH.
 
