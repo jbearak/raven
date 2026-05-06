@@ -2,10 +2,10 @@
   "extends": "../../../tsconfig.json",
   "compilerOptions": {
     "lib": ["ES2020", "DOM"],
-    "rootDir": ".",
+    "rootDir": "..",
     "noEmit": true,
     "types": []
   },
-  "include": ["**/*.ts"],
+  "include": ["**/*.ts", "../messages.ts"],
   "exclude": ["../../../node_modules"]
 }
