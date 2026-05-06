@@ -552,6 +552,10 @@ fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<Lib
     if node.kind() == "call" {
         if let Some(lib_call) = try_parse_library_call(node, content) {
             library_calls.push(lib_call);
+        } else {
+            // Not a direct library/require/loadNamespace call; try the
+            // apply-family form (sapply/map/etc. of bare library/require).
+            library_calls.extend(try_parse_apply_library_call(node, content));
         }
     }
 
@@ -717,6 +721,223 @@ fn extract_package_value(node: Node, content: &str) -> Option<String> {
             None
         }
     }
+}
+
+// ============================================================================
+// Apply-Family Library Detection (issue #172)
+// ============================================================================
+
+/// Apply-family functions whose bare-identifier form may load packages
+/// dynamically when paired with `library`/`require` and `character.only = TRUE`.
+const APPLY_BARE_NAMES: &[&str] = &[
+    "sapply",
+    "lapply",
+    "vapply",
+    "mapply",
+    "map",
+    "walk",
+    "pmap",
+    "imap",
+    "iwalk",
+    "pwalk",
+    "map_chr",
+    "map_int",
+    "map_dbl",
+    "map_lgl",
+    "map_raw",
+    "map_dfr",
+    "map_dfc",
+    "map_vec",
+    "map_if",
+    "map_at",
+    "map2",
+    "map2_chr",
+    "map2_int",
+    "map2_dbl",
+    "map2_lgl",
+    "map2_dfr",
+    "map2_dfc",
+    "map2_vec",
+    "walk2",
+];
+
+/// Apply-family functions accepted under the `purrr::` namespace.
+const APPLY_PURRR_NAMES: &[&str] = &[
+    "map",
+    "walk",
+    "pmap",
+    "imap",
+    "iwalk",
+    "pwalk",
+    "map_chr",
+    "map_int",
+    "map_dbl",
+    "map_lgl",
+    "map_raw",
+    "map_dfr",
+    "map_dfc",
+    "map_vec",
+    "map_if",
+    "map_at",
+    "map2",
+    "map2_chr",
+    "map2_int",
+    "map2_dbl",
+    "map2_lgl",
+    "map2_dfr",
+    "map2_dfc",
+    "map2_vec",
+    "walk2",
+];
+
+/// Returns true when `func_node` names a base-R or purrr apply-family function
+/// supported for static library-vector detection. Accepts a bare identifier
+/// (`sapply`, `map`, ...) or a `purrr::xxx` namespace_operator.
+fn is_apply_family_function(func_node: Node, content: &str) -> bool {
+    match func_node.kind() {
+        "identifier" => {
+            let name = node_text(func_node, content);
+            APPLY_BARE_NAMES.contains(&name)
+        }
+        "namespace_operator" => {
+            let mut cursor = func_node.walk();
+            let named_children: Vec<Node> = func_node
+                .children(&mut cursor)
+                .filter(|c| c.is_named())
+                .collect();
+            if named_children.len() != 2 {
+                return false;
+            }
+            let ns = node_text(named_children[0], content);
+            let name = node_text(named_children[1], content);
+            ns == "purrr" && APPLY_PURRR_NAMES.contains(&name)
+        }
+        _ => false,
+    }
+}
+
+/// Strict variant of `extract_c_string_args`: returns `Some(packages)` only
+/// when `node` is `c(arg1, arg2, ...)` where every argument is a positional
+/// string literal and at least one argument is present. Returns `None` for any
+/// non-string element, named argument, or empty `c()` — anything but a fully
+/// static character vector is treated as dynamic.
+fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
+    if !is_c_call(node, content) {
+        return None;
+    }
+    let args_node = node.child_by_field_name("arguments")?;
+    if args_node.has_error() {
+        return None;
+    }
+    let mut strings = Vec::new();
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if child.child_by_field_name("name").is_some() {
+            return None;
+        }
+        let value_node = child.child_by_field_name("value")?;
+        if value_node.kind() != "string" {
+            return None;
+        }
+        let s = extract_string_literal(value_node, content)?;
+        strings.push(s);
+    }
+    if strings.is_empty() {
+        None
+    } else {
+        Some(strings)
+    }
+}
+
+/// Try to interpret `node` as an apply-family call that loads a static vector
+/// of packages — e.g. `sapply(c("dplyr","tidyr"), library, character.only = TRUE)`.
+///
+/// Returns one `LibraryCall` per package when:
+/// - the function is a supported apply-family name (see [`is_apply_family_function`]),
+/// - `character.only = TRUE` (or `T`) is set,
+/// - exactly one positional arg resolves to a static `Vec<String>` via inline `c(...)`,
+/// - at least one positional arg is the bare identifier `library` or `require`.
+///
+/// All emitted entries share the apply call's end position. Returns an empty
+/// vec for every other case (the caller continues recursion into children).
+fn try_parse_apply_library_call(node: Node, content: &str) -> Vec<LibraryCall> {
+    let func_node = match node.child_by_field_name("function") {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    if !is_apply_family_function(func_node, content) {
+        return Vec::new();
+    }
+
+    let args_node = match node.child_by_field_name("arguments") {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    if args_node.has_error() {
+        return Vec::new();
+    }
+
+    if !has_character_only_true(&args_node, content) {
+        return Vec::new();
+    }
+
+    let mut has_library_fun = false;
+    let mut packages: Option<Vec<String>> = None;
+    let mut ambiguous = false;
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if child.child_by_field_name("name").is_some() {
+            continue;
+        }
+        let value_node = match child.child_by_field_name("value") {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if value_node.kind() == "identifier" {
+            let text = node_text(value_node, content);
+            if text == "library" || text == "require" {
+                has_library_fun = true;
+            }
+            continue;
+        }
+
+        if let Some(strings) = extract_c_strings_strict(value_node, content) {
+            if packages.is_some() {
+                ambiguous = true;
+            }
+            packages = Some(strings);
+        }
+    }
+
+    if !has_library_fun || ambiguous {
+        return Vec::new();
+    }
+    let packages = match packages {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let end = node.end_position();
+    let line_text = content.lines().nth(end.row).unwrap_or("");
+    let column = byte_offset_to_utf16_column(line_text, end.column);
+    let line = end.row as u32;
+
+    packages
+        .into_iter()
+        .map(|package| LibraryCall {
+            package,
+            line,
+            column,
+            function_scope: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1656,6 +1877,25 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 1);
+        assert!(lib_calls[0].function_scope.is_none());
+    }
+
+    // ==================== apply-family library detection (#172) ====================
+
+    #[test]
+    fn test_apply_inline_c_with_library() {
+        // sapply(c("dplyr","tidyr"), library, character.only = TRUE)
+        // Validates issue #172 — the "inline c()" path.
+        let code = r#"sapply(c("dplyr", "tidyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let lib_calls = detect_library_calls(&tree, code);
+        assert_eq!(lib_calls.len(), 2);
+        assert_eq!(lib_calls[0].package, "dplyr");
+        assert_eq!(lib_calls[1].package, "tidyr");
+        // Both share the apply call's end position.
+        assert_eq!(lib_calls[0].line, 0);
+        assert_eq!(lib_calls[1].line, 0);
+        assert_eq!(lib_calls[0].column, lib_calls[1].column);
         assert!(lib_calls[0].function_scope.is_none());
     }
 }
