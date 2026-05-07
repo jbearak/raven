@@ -128,6 +128,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     client.start();
 
+    // Plot services (session server + viewer panel) for managed R terminals.
+    // Constructed before raven.restart registration so the closure has a live
+    // reference, not just a temporal-dead-zone forward binding.
+    const plot_services = new PlotServices(context);
+    active_plot_services = plot_services;
+
     // Register restart command — re-reads trace config so changed settings take effect
     context.subscriptions.push(
         vscode.commands.registerCommand('raven.restart', async () => {
@@ -166,10 +172,6 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
-
-    // Plot services (session server + viewer panel) for managed R terminals.
-    const plot_services = new PlotServices(context);
-    active_plot_services = plot_services;
 
     // Register R terminal and send-to-R commands
     register_r_terminal(context, plot_services);
