@@ -9,16 +9,17 @@ import {
     RavenPlotEnv,
 } from '../plot/r-bootstrap-profile';
 import * as path from 'path';
+import {
+    PendingProfileSession,
+    _sweep_and_dequeue_session,
+} from './pending-fifo';
+
+export type { PendingProfileSession };
+export { _sweep_and_dequeue_session };
 
 const PROFILE_ID = 'raven.rTerminal';
 const TERMINAL_NAME = 'R (Raven)';
 const PENDING_TTL_MS = 30_000;
-
-type PendingProfileSession = {
-    sessionId: string;
-    programName: string;
-    generatedAtMs: number;
-};
 
 let plot_services: PlotServices | null = null;
 let extension_context: vscode.ExtensionContext | null = null;
@@ -33,14 +34,6 @@ const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
 function get_program(): string {
     const config = vscode.workspace.getConfiguration('raven.rTerminal');
     return config.get<string>('program', 'R');
-}
-
-function sweep_pending() {
-    const now = Date.now();
-    while (pending_profile_session_ids.length > 0
-        && now - pending_profile_session_ids[0].generatedAtMs > PENDING_TTL_MS) {
-        pending_profile_session_ids.shift();
-    }
 }
 
 async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: string } | null> {
@@ -74,9 +67,8 @@ function handle_terminal_opened(terminal: vscode.Terminal): void {
         pending_profile_creation_count--;
         profile_terminals.add(terminal);
         last_active_terminal = terminal;
-        sweep_pending();
-        const next = pending_profile_session_ids.shift();
-        if (next) terminal_to_session_id.set(terminal, next.sessionId);
+        const next_id = _sweep_and_dequeue_session(pending_profile_session_ids, Date.now(), PENDING_TTL_MS);
+        if (next_id) terminal_to_session_id.set(terminal, next_id);
     }
 }
 
