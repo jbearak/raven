@@ -74,6 +74,22 @@ main {
     align-items: center;
     justify-content: center;
     overflow: auto;
+    position: relative;
+}
+
+.toast {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 4px 12px;
+    background: var(--vscode-notifications-background);
+    color: var(--vscode-notifications-foreground);
+    border: 1px solid var(--vscode-notifications-border);
+    border-radius: 3px;
+    font-size: 0.85em;
+    pointer-events: none;
+    opacity: 0.95;
 }
 
 .placeholder {

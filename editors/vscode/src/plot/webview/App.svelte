@@ -22,6 +22,8 @@
     let client: HttpgdClient | null = null;
     let viewportEl: HTMLDivElement | undefined = $state();
     let dimensions = $state({ width: 800, height: 600 });
+    let copy_status = $state<'' | 'copying' | 'copied'>('');
+    let copy_status_timer: ReturnType<typeof setTimeout> | null = null;
 
     function dispatch(action: import('./state').ViewerAction) {
         state = reduce(state, action);
@@ -125,6 +127,58 @@
         vscode.postMessage({ type: 'request-open-externally', payload: { plotId: id } });
     }
 
+    function set_copy_status(status: '' | 'copying' | 'copied', clear_after_ms?: number) {
+        copy_status = status;
+        if (copy_status_timer) {
+            clearTimeout(copy_status_timer);
+            copy_status_timer = null;
+        }
+        if (clear_after_ms !== undefined) {
+            copy_status_timer = setTimeout(() => {
+                copy_status = '';
+                copy_status_timer = null;
+            }, clear_after_ms);
+        }
+    }
+
+    async function copy_current() {
+        if (state.phase !== 'viewing' || !state.activeSession) return;
+        const id = state.plotIds[state.currentIndex];
+        if (!id) return;
+        const session = state.activeSession;
+        const url = plot_url(session.httpgdBaseUrl, session.httpgdToken, id, {
+            format: 'png',
+            width: dimensions.width,
+            height: dimensions.height,
+            // Match the save flow: render against httpgd's default background
+            // so pasted images don't carry the editor's dark theme.
+            bg: null,
+        });
+        set_copy_status('copying');
+        try {
+            const r = await fetch(url);
+            if (!r.ok) throw new Error(`httpgd ${r.status}`);
+            const blob = await r.blob();
+            await navigator.clipboard.write([
+                new ClipboardItem({ 'image/png': blob }),
+            ]);
+            set_copy_status('copied', 1500);
+        } catch (err) {
+            set_copy_status('', 0);
+            vscode.postMessage({
+                type: 'report-error',
+                payload: { message: `copy plot: ${String(err)}` },
+            });
+        }
+    }
+
+    // Right-click on the plot suppresses the default browser menu (Cut/Copy/Paste
+    // don't apply to an httpgd-rendered img) and runs the copy action directly.
+    function on_plot_context_menu(e: MouseEvent) {
+        e.preventDefault();
+        void copy_current();
+    }
+
     let current_url = $derived.by(() => {
         if (state.phase !== 'viewing' && state.phase !== 'disconnected') return '';
         if (!state.activeSession || state.plotIds.length === 0) return '';
@@ -160,6 +214,9 @@
                 disabled={state.phase !== 'viewing'}
                 title="Remove current plot">✕</button>
         <span class="spacer"></span>
+        <button onclick={copy_current}
+                disabled={state.phase !== 'viewing'}
+                title="Copy plot to clipboard (PNG)">Copy</button>
         <button onclick={() => save_plot('png')}
                 disabled={state.phase !== 'viewing'}
                 title="Save as PNG">PNG</button>
@@ -186,7 +243,13 @@
         {:else if state.phase === 'disconnected' && state.plotIds.length === 0}
             <div class="placeholder">R session ended.</div>
         {:else if current_url}
-            <img class="plot" src={current_url} alt={`Plot ${state.currentIndex + 1}`} />
+            <img class="plot"
+                 src={current_url}
+                 alt={`Plot ${state.currentIndex + 1}`}
+                 oncontextmenu={on_plot_context_menu} />
+        {/if}
+        {#if copy_status === 'copied'}
+            <div class="toast">Copied</div>
         {/if}
     </div>
 </main>
