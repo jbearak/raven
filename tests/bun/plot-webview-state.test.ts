@@ -16,7 +16,7 @@ describe('webview state reducer', () => {
     test('SET_ACTIVE_SESSION transitions to empty', () => {
         const s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         expect(s.phase).toBe('empty');
@@ -27,7 +27,7 @@ describe('webview state reducer', () => {
     test('SET_PLOT_IDS with new plots transitions to viewing', () => {
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2'] });
@@ -39,7 +39,7 @@ describe('webview state reducer', () => {
     test('SET_PLOT_IDS empty list returns to empty when active', () => {
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: [] });
@@ -49,7 +49,7 @@ describe('webview state reducer', () => {
     test('GO_PREV decrements currentIndex but not below 0', () => {
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2', 'p3'] });
@@ -64,7 +64,7 @@ describe('webview state reducer', () => {
     test('GO_NEXT increments but not past the last plot', () => {
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2', 'p3'] });
@@ -78,7 +78,7 @@ describe('webview state reducer', () => {
     test('SESSION_ENDED transitions to disconnected and keeps last plot', () => {
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1'] });
@@ -95,7 +95,7 @@ describe('webview state reducer', () => {
         // so the SET_ACTIVE_SESSION step must not clear plotIds/currentIndex.
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2', 'p3'] });
@@ -105,7 +105,7 @@ describe('webview state reducer', () => {
         expect(s.currentIndex).toBe(1);
         s = reduce(s, {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: true,
         });
         expect(s.plotIds).toEqual(['p1', 'p2', 'p3']);
@@ -120,13 +120,13 @@ describe('webview state reducer', () => {
     test('SET_ACTIVE_SESSION with sessionEnded=false still resets plots', () => {
         let s = reduce(initial_state(), {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 'a', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            activeSession: { sessionId: 'a', httpgdBaseUrl: 'http://x', httpgdToken: 't', upid: 0 },
             sessionEnded: false,
         });
         s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2'] });
         s = reduce(s, {
             type: 'SET_ACTIVE_SESSION',
-            activeSession: { sessionId: 'b', httpgdBaseUrl: 'http://y', httpgdToken: 'u' },
+            activeSession: { sessionId: 'b', httpgdBaseUrl: 'http://y', httpgdToken: 'u', upid: 0 },
             sessionEnded: false,
         });
         expect(s.plotIds).toEqual([]);

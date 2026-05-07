@@ -34,6 +34,18 @@ describe('httpgd-client URL builders', () => {
         expect(ws_url('https://example.com:8443', token)).toBe(`wss://example.com:8443/?token=${token}`);
     });
 
+    test('plot_url adds c=<upid> cache-buster when upid > 0', () => {
+        const u = plot_url(base, token, 'p1', { format: 'svg', width: 100, height: 100, bg: null, upid: 7 });
+        expect(u).toContain('c=7');
+    });
+
+    test('plot_url omits c when upid is 0 or undefined', () => {
+        const u0 = plot_url(base, token, 'p1', { format: 'svg', width: 100, height: 100, bg: null, upid: 0 });
+        expect(u0).not.toContain('c=');
+        const u1 = plot_url(base, token, 'p1', { format: 'svg', width: 100, height: 100, bg: null });
+        expect(u1).not.toContain('c=');
+    });
+
     test('remove_url includes id and token', () => {
         const u = remove_url(base, token, 'p1');
         expect(u).toContain('/remove');

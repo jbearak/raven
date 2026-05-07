@@ -32,6 +32,7 @@ describe('POST /session-ready', () => {
             httpgdBaseUrl: 'http://127.0.0.1:7777',
             httpgdToken: 'plot-tok',
             ended: false,
+            lastUpid: 0,
         });
         expect(events).toContainEqual({
             type: 'session-ready',
@@ -40,6 +41,7 @@ describe('POST /session-ready', () => {
                 httpgdBaseUrl: 'http://127.0.0.1:7777',
                 httpgdToken: 'plot-tok',
                 ended: false,
+                lastUpid: 0,
             },
         });
     });

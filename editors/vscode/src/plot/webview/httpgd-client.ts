@@ -5,6 +5,10 @@ export type PlotRenderOpts = {
     width: number;
     height: number;
     bg: string | null;
+    /** httpgd's update id for the session. Forwarded as `c=<upid>` to bust the
+     *  browser cache when an existing plot id is updated in-place (e.g.
+     *  `points()` after `plot()`). Omitted when 0 (no plots yet). */
+    upid?: number;
 };
 
 export function plot_url(
@@ -20,6 +24,9 @@ export function plot_url(
     u.searchParams.set('height', String(opts.height));
     if (opts.bg !== null) u.searchParams.set('bg', opts.bg);
     u.searchParams.set('token', token);
+    if (opts.upid !== undefined && opts.upid > 0) {
+        u.searchParams.set('c', String(opts.upid));
+    }
     return u.toString();
 }
 

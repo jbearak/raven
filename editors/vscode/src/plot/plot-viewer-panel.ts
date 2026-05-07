@@ -82,13 +82,13 @@ export class PlotViewerPanel {
     /** Reveal the panel (creating it if needed) and push the current state. */
     notifyPlotAvailable(): void {
         this.ensure_panel();
-        this.post_state_update();
+        void this.post_state_update();
     }
 
     /** Push state-update so the webview can show the "session ended" banner.
      *  Does not create a panel if none exists yet. */
     notifySessionEnded(): void {
-        this.post_state_update();
+        void this.post_state_update();
     }
 
     dispose(): void {
@@ -132,17 +132,34 @@ export class PlotViewerPanel {
         this.panel = panel;
     }
 
-    private post_state_update(): void {
+    private async post_state_update(): Promise<void> {
         if (!this.panel) return;
         const session = this.server.getSession(this.sessionId);
+        // Translate the loopback httpgd base URL through asExternalUri so it
+        // remains reachable from the webview in remote VS Code hosts (SSH, WSL,
+        // containers, Codespaces). On a local host this is a no-op. We do this
+        // only for what the webview consumes; extension-host code paths
+        // (download_to_buffer in handle_save) keep using the loopback URL.
+        let externalBaseUrl = session?.httpgdBaseUrl ?? '';
+        if (session) {
+            try {
+                const mapped = await vscode.env.asExternalUri(vscode.Uri.parse(session.httpgdBaseUrl));
+                // Strip a trailing slash that vscode.Uri may add, so that
+                // `${base}/plot` keeps the same shape as before.
+                externalBaseUrl = mapped.toString(true).replace(/\/$/, '');
+            } catch {
+                externalBaseUrl = session.httpgdBaseUrl;
+            }
+        }
         this.post(this.panel, {
             type: 'state-update',
             payload: {
                 activeSession: session
                     ? {
                           sessionId: session.sessionId,
-                          httpgdBaseUrl: session.httpgdBaseUrl,
+                          httpgdBaseUrl: externalBaseUrl,
                           httpgdToken: session.httpgdToken,
+                          upid: session.lastUpid,
                       }
                     : null,
                 sessionEnded: session?.ended ?? false,
@@ -158,7 +175,7 @@ export class PlotViewerPanel {
         if (!isWebviewToExtensionMessage(msg)) return;
         switch (msg.type) {
             case 'webview-ready':
-                this.post_state_update();
+                void this.post_state_update();
                 break;
             case 'request-save-plot':
                 this.handle_save(msg.payload.plotId, msg.payload.format).catch(err => {
@@ -191,9 +208,12 @@ export class PlotViewerPanel {
         // Fixed export dimensions (1200x900) decouple saved file resolution from
         // the live preview viewport, so saved plots have consistent quality
         // regardless of how the user has the panel sized.
+        const cacheBuster = session.lastUpid > 0
+            ? `&c=${session.lastUpid}`
+            : '';
         const url = `${session.httpgdBaseUrl}/plot?id=${encodeURIComponent(plot_id)}` +
             `&renderer=${format}&width=1200&height=900` +
-            `&token=${encodeURIComponent(session.httpgdToken)}`;
+            `&token=${encodeURIComponent(session.httpgdToken)}${cacheBuster}`;
         // Use Node's http/https modules instead of the global `fetch`, which
         // is not available on the Node 16 runtime shipped by VS Code 1.75
         // (see engines.vscode in package.json).
@@ -204,8 +224,18 @@ export class PlotViewerPanel {
     private async handle_open_externally(plot_id: string): Promise<void> {
         const session = this.server.getSession(this.sessionId);
         if (!session) return;
-        const url = `${session.httpgdBaseUrl}/plot?id=${encodeURIComponent(plot_id)}` +
-            `&renderer=svg&token=${encodeURIComponent(session.httpgdToken)}`;
+        // Map the loopback URL through asExternalUri so that on remote hosts
+        // (SSH, WSL, Codespaces) the user's local browser opens the
+        // forwarded port instead of the empty loopback on their client.
+        const mapped = await vscode.env.asExternalUri(
+            vscode.Uri.parse(session.httpgdBaseUrl),
+        );
+        const externalBase = mapped.toString(true).replace(/\/$/, '');
+        const cacheBuster = session.lastUpid > 0
+            ? `&c=${session.lastUpid}`
+            : '';
+        const url = `${externalBase}/plot?id=${encodeURIComponent(plot_id)}` +
+            `&renderer=svg&token=${encodeURIComponent(session.httpgdToken)}${cacheBuster}`;
         await vscode.env.openExternal(vscode.Uri.parse(url));
     }
 

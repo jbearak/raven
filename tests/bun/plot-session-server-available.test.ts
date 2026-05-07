@@ -68,6 +68,17 @@ describe('POST /plot-available', () => {
         expect(r.status).toBe(400);
     });
 
+    test('updates session.lastUpid on plot-available', async () => {
+        await register('s1');
+        expect(server.getSession('s1')?.lastUpid).toBe(0);
+        await plotAvailable('s1', 1, 11);
+        expect(server.getSession('s1')?.lastUpid).toBe(11);
+        // A second plot-available with the same hsize but a new upid models
+        // an in-place update (e.g. `points()` after `plot()`).
+        await plotAvailable('s1', 1, 12);
+        expect(server.getSession('s1')?.lastUpid).toBe(12);
+    });
+
     test('rejects body missing hsize with 400', async () => {
         await register('s1');
         const r = await fetch(`http://127.0.0.1:${server.port}/plot-available`, {

@@ -15,6 +15,7 @@ describe('plot messages', () => {
                     sessionId: 'abc',
                     httpgdBaseUrl: 'http://127.0.0.1:1234',
                     httpgdToken: 'tok',
+                    upid: 0,
                 },
                 sessionEnded: false,
             },

@@ -134,14 +134,17 @@ export function activate(context: vscode.ExtensionContext) {
     const plot_services = new PlotServices(context);
     active_plot_services = plot_services;
 
-    // Register restart command — re-reads trace config so changed settings take effect
+    // Register restart command — re-reads trace config so changed settings take effect.
+    //
+    // Intentionally does NOT restart plot_services: existing Raven-managed R
+    // terminals already hold the current RAVEN_SESSION_PORT/RAVEN_SESSION_TOKEN
+    // in their environment, so tearing the session server down and bringing it
+    // back up on a different port would leave those terminals POSTing to a
+    // dead/unauthorized server until the user manually closes them.
     context.subscriptions.push(
         vscode.commands.registerCommand('raven.restart', async () => {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
-            await Promise.all([
-                client.restart(),
-                plot_services.restart(),
-            ]);
+            await client.restart();
         })
     );
 

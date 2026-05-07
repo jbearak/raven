@@ -8,6 +8,11 @@ export type SessionInfo = {
     httpgdBaseUrl: string;
     httpgdToken: string;
     ended: boolean;
+    /** httpgd state.upid from the most recent /plot-available for this session,
+     *  or 0 if none seen yet. Used as a cache-busting query parameter so plot
+     *  updates that reuse an existing id (e.g. `points()` on a live plot) are
+     *  not served stale from the browser cache. */
+    lastUpid: number;
 };
 
 export type PlotEvent =
@@ -149,6 +154,8 @@ export class PlotSessionServer {
             return;
         }
         this.active_session_id = sessionId;
+        const session = this.sessions.get(sessionId);
+        if (session) session.lastUpid = upid;
         this.emit({ type: 'plot-available', sessionId, hsize, upid });
         res.writeHead(200).end();
     }
@@ -190,6 +197,7 @@ export class PlotSessionServer {
             httpgdBaseUrl: `http://${hostForUrl}:${httpgdPort}`,
             httpgdToken,
             ended: false,
+            lastUpid: 0,
         };
         this.sessions.set(sessionId, session);
         this.emit({ type: 'session-ready', session });

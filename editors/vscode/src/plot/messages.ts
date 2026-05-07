@@ -13,6 +13,10 @@ export type ActiveSessionInfo = {
     sessionId: string;
     httpgdBaseUrl: string;
     httpgdToken: string;
+    /** httpgd `state.upid` for the last plot event. Used by the webview as a
+     *  cache-busting query parameter so re-rendered plots that reuse an id
+     *  (e.g. `points()` on a live plot) are not served stale by the browser. */
+    upid: number;
 };
 
 export type StateUpdatePayload = {
@@ -61,7 +65,8 @@ export function isExtensionToWebviewMessage(value: unknown): value is ExtensionT
                 const s = activeSession as Record<string, unknown>;
                 if (typeof s.sessionId !== 'string' ||
                     typeof s.httpgdBaseUrl !== 'string' ||
-                    typeof s.httpgdToken !== 'string') {
+                    typeof s.httpgdToken !== 'string' ||
+                    typeof s.upid !== 'number') {
                     return false;
                 }
             }

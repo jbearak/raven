@@ -153,6 +153,7 @@
             // Match the save flow: render against httpgd's default background
             // so pasted images don't carry the editor's dark theme.
             bg: null,
+            upid: session.upid,
         });
         set_copy_status('copying');
         try {
@@ -192,6 +193,7 @@
                 width: dimensions.width,
                 height: dimensions.height,
                 bg: state.themeBg,
+                upid: state.activeSession.upid,
             },
         );
     });
