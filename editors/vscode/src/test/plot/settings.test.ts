@@ -13,12 +13,18 @@ suite('Raven plot settings', () => {
     });
 
     test('raven.plot.viewerColumn enum accepts "active"', async () => {
-        const cfg = vscode.workspace.getConfiguration('raven.plot');
-        await cfg.update('viewerColumn', 'active', vscode.ConfigurationTarget.Global);
+        await vscode.workspace
+            .getConfiguration('raven.plot')
+            .update('viewerColumn', 'active', vscode.ConfigurationTarget.Global);
         try {
-            assert.strictEqual(cfg.get<string>('viewerColumn'), 'active');
+            assert.strictEqual(
+                vscode.workspace.getConfiguration('raven.plot').get<string>('viewerColumn'),
+                'active',
+            );
         } finally {
-            await cfg.update('viewerColumn', undefined, vscode.ConfigurationTarget.Global);
+            await vscode.workspace
+                .getConfiguration('raven.plot')
+                .update('viewerColumn', undefined, vscode.ConfigurationTarget.Global);
         }
     });
 });
