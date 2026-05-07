@@ -22,13 +22,19 @@ function build_html(webview: vscode.Webview, extension_uri: vscode.Uri, nonce: s
     const css_uri = webview.asWebviewUri(
         vscode.Uri.joinPath(extension_uri, 'dist', 'webviews', 'plot-viewer', 'index.css'),
     );
+    // Loopback hosts must match those accepted by PlotSessionServer for
+    // httpgdHost (see session-server.ts allowedHosts): 127.0.0.1, localhost,
+    // and ::1. If the CSP omits one, webview fetches and websocket connects
+    // to that host fail silently.
+    const loopbackHttp = 'http://127.0.0.1:* http://localhost:* http://[::1]:*';
+    const loopbackWs = 'ws://127.0.0.1:* ws://localhost:* ws://[::1]:*';
     const csp = [
         `default-src 'none'`,
-        `img-src ${webview.cspSource} http://127.0.0.1:* data:`,
+        `img-src ${webview.cspSource} ${loopbackHttp} data:`,
         `script-src ${webview.cspSource} 'nonce-${nonce}'`,
         `style-src ${webview.cspSource} 'unsafe-inline'`,
         `font-src ${webview.cspSource}`,
-        `connect-src http://127.0.0.1:* ws://127.0.0.1:*`,
+        `connect-src ${loopbackHttp} ${loopbackWs}`,
     ].join('; ');
     return `<!doctype html>
 <html lang="en">

@@ -23,6 +23,10 @@ const PENDING_TTL_MS = 30_000;
 
 let plot_services: PlotServices | null = null;
 let extension_context: vscode.ExtensionContext | null = null;
+// Cache the in-flight (or completed) write promise rather than a "done" flag,
+// so concurrent first calls in one activation share a single write instead of
+// racing on the same temp path inside write_profile_file.
+let profile_write_promise: Promise<void> | null = null;
 let profile_written_for_storage_dir: string | null = null;
 
 const profile_terminals = new Set<vscode.Terminal>();
@@ -48,8 +52,12 @@ async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: 
     const profile_path = path.join(storage_dir, RAVEN_PROFILE_FILENAME);
     // generate_profile_source() returns static content; write once per activation.
     if (profile_written_for_storage_dir !== storage_dir) {
-        await write_profile_file(storage_dir, generate_profile_source());
-        profile_written_for_storage_dir = storage_dir;
+        if (!profile_write_promise) {
+            profile_write_promise = write_profile_file(storage_dir, generate_profile_source())
+                .then(() => { profile_written_for_storage_dir = storage_dir; })
+                .catch(err => { profile_write_promise = null; throw err; });
+        }
+        await profile_write_promise;
     }
 
     const previous = process.env.R_PROFILE_USER;

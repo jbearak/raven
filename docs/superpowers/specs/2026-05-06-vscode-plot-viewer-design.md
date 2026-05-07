@@ -92,8 +92,9 @@ terminal sees:
 8. Closing the viewer panel does not disable plotting. The next plot recreates
    the panel.
 9. If an R terminal exits, the viewer remains open with the last rendered plot
-   and shows that the producing R session ended. Plots from other live sessions
-   can still replace it.
+   and shows that the producing R session ended. The panel is bound to that
+   session, so it is not replaced or reused by plots from other live sessions —
+   each session has its own panel.
 10. Once the user moves the panel (drag to a different editor column, pin to a
     side bar, etc.), Raven leaves the panel where it is. `raven.plot.viewerColumn`
     only controls the *initial* reveal column; subsequent reveals do not pass a
@@ -207,15 +208,19 @@ bidirectional push (e.g., extension-to-R signals). It is not implemented in v1.
 
 `plot/r-bootstrap-profile.ts` writes a generated profile file at
 `${context.globalStorageUri}/r-profile.R` and returns the environment block for
-terminal creation. The profile is regenerated every time
-`get_plot_terminal_env()` is called, so newer extension versions can update its
-contents without manual cache busting. The file does not embed per-session
-state — port, token, and session ID are passed via env vars at runtime.
+terminal creation. The profile content is static (depends only on the extension
+version), so `get_plot_terminal_env()` writes it at most once per activation —
+the first call writes, subsequent calls reuse the existing file. The file does
+not embed per-session state; port, token, and session ID are passed via env
+vars at runtime.
 
-Concurrent regeneration is safe: the profile content depends only on the
-extension version, so simultaneous writes from multiple terminal-creation calls
-produce identical bytes. The implementation may still write to a temp path and
-rename atomically, but a clobber is harmless.
+The first call per activation kicks off the write and caches the resulting
+promise; subsequent concurrent first-callers await that same promise instead of
+issuing their own write, so two terminal-creation calls cannot race on the
+same temp path inside `write_profile_file`. If the cached write rejects, the
+promise is cleared so a later call retries. Across activations or processes,
+the implementation still writes via a temp path and atomic rename so an
+overwrite by a different extension version is safe.
 
 The generated profile must be careful because setting `R_PROFILE_USER` replaces
 R's normal user-profile search. It must:
@@ -276,7 +281,9 @@ The helper:
 
 1. Lazily starts the session server.
 2. Generates a fresh `RAVEN_R_SESSION_ID`.
-3. Writes (or overwrites) the bootstrap profile under `globalStorageUri`.
+3. Ensures the bootstrap profile exists under `globalStorageUri`. The profile
+   is static, so it is written on the first call per activation and reused on
+   subsequent calls.
 4. Returns the env block, plus the generated session ID for the caller to track.
 
 If `raven.plot.enabled` is `false` or the server failed to start, the helper
@@ -318,16 +325,17 @@ exists per R session and is owned by `PlotServices` via a
 - Mediates messages with the webview using the typed contract in
   `plot/messages.ts` (see "Extension ↔ Webview Message Protocol" below).
 
-The panel's CSP allows the webview to talk directly to httpgd on
-`127.0.0.1:*`:
+The panel's CSP allows the webview to talk directly to httpgd on the same
+loopback hosts the session server accepts (`127.0.0.1`, `localhost`, `::1`):
 
 ```text
 default-src 'none';
-img-src ${webview.cspSource} http://127.0.0.1:* data:;
+img-src ${webview.cspSource} http://127.0.0.1:* http://localhost:* http://[::1]:* data:;
 script-src ${webview.cspSource} 'nonce-${nonce}';
 style-src ${webview.cspSource} 'unsafe-inline';
 font-src ${webview.cspSource};
-connect-src http://127.0.0.1:* ws://127.0.0.1:*;
+connect-src http://127.0.0.1:* http://localhost:* http://[::1]:*
+            ws://127.0.0.1:* ws://localhost:* ws://[::1]:*;
 ```
 
 The Svelte app:
@@ -427,8 +435,9 @@ Example: user runs `plot(1:10)` in a freshly-opened Raven terminal.
    terminal profile dropdown.
 2. `r-terminal-manager.ts` calls `get_plot_terminal_env(context, program_name)`.
 3. The helper lazily starts the session server, generates a fresh
-   `RAVEN_R_SESSION_ID`, writes the bootstrap profile to
-   `globalStorageUri/r-profile.R`, and returns the env block.
+   `RAVEN_R_SESSION_ID`, ensures the static bootstrap profile exists at
+   `globalStorageUri/r-profile.R` (writing it the first time per activation),
+   and returns the env block.
 4. The terminal is created. For the programmatic path, `terminal_to_session_id`
    is set immediately. For the profile path, the session ID is queued and
    matched in `onDidOpenTerminal`.
@@ -481,9 +490,9 @@ R session crash or terminal exit:
 
 - `onDidCloseTerminal` looks up the session ID in `terminal_to_session_id`,
   removes the entry, and notifies the panel.
-- The panel marks the active session as ended and shows the disconnected
-  banner. The last plot stays visible.
-- New plots from other live managed sessions can still replace the view.
+- The panel marks its session as ended and shows the disconnected banner. The
+  last plot stays visible. The panel is per-session, so plots from other live
+  sessions render in their own panels and do not overwrite this one.
 
 httpgd unreachable while terminal is still open (rare — e.g., user called
 `httpgd::hgd_close()` manually):
@@ -507,7 +516,6 @@ Malformed or unauthenticated session messages:
 User clicks Save but the fetch fails:
 
 - Extension shows `vscode.window.showErrorMessage` with a short message.
-- Webview is told via `report-error` echo so it can drop any pending UI state.
 
 ## Testing
 
@@ -577,7 +585,7 @@ boolean toggle with no path or credential implications, consistent with
 | `editors/vscode/src/send-to-r/r-terminal-manager.ts` | Modify | Inject plot env into both `createTerminal` and `TerminalProfileProvider` paths. Track `terminal_to_session_id`. |
 | `editors/vscode/src/plot/session-server.ts` | Create | Lazy per-window localhost HTTP server, token validation, session registry. |
 | `editors/vscode/src/plot/r-bootstrap-profile.ts` | Create | Profile file writer (to `globalStorageUri/r-profile.R`) and env builder. |
-| `editors/vscode/src/plot/plot-viewer-panel.ts` | Create | Singleton webview host and message dispatcher. |
+| `editors/vscode/src/plot/plot-viewer-panel.ts` | Create | Per-session webview host and message dispatcher. |
 | `editors/vscode/src/plot/messages.ts` | Create | Typed extension <-> webview message contract. |
 | `editors/vscode/src/plot/webview/main.ts` | Create | Svelte webview entry. |
 | `editors/vscode/src/plot/webview/App.svelte` | Create | Plot viewer UI and httpgd client. |
