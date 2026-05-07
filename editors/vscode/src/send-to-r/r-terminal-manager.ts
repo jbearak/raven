@@ -104,24 +104,30 @@ export function _set_validator_for_test(
     _validator = v ?? shell_can_find_program;
 }
 
-// Resolves the program to launch for an R terminal. For non-`R` configurations
-// it validates via the user's shell once per machine; the success is persisted
-// and we never re-spawn the shell for that program again on this host. If the
-// shell can't find the program we prompt with Switch-to-R / Keep. Picking
-// "Switch to R" updates the Global (== per-machine in Remote-SSH) setting so
-// the synced User default stays intact; "Keep" lets the configured value
-// through, and VS Code's own launch UX surfaces a real failure if the shell
-// check was a false negative (e.g. terminal.integrated.env.* PATH additions).
+// Resolves the program to launch for an R terminal. Once a program has been
+// shell-validated on this machine, persisted state short-circuits everything
+// and we never re-spawn the shell. Otherwise we re-validate on every launch:
+// the user may have installed the program mid-session, and the next launch
+// should pick that up and persist. If validation still fails, we prompt at
+// most once per session — Switch-to-R updates the Global (== per-machine in
+// Remote-SSH) setting so the synced User default stays intact; Keep / dismiss
+// proceeds with the configured value and VS Code surfaces any real launch
+// failure (e.g. for setups where terminal.integrated.env.* extends PATH only
+// inside the terminal).
 export async function resolve_program(): Promise<string> {
     const configured = get_program();
     if (configured === 'R') return 'R';
     if (is_program_validated_on_this_machine(configured)) return configured;
-    if (session_user_kept.has(configured)) return configured;
 
     if (await _validator(configured)) {
         await persist_program_validated(configured);
         return configured;
     }
+
+    // Validator failed. If the user already answered this session, proceed
+    // silently — but we still re-ran the validator above, so a mid-session
+    // install gets picked up and persisted.
+    if (session_user_kept.has(configured)) return configured;
 
     const SWITCH = 'Switch to R';
     const KEEP = 'Keep';

@@ -82,7 +82,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         assert.strictEqual(after, 'R');
     });
 
-    test('shell does not find program, user picks Keep: returns configured, no second prompt this session', async () => {
+    test('user picks Keep: subsequent launches re-validate but do not re-prompt', async () => {
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', 'arf', vscode.ConfigurationTarget.Global);
@@ -92,31 +92,35 @@ suite('rTerminal.program shell-validated fallback', () => {
 
         assert.strictEqual(await resolve_program(), 'arf');
         assert.strictEqual(await resolve_program(), 'arf');
-        assert.strictEqual(validator_count, 1, 'session-cached: do not re-validate');
-        assert.strictEqual(warnings.length, 1, 'no second prompt this session');
+        assert.strictEqual(await resolve_program(), 'arf');
+        assert.strictEqual(validator_count, 3, 'validator runs every call until success persists');
+        assert.strictEqual(warnings.length, 1, 'prompt only once per session after Keep');
     });
 
-    test('failures are NOT persisted: re-validates after clearing session state', async () => {
+    test('mid-session install: validator flips to true, success persists, prompt does not recur', async () => {
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', 'arf', vscode.ConfigurationTarget.Global);
+        let installed = false;
         let validator_count = 0;
-        _set_validator_for_test(async () => { validator_count++; return false; });
+        _set_validator_for_test(async () => { validator_count++; return installed; });
         warning_response = 'Keep';
 
-        // First "session": Keep is selected; cached for this session only.
+        // Initial launch: not installed yet, user picks Keep.
         assert.strictEqual(await resolve_program(), 'arf');
-        assert.strictEqual(validator_count, 1);
+        assert.strictEqual(warnings.length, 1);
 
-        // Simulate a new session by clearing in-memory session state. Persisted
-        // state is unchanged (no success was persisted).
-        await _clear_validation_state_for_test();
+        // User installs `arf` in another window during the session.
+        installed = true;
 
-        // Next "session" re-validates — this is the "user might have installed
-        // it since" path.
+        // Next launch re-validates, succeeds, persists. No prompt.
         assert.strictEqual(await resolve_program(), 'arf');
-        assert.strictEqual(validator_count, 2, 'failure was not persisted');
-        assert.strictEqual(warnings.length, 2);
+        assert.strictEqual(warnings.length, 1, 'no second prompt');
+
+        // Subsequent launches short-circuit on persisted success.
+        const before = validator_count;
+        assert.strictEqual(await resolve_program(), 'arf');
+        assert.strictEqual(validator_count, before, 'persisted success skips validator');
     });
 
     test('user dismisses prompt: behaves like Keep (suppressed this session)', async () => {
