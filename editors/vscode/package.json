@@ -525,7 +525,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Path to the R executable. If empty, Raven searches for R in the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation."
+          "description": "Path to the R executable used for non-interactive subprocess calls (package introspection, library path discovery). If empty, Raven searches for R in the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation. Must point to vanilla R, not radian or arf — those are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses. For the interactive terminal program, see raven.rTerminal.program."
         },
         "raven.packages.missingPackageSeverity": {
           "type": "string",
