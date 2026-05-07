@@ -123,6 +123,9 @@ export function register_r_terminal(
             }
             const program = get_program();
             const plot_env = await get_plot_terminal_env();
+            if (token.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
             const profile = new vscode.TerminalProfile({
                 name: TERMINAL_NAME,
                 shellPath: program,
