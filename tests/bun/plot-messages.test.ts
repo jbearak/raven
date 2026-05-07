@@ -22,6 +22,14 @@ describe('plot messages', () => {
         expect(isExtensionToWebviewMessage(msg)).toBe(true);
     });
 
+    test('extension-to-webview state-update accepts null activeSession', () => {
+        const msg: ExtensionToWebviewMessage = {
+            type: 'state-update',
+            payload: { activeSession: null, sessionEnded: true },
+        };
+        expect(isExtensionToWebviewMessage(msg)).toBe(true);
+    });
+
     test('extension-to-webview includes theme-changed', () => {
         const msg: ExtensionToWebviewMessage = { type: 'theme-changed', payload: {} };
         expect(isExtensionToWebviewMessage(msg)).toBe(true);

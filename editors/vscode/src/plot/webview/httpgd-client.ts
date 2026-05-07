@@ -24,7 +24,9 @@ export function plot_url(
 }
 
 export function plots_list_url(base: string, token: string): string {
-    return `${base}/plots?token=${encodeURIComponent(token)}`;
+    const u = new URL(`${base}/plots`);
+    u.searchParams.set('token', token);
+    return u.toString();
 }
 
 export function ws_url(base: string, token: string): string {

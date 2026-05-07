@@ -23,6 +23,7 @@ const PENDING_TTL_MS = 30_000;
 
 let plot_services: PlotServices | null = null;
 let extension_context: vscode.ExtensionContext | null = null;
+let profile_written_for_storage_dir: string | null = null;
 
 const profile_terminals = new Set<vscode.Terminal>();
 let last_active_terminal: vscode.Terminal | null = null;
@@ -45,7 +46,11 @@ async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: 
     const storage_uri = extension_context.globalStorageUri;
     const storage_dir = storage_uri.fsPath;
     const profile_path = path.join(storage_dir, RAVEN_PROFILE_FILENAME);
-    await write_profile_file(storage_dir, generate_profile_source());
+    // generate_profile_source() returns static content; write once per activation.
+    if (profile_written_for_storage_dir !== storage_dir) {
+        await write_profile_file(storage_dir, generate_profile_source());
+        profile_written_for_storage_dir = storage_dir;
+    }
 
     const previous = process.env.R_PROFILE_USER;
     const env = build_terminal_env({

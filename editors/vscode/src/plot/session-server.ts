@@ -183,9 +183,11 @@ export class PlotSessionServer {
             return;
         }
 
+        // IPv6 literals must be wrapped in brackets to form a valid URL host.
+        const hostForUrl = httpgdHost.includes(':') ? `[${httpgdHost}]` : httpgdHost;
         const session: SessionInfo = {
             sessionId,
-            httpgdBaseUrl: `http://${httpgdHost}:${httpgdPort}`,
+            httpgdBaseUrl: `http://${hostForUrl}:${httpgdPort}`,
             httpgdToken,
             ended: false,
         };

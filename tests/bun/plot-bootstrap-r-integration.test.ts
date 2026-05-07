@@ -39,10 +39,15 @@ type CapturedRequest = { headers: string; body: string };
 async function start_capture_server(): Promise<{
     port: number;
     requests: CapturedRequest[];
+    waitForRequest: (
+        predicate: (r: CapturedRequest) => boolean,
+        timeoutMs: number,
+    ) => Promise<CapturedRequest>;
     close: () => Promise<void>;
 }> {
     const requests: CapturedRequest[] = [];
     const sockets = new Set<net.Socket>();
+    const waiters: { predicate: (r: CapturedRequest) => boolean; resolve: (r: CapturedRequest) => void }[] = [];
     const server = net.createServer(socket => {
         sockets.add(socket);
         let buf = Buffer.alloc(0);
@@ -52,10 +57,17 @@ async function start_capture_server(): Promise<{
         socket.on('end', () => {
             const text = buf.toString('utf8');
             const sep = text.indexOf('\r\n\r\n');
-            requests.push({
+            const req: CapturedRequest = {
                 headers: sep >= 0 ? text.slice(0, sep) : text,
                 body: sep >= 0 ? text.slice(sep + 4) : '',
-            });
+            };
+            requests.push(req);
+            for (let i = waiters.length - 1; i >= 0; i--) {
+                if (waiters[i].predicate(req)) {
+                    waiters[i].resolve(req);
+                    waiters.splice(i, 1);
+                }
+            }
         });
         socket.on('close', () => sockets.delete(socket));
         socket.write('HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n');
@@ -68,6 +80,24 @@ async function start_capture_server(): Promise<{
     return {
         port,
         requests,
+        waitForRequest(predicate, timeoutMs) {
+            const existing = requests.find(predicate);
+            if (existing) return Promise.resolve(existing);
+            return new Promise<CapturedRequest>((resolve, reject) => {
+                const entry = { predicate, resolve };
+                waiters.push(entry);
+                const timer = setTimeout(() => {
+                    const idx = waiters.indexOf(entry);
+                    if (idx >= 0) waiters.splice(idx, 1);
+                    reject(new Error(`waitForRequest timed out after ${timeoutMs}ms`));
+                }, timeoutMs);
+                const wrapped = entry.resolve;
+                entry.resolve = req => {
+                    clearTimeout(timer);
+                    wrapped(req);
+                };
+            });
+        },
         close: () =>
             new Promise<void>(resolve => {
                 for (const s of sockets) s.destroy();
@@ -105,12 +135,16 @@ describe('R bootstrap end-to-end (real R subprocess)', () => {
                 stdout: 'pipe',
                 stderr: 'pipe',
             });
+            // Wait for the /session-ready POST before tearing down the
+            // capture server, instead of a flaky fixed-timer sleep.
+            const ready = await cap.waitForRequest(
+                r => r.headers.includes('POST /session-ready'),
+                15_000,
+            );
+
             const stderr = await new Response(proc.stderr).text();
             await new Response(proc.stdout).text();
             await proc.exited;
-
-            // Allow capture sockets to flush after R closes them.
-            await new Promise(r => setTimeout(r, 250));
             await cap.close();
 
             // Bug guards: the previous text-mode socketConnection produced
@@ -120,17 +154,13 @@ describe('R bootstrap end-to-end (real R subprocess)', () => {
 
             // Functional guard: the POST actually arrived with the right
             // token, session id, and httpgd endpoint fields.
-            const ready = cap.requests.find(r =>
-                r.headers.includes('POST /session-ready'),
-            );
-            expect(ready).toBeDefined();
-            expect(ready!.headers).toContain(
+            expect(ready.headers).toContain(
                 'X-Raven-Session-Token: test-token-deadbeef',
             );
-            expect(ready!.body).toContain('test-session-id-1');
-            expect(ready!.body).toContain('"httpgdHost"');
-            expect(ready!.body).toContain('"httpgdPort"');
-            expect(ready!.body).toContain('"httpgdToken"');
+            expect(ready.body).toContain('test-session-id-1');
+            expect(ready.body).toContain('"httpgdHost"');
+            expect(ready.body).toContain('"httpgdPort"');
+            expect(ready.body).toContain('"httpgdToken"');
         },
         20_000,
     );

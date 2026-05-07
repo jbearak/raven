@@ -181,6 +181,9 @@ export class PlotViewerPanel {
             filters,
         });
         if (!target) return;
+        // Fixed export dimensions (1200x900) decouple saved file resolution from
+        // the live preview viewport, so saved plots have consistent quality
+        // regardless of how the user has the panel sized.
         const url = `${session.httpgdBaseUrl}/plot?id=${encodeURIComponent(plot_id)}` +
             `&renderer=${format}&width=1200&height=900` +
             `&token=${encodeURIComponent(session.httpgdToken)}`;

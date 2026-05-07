@@ -117,7 +117,7 @@ VS Code window
 └─ plot/
    ├─ session-server.ts       (HTTP localhost server; single shared instance)
    ├─ r-bootstrap-profile.ts  (profile generator + env builder)
-   ├─ plot-viewer-panel.ts    (singleton webview host)
+   ├─ plot-viewer-panel.ts    (per-session webview host)
    ├─ messages.ts             (typed extension <-> webview message contract)
    └─ webview/
       ├─ App.svelte
@@ -555,7 +555,7 @@ The Rust LSP test suite does not change for this feature.
 | Setting | Type | Default | Scope | Description |
 |---------|------|---------|-------|-------------|
 | `raven.plot.enabled` | boolean | `true` | user/workspace | Enable Raven's `httpgd`-backed plot viewer for Raven-managed R terminals. Not restricted in untrusted workspaces. |
-| `raven.plot.viewerColumn` | enum (`active`, `beside`) | `beside` | user/workspace | Initial editor column for the shared plot viewer panel. Once the user moves the panel, Raven leaves it where it is. |
+| `raven.plot.viewerColumn` | enum (`active`, `beside`) | `beside` | user/workspace | Initial editor column for each per-session plot viewer panel. Once the user moves the panel, Raven leaves it where it is. |
 
 There is intentionally no `raven.plot.useHttpgd` setting. The feature is
 `httpgd`-only, so a boolean backend selector would imply a fallback path that
