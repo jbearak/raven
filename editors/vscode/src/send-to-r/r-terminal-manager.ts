@@ -47,15 +47,34 @@ const exec_async = promisify(exec);
 const SAFE_PROGRAM_NAME = /^[A-Za-z0-9._-]+$/;
 const SHELL_VALIDATION_TIMEOUT_MS = 5000;
 
-// Per-session cache of validation outcomes, keyed by program name. `validated-ok`
-// means the user's shell found it on PATH; `user-kept` means it wasn't found but
-// the user opted to keep the setting anyway. Either way we don't reprompt this
-// session. Cleared when raven.rTerminal.program changes.
-type ValidationOutcome = 'validated-ok' | 'user-kept';
-const validation_cache = new Map<string, ValidationOutcome>();
+// Per-machine "shell found this program" record (ExtensionContext.globalState,
+// which doesn't sync). Only successes are persisted: once the shell has
+// validated a program on this machine, we never re-spawn the shell to check
+// again. Failures are not persisted — next session we re-validate, in case
+// the user has since installed the program.
+const VALIDATED_KEY_PREFIX = 'rTerminal.programValidated.';
 
-export function _reset_validation_cache_for_test(): void {
-    validation_cache.clear();
+function is_program_validated_on_this_machine(program: string): boolean {
+    return extension_context?.globalState.get<boolean>(VALIDATED_KEY_PREFIX + program) === true;
+}
+
+async function persist_program_validated(program: string): Promise<void> {
+    await extension_context?.globalState.update(VALIDATED_KEY_PREFIX + program, true);
+}
+
+// Per-session: the user opted to keep a program we couldn't find. Don't
+// re-prompt for the rest of this session; next session we'll re-check.
+const session_user_kept = new Set<string>();
+
+export async function _clear_validation_state_for_test(): Promise<void> {
+    session_user_kept.clear();
+    const ctx = extension_context;
+    if (!ctx) return;
+    for (const key of ctx.globalState.keys()) {
+        if (key.startsWith(VALIDATED_KEY_PREFIX)) {
+            await ctx.globalState.update(key, undefined);
+        }
+    }
 }
 
 // Probes for the program in the user's interactive-login shell, where rc-file
@@ -86,18 +105,21 @@ export function _set_validator_for_test(
 }
 
 // Resolves the program to launch for an R terminal. For non-`R` configurations
-// it validates via the user's shell and, if the program isn't found, prompts
-// the user to switch to `R` for this machine. Picking "Switch to R" updates
-// the Global (== per-machine in Remote-SSH) setting so the synced User default
-// stays intact. Picking "Keep" lets the configured value through and lets VS
-// Code surface its own launch failure.
+// it validates via the user's shell once per machine; the success is persisted
+// and we never re-spawn the shell for that program again on this host. If the
+// shell can't find the program we prompt with Switch-to-R / Keep. Picking
+// "Switch to R" updates the Global (== per-machine in Remote-SSH) setting so
+// the synced User default stays intact; "Keep" lets the configured value
+// through, and VS Code's own launch UX surfaces a real failure if the shell
+// check was a false negative (e.g. terminal.integrated.env.* PATH additions).
 export async function resolve_program(): Promise<string> {
     const configured = get_program();
     if (configured === 'R') return 'R';
-    if (validation_cache.has(configured)) return configured;
+    if (is_program_validated_on_this_machine(configured)) return configured;
+    if (session_user_kept.has(configured)) return configured;
 
     if (await _validator(configured)) {
-        validation_cache.set(configured, 'validated-ok');
+        await persist_program_validated(configured);
         return configured;
     }
 
@@ -114,7 +136,7 @@ export async function resolve_program(): Promise<string> {
             .update('program', 'R', vscode.ConfigurationTarget.Global);
         return 'R';
     }
-    validation_cache.set(configured, 'user-kept');
+    session_user_kept.add(configured);
     return configured;
 }
 
@@ -233,7 +255,7 @@ export function register_r_terminal(
             if (event.affectsConfiguration('raven.rTerminal.program')) {
                 profile_terminals.clear();
                 last_active_terminal = null;
-                validation_cache.clear();
+                session_user_kept.clear();
             }
         }),
     );

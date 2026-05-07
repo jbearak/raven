@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
     resolve_program,
-    _reset_validation_cache_for_test,
+    _clear_validation_state_for_test,
     _set_validator_for_test,
 } from '../../send-to-r/r-terminal-manager';
 
@@ -12,7 +12,7 @@ suite('rTerminal.program shell-validated fallback', () => {
     let warning_response: string | undefined = undefined;
     let validator_calls: string[] = [];
 
-    setup(() => {
+    setup(async () => {
         warnings = [];
         warning_response = undefined;
         validator_calls = [];
@@ -25,14 +25,14 @@ suite('rTerminal.program shell-validated fallback', () => {
             warnings.push({ message: msg, items });
             return Promise.resolve(warning_response);
         };
-        _reset_validation_cache_for_test();
+        await _clear_validation_state_for_test();
     });
 
     teardown(async () => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (vscode.window as any).showWarningMessage = original_show_warning;
         _set_validator_for_test(null);
-        _reset_validation_cache_for_test();
+        await _clear_validation_state_for_test();
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', undefined, vscode.ConfigurationTarget.Global);
@@ -51,7 +51,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         assert.deepStrictEqual(warnings, []);
     });
 
-    test('shell finds program: returns it, no prompt, caches', async () => {
+    test('shell finds program: returns it, persists, never re-validates', async () => {
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', 'radian', vscode.ConfigurationTarget.Global);
@@ -61,7 +61,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         });
         assert.strictEqual(await resolve_program(), 'radian');
         assert.strictEqual(await resolve_program(), 'radian');
-        assert.deepStrictEqual(validator_calls, ['radian'], 'second call hits cache');
+        assert.deepStrictEqual(validator_calls, ['radian'], 'second call hits persisted state');
         assert.deepStrictEqual(warnings, []);
     });
 
@@ -82,7 +82,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         assert.strictEqual(after, 'R');
     });
 
-    test('shell does not find program, user picks Keep: returns configured, caches', async () => {
+    test('shell does not find program, user picks Keep: returns configured, no second prompt this session', async () => {
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', 'arf', vscode.ConfigurationTarget.Global);
@@ -92,11 +92,34 @@ suite('rTerminal.program shell-validated fallback', () => {
 
         assert.strictEqual(await resolve_program(), 'arf');
         assert.strictEqual(await resolve_program(), 'arf');
-        assert.strictEqual(validator_count, 1, 'second call hits cache');
-        assert.strictEqual(warnings.length, 1, 'no second prompt');
+        assert.strictEqual(validator_count, 1, 'session-cached: do not re-validate');
+        assert.strictEqual(warnings.length, 1, 'no second prompt this session');
     });
 
-    test('user dismisses prompt: returns configured, caches as user-kept', async () => {
+    test('failures are NOT persisted: re-validates after clearing session state', async () => {
+        await vscode.workspace
+            .getConfiguration('raven.rTerminal')
+            .update('program', 'arf', vscode.ConfigurationTarget.Global);
+        let validator_count = 0;
+        _set_validator_for_test(async () => { validator_count++; return false; });
+        warning_response = 'Keep';
+
+        // First "session": Keep is selected; cached for this session only.
+        assert.strictEqual(await resolve_program(), 'arf');
+        assert.strictEqual(validator_count, 1);
+
+        // Simulate a new session by clearing in-memory session state. Persisted
+        // state is unchanged (no success was persisted).
+        await _clear_validation_state_for_test();
+
+        // Next "session" re-validates — this is the "user might have installed
+        // it since" path.
+        assert.strictEqual(await resolve_program(), 'arf');
+        assert.strictEqual(validator_count, 2, 'failure was not persisted');
+        assert.strictEqual(warnings.length, 2);
+    });
+
+    test('user dismisses prompt: behaves like Keep (suppressed this session)', async () => {
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', 'arf', vscode.ConfigurationTarget.Global);
@@ -105,6 +128,6 @@ suite('rTerminal.program shell-validated fallback', () => {
 
         assert.strictEqual(await resolve_program(), 'arf');
         assert.strictEqual(await resolve_program(), 'arf');
-        assert.strictEqual(warnings.length, 1, 'no reprompt after dismiss');
+        assert.strictEqual(warnings.length, 1, 'no reprompt within session after dismiss');
     });
 });
