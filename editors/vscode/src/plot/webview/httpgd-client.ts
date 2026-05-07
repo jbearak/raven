@@ -57,6 +57,10 @@ export function create_httpgd_client(base: string, token: string): HttpgdClient 
 
     return {
         subscribe(onChange) {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
             listener = onChange;
             ws = new WebSocket(ws_url(base, token));
             ws.addEventListener('message', () => listener?.());
@@ -70,7 +74,7 @@ export function create_httpgd_client(base: string, token: string): HttpgdClient 
             return (body.plots ?? []).map(p => p.id);
         },
         async remove(id: string) {
-            const r = await fetch(remove_url(base, token, id), { method: 'POST' });
+            const r = await fetch(remove_url(base, token, id));
             if (!r.ok) throw new Error(`httpgd /remove ${r.status}`);
         },
         close() {
