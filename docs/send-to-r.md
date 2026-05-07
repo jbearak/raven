@@ -89,3 +89,55 @@ By default, the cursor advances to the next line after sending a single statemen
 |---------|------|---------|-------------|
 | `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"`, `"arf"`, or `"radian"` |
 | `raven.sendToR.advanceCursorOnSend` | boolean | `true` | Advance cursor to next line after sending a single statement |
+
+## Plot Viewer
+
+When `raven.plot.enabled` is `true` (the default), Raven shows plots from the
+managed R terminal directly in VS Code via a built-in viewer.
+
+### Prerequisites
+
+Install the [httpgd](https://nx10.dev/httpgd/) R package, version `2.0.2` or
+newer:
+
+```r
+install.packages("httpgd")
+```
+
+No other R packages are required. Standard R, [arf](https://github.com/eitsupi/arf),
+and [radian](https://github.com/randy3k/radian) all work because Raven loads its
+bootstrap profile via `R_PROFILE_USER`.
+
+### Behavior
+
+- Run any plotting code in the Raven R terminal (e.g., `plot(1:10)`, `ggplot(...) + geom_point()`).
+- The first plot from each R session opens its own "Raven Plot Viewer" panel
+  in the column configured by `raven.plot.viewerColumn` (default: `beside`).
+  The second session's panel is "Raven Plot Viewer 2", the third "Raven Plot
+  Viewer 3", and so on (numbered per VS Code window). Each R terminal
+  therefore gets a separate viewer with its own plot history.
+- Subsequent plots from the same session update that session's panel without
+  stealing focus from your editor.
+- The viewer toolbar provides previous/next history navigation, remove
+  current plot, copy to clipboard, save (PNG/SVG/PDF), and open externally.
+  Right-clicking a plot copies it to the clipboard as PNG.
+- If your terminal exits, the last rendered plot stays visible with an
+  "R session ended" indicator. Closing the panel manually is fine; the next
+  plot from that same R session would recreate it.
+
+### Settings
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `raven.plot.enabled` | `true` | Enable the plot viewer for Raven-managed terminals. |
+| `raven.plot.viewerColumn` | `beside` | Initial column when a new viewer opens. |
+
+### Troubleshooting
+
+- **No viewer appears.** Confirm httpgd is installed (`packageVersion("httpgd")`)
+  and that you're running R inside a terminal launched via Raven (the terminal
+  profile dropdown's "R (Raven)" entry, or any of Raven's send-to-R commands).
+  Plots from terminals you opened manually outside Raven won't trigger the viewer.
+- **httpgd console message about installing or upgrading.** Follow the printed
+  `install.packages("httpgd")` instructions. Plots fall back to R's default
+  graphics device until httpgd is available.

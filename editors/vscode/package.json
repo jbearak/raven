@@ -585,14 +585,29 @@
           ],
           "default": "rstudio",
           "description": "Indentation style for R code. Controls the AST-aware (Tier 2) indentation behavior. Set to 'off' to disable Tier 2 while keeping basic indentation rules active."
+        },
+        "raven.plot.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Raven's httpgd-backed plot viewer for Raven-managed R terminals. Plots from `R`, `radian`, or `arf` running in the Raven terminal appear in a VS Code webview. Requires the httpgd R package (>= 2.0.2)."
+        },
+        "raven.plot.viewerColumn": {
+          "type": "string",
+          "enum": ["active", "beside"],
+          "enumDescriptions": [
+            "Open the plot viewer in the active editor column.",
+            "Open the plot viewer beside the active editor."
+          ],
+          "default": "beside",
+          "description": "Initial editor column when the plot viewer first opens. Once you move the panel, Raven leaves it where you put it."
         }
       }
     }
   },
   "scripts": {
     "vscode:prepublish": "bun run bundle && bun run copy-binary",
-    "bundle": "bunx esbuild src/extension.ts --bundle --platform=node --outfile=dist/extension.js --external:vscode --minify",
-    "copy-binary": "bun scripts/bundle.js",
+    "bundle": "bun scripts/build.js",
+    "copy-binary": "bun scripts/bundle-binary.js",
     "compile": "bun run bundle",
     "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
@@ -600,7 +615,7 @@
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
     "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/plot/webview"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -617,7 +632,10 @@
     "@vscode/test-electron": "^2.3.9",
     "@vscode/vsce": "^3.9.1",
     "esbuild": "^0.27.2",
+    "esbuild-svelte": "^0.9.0",
     "fast-check": "^4.5.3",
+    "svelte": "^5.0.0",
+    "svelte-preprocess": "^6.0.0",
     "mocha": "^11.0.0",
     "typescript": "^5.0.0"
   }
