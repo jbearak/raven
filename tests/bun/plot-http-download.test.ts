@@ -69,9 +69,9 @@ describe('download_to_buffer', () => {
     });
 
     test('rejects when redirect chain exceeds max_redirects', async () => {
-        await start((req, res) => {
+        await start((_req, res) => {
             // Always redirect to itself; chain grows without bound.
-            res.writeHead(302, { location: req.url ?? '/loop' }).end();
+            res.writeHead(302, { location: '/loop' }).end();
         });
         await expect(
             download_to_buffer(`http://127.0.0.1:${port}/loop`, { max_redirects: 2 }),
