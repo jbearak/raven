@@ -8,6 +8,7 @@ import {
     SaveFormat,
 } from './messages';
 import { PlotSessionServer } from './session-server';
+import { download_to_buffer } from './http-download';
 
 type ViewerColumn = 'active' | 'beside';
 
@@ -193,9 +194,10 @@ export class PlotViewerPanel {
         const url = `${session.httpgdBaseUrl}/plot?id=${encodeURIComponent(plot_id)}` +
             `&renderer=${format}&width=1200&height=900` +
             `&token=${encodeURIComponent(session.httpgdToken)}`;
-        const r = await fetch(url);
-        if (!r.ok) throw new Error(`httpgd ${r.status}`);
-        const buf = Buffer.from(await r.arrayBuffer());
+        // Use Node's http/https modules instead of the global `fetch`, which
+        // is not available on the Node 16 runtime shipped by VS Code 1.75
+        // (see engines.vscode in package.json).
+        const buf = await download_to_buffer(url);
         await fs.writeFile(target.fsPath, buf);
     }
 

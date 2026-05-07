@@ -33,11 +33,22 @@ export function initial_state(): ViewerState {
 export function reduce(state: ViewerState, action: ViewerAction): ViewerState {
     switch (action.type) {
         case 'SET_ACTIVE_SESSION': {
+            // Preserve plot history when transitioning to a session-ended
+            // state so the "Showing last plot" banner has a plot to show.
+            // SESSION_ENDED follows this dispatch and flips the phase to
+            // 'disconnected' (see App.svelte attach_session).
+            if (action.sessionEnded) {
+                return {
+                    ...state,
+                    activeSession: action.activeSession,
+                    sessionEnded: true,
+                };
+            }
             const phase: Phase = action.activeSession ? 'empty' : 'loading';
             return {
                 ...state,
                 activeSession: action.activeSession,
-                sessionEnded: action.sessionEnded,
+                sessionEnded: false,
                 phase,
                 plotIds: [],
                 currentIndex: 0,

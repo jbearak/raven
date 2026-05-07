@@ -20,12 +20,22 @@ export class PlotServices {
     private readonly session_indices = new Map<string, number>();
     private next_panel_index = 1;
     private detach_session_listener: (() => void) | null = null;
+    private config_subscription: vscode.Disposable | null = null;
     private started = false;
     private start_failed = false;
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
         this.detach_session_listener = this.server.onEvent(e => this.on_server_event(e));
+        this.config_subscription = vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('raven.plot.enabled') && !this.isEnabled()) {
+                // User disabled the plot viewer: tear down the running server
+                // and any open panels so future terminals don't pick up plot
+                // bootstrap env, and existing webviews close. Re-enabling later
+                // re-starts on the next ensureStarted() call.
+                void this.shutdown_for_disable();
+            }
+        });
     }
 
     isEnabled(): boolean {
@@ -33,9 +43,14 @@ export class PlotServices {
     }
 
     async ensureStarted(): Promise<boolean> {
+        // Re-check enablement on every call: a previously-started server must
+        // not keep handing out plot env after the user disables the setting.
+        if (!this.isEnabled()) {
+            if (this.started) await this.shutdown_for_disable();
+            return false;
+        }
         if (this.started) return true;
         if (this.start_failed) return false;
-        if (!this.isEnabled()) return false;
         try {
             await this.server.start();
             this.started = true;
@@ -60,9 +75,20 @@ export class PlotServices {
     async dispose(): Promise<void> {
         this.detach_session_listener?.();
         this.detach_session_listener = null;
+        this.config_subscription?.dispose();
+        this.config_subscription = null;
         this.dispose_all_panels();
         await this.server.stop();
         this.started = false;
+    }
+
+    private async shutdown_for_disable(): Promise<void> {
+        this.dispose_all_panels();
+        this.session_indices.clear();
+        this.next_panel_index = 1;
+        await this.server.stop();
+        this.started = false;
+        this.start_failed = false;
     }
 
     private dispose_all_panels(): void {

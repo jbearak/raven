@@ -88,6 +88,53 @@ describe('webview state reducer', () => {
         expect(s.plotIds).toEqual(['p1']);
     });
 
+    test('SET_ACTIVE_SESSION with sessionEnded=true preserves plot history', () => {
+        // Reproduces the panel's session-ended state-update message:
+        //   activeSession=<session>, sessionEnded=true.
+        // App.svelte dispatches SET_ACTIVE_SESSION before SESSION_ENDED,
+        // so the SET_ACTIVE_SESSION step must not clear plotIds/currentIndex.
+        let s = reduce(initial_state(), {
+            type: 'SET_ACTIVE_SESSION',
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            sessionEnded: false,
+        });
+        s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2', 'p3'] });
+        // Step the user back from the most recent plot to ensure the index is
+        // preserved across the session-ended transition.
+        s = reduce(s, { type: 'GO_PREV' });
+        expect(s.currentIndex).toBe(1);
+        s = reduce(s, {
+            type: 'SET_ACTIVE_SESSION',
+            activeSession: { sessionId: 's', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            sessionEnded: true,
+        });
+        expect(s.plotIds).toEqual(['p1', 'p2', 'p3']);
+        expect(s.currentIndex).toBe(1);
+        expect(s.sessionEnded).toBe(true);
+        s = reduce(s, { type: 'SESSION_ENDED' });
+        expect(s.phase).toBe('disconnected');
+        expect(s.plotIds).toEqual(['p1', 'p2', 'p3']);
+        expect(s.currentIndex).toBe(1);
+    });
+
+    test('SET_ACTIVE_SESSION with sessionEnded=false still resets plots', () => {
+        let s = reduce(initial_state(), {
+            type: 'SET_ACTIVE_SESSION',
+            activeSession: { sessionId: 'a', httpgdBaseUrl: 'http://x', httpgdToken: 't' },
+            sessionEnded: false,
+        });
+        s = reduce(s, { type: 'SET_PLOT_IDS', plotIds: ['p1', 'p2'] });
+        s = reduce(s, {
+            type: 'SET_ACTIVE_SESSION',
+            activeSession: { sessionId: 'b', httpgdBaseUrl: 'http://y', httpgdToken: 'u' },
+            sessionEnded: false,
+        });
+        expect(s.plotIds).toEqual([]);
+        expect(s.currentIndex).toBe(0);
+        expect(s.phase).toBe('empty');
+        expect(s.sessionEnded).toBe(false);
+    });
+
     test('SET_THEME_BG records the bg', () => {
         const s = reduce(initial_state(), {
             type: 'SET_THEME_BG',
