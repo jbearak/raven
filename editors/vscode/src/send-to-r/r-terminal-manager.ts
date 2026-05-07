@@ -43,9 +43,7 @@ function sweep_pending() {
     }
 }
 
-async function get_plot_terminal_env(
-    program_name: string,
-): Promise<{ env: RavenPlotEnv; sessionId: string } | null> {
+async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: string } | null> {
     if (!plot_services || !extension_context) return null;
     const ok = await plot_services.ensureStarted();
     if (!ok) return null;
@@ -119,7 +117,7 @@ export function register_r_terminal(
                 throw new vscode.CancellationError();
             }
             const program = get_program();
-            const plot_env = await get_plot_terminal_env(program);
+            const plot_env = await get_plot_terminal_env();
             const profile = new vscode.TerminalProfile({
                 name: TERMINAL_NAME,
                 shellPath: program,
@@ -167,7 +165,7 @@ export async function get_or_create_r_terminal(): Promise<vscode.Terminal> {
 
 async function create_r_terminal(): Promise<vscode.Terminal> {
     const program = get_program();
-    const plot_env = await get_plot_terminal_env(program);
+    const plot_env = await get_plot_terminal_env();
     const terminal = vscode.window.createTerminal({
         name: TERMINAL_NAME,
         shellPath: program,
