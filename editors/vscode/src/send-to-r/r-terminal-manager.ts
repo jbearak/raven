@@ -1,5 +1,4 @@
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { PlotServices } from '../plot';
 import {
@@ -40,52 +39,6 @@ const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
 function get_program(): string {
     const config = vscode.workspace.getConfiguration('raven.rTerminal');
     return config.get<string>('program', 'R');
-}
-
-const fallback_warned_for = new Set<string>();
-
-export function _reset_fallback_warned_for_test(): void {
-    fallback_warned_for.clear();
-}
-
-function program_is_on_path(name: string): boolean {
-    const path_var = process.env.PATH ?? '';
-    const sep = process.platform === 'win32' ? ';' : ':';
-    const exts = process.platform === 'win32'
-        ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';')
-        : [''];
-    for (const dir of path_var.split(sep)) {
-        if (!dir) continue;
-        for (const ext of exts) {
-            const candidate = path.join(dir, name + ext);
-            try {
-                fs.accessSync(candidate, fs.constants.X_OK);
-                return true;
-            } catch {
-                // not executable here; try next
-            }
-        }
-    }
-    return false;
-}
-
-// Resolves the configured terminal program, falling back to `R` (and warning
-// the user once per session) when the configured value isn't on PATH. Lets
-// users sync `raven.rTerminal.program` across machines without breaking on
-// hosts where `arf` or `radian` aren't installed.
-export function resolve_program(): string {
-    const configured = get_program();
-    if (configured === 'R' || program_is_on_path(configured)) {
-        return configured;
-    }
-    if (!fallback_warned_for.has(configured)) {
-        fallback_warned_for.add(configured);
-        void vscode.window.showWarningMessage(
-            `Raven: '${configured}' is not on PATH; launching standard R console instead. `
-            + `Install ${configured} or change raven.rTerminal.program.`
-        );
-    }
-    return 'R';
 }
 
 async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: string } | null> {
@@ -168,7 +121,7 @@ export function register_r_terminal(
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
             }
-            const program = resolve_program();
+            const program = get_program();
             const plot_env = await get_plot_terminal_env();
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
@@ -200,7 +153,6 @@ export function register_r_terminal(
             if (event.affectsConfiguration('raven.rTerminal.program')) {
                 profile_terminals.clear();
                 last_active_terminal = null;
-                fallback_warned_for.clear();
             }
         }),
     );
@@ -220,7 +172,7 @@ export async function get_or_create_r_terminal(): Promise<vscode.Terminal> {
 }
 
 async function create_r_terminal(): Promise<vscode.Terminal> {
-    const program = resolve_program();
+    const program = get_program();
     const plot_env = await get_plot_terminal_env();
     const terminal = vscode.window.createTerminal({
         name: TERMINAL_NAME,
