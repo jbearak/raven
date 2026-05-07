@@ -72,9 +72,7 @@ export class PlotViewerPanel {
             this.ensure_panel();
             this.post_state_update();
         } else if (event.type === 'session-ended') {
-            if (this.server.activeSessionId === event.sessionId) {
-                this.post_state_update();
-            }
+            this.post_state_update();
         }
     }
 
