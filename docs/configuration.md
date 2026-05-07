@@ -52,6 +52,13 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 
 **Raven: Refresh package cache** (`raven.refreshPackages`) — re-runs `.libPaths()`, rebuilds the package library, restarts the filesystem watcher, clears the cache, and republishes diagnostics. Use after `renv::activate()`, `.libPaths()` changes, or if the watcher misses an event.
 
+## Plot Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.plot.enabled` | `true` | Enable Raven's httpgd-backed plot viewer for Raven-managed R terminals. Requires the `httpgd` R package (>= 2.0.2). See [Send to R → Plot Viewer](send-to-r.md#plot-viewer). |
+| `raven.plot.viewerColumn` | `beside` | Initial editor column for the shared plot viewer panel when the first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. |
+
 ## Symbol Settings
 
 | Setting | Default | Description |
