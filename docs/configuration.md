@@ -42,7 +42,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | Setting | Default | Description |
 |---|---|---|
 | `raven.packages.enabled` | `true` | Enable package function awareness |
-| `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls |
+| `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls. Must point to vanilla `R` — not `radian` or `arf`, which are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses for package introspection. For the interactive terminal program, see [`raven.rTerminal.program`](send-to-r.md#choosing-the-r-program). |
 | `raven.packages.additionalLibraryPaths` | `[]` | Additional R library paths for package discovery |
 | `raven.packages.missingPackageSeverity` | `"warning"` | Severity for missing package diagnostics (`"off"` to disable) |
 | `raven.packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on install/remove |
