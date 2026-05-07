@@ -9,6 +9,7 @@ import {
 } from './messages';
 import { PlotSessionServer } from './session-server';
 import { download_to_buffer } from './http-download';
+import { csp_sources_for_external_base } from './csp';
 
 type ViewerColumn = 'active' | 'beside';
 
@@ -16,7 +17,12 @@ function reveal_view_column(setting: ViewerColumn): vscode.ViewColumn {
     return setting === 'active' ? vscode.ViewColumn.Active : vscode.ViewColumn.Beside;
 }
 
-function build_html(webview: vscode.Webview, extension_uri: vscode.Uri, nonce: string): string {
+function build_html(
+    webview: vscode.Webview,
+    extension_uri: vscode.Uri,
+    nonce: string,
+    externalBaseUrl: string,
+): string {
     const js_uri = webview.asWebviewUri(
         vscode.Uri.joinPath(extension_uri, 'dist', 'webviews', 'plot-viewer', 'index.js'),
     );
@@ -29,13 +35,18 @@ function build_html(webview: vscode.Webview, extension_uri: vscode.Uri, nonce: s
     // to that host fail silently.
     const loopbackHttp = 'http://127.0.0.1:* http://localhost:* http://[::1]:*';
     const loopbackWs = 'ws://127.0.0.1:* ws://localhost:* ws://[::1]:*';
+    const external = csp_sources_for_external_base(externalBaseUrl);
+    const imgSrc = `${webview.cspSource} ${loopbackHttp} ${external.http} data:`.trim();
+    const connectSrc = `${loopbackHttp} ${loopbackWs} ${external.http} ${external.ws}`
+        .replace(/\s+/g, ' ')
+        .trim();
     const csp = [
         `default-src 'none'`,
-        `img-src ${webview.cspSource} ${loopbackHttp} data:`,
+        `img-src ${imgSrc}`,
         `script-src ${webview.cspSource} 'nonce-${nonce}'`,
         `style-src ${webview.cspSource} 'unsafe-inline'`,
         `font-src ${webview.cspSource}`,
-        `connect-src ${loopbackHttp} ${loopbackWs}`,
+        `connect-src ${connectSrc}`,
     ].join('; ');
     return `<!doctype html>
 <html lang="en">
@@ -70,6 +81,11 @@ export interface PlotViewerPanelOptions {
 export class PlotViewerPanel {
     private panel: vscode.WebviewPanel | null = null;
     private theme_sub: vscode.Disposable | null = null;
+    /** httpgd base URL after `vscode.env.asExternalUri` mapping. Computed
+     *  once when the panel is created so the CSP and the URLs sent to the
+     *  webview stay consistent. Equal to the loopback URL on local hosts. */
+    private external_base_url: string | null = null;
+    private ensure_panel_in_flight: Promise<void> | null = null;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -81,14 +97,13 @@ export class PlotViewerPanel {
 
     /** Reveal the panel (creating it if needed) and push the current state. */
     notifyPlotAvailable(): void {
-        this.ensure_panel();
-        void this.post_state_update();
+        void this.ensure_panel().then(() => this.post_state_update());
     }
 
     /** Push state-update so the webview can show the "session ended" banner.
      *  Does not create a panel if none exists yet. */
     notifySessionEnded(): void {
-        void this.post_state_update();
+        this.post_state_update();
     }
 
     dispose(): void {
@@ -98,8 +113,28 @@ export class PlotViewerPanel {
         this.theme_sub = null;
     }
 
-    private ensure_panel(): void {
+    private async ensure_panel(): Promise<void> {
         if (this.panel) return;
+        if (this.ensure_panel_in_flight) return this.ensure_panel_in_flight;
+        this.ensure_panel_in_flight = this.create_panel().finally(() => {
+            this.ensure_panel_in_flight = null;
+        });
+        return this.ensure_panel_in_flight;
+    }
+
+    private async create_panel(): Promise<void> {
+        // Compute the externally-reachable httpgd base URL once and reuse it
+        // for both the CSP allow-list and every URL we post to the webview,
+        // so they cannot drift. On a local host this is the loopback URL
+        // unchanged; on a remote host (SSH, WSL, Codespaces) it's the
+        // tunnel origin assigned by VS Code.
+        const session = this.server.getSession(this.sessionId);
+        if (session && this.external_base_url === null) {
+            const mapped = await vscode.env.asExternalUri(vscode.Uri.parse(session.httpgdBaseUrl));
+            // Strip a trailing slash that vscode.Uri may add, so that
+            // `${base}/plot` keeps the same shape as before.
+            this.external_base_url = mapped.toString(true).replace(/\/$/, '');
+        }
         const config = vscode.workspace.getConfiguration('raven.plot');
         const column_setting = config.get<ViewerColumn>('viewerColumn', 'beside');
         const title = this.panelIndex === 1
@@ -118,7 +153,12 @@ export class PlotViewerPanel {
             },
         );
         const nonce = crypto.randomBytes(16).toString('base64');
-        panel.webview.html = build_html(panel.webview, this.context.extensionUri, nonce);
+        panel.webview.html = build_html(
+            panel.webview,
+            this.context.extensionUri,
+            nonce,
+            this.external_base_url ?? '',
+        );
         panel.webview.onDidReceiveMessage((msg) => this.on_webview_message(msg));
         panel.onDidDispose(() => {
             this.panel = null;
@@ -132,25 +172,13 @@ export class PlotViewerPanel {
         this.panel = panel;
     }
 
-    private async post_state_update(): Promise<void> {
+    private post_state_update(): void {
         if (!this.panel) return;
         const session = this.server.getSession(this.sessionId);
-        // Translate the loopback httpgd base URL through asExternalUri so it
-        // remains reachable from the webview in remote VS Code hosts (SSH, WSL,
-        // containers, Codespaces). On a local host this is a no-op. We do this
-        // only for what the webview consumes; extension-host code paths
-        // (download_to_buffer in handle_save) keep using the loopback URL.
-        let externalBaseUrl = session?.httpgdBaseUrl ?? '';
-        if (session) {
-            try {
-                const mapped = await vscode.env.asExternalUri(vscode.Uri.parse(session.httpgdBaseUrl));
-                // Strip a trailing slash that vscode.Uri may add, so that
-                // `${base}/plot` keeps the same shape as before.
-                externalBaseUrl = mapped.toString(true).replace(/\/$/, '');
-            } catch {
-                externalBaseUrl = session.httpgdBaseUrl;
-            }
-        }
+        // The mapped URL is computed once at panel creation. The CSP in the
+        // webview HTML was generated against the same value, so the webview
+        // can always fetch/connect to whatever we post here.
+        const externalBaseUrl = this.external_base_url ?? session?.httpgdBaseUrl ?? '';
         this.post(this.panel, {
             type: 'state-update',
             payload: {
@@ -175,7 +203,7 @@ export class PlotViewerPanel {
         if (!isWebviewToExtensionMessage(msg)) return;
         switch (msg.type) {
             case 'webview-ready':
-                void this.post_state_update();
+                this.post_state_update();
                 break;
             case 'request-save-plot':
                 this.handle_save(msg.payload.plotId, msg.payload.format).catch(err => {
@@ -224,13 +252,10 @@ export class PlotViewerPanel {
     private async handle_open_externally(plot_id: string): Promise<void> {
         const session = this.server.getSession(this.sessionId);
         if (!session) return;
-        // Map the loopback URL through asExternalUri so that on remote hosts
-        // (SSH, WSL, Codespaces) the user's local browser opens the
-        // forwarded port instead of the empty loopback on their client.
-        const mapped = await vscode.env.asExternalUri(
-            vscode.Uri.parse(session.httpgdBaseUrl),
-        );
-        const externalBase = mapped.toString(true).replace(/\/$/, '');
+        // Use the externally-reachable URL computed at panel creation so the
+        // user's local browser opens the forwarded port on remote hosts
+        // (SSH, WSL, Codespaces) instead of an unreachable loopback.
+        const externalBase = this.external_base_url ?? session.httpgdBaseUrl;
         const cacheBuster = session.lastUpid > 0
             ? `&c=${session.lastUpid}`
             : '';

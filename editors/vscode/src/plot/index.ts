@@ -4,8 +4,11 @@ import { PlotViewerPanel } from './plot-viewer-panel';
 
 /**
  * Per-window plot services. Lazily started on first managed terminal
- * creation when raven.plot.enabled is true; restarted by raven.restart;
- * disposed on extension deactivation.
+ * creation when raven.plot.enabled is true; disposed on extension
+ * deactivation. Intentionally NOT torn down by raven.restart — existing
+ * Raven-managed R terminals already hold the current session port/token
+ * in their environment, so cycling the server would leave them POSTing
+ * to a dead port until the user closes them.
  *
  * Owns one `PlotViewerPanel` per R session. The first /plot-available
  * event for a session creates that session's panel; closing the panel
