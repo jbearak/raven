@@ -1,9 +1,6 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 
-declare const suite: Mocha.SuiteFunction;
-declare const test: Mocha.TestFunction;
-
 suite('Raven plot settings', () => {
     test('raven.plot.enabled defaults to true', () => {
         const cfg = vscode.workspace.getConfiguration('raven.plot');

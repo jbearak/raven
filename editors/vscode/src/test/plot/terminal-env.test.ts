@@ -1,10 +1,6 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 
-declare const suite: Mocha.SuiteFunction;
-declare const test: Mocha.TestFunction;
-declare const teardown: Mocha.HookFunction;
-
 suite('Raven plot terminal integration', () => {
     teardown(async () => {
         await vscode.workspace
