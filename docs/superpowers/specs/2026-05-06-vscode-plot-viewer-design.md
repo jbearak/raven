@@ -22,8 +22,12 @@ The product shape was settled in the 2026-05-06 brainstorm:
 
 - `httpgd`-only (no static-PNG fallback, no auto-install).
 - Custom Svelte webview (not an iframe of httpgd's built-in UI).
-- Single shared panel that updates to the most recent plot without stealing
-  focus from the active editor.
+- One panel per R session — each managed terminal owns its own viewer with
+  its own plot history. Panels are titled "R Plots N" with N assigned per VS
+  Code window. Originally the design used a single shared panel that followed
+  the most recent plot, but in practice users could not navigate the history
+  of a non-most-recent terminal without switching back to it; per-session
+  panels remove that interaction trap.
 - Lazy panel: created on the first plot, recreated automatically on the next
   plot if the user closes it.
 - v1 controls: latest-plot display with auto-resize, theme-aware background,
@@ -41,8 +45,8 @@ Goals:
    paths: `get_or_create_r_terminal()` and the contributed `raven.rTerminal`
    terminal profile.
 3. Use `httpgd >= 2.0.2` as the only R graphics backend.
-4. Show a single shared VS Code webview panel that switches to the most recent
-   plot across managed R terminals.
+4. Show a separate VS Code webview panel for each R session so each
+   terminal's plot history is independently navigable.
 5. Preserve the user's normal R startup behavior even though Raven must set
    `R_PROFILE_USER`.
 6. Keep the Rust LSP server untouched.
@@ -75,12 +79,13 @@ terminal sees:
    not started.
 4. If `httpgd` is available, Raven starts an `httpgd` device for that R session
    and the bootstrap reports the device endpoint to the extension.
-5. The first plot opens a single shared "Raven Plot Viewer" panel in the
-   configured editor column. Later plots reuse that panel and update its content
-   to the newest plot. Reusing the panel does not steal focus from the user's
-   current editor or change the panel's column.
-6. Multiple Raven-managed R terminals share the same extension session server.
-   The most recent plot from any live session becomes the active plot.
+5. The first plot from each R session opens an "R Plots N" panel in the
+   configured editor column (N is assigned per VS Code window in the order
+   sessions first plot). Later plots from the same session update that panel
+   without stealing focus or changing its column.
+6. Multiple Raven-managed R terminals share the same extension session server,
+   but each session has its own panel and its own httpgd-backed plot history.
+   The user can navigate the histories independently.
 7. The viewer exposes previous/next history navigation, remove-current-plot,
    save (PNG/SVG/PDF), and open-externally controls.
 8. Closing the viewer panel does not disable plotting. The next plot recreates
@@ -296,10 +301,12 @@ calls `plot_services.markSessionEnded(sessionId)`, which informs the panel.
 
 ### Plot Viewer Webview
 
-`plot/plot-viewer-panel.ts` owns the single shared webview panel:
+`plot/plot-viewer-panel.ts` defines a per-session webview panel; one instance
+exists per R session and is owned by `PlotServices` via a
+`Map<sessionId, PlotViewerPanel>`. Each panel:
 
-- Creates the panel lazily on first `/plot-available` and reveals it once in
-  `raven.plot.viewerColumn` (with `preserveFocus: true`).
+- Is created lazily on the first `/plot-available` event for its session and
+  revealed once in `raven.plot.viewerColumn` (with `preserveFocus: true`).
 - For subsequent plots, posts a `state-update` to the existing webview to
   update content. Does not call `panel.reveal()` again, so the panel stays in
   whatever column the user has it in and never steals focus.

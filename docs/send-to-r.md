@@ -111,21 +111,25 @@ bootstrap profile via `R_PROFILE_USER`.
 ### Behavior
 
 - Run any plotting code in the Raven R terminal (e.g., `plot(1:10)`, `ggplot(...) + geom_point()`).
-- The first plot opens a "Raven Plot Viewer" panel in the column configured by
-  `raven.plot.viewerColumn` (default: `beside`).
-- Subsequent plots reuse the same panel and update its content. The viewer
-  does not steal focus from your editor.
+- The first plot from each R session opens its own "R Plots N" panel (numbered
+  per VS Code window) in the column configured by `raven.plot.viewerColumn`
+  (default: `beside`). Each R terminal therefore gets a separate viewer with
+  its own plot history.
+- Subsequent plots from the same session update that session's panel without
+  stealing focus from your editor.
 - The viewer toolbar provides previous/next history navigation, remove
-  current plot, save (PNG/SVG/PDF), and open externally.
+  current plot, copy to clipboard, save (PNG/SVG/PDF), and open externally.
+  Right-clicking a plot copies it to the clipboard as PNG.
 - If your terminal exits, the last rendered plot stays visible with an
-  "R session ended" indicator.
+  "R session ended" indicator. Closing the panel manually is fine; the next
+  plot from that same R session would recreate it.
 
 ### Settings
 
 | Setting | Default | Description |
 | --- | --- | --- |
 | `raven.plot.enabled` | `true` | Enable the plot viewer for Raven-managed terminals. |
-| `raven.plot.viewerColumn` | `beside` | Initial column when the viewer first opens. |
+| `raven.plot.viewerColumn` | `beside` | Initial column when a new viewer opens. |
 
 ### Troubleshooting
 

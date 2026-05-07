@@ -7,7 +7,7 @@ import {
     isWebviewToExtensionMessage,
     SaveFormat,
 } from './messages';
-import { PlotEvent, PlotSessionServer } from './session-server';
+import { PlotSessionServer } from './session-server';
 
 type ViewerColumn = 'active' | 'beside';
 
@@ -36,7 +36,7 @@ function build_html(webview: vscode.Webview, extension_uri: vscode.Uri, nonce: s
     <meta charset="utf-8" />
     <meta http-equiv="Content-Security-Policy" content="${csp}" />
     <link rel="stylesheet" href="${css_uri}" />
-    <title>Raven Plot Viewer</title>
+    <title>R Plots</title>
 </head>
 <body>
     <script nonce="${nonce}" src="${js_uri}"></script>
@@ -44,45 +44,60 @@ function build_html(webview: vscode.Webview, extension_uri: vscode.Uri, nonce: s
 </html>`;
 }
 
+export interface PlotViewerPanelOptions {
+    /** Called once after the underlying webview disposes (user closed it,
+     *  or VS Code shut down). Gives the owner a chance to drop its reference. */
+    onDisposed: () => void;
+}
+
+/**
+ * One webview panel bound to a single R session. Lifetimes:
+ *   - Created lazily by `PlotServices` on the first /plot-available event for
+ *     this session.
+ *   - Reveals once on creation in raven.plot.viewerColumn (preserveFocus).
+ *   - Subsequent plots from the same session post a state-update; the panel
+ *     stays where the user put it.
+ *   - User-closed panels invoke `onDisposed`; the next plot from the same
+ *     session creates a fresh panel via `PlotServices`.
+ */
 export class PlotViewerPanel {
     private panel: vscode.WebviewPanel | null = null;
     private theme_sub: vscode.Disposable | null = null;
-    private detach_session_listener: (() => void) | null = null;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
         private readonly server: PlotSessionServer,
+        private readonly sessionId: string,
+        private readonly panelIndex: number,
+        private readonly options: PlotViewerPanelOptions,
     ) {}
 
-    attach() {
-        this.detach_session_listener = this.server.onEvent(e => this.on_server_event(e));
+    /** Reveal the panel (creating it if needed) and push the current state. */
+    notifyPlotAvailable(): void {
+        this.ensure_panel();
+        this.post_state_update();
     }
 
-    dispose() {
-        this.detach_session_listener?.();
-        this.detach_session_listener = null;
+    /** Push state-update so the webview can show the "session ended" banner.
+     *  Does not create a panel if none exists yet. */
+    notifySessionEnded(): void {
+        this.post_state_update();
+    }
+
+    dispose(): void {
         this.panel?.dispose();
         this.panel = null;
         this.theme_sub?.dispose();
         this.theme_sub = null;
     }
 
-    private on_server_event(event: PlotEvent) {
-        if (event.type === 'plot-available') {
-            this.ensure_panel();
-            this.post_state_update();
-        } else if (event.type === 'session-ended') {
-            this.post_state_update();
-        }
-    }
-
-    private ensure_panel() {
+    private ensure_panel(): void {
         if (this.panel) return;
         const config = vscode.workspace.getConfiguration('raven.plot');
         const column_setting = config.get<ViewerColumn>('viewerColumn', 'beside');
         const panel = vscode.window.createWebviewPanel(
             'raven.plotViewer',
-            'Raven Plot Viewer',
+            `R Plots ${this.panelIndex}`,
             { viewColumn: reveal_view_column(column_setting), preserveFocus: true },
             {
                 enableScripts: true,
@@ -99,6 +114,7 @@ export class PlotViewerPanel {
             this.panel = null;
             this.theme_sub?.dispose();
             this.theme_sub = null;
+            this.options.onDisposed();
         });
         this.theme_sub = vscode.window.onDidChangeActiveColorTheme(() => {
             this.post(this.panel, { type: 'theme-changed', payload: {} });
@@ -106,10 +122,9 @@ export class PlotViewerPanel {
         this.panel = panel;
     }
 
-    private post_state_update() {
+    private post_state_update(): void {
         if (!this.panel) return;
-        const active_id = this.server.activeSessionId;
-        const session = active_id ? this.server.getSession(active_id) : undefined;
+        const session = this.server.getSession(this.sessionId);
         this.post(this.panel, {
             type: 'state-update',
             payload: {
@@ -152,8 +167,7 @@ export class PlotViewerPanel {
     }
 
     private async handle_save(plot_id: string, format: SaveFormat): Promise<void> {
-        const active_id = this.server.activeSessionId;
-        const session = active_id ? this.server.getSession(active_id) : undefined;
+        const session = this.server.getSession(this.sessionId);
         if (!session) return;
         const filters: Record<string, string[]> = {
             PNG: ['png'], SVG: ['svg'], PDF: ['pdf'],
@@ -174,8 +188,7 @@ export class PlotViewerPanel {
     }
 
     private async handle_open_externally(plot_id: string): Promise<void> {
-        const active_id = this.server.activeSessionId;
-        const session = active_id ? this.server.getSession(active_id) : undefined;
+        const session = this.server.getSession(this.sessionId);
         if (!session) return;
         const url = `${session.httpgdBaseUrl}/plot?id=${encodeURIComponent(plot_id)}` +
             `&renderer=svg&token=${encodeURIComponent(session.httpgdToken)}`;
