@@ -69,7 +69,7 @@ local({
         }
         tryCatch({
             con <- socketConnection(host = "127.0.0.1", port = port,
-                                     blocking = TRUE, open = "r+",
+                                     blocking = TRUE, open = "r+b",
                                      timeout = 2)
             on.exit(close(con), add = TRUE)
             body_bytes <- charToRaw(body_str)
