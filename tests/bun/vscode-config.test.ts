@@ -101,3 +101,25 @@ test("VS Code package metadata activates on JAGS and Stan languages", () => {
   expect(pkg.activationEvents).toContain("onLanguage:jags");
   expect(pkg.activationEvents).toContain("onLanguage:stan");
 });
+
+test("VS Code package metadata exposes send method setting", () => {
+  const packageJsonPath = path.join(
+    import.meta.dir,
+    "..",
+    "..",
+    "editors",
+    "vscode",
+    "package.json",
+  );
+  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+  const setting =
+    pkg.contributes.configuration.properties["raven.sendToR.sendMethod"];
+
+  expect(setting).toMatchObject({
+    type: "string",
+    enum: ["auto", "paste", "tempfile"],
+    default: "auto",
+  });
+  expect(setting.enumDescriptions).toHaveLength(3);
+  expect(setting.description).toContain("Controls how Raven sends code to R");
+});

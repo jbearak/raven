@@ -6,6 +6,7 @@ import {
 } from './statement-detector';
 import { get_or_create_r_terminal } from './r-terminal-manager';
 import { create_temp_file, schedule_temp_file_cleanup } from './temp-file';
+import { choose_send_transport, SendMethod } from './send-method';
 
 type SendMode = 'statement' | 'upward' | 'downward' | 'file';
 
@@ -83,10 +84,10 @@ async function handle_send(mode: SendMode): Promise<void> {
     const terminal = await get_or_create_r_terminal();
     terminal.show(true);
 
-    if (code.includes('\n')) {
-        send_via_tempfile(terminal, code);
-    } else {
+    if (mode === 'file') {
         terminal.sendText(code);
+    } else {
+        send_code(terminal, code, get_send_method());
     }
 
     if (advance_to_line !== null) {
@@ -113,12 +114,43 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
     if (mode === 'file') {
         terminal.sendText(code);
     } else {
-        send_via_tempfile(terminal, code);
+        send_code(terminal, code, get_send_method());
     }
 
     if (advance_to_line !== null) {
         advance_cursor(editor, advance_to_line);
     }
+}
+
+function get_send_method(): SendMethod {
+    return vscode.workspace
+        .getConfiguration('raven.sendToR')
+        .get<SendMethod>('sendMethod', 'auto');
+}
+
+function send_code(
+    terminal: vscode.Terminal,
+    code: string,
+    sendMethod: SendMethod,
+): void {
+    switch (choose_send_transport(code, sendMethod)) {
+        case 'direct-paste':
+            terminal.sendText(code);
+            return;
+        case 'bracketed-paste':
+            send_via_bracketed_paste(terminal, code);
+            return;
+        case 'tempfile':
+            send_via_tempfile(terminal, code);
+            return;
+    }
+}
+
+function send_via_bracketed_paste(
+    terminal: vscode.Terminal,
+    code: string,
+): void {
+    terminal.sendText('\x1b[200~' + code + '\x1b[201~');
 }
 
 function send_via_tempfile(terminal: vscode.Terminal, code: string): void {
@@ -150,7 +182,7 @@ export function register_send_to_r_commands(
         );
     }
 
-    // Terminal submenu: send to active terminal via tempfile
+    // Terminal submenu: send to active terminal using the configured send method.
     const terminal_commands: Array<[string, SendMode]> = [
         ['raven.terminal.runLineOrSelection', 'statement'],
         ['raven.terminal.runUpwardLines', 'upward'],

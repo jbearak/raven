@@ -47,7 +47,7 @@ A toolbar button (▶) appears in the editor title bar for R files, providing qu
 - **Main commands** — Send code to the managed R (Raven) terminal. If no R terminal is open, one is created automatically.
 - **Terminal submenu** — Send code to whatever terminal is currently active in VS Code, regardless of type. This is useful for sending commands to R running inside `tmux`, a Docker container, or any other terminal session that isn't the extension's built-in R terminal.
 
-Selections and line ranges sent via the Terminal submenu are written to a temporary file and executed with `source()`, which avoids issues with large pastes over SSH or slow connections. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
+Code sent via the Terminal submenu follows the same send method as the main commands. By default, Raven pastes single-line code directly and writes multi-line code to a temporary file, executing it with `source()`. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
 
 ## Statement Detection
 
@@ -83,12 +83,28 @@ By default, the cursor advances to the next line after sending a single statemen
 
 **Configuration**: `raven.sendToR.advanceCursorOnSend` (default: `true`)
 
+## Send Method
+
+By default (`auto`), Raven pastes single-line code directly and writes multi-line code to a temporary file, executing it with `source()`. Override this with `raven.sendToR.sendMethod`:
+
+- **`paste`** — always pastes. For multi-line code, uses bracketed paste mode to deliver the block as a single unit.
+- **`tempfile`** — always writes to a temp file and runs `source()`. Use this for maximum consistency, or when even single-line paste is unreliable.
+
+**Why Raven defaults to temp files for multi-line code**
+
+When multi-line code is pasted, the terminal delivers characters to R's stdin faster than readline can process them, which can silently drop or corrupt lines. This affects the standard R console as well as arf and radian. Writing to a temp file sidesteps this entirely: R reads from disk rather than stdin, so there is no terminal paste-buffer race, no practical paste-size limit from stdin buffering, and no sensitivity to connection speed.
+
+`source(echo = TRUE)` also produces cleaner output: code is echoed line-by-line with `+` continuation prompts, matching how R normally displays interactive input.
+
+REditorSupport pastes directly for all code. If you prefer that behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
+
 ## Configuration Options
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"`, `"arf"`, or `"radian"` |
 | `raven.sendToR.advanceCursorOnSend` | boolean | `true` | Advance cursor to next line after sending a single statement |
+| `raven.sendToR.sendMethod` | enum | `"auto"` | How code is sent to R: `"auto"`, `"paste"`, or `"tempfile"` |
 
 ## Plot Viewer
 
