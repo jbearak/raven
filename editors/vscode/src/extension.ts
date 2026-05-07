@@ -20,6 +20,7 @@ import {
     shouldTriggerNestedPathSuggest,
 } from './pathCompletionTriggers';
 import { register_r_terminal, register_send_to_r_commands } from './send-to-r';
+import { PlotServices } from './plot';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -131,7 +132,10 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('raven.restart', async () => {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
-            await client.restart();
+            await Promise.all([
+                client.restart(),
+                plot_services.restart(),
+            ]);
         })
     );
 
@@ -163,8 +167,12 @@ export function activate(context: vscode.ExtensionContext) {
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
 
+    // Plot services (session server + viewer panel) for managed R terminals.
+    const plot_services = new PlotServices(context);
+    active_plot_services = plot_services;
+
     // Register R terminal and send-to-R commands
-    register_r_terminal(context);
+    register_r_terminal(context, plot_services);
     register_send_to_r_commands(context);
 
     // Warn if REditorSupport is also installed (keybinding conflict)
@@ -310,9 +318,12 @@ function checkRExtensionConflict(context: vscode.ExtensionContext) {
     });
 }
 
+let active_plot_services: PlotServices | null = null;
+
 export function deactivate(): Thenable<void> | undefined {
-    if (!client) {
-        return undefined;
-    }
-    return client.stop();
+    const stops: Thenable<void>[] = [];
+    if (active_plot_services) stops.push(active_plot_services.dispose());
+    if (client) stops.push(client.stop());
+    if (stops.length === 0) return undefined;
+    return Promise.all(stops).then(() => undefined);
 }
