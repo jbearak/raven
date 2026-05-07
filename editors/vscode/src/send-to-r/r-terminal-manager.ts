@@ -1,4 +1,6 @@
 import * as crypto from 'crypto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { PlotServices } from '../plot';
 import {
@@ -39,6 +41,81 @@ const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
 function get_program(): string {
     const config = vscode.workspace.getConfiguration('raven.rTerminal');
     return config.get<string>('program', 'R');
+}
+
+const exec_async = promisify(exec);
+const SAFE_PROGRAM_NAME = /^[A-Za-z0-9._-]+$/;
+const SHELL_VALIDATION_TIMEOUT_MS = 5000;
+
+// Per-session cache of validation outcomes, keyed by program name. `validated-ok`
+// means the user's shell found it on PATH; `user-kept` means it wasn't found but
+// the user opted to keep the setting anyway. Either way we don't reprompt this
+// session. Cleared when raven.rTerminal.program changes.
+type ValidationOutcome = 'validated-ok' | 'user-kept';
+const validation_cache = new Map<string, ValidationOutcome>();
+
+export function _reset_validation_cache_for_test(): void {
+    validation_cache.clear();
+}
+
+// Probes for the program in the user's interactive-login shell, where rc-file
+// PATH additions (conda, pyenv, asdf, homebrew shellenv) are visible — unlike
+// the extension host's process.env.PATH. Returns false on missing/timeout.
+async function shell_can_find_program(program: string): Promise<boolean> {
+    if (process.platform === 'win32') return true; // skip; cmd/pwsh/wsl shells vary too much
+    if (!SAFE_PROGRAM_NAME.test(program)) return false;
+    const shell = process.env.SHELL ?? '/bin/sh';
+    try {
+        await exec_async(
+            `${JSON.stringify(shell)} -ilc 'command -v ${program} >/dev/null 2>&1'`,
+            { timeout: SHELL_VALIDATION_TIMEOUT_MS },
+        );
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// Indirection for tests; production code uses shell_can_find_program.
+let _validator: (program: string) => Promise<boolean> = shell_can_find_program;
+
+export function _set_validator_for_test(
+    v: ((program: string) => Promise<boolean>) | null,
+): void {
+    _validator = v ?? shell_can_find_program;
+}
+
+// Resolves the program to launch for an R terminal. For non-`R` configurations
+// it validates via the user's shell and, if the program isn't found, prompts
+// the user to switch to `R` for this machine. Picking "Switch to R" updates
+// the Global (== per-machine in Remote-SSH) setting so the synced User default
+// stays intact. Picking "Keep" lets the configured value through and lets VS
+// Code surface its own launch failure.
+export async function resolve_program(): Promise<string> {
+    const configured = get_program();
+    if (configured === 'R') return 'R';
+    if (validation_cache.has(configured)) return configured;
+
+    if (await _validator(configured)) {
+        validation_cache.set(configured, 'validated-ok');
+        return configured;
+    }
+
+    const SWITCH = 'Switch to R';
+    const KEEP = 'Keep';
+    const choice = await vscode.window.showWarningMessage(
+        `Raven: '${configured}' was not found in your shell PATH. The R terminal will likely fail to launch. Switch to R on this machine?`,
+        SWITCH,
+        KEEP,
+    );
+    if (choice === SWITCH) {
+        await vscode.workspace
+            .getConfiguration('raven.rTerminal')
+            .update('program', 'R', vscode.ConfigurationTarget.Global);
+        return 'R';
+    }
+    validation_cache.set(configured, 'user-kept');
+    return configured;
 }
 
 async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: string } | null> {
@@ -121,7 +198,10 @@ export function register_r_terminal(
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
             }
-            const program = get_program();
+            const program = await resolve_program();
+            if (token.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
             const plot_env = await get_plot_terminal_env();
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
@@ -153,6 +233,7 @@ export function register_r_terminal(
             if (event.affectsConfiguration('raven.rTerminal.program')) {
                 profile_terminals.clear();
                 last_active_terminal = null;
+                validation_cache.clear();
             }
         }),
     );
@@ -172,7 +253,7 @@ export async function get_or_create_r_terminal(): Promise<vscode.Terminal> {
 }
 
 async function create_r_terminal(): Promise<vscode.Terminal> {
-    const program = get_program();
+    const program = await resolve_program();
     const plot_env = await get_plot_terminal_env();
     const terminal = vscode.window.createTerminal({
         name: TERMINAL_NAME,

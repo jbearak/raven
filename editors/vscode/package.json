@@ -234,7 +234,7 @@
             "radian"
           ],
           "default": "R",
-          "description": "Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately)."
+          "description": "Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately). If the configured program is not found in your shell PATH, Raven prompts you to switch to 'R' on this machine, leaving your User-level default unchanged."
         },
         "raven.sendToR.advanceCursorOnSend": {
           "type": "boolean",
