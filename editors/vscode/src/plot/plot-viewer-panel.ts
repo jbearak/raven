@@ -48,7 +48,6 @@ export class PlotViewerPanel {
     private panel: vscode.WebviewPanel | null = null;
     private theme_sub: vscode.Disposable | null = null;
     private detach_session_listener: (() => void) | null = null;
-    private webview_ready = false;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -100,7 +99,6 @@ export class PlotViewerPanel {
         panel.webview.onDidReceiveMessage((msg) => this.on_webview_message(msg));
         panel.onDidDispose(() => {
             this.panel = null;
-            this.webview_ready = false;
             this.theme_sub?.dispose();
             this.theme_sub = null;
         });
@@ -108,7 +106,6 @@ export class PlotViewerPanel {
             this.post(this.panel, { type: 'theme-changed', payload: {} });
         });
         this.panel = panel;
-        this.webview_ready = false;
     }
 
     private post_state_update() {
@@ -138,7 +135,6 @@ export class PlotViewerPanel {
         if (!isWebviewToExtensionMessage(msg)) return;
         switch (msg.type) {
             case 'webview-ready':
-                this.webview_ready = true;
                 this.post_state_update();
                 break;
             case 'request-save-plot':
