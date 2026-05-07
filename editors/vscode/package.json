@@ -241,6 +241,21 @@
           "default": true,
           "description": "Advance cursor to the next line after sending a single statement to R."
         },
+        "raven.sendToR.sendMethod": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "paste",
+            "tempfile"
+          ],
+          "enumDescriptions": [
+            "Paste single-line code directly and use a temporary file for multi-line blocks.",
+            "Paste code directly. Multi-line blocks use bracketed paste mode.",
+            "Write code to a temporary file and run source() for both single-line and multi-line sends."
+          ],
+          "default": "auto",
+          "description": "Controls how Raven sends code to R. 'auto' pastes single-line code directly and uses a temp file for multi-line blocks. 'paste' always pastes, using bracketed paste mode for multi-line code. 'tempfile' always writes to a temp file and runs source()."
+        },
         "raven.server.path": {
           "type": "string",
           "default": "",
