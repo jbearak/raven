@@ -45,6 +45,7 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Send to R](docs/send-to-r.md)** — Interactive R console with statement detection; supports R, arf, and radian
+- **Plot viewer** — Plots from the Raven-managed R terminal appear in a VS Code panel via [httpgd](https://nx10.dev/httpgd/). History navigation, save (PNG/SVG/PDF), and theme-aware background.
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **Syntax highlighting** — JAGS and Stan (R highlighting is built into VS Code)
