@@ -23,11 +23,12 @@ The product shape was settled in the 2026-05-06 brainstorm:
 - `httpgd`-only (no static-PNG fallback, no auto-install).
 - Custom Svelte webview (not an iframe of httpgd's built-in UI).
 - One panel per R session — each managed terminal owns its own viewer with
-  its own plot history. Panels are titled "R Plots N" with N assigned per VS
-  Code window. Originally the design used a single shared panel that followed
-  the most recent plot, but in practice users could not navigate the history
-  of a non-most-recent terminal without switching back to it; per-session
-  panels remove that interaction trap.
+  its own plot history. The first session's panel is titled "Raven Plot
+  Viewer"; later sessions are "Raven Plot Viewer 2", "Raven Plot Viewer 3",
+  etc., numbered per VS Code window. Originally the design used a single
+  shared panel that followed the most recent plot, but in practice users
+  could not navigate the history of a non-most-recent terminal without
+  switching back to it; per-session panels remove that interaction trap.
 - Lazy panel: created on the first plot, recreated automatically on the next
   plot if the user closes it.
 - v1 controls: latest-plot display with auto-resize, theme-aware background,
@@ -79,10 +80,11 @@ terminal sees:
    not started.
 4. If `httpgd` is available, Raven starts an `httpgd` device for that R session
    and the bootstrap reports the device endpoint to the extension.
-5. The first plot from each R session opens an "R Plots N" panel in the
-   configured editor column (N is assigned per VS Code window in the order
-   sessions first plot). Later plots from the same session update that panel
-   without stealing focus or changing its column.
+5. The first plot from each R session opens its own "Raven Plot Viewer"
+   panel (or "Raven Plot Viewer 2", "Raven Plot Viewer 3", etc. for the
+   second, third, ... session) in the configured editor column. Later plots
+   from the same session update that panel without stealing focus or
+   changing its column.
 6. Multiple Raven-managed R terminals share the same extension session server,
    but each session has its own panel and its own httpgd-backed plot history.
    The user can navigate the histories independently.

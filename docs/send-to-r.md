@@ -111,10 +111,11 @@ bootstrap profile via `R_PROFILE_USER`.
 ### Behavior
 
 - Run any plotting code in the Raven R terminal (e.g., `plot(1:10)`, `ggplot(...) + geom_point()`).
-- The first plot from each R session opens its own "R Plots N" panel (numbered
-  per VS Code window) in the column configured by `raven.plot.viewerColumn`
-  (default: `beside`). Each R terminal therefore gets a separate viewer with
-  its own plot history.
+- The first plot from each R session opens its own "Raven Plot Viewer" panel
+  in the column configured by `raven.plot.viewerColumn` (default: `beside`).
+  The second session's panel is "Raven Plot Viewer 2", the third "Raven Plot
+  Viewer 3", and so on (numbered per VS Code window). Each R terminal
+  therefore gets a separate viewer with its own plot history.
 - Subsequent plots from the same session update that session's panel without
   stealing focus from your editor.
 - The viewer toolbar provides previous/next history navigation, remove

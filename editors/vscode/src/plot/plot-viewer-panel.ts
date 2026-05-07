@@ -36,7 +36,7 @@ function build_html(webview: vscode.Webview, extension_uri: vscode.Uri, nonce: s
     <meta charset="utf-8" />
     <meta http-equiv="Content-Security-Policy" content="${csp}" />
     <link rel="stylesheet" href="${css_uri}" />
-    <title>R Plots</title>
+    <title>Raven Plot Viewer</title>
 </head>
 <body>
     <script nonce="${nonce}" src="${js_uri}"></script>
@@ -95,9 +95,12 @@ export class PlotViewerPanel {
         if (this.panel) return;
         const config = vscode.workspace.getConfiguration('raven.plot');
         const column_setting = config.get<ViewerColumn>('viewerColumn', 'beside');
+        const title = this.panelIndex === 1
+            ? 'Raven Plot Viewer'
+            : `Raven Plot Viewer ${this.panelIndex}`;
         const panel = vscode.window.createWebviewPanel(
             'raven.plotViewer',
-            `R Plots ${this.panelIndex}`,
+            title,
             { viewColumn: reveal_view_column(column_setting), preserveFocus: true },
             {
                 enableScripts: true,
