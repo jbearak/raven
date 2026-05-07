@@ -44,12 +44,63 @@ const WEBVIEW_TO_EXTENSION_TYPES = new Set<WebviewToExtensionMessage['type']>([
 
 export function isExtensionToWebviewMessage(value: unknown): value is ExtensionToWebviewMessage {
     if (!value || typeof value !== 'object') return false;
-    const t = (value as { type?: unknown }).type;
-    return typeof t === 'string' && EXTENSION_TO_WEBVIEW_TYPES.has(t as ExtensionToWebviewMessage['type']);
+    const msg = value as { type?: unknown; payload?: unknown };
+    const t = msg.type;
+    if (typeof t !== 'string' || !EXTENSION_TO_WEBVIEW_TYPES.has(t as ExtensionToWebviewMessage['type'])) {
+        return false;
+    }
+    const p = msg.payload;
+    if (!p || typeof p !== 'object') return false;
+
+    switch (t) {
+        case 'state-update': {
+            const payload = p as Record<string, unknown>;
+            const activeSession = payload.activeSession;
+            if (activeSession !== null) {
+                if (typeof activeSession !== 'object') return false;
+                const s = activeSession as Record<string, unknown>;
+                if (typeof s.sessionId !== 'string' ||
+                    typeof s.httpgdBaseUrl !== 'string' ||
+                    typeof s.httpgdToken !== 'string') {
+                    return false;
+                }
+            }
+            return typeof payload.sessionEnded === 'boolean';
+        }
+        case 'theme-changed':
+            return true;
+        default:
+            return false;
+    }
 }
 
 export function isWebviewToExtensionMessage(value: unknown): value is WebviewToExtensionMessage {
     if (!value || typeof value !== 'object') return false;
-    const t = (value as { type?: unknown }).type;
-    return typeof t === 'string' && WEBVIEW_TO_EXTENSION_TYPES.has(t as WebviewToExtensionMessage['type']);
+    const msg = value as { type?: unknown; payload?: unknown };
+    const t = msg.type;
+    if (typeof t !== 'string' || !WEBVIEW_TO_EXTENSION_TYPES.has(t as WebviewToExtensionMessage['type'])) {
+        return false;
+    }
+    const p = msg.payload;
+    if (!p || typeof p !== 'object') return false;
+
+    switch (t) {
+        case 'webview-ready':
+            return true;
+        case 'request-save-plot': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.plotId === 'string' &&
+                   (payload.format === 'png' || payload.format === 'svg' || payload.format === 'pdf');
+        }
+        case 'request-open-externally': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.plotId === 'string';
+        }
+        case 'report-error': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.message === 'string';
+        }
+        default:
+            return false;
+    }
 }

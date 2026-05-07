@@ -61,12 +61,10 @@ describe('PlotSessionServer auth + lifecycle', () => {
         await server.start();
     });
 
-    test('start() failure resets state so a retry can succeed', async () => {
-        // Force a listen failure by binding the same port through a second
-        // server first. Easiest cross-platform trick: bind to an already-bound
-        // privileged-ish port? Better: simulate by injecting a fake http server
-        // that immediately errors. Since we can't easily inject from outside,
-        // we test the recovery path by stopping and restarting.
+    test('stop() resets state so a retry can succeed', async () => {
+        // Test the recovery path by stopping and restarting.
+        // After stop(), the server should reset to initial state,
+        // then start() should succeed with fresh credentials.
         const token = server.token;
         await server.stop();
         expect(server.port).toBe(0);

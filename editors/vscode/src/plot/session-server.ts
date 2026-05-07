@@ -163,10 +163,26 @@ export class PlotSessionServer {
         const httpgdHost = typeof b.httpgdHost === 'string' ? b.httpgdHost : '';
         const httpgdPort = typeof b.httpgdPort === 'number' ? b.httpgdPort : -1;
         const httpgdToken = typeof b.httpgdToken === 'string' ? b.httpgdToken : '';
-        if (!sessionId || !httpgdHost || httpgdPort <= 0 || !httpgdToken) {
+
+        // Validate sessionId and httpgdToken are non-empty
+        if (!sessionId || !httpgdToken) {
             res.writeHead(400).end();
             return;
         }
+
+        // Validate httpgdHost is a loopback address
+        const allowedHosts = ['127.0.0.1', 'localhost', '::1'];
+        if (!allowedHosts.includes(httpgdHost)) {
+            res.writeHead(400).end();
+            return;
+        }
+
+        // Validate httpgdPort is in valid range
+        if (!Number.isInteger(httpgdPort) || httpgdPort < 1 || httpgdPort > 65535) {
+            res.writeHead(400).end();
+            return;
+        }
+
         const session: SessionInfo = {
             sessionId,
             httpgdBaseUrl: `http://${httpgdHost}:${httpgdPort}`,

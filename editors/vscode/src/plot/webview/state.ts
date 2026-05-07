@@ -61,11 +61,15 @@ export function reduce(state: ViewerState, action: ViewerAction): ViewerState {
         }
         case 'GO_PREV':
             return { ...state, currentIndex: Math.max(0, state.currentIndex - 1) };
-        case 'GO_NEXT':
+        case 'GO_NEXT': {
+            if (state.plotIds.length === 0) {
+                return { ...state, currentIndex: 0 };
+            }
             return {
                 ...state,
                 currentIndex: Math.min(state.plotIds.length - 1, state.currentIndex + 1),
             };
+        }
         case 'SESSION_ENDED':
             return { ...state, phase: 'disconnected', sessionEnded: true };
         case 'SET_THEME_BG':

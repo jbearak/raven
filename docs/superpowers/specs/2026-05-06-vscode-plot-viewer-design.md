@@ -32,9 +32,9 @@ The product shape was settled in the 2026-05-06 brainstorm:
 - Lazy panel: created on the first plot, recreated automatically on the next
   plot if the user closes it.
 - v1 controls: latest-plot display with auto-resize, theme-aware background,
-  prev/next history navigation, remove-current-plot, save (PNG/SVG/PDF) through
-  the OS save dialog, open-externally, and explicit loading/empty/disconnected
-  states.
+  prev/next history navigation, remove-current-plot, copy-to-clipboard,
+  save (PNG/SVG/PDF) through the OS save dialog, open-externally, and explicit
+  loading/empty/disconnected states.
 
 ## Goals / Non-Goals
 
@@ -57,7 +57,6 @@ Non-goals for v1:
 - Static PNG fallback, base `png()` fallback, or non-`httpgd` graphics devices.
 - Auto-installing `httpgd` or showing VS Code modal install prompts.
 - Thumbnail picker for plot history.
-- Copy-to-clipboard.
 - Zoom, pan, and fit-to-window controls.
 - Bulk "clear all plots" action (single-plot remove only).
 - Migration from older managed-terminal behavior; the managed terminal has not
@@ -89,7 +88,7 @@ terminal sees:
    but each session has its own panel and its own httpgd-backed plot history.
    The user can navigate the histories independently.
 7. The viewer exposes previous/next history navigation, remove-current-plot,
-   save (PNG/SVG/PDF), and open-externally controls.
+   copy-to-clipboard, save (PNG/SVG/PDF), and open-externally controls.
 8. Closing the viewer panel does not disable plotting. The next plot recreates
    the panel.
 9. If an R terminal exits, the viewer remains open with the last rendered plot
@@ -594,7 +593,6 @@ boolean toggle with no path or credential implications, consistent with
 Explicit deferrals, not omissions:
 
 - Thumbnail picker for plot history.
-- Copy plot to clipboard.
 - Zoom, pan, and fit-to-window.
 - Bulk "clear all plots" action.
 - Static image fallback when `httpgd` is unavailable.
@@ -602,3 +600,8 @@ Explicit deferrals, not omissions:
 - A richer R-to-extension WebSocket protocol if future features need
   long-lived bidirectional messages from R. The session server is structured
   to allow this addition without rewriting the bootstrap.
+
+## Notes
+
+Copy-to-clipboard is implemented in v1 via both the toolbar button and
+right-click context menu on a plot.

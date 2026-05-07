@@ -121,9 +121,10 @@ bootstrap profile via `R_PROFILE_USER`.
 - The viewer toolbar provides previous/next history navigation, remove
   current plot, copy to clipboard, save (PNG/SVG/PDF), and open externally.
   Right-clicking a plot copies it to the clipboard as PNG.
-- If your terminal exits, the last rendered plot stays visible with an
-  "R session ended" indicator. Closing the panel manually is fine; the next
-  plot from that same R session would recreate it.
+- If your terminal exits (R session ends), the last rendered plot stays
+  visible with an "R session ended" indicator and must be closed manually.
+- When a new R session is started or the panel is reopened, a subsequent
+  plot from that new session will recreate the plot panel.
 
 ### Settings
 
