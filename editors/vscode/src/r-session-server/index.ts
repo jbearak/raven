@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
 import {
+    DataViewerWarningEvent,
     PlotEvent,
     RSessionEvent,
     RSessionEventListener,
@@ -10,7 +11,7 @@ import {
     ViewDataEvent,
 } from './types';
 
-export type { PlotEvent, RSessionEvent, RSessionEventListener, SessionInfo, ViewDataEvent };
+export type { DataViewerWarningEvent, PlotEvent, RSessionEvent, RSessionEventListener, SessionInfo, ViewDataEvent };
 /** @deprecated Use {@link RSessionEventListener}. */
 export type PlotEventListener = RSessionEventListener;
 
@@ -115,7 +116,33 @@ export class RSessionServer {
             this.read_json_body(req, res, body => this.handle_view_data(body, res));
             return;
         }
+        if (url === '/data-viewer-warning') {
+            this.read_json_body(req, res, body => this.handle_data_viewer_warning(body, res));
+            return;
+        }
         res.writeHead(404).end();
+    }
+
+    private handle_data_viewer_warning(body: unknown, res: http.ServerResponse): void {
+        if (!body || typeof body !== 'object') {
+            res.writeHead(400).end();
+            return;
+        }
+        const b = body as Record<string, unknown>;
+        const sessionId = typeof b.sessionId === 'string' ? b.sessionId : '';
+        const reason = b.reason === 'missing-arrow' ? b.reason : '';
+        const message = typeof b.message === 'string' ? b.message : '';
+        if (!sessionId || !reason || !message) {
+            res.writeHead(400).end();
+            return;
+        }
+        this.emit({
+            type: 'data-viewer-warning',
+            sessionId,
+            reason,
+            message,
+        });
+        res.writeHead(200).end();
     }
 
     private handle_view_data(body: unknown, res: http.ServerResponse): void {

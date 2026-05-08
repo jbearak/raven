@@ -41,6 +41,8 @@ export async function registerDataViewer(
         dispose: server.onEvent(e => {
             if (e.type === 'view-data-requested') {
                 void manager.onViewDataRequested(e);
+            } else if (e.type === 'data-viewer-warning' && e.reason === 'missing-arrow') {
+                vscode.window.showWarningMessage(e.message);
             }
         }),
     });

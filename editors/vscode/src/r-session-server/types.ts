@@ -29,5 +29,12 @@ export type ViewDataEvent = {
     nrow: number;
 };
 
-export type RSessionEvent = PlotEvent | ViewDataEvent;
+export type DataViewerWarningEvent = {
+    type: 'data-viewer-warning';
+    sessionId: string;
+    reason: 'missing-arrow';
+    message: string;
+};
+
+export type RSessionEvent = PlotEvent | ViewDataEvent | DataViewerWarningEvent;
 export type RSessionEventListener = (event: RSessionEvent) => void;

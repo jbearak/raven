@@ -38,6 +38,15 @@ describe('bootstrap profile: data viewer block', () => {
         expect(assignIdx).toBeGreaterThan(arrowCheckIdx);
     });
 
+    test('missing arrow warns, notifies VS Code, and returns invisibly', () => {
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        expect(slice).toContain('warning(msg, call. = FALSE)');
+        expect(slice).toContain('/data-viewer-warning');
+        expect(slice).toContain('return(invisible(NULL))');
+        expect(slice).not.toContain('stop("Raven data viewer requires');
+    });
+
     test('overrides View in globalenv', () => {
         const dvIdx = src.indexOf('# Raven data viewer block');
         const slice = src.slice(dvIdx);

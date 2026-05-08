@@ -268,8 +268,16 @@ local({
 
     .raven_view <- function(x, title) {
         if (!requireNamespace("arrow", quietly = TRUE)) {
-            stop("Raven data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")",
-                 call. = FALSE)
+            msg <- "Raven data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")"
+            warning(msg, call. = FALSE)
+            .raven_post("/data-viewer-warning", paste0(
+                "{",
+                "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+                "\\"reason\\":\\"missing-arrow\\",",
+                "\\"message\\":", .raven_json_str(msg),
+                "}"
+            ))
+            return(invisible(NULL))
         }
         # Resolve panel name.
         panel_name <- if (!missing(title) && !is.null(title)) {
