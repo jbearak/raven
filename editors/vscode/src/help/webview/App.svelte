@@ -74,13 +74,9 @@
     }
 
     /**
-     * Delegated click handler for the help content area.
-     *
-     * Classification rules (from spec §"Webview UI"):
-     *   raven-help://topic/<pkg>/<topic>[#anchor]  → navigate
-     *   https:// / http:// / mailto:               → open-external
-     *   #anchor only (no scheme)                   → no-op (native scroll)
-     *   anything else                              → report-error + preventDefault
+     * Delegated click handler for the help content area: walks up to the
+     * closest <a> ancestor and dispatches via classifyAndDispatch in
+     * click-handler.ts (where the spec's link-classification rules live).
      */
     function on_content_click(event: MouseEvent) {
         // Walk up from event target to find the nearest <a> element.

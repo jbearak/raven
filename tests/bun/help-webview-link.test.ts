@@ -1,3 +1,7 @@
+// jsdom lives in editors/vscode/node_modules. Bun walks up from this test
+// file looking for a node_modules dir, so we keep a tracked symlink at
+// tests/bun/node_modules → ../../editors/vscode/node_modules to make it
+// resolvable. (The repo has no root-level package.json.)
 import { describe, test, expect, mock } from 'bun:test';
 import { JSDOM } from 'jsdom';
 import { classifyAndDispatch } from '../../editors/vscode/src/help/webview/click-handler';
@@ -12,6 +16,17 @@ function makeEvent(target: EventTarget | null): {
     preventDefault: ReturnType<typeof mock>;
 } {
     return { target, preventDefault: mock(() => {}) };
+}
+
+function assertReportError(post: ReturnType<typeof mock>): void {
+    const call = post.mock.calls[0][0] as {
+        type: string;
+        payload: { message: string };
+    };
+    expect(call.type).toBe('report-error');
+    expect(call.payload).toBeDefined();
+    expect(typeof call.payload.message).toBe('string');
+    expect(call.payload.message.length).toBeGreaterThan(0);
 }
 
 describe('webview link click', () => {
@@ -147,10 +162,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('file:// scheme → report-error', () => {
@@ -160,10 +172,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('other:// scheme → report-error', () => {
@@ -173,10 +182,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('relative ./foo path → report-error', () => {
@@ -186,10 +192,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('data-raven-dropped anchor → report-error regardless of href', () => {
@@ -203,10 +206,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), isDropped, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     // ---- Malformed raven-help:// URLs → report-error ----
@@ -219,10 +219,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('raven-help://topic/stats/ (empty topic) → report-error', () => {
@@ -232,10 +229,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('raven-help://topic//foo (empty pkg) → report-error', () => {
@@ -245,10 +239,7 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 
     test('raven-help://topic/base/%ZZ (invalid percent) → report-error', () => {
@@ -260,9 +251,6 @@ describe('webview link click', () => {
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
         expect(handled).toBe(true);
         expect(ev.preventDefault).toHaveBeenCalled();
-        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
-            type: string;
-        };
-        expect(call.type).toBe('report-error');
+        assertReportError(post);
     });
 });
