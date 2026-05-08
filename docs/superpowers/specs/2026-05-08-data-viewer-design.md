@@ -248,11 +248,24 @@ v1 prototype (step 1 of *Implementation order*); this section describes
 behavior, not specific class names, since the JS package's reader names
 have moved between recent versions.
 
+**File loading model.** On open the reader reads the entire file into a
+`Buffer` and hands it to `apache-arrow`'s file-format reader. Decoding
+of individual record batches is **lazy** (only the requested batch's
+columns are materialized into JS arrays), but the on-disk byte buffer
+itself is in process memory. RSS is therefore bounded by the file size
+plus the LRU decoded-batch cache. For v1 this is acceptable: the
+gigabyte-scale target is met by lazy *decoding*, not by streaming bytes
+from disk. True mmap would require a third-party Node addon and is out
+of scope for v1. (Apache Arrow IPC compresses well; in practice a 1-GB
+data frame is far smaller on disk.) Files larger than free RAM should
+not be `View()`-ed.
+
 On open:
 
-1. Read the file's footer to get the offset/length of every record batch
-   (no row data loaded yet).
-2. Build an in-memory `batch_starts: Uint32Array` (cumulative row counts).
+1. Read the file into a `Buffer`.
+2. Read the file's footer to get the offset/length of every record batch
+   (no row data decoded yet).
+3. Build an in-memory `batch_starts: Uint32Array` (cumulative row counts).
 3. Read the file's schema and column-level KV metadata into a typed
    `ColumnSchema[]`.
 4. For each dictionary-encoded column whose dictionary cardinality is
@@ -495,7 +508,7 @@ max(header text width, sample of first 200 visible cells) clamped to
 | `arrow::write_feather` throws | R surfaces via `stop()`; no panel opens |
 | Disk write succeeds but POST fails | R logs `Raven: data viewer POST failed: …`; temp file is left in place and swept on next activation |
 | `filePath` outside `<globalStorageUri>/data-viewer/` | Server replies 400 (path-trust check); R logs the rejection |
-| Arrow file vanishes mid-session | Reader emits an error to the webview which shows an in-panel banner: "Data file no longer available. Re-run View() to refresh." |
+| Arrow file fails to open | Reader throws synchronously from its constructor; manager catches, posts a one-time `vscode.window.showErrorMessage`, and refuses to create the panel. Once a panel is open, the file's byte buffer is held in memory, so later disk-side deletions don't affect reads |
 | Webview asks for rows past `nrow` | Reader returns empty; webview clamps |
 | Two same-name views race | Manager processes events in event-loop order; the second view's `replace` runs after the first's `init` completes. No timeout, no force path |
 | Late `getRows` / `copy` arrives after `replace` | Receiver checks `panelGeneration` and drops |

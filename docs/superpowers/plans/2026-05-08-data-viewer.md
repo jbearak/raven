@@ -104,10 +104,14 @@ if (!requireNamespace("arrow", quietly = TRUE)) {
 }
 library(arrow)
 
-out_dir <- file.path(
-    dirname(sys.frame(1)$ofile %||% commandArgs(trailingOnly = FALSE)[4]),
-    "data-viewer"
-)
+script_path <- (function() {
+    args <- commandArgs(trailingOnly = FALSE)
+    file_arg <- sub("^--file=", "", grep("^--file=", args, value = TRUE))
+    if (length(file_arg) > 0) return(normalizePath(file_arg[[1]]))
+    if (!is.null(sys.frame(1)$ofile)) return(normalizePath(sys.frame(1)$ofile))
+    stop("Run with Rscript so the script path is recoverable")
+})()
+out_dir <- file.path(dirname(script_path), "data-viewer")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 write_tiny <- function() {
@@ -686,17 +690,32 @@ write_bigdict <- function() {
 }
 
 write_types <- function() {
+    if (!requireNamespace("haven", quietly = TRUE)) {
+        # Hand-roll the haven_labelled attributes so the fixture works
+        # without an installed haven.
+        labelled_num <- c(1, 2, 3)
+        attr(labelled_num, "label") <- "Group"
+        attr(labelled_num, "labels") <- c(low = 1, mid = 2, high = 3)
+        class(labelled_num) <- c("haven_labelled", "vctrs_vctr", "double")
+    } else {
+        labelled_num <- haven::labelled(
+            c(1, 2, 3), labels = c(low = 1, mid = 2, high = 3),
+            label = "Group"
+        )
+    }
+    # arrow does not natively serialize haven_labelled — the bootstrap
+    # profile strips that class; for the test fixture we mimic the
+    # post-stripping shape and capture labels into column metadata.
     df <- data.frame(
         small_factor = factor(c("a", "b", "a"), levels = c("a", "b", "c")),
-        labelled_num = haven::labelled(c(1, 2, 3), labels = c(low = 1, mid = 2, high = 3))
-            # If haven is unavailable, fall back: this branch is best-effort
+        labelled_num = unclass(labelled_num)
     )
     write_feather(df, file.path(out_dir, "types.arrow"))
 }
 
 write_multibatch()
 write_bigdict()
-tryCatch(write_types(), error = function(e) message("skipping types fixture: ", conditionMessage(e)))
+write_types()
 ```
 
 Run by hand:
@@ -932,6 +951,11 @@ export class ArrowSliceReader {
         const startBatch = upperBoundLE(this.batchStarts, lo);
         const endBatch = upperBoundLE(this.batchStarts, hi - 1);
         for (let bi = startBatch; bi <= endBatch; bi++) {
+            // Re-check generation between batches so a long decode aborts
+            // promptly when the user keeps scrolling.
+            if (req.viewportGeneration < this.latestViewportGen) {
+                return { rows: [], stale: true };
+            }
             const batch = this.reader.readRecordBatch(bi)!;
             this.onBatchLoad?.(bi);
             const batchRowStart = this.batchStarts[bi];
@@ -1332,6 +1356,9 @@ export class DataViewerPanel {
 
     private async handle(m: WebviewToExtension): Promise<void> {
         if (m.panelGeneration !== this.generation) return;
+        // Capture generation BEFORE any await so a replace mid-fetch causes
+        // us to drop the response rather than post under the new generation.
+        const gen = this.generation;
         switch (m.type) {
             case 'getRows': {
                 this.reader.setLatestViewportGeneration(m.viewportGeneration);
@@ -1339,6 +1366,7 @@ export class DataViewerPanel {
                     start: m.start, end: m.end, columns: m.columns,
                     viewportGeneration: m.viewportGeneration,
                 });
+                if (gen !== this.generation) return;
                 const reply: ExtensionToWebview = {
                     type: 'rows',
                     panelGeneration: this.generation,
@@ -1352,6 +1380,7 @@ export class DataViewerPanel {
             }
             case 'getLabels': {
                 const labels = await this.reader.getLabels(m.columnIndex, m.indices);
+                if (gen !== this.generation) return;
                 const reply: ExtensionToWebview = {
                     type: 'labels',
                     panelGeneration: this.generation,
@@ -1442,6 +1471,11 @@ function formatCellForTsv(
     }
     if (typeof cell === 'number' && col?.dictionaryShipped && dict) {
         return labelsOn && dict[cell] !== undefined ? dict[cell] : String(cell + 1);
+    }
+    if (labelsOn && col?.valueLabels && (typeof cell === 'number' || typeof cell === 'string')) {
+        const key = String(cell);
+        const lbl = col.valueLabels[key];
+        if (lbl !== undefined) return lbl.replace(/[\t\n\r]/g, ' ');
     }
     if (typeof cell === 'number' && col && !col.isInteger && formatOn) {
         return cell.toFixed(digits);
@@ -2046,7 +2080,16 @@ export function formatCell(
         if (labelsOn && dictionary && dictionary[cell] !== undefined) {
             return { text: dictionary[cell], missing: false };
         }
-        return { text: String(cell + 1), missing: false }; // 1-based code
+        return { text: String(cell + 1), missing: false }; // 1-based factor code
+    }
+    // haven_labelled path: non-dictionary numeric/string columns with
+    // raven.value_labels metadata. Labels=on swaps the cell value for the
+    // mapped label string when one exists; otherwise the raw value passes
+    // through. Labels=off always shows the raw value.
+    if (labelsOn && col?.valueLabels && (typeof cell === 'number' || typeof cell === 'string')) {
+        const key = String(cell);
+        const lbl = col.valueLabels[key];
+        if (lbl !== undefined) return { text: lbl, missing: false };
     }
     if (typeof cell === 'number' && col && !col.isInteger && formatOn) {
         return { text: cell.toFixed(digits), missing: false };
