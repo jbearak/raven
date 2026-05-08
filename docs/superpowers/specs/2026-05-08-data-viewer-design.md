@@ -131,7 +131,7 @@ Pre-encoding rules in R (executed in the bootstrap, before `write_feather`):
 | `factor` | dictionary<int32, utf8> | `arrow` does this natively |
 | `Date` | date32 |  |
 | `POSIXct` | timestamp[us, tz] | tz pulled from `attr(x, "tzone")` |
-| `haven_labelled` | numeric or utf8 + sidecar `value_labels` metadata | Class is stripped before write; labels flow into column KV metadata |
+| `haven_labelled` | encoded as its underlying storage type (`int32`/`float64` for `<dbl>`, `utf8` for `<chr>`) | Class is stripped before write; labels flow into column KV metadata, not into the cell stream |
 | `matrix` | `as.data.frame(x)`; rownames preserved as a virtual `rowname` column iff present | Avoids reinventing matrix serialization |
 | Other (list-cols, S4, sf-geometry, etc.) | utf8 via `format()` per cell | Non-fatal fallback so unusual columns don't kill the viewer |
 
@@ -231,9 +231,9 @@ files (>24 h old).
 
 ```text
 extension → webview:
-  { type: 'init',    schema, nrow, layout, settings }
+  { type: 'init',    schema, nrow, layout, settings, dictionaries }
   { type: 'rows',    requestId, start, end, rows }
-  { type: 'replace', schema, nrow, layout }
+  { type: 'replace', schema, nrow, layout, dictionaries }
 
 webview → extension:
   { type: 'getRows',    requestId, start, end, columns }   // columns = visible only
@@ -245,6 +245,14 @@ webview → extension:
 hidden columns are never decoded. The webview coalesces scroll-driven
 requests at ~60 Hz so rapid scrolling doesn't fire dozens of concurrent
 reads.
+
+Dictionary columns (factors and any `haven_labelled` column with
+`raven.value_labels`) ship the dictionary itself **once**, in `init` /
+`replace`, as `dictionaries: { <columnIndex>: string[] }`. Row payloads
+for those columns carry **integer indices**, not decoded strings. The
+webview chooses what to render by looking up the index in the dictionary
+when Labels is `on` and showing the index directly when Labels is
+`off`. This keeps row payloads compact regardless of label length.
 
 ### File layout
 
@@ -342,8 +350,10 @@ Missing values rendered per the setting
 ### Selection & copy
 
 Single rectangular range selection: click a cell, shift-click to extend;
-click-drag also extends. Keyboard: arrows extend, `Cmd/Ctrl+A` selects all
-visible rows × visible cols. `Cmd/Ctrl+C` posts `{type:'copy', tsv}`
+click-drag also extends. Keyboard: arrows extend; `Cmd/Ctrl+A` selects
+the whole frame across all currently-visible (non-hidden) columns —
+*not* just the viewport — but the TSV is materialized lazily on copy.
+`Cmd/Ctrl+C` posts `{type:'copy', tsv}`
 to the extension, which writes to `vscode.env.clipboard`. Copying respects
 the current Labels and Format toggles — what you see is what you copy.
 
