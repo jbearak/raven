@@ -413,26 +413,43 @@ fn get_help_inner(
         buf
     });
 
-    // Watchdog thread: kills the subprocess after the configured timeout if it
-    // hasn't exited. An atomic flag prevents killing a recycled PID after the
-    // child has already exited naturally.
-    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let exited_clone = exited.clone();
+    // Watchdog: a sleeper thread sends a one-shot timeout signal. The main
+    // thread polls `try_wait()` and the signal channel together. We kill via
+    // `child.kill()` only after a `try_wait()` that returned `Ok(None)` —
+    // meaning we have NOT reaped the PID yet — so the kill cannot land on a
+    // recycled PID. This is the structural cure for the old "atomic flag plus
+    // bare-PID SIGKILL from a detached thread" race, where a watchdog firing
+    // between `wait()` reaping the child and the atomic store could SIGKILL
+    // an unrelated process that had grabbed the freed PID.
+    let (timeout_tx, timeout_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         std::thread::sleep(timeout);
-        if !exited_clone.load(std::sync::atomic::Ordering::SeqCst) {
-            log::trace!(
-                "get_help: timeout after {:?}, killing pid {}",
-                timeout,
-                child_pid
-            );
-            kill_process_by_pid(child_pid);
-        }
+        let _ = timeout_tx.send(());
     });
 
-    // Block efficiently via waitpid() instead of polling with try_wait()+sleep().
-    let wait_result = child.wait();
-    exited.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Poll just slow enough that idle CPU cost is negligible (~20 wakeups/s)
+    // but small enough that a fast subprocess returns near-instantly.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let wait_result: std::io::Result<std::process::ExitStatus> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if timeout_rx.try_recv().is_ok() {
+                    log::trace!(
+                        "get_help: timeout after {:?}, killing pid {}",
+                        timeout,
+                        child_pid
+                    );
+                    // Safe: try_wait returned None, so the child has not been
+                    // reaped and `child_pid` still names this child.
+                    let _ = child.kill();
+                    break child.wait();
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => break Err(e),
+        }
+    };
 
     let stdout_bytes = stdout_thread.join().unwrap_or_default();
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
