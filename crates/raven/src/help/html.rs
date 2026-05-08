@@ -228,4 +228,52 @@ mod tests {
         );
         assert_eq!(extract_h2_title("<p>no h2</p>"), None);
     }
+
+    use crate::r_subprocess::RSubprocess;
+
+    fn r_path() -> Option<std::path::PathBuf> {
+        RSubprocess::new(None).map(|s| s.r_path().clone())
+    }
+
+    #[test]
+    fn renders_base_mean() {
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("mean", Some("base"), &r).expect("render");
+        assert_eq!(res.package, "base");
+        assert!(res.html.contains("Arithmetic Mean") || res.title.contains("Mean"));
+        assert!(res.help_dir.ends_with("help"));
+        assert!(!res.lib_paths.is_empty());
+    }
+
+    #[test]
+    fn invalid_topic_short_circuits() {
+        // Path doesn't exist; this should still fail BEFORE spawning R.
+        let bogus = std::path::PathBuf::from("/no/such/R");
+        let res = get_help_html("with\nnewline", None, &bogus);
+        assert!(matches!(res, Err(HelpHtmlError::InvalidTopic { .. })));
+    }
+
+    #[test]
+    fn unknown_topic_returns_not_found() {
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("definitely_not_a_real_topic_zzz", Some("base"), &r);
+        assert!(matches!(res, Err(HelpHtmlError::NotFound) | Err(HelpHtmlError::RenderFailed { .. })));
+    }
+
+    #[test]
+    fn unknown_package_returns_package_not_installed() {
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("filter", Some("totally_not_installed_pkg_xyz"), &r);
+        assert!(matches!(
+            res,
+            Err(HelpHtmlError::PackageNotInstalled) | Err(HelpHtmlError::RenderFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn operator_topic_works() {
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("[", Some("base"), &r).expect("render");
+        assert_eq!(res.package, "base");
+    }
 }

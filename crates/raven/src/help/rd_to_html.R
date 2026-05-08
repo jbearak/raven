@@ -3,15 +3,19 @@ args <- commandArgs(trailingOnly = TRUE)
 topic <- args[1]
 pkg <- if (nzchar(args[2])) args[2] else NULL
 meta_path <- args[3]
-rd <- utils:::.getHelpFile(help(topic, package = (pkg)))
-resolved_pkg <- attr(rd, "package")
+h <- help(topic, package = (pkg))
+rd <- utils:::.getHelpFile(h)
+# In R 4.6, attr(rd, "package") is no longer populated; extract from the help path.
+help_path <- as.character(h)
+help_dir <- dirname(help_path)
+resolved_pkg <- basename(dirname(help_dir))
+# "\\alias" in R source is \a (BEL) + "lias"; use "\\\\alias" for a literal backslash.
 aliases <- vapply(
-  Filter(function(x) attr(x, "Rd_tag") == "\\alias", rd),
+  Filter(function(x) attr(x, "Rd_tag") == "\\\\alias", rd),
   function(x) as.character(x[[1]]),
   character(1)
 )
 canonical_topic <- if (length(aliases) >= 1) aliases[1] else topic
-help_dir <- system.file("help", package = resolved_pkg)
 lib_paths <- .libPaths()
 con <- file(meta_path, "w")
 on.exit(close(con))
