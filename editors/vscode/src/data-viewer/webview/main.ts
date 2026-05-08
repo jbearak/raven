@@ -6,6 +6,6 @@ declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
 const vscode = acquireVsCodeApi();
 
 mount(App, {
-    target: document.body,
+    target: document.getElementById('root')!,
     props: { vscode },
 });

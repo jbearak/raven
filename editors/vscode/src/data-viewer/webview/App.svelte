@@ -365,6 +365,8 @@
         <div class="toast toast-{copyStatus}">{copyStatusMsg}</div>
     {/if}
     <div class="viewport"
+         role="grid"
+         aria-rowcount={nrow}
          bind:this={viewportEl}
          onscroll={onScroll}
          tabindex="0">
@@ -405,6 +407,8 @@
                                 {decoded.missing ? 'missing-' + settings.missingValueStyle : ''}
                                 {col.isInteger || col.arrowType.startsWith('Float') ? 'numeric' : ''}
                                 {isInRect(absRow, colIdx) ? 'selected' : ''}"
+                                 role="gridcell"
+                                 tabindex="-1"
                                  style="width: {widthOf(colIdx)}px;"
                                  onpointerdown={(e) => onCellPointerDown(absRow, colIdx, e)}
                                  onpointerenter={(e) => onCellPointerEnter(absRow, colIdx, e)}
