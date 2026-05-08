@@ -35,7 +35,7 @@ Internal cross-references are rewritten to a custom URL scheme that correctly ro
 
 - **No search**: There is no way to search across help topics from the panel. Use `?topic` or `??topic` in the R console.
 - **No examples runner**: Clicking inside an examples block does not execute the code. Copy-paste it into your R console.
-- **No vignettes**: Links to vignettes (`` \`../../<pkg>/doc/<vignette>.html\` ``) pass through unchanged and will not navigate; vignettes are out of scope for v1.
+- **No vignettes**: Vignette links (`` \`../../<pkg>/doc/<vignette>.html\` ``) are neutralized in the rendered HTML; clicking them does nothing. Vignettes are out of scope for v1.
 - **Remote images dropped**: `<img>` tags pointing to `https://` or any non-local source are stripped by the sanitizer. Only local images shipped with installed packages render.
 - **Singleton panel**: Only one help panel per VS Code window. Navigating to a new topic reuses the same panel.
 - **Help format support**: `tools::Rd2HTML()` output is sanitized via ammonia. Topics with unusual Rd structure may render slightly differently than RStudio's help pane.
