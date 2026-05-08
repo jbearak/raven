@@ -9901,6 +9901,24 @@ async fn get_help_cached(
     .flatten()
 }
 
+/// Build the bold clickable heading line that links to the help panel for
+/// `(topic, package)`. Returns markdown like:
+///
+/// `**[`base::mean`](command:raven.openHelpPanel?%5B%22mean%22%2C%22base%22%5D)**\n\n`
+///
+/// Uses `NON_ALPHANUMERIC` percent-encoding (stricter than `encodeURIComponent`),
+/// which is RFC 3986 compliant and survives any roundtrip through VS Code's URL
+/// parsing. The webview decodes via `JSON.parse(decodeURIComponent(...))`.
+fn build_help_panel_link(topic: &str, package: &str) -> String {
+    let arg_json = serde_json::json!([topic, package]).to_string();
+    let arg_encoded = percent_encoding::utf8_percent_encode(
+        &arg_json,
+        percent_encoding::NON_ALPHANUMERIC,
+    )
+    .to_string();
+    format!("**[`{package}::{topic}`](command:raven.openHelpPanel?{arg_encoded})**\n\n")
+}
+
 /// Provide hover information for the symbol at a given text document position.
 ///
 /// Tries, in order:
@@ -10060,6 +10078,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     );
                     if let Some(help_text) = help_text {
                         value.push_str(&format!("```\n{}\n```", help_text));
+                        value.insert_str(0, &build_help_panel_link(name, pkg));
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
                         value.push_str(&format!("\nfrom {{{}}}", pkg));
@@ -10121,6 +10140,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 get_help_cached(&state.help_cache, name, Some(&pkg_name), r_path.clone()).await;
             if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
+                value.insert_str(0, &build_help_panel_link(name, &pkg_name));
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
                 value.push_str(&format!("\nfrom {{{}}}", pkg_name));
@@ -40923,8 +40943,8 @@ generated quantities {
 #[cfg(test)]
 mod issue_149_utf16_handlers {
     use super::{
-        completion, goto_definition, hover, lsp_position_to_ts_point, prepare_signature_help,
-        references, selection_range,
+        build_help_panel_link, completion, goto_definition, hover, lsp_position_to_ts_point,
+        prepare_signature_help, references, selection_range,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{CompletionResponse, GotoDefinitionResponse, Position, Url};
@@ -41194,5 +41214,37 @@ mod issue_149_utf16_handlers {
             "expected the chain to contain the `abc` identifier range; got {:#?}",
             result[0]
         );
+    }
+
+    #[test]
+    fn test_build_help_panel_link_basic() {
+        let link = build_help_panel_link("mean", "base");
+        assert!(link.starts_with("**[`base::mean`](command:raven.openHelpPanel?"));
+        assert!(link.ends_with(")**\n\n"));
+        // The encoded args should round-trip through percent-decode + JSON.parse to ["mean", "base"]
+        let after_q = &link[link.find('?').unwrap() + 1..link.find(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["mean".to_string(), "base".to_string()]);
+    }
+
+    #[test]
+    fn test_build_help_panel_link_operator_topic() {
+        let link = build_help_panel_link("[", "base");
+        assert!(link.starts_with("**[`base::["));
+        let after_q = &link[link.find('?').unwrap() + 1..link.rfind(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["[".to_string(), "base".to_string()]);
+    }
+
+    #[test]
+    fn test_build_help_panel_link_topic_with_dot() {
+        let link = build_help_panel_link("print.default", "base");
+        assert!(link.contains("`base::print.default`"));
     }
 }
