@@ -1,34 +1,41 @@
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as http from 'http';
+import * as path from 'path';
+import {
+    PlotEvent,
+    RSessionEvent,
+    RSessionEventListener,
+    SessionInfo,
+    ViewDataEvent,
+} from './types';
+
+export type { PlotEvent, RSessionEvent, RSessionEventListener, SessionInfo, ViewDataEvent };
+/** @deprecated Use {@link RSessionEventListener}. */
+export type PlotEventListener = RSessionEventListener;
 
 const MAX_BODY_BYTES = 64 * 1024;
-
-export type SessionInfo = {
-    sessionId: string;
-    httpgdBaseUrl: string;
-    httpgdToken: string;
-    ended: boolean;
-    /** httpgd state.upid from the most recent /plot-available for this session,
-     *  or 0 if none seen yet. Used as a cache-busting query parameter so plot
-     *  updates that reuse an existing id (e.g. `points()` on a live plot) are
-     *  not served stale from the browser cache. */
-    lastUpid: number;
-};
-
-export type PlotEvent =
-    | { type: 'session-ready'; session: SessionInfo }
-    | { type: 'plot-available'; sessionId: string; hsize: number; upid: number }
-    | { type: 'session-ended'; sessionId: string };
-
-export type PlotEventListener = (event: PlotEvent) => void;
 
 export class RSessionServer {
     private server: http.Server | null = null;
     private _port = 0;
     private _token = '';
     private sessions = new Map<string, SessionInfo>();
-    private listeners = new Set<PlotEventListener>();
+    private listeners = new Set<RSessionEventListener>();
     private active_session_id: string | null = null;
+    private readonly allowed_data_viewer_dir: string;
+
+    /**
+     * @param allowed_data_viewer_dir
+     *   Absolute path of the directory under which `/view-data` filePaths must
+     *   resolve. When empty, `/view-data` returns 404 — used in plot-only
+     *   contexts where the data viewer is disabled or not yet initialized.
+     */
+    constructor(allowed_data_viewer_dir: string = '') {
+        this.allowed_data_viewer_dir = allowed_data_viewer_dir
+            ? path.resolve(allowed_data_viewer_dir)
+            : '';
+    }
 
     get port(): number { return this._port; }
     get token(): string { return this._token; }
@@ -67,7 +74,7 @@ export class RSessionServer {
         await new Promise<void>(resolve => s.close(() => resolve()));
     }
 
-    onEvent(listener: PlotEventListener): () => void {
+    onEvent(listener: RSessionEventListener): () => void {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
     }
@@ -79,7 +86,7 @@ export class RSessionServer {
         this.emit({ type: 'session-ended', sessionId });
     }
 
-    private emit(event: PlotEvent): void {
+    private emit(event: RSessionEvent): void {
         for (const l of this.listeners) {
             try { l(event); } catch { /* ignore listener errors */ }
         }
@@ -104,7 +111,58 @@ export class RSessionServer {
             this.read_json_body(req, res, body => this.handle_plot_available(body, res));
             return;
         }
+        if (url === '/view-data') {
+            this.read_json_body(req, res, body => this.handle_view_data(body, res));
+            return;
+        }
         res.writeHead(404).end();
+    }
+
+    private handle_view_data(body: unknown, res: http.ServerResponse): void {
+        // /view-data is only enabled when the server was constructed with an
+        // allowed data-viewer directory.
+        if (!this.allowed_data_viewer_dir) {
+            res.writeHead(404).end();
+            return;
+        }
+        if (!body || typeof body !== 'object') {
+            res.writeHead(400).end();
+            return;
+        }
+        const b = body as Record<string, unknown>;
+        const sessionId = typeof b.sessionId === 'string' ? b.sessionId : '';
+        const panelName = typeof b.panelName === 'string' ? b.panelName : '';
+        const filePath = typeof b.filePath === 'string' ? b.filePath : '';
+        const nrow = typeof b.nrow === 'number' ? b.nrow : NaN;
+        if (!sessionId || !panelName || !filePath
+            || !Number.isFinite(nrow) || nrow < 0) {
+            res.writeHead(400).end();
+            return;
+        }
+
+        // Path-trust: canonicalize and require strict containment in the
+        // allowed directory. realpathSync also rejects non-existent files.
+        let canonical: string;
+        try {
+            canonical = fs.realpathSync(filePath);
+        } catch {
+            res.writeHead(400).end();
+            return;
+        }
+        const allowed = this.allowed_data_viewer_dir;
+        if (canonical !== allowed && !canonical.startsWith(allowed + path.sep)) {
+            res.writeHead(400).end();
+            return;
+        }
+
+        this.emit({
+            type: 'view-data-requested',
+            sessionId,
+            panelName,
+            filePath: canonical,
+            nrow,
+        });
+        res.writeHead(200).end();
     }
 
     private read_json_body(
