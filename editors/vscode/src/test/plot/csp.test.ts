@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import * as http from 'http';
-import { PlotSessionServer } from '../../plot/session-server';
+import { RSessionServer } from '../../r-session-server';
 import { PlotViewerPanel } from '../../plot/plot-viewer-panel';
 import { csp_sources_for_external_base } from '../../plot/csp';
 
@@ -43,7 +43,7 @@ suite('plot viewer CSP — local host', () => {
 
         // Real session server + a fake httpgd listener so /session-ready is
         // accepted and the panel has a session to derive CSP from.
-        const server = new PlotSessionServer();
+        const server = new RSessionServer();
         await server.start();
         const fake_httpgd = http.createServer((_req, res) => res.writeHead(200).end());
         await new Promise<void>(r => fake_httpgd.listen(0, '127.0.0.1', () => r()));

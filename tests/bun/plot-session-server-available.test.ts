@@ -1,8 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { PlotSessionServer } from '../../editors/vscode/src/plot/session-server';
+import { RSessionServer } from '../../editors/vscode/src/r-session-server';
 
 describe('POST /plot-available', () => {
-    let server: PlotSessionServer;
+    let server: RSessionServer;
 
     async function register(sid: string) {
         await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
@@ -32,7 +32,7 @@ describe('POST /plot-available', () => {
     }
 
     beforeEach(async () => {
-        server = new PlotSessionServer();
+        server = new RSessionServer();
         await server.start();
     });
     afterEach(async () => { await server.stop(); });

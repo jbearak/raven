@@ -22,7 +22,7 @@ export type PlotEvent =
 
 export type PlotEventListener = (event: PlotEvent) => void;
 
-export class PlotSessionServer {
+export class RSessionServer {
     private server: http.Server | null = null;
     private _port = 0;
     private _token = '';
@@ -204,3 +204,9 @@ export class PlotSessionServer {
         res.writeHead(200).end();
     }
 }
+
+/** @deprecated Use {@link RSessionServer}. Retained for one release while
+ *  callers migrate. */
+export const PlotSessionServer = RSessionServer;
+/** @deprecated Use {@link RSessionServer}. */
+export type PlotSessionServer = RSessionServer;

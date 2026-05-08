@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { PlotEvent, PlotSessionServer } from './session-server';
+import { PlotEvent, RSessionServer } from '../r-session-server';
 import { PlotViewerPanel } from './plot-viewer-panel';
 
 /**
@@ -17,7 +17,7 @@ import { PlotViewerPanel } from './plot-viewer-panel';
  * recreated panel keeps its "R Plots N" label.
  */
 export class PlotServices {
-    readonly server = new PlotSessionServer();
+    readonly server = new RSessionServer();
     private readonly context: vscode.ExtensionContext;
     private readonly panels = new Map<string, PlotViewerPanel>();
     private readonly session_indices = new Map<string, number>();
