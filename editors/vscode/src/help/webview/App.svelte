@@ -6,6 +6,7 @@
         isExtensionToWebviewMessage,
     } from '../messages';
     import type { WebviewToExtensionMessage } from '../messages';
+    import { classifyAndDispatch } from './click-handler';
 
     interface Props {
         vscode: { postMessage(msg: WebviewToExtensionMessage): void };
@@ -90,69 +91,9 @@
         if (!target || target.tagName.toUpperCase() !== 'A') return;
 
         const anchor = target as HTMLAnchorElement;
-        const href = anchor.getAttribute('href') ?? '';
-
-        // Anchors rewritten by server neutralization carry data-raven-dropped="1".
-        // Treat them as disallowed links.
-        if (anchor.dataset['ravenDropped'] === '1') {
-            event.preventDefault();
-            vscode.postMessage({
-                type: 'report-error',
-                payload: { message: `Blocked neutralized link: ${href}` },
-            });
-            return;
-        }
-
-        // Pure hash anchor (#section) — let browser scroll natively.
-        if (href.startsWith('#') && !href.includes('://')) {
-            // No preventDefault — native scroll.
-            return;
-        }
-
-        // raven-help://topic/<pkg>/<topic>[#anchor]
-        if (href.startsWith('raven-help://topic/')) {
-            event.preventDefault();
-            try {
-                const url = new URL(href);
-                // path is /<pkg>/<topic>
-                const parts = url.pathname.replace(/^\//, '').split('/');
-                if (parts.length < 2 || !parts[0] || !parts[1]) {
-                    throw new Error(`Malformed raven-help URL: ${href}`);
-                }
-                const pkg = decodeURIComponent(parts[0]);
-                const topic = decodeURIComponent(parts[1]);
-                const rawAnchor = url.hash.startsWith('#') ? url.hash.slice(1) : null;
-                const anchorDecoded = rawAnchor ? decodeURIComponent(rawAnchor) : null;
-                vscode.postMessage({
-                    type: 'navigate',
-                    payload: { topic, package: pkg, anchor: anchorDecoded },
-                });
-            } catch (err) {
-                vscode.postMessage({
-                    type: 'report-error',
-                    payload: { message: `Invalid raven-help URL: ${href} — ${String(err)}` },
-                });
-            }
-            return;
-        }
-
-        // External URLs — http, https, mailto.
-        if (
-            href.startsWith('https://') ||
-            href.startsWith('http://') ||
-            href.startsWith('mailto:')
-        ) {
-            event.preventDefault();
-            vscode.postMessage({ type: 'open-external', payload: { url: href } });
-            return;
-        }
-
-        // Everything else (javascript:, data:, relative paths with no scheme, etc.)
-        event.preventDefault();
-        vscode.postMessage({
-            type: 'report-error',
-            payload: { message: `Disallowed link: ${href}` },
-        });
+        const href = anchor.getAttribute('href');
+        const isDropped = anchor.dataset['ravenDropped'] === '1';
+        classifyAndDispatch(event, href, isDropped, vscode.postMessage.bind(vscode));
     }
 
     onMount(() => {
@@ -168,14 +109,35 @@
     });
 
     /**
-     * Keyboard companion to on_content_click: fire click classification on
-     * Enter/Space keydown over an <a> element so keyboard navigation works.
+     * Delegated keydown handler on the content container.
+     *
+     * Activates links via Enter or Space so keyboard navigation works.
+     * For Space, always calls preventDefault() first to suppress the browser's
+     * page-scroll default — even when the link is a hash anchor.
      */
     function on_content_keydown(event: KeyboardEvent) {
         if (event.key !== 'Enter' && event.key !== ' ') return;
-        // Synthesise a MouseEvent-compatible object for on_content_click.
-        // We only need `target`, `preventDefault`, and `parentElement`.
-        on_content_click(event as unknown as MouseEvent);
+
+        // Walk up from event target to find the nearest <a> element.
+        let target = event.target as Element | null;
+        while (target && target.tagName.toUpperCase() !== 'A') {
+            target = target.parentElement;
+        }
+        if (!target || target.tagName.toUpperCase() !== 'A') return;
+
+        const anchor = target as HTMLAnchorElement;
+        const href = anchor.getAttribute('href');
+        const isDropped = anchor.dataset['ravenDropped'] === '1';
+
+        // For Space, always suppress the page-scroll default before dispatching.
+        // classifyAndDispatch returns false for hash anchors (no preventDefault
+        // inside), but Space's native scroll should never fire here — the anchor
+        // activation is handled by classifyAndDispatch or the native hash scroll.
+        if (event.key === ' ') {
+            event.preventDefault();
+        }
+
+        classifyAndDispatch(event, href, isDropped, vscode.postMessage.bind(vscode));
     }
 
     function go_back() {

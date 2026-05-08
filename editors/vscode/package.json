@@ -577,7 +577,7 @@
           "type": "number",
           "default": 1000,
           "minimum": 100,
-          "maximum": 10000,
+          "maximum": 1e4,
           "description": "Maximum number of symbols returned by workspace symbol search (Ctrl+T / Cmd+T). Higher values show more results but may impact performance. Valid range: 100-10000."
         },
         "raven.completion.triggerOnOpenParen": {
@@ -639,6 +639,7 @@
     "uuid": ">=14.0.0"
   },
   "devDependencies": {
+    "@types/jsdom": "^28.0.1",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.75.0",
@@ -648,9 +649,10 @@
     "esbuild": "^0.27.2",
     "esbuild-svelte": "^0.9.0",
     "fast-check": "^4.5.3",
+    "jsdom": "^29.1.1",
+    "mocha": "^11.0.0",
     "svelte": "^5.0.0",
     "svelte-preprocess": "^6.0.0",
-    "mocha": "^11.0.0",
     "typescript": "^5.0.0"
   }
 }
