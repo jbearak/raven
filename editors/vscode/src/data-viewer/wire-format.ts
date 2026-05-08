@@ -63,8 +63,14 @@ export function encodeDate(daysSinceEpoch: number | null): Cell {
  */
 export function encodeTimestampMicros(us: bigint | null, tz: string): Cell {
     if (us === null) return null;
-    const ms = Number(us / 1000n);
-    const usRem = Number(us - BigInt(ms) * 1000n);
+    // BigInt division truncates toward zero, not toward -Infinity. For
+    // pre-epoch values whose microsecond remainder isn't zero, the naive
+    // computation lands on a positive ms and a negative usRem, which
+    // pad3() turns into garbage like "00-1". Correct to floor-division.
+    const ms_bigint = us / 1000n;
+    let ms = Number(ms_bigint);
+    let usRem = Number(us - ms_bigint * 1000n);
+    if (usRem < 0) { ms -= 1; usRem += 1000; }
     const d = new Date(ms);
     const base = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}` +
         `T${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;

@@ -94,14 +94,14 @@ local({
 local({
     .raven_log <- function(msg) message(paste0("Raven: ", msg))
 
-    if (!requireNamespace("arrow", quietly = TRUE)) {
-        .raven_log("data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")")
-        return(invisible(NULL))
-    }
-
     .raven_dv_dir <- Sys.getenv("RAVEN_DATA_VIEWER_DIR")
     if (!nzchar(.raven_dv_dir)) {
-        # Data viewer is disabled in this terminal.
+        # Data viewer is disabled in this terminal — stay silent so users
+        # who never opted in don't see the "install arrow" message.
+        return(invisible(NULL))
+    }
+    if (!requireNamespace("arrow", quietly = TRUE)) {
+        .raven_log("data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")")
         return(invisible(NULL))
     }
     if (!dir.exists(.raven_dv_dir)) {
@@ -277,7 +277,8 @@ local({
             s <- tryCatch(deparse1(substitute(x), collapse = " "),
                           error = function(e) "View")
             if (nchar(s, type = "bytes") > 256L) {
-                s <- paste0(.raven_truncate_utf8(s, 255L), "\\u2026")
+                # truncate_utf8 already appends a single "…" when it cuts.
+                s <- .raven_truncate_utf8(s, 256L)
             }
             s
         }

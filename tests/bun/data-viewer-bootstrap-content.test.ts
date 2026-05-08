@@ -67,6 +67,32 @@ describe('bootstrap profile: data viewer block', () => {
         expect(slice).toContain('RAVEN_DATA_VIEWER_DIR');
     });
 
+    test('checks RAVEN_DATA_VIEWER_DIR BEFORE the arrow requireNamespace check', () => {
+        // The data viewer being disabled must not fire the "install arrow"
+        // message at terminal startup.
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        const dirCheckIdx = slice.indexOf('RAVEN_DATA_VIEWER_DIR');
+        const arrowCheckIdx = slice.indexOf('requireNamespace("arrow"');
+        expect(dirCheckIdx).toBeGreaterThan(-1);
+        expect(arrowCheckIdx).toBeGreaterThan(-1);
+        expect(dirCheckIdx).toBeLessThan(arrowCheckIdx);
+    });
+
+    test('panelName truncation does not double-append the ellipsis', () => {
+        // The truncate helper already appends "…" when truncating; the
+        // caller must not wrap that result in another paste0 with another
+        // "…" — that would produce a double ellipsis and push the title
+        // past the advertised cap.
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        // Smoking gun: the verbatim text `.raven_truncate_utf8(s, 255L), "…")`
+        // — i.e., truncate to 255 then paste an ellipsis on top.
+        expect(slice).not.toContain(
+            '.raven_truncate_utf8(s, 255L), "\\u2026")',
+        );
+    });
+
     test('user .Rprofile is sourced exactly once at the top', () => {
         // Profile-source happens before either bridge marker.
         const userProfile = src.indexOf('RAVEN_ORIGINAL_R_PROFILE_USER');

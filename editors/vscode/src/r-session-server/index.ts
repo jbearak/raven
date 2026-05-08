@@ -135,7 +135,7 @@ export class RSessionServer {
         const filePath = typeof b.filePath === 'string' ? b.filePath : '';
         const nrow = typeof b.nrow === 'number' ? b.nrow : NaN;
         if (!sessionId || !panelName || !filePath
-            || !Number.isFinite(nrow) || nrow < 0) {
+            || !Number.isInteger(nrow) || nrow < 0) {
             res.writeHead(400).end();
             return;
         }

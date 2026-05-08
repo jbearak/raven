@@ -21,7 +21,7 @@ import {
 } from './messages';
 import { LayoutStore, schemaHash } from './layout-state';
 import { build_csp } from './csp';
-import { render_tsv } from './tsv';
+import { render_tsv, ResolvedLabels } from './tsv';
 
 export class DataViewerPanel {
     readonly panelName: string;
@@ -216,9 +216,32 @@ export class DataViewerPanel {
             viewportGeneration: Number.MAX_SAFE_INTEGER,
         });
         if (gen !== this.generation) return;
+
+        // Resolve labels for any non-shipped dictionary columns in the
+        // selection so a Labels-on copy renders the level strings the
+        // grid is showing rather than the raw numeric indices.
+        const resolved: ResolvedLabels = {};
+        if (m.labelsOn) {
+            for (let ci = 0; ci < m.range.colIndices.length; ci++) {
+                const colIdx = m.range.colIndices[ci];
+                const col = this.columns[colIdx];
+                if (!col || col.dictionaryShipped
+                    || !col.arrowType.startsWith('Dictionary')) continue;
+                const indices = new Set<number>();
+                for (const row of got.rows) {
+                    const cell = row[ci];
+                    if (typeof cell === 'number') indices.add(cell);
+                }
+                if (indices.size === 0) continue;
+                const labels = await this.reader.getLabels(colIdx, [...indices]);
+                if (gen !== this.generation) return;
+                resolved[colIdx] = labels;
+            }
+        }
+
         const tsv = render_tsv(
             got.rows, m.range.colIndices, this.columns, this.dictionaries,
-            m.labelsOn, m.formatOn, m.digits,
+            m.labelsOn, m.formatOn, m.digits, resolved,
         );
         try {
             await vscode.env.clipboard.writeText(tsv);

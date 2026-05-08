@@ -73,16 +73,33 @@ describe('POST /view-data', () => {
         expect(r.status).toBe(400);
     });
 
-    test('filePath outside allowed dir returns 400', async () => {
+    test('fractional nrow returns 400 (must be an integer)', async () => {
+        const fp = join(dvDir, 'x.arrow');
+        await writeFile(fp, '');
         const r = await post({
-            sessionId: 's', panelName: 'p', filePath: '/etc/passwd', nrow: 1,
+            sessionId: 's', panelName: 'p', filePath: fp, nrow: 1.5,
         });
         expect(r.status).toBe(400);
     });
 
-    test('filePath using .. traversal returns 400', async () => {
-        const traversed = join(dvDir, '..', '..', 'tmp', 'evil.arrow');
-        await writeFile(join(root, 'evil.arrow'), '');
+    test('filePath outside allowed dir returns 400 (file exists, just elsewhere)', async () => {
+        // Use a real file in a sibling directory of dvDir so the rejection
+        // is unambiguously about path containment, not file existence.
+        const outside = join(root, 'outside.arrow');
+        await writeFile(outside, 'pretend-arrow');
+        const r = await post({
+            sessionId: 's', panelName: 'p', filePath: outside, nrow: 1,
+        });
+        expect(r.status).toBe(400);
+    });
+
+    test('filePath using .. traversal to a real outside file returns 400', async () => {
+        // The traversed path must resolve to a file that exists outside
+        // dvDir; otherwise the rejection would be ambiguous (could be
+        // realpath ENOENT instead of containment).
+        const outside = join(root, 'evil.arrow');
+        await writeFile(outside, 'pretend-arrow');
+        const traversed = `${dvDir}/../evil.arrow`;
         const r = await post({
             sessionId: 's', panelName: 'p', filePath: traversed, nrow: 1,
         });
@@ -90,8 +107,13 @@ describe('POST /view-data', () => {
     });
 
     test('symlink redirecting outside allowed dir returns 400', async () => {
+        // Create a real file under root (not dvDir) and point a symlink
+        // inside dvDir at it. realpath resolves through the symlink, so
+        // containment must reject this.
+        const realTarget = join(root, 'target.arrow');
+        await writeFile(realTarget, 'pretend-arrow');
         const link = join(dvDir, 'evil.arrow');
-        await symlink('/etc/hosts', link); // safer than passwd; just any file outside dvDir
+        await symlink(realTarget, link);
         const r = await post({
             sessionId: 's', panelName: 'p', filePath: link, nrow: 1,
         });

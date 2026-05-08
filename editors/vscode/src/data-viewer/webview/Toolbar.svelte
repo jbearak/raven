@@ -53,7 +53,7 @@
         disabled={!formatOn}
         title="Number of digits when Format is on."
     >
-        {#each [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15] as d (d)}
+        {#each Array.from({ length: 16 }, (_, i) => i) as d (d)}
             <option value={d}>{d}</option>
         {/each}
     </select>

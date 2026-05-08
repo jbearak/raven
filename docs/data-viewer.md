@@ -85,7 +85,7 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 ## Settings
 
 | Setting | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `raven.dataViewer.enabled` | `true` | Override `View()` in the Raven-managed R terminal. Set to `false` to disable the viewer entirely. |
 | `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colorize the text), `background` (tint the cell), or `none`. |
 | `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |

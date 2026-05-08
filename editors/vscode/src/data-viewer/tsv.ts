@@ -8,6 +8,12 @@
 import type { Cell } from './wire-format';
 import type { ColumnSchema } from './arrow-reader';
 
+/** Map of column index → (dictionary index → label string), for columns
+ *  whose dictionaries weren't shipped up front (cardinality above the
+ *  threshold). The copy path passes labels it has resolved via
+ *  `reader.getLabels` so what's copied matches what the grid showed. */
+export type ResolvedLabels = Record<number, Record<number, string>>;
+
 export function render_tsv(
     rows: Cell[][],
     colIndices: number[],
@@ -16,6 +22,7 @@ export function render_tsv(
     labelsOn: boolean,
     formatOn: boolean,
     digits: number,
+    resolvedLabels: ResolvedLabels = {},
 ): string {
     const lines: string[] = [];
     for (const row of rows) {
@@ -24,6 +31,7 @@ export function render_tsv(
             const colIdx = colIndices[j];
             parts.push(format_cell_for_tsv(
                 row[j], columns[colIdx], dictionaries[colIdx],
+                resolvedLabels[colIdx],
                 labelsOn, formatOn, digits,
             ));
         }
@@ -32,10 +40,13 @@ export function render_tsv(
     return lines.join('\n');
 }
 
+const sanitize = (s: string): string => s.replace(/[\t\n\r]/g, ' ');
+
 function format_cell_for_tsv(
     cell: Cell,
     col: ColumnSchema | undefined,
     dict: string[] | undefined,
+    resolved: Record<number, string> | undefined,
     labelsOn: boolean,
     formatOn: boolean,
     digits: number,
@@ -46,23 +57,31 @@ function format_cell_for_tsv(
             case 'nan': return 'NaN';
             case 'inf': return 'Inf';
             case '-inf': return '-Inf';
-            case 'date': return cell.v;
-            case 'ts': return cell.v;
-            case 'trunc': return cell.v;
+            case 'date':  return sanitize(cell.v);
+            case 'ts':    return sanitize(cell.v);
+            case 'trunc': return sanitize(cell.v);
         }
     }
+    // Dictionary cell with shipped dictionary.
     if (typeof cell === 'number' && col?.dictionaryShipped && dict) {
         return labelsOn && dict[cell] !== undefined
-            ? dict[cell].replace(/[\t\n\r]/g, ' ')
+            ? sanitize(dict[cell])
             : String(cell + 1);
+    }
+    // Dictionary cell without a shipped dictionary (high cardinality).
+    if (typeof cell === 'number' && col?.arrowType.startsWith('Dictionary')) {
+        if (labelsOn && resolved && resolved[cell] !== undefined) {
+            return sanitize(resolved[cell]);
+        }
+        return String(cell + 1);
     }
     if (labelsOn && col?.valueLabels
         && (typeof cell === 'number' || typeof cell === 'string')) {
         const lbl = col.valueLabels[String(cell)];
-        if (lbl !== undefined) return lbl.replace(/[\t\n\r]/g, ' ');
+        if (lbl !== undefined) return sanitize(lbl);
     }
     if (typeof cell === 'number' && col && !col.isInteger && formatOn) {
         return cell.toFixed(digits);
     }
-    return String(cell).replace(/[\t\n\r]/g, ' ');
+    return sanitize(String(cell));
 }

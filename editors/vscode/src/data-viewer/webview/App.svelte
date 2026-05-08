@@ -267,6 +267,12 @@
         if (hidden) set.add(name); else set.delete(name);
         layout = { ...layout, hiddenColumns: Array.from(set) };
         persistLayout();
+        // Cached row windows were decoded for the previous visible-column
+        // subset. After a hide/show toggle, those cells no longer line up
+        // with the new column order, so we must drop the cache before
+        // refetching.
+        rowCache.clear();
+        visibleRows = [];
         scheduleFetchVisible();
     }
 

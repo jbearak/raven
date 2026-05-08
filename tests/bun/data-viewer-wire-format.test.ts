@@ -75,4 +75,27 @@ describe('encodeTimestampMicros', () => {
     test('null is null', () => {
         expect(encodeTimestampMicros(null, 'UTC')).toBeNull();
     });
+    test('exact epoch produces no fractional component', () => {
+        const r = encodeTimestampMicros(0n, 'UTC') as { _: string; v: string };
+        expect(r.v).toBe('1970-01-01T00:00:00Z');
+    });
+    test('one microsecond before epoch encodes as 1969-12-31T23:59:59.999999Z', () => {
+        const r = encodeTimestampMicros(-1n, 'UTC') as { _: string; v: string };
+        expect(r.v).toBe('1969-12-31T23:59:59.999999Z');
+    });
+    test('one millisecond before epoch encodes as 1969-12-31T23:59:59.999Z', () => {
+        const r = encodeTimestampMicros(-1000n, 'UTC') as { _: string; v: string };
+        expect(r.v).toBe('1969-12-31T23:59:59.999Z');
+    });
+    test('pre-epoch sub-millisecond timestamps (BigInt floor-division correction)', () => {
+        // BigInt division truncates toward zero, not floor. The encoder must
+        // correct for that or it produces garbled "00-1" fractional strings
+        // for any negative microsecond not aligned to a millisecond boundary.
+        const r = encodeTimestampMicros(-1001n, 'UTC') as { _: string; v: string };
+        expect(r.v).toBe('1969-12-31T23:59:59.998999Z');
+    });
+    test('pre-epoch microsecond-only offset', () => {
+        const r = encodeTimestampMicros(-999001n, 'UTC') as { _: string; v: string };
+        expect(r.v).toBe('1969-12-31T23:59:59.000999Z');
+    });
 });

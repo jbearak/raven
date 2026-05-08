@@ -64,4 +64,29 @@ describe('render_tsv', () => {
         const tsv = render_tsv(rows, [0, 1], cols, dictionaries, false, false, 3);
         expect(tsv).toBe('\t');
     });
+
+    test('high-cardinality dictionary uses resolvedLabels when Labels on', () => {
+        const bigDict: ColumnSchema = {
+            name: 'zip', arrowType: 'Dictionary<Int32, Utf8>',
+            isInteger: false, dictionaryShipped: false,
+        };
+        const rows = [[5] as any, [7] as any];
+        const resolved = { 0: { 5: 'zip-005', 7: 'zip-007' } };
+        const tsv = render_tsv(
+            rows, [0], [bigDict], {}, true, false, 3, resolved,
+        );
+        expect(tsv).toBe('zip-005\nzip-007');
+    });
+
+    test('high-cardinality dictionary missing a label falls back to 1-based code', () => {
+        const bigDict: ColumnSchema = {
+            name: 'zip', arrowType: 'Dictionary<Int32, Utf8>',
+            isInteger: false, dictionaryShipped: false,
+        };
+        const rows = [[5] as any];
+        const tsv = render_tsv(
+            rows, [0], [bigDict], {}, true, false, 3, {},
+        );
+        expect(tsv).toBe('6');  // 5 + 1
+    });
 });

@@ -12,7 +12,7 @@
  * tests/bun/data-viewer-arrow-spike.test.ts.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { RecordBatchFileReader } from 'apache-arrow';
 import {
     Cell,
@@ -104,7 +104,9 @@ export class ArrowSliceReader {
      * deletion of the file on disk doesn't affect reads.
      */
     static async open(filePath: string, opts: OpenOptions = {}): Promise<ArrowSliceReader> {
-        const buf = readFileSync(filePath);
+        // Asynchronous read: a multi-hundred-MB Arrow file would otherwise
+        // stall the VS Code extension host's event loop for the duration.
+        const buf = await readFile(filePath);
         const reader = await (RecordBatchFileReader.from(buf) as any).open();
         const threshold = opts.dictionaryThreshold ?? DEFAULT_DICTIONARY_THRESHOLD;
 
