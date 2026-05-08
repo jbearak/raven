@@ -82,7 +82,7 @@ Goals:
    base packages — the user gets to know where things come from). Note that
    this reuses the **same** `get_or_fetch` value the hover handler already
    computed — no second R subprocess per hover.
-7. New setting `raven.help.viewer.viewColumn` (`active` | `beside`, default
+7. New setting `raven.help.viewerColumn` (`active` | `beside`, default
    `beside`), wired through all three places per the `CLAUDE.md` rule.
 8. Real subprocess-timeout test coverage for both the new `get_help_html` and
    the existing `get_help` (the latter is currently uncovered).
@@ -168,47 +168,72 @@ file outgrows itself; see "Implementation notes" below):
   `get_help` is replaced by the same `r_path` parameter as part of this
   work, so help rendering, package indexing, and other R queries always
   agree on the R installation.
-- The R snippet performs **both** rendering and metadata lookup in one
-  subprocess call:
+- **Single-subprocess strategy with two output sinks**: rendered HTML
+  goes to `stdout`; metadata goes to a per-request **tempfile** whose
+  path is passed in via R command-line args. This eliminates marker
+  collision risk (the previous `<!--RAVEN-META-->` inline marker would
+  be ambiguous if a package's documentation happened to include the
+  literal string).
 
   ```r
   args <- commandArgs(trailingOnly = TRUE)
   topic <- args[1]
   pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
+  meta_path <- args[3]  # absolute path to per-request tempfile
   rd <- utils:::.getHelpFile(help(topic, package = (pkg)))
-  # Resolve canonical metadata
   resolved_pkg <- attr(rd, "package")
+  # Canonical topic: first \alias entry in the Rd object, falling back
+  # to the requested topic if Rd2HTML chose to render this same Rd in
+  # response to that alias.
+  aliases <- vapply(
+    Filter(function(x) attr(x, "Rd_tag") == "\\alias", rd),
+    function(x) as.character(x[[1]]),
+    character(1)
+  )
+  canonical_topic <- if (length(aliases) >= 1) aliases[1] else topic
   help_dir <- system.file("help", package = resolved_pkg)
   lib_paths <- .libPaths()
-  # Render HTML to stdout, then a delimited footer with metadata
+  # Write metadata to the tempfile (simple key=value lines, no JSON dep)
+  con <- file(meta_path, "w")
+  on.exit(close(con))
+  cat("topic\t", canonical_topic, "\n", sep = "", file = con)
+  cat("package\t", resolved_pkg, "\n", sep = "", file = con)
+  cat("helpDir\t", help_dir, "\n", sep = "", file = con)
+  for (lp in lib_paths) cat("libPath\t", lp, "\n", sep = "", file = con)
+  # Render HTML to stdout
   tools::Rd2HTML(rd, out = stdout(), package = resolved_pkg)
-  cat("\n<!--RAVEN-META-->\n")
-  cat(jsonlite::toJSON(list(
-    package = resolved_pkg,
-    helpDir = help_dir,
-    libPaths = lib_paths
-  ), auto_unbox = TRUE))
   ```
 
-  - `jsonlite` is in base R installs (`utils::available.packages` /
-    `tools` ecosystem); if absent we fall back to a hand-rolled JSON
-    emitter (the metadata fields are simple strings/arrays). Document
-    `jsonlite` as a soft dependency.
-  - The HTML is the bytes before `<!--RAVEN-META-->`; the metadata is
-    parsed from the bytes after. This avoids a second R subprocess to
-    look up `helpDir` / `libPaths`.
-  - **`help_dir` is sourced from `system.file("help", package = ...)`**,
+  - **No `jsonlite` dependency**: the metadata is emitted as
+    tab-separated `key\tvalue\n` lines that the Rust side parses with
+    `str::lines()` and `split_once('\t')`. Robust against package
+    documentation contents.
+  - **`canonical_topic`** is the first `\alias` from the Rd object,
+    which R uses as the page's primary identifier. Cross-references in
+    rewritten URLs and history entries use the canonical topic so
+    requesting `("filter.tbl_df", null)` and `("filter", "dplyr")`
+    converge on the same cache key after R resolves them.
+  - **`help_dir`** is sourced from `system.file("help", package = ...)`,
     not constructed as `<libpath>/<pkg>/help`. R is the authority on
     where its help assets live; this works for unusual installs (binary
     packages with custom layouts, `R CMD INSTALL --prefix`, etc.).
 - After R returns, the function:
-  1. Splits stdout at the `<!--RAVEN-META-->` marker.
-  2. Validates the meta JSON; falls back to `package` and the canonical
-     libpath if parse fails.
-  3. Sanitizes the HTML (see "HTML sanitization" below).
-  4. Runs `rewrite_help_html(html, source_pkg)` — pure function; covered
+  1. Reads the tempfile (absolute path generated server-side via
+     `tempfile()` equivalent before spawning R) and parses the
+     `key\tvalue` lines.
+  2. Removes the tempfile (best effort; errors logged but not fatal).
+  3. **On metadata parse failure** — empty file, missing required
+     keys, or unreadable — returns `HelpHtmlError::RenderFailed`. No
+     "fallback to canonical libpath" recovery; the result is too
+     degraded to be useful.
+  4. Sanitizes the HTML (see "HTML sanitization" below). On
+     sanitization failure (extremely rare — `ammonia` panics or
+     malformed UTF-8 in Rd2HTML output), returns
+     `HelpHtmlError::RenderFailed`.
+  5. Runs `rewrite_help_html(html, source_pkg)` — pure function; covered
      below.
-  5. Extracts `title` from the sanitized HTML's first `<h2>`.
+  6. Extracts `title` from the sanitized HTML's first `<h2>` (falls
+     back to the canonical topic name if no `<h2>` is present).
 - **Stdout size cap**: the read thread aborts and returns
   `HelpHtmlError::TooLarge` if more than `HELP_HTML_MAX_BYTES` (default 8
   MiB) is read. Real help pages are far below this. The cap protects the
@@ -387,11 +412,26 @@ The rewriter walks `<a href="...">` attributes and produces:
 | `#examples` (in-page) | unchanged |
 | anything else (file://, javascript:, malformed) | replaced with `href="javascript:void(0)"` and `data-raven-dropped="1"` so the webview's universal `preventDefault()` neutralizes them |
 
-**Path-segment encoding**: pkg and topic are percent-encoded in the
-rewritten URL (`/`, `#`, `%`, control chars, and any non-ASCII bytes are
-encoded — `[`, `+`, etc. as well). Decoding happens once in the webview's
-click handler before the topic/package values are forwarded to the
-extension.
+**Path-segment encoding rules** (apply uniformly to `pkg`, `topic`, **and**
+the optional `anchor`):
+
+1. **Decode-then-encode pipeline**: each segment from the source href is
+   percent-decoded **once** (so `%5B` from Rd2HTML becomes `[`), then
+   re-encoded with our strict allowlist. This canonicalizes the source
+   regardless of how Rd2HTML happened to encode it; identical topics
+   always produce identical rewritten URLs.
+2. **Encoding allowlist**: keep only `[A-Za-z0-9._~-]` unencoded (RFC 3986
+   "unreserved"); percent-encode every other byte, including `/`, `#`,
+   `%`, `+`, `?`, ASCII whitespace, control characters, and any non-ASCII
+   bytes. This is stricter than `encodeURIComponent` (which leaves `!`,
+   `*`, `(`, `)`, `'` unescaped) but produces unambiguous URLs.
+3. **Decoding in the webview**: the click handler percent-decodes each
+   path segment and the anchor exactly once before forwarding the
+   (`topic`, `package`, `anchor?`) tuple to the extension.
+
+The same rules govern hover-link encoding: `encodeURIComponent` is
+sufficient on the JSON arg array (it's only used to wrap the JSON for the
+`command:` URL).
 
 **Malformed `../../...`** is **not** left in place; the rewriter neutralizes
 it as in the table. Relying on a webview "default → ignore" branch to
@@ -405,10 +445,11 @@ only the extension can call `webview.asWebviewUri(...)`.
 ## HTML sanitization
 
 After Rd2HTML produces the help body, but before the rewriter runs and the
-response is returned, the server passes the HTML through an allowlist
-sanitizer (the `ammonia` crate, or an equivalent if `ammonia` proves
-problematic). The allowlist is restricted to the tags that Rd2HTML actually
-emits and a small additional set of generic block/inline tags:
+response is returned, the server passes the HTML through the
+[`ammonia`](https://crates.io/crates/ammonia) crate (committed dependency,
+not "or equivalent" — this fixes a behavior contract we test against). The
+allowlist is restricted to the tags that Rd2HTML actually emits and a small
+additional set of generic block/inline tags:
 
 - Headings: `h1`, `h2`, `h3`, `h4`, `h5`, `h6`.
 - Block: `p`, `div`, `pre`, `blockquote`, `hr`, `table`, `thead`, `tbody`,
@@ -418,17 +459,41 @@ emits and a small additional set of generic block/inline tags:
 
 Attribute allowlist:
 
-- Universal: `class`, `id`, `style`, `title`.
+- Universal: `class`, `id`, `title`.
 - `<a>`: `href`.
 - `<img>`: `src`, `alt`, `width`, `height`.
 - `<table>`/`<th>`/`<td>`: `colspan`, `rowspan`, `align`.
 
 Everything else (e.g., `onclick`, `onload`, `<script>`, `<iframe>`,
 `<object>`, `<embed>`, `<form>`, `<input>`, `<style>` elements) is
-stripped. Inline `style` attributes are kept (Rd2HTML uses them, and CSP
-already allows `'unsafe-inline'` styles); the sanitizer rejects URL
-expressions in styles (`url(...)`) so a CSS-loaded image cannot bypass the
-extension's image policy.
+stripped.
+
+**`style` attribute policy**: `ammonia` does not analyze CSS
+declarations, so a fine-grained allowlist of CSS properties is
+impractical. Two-step approach instead:
+
+1. Before passing to `ammonia`, run a **regex pre-pass** over the raw
+   HTML that strips any `style="..."` attribute whose value contains
+   `url(` (case-insensitive). This is a coarse filter — it strips the
+   whole attribute even if the URL was benign. It is cheap, well-tested,
+   and covers the threat (CSS-loaded images bypassing the image
+   policy).
+2. `ammonia` then sees `style` attributes that are guaranteed
+   `url(`-free; we add `style` to the per-tag attribute allowlist for
+   the tags Rd2HTML actually emits with inline styles.
+
+Because every remaining `style=` value is `url(`-free, the
+already-strict CSP `default-src 'none'` plus the lack of `https:` in
+`img-src` together defang any other CSS-loaded resource (fonts, etc.)
+even if `ammonia`'s allowlist later changes.
+
+**Sanitizer failure behavior**: `ammonia::clean()` does not return a
+`Result` — it always produces a string. The only failure surface is
+panic (e.g., from a malformed UTF-8 input) or upstream library bugs.
+The implementation wraps the call in `std::panic::catch_unwind` and
+maps any panic to `HelpHtmlError::RenderFailed`. Sanitizer panics are
+logged at `warn` level with the offending package/topic for
+investigation but never crash the LSP.
 
 ## Image serving
 
@@ -438,20 +503,29 @@ extension's image policy.
 - Extension at panel creation passes `localResourceRoots = libPaths` from
   the first response. The roots are `libPaths`, not just `helpDir`,
   because navigation across packages is expected.
-- On each `load`, extension scans the HTML for `<img src="...">` and:
-  1. If src is absolute http(s) or any non-`file:` scheme, replace with
-     empty string. **Remote images are not allowed** — see CSP below. This
-     blocks privacy/tracking surface inside the help viewer.
-  2. If src is relative, prepend the response's `helpDir` to get an
-     absolute filesystem path.
-  3. Canonicalize the absolute path. Verify it is **under the response's
+- On each `load`, extension scans the HTML for `<img src="...">` and
+  classifies the src by scheme:
+
+  | Source `src` | Action |
+  | --- | --- |
+  | `data:image/...` | **Pass through unchanged**. CSP allows `data:`. R help may legitimately embed small icons inline. |
+  | Relative path (no scheme) | Process: prepend `helpDir`, canonicalize, validate under `helpDir`, rewrite to `webview.asWebviewUri(...)`. |
+  | `http:` / `https:` / `ftp:` / `ws:` / `mailto:` / any non-`data:` remote scheme | Replace `src` with `""` (broken-image icon). Blocks privacy/tracking surface. |
+  | `file:` (absolute filesystem URL) | Replace `src` with `""`. Rd2HTML should never emit these; if it did we'd lose the helpDir validation. |
+  | Anything else (malformed, control chars) | Replace `src` with `""`. |
+
+  For the relative-path case:
+  1. Compute absolute path: `join(helpDir, srcRelative)`.
+  2. Canonicalize (resolve `..`, symlinks).
+  3. Verify the canonicalized path is **under the response's
      `helpDir`** (not just under any libpath root). This blocks
      `\figure{../../etc/passwd}` traversal **and** cross-package
      references like `<img src="../../OTHERPKG/help/figures/x.png">`.
   4. If validated, rewrite to `webview.asWebviewUri(vscode.Uri.file(absPath)).toString()`.
-  5. Otherwise, set `src=""` (broken-image icon).
+  5. Otherwise, set `src=""`.
 
-CSP for the panel (note: no `https:` in `img-src`):
+CSP for the panel (no `https:` in `img-src`; only `data:` for inline icons
+plus the webview's own resource origin for our rewritten file URLs):
 
 ```text
 default-src 'none';
@@ -552,21 +626,51 @@ toolbar.
 TTL 300s, drained on libpath-change events) and adds **single-flight
 de-duplication**:
 
-- An `Arc<Mutex<HashMap<String, broadcast::Sender<HelpHtmlResult>>>>` holds
-  in-flight fetches keyed by `cache_key(topic, package)`.
-- On a cache miss, a thread that wants to fetch first **registers** in the
-  in-flight map: if no entry exists, insert one (with a `broadcast::Sender`)
-  and proceed to spawn R; if an entry exists, subscribe to its receiver and
-  await the result without spawning a second subprocess.
-- When the spawning thread completes, it writes to the cache, sends on the
-  channel, and removes the in-flight entry. All subscribers receive the
-  same result.
-- This eliminates the existing "concurrent webview clicks spawn duplicate R
-  subprocesses" pattern that `HelpCache::get_or_fetch` exhibits.
+- An `Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<HelpHtmlResultShared>>>>`
+  holds in-flight fetches keyed by `cache_key(topic, package)`. The shared
+  payload is `Arc<Result<HelpHtml, HelpHtmlError>>` so all subscribers
+  share one allocation.
+- On a cache miss, a caller acquires the in-flight mutex, then:
+  - If no entry exists, inserts a fresh `broadcast::Sender` and proceeds
+    to spawn R as the **owner** of this fetch.
+  - If an entry exists, calls `sender.subscribe()` to get a receiver,
+    drops the mutex, and `await`s the receiver. No second subprocess.
+- When the owner completes:
+  1. Decides whether the result should be **cached** based on the
+     classification table below.
+  2. If cacheable: writes to the LRU cache.
+  3. Broadcasts the shared result on the channel.
+  4. Removes the in-flight entry from the map.
+- **Sender-dropped behavior**: the owner is held in a `tokio::spawn` task
+  guarded by a `Drop` impl that, if the task is canceled or panics
+  before broadcast, removes the in-flight entry and drops the sender.
+  Subscribers receive `RecvError::Closed`, which the caller maps to
+  `HelpHtmlError::RenderFailed("subprocess task aborted")`. The owner
+  task is **not** canceled when the originating caller's request id is
+  superseded — the LSP-side request id only governs whether the LSP
+  forwards the result to the extension. Letting the owner finish
+  ensures other subscribers (and the cache) still benefit.
 
-The same single-flight pattern is also retrofitted onto `HelpCache::get_or_fetch`
-during this work. It's a small refactor (one new field + one helper) and
-fixes a long-standing inefficiency under concurrent hover.
+**Result-classification table** (which errors get cached):
+
+| Result | Cached as positive? | Cached as negative? | TTL |
+| --- | --- | --- | --- |
+| `Ok(HelpHtml)` | ✓ | — | until LRU eviction or libpath-change drain |
+| `Err(NotFound)` | — | ✓ | 300s (`NEGATIVE_CACHE_TTL`) |
+| `Err(PackageNotInstalled)` | — | ✓ | 300s |
+| `Err(InvalidTopic)` | — | ✓ | 300s — these args won't become valid |
+| `Err(RenderFailed)` | — | ✓ | 300s — the Rd is malformed; not a transient issue |
+| `Err(TooLarge)` | — | ✓ | 300s |
+| `Err(Timeout)` | — | **not cached** — transient | n/a |
+| `Err(RUnavailable)` | — | **not cached** — env will be fixed | n/a |
+
+For non-cached errors, the in-flight entry is removed but no cache write
+happens; the next request retries the R subprocess.
+
+The same single-flight pattern is also retrofitted onto
+`HelpCache::get_or_fetch` during this work. It's a small refactor (one
+new field + one helper) and fixes a long-standing inefficiency under
+concurrent hover.
 
 ## Edge cases & error handling
 
@@ -623,7 +727,7 @@ Other defensive behavior:
 ### Settings
 
 ```jsonc
-"raven.help.viewer.viewColumn": {
+"raven.help.viewerColumn": {
   "type": "string",
   "enum": ["active", "beside"],
   "default": "beside",
@@ -631,8 +735,8 @@ Other defensive behavior:
 }
 ```
 
-Mirrors the plot viewer's `raven.plot.viewer.viewColumn`. Wired in three places
-per `CLAUDE.md`:
+Matches the existing `raven.plot.viewerColumn` naming convention. Wired in
+three places per `CLAUDE.md`:
 
 1. `editors/vscode/package.json` — schema entry above.
 2. `editors/vscode/src/initializationOptions.ts` — exposed as
@@ -782,7 +886,7 @@ v1.
 
 4. **Settings wiring** — extend `editors/vscode/src/test/settings.test.ts`
    per the existing pattern. New entry in `SETTINGS_MAPPING` for
-   `raven.help.viewer.viewColumn`. Verify default and explicit values flow
+   `raven.help.viewerColumn`. Verify default and explicit values flow
    through `buildInitializationOptions`.
 
 ### Webview-side
@@ -861,5 +965,5 @@ Per `CLAUDE.md`, on completion:
   list.
 - Update `CLAUDE.md`'s "What to read (in order)" pointer block to include
   `docs/help-viewer.md`.
-- The `raven.help.viewer.viewColumn` setting needs a row in
+- The `raven.help.viewerColumn` setting needs a row in
   `docs/configuration.md` (consistent with other `raven.*` settings).
