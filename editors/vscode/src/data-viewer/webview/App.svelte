@@ -93,6 +93,8 @@
             .filter(i => !hiddenSet.has(i)),
     );
     const totalGridHeight = $derived(nrow * ROW_HEIGHT);
+    /** Width of the sticky row-number column, sized to fit the widest row number. */
+    const rowColWidth = $derived(`calc(${String(Math.max(1, nrow)).length}ch + 16px)`);
 
     // ----- Selection -------------------------------------------------------
     const selection = new Selection();
@@ -467,7 +469,7 @@
         <div class="grid" style="height: {totalGridHeight + ROW_HEIGHT}px;">
             <!-- Header row (sticky top) -->
             <div class="header-row">
-                <div class="cell header rowname-col">#</div>
+                <div class="cell header rowname-col" style="width: {rowColWidth};">#</div>
                 {#each visibleCols as colIdx (colIdx)}
                     {@const col = columns[colIdx]}
                     <div class="cell header"
@@ -483,7 +485,7 @@
                 {#each visibleRows as rowCells, rowOffset (visibleRangeStart + rowOffset)}
                     {@const absRow = visibleRangeStart + rowOffset}
                     <div class="data-row" style="height: {ROW_HEIGHT}px;">
-                        <div class="cell rowname-col">{absRow + 1}</div>
+                        <div class="cell rowname-col" style="width: {rowColWidth};">{absRow + 1}</div>
                         {#each visibleCols as colIdx, ci (colIdx)}
                             {@const col = columns[colIdx]}
                             {@const cell = rowCells[ci]}

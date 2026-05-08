@@ -238,12 +238,13 @@ html, body, #root {
     background: var(--vscode-inputValidation-warningBackground, rgba(255, 220, 130, 0.4));
 }
 
-/* Sticky first (rownumber) column */
+/* Sticky first (rownumber) column.
+   Width is set dynamically via inline style in App.svelte (calc(Nch + 16px))
+   so it fits the widest row number without truncation. */
 .cell.rowname-col {
     position: sticky;
     left: 0;
     z-index: 1;
-    width: 48px;
     text-align: right;
     background: var(--vscode-editor-background, #fff);
     color: var(--vscode-descriptionForeground, #888);
