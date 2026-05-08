@@ -1506,6 +1506,74 @@ impl LanguageServer for Backend {
                 }
                 Ok(Some(serde_json::json!({ "cleared": cleared })))
             }
+            "raven.getHelpHtml" => {
+                let topic = params.arguments.first().and_then(|v| v.as_str()).unwrap_or("");
+                let package = params.arguments.get(1).and_then(|v| v.as_str());
+
+                if !crate::help::is_valid_help_topic(topic) {
+                    return Ok(Some(serde_json::json!({
+                        "ok": false,
+                        "reason": "invalid-topic",
+                        "message": "topic failed validation",
+                    })));
+                }
+                if let Some(p) = package {
+                    if !crate::r_subprocess::is_valid_package_name(p) {
+                        return Ok(Some(serde_json::json!({
+                            "ok": false,
+                            "reason": "invalid-topic",
+                            "message": "package failed validation",
+                        })));
+                    }
+                }
+
+                let (cache, r_path) = {
+                    let state = self.state.read().await;
+                    let r_path = state.cross_file_config.packages_r_path.clone();
+                    let cache = state.html_help_cache.clone();
+                    (cache, r_path)
+                };
+
+                let Some(r_path) = r_path else {
+                    return Ok(Some(serde_json::json!({
+                        "ok": false,
+                        "reason": "r-unavailable",
+                        "message": "R not configured (set raven.packages.rPath)",
+                    })));
+                };
+
+                let result = cache
+                    .get_or_fetch(topic, package, move |t, p| async move {
+                        tokio::task::spawn_blocking(move || {
+                            crate::help::get_help_html(&t, p.as_deref(), &r_path)
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(crate::help::HelpHtmlError::RenderFailed {
+                                message: "spawn_blocking joined with error".into(),
+                            })
+                        })
+                    })
+                    .await;
+
+                let json = match result {
+                    Ok(h) => serde_json::json!({
+                        "ok": true,
+                        "topic": h.topic,
+                        "package": h.package,
+                        "title": h.title,
+                        "html": h.html,
+                        "helpDir": h.help_dir,
+                        "libPaths": h.lib_paths,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "ok": false,
+                        "reason": e.reason(),
+                        "message": format!("{:?}", e),
+                    }),
+                };
+                Ok(Some(json))
+            }
             other => {
                 log::warn!("execute_command: unknown command '{other}'");
                 Ok(None)
@@ -7057,5 +7125,155 @@ mod refresh_packages_tests {
              undefined-variable diagnostics in child.R for unrelated \
              uninstalled packages"
         );
+    }
+
+    // ============================================================================
+    // Unit tests for raven.getHelpHtml execute_command handler.
+    // ============================================================================
+    mod get_help_html_command {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use tower_lsp::{LanguageServer, LspService};
+        use tower_lsp::lsp_types::{ExecuteCommandParams, InitializeParams, InitializeResult};
+
+        use super::super::{Backend, RequestCancellationRegistry};
+
+        /// Minimal stub language server required by `LspService::new`.
+        struct StubServer;
+
+        #[tower_lsp::async_trait]
+        impl LanguageServer for StubServer {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Build a `Backend` whose `packages_r_path` is left as `None` (the default).
+        /// Returns an `Arc<Backend>` ready for direct `LanguageServer` method calls.
+        fn make_backend_no_r() -> Arc<Backend> {
+            let (client_tx, client_rx) = mpsc::channel();
+            let (_service, _socket) = LspService::new(|client| {
+                client_tx.send(client).expect("capture client");
+                StubServer
+            });
+            let client = client_rx.recv().expect("client captured");
+            Arc::new(Backend::new_with_request_cancellation(
+                client,
+                Arc::new(RequestCancellationRegistry::new()),
+            ))
+        }
+
+        /// Build a `Backend` and set `packages_r_path` to the given path.
+        fn make_backend_with_r(r_path: std::path::PathBuf) -> Arc<Backend> {
+            let backend = make_backend_no_r();
+            // Set r_path synchronously — we need a tokio runtime for the write lock.
+            // We use `tokio::runtime::Handle::current()` which is available inside
+            // the `#[tokio::test]` harness.
+            let state = Arc::clone(&backend.state);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut guard = state.write().await;
+                    guard.cross_file_config.packages_r_path = Some(r_path);
+                })
+            });
+            backend
+        }
+
+        /// Helper: invoke `raven.getHelpHtml` with the given args and return the response value.
+        async fn run_command(
+            backend: &Backend,
+            args: Vec<serde_json::Value>,
+        ) -> serde_json::Value {
+            let params = ExecuteCommandParams {
+                command: "raven.getHelpHtml".into(),
+                arguments: args,
+                work_done_progress_params: Default::default(),
+            };
+            backend
+                .execute_command(params)
+                .await
+                .expect("execute_command must not error")
+                .expect("execute_command must return Some")
+        }
+
+        #[tokio::test]
+        async fn r_unavailable_when_packages_r_path_is_none() {
+            let backend = make_backend_no_r();
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("mean"), serde_json::json!("base")],
+            )
+            .await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "r-unavailable");
+        }
+
+        #[tokio::test]
+        async fn invalid_topic_returns_invalid_topic_reason() {
+            // Even with no R configured, validation runs first — so we get
+            // "invalid-topic" rather than "r-unavailable".
+            let backend = make_backend_no_r();
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("with\nnewline"), serde_json::json!("base")],
+            )
+            .await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "invalid-topic");
+        }
+
+        #[tokio::test]
+        async fn invalid_package_returns_invalid_topic_reason() {
+            let backend = make_backend_no_r();
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("mean"), serde_json::json!("bad package!")],
+            )
+            .await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "invalid-topic");
+        }
+
+        #[tokio::test]
+        async fn missing_topic_arg_is_invalid() {
+            // Empty args → topic defaults to "" which fails validation.
+            let backend = make_backend_no_r();
+            let resp = run_command(&backend, vec![]).await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "invalid-topic");
+        }
+
+        /// R-required happy-path test: renders `mean` from `base`.
+        ///
+        /// Skips automatically when no R binary is available on PATH,
+        /// following the same `RSubprocess::new(None)` pattern used in
+        /// `crates/raven/src/help/html.rs`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn happy_path_renders_base_mean_when_r_is_available() {
+            let Some(r) =
+                crate::r_subprocess::RSubprocess::new(None).map(|s| s.r_path().clone())
+            else {
+                eprintln!("skip: no R");
+                return;
+            };
+            let backend = make_backend_with_r(r);
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("mean"), serde_json::json!("base")],
+            )
+            .await;
+            assert_eq!(resp["ok"], true, "unexpected error: {resp:?}");
+            assert_eq!(resp["package"], "base");
+            assert!(
+                resp["html"].as_str().is_some_and(|h| !h.is_empty()),
+                "html must be non-empty"
+            );
+        }
     }
 }
