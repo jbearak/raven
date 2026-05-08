@@ -85,7 +85,22 @@ function sendActivityNotification() {
     });
 }
 
-export function activate(context: vscode.ExtensionContext) {
+/**
+ * Public extension API surface, returned from `activate()` and reachable
+ * from other extensions and the test harness via
+ * `vscode.extensions.getExtension('jbearak.raven').exports`.
+ *
+ * The only consumer today is the Mocha test suite, which uses the live
+ * LanguageClient to round-trip `workspace/executeCommand` calls (e.g.
+ * `raven.getHelpHtml`) that are intentionally NOT registered as VS Code
+ * commands per the executeCommandProvider rule in CLAUDE.md.
+ */
+export interface RavenExtensionApi {
+    /** Returns the live LSP client once activation has installed it. */
+    getLanguageClient(): LanguageClient | undefined;
+}
+
+export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     const serverPath = getServerPath(context);
 
     function buildRustLogEnv(): Record<string, string> | undefined {
@@ -245,6 +260,10 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Prompt for word separators configuration
     promptWordSeparators();
+
+    return {
+        getLanguageClient: () => client,
+    };
 }
 
 async function promptWordSeparators() {
