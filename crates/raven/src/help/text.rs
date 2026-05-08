@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::Command;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -379,7 +380,7 @@ txt <- capture.output(
 )
 cat(paste(txt, collapse = "\n"))
 "#;
-    get_help_inner(topic, package, r_path, r_code)
+    get_help_inner(topic, package, r_path, r_code, None)
 }
 
 /// Inner implementation that accepts the R script as a parameter.
@@ -387,11 +388,16 @@ cat(paste(txt, collapse = "\n"))
 /// This allows tests to inject custom R code (e.g., `Sys.sleep(60)` for timeout
 /// testing) without duplicating the full implementation. The public `get_help`
 /// always passes the built-in R snippet.
+///
+/// The optional `pid_capture` parameter, when provided, receives the spawned child's
+/// PID immediately after a successful `spawn()`. This is used only in tests to verify
+/// that the watchdog reaps the child process after a timeout.
 fn get_help_inner(
     topic: &str,
     package: Option<&str>,
     r_path: &std::path::Path,
     r_code: &str,
+    pid_capture: Option<&AtomicU32>,
 ) -> Option<String> {
     log::trace!("get_help: topic={}, package={:?}", topic, package);
 
@@ -438,6 +444,10 @@ fn get_help_inner(
     };
 
     let child_pid = child.id();
+    // Store the pid before heavy work so tests can observe it even if we return early.
+    if let Some(cap) = pid_capture {
+        cap.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+    }
 
     // Take pipe handles before spawning threads. Reading pipes in separate
     // threads prevents deadlock when pipe buffers fill before the child exits.
@@ -967,7 +977,22 @@ pub(crate) fn get_help_with_code(
     r_path: &std::path::Path,
     r_code: &str,
 ) -> Option<String> {
-    get_help_inner(topic, package, r_path, r_code)
+    get_help_inner(topic, package, r_path, r_code, None)
+}
+
+/// Test-only entry point that injects custom R code and captures the spawned PID.
+///
+/// Writes the child's PID into `pid_capture` immediately after a successful spawn,
+/// allowing the caller to probe whether the watchdog has reaped the process.
+#[cfg(test)]
+pub(crate) fn get_help_with_code_capturing_pid(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &std::path::Path,
+    r_code: &str,
+    pid_capture: &AtomicU32,
+) -> Option<String> {
+    get_help_inner(topic, package, r_path, r_code, Some(pid_capture))
 }
 
 /// RAII guard that sets an environment variable on creation and removes it on drop.
@@ -1774,5 +1799,52 @@ Value:
             elapsed.as_millis() < 1000,
             "timeout test took too long: {elapsed:?}"
         );
+    }
+
+    /// Paranoia check: after a watchdog-triggered timeout, the R child process must
+    /// actually be gone (reaped by the OS).
+    ///
+    /// After `get_help` returns `None` we send signal 0 (`kill(pid, 0)`) to the
+    /// captured PID and assert that it returns -1 with errno ESRCH (no such process).
+    /// Signal 0 never delivers — it only probes process existence.
+    ///
+    /// Marked `#[ignore]` because it mutates a process-wide env var; run explicitly
+    /// with `-- --include-ignored --test-threads=1`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn get_help_timeout_reaps_process() {
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => { eprintln!("skip: no R"); return; }
+        };
+        let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
+
+        let pid_capture = AtomicU32::new(0);
+        let res = get_help_with_code_capturing_pid(
+            "mean",
+            Some("base"),
+            &r,
+            "Sys.sleep(60)",
+            &pid_capture,
+        );
+
+        assert!(res.is_none(), "expected None (timeout), got {res:?}");
+
+        let pid = pid_capture.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(pid != 0, "expected a captured pid after spawn");
+
+        // Brief delay to allow the watchdog kill to take effect before probing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // SAFETY: signal 0 never delivers; it only checks whether the pid exists.
+        let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(
+            kill_result, -1,
+            "expected kill(pid, 0) == -1 (process should be reaped); got {}",
+            kill_result
+        );
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(errno, Some(libc::ESRCH), "expected ESRCH; got errno {:?}", errno);
     }
 }

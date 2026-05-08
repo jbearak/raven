@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ pub fn get_help_html(
     package: Option<&str>,
     r_path: &Path,
 ) -> Result<HelpHtml, HelpHtmlError> {
-    get_help_html_inner(topic, package, r_path, include_str!("rd_to_html.R"))
+    get_help_html_inner(topic, package, r_path, include_str!("rd_to_html.R"), None)
 }
 
 /// Inner implementation that accepts the R script as a parameter.
@@ -57,12 +57,17 @@ pub fn get_help_html(
 /// This allows tests to inject custom R code (e.g., `Sys.sleep(60)` for timeout
 /// testing) without duplicating the full implementation. The public `get_help_html`
 /// always passes the bundled `rd_to_html.R` script.
+///
+/// The optional `pid_capture` parameter, when provided, receives the spawned child's
+/// PID immediately after a successful `spawn()`. This is used only in tests to verify
+/// that the watchdog reaps the child process after a timeout.
 #[allow(dead_code)] // used transitively from get_help_html; whole module wired in Tasks 14-17
 fn get_help_html_inner(
     topic: &str,
     package: Option<&str>,
     r_path: &Path,
     r_code: &str,
+    pid_capture: Option<&AtomicU32>,
 ) -> Result<HelpHtml, HelpHtmlError> {
     // 1) Validate inputs.
     if !is_valid_help_topic(topic) {
@@ -106,10 +111,16 @@ fn get_help_html_inner(
         message: format!("R spawn failed: {e}"),
     })?;
     let pid = child.id();
+    // Store the pid before heavy work so tests can observe it even if we return early.
+    if let Some(cap) = pid_capture {
+        cap.store(pid, Ordering::SeqCst);
+    }
 
     // 4) Watchdog (mirrors get_help in text.rs).
-    //    `kill_fired` is set by the watchdog just before it kills the child so
-    //    the post-wait branch can distinguish a timeout kill from a natural failure.
+    //    `kill_fired` is set by the watchdog just before it kills the child.
+    //    The post-wait branch consults it ONLY when the child exited unsuccessfully —
+    //    a stale `kill_fired` from a kill that raced with natural exit is harmless
+    //    because we don't look at the flag in the success path.
     let exited = Arc::new(AtomicBool::new(false));
     let kill_fired = Arc::new(AtomicBool::new(false));
     let exited_clone = exited.clone();
@@ -162,16 +173,18 @@ fn get_help_html_inner(
     }))?;
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
 
-    // 6) If the watchdog fired the kill, report Timeout regardless of exit status.
-    if kill_fired.load(Ordering::SeqCst) {
-        return Err(HelpHtmlError::Timeout);
-    }
-
     let status = wait_result.map_err(|e| HelpHtmlError::RenderFailed {
         message: format!("wait: {e}"),
     })?;
 
     if !status.success() {
+        // 6) Watchdog kill takes precedence over stderr heuristics.
+        //    Only consult kill_fired on the failure path: if the child exited
+        //    successfully, a stale kill_fired (kill raced with natural exit) is
+        //    harmless and must be ignored so we don't misclassify a clean run.
+        if kill_fired.load(Ordering::SeqCst) {
+            return Err(HelpHtmlError::Timeout);
+        }
         let err = String::from_utf8_lossy(&stderr_bytes).to_string();
         if err.contains("there is no package called") {
             return Err(HelpHtmlError::PackageNotInstalled);
@@ -275,7 +288,22 @@ pub(crate) fn get_help_html_with_code(
     r_path: &Path,
     r_code: &str,
 ) -> Result<HelpHtml, HelpHtmlError> {
-    get_help_html_inner(topic, package, r_path, r_code)
+    get_help_html_inner(topic, package, r_path, r_code, None)
+}
+
+/// Test-only entry point that injects custom R code and captures the spawned PID.
+///
+/// Writes the child's PID into `pid_capture` immediately after a successful spawn,
+/// allowing the caller to probe whether the watchdog has reaped the process.
+#[cfg(test)]
+pub(crate) fn get_help_html_with_code_capturing_pid(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &Path,
+    r_code: &str,
+    pid_capture: &AtomicU32,
+) -> Result<HelpHtml, HelpHtmlError> {
+    get_help_html_inner(topic, package, r_path, r_code, Some(pid_capture))
 }
 
 /// RAII guard that sets an environment variable on creation and removes it on drop.
@@ -413,5 +441,52 @@ mod tests {
             elapsed.as_millis() < 1000,
             "timeout test took too long: {elapsed:?}"
         );
+    }
+
+    /// Paranoia check: after a watchdog-triggered timeout, the R child process must
+    /// actually be gone (reaped by the OS).
+    ///
+    /// After `get_help_html` returns `Err(Timeout)` we send signal 0 (`kill(pid, 0)`)
+    /// to the captured PID and assert that it returns -1 with errno ESRCH (no such
+    /// process). Signal 0 never delivers — it only probes process existence.
+    ///
+    /// Marked `#[ignore]` because it mutates a process-wide env var; run explicitly
+    /// with `-- --include-ignored --test-threads=1`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn get_help_html_timeout_reaps_process() {
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
+
+        let pid_capture = AtomicU32::new(0);
+        let res = get_help_html_with_code_capturing_pid(
+            "mean",
+            Some("base"),
+            &r,
+            "Sys.sleep(60)",
+            &pid_capture,
+        );
+
+        assert!(
+            matches!(res, Err(HelpHtmlError::Timeout)),
+            "expected Timeout, got {res:?}"
+        );
+
+        let pid = pid_capture.load(Ordering::SeqCst);
+        assert!(pid != 0, "expected a captured pid after spawn");
+
+        // Brief delay to allow the watchdog kill to take effect before probing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // SAFETY: signal 0 never delivers; it only checks whether the pid exists.
+        let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(
+            kill_result, -1,
+            "expected kill(pid, 0) == -1 (process should be reaped); got {}",
+            kill_result
+        );
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(errno, Some(libc::ESRCH), "expected ESRCH; got errno {:?}", errno);
     }
 }
