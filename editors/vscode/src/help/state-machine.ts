@@ -69,6 +69,7 @@ export function createHelpStateMachine(deps: StateMachineDeps) {
         t: string,
         p: string,
         anchor: string | null,
+        scrollY: number,
     ): Promise<{ ok: boolean; stale: boolean }> {
         nextId += 1;
         const id = nextId;
@@ -77,7 +78,7 @@ export function createHelpStateMachine(deps: StateMachineDeps) {
         const res = await deps.fetch(t, p, id);
         if (id !== inFlight) return { ok: false, stale: true };
         if (res.ok) {
-            current = { topic: t, package: p, anchor, scrollY: 0 };
+            current = { topic: t, package: p, anchor, scrollY };
             deps.onLoad?.(
                 {
                     topic: res.topic,
@@ -85,8 +86,9 @@ export function createHelpStateMachine(deps: StateMachineDeps) {
                     title: res.title,
                     html: res.html,
                     anchor,
+                    scrollY,
                 },
-                0,
+                scrollY,
             );
         } else {
             deps.onError?.({ reason: res.reason, message: res.message });
@@ -100,8 +102,9 @@ export function createHelpStateMachine(deps: StateMachineDeps) {
             // Spec: failures do not mutate stacks. So we only push to back AFTER
             // confirming success (or always, but rollback on failure).
             // The simplest correct approach: push to back IF the load succeeds.
+            // Fresh navigations land at scrollY=0; only back/forward restore.
             const previousCurrent = current;
-            const result = await load(t, p, anchor);
+            const result = await load(t, p, anchor, 0);
             if (result.stale) return;
             if (result.ok && previousCurrent) {
                 back.push(previousCurrent);
@@ -114,7 +117,12 @@ export function createHelpStateMachine(deps: StateMachineDeps) {
             if (back.length === 0) return;
             const target = back[back.length - 1]!;
             const previousCurrent = current;
-            const result = await load(target.topic, target.package, target.anchor);
+            const result = await load(
+                target.topic,
+                target.package,
+                target.anchor,
+                target.scrollY,
+            );
             if (result.stale) return;
             if (result.ok) {
                 back.pop();
@@ -129,7 +137,12 @@ export function createHelpStateMachine(deps: StateMachineDeps) {
             if (forward.length === 0) return;
             const target = forward[forward.length - 1]!;
             const previousCurrent = current;
-            const result = await load(target.topic, target.package, target.anchor);
+            const result = await load(
+                target.topic,
+                target.package,
+                target.anchor,
+                target.scrollY,
+            );
             if (result.stale) return;
             if (result.ok) {
                 forward.pop();

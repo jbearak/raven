@@ -12,6 +12,7 @@ function okResponse(topic: string, pkg: string): FetchResponse {
         title: `${pkg}::${topic}`,
         html: `<p>${topic}</p>`,
         anchor: null,
+        scrollY: 0,
         helpDir: `/lib/${pkg}/help`,
         libPaths: [`/lib`],
     };
@@ -88,6 +89,28 @@ describe('help state machine', () => {
         await slow;
         // Only 'fast' should have been loaded.
         expect(loaded).toEqual([{ topic: 'fast', package: 'p' }]);
+    });
+
+    test('back/forward restore captured scrollY; navigate lands at 0', async () => {
+        const fetch = async (t: string, p: string) => okResponse(t, p);
+        const loads: Array<{ topic: string; scrollY: number }> = [];
+        const sm = createHelpStateMachine({
+            fetch,
+            onLoad: (load) => loads.push({ topic: load.topic, scrollY: load.scrollY }),
+        });
+        await sm.navigate('a', 'p');
+        sm.setScrollY(120);
+        await sm.navigate('b', 'p');
+        sm.setScrollY(45);
+        await sm.back();
+        // back to 'a' must restore 120, not start at 0.
+        expect(loads.at(-1)).toEqual({ topic: 'a', scrollY: 120 });
+        await sm.forward();
+        // forward to 'b' must restore 45.
+        expect(loads.at(-1)).toEqual({ topic: 'b', scrollY: 45 });
+        // Fresh navigation always lands at 0, no matter the back-entry's scroll.
+        await sm.navigate('c', 'p');
+        expect(loads.at(-1)).toEqual({ topic: 'c', scrollY: 0 });
     });
 
     test('stack capped at 50', async () => {

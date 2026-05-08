@@ -13,6 +13,11 @@ export type LoadPayload = {
     title: string;
     html: string;
     anchor: string | null;
+    /** Pixel offset to scroll the content area to after the load lands.
+     * Captured by the state machine on back/forward navigation; 0 for
+     * fresh navigations. The webview applies it after Svelte renders the
+     * new HTML, but only when there is no anchor (the anchor wins). */
+    scrollY: number;
 };
 
 export type ErrorPayload = {
@@ -85,7 +90,8 @@ export function isExtensionToWebviewMessage(value: unknown): value is ExtensionT
                 typeof payload.package === 'string' &&
                 typeof payload.title === 'string' &&
                 typeof payload.html === 'string' &&
-                (payload.anchor === null || typeof payload.anchor === 'string')
+                (payload.anchor === null || typeof payload.anchor === 'string') &&
+                typeof payload.scrollY === 'number'
             );
         }
         case 'loading':

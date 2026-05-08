@@ -27,7 +27,9 @@
         switch (msg.type) {
             case 'load':
                 dispatch({ type: 'LOAD', payload: msg.payload });
-                // After Svelte renders the new HTML, scroll to anchor if present.
+                // After Svelte renders the new HTML, restore scroll position.
+                // Anchor wins if present; otherwise apply the back/forward
+                // scrollY (0 for fresh navigations).
                 if (msg.payload.anchor) {
                     const anchor = msg.payload.anchor;
                     await tick();
@@ -35,11 +37,11 @@
                     if (target) {
                         target.scrollIntoView({ behavior: 'auto', block: 'start' });
                     } else if (contentEl) {
-                        contentEl.scrollTop = 0;
+                        contentEl.scrollTop = msg.payload.scrollY;
                     }
                 } else if (contentEl) {
                     await tick();
-                    contentEl.scrollTop = 0;
+                    contentEl.scrollTop = msg.payload.scrollY;
                 }
                 break;
             case 'loading':

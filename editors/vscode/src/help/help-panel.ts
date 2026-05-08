@@ -226,6 +226,7 @@ export class HelpPanel {
                     helpDir: help_dir,
                     libPaths: lib_paths,
                     anchor: null,
+                    scrollY: 0,
                 };
             }
             return {

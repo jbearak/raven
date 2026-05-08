@@ -16,9 +16,28 @@ describe('help messages', () => {
                 title: 'Subset rows',
                 html: '<p>x</p>',
                 anchor: null,
+                scrollY: 0,
             },
         };
         expect(isExtensionToWebviewMessage(msg)).toBe(true);
+    });
+
+    test('ext->webview load message rejects missing scrollY', () => {
+        // Validator should reject pre-scroll-restoration payloads to keep
+        // the wire-protocol contract honest.
+        expect(
+            isExtensionToWebviewMessage({
+                type: 'load',
+                payload: {
+                    topic: 'filter',
+                    package: 'dplyr',
+                    title: 'Subset rows',
+                    html: '<p>x</p>',
+                    anchor: null,
+                    // scrollY missing
+                },
+            }),
+        ).toBe(false);
     });
 
     test('ext->webview loading and error', () => {
