@@ -4,6 +4,16 @@ topic <- args[1]
 pkg <- if (nzchar(args[2])) args[2] else NULL
 meta_path <- args[3]
 h <- help(topic, package = (pkg))
+# Rd2HTML(dynamic = TRUE) emits cross-reference links of the form
+# `../../<source-pkg>/help/<topic>` even when <topic> actually lives in a
+# different package (e.g. base::plot links to base/plot.default, but
+# plot.default lives in graphics; graphics::par links to graphics/options,
+# but options lives in base; aliases like `finite` resolve to base/is.finite).
+# When the package-qualified search returns nothing, fall back to a global
+# help() search so cross-package cross-references (and aliases) resolve.
+if (length(as.character(h)) == 0) {
+  h <- help(topic)
+}
 rd <- utils:::.getHelpFile(h)
 # In R 4.6, attr(rd, "package") is no longer populated; extract from the help path.
 help_path <- as.character(h)

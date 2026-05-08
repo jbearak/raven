@@ -10,10 +10,28 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// Sanitize Rd2HTML output to a safe allowlist.
+///
+/// Note: dead-link stripping (`Run examples`, `Index`) lives in
+/// [`strip_dead_links`] and must run on the raw R output BEFORE the
+/// cross-reference rewriter, because the rewriter converts unrecognized
+/// hrefs to `javascript:void(0)`+`data-raven-dropped` and the strip regexes
+/// match by the original href.
 pub fn sanitize_help_html(html: &str) -> String {
     let pre = strip_style_url(html);
     let pre2 = strip_rd_doc_header_table(&pre);
     build_ammonia_sanitized(&pre2)
+}
+
+/// Strip elements that point at endpoints we don't implement (R's dynamic
+/// help server's `../Example/<topic>` runner and the per-package
+/// `00Index.html` page). Must run on the raw Rd2HTML output BEFORE the
+/// cross-reference rewriter — the rewriter overwrites unmatched hrefs with
+/// `javascript:void(0)`, after which these regexes can no longer recognize
+/// the original URL.
+pub fn strip_dead_links(html: &str) -> String {
+    let pre = strip_run_examples_link(html);
+    let pre2 = strip_index_link(&pre);
+    pre2.into_owned()
 }
 
 fn strip_style_url(html: &str) -> std::borrow::Cow<'_, str> {
@@ -34,6 +52,38 @@ fn strip_rd_doc_header_table(html: &str) -> std::borrow::Cow<'_, str> {
     let re = RE.get_or_init(|| {
         regex::Regex::new(
             r#"(?is)<table\b[^>]*>\s*<tr\b[^>]*>\s*<td\b[^>]*>[^<]*\{[^}]+\}\s*</td>\s*<td\b[^>]*>\s*R\s+Documentation\s*</td>\s*</tr>\s*</table>"#,
+        )
+        .expect("valid regex")
+    });
+    re.replace(html, "")
+}
+
+/// Remove the `<p><a href='../Example/<topic>'>Run examples</a></p>` paragraph
+/// emitted by Rd2HTML(dynamic = TRUE). The link points at R's dynamic help
+/// server endpoint that runs example code; we have no equivalent runner, so
+/// clicking does nothing. Stripping the element entirely is preferable to
+/// leaving a no-op link in place.
+fn strip_run_examples_link(html: &str) -> std::borrow::Cow<'_, str> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<p>\s*<a\b[^>]*\bhref=['"][^'"]*Example/[^'"]*['"][^>]*>\s*Run\s+examples\s*</a>\s*</p>"#,
+        )
+        .expect("valid regex")
+    });
+    re.replace(html, "")
+}
+
+/// Remove the trailing `<a href="00Index.html">Index</a>` link from the
+/// page footer (`[Package <em>pkg</em> version X.Y.Z <a ...>Index</a>]`).
+/// The link points at a per-package index page that we don't render, so it
+/// would be a dead link. Strip the entire anchor — including the leading
+/// whitespace — leaving `[Package <em>pkg</em> version X.Y.Z]`.
+fn strip_index_link(html: &str) -> std::borrow::Cow<'_, str> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)\s*<a\b[^>]*\bhref=['"]00Index\.html['"][^>]*>\s*Index\s*</a>"#,
         )
         .expect("valid regex")
     });
@@ -227,5 +277,54 @@ mod tests {
         let out = sanitize_help_html(html);
         assert!(out.contains("<table>"));
         assert!(out.contains("<td>c</td>"));
+    }
+
+    #[test]
+    fn strip_dead_links_removes_run_examples() {
+        // Rd2HTML(dynamic = TRUE) emits a dynamic-server "Run examples" link
+        // before every <pre> example block. Clicking it does nothing in our
+        // viewer, so strip the whole paragraph.
+        let html = r#"<h3>Examples</h3><p><a href='../Example/plot'>Run examples</a></p><pre>plot(1:10)</pre>"#;
+        let out = strip_dead_links(html);
+        assert!(!out.contains("Run examples"), "Run examples must be stripped: {}", out);
+        assert!(!out.contains("../Example/"), "Example href must be gone: {}", out);
+        assert!(out.contains("<h3>Examples</h3>"));
+        assert!(out.contains("plot(1:10)"));
+    }
+
+    #[test]
+    fn strip_dead_links_handles_double_quoted_run_examples() {
+        // Defensive: handle either quote style.
+        let html = r#"<p><a href="../Example/mean">Run examples</a></p>"#;
+        let out = strip_dead_links(html);
+        assert!(!out.contains("Run examples"));
+    }
+
+    #[test]
+    fn strip_dead_links_removes_index_footer() {
+        // Rd2HTML emits `[Package <em>pkg</em> version X.Y.Z <a href="00Index.html">Index</a>]`.
+        // Strip the link AND its leading whitespace, leaving the package/version text.
+        let html = r#"<hr><div style="text-align: center;">[Package <em>base</em> version 4.6.0 <a href="00Index.html">Index</a>]</div>"#;
+        let out = strip_dead_links(html);
+        assert!(!out.contains("00Index.html"), "Index href must be gone: {}", out);
+        assert!(!out.contains(">Index<"), "Index text must be gone: {}", out);
+        assert!(out.contains("[Package <em>base</em> version 4.6.0]"), "footer text preserved: {}", out);
+    }
+
+    #[test]
+    fn strip_dead_links_runs_before_rewrite() {
+        // Regression: previously the strips lived inside sanitize_help_html, which
+        // runs AFTER the cross-reference rewriter. The rewriter converts unknown
+        // hrefs (`00Index.html`) to `javascript:void(0)`+`data-raven-dropped`,
+        // after which the strip regex (which keys on the original href) no longer
+        // matches. The strip must run on raw R output, before the rewriter.
+        //
+        // This test asserts strip_dead_links is callable on raw HTML and produces
+        // output that contains neither the original href nor the post-rewrite
+        // form's text "Index" inside an <a>.
+        let raw = r#"[Package <em>base</em> version 4.6.0 <a href="00Index.html">Index</a>]"#;
+        let stripped = strip_dead_links(raw);
+        assert!(!stripped.contains("00Index.html"));
+        assert!(!stripped.contains(">Index<"));
     }
 }

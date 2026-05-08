@@ -177,8 +177,17 @@
         role="region"
         aria-label="R help content"
     >
-        {#if state.phase === 'viewing' && state.current}
+        {#if state.current}
             <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <!--
+                Keep showing the last successfully loaded topic even while we
+                are in 'loading' or 'error' phases — the banner above already
+                conveys the transient state. Replacing the content with a
+                placeholder during a failed in-panel navigation made the back
+                button surprising: from the user's perspective they were still
+                on the previous topic, so back should take them one step back
+                from there, not from the displaced placeholder.
+            -->
             <div
                 class="help-content"
                 onclick={on_content_click}
@@ -191,10 +200,10 @@
                 </p>
                 {@html state.current.html}
             </div>
-        {:else if state.phase === 'idle'}
-            <div class="placeholder">Open a topic to see R help here.</div>
         {:else if state.phase === 'error'}
             <div class="placeholder">Failed to load help.</div>
+        {:else}
+            <div class="placeholder">Open a topic to see R help here.</div>
         {/if}
     </div>
 </main>

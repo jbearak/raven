@@ -26,15 +26,17 @@ Internal cross-references are rewritten to a custom URL scheme that correctly ro
 ## What works
 
 - Most installed-package help pages render, including titles, descriptions, usage, arguments, examples, and see-also sections.
-- Cross-references within and across packages navigate in-panel.
+- Cross-references within and across packages navigate in-panel. When `Rd2HTML(dynamic = TRUE)` mis-attributes a link to its source package (e.g. `base::plot` linking to `base/plot.default` even though `plot.default` lives in `graphics`, or `graphics::plot.default` linking to `graphics/finite` for the `is.finite` alias in `base`), the renderer falls back to a global `help()` lookup so the link still resolves.
 - Operator topics (`` \`[\` ``, `` \`%in%\` ``, `+`, `if`, etc.) render and navigate correctly.
 - Images embedded in help pages (e.g., `?ggplot2::theme`) render — local files are served via webview URIs from package help directories.
 - External links (`https://`, `http://`, `mailto:`) open via `vscode.env.openExternal`.
+- `Run examples` and per-package `Index` footer links emitted by `Rd2HTML` are stripped before rendering — they pointed at endpoints that have no analog in the panel and would render as no-op links.
+- A failed in-panel navigation (e.g. a topic that genuinely cannot be resolved) leaves the previously rendered topic visible, with the error shown in the toolbar banner. Back/forward continues to operate from the last successful topic, not from the failed attempt.
 
 ## v1 Limitations
 
 - **No search**: There is no way to search across help topics from the panel. Use `?topic` or `??topic` in the R console.
-- **No examples runner**: Clicking inside an examples block does not execute the code. Copy-paste it into your R console.
+- **No examples runner**: Clicking inside an examples block does not execute the code. Copy-paste it into your R console. (The `Run examples` link `Rd2HTML` would otherwise emit is stripped before rendering, since it points at an R dynamic-help-server endpoint we don't run.)
 - **No vignettes**: Vignette links (`` \`../../<pkg>/doc/<vignette>.html\` ``) are neutralized in the rendered HTML; clicking them does nothing. Vignettes are out of scope for v1.
 - **Remote images dropped**: `<img>` tags pointing to `https://` or any non-local source are stripped by the sanitizer. Only local images shipped with installed packages render.
 - **Singleton panel**: Only one help panel per VS Code window. Navigating to a new topic reuses the same panel.

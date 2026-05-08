@@ -13,7 +13,7 @@ use std::time::Duration;
 use tempfile::NamedTempFile;
 
 use super::rewrite::rewrite_help_html;
-use super::sanitize::sanitize_help_html;
+use super::sanitize::{sanitize_help_html, strip_dead_links};
 use super::types::{HelpHtml, HelpHtmlError};
 use super::validate::is_valid_help_topic;
 
@@ -230,19 +230,28 @@ fn get_help_html_inner(
         });
     }
 
-    // 8) Rewrite cross-reference URLs FIRST, then sanitize.
+    // 8) Strip dead links FIRST, then rewrite cross-references, then sanitize.
     //
-    // The rewriter converts `<a href="../../<pkg>/help/<topic>">` (relative,
-    // produced by Rd2HTML(dynamic = TRUE)) into `raven-help://...`, which is
-    // an explicit allowlisted scheme. Running it before sanitization means
-    // ammonia sees a scheme it recognizes and keeps the href; running it
+    // strip_dead_links removes the `Run examples` paragraph (points at R's
+    // dynamic help server's example runner, which we don't have) and the
+    // `00Index.html` footer link (per-package index page, also unimplemented).
+    // Both must run on the raw R output: the rewriter converts unrecognized
+    // hrefs to `javascript:void(0)`+`data-raven-dropped`, which would prevent
+    // the strip regexes from matching by the original href.
+    //
+    // The rewriter then converts `<a href="../../<pkg>/help/<topic>">`
+    // (relative, produced by Rd2HTML(dynamic = TRUE)) into `raven-help://...`,
+    // which is an explicit allowlisted scheme. Running it before sanitization
+    // means ammonia sees a scheme it recognizes and keeps the href; running it
     // after would mean ammonia stripped the relative href first and the
     // rewriter had nothing to convert.
     //
-    // The rewriter is a regex-only transform on `<a href>` and is safe to
-    // run on raw R output — it cannot introduce dangerous tags or scripts.
+    // Both the strip and rewrite passes are regex-only transforms on `<a>`
+    // tags and are safe to run on raw R output — neither can introduce
+    // dangerous tags or scripts.
     let html_raw = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let rewritten_raw = rewrite_help_html(&html_raw, &canonical_pkg);
+    let stripped_raw = strip_dead_links(&html_raw);
+    let rewritten_raw = rewrite_help_html(&stripped_raw, &canonical_pkg);
     let rewritten = std::panic::catch_unwind(|| sanitize_help_html(&rewritten_raw))
         .map_err(|_| HelpHtmlError::RenderFailed {
             message: "ammonia panic".into(),
@@ -432,6 +441,62 @@ mod tests {
         let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
         let res = get_help_html("[", Some("base"), &r).expect("render");
         assert_eq!(res.package, "base");
+    }
+
+    #[test]
+    fn cross_package_fallback_resolves_misattributed_link() {
+        // Regression for the smoke-test bug where Rd2HTML(dynamic = TRUE)
+        // emits links of the form `../../<source-pkg>/help/<topic>` even
+        // when <topic> lives in a different package — e.g. base::plot links
+        // to `base/plot.default`, but plot.default is in graphics. Without
+        // a fallback, `help("plot.default", package = "base")` returns
+        // length 0 and `.getHelpFile()` then throws "argument is of length
+        // zero". The fix in rd_to_html.R falls back to `help(topic)` when
+        // the package-qualified search returns nothing.
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("plot.default", Some("base"), &r).expect("render");
+        assert_eq!(res.package, "graphics", "fallback must resolve to graphics, not base");
+        assert_eq!(res.topic, "plot.default");
+    }
+
+    #[test]
+    fn cross_package_fallback_resolves_alias() {
+        // Aliases are another flavor of the misattribution: `finite` is an
+        // alias for `is.finite` in base, but graphics::plot.default emits
+        // `graphics/help/finite` for it. The fallback resolves the alias.
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("finite", Some("graphics"), &r).expect("render");
+        assert_eq!(res.package, "base", "alias must resolve to base, not graphics");
+    }
+
+    #[test]
+    fn rendered_output_strips_dead_links() {
+        // Regression for two smoke-test bugs: Rd2HTML(dynamic = TRUE) emits a
+        // `<p><a href='../Example/<topic>'>Run examples</a></p>` paragraph and
+        // an `<a href="00Index.html">Index</a>` footer. Both point at endpoints
+        // we don't implement; clicking does nothing. They must be removed
+        // before the cross-reference rewriter runs (the rewriter converts
+        // unknown hrefs to javascript:void(0) which would prevent strip-by-href
+        // from matching), so the actual rendered HTML must contain neither.
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("mean", Some("base"), &r).expect("render");
+        assert!(
+            !res.html.contains("Run examples"),
+            "Run examples link must not survive into rendered HTML; html was:\n{}",
+            res.html
+        );
+        assert!(
+            !res.html.contains("00Index.html"),
+            "00Index.html link must not survive into rendered HTML; html was:\n{}",
+            res.html
+        );
+        // The footer text "[Package base version X.Y.Z]" should still be there;
+        // we strip only the trailing Index anchor, not the brackets.
+        assert!(
+            !res.html.contains(">Index<"),
+            "Index anchor text must be gone (cursor would be I-beam on a naked <a>); html was:\n{}",
+            res.html
+        );
     }
 
     /// Verifies that `get_help_html` returns `Err(TooLarge)` when the rendered
