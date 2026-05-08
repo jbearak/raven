@@ -710,7 +710,7 @@ concurrent hover.
 | `package-not-installed` | Cross-ref to a package missing from libpaths | `"Package \`pkg\` is not installed."` (no install button in v1) |
 | `render-failed` | `Rd2HTML()` errors on a malformed Rd | `"Could not render help for \`topic\`."` + retry button |
 | `timeout` | R subprocess exceeds `HELP_TIMEOUT` (10s default) | `"R timed out rendering help."` + retry button |
-| `r-unavailable` | R binary not configured / not found | `"R is not configured. Check raven.r.path."` |
+| `r-unavailable` | R binary not configured / not found | `"R is not configured. Check raven.packages.rPath."` |
 | `invalid-topic` | Dispatcher rejected the args before reaching R | `"Invalid help topic: \`topic\`"` (rare; typically only on a buggy webview) |
 | `too-large` | Rd2HTML output exceeded `HELP_HTML_MAX_BYTES` (8 MiB default) | `"Help page too large to display."` + suggestion to file an issue |
 
