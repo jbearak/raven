@@ -211,7 +211,7 @@ html, body, #root {
     border-right: 1px solid var(--vscode-tree-tableColumnsBorder, #f0f0f0);
     box-sizing: border-box;
     line-height: 16px;
-    cursor: cell;
+    cursor: default;
     user-select: none;
 }
 .cell.header {
@@ -222,7 +222,7 @@ html, body, #root {
     border-bottom: 2px solid var(--vscode-panel-border, #ccc);
 }
 .cell.col-header {
-    cursor: pointer;
+    cursor: default;
     position: relative;
 }
 
@@ -232,7 +232,7 @@ html, body, #root {
     top: 0;
     bottom: 0;
     width: 6px;
-    cursor: default;
+    cursor: col-resize;
     z-index: 1;
 }
 .resize-handle:hover {
@@ -270,7 +270,7 @@ html, body, #root {
     border-right: 1px solid var(--vscode-panel-border, #ccc);
 }
 .cell.row-header {
-    cursor: pointer;
+    cursor: default;
 }
 .cell.corner-cell {
     cursor: default;

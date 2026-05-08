@@ -8,7 +8,10 @@
     } from '../messages';
     import type { Cell } from '../wire-format';
     import type { ColumnSchema } from '../arrow-reader';
-    import { visibleRange, coalesceScroll } from './grid-model';
+    import {
+        visibleRange, coalesceScroll,
+        cappedScrollHeight, logicalScrollTop, visualOffsetPx,
+    } from './grid-model';
     import { RowCache } from './row-cache';
     import { Selection } from './selection-model';
     import { formatCell } from './cell-render';
@@ -187,7 +190,8 @@
         inflight.delete(m.requestId);
         rowCache.put(m.start, m.end, m.rows);
         const range = visibleRange({
-            scrollTop, viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
+            scrollTop: logicalScrollTop(scrollTop, totalGridHeight),
+            viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
         });
         if (range.start === m.start && range.end === m.end) {
             visibleRows = m.rows;
@@ -224,7 +228,8 @@
     // ----- Fetching -------------------------------------------------------
     const scheduleFetchVisible = coalesceScroll(() => {
         const range = visibleRange({
-            scrollTop, viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
+            scrollTop: logicalScrollTop(scrollTop, totalGridHeight),
+            viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
         });
         if (range.end <= range.start) {
             visibleRows = [];
@@ -663,7 +668,7 @@
          bind:this={viewportEl}
          onscroll={onScroll}
          tabindex="0">
-        <div class="grid" style="height: {totalGridHeight + ROW_HEIGHT}px;">
+        <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
             <!-- Header row (sticky top) -->
             <div class="header-row">
                 <div class="cell header rowname-col corner-cell" style="width: {rowColWidth};">#</div>
@@ -686,7 +691,7 @@
                 {/each}
             </div>
             <!-- Data rows -->
-            <div class="rows" style="transform: translateY({visibleRangeStart * ROW_HEIGHT}px);">
+            <div class="rows" style="transform: translateY({visualOffsetPx(visibleRangeStart * ROW_HEIGHT, totalGridHeight)}px);">
                 {#each visibleRows as rowCells, rowOffset (visibleRangeStart + rowOffset)}
                     {@const absRow = visibleRangeStart + rowOffset}
                     <div class="data-row" style="height: {ROW_HEIGHT}px;">
