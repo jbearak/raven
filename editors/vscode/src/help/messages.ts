@@ -1,0 +1,158 @@
+/**
+ * Typed wire protocol between the help-viewer extension host and the
+ * Svelte webview. No VS Code or DOM imports here.
+ *
+ * Rules:
+ *  - No VS Code or DOM imports — this module must be importable from both sides.
+ *  - Pure types + small runtime type-guards only.
+ */
+
+export type LoadPayload = {
+    topic: string;
+    package: string;
+    title: string;
+    html: string;
+    anchor: string | null;
+};
+
+export type ErrorPayload = {
+    reason:
+        | 'not-found'
+        | 'package-not-installed'
+        | 'render-failed'
+        | 'timeout'
+        | 'r-unavailable'
+        | 'invalid-topic'
+        | 'too-large';
+    message: string;
+};
+
+export type ExtensionToWebviewMessage =
+    | { type: 'load'; payload: LoadPayload }
+    | { type: 'loading'; payload: Record<string, never> }
+    | { type: 'error'; payload: ErrorPayload }
+    | { type: 'theme-changed'; payload: Record<string, never> }
+    | { type: 'history-state'; payload: { canBack: boolean; canForward: boolean } };
+
+export type NavigatePayload = {
+    topic: string;
+    package: string;
+    anchor: string | null;
+};
+
+export type WebviewToExtensionMessage =
+    | { type: 'webview-ready'; payload: Record<string, never> }
+    | { type: 'navigate'; payload: NavigatePayload }
+    | { type: 'open-external'; payload: { url: string } }
+    | { type: 'report-error'; payload: { message: string } }
+    | { type: 'scroll'; payload: { y: number } }
+    | { type: 'back'; payload: Record<string, never> }
+    | { type: 'forward'; payload: Record<string, never> };
+
+const EXTENSION_TO_WEBVIEW_TYPES = new Set<ExtensionToWebviewMessage['type']>([
+    'load',
+    'loading',
+    'error',
+    'theme-changed',
+    'history-state',
+]);
+
+const WEBVIEW_TO_EXTENSION_TYPES = new Set<WebviewToExtensionMessage['type']>([
+    'webview-ready',
+    'navigate',
+    'open-external',
+    'report-error',
+    'scroll',
+    'back',
+    'forward',
+]);
+
+export function isExtensionToWebviewMessage(value: unknown): value is ExtensionToWebviewMessage {
+    if (!value || typeof value !== 'object') return false;
+    const msg = value as { type?: unknown; payload?: unknown };
+    const t = msg.type;
+    if (typeof t !== 'string' || !EXTENSION_TO_WEBVIEW_TYPES.has(t as ExtensionToWebviewMessage['type'])) {
+        return false;
+    }
+    const p = msg.payload;
+    if (!p || typeof p !== 'object') return false;
+
+    switch (t) {
+        case 'load': {
+            const payload = p as Record<string, unknown>;
+            return (
+                typeof payload.topic === 'string' &&
+                typeof payload.package === 'string' &&
+                typeof payload.title === 'string' &&
+                typeof payload.html === 'string' &&
+                (payload.anchor === null || typeof payload.anchor === 'string')
+            );
+        }
+        case 'loading':
+        case 'theme-changed':
+            return true;
+        case 'error': {
+            const payload = p as Record<string, unknown>;
+            const validReasons = new Set([
+                'not-found',
+                'package-not-installed',
+                'render-failed',
+                'timeout',
+                'r-unavailable',
+                'invalid-topic',
+                'too-large',
+            ]);
+            return (
+                typeof payload.reason === 'string' &&
+                validReasons.has(payload.reason) &&
+                typeof payload.message === 'string'
+            );
+        }
+        case 'history-state': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.canBack === 'boolean' && typeof payload.canForward === 'boolean';
+        }
+        default:
+            return false;
+    }
+}
+
+export function isWebviewToExtensionMessage(value: unknown): value is WebviewToExtensionMessage {
+    if (!value || typeof value !== 'object') return false;
+    const msg = value as { type?: unknown; payload?: unknown };
+    const t = msg.type;
+    if (typeof t !== 'string' || !WEBVIEW_TO_EXTENSION_TYPES.has(t as WebviewToExtensionMessage['type'])) {
+        return false;
+    }
+    const p = msg.payload;
+    if (!p || typeof p !== 'object') return false;
+
+    switch (t) {
+        case 'webview-ready':
+        case 'back':
+        case 'forward':
+            return true;
+        case 'navigate': {
+            const payload = p as Record<string, unknown>;
+            return (
+                typeof payload.topic === 'string' &&
+                typeof payload.package === 'string' &&
+                (payload.anchor === null || typeof payload.anchor === 'string')
+            );
+        }
+        case 'open-external': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.url === 'string';
+        }
+        case 'report-error': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.message === 'string';
+        }
+        case 'scroll': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.y === 'number';
+        }
+        default:
+            return false;
+    }
+}
