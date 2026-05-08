@@ -1,5 +1,11 @@
 # Argument order is fixed: [1]=topic, [2]=package-or-empty, [3]=tempfile path.
 args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 3) {
+  stop(sprintf(
+    "rd_to_html.R: expected 3 arguments (topic, package-or-empty, meta_path); got %d",
+    length(args)
+  ))
+}
 topic <- args[1]
 pkg <- if (nzchar(args[2])) args[2] else NULL
 meta_path <- args[3]

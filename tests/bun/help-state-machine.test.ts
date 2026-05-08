@@ -28,6 +28,13 @@ describe('help state machine', () => {
         expect(sm.canForward()).toBe(false);
         await sm.back();
         expect(sm.canForward()).toBe(true);
+        // A fresh navigate after going back must clear the forward history —
+        // browsers behave this way and the spec says navigate() does too.
+        // Regression guard: removing `forward.length = 0` from navigate()
+        // should fail this test.
+        await sm.navigate('c', 'p');
+        expect(sm.canForward()).toBe(false);
+        expect(sm.canBack()).toBe(true);
     });
 
     test('failed fetch does not mutate stacks', async () => {

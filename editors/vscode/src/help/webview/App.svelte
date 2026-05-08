@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount, onDestroy, tick } from 'svelte';
-    import { initial_state, reduce } from './state';
+    import { initialState, reduce } from './state';
     import type { ViewerState } from './state';
     import {
         isExtensionToWebviewMessage,
@@ -13,7 +13,7 @@
     }
 
     let { vscode }: Props = $props();
-    let state = $state<ViewerState>(initial_state());
+    let state = $state<ViewerState>(initialState());
     let contentEl: HTMLDivElement | undefined = $state();
     let scroll_timer: ReturnType<typeof setTimeout> | null = null;
 

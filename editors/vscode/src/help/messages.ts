@@ -20,15 +20,23 @@ export type LoadPayload = {
     scrollY: number;
 };
 
+/**
+ * Single source of truth for valid error reason codes. The TypeScript
+ * `ErrorPayload.reason` union and the runtime `validReasons` set both
+ * derive from this constant, so a typo in either place becomes impossible.
+ */
+export const REASONS = [
+    'not-found',
+    'package-not-installed',
+    'render-failed',
+    'timeout',
+    'r-unavailable',
+    'invalid-topic',
+    'too-large',
+] as const;
+
 export type ErrorPayload = {
-    reason:
-        | 'not-found'
-        | 'package-not-installed'
-        | 'render-failed'
-        | 'timeout'
-        | 'r-unavailable'
-        | 'invalid-topic'
-        | 'too-large';
+    reason: typeof REASONS[number];
     message: string;
 };
 
@@ -101,15 +109,7 @@ export function isExtensionToWebviewMessage(value: unknown): value is ExtensionT
             return true;
         case 'error': {
             const payload = p as Record<string, unknown>;
-            const validReasons = new Set([
-                'not-found',
-                'package-not-installed',
-                'render-failed',
-                'timeout',
-                'r-unavailable',
-                'invalid-topic',
-                'too-large',
-            ]);
+            const validReasons: Set<string> = new Set(REASONS);
             return (
                 typeof payload.reason === 'string' &&
                 validReasons.has(payload.reason) &&

@@ -695,6 +695,18 @@ impl WorldState {
         }
     }
 
+    /// Drain the text and HTML help caches.
+    ///
+    /// Call this whenever the package set may have shifted underneath cached
+    /// help content (libpath watcher events, `raven.refreshPackages`, and the
+    /// package-settings branch of `did_change_configuration`). Keeping all the
+    /// callers funnelled through this helper makes it impossible to flush one
+    /// cache and forget the other.
+    pub fn clear_help_caches(&self) {
+        self.help_cache.drain();
+        self.html_help_cache.drain();
+    }
+
     /// Create a content provider for this state
     ///
     /// The content provider provides a unified interface for accessing file content,

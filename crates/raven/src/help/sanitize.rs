@@ -37,8 +37,16 @@ pub fn strip_dead_links(html: &str) -> String {
 fn strip_style_url(html: &str) -> std::borrow::Cow<'_, str> {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r#"(?i)\s+style\s*=\s*"[^"]*url\s*\([^"]*""#)
-            .expect("valid regex")
+        // Match `style=...` whose value contains `url(`, regardless of quoting:
+        //   - double-quoted: style="...url(...)..."
+        //   - single-quoted: style='...url(...)...'
+        //   - unquoted: style=foo:url(x); (terminated by whitespace or `>`)
+        // Attribute parsing is irregular; this is best-effort defense-in-depth.
+        // Final HTML cleanup still goes through ammonia below.
+        regex::Regex::new(
+            r#"(?i)\s+style\s*=\s*(?:"[^"]*url\s*\([^"]*"|'[^']*url\s*\([^']*'|[^\s>'"]*url\s*\([^\s>]*)"#,
+        )
+        .expect("valid regex")
     });
     re.replace_all(html, "")
 }
@@ -203,6 +211,20 @@ mod tests {
     #[test]
     fn drops_style_with_url_case_insensitive() {
         let html = r#"<span style="background: URL(x)">x</span>"#;
+        let out = sanitize_help_html(html);
+        assert!(!out.to_lowercase().contains("url("));
+    }
+
+    #[test]
+    fn drops_style_with_single_quoted_url() {
+        let html = r#"<span style='background: url(http://evil/x)'>x</span>"#;
+        let out = sanitize_help_html(html);
+        assert!(!out.to_lowercase().contains("url("));
+    }
+
+    #[test]
+    fn drops_style_with_unquoted_url() {
+        let html = r#"<span style=background:url(x)>x</span>"#;
         let out = sanitize_help_html(html);
         assert!(!out.to_lowercase().contains("url("));
     }

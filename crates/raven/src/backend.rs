@@ -1482,6 +1482,10 @@ impl LanguageServer for Backend {
                 // reported cleared count.
                 let pkg_lib = self.state.read().await.package_library.clone();
                 pkg_lib.clear_cache().await;
+                // Help and HTML help caches reference package-export content
+                // that just got invalidated; flush them too so subsequent
+                // hover/help-panel requests re-fetch from R.
+                self.state.read().await.clear_help_caches();
                 let after_count = pkg_lib.cached_count().await;
                 let cleared = before_count.saturating_sub(after_count);
                 prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
@@ -1508,7 +1512,21 @@ impl LanguageServer for Backend {
             }
             "raven.getHelpHtml" => {
                 let topic = params.arguments.first().and_then(|v| v.as_str()).unwrap_or("");
-                let package = params.arguments.get(1).and_then(|v| v.as_str());
+
+                // Distinguish missing (absent or JSON null) from wrong-type
+                // (e.g. a number) so a malformed second argument doesn't
+                // silently fall through to an unqualified lookup.
+                let package = match params.arguments.get(1) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                    Some(_) => {
+                        return Ok(Some(serde_json::json!({
+                            "ok": false,
+                            "reason": "invalid-topic",
+                            "message": "package argument must be a string or null",
+                        })));
+                    }
+                };
 
                 // Validation runs first — defense-in-depth before any cache or R access.
                 if !crate::help::is_valid_help_topic(topic) {
@@ -3040,6 +3058,10 @@ impl LanguageServer for Backend {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
             }
+
+            // Help/HTML help caches index by (topic, package); the package set
+            // just changed, so flush them to match watcher and refresh paths.
+            self.state.read().await.clear_help_caches();
         }
 
         // Restart the libpath watcher if any setting that affects it changed.
@@ -4829,11 +4851,7 @@ async fn run_libpath_consumer(
                 // Bust help caches before invalidating the package library so
                 // any concurrent hover/completion requests see a clean slate and
                 // re-fetch from R rather than returning stale HTML or text help.
-                {
-                    let state = state_arc.read().await;
-                    state.help_cache.drain();
-                    state.html_help_cache.drain();
-                }
+                state_arc.read().await.clear_help_caches();
 
                 // Invalidate the package cache and learn which combined_exports
                 // aggregates were dropped as a side effect. A document loading
@@ -4975,11 +4993,7 @@ async fn run_libpath_consumer(
 
                 // The watcher is gone so we can no longer track installs or
                 // upgrades; any cached help content may now be stale.
-                {
-                    let state = state_arc.read().await;
-                    state.help_cache.drain();
-                    state.html_help_cache.drain();
-                }
+                state_arc.read().await.clear_help_caches();
 
                 let open_uris = prepare_dropped_recovery(&state_arc).await;
                 for uri in open_uris {

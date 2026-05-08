@@ -302,21 +302,30 @@ Under `editors/vscode/src/help/webview/`:
   Both buttons send messages to the extension; the extension owns history
   state. The webview never decides what topic to load.
 - Click handler on the help-content area uses **a single delegated listener
-  on the help-content root**. Behavior depends on the link kind:
+  on the help-content root**. `classifyAndDispatch` returns true when it
+  handled the event (calls `preventDefault()`) and false when it deferred to
+  the browser/webview default. Behavior depends on the link kind:
   - `raven-help://topic/<pkg>/<topic>[#anchor]`: `preventDefault()`,
     percent-decode each path segment and the anchor exactly once, then
-    post `navigate { topic, package, anchor? }` to extension.
+    post `navigate { topic, package, anchor? }` to extension. Returns
+    true.
   - `https://...` / `http://...` / `mailto:...` (allowed protocols only):
-    `preventDefault()`, post `open-external { url }`. Extension
-    validates the URL parses cleanly and that its scheme is
-    allowlisted before calling `vscode.env.openExternal`.
+    returns false **without** `preventDefault()`. VS Code's native webview
+    handling shows a single trust prompt and opens the URL — posting our
+    own `open-external` would race with that handler and produce a
+    duplicate browser open, so it is intentionally omitted from the wire
+    protocol.
   - `#anchor` (in-page only — leading `#`, no scheme, no path):
-    **no `preventDefault()`** — let the browser scroll natively.
+    returns false without `preventDefault()` — let the browser scroll
+    natively.
   - Anything else (other schemes, `javascript:`, malformed URLs, relative
     paths the server rewriter missed, or anchors carrying
     `data-raven-dropped="1"` from server-side neutralization):
     `preventDefault()`, post `report-error` to the extension for
-    telemetry. Never navigates.
+    telemetry. Never navigates. Returns true.
+
+  Coverage of `classifyAndDispatch` lives in the Bun suite at
+  `tests/bun/help-webview-link.test.ts`.
 
 ## LSP protocol surface
 
@@ -413,7 +422,7 @@ The rewriter walks `<a href="...">` attributes and produces:
 | `../../base/help/%5B` (i.e., `[`) | `raven-help://topic/base/%5B` |
 | `../../base/help/+` (operator topic) | `raven-help://topic/base/%2B` |
 | `../../<pkg>/topic/<topic>` (older Rd format) | same as `help/` form |
-| `../../<pkg>/doc/<vignette>.html` (vignette link) | unchanged (out of v1 scope) |
+| `../../<pkg>/doc/<vignette>.html` (vignette link) | replaced with `href="javascript:void(0)"` and `data-raven-dropped="1"` (vignette rendering is out of v1 scope) |
 | `https://example.com/...` | unchanged |
 | `http://example.com/...` | unchanged |
 | `mailto:...` | unchanged |

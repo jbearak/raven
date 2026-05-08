@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import type { LanguageClient } from 'vscode-languageclient/node';
+import { State, type LanguageClient } from 'vscode-languageclient/node';
 import type { RavenExtensionApi } from '../extension';
 import { activate, openDocument, sleep } from './helper';
 
@@ -22,7 +22,11 @@ import { activate, openDocument, sleep } from './helper';
 
 interface OpenHelpPanelArgs {
     topic: string;
-    package: string;
+    // The hover currently always passes a string here, but the wire contract
+    // for `raven.openHelpPanel` accepts `null` for the unqualified case
+    // (e.g. base topics without a package qualifier). Keep the decoder lenient
+    // so a future hover that omits the package doesn't make this test choke.
+    package: string | null;
 }
 
 /**
@@ -35,7 +39,8 @@ function decodeOpenHelpPanelArgs(markdown: string): OpenHelpPanelArgs | null {
     const decoded = decodeURIComponent(m[1]);
     const args = JSON.parse(decoded) as unknown;
     if (!Array.isArray(args) || args.length < 2) return null;
-    if (typeof args[0] !== 'string' || typeof args[1] !== 'string') return null;
+    if (typeof args[0] !== 'string') return null;
+    if (typeof args[1] !== 'string' && args[1] !== null) return null;
     return { topic: args[0], package: args[1] };
 }
 
@@ -66,8 +71,8 @@ async function waitForLanguageClient(timeoutMs = 15000): Promise<LanguageClient 
     while (Date.now() - start < timeoutMs) {
         const client = api.getLanguageClient();
         // The client is "running" once the LSP server has responded to
-        // initialize. State 2 = Running per vscode-languageclient's State enum.
-        if (client && client.state === 2) return client;
+        // initialize.
+        if (client && client.state === State.Running) return client;
         await sleep(100);
     }
     return api.getLanguageClient();

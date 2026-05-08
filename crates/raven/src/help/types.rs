@@ -101,9 +101,24 @@ mod tests {
 
     #[test]
     fn reason_strings_match_spec() {
+        // Each variant must produce the exact string the webview's
+        // `validReasons` set in `editors/vscode/src/help/messages.ts`
+        // accepts. A typo here breaks the wire protocol silently.
         assert_eq!(HelpHtmlError::NotFound.reason(), "not-found");
         assert_eq!(HelpHtmlError::PackageNotInstalled.reason(), "package-not-installed");
+        assert_eq!(
+            HelpHtmlError::InvalidTopic { message: "x".into() }.reason(),
+            "invalid-topic"
+        );
+        assert_eq!(
+            HelpHtmlError::RenderFailed { message: "x".into() }.reason(),
+            "render-failed"
+        );
         assert_eq!(HelpHtmlError::Timeout.reason(), "timeout");
+        assert_eq!(
+            HelpHtmlError::RUnavailable { message: "x".into() }.reason(),
+            "r-unavailable"
+        );
         assert_eq!(HelpHtmlError::TooLarge.reason(), "too-large");
     }
 }

@@ -16,7 +16,7 @@ export type ViewerAction =
     | { type: 'ERROR'; payload: ErrorPayload }
     | { type: 'HISTORY_STATE'; canBack: boolean; canForward: boolean };
 
-export function initial_state(): ViewerState {
+export function initialState(): ViewerState {
     return {
         phase: 'idle',
         current: null,

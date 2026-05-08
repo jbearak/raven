@@ -935,18 +935,26 @@ pub(crate) fn get_help_with_code_capturing_pid(
     get_help_inner(topic, package, r_path, r_code, Some(pid_capture))
 }
 
-/// RAII guard that sets an environment variable on creation and removes it on drop.
+/// RAII guard that sets an environment variable on creation and restores the
+/// prior value (or removes the var if it was unset) on drop.
 ///
-/// Keeps env-var mutations local to a single test even in the presence of panics.
+/// Keeps env-var mutations local to a single test even in the presence of
+/// panics. Storing the previous value matters when a parent process or an
+/// outer test set the variable: unconditionally removing on drop would
+/// clobber that state.
 #[cfg(test)]
-struct EnvGuard(&'static str);
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
 
 #[cfg(test)]
 impl EnvGuard {
     fn set(key: &'static str, val: &str) -> Self {
+        let previous = std::env::var_os(key);
         // SAFETY: single-threaded test context; we restore in Drop.
         unsafe { std::env::set_var(key, val) };
-        EnvGuard(key)
+        EnvGuard { key, previous }
     }
 }
 
@@ -954,7 +962,12 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         // SAFETY: mirrors the set_var above.
-        unsafe { std::env::remove_var(self.0) };
+        unsafe {
+            match self.previous.take() {
+                Some(prev) => std::env::set_var(self.key, prev),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }
 

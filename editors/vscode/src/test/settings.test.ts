@@ -394,6 +394,33 @@ suite('Settings Transmission Unit Tests', () => {
     });
 
     /**
+     * Unit test: Verify the help.viewerColumn mapping accepts both allowed
+     * literals ('active' / 'beside') and lands them at helpViewer.viewColumn.
+     * Deterministic complement to the property-based coverage above so a
+     * regression in either the mapping entry or the JSON path is obvious.
+     */
+    test('help.viewerColumn enum transmits correctly to helpViewer.viewColumn', () => {
+        const mapping = SETTINGS_MAPPING.find(s => s.vsCodeKey === 'help.viewerColumn');
+        assert.ok(mapping, 'help.viewerColumn must exist in SETTINGS_MAPPING');
+        assert.strictEqual(mapping!.type, 'enum');
+        assert.deepStrictEqual([...(mapping!.enumValues ?? [])], ['active', 'beside']);
+        assert.deepStrictEqual(mapping!.jsonPath, ['helpViewer', 'viewColumn']);
+
+        for (const value of ['active', 'beside'] as const) {
+            const configuredSettings = new Map<string, unknown>([
+                ['help.viewerColumn', value],
+            ]);
+            const mockConfig = createMockConfig(configuredSettings);
+            const options = getInitializationOptions(mockConfig);
+            assert.strictEqual(
+                (options as Record<string, Record<string, unknown> | undefined>).helpViewer?.viewColumn,
+                value,
+                `help.viewerColumn=${value} must map to helpViewer.viewColumn`
+            );
+        }
+    });
+
+    /**
      * Unit test: Verify severity settings transmission.
      */
     test('severity settings transmit correctly', () => {

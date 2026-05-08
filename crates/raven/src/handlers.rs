@@ -9875,6 +9875,12 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 // Hover
 // ============================================================================
 
+/// Outer bound on a single help lookup awaited by an LSP handler. Sits above
+/// the help subprocess' own 10-second timeout (`HELP_TIMEOUT`) and watchdog —
+/// belt-and-suspenders against an unforeseen lock or kill failure that would
+/// otherwise hang the hover/signature path indefinitely.
+const HELP_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// Fetches R help text with cache support, running the R subprocess on a
 /// blocking thread. Used by hover to avoid duplicating the
 /// cache-check → spawn_blocking → cache-result pattern.
@@ -9893,12 +9899,16 @@ async fn get_help_cached(
     let cache = cache.clone();
     let topic = topic.to_string();
     let package = package.map(|s| s.to_string());
-    tokio::task::spawn_blocking(move || {
+    let task = tokio::task::spawn_blocking(move || {
         cache.get_or_fetch(&topic, package.as_deref(), &r_path)
-    })
-    .await
-    .ok()
-    .flatten()
+    });
+    // Treat both timeout and join-error as "no help available" — the same
+    // fallback the cache-miss path already returns.
+    tokio::time::timeout(HELP_LOOKUP_TIMEOUT, task)
+        .await
+        .ok()
+        .and_then(|join| join.ok())
+        .flatten()
 }
 
 /// Build the bold clickable heading line that links to the help panel for
@@ -10337,16 +10347,22 @@ async fn try_build_package_signature(
     package_name: &str,
     r_path: std::path::PathBuf,
 ) -> Option<SignatureInformation> {
-    // Fetch help text from cache (may block on R subprocess)
-    let help_text = tokio::task::spawn_blocking({
+    // Fetch help text from cache (may block on R subprocess). Bound the
+    // whole await with `HELP_LOOKUP_TIMEOUT` so a runaway subprocess can't
+    // freeze signature help — see the constant's docs for why this is on
+    // top of the inner subprocess timeout.
+    let help_task = tokio::task::spawn_blocking({
         let cache = help_cache.clone();
         let func = function_name.to_string();
         let pkg = package_name.to_string();
         let rp = r_path.clone();
         move || cache.get_or_fetch(&func, Some(&pkg), &rp)
-    })
-    .await
-    .ok()??;
+    });
+    let help_text = tokio::time::timeout(HELP_LOOKUP_TIMEOUT, help_task)
+        .await
+        .ok()
+        .and_then(|join| join.ok())
+        .flatten()?;
 
     // Extract signature from help text
     let signature_str = crate::help::extract_signature_from_help(&help_text);
@@ -10354,15 +10370,17 @@ async fn try_build_package_signature(
     // Extract description from help text
     let description = crate::help::extract_description_from_help(&help_text);
 
-    // Get parameter documentation
-    let param_docs = tokio::task::spawn_blocking({
+    // Get parameter documentation. Same timeout protection as above.
+    let args_task = tokio::task::spawn_blocking({
         let cache = help_cache.clone();
         let func = function_name.to_string();
         let pkg = package_name.to_string();
         move || cache.get_arguments(&func, Some(&pkg), &r_path)
-    })
-    .await
-    .ok()?;
+    });
+    let param_docs = tokio::time::timeout(HELP_LOOKUP_TIMEOUT, args_task)
+        .await
+        .ok()
+        .and_then(|join| join.ok())?;
 
     // If we have a signature, parse it to extract parameters
     if let Some(sig_str) = signature_str {
