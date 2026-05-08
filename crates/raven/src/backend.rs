@@ -1567,19 +1567,32 @@ impl LanguageServer for Backend {
                     return Ok(Some(help_html_to_json(cached)));
                 }
 
-                let result = cache
-                    .get_or_fetch(topic, package, move |t, p| async move {
-                        tokio::task::spawn_blocking(move || {
-                            crate::help::get_help_html(&t, p.as_deref(), &r_path)
-                        })
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(crate::help::HelpHtmlError::RenderFailed {
-                                message: "spawn_blocking joined with error".into(),
-                            })
+                // Outer `tokio::time::timeout` belt-and-suspenders: the inner
+                // `get_help_html` already has a 10-second watchdog over its R
+                // subprocess, but per AGENTS.md every R subprocess call awaited
+                // by an LSP handler must additionally be bounded by
+                // `HELP_LOOKUP_TIMEOUT` so an unforeseen lock or kill failure
+                // can't freeze the execute_command dispatcher.
+                let fetch = cache.get_or_fetch(topic, package, move |t, p| async move {
+                    tokio::task::spawn_blocking(move || {
+                        crate::help::get_help_html(&t, p.as_deref(), &r_path)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(crate::help::HelpHtmlError::RenderFailed {
+                            message: "spawn_blocking joined with error".into(),
                         })
                     })
-                    .await;
+                });
+                let result = match tokio::time::timeout(
+                    crate::handlers::HELP_LOOKUP_TIMEOUT,
+                    fetch,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(crate::help::HelpHtmlError::Timeout),
+                };
 
                 Ok(Some(help_html_to_json(result)))
             }

@@ -6,8 +6,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tempfile::NamedTempFile;
@@ -116,24 +115,9 @@ fn get_help_html_inner(
         cap.store(pid, Ordering::SeqCst);
     }
 
-    // 4) Watchdog (mirrors get_help in text.rs).
-    //    `kill_fired` is set by the watchdog just before it kills the child.
-    //    The post-wait branch consults it ONLY when the child exited unsuccessfully —
-    //    a stale `kill_fired` from a kill that raced with natural exit is harmless
-    //    because we don't look at the flag in the success path.
-    let exited = Arc::new(AtomicBool::new(false));
-    let kill_fired = Arc::new(AtomicBool::new(false));
-    let exited_clone = exited.clone();
-    let kill_fired_clone = kill_fired.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        if !exited_clone.load(Ordering::SeqCst) {
-            kill_fired_clone.store(true, Ordering::SeqCst);
-            super::text::kill_process_by_pid(pid);
-        }
-    });
-
-    // 5) Drain stdout up to the cap.
+    // 4) Drain stdout / stderr on background threads. Reading pipes from
+    //    separate threads prevents deadlock when pipe buffers fill before
+    //    the child exits.
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
@@ -166,8 +150,45 @@ fn get_help_html_inner(
         buf
     });
 
-    let wait_result = child.wait();
-    exited.store(true, Ordering::SeqCst);
+    // 5) Watchdog: a sleeper thread sends a one-shot timeout signal. The main
+    //    thread polls `try_wait()` and the signal channel together. We kill
+    //    via `child.kill()` only after a `try_wait()` that returned `Ok(None)`
+    //    — meaning we have NOT reaped the PID yet — so the kill cannot land
+    //    on a recycled PID. This is the structural cure for the old
+    //    "atomic flag plus bare-PID SIGKILL from a detached thread" race in
+    //    `text.rs::get_help` (commit b867a57): a watchdog firing between
+    //    `wait()` reaping the child and the atomic store could SIGKILL an
+    //    unrelated process that had grabbed the freed PID.
+    let (timeout_tx, timeout_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        let _ = timeout_tx.send(());
+    });
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let mut killed_by_watchdog = false;
+    let wait_result: std::io::Result<std::process::ExitStatus> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if timeout_rx.try_recv().is_ok() {
+                    log::trace!(
+                        "get_help_html: timeout after {:?}, killing pid {}",
+                        timeout,
+                        pid
+                    );
+                    // Safe: try_wait returned None, so the child has not been
+                    // reaped and `pid` still names this child.
+                    let _ = child.kill();
+                    killed_by_watchdog = true;
+                    break child.wait();
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
     let stdout_bytes = stdout_thread.join().unwrap_or(Err(HelpHtmlError::RenderFailed {
         message: "stdout thread panicked".into(),
     }))?;
@@ -178,11 +199,10 @@ fn get_help_html_inner(
     })?;
 
     if !status.success() {
-        // 6) Watchdog kill takes precedence over stderr heuristics.
-        //    Only consult kill_fired on the failure path: if the child exited
-        //    successfully, a stale kill_fired (kill raced with natural exit) is
-        //    harmless and must be ignored so we don't misclassify a clean run.
-        if kill_fired.load(Ordering::SeqCst) {
+        // 6) Watchdog kill takes precedence over stderr heuristics: if we
+        //    fired the kill ourselves, classify as Timeout regardless of
+        //    whatever stderr contains.
+        if killed_by_watchdog {
             return Err(HelpHtmlError::Timeout);
         }
         let err = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -325,20 +345,26 @@ pub(crate) fn get_help_html_with_code_capturing_pid(
     get_help_html_inner(topic, package, r_path, r_code, Some(pid_capture))
 }
 
-/// RAII guard that sets an environment variable on creation and removes it on drop.
+/// RAII guard that sets an environment variable on creation and restores the
+/// prior value (or removes the var if it was unset) on drop.
 ///
-/// Keeps env-var mutations local to a single test even in the presence of panics.
-/// Tests that need this must run with `--test-threads=1` if they share the same
-/// env key, since `std::env::set_var` is process-wide.
+/// Keeps env-var mutations local to a single test even in the presence of
+/// panics. Storing the previous value matters when a parent process or an
+/// outer test set the variable: unconditionally removing on drop would
+/// clobber that state.
 #[cfg(test)]
-struct EnvGuard(&'static str);
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
 
 #[cfg(test)]
 impl EnvGuard {
     fn set(key: &'static str, val: &str) -> Self {
+        let previous = std::env::var_os(key);
         // SAFETY: single-threaded test context; we restore in Drop.
         unsafe { std::env::set_var(key, val) };
-        EnvGuard(key)
+        EnvGuard { key, previous }
     }
 }
 
@@ -346,7 +372,12 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         // SAFETY: mirrors the set_var above.
-        unsafe { std::env::remove_var(self.0) };
+        unsafe {
+            match self.previous.take() {
+                Some(prev) => std::env::set_var(self.key, prev),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }
 

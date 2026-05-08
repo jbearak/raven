@@ -254,42 +254,6 @@ fn timeout_from_env() -> Duration {
     }
 }
 
-/// Kill a process by PID. Used by the help subprocess watchdog on timeout.
-///
-/// On Unix, sends SIGKILL directly. On Windows, delegates to `taskkill /F`.
-/// If the process has already exited, the call is harmless on all platforms.
-#[cfg(unix)]
-pub(crate) fn kill_process_by_pid(pid: u32) {
-    match i32::try_from(pid) {
-        Ok(pid_i32) => {
-            // SAFETY: Sending SIGKILL to a known child PID. If the process
-            // already exited, kill() returns ESRCH harmlessly.
-            unsafe {
-                libc::kill(pid_i32, libc::SIGKILL);
-            }
-        }
-        Err(_) => {
-            // PID > i32::MAX would wrap to negative, which kill() interprets
-            // as a process group signal — bail rather than risk that.
-            log::trace!("get_help: pid {} exceeds i32::MAX, cannot kill", pid);
-        }
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn kill_process_by_pid(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn kill_process_by_pid(_pid: u32) {
-    log::trace!("get_help: timeout kill not supported on this platform");
-}
-
 /// Fetches help text for an R topic by invoking R and returns the rendered help if available.
 ///
 /// Returns `Some(String)` containing the help text when R executes successfully, the output is not empty,

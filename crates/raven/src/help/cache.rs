@@ -154,9 +154,20 @@ impl HtmlHelpCache {
                 }
 
                 // 5) Remove in-flight entry, then broadcast to waiting subscribers.
+                //
+                // Identity-check before removing: `drain()` may have cleared
+                // the map mid-fetch, after which a new caller becomes a fresh
+                // Owner and inserts its own sender. Removing unconditionally
+                // by key would evict that new sender, leaving subsequent
+                // callers without an entry to subscribe to and degrading the
+                // single-flight guarantee until the new Owner finishes.
                 {
                     let mut map = self.in_flight.lock().expect("in_flight lock");
-                    map.remove(&key);
+                    if let Some(current) = map.get(&key) {
+                        if current.same_channel(&sender) {
+                            map.remove(&key);
+                        }
+                    }
                 }
                 let shared = Arc::new(result.clone());
                 let _ = sender.send(shared);
@@ -268,6 +279,98 @@ mod tests {
         c.insert("filter.tbl_df", Some("dplyr"), Ok(h.clone()));
         assert!(c.get("filter.tbl_df", Some("dplyr")).is_some());
         assert!(c.get("filter", Some("dplyr")).is_some());
+    }
+
+    #[tokio::test]
+    async fn drain_during_inflight_does_not_evict_new_owner() {
+        // Regression: when `drain()` ran mid-fetch, the original Owner's
+        // unconditional `map.remove(&key)` would also evict the next Owner's
+        // sender, breaking single-flight dedup until that next Owner finished.
+        // The fix gates the removal on `Sender::same_channel`.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let c = Arc::new(HtmlHelpCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner1_started = Arc::new(Notify::new());
+        let owner1_unblock = Arc::new(Notify::new());
+
+        // Owner 1: blocks until we explicitly let it finish, so we can drain
+        // and start Owner 2 while Owner 1 is still in-flight.
+        let c1 = c.clone();
+        let calls1 = calls.clone();
+        let started1 = owner1_started.clone();
+        let unblock1 = owner1_unblock.clone();
+        let owner1 = tokio::spawn(async move {
+            c1.get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls1.clone();
+                let started = started1.clone();
+                let unblock = unblock1.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    unblock.notified().await;
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await
+        });
+
+        // Wait until Owner 1's fetch has registered its sender in the map.
+        owner1_started.notified().await;
+
+        // Drain (libpath change): clears LRU and in_flight.
+        c.drain();
+
+        // Owner 2: now becomes a fresh Owner for the same key.
+        let c2 = c.clone();
+        let calls2 = calls.clone();
+        let owner2 = tokio::spawn(async move {
+            c2.get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await
+        });
+
+        // Yield to let Owner 2 register its sender.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // A late Subscriber for the same key: must subscribe to Owner 2 (not
+        // become a third Owner, which would happen if Owner 1's eventual
+        // removal evicted Owner 2's sender).
+        let c3 = c.clone();
+        let calls3 = calls.clone();
+        let subscriber = tokio::spawn(async move {
+            c3.get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls3.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await
+        });
+
+        // Now release Owner 1 — its post-fetch removal must NOT evict Owner 2.
+        owner1_unblock.notify_one();
+
+        let _ = owner1.await.unwrap();
+        let _ = owner2.await.unwrap();
+        let _ = subscriber.await.unwrap();
+
+        // Two fetches total: Owner 1 (pre-drain) and Owner 2 (post-drain).
+        // The subscriber must have ridden Owner 2's broadcast, not become a
+        // third Owner.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "expected exactly 2 fetches (Owner 1 + Owner 2); subscriber must not become a 3rd Owner"
+        );
     }
 
     #[tokio::test]

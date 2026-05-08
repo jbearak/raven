@@ -9879,7 +9879,7 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 /// the help subprocess' own 10-second timeout (`HELP_TIMEOUT`) and watchdog —
 /// belt-and-suspenders against an unforeseen lock or kill failure that would
 /// otherwise hang the hover/signature path indefinitely.
-const HELP_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+pub(crate) const HELP_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Fetches R help text with cache support, running the R subprocess on a
 /// blocking thread. Used by hover to avoid duplicating the

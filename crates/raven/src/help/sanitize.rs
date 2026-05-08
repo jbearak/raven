@@ -132,6 +132,13 @@ fn build_ammonia_sanitized(html: &str) -> String {
         }
         m
     });
+    // `data:` is allowlisted globally so `<img src="data:image/...">` (used
+    // for inline icons in some packages' Rd documentation, where the CSP also
+    // permits `img-src ... data:`) survives sanitization. We then drop
+    // `data:` from `<a href>` specifically via `attribute_filter` below —
+    // ammonia has no per-tag scheme allowlist, so a global allow + targeted
+    // filter is the only way to keep inline images while denying `data:` URLs
+    // as link targets.
     let schemes = URL_SCHEMES.get_or_init(|| {
         ["http", "https", "mailto", "raven-help", "data"]
             .into_iter()
@@ -154,6 +161,19 @@ fn build_ammonia_sanitized(html: &str) -> String {
     b.tag_attributes(per_tag.clone());
     b.url_schemes(schemes.clone());
     b.clean_content_tags(clean_content.clone());
+    // Drop `data:` href values on `<a>` even though `data:` is in the
+    // global url_schemes (needed for `<img src>`). `data:` link navigation
+    // is a known XSS / phishing vector and the CSP / click handler are
+    // secondary defenses; the sanitizer should be the primary gate.
+    b.attribute_filter(|element, attribute, value| {
+        if element.eq_ignore_ascii_case("a") && attribute.eq_ignore_ascii_case("href") {
+            let trimmed = value.trim_start();
+            if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("data:") {
+                return None;
+            }
+        }
+        Some(std::borrow::Cow::Borrowed(value))
+    });
     // Keep relative URLs (e.g. `<a href="../../base/help/sum">`,
     // `<img src="figures/x.png">`) so the rewriter and the extension's
     // image rewriter can convert them downstream. Default Deny would
@@ -268,6 +288,48 @@ mod tests {
         let html = r#"<a href="raven-help://topic/base/sum">sum</a>"#;
         let out = sanitize_help_html(html);
         assert!(out.contains(r#"href="raven-help://topic/base/sum""#));
+    }
+
+    #[test]
+    fn drops_data_url_on_a_href() {
+        // `data:` must be allowed only for `<img src>`, never for `<a href>`,
+        // so a malicious or buggy package can't ship inline-document or
+        // phishing links. The CSP and click handler both block `data:`
+        // navigation in practice, but the sanitizer is the primary gate.
+        let html = r#"<a href="data:text/html,<b>x</b>">click</a>"#;
+        let out = sanitize_help_html(html);
+        assert!(
+            !out.contains("data:"),
+            "data: href on <a> must be stripped by sanitizer: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn keeps_data_url_on_img_src() {
+        // Inline `data:` images remain allowed — the CSP's `img-src ... data:`
+        // permits them for inline icons in package help pages.
+        let html = r#"<img src="data:image/png;base64,iVBORw==" alt="x">"#;
+        let out = sanitize_help_html(html);
+        assert!(
+            out.contains("data:image/png;base64"),
+            "data: src on <img> must be preserved: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn drops_data_url_on_a_href_case_and_whitespace_insensitive() {
+        // Defense-in-depth: case variation and leading whitespace must not
+        // smuggle a `data:` href past the filter.
+        for raw_href in [r#"DATA:text/html,x"#, r#"  data:text/html,x"#, r#"Data:text/html,x"#] {
+            let html = format!(r#"<a href="{raw_href}">x</a>"#);
+            let out = sanitize_help_html(&html);
+            assert!(
+                !out.to_ascii_lowercase().contains("data:"),
+                "variant {raw_href:?} must be stripped: got {out}"
+            );
+        }
     }
 
     #[test]
