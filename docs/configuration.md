@@ -59,6 +59,12 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.plot.enabled` | `true` | Enable Raven's httpgd-backed plot viewer for Raven-managed R terminals. Requires the `httpgd` R package (>= 2.0.2). See [Send to R → Plot Viewer](send-to-r.md#plot-viewer). |
 | `raven.plot.viewerColumn` | `beside` | Initial editor column for the shared plot viewer panel when the first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. |
 
+## Help Viewer Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.help.viewerColumn` | `beside` | Initial editor column when the R help viewer first opens. Once you move the panel, Raven leaves it where you put it. Values: `active`, `beside`. See [Help Viewer](help-viewer.md). |
+
 ## Symbol Settings
 
 | Setting | Default | Description |

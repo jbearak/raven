@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::Command;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -128,11 +129,16 @@ impl HelpCache {
     ///
     /// **Note:** This method blocks on R subprocess I/O. Callers on an async
     /// runtime should use `tokio::task::spawn_blocking`.
-    pub fn get_or_fetch(&self, topic: &str, package: Option<&str>) -> Option<String> {
+    pub fn get_or_fetch(
+        &self,
+        topic: &str,
+        package: Option<&str>,
+        r_path: &std::path::Path,
+    ) -> Option<String> {
         if let Some(cached) = self.get(topic, package) {
             return cached;
         }
-        let result = get_help(topic, package);
+        let result = get_help(topic, package, r_path);
         self.insert(topic, package, result.clone());
         result
     }
@@ -153,6 +159,7 @@ impl HelpCache {
         &self,
         topic: &str,
         package: Option<&str>,
+        r_path: &std::path::Path,
     ) -> Option<HashMap<String, String>> {
         let key = cache_key(topic, package);
 
@@ -166,7 +173,7 @@ impl HelpCache {
         }
 
         // Cache miss — fetch help text and parse arguments
-        let help_text = self.get_or_fetch(topic, package);
+        let help_text = self.get_or_fetch(topic, package, r_path);
         let args = match help_text {
             Some(text) => {
                 let map = extract_arguments_from_help(&text);
@@ -186,6 +193,19 @@ impl HelpCache {
         }
 
         args
+    }
+
+    /// Clear all cached help entries (positive, negative, and arguments).
+    ///
+    /// Called when libpath changes invalidate the help corpus (package install,
+    /// uninstall, or upgrade).
+    pub fn drain(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.arguments.write() {
+            guard.clear();
+        }
     }
 
     #[cfg(test)]
@@ -223,40 +243,15 @@ impl Default for HelpCache {
 /// blocking threads indefinitely.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Kill a process by PID. Used by the help subprocess watchdog on timeout.
-///
-/// On Unix, sends SIGKILL directly. On Windows, delegates to `taskkill /F`.
-/// If the process has already exited, the call is harmless on all platforms.
-#[cfg(unix)]
-fn kill_process_by_pid(pid: u32) {
-    match i32::try_from(pid) {
-        Ok(pid_i32) => {
-            // SAFETY: Sending SIGKILL to a known child PID. If the process
-            // already exited, kill() returns ESRCH harmlessly.
-            unsafe {
-                libc::kill(pid_i32, libc::SIGKILL);
-            }
-        }
-        Err(_) => {
-            // PID > i32::MAX would wrap to negative, which kill() interprets
-            // as a process group signal — bail rather than risk that.
-            log::trace!("get_help: pid {} exceeds i32::MAX, cannot kill", pid);
-        }
+/// Returns the effective timeout, overridable by `RAVEN_HELP_TIMEOUT_MS` for tests.
+fn timeout_from_env() -> Duration {
+    match std::env::var("RAVEN_HELP_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(ms) => Duration::from_millis(ms),
+        None => HELP_TIMEOUT,
     }
-}
-
-#[cfg(windows)]
-fn kill_process_by_pid(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn kill_process_by_pid(_pid: u32) {
-    log::trace!("get_help: timeout kill not supported on this platform");
 }
 
 /// Fetches help text for an R topic by invoking R and returns the rendered help if available.
@@ -271,13 +266,12 @@ fn kill_process_by_pid(_pid: u32) {
 ///
 /// ```no_run
 /// // Attempt to get help for `mean` from the base package
-/// if let Some(text) = raven::help::get_help("mean", Some("base")) {
+/// # let r_path = std::path::Path::new("R");
+/// if let Some(text) = raven::help::get_help("mean", Some("base"), r_path) {
 ///     assert!(text.contains("Usage:"));
 /// }
 /// ```
-pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
-    log::trace!("get_help: topic={}, package={:?}", topic, package);
-
+pub fn get_help(topic: &str, package: Option<&str>, r_path: &std::path::Path) -> Option<String> {
     let r_code = r#"
 args <- commandArgs(trailingOnly = TRUE)
 topic <- args[1]
@@ -290,8 +284,41 @@ txt <- capture.output(
 )
 cat(paste(txt, collapse = "\n"))
 "#;
+    get_help_inner(topic, package, r_path, r_code, None)
+}
 
-    let mut cmd = Command::new("R");
+/// Inner implementation that accepts the R script as a parameter.
+///
+/// This allows tests to inject custom R code (e.g., `Sys.sleep(60)` for timeout
+/// testing) without duplicating the full implementation. The public `get_help`
+/// always passes the built-in R snippet.
+///
+/// The optional `pid_capture` parameter, when provided, receives the spawned child's
+/// PID immediately after a successful `spawn()`. This is used only in tests to verify
+/// that the watchdog reaps the child process after a timeout.
+fn get_help_inner(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &std::path::Path,
+    r_code: &str,
+    pid_capture: Option<&AtomicU32>,
+) -> Option<String> {
+    log::trace!("get_help: topic={}, package={:?}", topic, package);
+
+    if !super::validate::is_valid_help_topic(topic) {
+        log::trace!("get_help: topic {:?} failed validation", topic);
+        return None;
+    }
+    if let Some(p) = package {
+        if !crate::r_subprocess::is_valid_package_name(p) {
+            log::trace!("get_help: package {:?} failed validation", p);
+            return None;
+        }
+    }
+
+    let timeout = timeout_from_env();
+
+    let mut cmd = Command::new(r_path);
     cmd.args([
         "--slave",
         "--no-save",
@@ -321,6 +348,10 @@ cat(paste(txt, collapse = "\n"))
     };
 
     let child_pid = child.id();
+    // Store the pid before heavy work so tests can observe it even if we return early.
+    if let Some(cap) = pid_capture {
+        cap.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+    }
 
     // Take pipe handles before spawning threads. Reading pipes in separate
     // threads prevents deadlock when pipe buffers fill before the child exits.
@@ -346,26 +377,43 @@ cat(paste(txt, collapse = "\n"))
         buf
     });
 
-    // Watchdog thread: kills the subprocess after HELP_TIMEOUT if it hasn't
-    // exited. An atomic flag prevents killing a recycled PID after the child
-    // has already exited naturally.
-    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let exited_clone = exited.clone();
+    // Watchdog: a sleeper thread sends a one-shot timeout signal. The main
+    // thread polls `try_wait()` and the signal channel together. We kill via
+    // `child.kill()` only after a `try_wait()` that returned `Ok(None)` —
+    // meaning we have NOT reaped the PID yet — so the kill cannot land on a
+    // recycled PID. This is the structural cure for the old "atomic flag plus
+    // bare-PID SIGKILL from a detached thread" race, where a watchdog firing
+    // between `wait()` reaping the child and the atomic store could SIGKILL
+    // an unrelated process that had grabbed the freed PID.
+    let (timeout_tx, timeout_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        std::thread::sleep(HELP_TIMEOUT);
-        if !exited_clone.load(std::sync::atomic::Ordering::SeqCst) {
-            log::trace!(
-                "get_help: timeout after {:?}, killing pid {}",
-                HELP_TIMEOUT,
-                child_pid
-            );
-            kill_process_by_pid(child_pid);
-        }
+        std::thread::sleep(timeout);
+        let _ = timeout_tx.send(());
     });
 
-    // Block efficiently via waitpid() instead of polling with try_wait()+sleep().
-    let wait_result = child.wait();
-    exited.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Poll just slow enough that idle CPU cost is negligible (~20 wakeups/s)
+    // but small enough that a fast subprocess returns near-instantly.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let wait_result: std::io::Result<std::process::ExitStatus> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if timeout_rx.try_recv().is_ok() {
+                    log::trace!(
+                        "get_help: timeout after {:?}, killing pid {}",
+                        timeout,
+                        child_pid
+                    );
+                    // Safe: try_wait returned None, so the child has not been
+                    // reaped and `child_pid` still names this child.
+                    let _ = child.kill();
+                    break child.wait();
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => break Err(e),
+        }
+    };
 
     let stdout_bytes = stdout_thread.join().unwrap_or_default();
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
@@ -519,14 +567,19 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
 /// ```no_run
 /// use raven::help::get_function_signature;
 ///
-/// let sig = get_function_signature("mean", "base");
+/// # let r_path = std::path::Path::new("R");
+/// let sig = get_function_signature("mean", "base", r_path);
 /// if let Some(s) = sig {
 ///     println!("{}", s);
 /// }
 /// ```
 #[allow(dead_code)] // Used in tests, may be useful in the future
-pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
-    let help_text = get_help(topic, Some(package))?;
+pub fn get_function_signature(
+    topic: &str,
+    package: &str,
+    r_path: &std::path::Path,
+) -> Option<String> {
+    let help_text = get_help(topic, Some(package), r_path)?;
     extract_signature_from_help(&help_text)
 }
 
@@ -835,6 +888,71 @@ fn finalize_description(parts: &[String]) -> String {
     r_quotes_to_markdown(&normalized)
 }
 
+/// Test-only entry point that injects custom R code instead of the built-in snippet.
+///
+/// Used by timeout tests to inject hanging R code (e.g., `Sys.sleep(60)`) without
+/// touching the public API or duplicating the full implementation.
+#[cfg(test)]
+pub(crate) fn get_help_with_code(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &std::path::Path,
+    r_code: &str,
+) -> Option<String> {
+    get_help_inner(topic, package, r_path, r_code, None)
+}
+
+/// Test-only entry point that injects custom R code and captures the spawned PID.
+///
+/// Writes the child's PID into `pid_capture` immediately after a successful spawn,
+/// allowing the caller to probe whether the watchdog has reaped the process.
+#[cfg(test)]
+pub(crate) fn get_help_with_code_capturing_pid(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &std::path::Path,
+    r_code: &str,
+    pid_capture: &AtomicU32,
+) -> Option<String> {
+    get_help_inner(topic, package, r_path, r_code, Some(pid_capture))
+}
+
+/// RAII guard that sets an environment variable on creation and restores the
+/// prior value (or removes the var if it was unset) on drop.
+///
+/// Keeps env-var mutations local to a single test even in the presence of
+/// panics. Storing the previous value matters when a parent process or an
+/// outer test set the variable: unconditionally removing on drop would
+/// clobber that state.
+#[cfg(test)]
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: single-threaded test context; we restore in Drop.
+        unsafe { std::env::set_var(key, val) };
+        EnvGuard { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: mirrors the set_var above.
+        unsafe {
+            match self.previous.take() {
+                Some(prev) => std::env::set_var(self.key, prev),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,11 +1208,13 @@ Arguments:
         // get_or_fetch should return cached content without calling get_help().
         // We verify this by pre-populating the cache with synthetic help text
         // that R would never produce, then checking get_or_fetch returns it.
+        // r_path is required by the signature but never invoked on a cache hit.
         let cache = HelpCache::with_max_entries(10);
         let synthetic = "SYNTHETIC_HELP_TEXT_NOT_FROM_R";
         cache.insert("fake_topic", Some("fake_pkg"), Some(synthetic.to_string()));
 
-        let result = cache.get_or_fetch("fake_topic", Some("fake_pkg"));
+        let dummy_r = std::path::Path::new("R");
+        let result = cache.get_or_fetch("fake_topic", Some("fake_pkg"), dummy_r);
         assert_eq!(
             result,
             Some(synthetic.to_string()),
@@ -1108,7 +1228,14 @@ Arguments:
         // cache the negative result so subsequent calls don't spawn R again.
         let cache = HelpCache::with_max_entries(10);
 
-        let _ = cache.get_or_fetch("no_such_func", Some("nonexistent_pkg_xyzzy"));
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
+        let _ = cache.get_or_fetch("no_such_func", Some("nonexistent_pkg_xyzzy"), &r);
 
         let cached = cache.get("no_such_func", Some("nonexistent_pkg_xyzzy"));
         assert_eq!(
@@ -1123,6 +1250,13 @@ Arguments:
         // End-to-end test: a negative entry expires after TTL, and a subsequent
         // get_or_fetch() re-populates the cache (rather than returning stale data
         // or permanently treating the topic as missing).
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
         let cache = HelpCache::with_max_entries_and_ttl(10, Duration::from_millis(50));
 
         // Simulate a failed lookup by inserting a negative entry directly
@@ -1146,7 +1280,7 @@ Arguments:
 
         // get_or_fetch() should re-fetch from R (which will fail again for this
         // fake package) and re-populate the cache with a fresh negative entry
-        let result = cache.get_or_fetch("some_func", Some("nonexistent_pkg_xyzzy"));
+        let result = cache.get_or_fetch("some_func", Some("nonexistent_pkg_xyzzy"), &r);
         assert!(
             result.is_none(),
             "R should still not find this fake package"
@@ -1482,15 +1616,17 @@ Value:
 "#;
         cache.insert("test_fn", Some("test_pkg"), Some(help_text.to_string()));
 
-        // First call should parse and cache
-        let args1 = cache.get_arguments("test_fn", Some("test_pkg"));
+        // First call should parse and cache; r_path is required by signature
+        // but never invoked since the help text is already in the cache.
+        let dummy_r = std::path::Path::new("R");
+        let args1 = cache.get_arguments("test_fn", Some("test_pkg"), dummy_r);
         assert!(args1.is_some());
         let args1 = args1.unwrap();
         assert_eq!(args1.len(), 2);
         assert_eq!(args1.get("x").unwrap(), "first arg.");
 
         // Second call should return cached result (same content)
-        let args2 = cache.get_arguments("test_fn", Some("test_pkg"));
+        let args2 = cache.get_arguments("test_fn", Some("test_pkg"), dummy_r);
         assert!(args2.is_some());
         assert_eq!(args2.unwrap(), args1);
     }
@@ -1503,8 +1639,10 @@ Value:
         let help_text = "Test\n\nDescription:\n\n     A test.\n\nValue:\n\n     Result.\n";
         cache.insert("no_args_fn", Some("pkg"), Some(help_text.to_string()));
 
-        // Should return None and cache the negative result
-        let args = cache.get_arguments("no_args_fn", Some("pkg"));
+        // Should return None and cache the negative result; r_path never invoked
+        // since the help text (which has no Arguments section) is pre-populated.
+        let dummy_r = std::path::Path::new("R");
+        let args = cache.get_arguments("no_args_fn", Some("pkg"), dummy_r);
         assert!(args.is_none());
 
         // Verify the negative result is cached (check arguments cache directly)
@@ -1527,8 +1665,9 @@ Value:
         let help_text = "Test\n\nDescription:\n\n     A test.\n\nArguments:\n\n       x: an arg.\n\nValue:\n\n     Result.\n";
         cache1.insert("fn1", Some("pkg"), Some(help_text.to_string()));
 
-        // Fetch arguments through clone
-        let args = cache2.get_arguments("fn1", Some("pkg"));
+        // Fetch arguments through clone; r_path never invoked since cache is pre-populated.
+        let dummy_r = std::path::Path::new("R");
+        let args = cache2.get_arguments("fn1", Some("pkg"), dummy_r);
         assert!(args.is_some());
 
         // Verify it's visible through original
@@ -1537,6 +1676,146 @@ Value:
         assert!(
             guard.peek(&key).is_some(),
             "Arguments cached via clone should be visible through original"
+        );
+    }
+
+    /// Verifies that `get_help` returns `None` when R hangs, and that it does
+    /// so well within 1 second.
+    ///
+    /// Uses a 200 ms timeout (via `RAVEN_HELP_TIMEOUT_MS`) and injects a
+    /// `Sys.sleep(60)` snippet via `get_help_with_code`.  The env var is
+    /// removed via RAII after the test.
+    ///
+    /// Marked `#[ignore]` because it mutates a process-wide env var; run explicitly
+    /// with `-- --include-ignored --test-threads=1` to avoid interference with
+    /// parallel tests.
+    #[test]
+    #[ignore]
+    fn get_help_timeout_returns_none() {
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
+        let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
+        let start = std::time::Instant::now();
+        let res = get_help_with_code("mean", Some("base"), &r, "Sys.sleep(60)");
+        let elapsed = start.elapsed();
+        assert!(res.is_none(), "expected None, got {res:?}");
+        assert!(
+            elapsed.as_millis() < 1000,
+            "timeout test took too long: {elapsed:?}"
+        );
+    }
+
+    /// Paranoia check: after a watchdog-triggered timeout, the R child process must
+    /// actually be gone (reaped by the OS).
+    ///
+    /// After `get_help` returns `None` we send signal 0 (`kill(pid, 0)`) to the
+    /// captured PID and assert that it returns -1 with errno ESRCH (no such process).
+    /// Signal 0 never delivers — it only probes process existence.
+    ///
+    /// Marked `#[ignore]` because it mutates a process-wide env var; run explicitly
+    /// with `-- --include-ignored --test-threads=1`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn get_help_timeout_reaps_process() {
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
+        let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
+
+        let pid_capture = AtomicU32::new(0);
+        let res = get_help_with_code_capturing_pid(
+            "mean",
+            Some("base"),
+            &r,
+            "Sys.sleep(60)",
+            &pid_capture,
+        );
+
+        assert!(res.is_none(), "expected None (timeout), got {res:?}");
+
+        let pid = pid_capture.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(pid != 0, "expected a captured pid after spawn");
+
+        // Brief delay to allow the watchdog kill to take effect before probing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // SAFETY: signal 0 never delivers; it only checks whether the pid exists.
+        let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(
+            kill_result, -1,
+            "expected kill(pid, 0) == -1 (process should be reaped); got {}",
+            kill_result
+        );
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            errno,
+            Some(libc::ESRCH),
+            "expected ESRCH; got errno {:?}",
+            errno
+        );
+    }
+
+    #[test]
+    fn test_help_cache_drain_clears_all_sub_caches() {
+        let cache = HelpCache::with_max_entries(10);
+
+        // Populate the main help-text cache (positive entry)
+        cache.insert("mean", Some("base"), Some("help text".to_string()));
+        assert_eq!(cache.len(), 1);
+
+        // Populate the arguments cache by inserting help text that has an
+        // Arguments section and calling get_arguments (which will cache the
+        // parsed result); r_path is unused because the help text is already
+        // in the main cache.
+        let help_text =
+            "mean\n\nDescription:\n\n     Mean.\n\nArguments:\n\n       x: numeric vector.\n";
+        cache.insert("mean_with_args", Some("base"), Some(help_text.to_string()));
+        let dummy_r = std::path::Path::new("R");
+        let _ = cache.get_arguments("mean_with_args", Some("base"), dummy_r);
+        {
+            let guard = cache.arguments.read().unwrap();
+            assert_eq!(
+                guard.len(),
+                1,
+                "arguments cache should have one entry before drain"
+            );
+        }
+
+        // Also insert a negative cache entry
+        cache.insert("nonexistent", Some("pkg"), None);
+
+        // Drain everything
+        cache.drain();
+
+        // All sub-caches must be empty
+        assert_eq!(cache.len(), 0, "inner cache should be empty after drain");
+        {
+            let guard = cache.arguments.read().unwrap();
+            assert_eq!(
+                guard.len(),
+                0,
+                "arguments cache should be empty after drain"
+            );
+        }
+
+        // Cache misses after drain (not Some(None) for the negative entry)
+        assert!(
+            cache.get("mean", Some("base")).is_none(),
+            "positive entry should be a cache miss after drain"
+        );
+        assert!(
+            cache.get("nonexistent", Some("pkg")).is_none(),
+            "negative entry should be a cache miss after drain"
         );
     }
 }

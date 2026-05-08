@@ -13,6 +13,7 @@ name = "raven"
 path = "src/main.rs"
 
 [dependencies]
+ammonia = "4"
 anyhow = "1.0.80"
 async-trait = "0.1"
 log = "0.4.17"
@@ -34,7 +35,8 @@ rayon = "1.10"
 ropey = "1.6"
 lru = "0.16"
 notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
-tempfile = { version = "3", optional = true }
+percent-encoding = "2"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -42,12 +44,11 @@ xdg = "2.5.2"
 
 [features]
 # Expose test_utils for integration tests and benchmarks (kept out of production builds)
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"
-tempfile = "3"
 tokio = { version = "1.26.0", features = ["test-util"] }
 
 [[bench]]

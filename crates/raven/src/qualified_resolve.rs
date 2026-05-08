@@ -866,9 +866,7 @@ fn top_level_scope_change_positions_for(
                 function_scope: None,
                 symbols,
                 ..
-            } if symbols.iter().any(|s| s == lhs_name) => {
-                Some((*line, column.saturating_add(1)))
-            }
+            } if symbols.iter().any(|s| s == lhs_name) => Some((*line, column.saturating_add(1))),
             ScopeEvent::PackageLoad {
                 line,
                 column,
@@ -2542,7 +2540,8 @@ df$gamma <- 3
     /// reference a different `df` and must not be offered as completions
     /// for the cursor's `df`.
     #[test]
-    fn dollar_member_completion_excludes_post_nested_source_rebinding_in_non_redefining_contributor() {
+    fn dollar_member_completion_excludes_post_nested_source_rebinding_in_non_redefining_contributor(
+    ) {
         let mut state = fresh_state();
         let main_code = "\
 df <- list(alpha = 1)

@@ -1482,6 +1482,10 @@ impl LanguageServer for Backend {
                 // reported cleared count.
                 let pkg_lib = self.state.read().await.package_library.clone();
                 pkg_lib.clear_cache().await;
+                // Help and HTML help caches reference package-export content
+                // that just got invalidated; flush them too so subsequent
+                // hover/help-panel requests re-fetch from R.
+                self.state.read().await.clear_help_caches();
                 let after_count = pkg_lib.cached_count().await;
                 let cleared = before_count.saturating_sub(after_count);
                 prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
@@ -1505,6 +1509,103 @@ impl LanguageServer for Backend {
                     });
                 }
                 Ok(Some(serde_json::json!({ "cleared": cleared })))
+            }
+            "raven.getHelpHtml" => {
+                let topic = params
+                    .arguments
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                // Distinguish missing (absent or JSON null) from wrong-type
+                // (e.g. a number) so a malformed second argument doesn't
+                // silently fall through to an unqualified lookup.
+                let package = match params.arguments.get(1) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                    Some(_) => {
+                        return Ok(Some(serde_json::json!({
+                            "ok": false,
+                            "reason": "invalid-topic",
+                            "message": "package argument must be a string or null",
+                        })));
+                    }
+                };
+
+                // Validation runs first — defense-in-depth before any cache or R access.
+                if !crate::help::is_valid_help_topic(topic) {
+                    return Ok(Some(serde_json::json!({
+                        "ok": false,
+                        "reason": "invalid-topic",
+                        "message": "topic failed validation",
+                    })));
+                }
+                if let Some(p) = package {
+                    if !crate::r_subprocess::is_valid_package_name(p) {
+                        return Ok(Some(serde_json::json!({
+                            "ok": false,
+                            "reason": "invalid-topic",
+                            "message": "package failed validation",
+                        })));
+                    }
+                }
+
+                let (cache, r_path) = {
+                    let state = self.state.read().await;
+                    // Mirror the hover handler: fall back to "R" (PATH lookup) when
+                    // raven.packages.rPath is unset. The setting is opt-in for users
+                    // with non-default R installs; the default expectation is that
+                    // `R` resolves through PATH like every other R-spawning code path.
+                    let r_path = state
+                        .cross_file_config
+                        .packages_r_path
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from("R"));
+                    let cache = state.html_help_cache.clone();
+                    (cache, r_path)
+                };
+
+                // Probe the cache before spawning R: a cached positive entry
+                // is returned without re-running the subprocess.
+                if let Some(cached) = cache.get(topic, package) {
+                    return Ok(Some(help_html_to_json(cached)));
+                }
+
+                // Belt-and-suspenders timeout: bound the R subprocess await
+                // with `HELP_LOOKUP_TIMEOUT` so an unforeseen lock or kill
+                // failure inside `get_help_html`'s own watchdog can't freeze
+                // the execute_command dispatcher.
+                //
+                // The timeout MUST live inside the fetch closure rather than
+                // around the outer `cache.get_or_fetch(...).await`. Wrapping
+                // the outer call would, on timeout, drop the `get_or_fetch`
+                // future mid-flight — and if this caller happens to be the
+                // single-flight Owner, its post-fetch cleanup (remove the
+                // `in_flight` entry, broadcast to subscribers) never runs.
+                // The map's surviving `Sender` clone keeps the broadcast
+                // channel open with no remaining sender to ever publish,
+                // poisoning the key until `drain()` clears it. Putting the
+                // timeout inside guarantees the Owner always reaches its
+                // cleanup branch and broadcasts `Err(Timeout)` to any
+                // waiting subscribers. `Timeout` is non-cacheable, so the
+                // next caller starts a fresh fetch.
+                let result = cache
+                    .get_or_fetch(topic, package, move |t, p| async move {
+                        let task = tokio::task::spawn_blocking(move || {
+                            crate::help::get_help_html(&t, p.as_deref(), &r_path)
+                        });
+                        match tokio::time::timeout(crate::handlers::HELP_LOOKUP_TIMEOUT, task).await
+                        {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(_)) => Err(crate::help::HelpHtmlError::RenderFailed {
+                                message: "spawn_blocking joined with error".into(),
+                            }),
+                            Err(_) => Err(crate::help::HelpHtmlError::Timeout),
+                        }
+                    })
+                    .await;
+
+                Ok(Some(help_html_to_json(result)))
             }
             other => {
                 log::warn!("execute_command: unknown command '{other}'");
@@ -2981,6 +3082,10 @@ impl LanguageServer for Backend {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
             }
+
+            // Help/HTML help caches index by (topic, package); the package set
+            // just changed, so flush them to match watcher and refresh paths.
+            self.state.read().await.clear_help_caches();
         }
 
         // Restart the libpath watcher if any setting that affects it changed.
@@ -3507,10 +3612,16 @@ impl LanguageServer for Backend {
             .iter()
             .map(|(uri, doc)| (uri.clone(), doc.text()))
             .collect();
+        // Resolve R executable path; falls back to "R" (PATH lookup) when not configured.
+        let r_path: std::path::PathBuf = state
+            .cross_file_config
+            .packages_r_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("R"));
         drop(state);
         // Run in spawn_blocking since get_help() calls R subprocess (blocking I/O)
         match tokio::task::spawn_blocking(move || {
-            handlers::completion_item_resolve(item, &help_cache, &document_contents)
+            handlers::completion_item_resolve(item, &help_cache, &document_contents, &r_path)
         })
         .await
         {
@@ -3762,6 +3873,31 @@ impl LanguageServer for Backend {
         );
 
         Ok(Some(vec![edit]))
+    }
+}
+
+/// Convert a `get_help_html` result into the LSP JSON response for `raven.getHelpHtml`.
+///
+/// Used by the `execute_command` dispatcher both for cache hits and for the
+/// `get_or_fetch` path, keeping the JSON shape in exactly one place.
+fn help_html_to_json(
+    result: std::result::Result<crate::help::HelpHtml, crate::help::HelpHtmlError>,
+) -> serde_json::Value {
+    match result {
+        Ok(h) => serde_json::json!({
+            "ok": true,
+            "topic": h.topic,
+            "package": h.package,
+            "title": h.title,
+            "html": h.html,
+            "helpDir": h.help_dir,
+            "libPaths": h.lib_paths,
+        }),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "reason": e.reason(),
+            "message": format!("{e}"),
+        }),
     }
 }
 
@@ -4736,6 +4872,11 @@ async fn run_libpath_consumer(
                     touched.len()
                 );
 
+                // Bust help caches before invalidating the package library so
+                // any concurrent hover/completion requests see a clean slate and
+                // re-fetch from R rather than returning stale HTML or text help.
+                state_arc.read().await.clear_help_caches();
+
                 // Invalidate the package cache and learn which combined_exports
                 // aggregates were dropped as a side effect. A document loading
                 // a meta-package like `tidyverse` needs revalidation when
@@ -4873,6 +5014,10 @@ async fn run_libpath_consumer(
                      force-republishing diagnostics",
                     allow_recovery
                 );
+
+                // The watcher is gone so we can no longer track installs or
+                // upgrades; any cached help content may now be stale.
+                state_arc.read().await.clear_help_caches();
 
                 let open_uris = prepare_dropped_recovery(&state_arc).await;
                 for uri in open_uris {
@@ -7034,5 +7179,249 @@ mod refresh_packages_tests {
              undefined-variable diagnostics in child.R for unrelated \
              uninstalled packages"
         );
+    }
+
+    // ============================================================================
+    // Unit tests for raven.getHelpHtml execute_command handler.
+    // ============================================================================
+    mod get_help_html_command {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use tower_lsp::lsp_types::{ExecuteCommandParams, InitializeParams, InitializeResult};
+        use tower_lsp::{LanguageServer, LspService};
+
+        use super::super::{Backend, RequestCancellationRegistry};
+
+        /// Minimal stub language server required by `LspService::new`.
+        struct StubServer;
+
+        #[tower_lsp::async_trait]
+        impl LanguageServer for StubServer {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Build a `Backend` whose `packages_r_path` is left as `None` (the default).
+        /// Returns an `Arc<Backend>` ready for direct `LanguageServer` method calls.
+        fn make_backend_no_r() -> Arc<Backend> {
+            let (client_tx, client_rx) = mpsc::channel();
+            let (_service, _socket) = LspService::new(|client| {
+                client_tx.send(client).expect("capture client");
+                StubServer
+            });
+            let client = client_rx.recv().expect("client captured");
+            Arc::new(Backend::new_with_request_cancellation(
+                client,
+                Arc::new(RequestCancellationRegistry::new()),
+            ))
+        }
+
+        /// Build a `Backend` and set `packages_r_path` to the given path.
+        fn make_backend_with_r(r_path: std::path::PathBuf) -> Arc<Backend> {
+            let backend = make_backend_no_r();
+            // Set r_path synchronously — we need a tokio runtime for the write lock.
+            // We use `tokio::runtime::Handle::current()` which is available inside
+            // the `#[tokio::test]` harness.
+            let state = Arc::clone(&backend.state);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut guard = state.write().await;
+                    guard.cross_file_config.packages_r_path = Some(r_path);
+                })
+            });
+            backend
+        }
+
+        /// Helper: invoke `raven.getHelpHtml` with the given args and return the response value.
+        async fn run_command(backend: &Backend, args: Vec<serde_json::Value>) -> serde_json::Value {
+            let params = ExecuteCommandParams {
+                command: "raven.getHelpHtml".into(),
+                arguments: args,
+                work_done_progress_params: Default::default(),
+            };
+            backend
+                .execute_command(params)
+                .await
+                .expect("execute_command must not error")
+                .expect("execute_command must return Some")
+        }
+
+        fn binary_available_on_path(binary: &str) -> bool {
+            std::process::Command::new(binary)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn unset_r_path_falls_back_to_path_lookup() {
+            // Regression for the smoke-test bug where leaving raven.packages.rPath
+            // unset (the documented default — auto-detect) made the help panel
+            // show "r-unavailable: R not configured (set raven.packages.rPath)"
+            // even on machines with R on PATH. The handler must mirror the hover
+            // path's fallback to PathBuf::from("R") so PATH-resolved R is used.
+            //
+            // Skip on hosts without R on PATH: the production fallback correctly
+            // returns r-unavailable when `Command::new("R")` cannot spawn, so the
+            // assertion below would fail spuriously on R-less CI runners. Probe
+            // the same plain PATH lookup the handler uses, not broader R
+            // autodiscovery locations.
+            if !binary_available_on_path("R") {
+                eprintln!("skip: no R on PATH");
+                return;
+            }
+            let backend = make_backend_no_r();
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("mean"), serde_json::json!("base")],
+            )
+            .await;
+            if resp["ok"] == false {
+                assert_ne!(
+                    resp["reason"], "r-unavailable",
+                    "handler must not bail with r-unavailable when PATH could provide R; got: {resp:?}"
+                );
+                let msg = resp["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("set raven.packages.rPath"),
+                    "stale 'set raven.packages.rPath' wording leaked through: {resp:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn r_path_skip_probe_uses_plain_path_lookup() {
+            let missing = "__raven_missing_r_binary_for_path_probe__";
+            assert!(!binary_available_on_path(missing));
+        }
+
+        #[tokio::test]
+        async fn invalid_topic_returns_invalid_topic_reason() {
+            // Even with no R configured, validation runs first — so we get
+            // "invalid-topic" rather than "r-unavailable".
+            let backend = make_backend_no_r();
+            let resp = run_command(
+                &backend,
+                vec![
+                    serde_json::json!("with\nnewline"),
+                    serde_json::json!("base"),
+                ],
+            )
+            .await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "invalid-topic");
+        }
+
+        #[tokio::test]
+        async fn invalid_package_returns_invalid_topic_reason() {
+            let backend = make_backend_no_r();
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("mean"), serde_json::json!("bad package!")],
+            )
+            .await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "invalid-topic");
+        }
+
+        #[tokio::test]
+        async fn missing_topic_arg_is_invalid() {
+            // Empty args → topic defaults to "" which fails validation.
+            let backend = make_backend_no_r();
+            let resp = run_command(&backend, vec![]).await;
+            assert_eq!(resp["ok"], false);
+            assert_eq!(resp["reason"], "invalid-topic");
+        }
+
+        /// Cache hit is served without spawning R.
+        ///
+        /// Positive entries cached from an earlier session must be served
+        /// straight from the LRU before the handler resolves an R path or
+        /// spawns a subprocess. The cache probe runs after r_path resolution
+        /// in the handler but before any fetch, so a hit short-circuits the
+        /// PATH-fallback subprocess work.
+        #[tokio::test]
+        async fn cached_entry_served_without_r() {
+            use crate::help::HelpHtml;
+            use std::path::PathBuf;
+
+            let backend = make_backend_no_r();
+
+            // Pre-populate the cache with a synthetic positive entry.
+            let synthetic = HelpHtml {
+                topic: "synthetic".into(),
+                package: "fake".into(),
+                title: "Synthetic Help".into(),
+                html: "<p>cached</p>".into(),
+                help_dir: PathBuf::from("/fake/lib/fake/help"),
+                lib_paths: vec![PathBuf::from("/fake/lib")],
+            };
+            {
+                let state = backend.state.read().await;
+                state
+                    .html_help_cache
+                    .insert("synthetic", Some("fake"), Ok(synthetic));
+            }
+
+            // With no r_path configured, a miss would return r-unavailable.
+            // The cache probe must intercept first.
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("synthetic"), serde_json::json!("fake")],
+            )
+            .await;
+            assert_eq!(resp["ok"], true, "expected cache hit, got: {resp:?}");
+            assert_eq!(resp["topic"], "synthetic");
+            assert_eq!(resp["package"], "fake");
+            assert_eq!(resp["html"], "<p>cached</p>");
+        }
+
+        /// R-required happy-path test: renders `mean` from `base`.
+        ///
+        /// Skips automatically when no R binary is available on PATH,
+        /// following the same `RSubprocess::new(None)` pattern used in
+        /// `crates/raven/src/help/html.rs`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn happy_path_renders_base_mean_when_r_is_available() {
+            let Some(r) = crate::r_subprocess::RSubprocess::new(None).map(|s| s.r_path().clone())
+            else {
+                eprintln!("skip: no R");
+                return;
+            };
+            let backend = make_backend_with_r(r);
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("mean"), serde_json::json!("base")],
+            )
+            .await;
+            assert_eq!(resp["ok"], true, "unexpected error: {resp:?}");
+            assert_eq!(resp["package"], "base");
+            assert!(
+                resp["html"].as_str().is_some_and(|h| !h.is_empty()),
+                "html must be non-empty"
+            );
+            assert!(
+                resp["helpDir"].as_str().is_some_and(|s| !s.is_empty()),
+                "helpDir must be a non-empty string, got {:?}",
+                resp["helpDir"]
+            );
+            let lib_paths = resp["libPaths"].as_array().expect("libPaths must be array");
+            assert!(!lib_paths.is_empty(), "libPaths must be non-empty");
+            for p in lib_paths {
+                assert!(
+                    p.is_string(),
+                    "libPaths element must be a string, got {p:?}"
+                );
+            }
+        }
     }
 }

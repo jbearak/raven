@@ -6,6 +6,7 @@ import {
     LanguageClientOptions,
     ServerOptions,
 } from 'vscode-languageclient/node';
+import { activateHelpViewer, wrapHoverWithHelpTrust } from './help';
 import { registerAutoCloseFix } from './autoCloseFix';
 import {
     getInitializationOptions as buildInitializationOptions,
@@ -84,7 +85,22 @@ function sendActivityNotification() {
     });
 }
 
-export function activate(context: vscode.ExtensionContext) {
+/**
+ * Public extension API surface, returned from `activate()` and reachable
+ * from other extensions and the test harness via
+ * `vscode.extensions.getExtension('jbearak.raven').exports`.
+ *
+ * The only consumer today is the Mocha test suite, which uses the live
+ * LanguageClient to round-trip `workspace/executeCommand` calls (e.g.
+ * `raven.getHelpHtml`) that are intentionally NOT registered as VS Code
+ * commands per the executeCommandProvider rule in CLAUDE.md.
+ */
+export interface RavenExtensionApi {
+    /** Returns the live LSP client once activation has installed it. */
+    getLanguageClient(): LanguageClient | undefined;
+}
+
+export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     const serverPath = getServerPath(context);
 
     function buildRustLogEnv(): Record<string, string> | undefined {
@@ -117,6 +133,13 @@ export function activate(context: vscode.ExtensionContext) {
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions,
+        middleware: {
+            provideHover: (document, position, token, next) =>
+                wrapHoverWithHelpTrust(async (doc, pos, tok) => {
+                    const result = await next(doc, pos, tok);
+                    return result as vscode.Hover | null | undefined;
+                })(document, position, token),
+        },
     };
 
     client = new LanguageClient(
@@ -127,6 +150,9 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     client.start();
+
+    // Activate help viewer (registers raven.openHelpPanel, raven.help.back, raven.help.forward).
+    activateHelpViewer(context, client);
 
     // Plot services (session server + viewer panel) for managed R terminals.
     // Constructed before raven.restart registration so the closure has a live
@@ -234,6 +260,10 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Prompt for word separators configuration
     promptWordSeparators();
+
+    return {
+        getLanguageClient: () => client,
+    };
 }
 
 async function promptWordSeparators() {

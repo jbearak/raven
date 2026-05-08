@@ -4,7 +4,35 @@ import {
     resolve_program,
     _clear_validation_state_for_test,
     _set_validator_for_test,
+    _set_extension_context_for_test,
 } from '../../send-to-r/r-terminal-manager';
+
+/**
+ * Build a minimal ExtensionContext-shaped stub backed by an in-memory map.
+ *
+ * The bundled extension stores its own `extension_context` from its own
+ * inlined copy of `r-terminal-manager`; the test runner imports a SEPARATE
+ * compiled copy from `out/`, whose module-level `extension_context` is
+ * never set by activation. Rather than leaking the real ExtensionContext
+ * through the public extension API, give the test copy a hermetic in-memory
+ * context per suite — every persistence assertion is then isolated from
+ * the bundle's actual globalState.
+ */
+function make_fake_context(): vscode.ExtensionContext {
+    const store = new Map<string, unknown>();
+    const globalState = {
+        get: <T>(key: string, defaultValue?: T) =>
+            (store.has(key) ? (store.get(key) as T) : defaultValue) as T | undefined,
+        update: async (key: string, value: unknown) => {
+            if (value === undefined) store.delete(key);
+            else store.set(key, value);
+        },
+        keys: () => Array.from(store.keys()),
+        setKeysForSync: () => {},
+    };
+    // Cast through unknown — only globalState is exercised by the manager.
+    return { globalState } as unknown as vscode.ExtensionContext;
+}
 
 suite('rTerminal.program shell-validated fallback', () => {
     const original_show_warning = vscode.window.showWarningMessage;
@@ -25,6 +53,8 @@ suite('rTerminal.program shell-validated fallback', () => {
             warnings.push({ message: msg, items });
             return Promise.resolve(warning_response);
         };
+        // Fresh hermetic context per test so persistence asserts cleanly.
+        _set_extension_context_for_test(make_fake_context());
         await _clear_validation_state_for_test();
     });
 
@@ -33,6 +63,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         (vscode.window as any).showWarningMessage = original_show_warning;
         _set_validator_for_test(null);
         await _clear_validation_state_for_test();
+        _set_extension_context_for_test(null);
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', undefined, vscode.ConfigurationTarget.Global);

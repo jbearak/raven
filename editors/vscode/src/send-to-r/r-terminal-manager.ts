@@ -58,6 +58,19 @@ function is_program_validated_on_this_machine(program: string): boolean {
     return extension_context?.globalState.get<boolean>(VALIDATED_KEY_PREFIX + program) === true;
 }
 
+/**
+ * Test-only setter. The bundled extension sets `extension_context` from its
+ * own copy of this module (esbuild inlines the source). The test runner
+ * imports a SEPARATE compiled copy from `out/`, whose `extension_context`
+ * is never written by the bundle. Tests that exercise the persistence path
+ * must wire `extension_context` themselves via this setter.
+ */
+export function _set_extension_context_for_test(
+    ctx: vscode.ExtensionContext | null,
+): void {
+    extension_context = ctx;
+}
+
 async function persist_program_validated(program: string): Promise<void> {
     await extension_context?.globalState.update(VALIDATED_KEY_PREFIX + program, true);
 }

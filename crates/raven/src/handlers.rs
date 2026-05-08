@@ -9300,6 +9300,7 @@ pub fn completion_item_resolve(
     item: CompletionItem,
     help_cache: &crate::help::HelpCache,
     document_contents: &HashMap<Url, String>,
+    r_path: &std::path::Path,
 ) -> CompletionItem {
     let data = match &item.data {
         Some(data) => data.clone(),
@@ -9315,14 +9316,14 @@ pub fn completion_item_resolve(
     match item_type.as_deref() {
         // Parameter completion resolve (Requirement 7)
         Some("parameter") => {
-            resolve_parameter_documentation(item, &data, help_cache, document_contents)
+            resolve_parameter_documentation(item, &data, help_cache, document_contents, r_path)
         }
         // User-defined function name completion resolve (Requirement 8)
         Some("user_function") => {
             resolve_user_function_documentation(item, &data, document_contents)
         }
         // Package export completion resolve (existing behavior)
-        _ => resolve_package_export_documentation(item, &data, help_cache),
+        _ => resolve_package_export_documentation(item, &data, help_cache, r_path),
     }
 }
 
@@ -9336,6 +9337,7 @@ fn resolve_parameter_documentation(
     data: &serde_json::Value,
     help_cache: &crate::help::HelpCache,
     document_contents: &HashMap<Url, String>,
+    r_path: &std::path::Path,
 ) -> CompletionItem {
     let param_name = match data.get("param_name").and_then(|v| v.as_str()) {
         Some(name) => name.to_string(),
@@ -9349,7 +9351,7 @@ fn resolve_parameter_documentation(
 
     let documentation = if let Some(package) = data.get("package").and_then(|v| v.as_str()) {
         // Package function parameter: use structured Rd arguments from help subsystem
-        resolve_package_param_doc(help_cache, &function_name, package, &param_name)
+        resolve_package_param_doc(help_cache, &function_name, package, &param_name, r_path)
     } else if let (Some(uri_str), Some(func_line)) = (
         data.get("uri").and_then(|v| v.as_str()),
         data.get("func_line").and_then(|v| v.as_u64()),
@@ -9378,8 +9380,9 @@ fn resolve_package_param_doc(
     function_name: &str,
     package: &str,
     param_name: &str,
+    r_path: &std::path::Path,
 ) -> Option<String> {
-    let arguments = help_cache.get_arguments(function_name, Some(package))?;
+    let arguments = help_cache.get_arguments(function_name, Some(package), r_path)?;
     arguments.get(param_name).cloned()
 }
 
@@ -9445,6 +9448,7 @@ fn resolve_package_export_documentation(
     item: CompletionItem,
     data: &serde_json::Value,
     help_cache: &crate::help::HelpCache,
+    r_path: &std::path::Path,
 ) -> CompletionItem {
     let topic = match data.get("topic").and_then(|v| v.as_str()) {
         Some(t) => t.to_string(),
@@ -9457,7 +9461,7 @@ fn resolve_package_export_documentation(
     };
 
     // get_or_fetch handles cache check, R subprocess call, and caching the result
-    let help_text = help_cache.get_or_fetch(&topic, Some(&package));
+    let help_text = help_cache.get_or_fetch(&topic, Some(&package), r_path);
 
     let documentation =
         help_text.and_then(|text| crate::help::extract_description_from_help(&text));
@@ -9871,6 +9875,12 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 // Hover
 // ============================================================================
 
+/// Outer bound on a single help lookup awaited by an LSP handler. Sits above
+/// the help subprocess' own 10-second timeout (`HELP_TIMEOUT`) and watchdog —
+/// belt-and-suspenders against an unforeseen lock or kill failure that would
+/// otherwise hang the hover/signature path indefinitely.
+pub(crate) const HELP_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// Fetches R help text with cache support, running the R subprocess on a
 /// blocking thread. Used by hover to avoid duplicating the
 /// cache-check → spawn_blocking → cache-result pattern.
@@ -9878,6 +9888,7 @@ async fn get_help_cached(
     cache: &crate::help::HelpCache,
     topic: &str,
     package: Option<&str>,
+    r_path: std::path::PathBuf,
 ) -> Option<String> {
     // Fast path: return cached content without spawning a blocking task
     if let Some(cached) = cache.get(topic, package) {
@@ -9888,10 +9899,40 @@ async fn get_help_cached(
     let cache = cache.clone();
     let topic = topic.to_string();
     let package = package.map(|s| s.to_string());
-    tokio::task::spawn_blocking(move || cache.get_or_fetch(&topic, package.as_deref()))
+    let task = tokio::task::spawn_blocking(move || {
+        cache.get_or_fetch(&topic, package.as_deref(), &r_path)
+    });
+    // Treat both timeout and join-error as "no help available" — the same
+    // fallback the cache-miss path already returns.
+    tokio::time::timeout(HELP_LOOKUP_TIMEOUT, task)
         .await
         .ok()
+        .and_then(|join| join.ok())
         .flatten()
+}
+
+/// Build the bold clickable heading line that links to the help panel for
+/// `(topic, package)`. Returns markdown like:
+///
+/// `**[`base::mean`](command:raven.openHelpPanel?%5B%22mean%22%2C%22base%22%5D)**\n\n`
+///
+/// Uses `NON_ALPHANUMERIC` percent-encoding (stricter than `encodeURIComponent`),
+/// which is RFC 3986 compliant and survives any roundtrip through VS Code's URL
+/// parsing. The webview decodes via `JSON.parse(decodeURIComponent(...))`.
+///
+/// Backticks in `topic` or `package` are stripped from the rendered link
+/// label so they can't break the inline code span. Hover supplies these
+/// values from a tree-sitter node, and a backtick-quoted R identifier
+/// like `` `weird name` `` would otherwise close the code span early.
+/// The encoded JSON args (which drive the actual click) are unaffected.
+fn build_help_panel_link(topic: &str, package: &str) -> String {
+    let arg_json = serde_json::json!([topic, package]).to_string();
+    let arg_encoded =
+        percent_encoding::utf8_percent_encode(&arg_json, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+    let label_topic = topic.replace('`', "");
+    let label_package = package.replace('`', "");
+    format!("**[`{label_package}::{label_topic}`](command:raven.openHelpPanel?{arg_encoded})**\n\n")
 }
 
 /// Provide hover information for the symbol at a given text document position.
@@ -9928,6 +9969,14 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
+    // Resolve the R executable path once for all help lookups in this hover call.
+    // Falls back to "R" (PATH lookup) when no explicit path is configured.
+    let r_path: std::path::PathBuf = state
+        .cross_file_config
+        .packages_r_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("R"));
+
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     let row = position.line as usize;
@@ -9950,6 +9999,34 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         start: ts_point_to_lsp_position(&text, node.start_position()),
         end: ts_point_to_lsp_position(&text, node.end_position()),
     };
+
+    // Explicit `pkg::name` / `pkg:::name` qualifier wins over the cross-file
+    // scope's name resolution. Without this, hovering `filter` in
+    // `dplyr::filter()` would resolve to whichever `filter` the workspace
+    // scope happened to surface (often `base`/`stats::filter`), and the
+    // bold help-panel link would point at the wrong package.
+    if let Some(qualifier_pkg) = find_namespace_context(&node, &text) {
+        let pkg_owned = qualifier_pkg.to_string();
+        let mut value = build_help_panel_link(name, &pkg_owned);
+        if let Some(help_text) =
+            get_help_cached(&state.help_cache, name, Some(&pkg_owned), r_path.clone()).await
+        {
+            value.push_str(&format!("```\n{}\n```", help_text));
+        } else {
+            // No help text available — still show the qualified heading + a
+            // 'from {pkg}' attribution so the user sees we honored the
+            // qualifier even when R doesn't have a topic for it.
+            value.push_str(&format!("```r\n{}\n```\n", name));
+            value.push_str(&format!("\nfrom {{{}}}", pkg_owned));
+        }
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(node_range),
+        });
+    }
 
     // Try cross-file symbols (includes local scope with definition extraction)
     log::trace!("Calling get_cross_file_symbols for hover");
@@ -10037,13 +10114,15 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
-                    let help_text = get_help_cached(&state.help_cache, name, Some(pkg)).await;
+                    let help_text =
+                        get_help_cached(&state.help_cache, name, Some(pkg), r_path.clone()).await;
                     log::trace!(
                         "hover: get_help returned {:?}",
                         help_text.as_ref().map(|s| s.len())
                     );
                     if let Some(help_text) = help_text {
                         value.push_str(&format!("```\n{}\n```", help_text));
+                        value.insert_str(0, &build_help_panel_link(name, pkg));
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
                         value.push_str(&format!("\nfrom {{{}}}", pkg));
@@ -10101,9 +10180,11 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            let help_text = get_help_cached(&state.help_cache, name, Some(&pkg_name)).await;
+            let help_text =
+                get_help_cached(&state.help_cache, name, Some(&pkg_name), r_path.clone()).await;
             if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
+                value.insert_str(0, &build_help_panel_link(name, &pkg_name));
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
                 value.push_str(&format!("\nfrom {{{}}}", pkg_name));
@@ -10120,7 +10201,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     }
 
     // Fallback to R help system for built-ins and undefined symbols
-    if let Some(help_text) = get_help_cached(&state.help_cache, name, None).await {
+    if let Some(help_text) = get_help_cached(&state.help_cache, name, None, r_path).await {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -10270,16 +10351,24 @@ async fn try_build_package_signature(
     help_cache: &crate::help::HelpCache,
     function_name: &str,
     package_name: &str,
+    r_path: std::path::PathBuf,
 ) -> Option<SignatureInformation> {
-    // Fetch help text from cache (may block on R subprocess)
-    let help_text = tokio::task::spawn_blocking({
+    // Fetch help text from cache (may block on R subprocess). Bound the
+    // whole await with `HELP_LOOKUP_TIMEOUT` so a runaway subprocess can't
+    // freeze signature help — see the constant's docs for why this is on
+    // top of the inner subprocess timeout.
+    let help_task = tokio::task::spawn_blocking({
         let cache = help_cache.clone();
         let func = function_name.to_string();
         let pkg = package_name.to_string();
-        move || cache.get_or_fetch(&func, Some(&pkg))
-    })
-    .await
-    .ok()??;
+        let rp = r_path.clone();
+        move || cache.get_or_fetch(&func, Some(&pkg), &rp)
+    });
+    let help_text = tokio::time::timeout(HELP_LOOKUP_TIMEOUT, help_task)
+        .await
+        .ok()
+        .and_then(|join| join.ok())
+        .flatten()?;
 
     // Extract signature from help text
     let signature_str = crate::help::extract_signature_from_help(&help_text);
@@ -10287,15 +10376,17 @@ async fn try_build_package_signature(
     // Extract description from help text
     let description = crate::help::extract_description_from_help(&help_text);
 
-    // Get parameter documentation
-    let param_docs = tokio::task::spawn_blocking({
+    // Get parameter documentation. Same timeout protection as above.
+    let args_task = tokio::task::spawn_blocking({
         let cache = help_cache.clone();
         let func = function_name.to_string();
         let pkg = package_name.to_string();
-        move || cache.get_arguments(&func, Some(&pkg))
-    })
-    .await
-    .ok()?;
+        move || cache.get_arguments(&func, Some(&pkg), &r_path)
+    });
+    let param_docs = tokio::time::timeout(HELP_LOOKUP_TIMEOUT, args_task)
+        .await
+        .ok()
+        .and_then(|join| join.ok())?;
 
     // If we have a signature, parse it to extract parameters
     if let Some(sig_str) = signature_str {
@@ -10609,6 +10700,8 @@ enum SignatureResolution {
         package_name: String,
         /// Pre-built fallback used when async package lookup returns `None`.
         fallback: SignatureInformation,
+        /// Resolved R executable path for spawning the help subprocess.
+        r_path: std::path::PathBuf,
     },
     /// Already resolved (user function or fallback).
     Ready(SignatureInformation),
@@ -10680,6 +10773,14 @@ pub fn prepare_signature_help(
         )
     }
 
+    // Resolve the R executable path for any package help lookups.
+    // Falls back to "R" (PATH lookup) when no explicit path is configured.
+    let r_path: std::path::PathBuf = state
+        .cross_file_config
+        .packages_r_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("R"));
+
     // Determine resolution strategy
     let resolution = if let Some(symbol) = scope.symbols.get(func_name) {
         if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
@@ -10688,6 +10789,7 @@ pub fn prepare_signature_help(
                 func_name: func_name.to_string(),
                 package_name: pkg.to_string(),
                 fallback: build_fallback_signature(func_name, &scope, uri, state),
+                r_path: r_path.clone(),
             }
         } else {
             resolve_user_or_fallback(state, func_name, uri, position, &scope)
@@ -10709,6 +10811,7 @@ pub fn prepare_signature_help(
                 func_name: func_name.to_string(),
                 package_name: pkg_name,
                 fallback: build_fallback_signature(func_name, &scope, uri, state),
+                r_path,
             }
         } else {
             resolve_user_or_fallback(state, func_name, uri, position, &scope)
@@ -10737,8 +10840,10 @@ pub async fn resolve_signature_help(ctx: SignatureHelpContext) -> Option<Signatu
             func_name,
             package_name,
             fallback,
+            r_path,
         } => {
-            let sig = try_build_package_signature(&help_cache, &func_name, &package_name).await;
+            let sig =
+                try_build_package_signature(&help_cache, &func_name, &package_name, r_path).await;
             sig.unwrap_or(fallback)
         }
         SignatureResolution::Ready(sig) => sig,
@@ -13000,7 +13105,8 @@ x <- "#;
 
         let cache = crate::help::HelpCache::new();
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs, dummy_r);
         assert!(
             resolved.documentation.is_none(),
             "Should not add documentation to items without data"
@@ -13018,7 +13124,8 @@ x <- "#;
 
         let cache = crate::help::HelpCache::new();
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs, dummy_r);
         assert_eq!(resolved.label, "something");
         assert!(
             resolved.documentation.is_none(),
@@ -13047,8 +13154,13 @@ x <- "#;
             ..Default::default()
         };
 
-        let resolved =
-            super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(
+            item,
+            &cache,
+            &std::collections::HashMap::new(),
+            dummy_r,
+        );
 
         // Should have documentation populated from the cached help text
         let doc = resolved
@@ -13077,6 +13189,14 @@ x <- "#;
     /// should prevent another R subprocess spawn.
     #[test]
     fn test_completion_resolve_caches_negative_on_miss() {
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
+
         let cache = crate::help::HelpCache::new();
 
         // Use a fake package name that R won't have help for
@@ -13091,7 +13211,7 @@ x <- "#;
 
         // First call — R subprocess will fail (no such package), should cache None
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs);
+        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs, &r);
         assert!(
             resolved.documentation.is_none(),
             "Should have no documentation for nonexistent package"
@@ -13108,7 +13228,7 @@ x <- "#;
         // Second call — should hit the negative cache entry and NOT spawn R again.
         // (We can't directly assert "no subprocess was spawned", but we can verify
         // the cache is consulted by checking it returns the same result quickly.)
-        let resolved2 = super::completion_item_resolve(item, &cache, &empty_docs);
+        let resolved2 = super::completion_item_resolve(item, &cache, &empty_docs, &r);
         assert!(
             resolved2.documentation.is_none(),
             "Negative cache hit should still return no documentation"
@@ -13140,7 +13260,8 @@ x <- "#;
             ..Default::default()
         };
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item_dplyr, &cache, &empty_docs);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item_dplyr, &cache, &empty_docs, dummy_r);
         let doc = resolved
             .documentation
             .expect("dplyr::filter should have cached documentation");
@@ -13160,7 +13281,7 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "filter", "package": "nonexistent_pkg"})),
             ..Default::default()
         };
-        let resolved_bad = super::completion_item_resolve(item_bad, &cache, &empty_docs);
+        let resolved_bad = super::completion_item_resolve(item_bad, &cache, &empty_docs, dummy_r);
         assert!(
             resolved_bad.documentation.is_none(),
             "nonexistent_pkg::filter should return no documentation from negative cache"
@@ -13188,8 +13309,13 @@ x <- "#;
             data: Some(serde_json::json!({"topic": "read_csv", "package": "readr"})),
             ..Default::default()
         };
-        let resolved =
-            super::completion_item_resolve(item, &cache, &std::collections::HashMap::new());
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(
+            item,
+            &cache,
+            &std::collections::HashMap::new(),
+            dummy_r,
+        );
 
         assert!(
             resolved.documentation.is_some(),
@@ -13228,7 +13354,8 @@ x <- "#;
         };
 
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs, dummy_r);
 
         // Should have documentation from the Rd arguments
         let doc = resolved
@@ -13286,7 +13413,8 @@ process_data <- function(data, threshold = 0) {
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents, dummy_r);
 
         // Should have documentation from roxygen @param
         let doc = resolved
@@ -13330,7 +13458,8 @@ process_data <- function(data, threshold = 0) {
         };
 
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs, dummy_r);
 
         // No documentation should be added
         assert!(
@@ -13374,7 +13503,8 @@ process_data <- function(data, threshold = 0) {
         };
 
         let empty_docs = std::collections::HashMap::new();
-        let resolved = super::completion_item_resolve(item, &cache, &empty_docs);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &empty_docs, dummy_r);
 
         assert!(
             resolved.documentation.is_none(),
@@ -13414,7 +13544,8 @@ process_data <- function(data, threshold = 0) {
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents, dummy_r);
 
         // No roxygen comments, so no documentation
         assert!(
@@ -13461,7 +13592,8 @@ process_data <- function(data, threshold = 0) {
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents, dummy_r);
 
         // Should have documentation from roxygen title + description
         let doc = resolved
@@ -13518,7 +13650,8 @@ process_data <- function(data, threshold = 0) {
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents, dummy_r);
 
         // No roxygen comments, so no documentation
         assert!(
@@ -13561,7 +13694,8 @@ clean_data <- function(x) {
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents, dummy_r);
 
         // Should have documentation from plain comment fallback
         let doc = resolved
@@ -13603,7 +13737,8 @@ clean_data <- function(x) {
             ..Default::default()
         };
 
-        let resolved = super::completion_item_resolve(item, &cache, &document_contents);
+        let dummy_r = std::path::Path::new("R");
+        let resolved = super::completion_item_resolve(item, &cache, &document_contents, dummy_r);
 
         // No uri/func_line, so no documentation
         assert!(
@@ -31141,6 +31276,50 @@ result <- my_func(1, 2)"#;
     }
 
     #[test]
+    fn test_hover_namespace_qualifier_wins_over_scope_lookup() {
+        // Regression for the smoke-test bug where hovering `filter` in
+        // `dplyr::filter()` rendered "from {base}" because the cross-file
+        // scope returned `base::filter` (or similar) before the qualifier
+        // was checked. The qualifier MUST win — the bold help-panel link
+        // and the attribution string must both reference dplyr.
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "result <- dplyr::filter(df, x > 1)";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Position the cursor on the `f` of `filter` (column 16 of the
+        // 0-indexed line: "result <- dplyr::filter(...)"
+        //                  0         1
+        //                  0123456789012345678
+        // d-p-l-y-r-:-:-f-i-l-t-e-r → 'f' is at column 17).
+        let position = Position::new(0, 17);
+        let hover_result = hover_blocking(&state, &uri, position);
+
+        // We don't require R to be reachable — the qualifier-driven branch
+        // produces a hover string whether or not the help cache has data.
+        let hover = hover_result.expect("hover must return for a known qualified call");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            // The bold link must encode dplyr as the package, not base/stats.
+            assert!(
+                value.starts_with("**[`dplyr::filter`](command:raven.openHelpPanel?"),
+                "expected bold link to dplyr::filter, got: {}",
+                value
+            );
+            assert!(
+                !value.contains("from {base}") && !value.contains("from {stats}"),
+                "qualifier-driven hover must not attribute to base/stats: {}",
+                value
+            );
+        } else {
+            panic!("Expected markup content");
+        }
+    }
+
+    #[test]
     fn test_hover_undefined_symbol_returns_none() {
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
@@ -40859,8 +41038,8 @@ generated quantities {
 #[cfg(test)]
 mod issue_149_utf16_handlers {
     use super::{
-        completion, goto_definition, hover, lsp_position_to_ts_point, prepare_signature_help,
-        references, selection_range,
+        build_help_panel_link, completion, goto_definition, hover, lsp_position_to_ts_point,
+        prepare_signature_help, references, selection_range,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{CompletionResponse, GotoDefinitionResponse, Position, Url};
@@ -41130,5 +41309,69 @@ mod issue_149_utf16_handlers {
             "expected the chain to contain the `abc` identifier range; got {:#?}",
             result[0]
         );
+    }
+
+    #[test]
+    fn test_build_help_panel_link_basic() {
+        let link = build_help_panel_link("mean", "base");
+        assert!(link.starts_with("**[`base::mean`](command:raven.openHelpPanel?"));
+        assert!(link.ends_with(")**\n\n"));
+        // The encoded args should round-trip through percent-decode + JSON.parse to ["mean", "base"]
+        let after_q = &link[link.find('?').unwrap() + 1..link.find(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["mean".to_string(), "base".to_string()]);
+    }
+
+    #[test]
+    fn test_build_help_panel_link_operator_topic() {
+        let link = build_help_panel_link("[", "base");
+        assert!(link.starts_with("**[`base::["));
+        let after_q = &link[link.find('?').unwrap() + 1..link.rfind(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["[".to_string(), "base".to_string()]);
+    }
+
+    #[test]
+    fn test_build_help_panel_link_topic_with_dot() {
+        let link = build_help_panel_link("print.default", "base");
+        assert!(link.contains("`base::print.default`"));
+        // Round-trip: encoded args must decode back to ["print.default", "base"]
+        let after_q = &link[link.find('?').unwrap() + 1..link.find(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(
+            parsed,
+            vec!["print.default".to_string(), "base".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_help_panel_link_strips_backticks_from_label() {
+        // A backtick-quoted R identifier (`weird name`) reaches build_help_panel_link
+        // with the surrounding backticks intact via tree-sitter's node text. The
+        // rendered label MUST NOT contain a backtick — it would close the inline
+        // code span early and produce broken markdown. The encoded args, which
+        // drive the click, are unaffected.
+        let link = build_help_panel_link("`weird name`", "pkg");
+        let label_end = link.find("](").expect("link has a label");
+        let label = &link[..label_end];
+        assert!(
+            !label.contains('`') || label.matches('`').count() == 2,
+            "label backticks must only be the code-span delimiters; got: {label}"
+        );
+        let after_q = &link[link.find('?').unwrap() + 1..link.rfind(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["`weird name`".to_string(), "pkg".to_string()]);
     }
 }

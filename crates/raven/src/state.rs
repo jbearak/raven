@@ -567,6 +567,7 @@ pub struct WorldState {
 
     // Caches
     pub help_cache: crate::help::HelpCache,
+    pub html_help_cache: crate::help::HtmlHelpCache,
     pub signature_cache: Arc<SignatureCache>,
     pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
@@ -673,6 +674,7 @@ impl WorldState {
 
             // Caches
             help_cache: crate::help::HelpCache::new(),
+            html_help_cache: crate::help::HtmlHelpCache::new(),
             signature_cache: Arc::new(SignatureCache::new(500, 200)),
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
@@ -691,6 +693,18 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_complete: false,
         }
+    }
+
+    /// Drain the text and HTML help caches.
+    ///
+    /// Call this whenever the package set may have shifted underneath cached
+    /// help content (libpath watcher events, `raven.refreshPackages`, and the
+    /// package-settings branch of `did_change_configuration`). Keeping all the
+    /// callers funnelled through this helper makes it impossible to flush one
+    /// cache and forget the other.
+    pub fn clear_help_caches(&self) {
+        self.help_cache.drain();
+        self.html_help_cache.drain();
     }
 
     /// Create a content provider for this state
