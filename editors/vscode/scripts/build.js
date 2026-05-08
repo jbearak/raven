@@ -1,4 +1,4 @@
-// Two-pass esbuild: extension bundle + webview bundle (Svelte).
+// Two-pass esbuild: extension bundle + webview bundles (Svelte).
 const path = require('path');
 const esbuild = require('esbuild');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -8,7 +8,6 @@ const sveltePreprocess = require('svelte-preprocess').default ?? require('svelte
 
 const root = path.resolve(__dirname, '..');
 const dist = path.join(root, 'dist');
-const webviewDist = path.join(dist, 'webviews', 'plot-viewer');
 
 async function buildExtension() {
     await esbuild.build({
@@ -24,9 +23,16 @@ async function buildExtension() {
     });
 }
 
-async function buildWebview() {
+/**
+ * Build a Svelte webview bundle.
+ *
+ * @param {string} name   - Output directory name under dist/webviews/ (e.g. 'plot-viewer').
+ * @param {string} entry  - Absolute path to the webview entry point (main.ts).
+ */
+async function buildSvelteWebview(name, entry) {
+    const webviewDist = path.join(dist, 'webviews', name);
     await esbuild.build({
-        entryPoints: [path.join(root, 'src', 'plot', 'webview', 'main.ts')],
+        entryPoints: [entry],
         bundle: true,
         platform: 'browser',
         target: 'chrome108',
@@ -48,7 +54,17 @@ async function buildWebview() {
 
 (async () => {
     try {
-        await Promise.all([buildExtension(), buildWebview()]);
+        await Promise.all([
+            buildExtension(),
+            buildSvelteWebview(
+                'plot-viewer',
+                path.join(root, 'src', 'plot', 'webview', 'main.ts'),
+            ),
+            buildSvelteWebview(
+                'help-viewer',
+                path.join(root, 'src', 'help', 'webview', 'main.ts'),
+            ),
+        ]);
     } catch (err) {
         console.error(err);
         process.exit(1);
