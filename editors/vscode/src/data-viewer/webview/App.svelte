@@ -264,8 +264,9 @@
     /** Active drag mode. Set on pointerdown and cleared on global pointerup
      *  so a drag that begins on a column header doesn't get hijacked by a
      *  cell's pointerenter handler (and vice versa). */
-    type DragMode = 'cell' | 'column' | 'row' | null;
+    type DragMode = 'cell' | 'column' | 'row' | 'resize' | null;
     let dragMode: DragMode = null;
+    let resizeDrag: { colIdx: number; startX: number; startWidth: number } | null = null;
 
     function onCellPointerDown(row: number, col: number, e: PointerEvent): void {
         if (e.button !== 0) return;
@@ -325,8 +326,23 @@
         bumpSelection();
     }
 
+    function onResizeHandlePointerDown(colIdx: number, e: PointerEvent): void {
+        e.stopPropagation(); // don't trigger column selection
+        dragMode = 'resize';
+        resizeDrag = { colIdx, startX: e.clientX, startWidth: widthOf(colIdx) };
+        (e.target as Element).setPointerCapture(e.pointerId);
+    }
+
+    function onWindowPointerMove(e: PointerEvent): void {
+        if (!resizeDrag) return;
+        const delta = e.clientX - resizeDrag.startX;
+        const newWidth = Math.max(30, resizeDrag.startWidth + delta);
+        onResizeColumn(resizeDrag.colIdx, newWidth);
+    }
+
     function onWindowPointerUp(): void {
         dragMode = null;
+        resizeDrag = null;
     }
 
     function copySelection(): void {
@@ -619,7 +635,7 @@
     }
 </script>
 
-<svelte:window onkeydown={onKeyDown} onpointerup={onWindowPointerUp} />
+<svelte:window onkeydown={onKeyDown} onpointerup={onWindowPointerUp} onpointermove={onWindowPointerMove} />
 
 <!-- Suppress the platform context menu everywhere in the panel; show our
      own only when the click lands on a cell, column header, or row
@@ -663,6 +679,9 @@
                          onpointerenter={(e) => onColHeaderPointerEnter(colIdx, e)}
                     >
                         {col.name}
+                        <!-- svelte-ignore a11y_no_static_element_interactions -->
+                        <div class="resize-handle"
+                             onpointerdown={(e) => onResizeHandlePointerDown(colIdx, e)}></div>
                     </div>
                 {/each}
             </div>

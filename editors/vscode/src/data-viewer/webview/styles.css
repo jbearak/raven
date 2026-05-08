@@ -223,6 +223,21 @@ html, body, #root {
 }
 .cell.col-header {
     cursor: pointer;
+    position: relative;
+}
+
+.resize-handle {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: default;
+    z-index: 1;
+}
+.resize-handle:hover {
+    background: var(--vscode-panel-border, #ccc);
+    opacity: 0.5;
 }
 .cell.numeric {
     text-align: right;
