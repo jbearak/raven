@@ -739,17 +739,23 @@ Other defensive behavior:
   and `is_valid_help_topic()` permits the operator-character set explicitly
   (see "Validation"). Path segments in `raven-help://` URLs are
   percent-encoded.
-- **External link reachability**: the extension calls
-  `vscode.env.openExternal` for allowlisted URLs; if the URL is dead, the
+- **External link reachability**: for `https://`, `http://`, and `mailto:`
+  URLs the click handler returns false (does NOT call `preventDefault()`)
+  and lets VS Code's native webview link handling open the URL through the
+  user's default browser. The webview wire protocol intentionally has no
+  `open-external` message — posting one would race with VS Code's native
+  handler and produce a duplicate browser open. If the URL is dead, the
   user's browser surfaces the error. Raven does not pre-flight remote URLs.
 - **Vignettes and non-help Rd links**: the rewriter explicitly recognizes
   `../../<pkg>/help/` and `../../<pkg>/topic/` as cross-references to other
-  Rd help pages. Vignette links (`../../<pkg>/doc/<vignette>.html`) are
-  out-of-scope for v1 and pass through unchanged; the webview's universal
-  `preventDefault()` plus the dispatcher's "navigate" allowlist guard
-  prevents accidental navigation. Vignette browsing can be added in a
-  follow-up by extending the rewriter and adding a dedicated rendering
-  path.
+  Rd help pages. Vignette links (`../../<pkg>/doc/<vignette>.html`) and any
+  other unrecognized relative paths are out-of-scope for v1 and the
+  rewriter neutralizes them — `href="javascript:void(0)"` plus
+  `data-raven-dropped="1"`. The webview's click handler treats anchors with
+  `data-raven-dropped="1"` as disallowed regardless of `href`,
+  `preventDefault`s, and posts `report-error` for telemetry. Vignette
+  browsing can be added in a follow-up by extending the rewriter and adding
+  a dedicated rendering path.
 - **Multiple R installations**: `get_help_html` always uses the same R
   executable as the rest of Raven (sourced from `RSubprocess::r_path()`).
   `find.package`/`system.file` calls inside the same R subprocess therefore
@@ -930,7 +936,9 @@ v1.
 
 ### Webview-side
 
-Mocha tests using JSDOM:
+Bun tests in `tests/bun/help-webview-link.test.ts` exercise
+`classifyAndDispatch` directly — no DOM is needed because the function
+takes an event-like object with `target` and `preventDefault`:
 
 1. Dispatch click events on `<a href="raven-help://topic/base/sum">`,
    `<a href="raven-help://topic/base/%5B">` (encoded `[`),
@@ -938,15 +946,21 @@ Mocha tests using JSDOM:
    `<a href="javascript:alert(1)">`, `<a href="file:///etc/shadow">`,
    `<a href="other://x">`, and a malformed URL.
 2. Verify:
-   - `raven-help://...` → `preventDefault()` called, `postMessage("navigate", { topic, package, anchor? })`.
-     The topic/package values are **percent-decoded** before posting.
-   - `https://`/`http://`/`mailto:` → `preventDefault()`, `postMessage("open-external", { url })`.
-   - `#anchor` → no `preventDefault()`, no `postMessage`. Browser scrolls.
-   - `javascript:`/`file:`/`other:`/malformed → `preventDefault()`,
-     `postMessage("report-error", { ... })`. Never navigates.
+   - `raven-help://...` → returns true, `preventDefault()` called,
+     `postMessage("navigate", { topic, package, anchor? })`. The
+     topic/package values are **percent-decoded** before posting.
+   - `https://`/`http://`/`mailto:` → returns false (no
+     `preventDefault()`, no `postMessage`); VS Code's native webview link
+     handling opens the URL.
+   - `#anchor` → returns false, no `preventDefault()`, no `postMessage`;
+     browser scrolls natively.
+   - `javascript:`/`file:`/`other:`/malformed → returns true,
+     `preventDefault()`, `postMessage("report-error", { ... })`. Never
+     navigates.
 3. Anchor elements with `data-raven-dropped="1"` (the rewriter's
-   neutralization sentinel) trigger no postMessage and call
-   `preventDefault()`.
+   neutralization sentinel) trigger `preventDefault()`,
+   `postMessage("report-error", { ... })`, and return true regardless of
+   `href`.
 
 ### Manual smoke test plan
 

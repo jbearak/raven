@@ -9919,6 +9919,12 @@ async fn get_help_cached(
 /// Uses `NON_ALPHANUMERIC` percent-encoding (stricter than `encodeURIComponent`),
 /// which is RFC 3986 compliant and survives any roundtrip through VS Code's URL
 /// parsing. The webview decodes via `JSON.parse(decodeURIComponent(...))`.
+///
+/// Backticks in `topic` or `package` are stripped from the rendered link
+/// label so they can't break the inline code span. Hover supplies these
+/// values from a tree-sitter node, and a backtick-quoted R identifier
+/// like `` `weird name` `` would otherwise close the code span early.
+/// The encoded JSON args (which drive the actual click) are unaffected.
 fn build_help_panel_link(topic: &str, package: &str) -> String {
     let arg_json = serde_json::json!([topic, package]).to_string();
     let arg_encoded = percent_encoding::utf8_percent_encode(
@@ -9926,7 +9932,9 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
         percent_encoding::NON_ALPHANUMERIC,
     )
     .to_string();
-    format!("**[`{package}::{topic}`](command:raven.openHelpPanel?{arg_encoded})**\n\n")
+    let label_topic = topic.replace('`', "");
+    let label_package = package.replace('`', "");
+    format!("**[`{label_package}::{label_topic}`](command:raven.openHelpPanel?{arg_encoded})**\n\n")
 }
 
 /// Provide hover information for the symbol at a given text document position.
@@ -41341,5 +41349,27 @@ mod issue_149_utf16_handlers {
             .unwrap();
         let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
         assert_eq!(parsed, vec!["print.default".to_string(), "base".to_string()]);
+    }
+
+    #[test]
+    fn test_build_help_panel_link_strips_backticks_from_label() {
+        // A backtick-quoted R identifier (`weird name`) reaches build_help_panel_link
+        // with the surrounding backticks intact via tree-sitter's node text. The
+        // rendered label MUST NOT contain a backtick — it would close the inline
+        // code span early and produce broken markdown. The encoded args, which
+        // drive the click, are unaffected.
+        let link = build_help_panel_link("`weird name`", "pkg");
+        let label_end = link.find("](").expect("link has a label");
+        let label = &link[..label_end];
+        assert!(
+            !label.contains('`') || label.matches('`').count() == 2,
+            "label backticks must only be the code-span delimiters; got: {label}"
+        );
+        let after_q = &link[link.find('?').unwrap() + 1..link.rfind(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["`weird name`".to_string(), "pkg".to_string()]);
     }
 }
