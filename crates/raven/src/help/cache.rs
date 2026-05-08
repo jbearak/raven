@@ -166,8 +166,18 @@ impl HtmlHelpCache {
         }
     }
 
+    /// Clear cached entries.
+    ///
+    /// Called when libpath changes invalidate the help corpus (package install,
+    /// uninstall, or upgrade). Drops in-flight entries too — mirroring
+    /// `HelpCache::drain` — so a freshly-arriving caller starts a new fetch
+    /// instead of subscribing to (and trusting) a result that began before the
+    /// libpath changed.
     pub fn drain(&self) {
         if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.in_flight.lock() {
             guard.clear();
         }
     }
