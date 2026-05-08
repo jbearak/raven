@@ -252,6 +252,11 @@ export class DataViewerPanel {
         }
     }
 
+    /** Column names in schema order — used by the test harness. */
+    getColumnNames(): string[] {
+        return this.columns.map(c => c.name);
+    }
+
     private async dispose(): Promise<void> {
         try { await fs.unlink(this.filePath); } catch { /* ignore */ }
         this.disposeHook();

@@ -20,9 +20,10 @@ import {
     shouldTriggerDirectivePathSuggest,
     shouldTriggerNestedPathSuggest,
 } from './pathCompletionTriggers';
-import { register_r_terminal, register_send_to_r_commands } from './send-to-r';
+import { register_r_terminal, register_send_to_r_commands, get_or_create_r_terminal } from './send-to-r';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
+import type { DataViewerManager } from './data-viewer/manager';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -99,6 +100,15 @@ function sendActivityNotification() {
 export interface RavenExtensionApi {
     /** Returns the live LSP client once activation has installed it. */
     getLanguageClient(): LanguageClient | undefined;
+    /**
+     * Creates (or reuses) a Raven-managed R terminal with the bootstrap
+     * profile injected, then sends `code` to it. Used by integration tests.
+     */
+    sendToRTerminal(code: string): Promise<void>;
+    /** Names of currently-open data viewer panels. Used by integration tests. */
+    getDataViewerPanelNames(): string[];
+    /** Column names for a named data viewer panel. Used by integration tests. */
+    getDataViewerPanelColumnNames(panelName: string): string[] | undefined;
 }
 
 export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
@@ -168,8 +178,11 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         data_viewer_enabled ? dataViewerDirOf(context) : '',
     );
     active_plot_services = plot_services;
+    let data_viewer_manager: DataViewerManager | undefined;
     if (data_viewer_enabled) {
-        void registerDataViewer(context, plot_services.server, dataViewerDirOf(context));
+        void registerDataViewer(context, plot_services.server, dataViewerDirOf(context)).then(m => {
+            data_viewer_manager = m;
+        });
     }
 
     // Register restart command — re-reads trace config so changed settings take effect.
@@ -275,6 +288,13 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     return {
         getLanguageClient: () => client,
+        sendToRTerminal: async (code: string) => {
+            const terminal = await get_or_create_r_terminal();
+            terminal.sendText(code, true);
+        },
+        getDataViewerPanelNames: () => data_viewer_manager?.getPanelNames() ?? [],
+        getDataViewerPanelColumnNames: (panelName: string) =>
+            data_viewer_manager?.getPanelColumnNames(panelName),
     };
 }
 

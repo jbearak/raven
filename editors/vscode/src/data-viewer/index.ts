@@ -17,7 +17,7 @@ export async function registerDataViewer(
     context: vscode.ExtensionContext,
     server: RSessionServer,
     dataViewerDir: string,
-): Promise<void> {
+): Promise<DataViewerManager> {
     const cap = vscode.workspace.getConfiguration('raven.dataViewer')
         .get<number>('maxStoredLayouts', 10000);
     const store = new LayoutStore(context.globalState as any, cap);
@@ -44,6 +44,8 @@ export async function registerDataViewer(
             }
         }),
     });
+
+    return manager;
 }
 
 export function dataViewerDirOf(context: vscode.ExtensionContext): string {

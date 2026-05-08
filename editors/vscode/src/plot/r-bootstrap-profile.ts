@@ -266,7 +266,8 @@ local({
             json <- paste0("{", paste(entries, collapse = ","), "}")
             tbl <- tbl$ReplaceSchemaMetadata(list("raven.fields" = json))
         }
-        arrow::write_feather(tbl, file_path, chunk_size = 65536L)
+        # apache-arrow JS does not ship LZ4/Zstd codecs, so write uncompressed.
+        arrow::write_feather(tbl, file_path, chunk_size = 65536L, compression = "uncompressed")
     }
 
     .raven_view <- function(x, title) {

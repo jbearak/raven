@@ -57,6 +57,16 @@ export class DataViewerManager {
         });
     }
 
+    /** Panel names currently open — used by the test harness. */
+    getPanelNames(): string[] {
+        return [...this.panels.keys()];
+    }
+
+    /** Column names for a named panel — used by the test harness. */
+    getPanelColumnNames(panelName: string): string[] | undefined {
+        return this.panels.get(panelName)?.getColumnNames();
+    }
+
     /** For tests + activation; delegates to {@link sweep_stale}. */
     static sweepStale = sweep_stale;
 }
