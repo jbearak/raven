@@ -307,7 +307,7 @@ const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 /// On Unix, sends SIGKILL directly. On Windows, delegates to `taskkill /F`.
 /// If the process has already exited, the call is harmless on all platforms.
 #[cfg(unix)]
-fn kill_process_by_pid(pid: u32) {
+pub(crate) fn kill_process_by_pid(pid: u32) {
     match i32::try_from(pid) {
         Ok(pid_i32) => {
             // SAFETY: Sending SIGKILL to a known child PID. If the process
@@ -325,7 +325,7 @@ fn kill_process_by_pid(pid: u32) {
 }
 
 #[cfg(windows)]
-fn kill_process_by_pid(pid: u32) {
+pub(crate) fn kill_process_by_pid(pid: u32) {
     let _ = Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
@@ -334,7 +334,7 @@ fn kill_process_by_pid(pid: u32) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn kill_process_by_pid(_pid: u32) {
+pub(crate) fn kill_process_by_pid(_pid: u32) {
     log::trace!("get_help: timeout kill not supported on this platform");
 }
 

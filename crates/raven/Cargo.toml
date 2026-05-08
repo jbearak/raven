@@ -36,7 +36,7 @@ ropey = "1.6"
 lru = "0.16"
 notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
 percent-encoding = "2"
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -44,7 +44,7 @@ xdg = "2.5.2"
 
 [features]
 # Expose test_utils for integration tests and benchmarks (kept out of production builds)
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
