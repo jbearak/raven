@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 /// Sanitize Rd2HTML output to a safe allowlist.
 pub fn sanitize_help_html(html: &str) -> String {
     let pre = strip_style_url(html);
-    build_ammonia_sanitized(&pre)
+    let pre2 = strip_rd_doc_header_table(&pre);
+    build_ammonia_sanitized(&pre2)
 }
 
 fn strip_style_url(html: &str) -> std::borrow::Cow<'_, str> {
@@ -22,6 +23,21 @@ fn strip_style_url(html: &str) -> std::borrow::Cow<'_, str> {
             .expect("valid regex")
     });
     re.replace_all(html, "")
+}
+
+/// Remove the decorative `<table>...<td>topic {pkg}</td><td>R Documentation</td>...</table>`
+/// header that Rd2HTML emits at the top of every page. The same information
+/// already lives in the panel's editor-tab title; rendering it inline as a
+/// one-row table is just visual noise.
+fn strip_rd_doc_header_table(html: &str) -> std::borrow::Cow<'_, str> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<table\b[^>]*>\s*<tr\b[^>]*>\s*<td\b[^>]*>[^<]*\{[^}]+\}\s*</td>\s*<td\b[^>]*>\s*R\s+Documentation\s*</td>\s*</tr>\s*</table>"#,
+        )
+        .expect("valid regex")
+    });
+    re.replace(html, "")
 }
 
 fn build_ammonia_sanitized(html: &str) -> String {
@@ -64,11 +80,27 @@ fn build_ammonia_sanitized(html: &str) -> String {
             .collect()
     });
 
+    static CLEAN_CONTENT_TAGS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    let clean_content = CLEAN_CONTENT_TAGS.get_or_init(|| {
+        // Tags whose CONTENTS we also strip. Without these, `<title>R: ...</title>`
+        // in the head leaks "R: ..." as raw text into the rendered body
+        // (ammonia's default for unknown tags is to keep inner text).
+        ["script", "style", "title", "head", "meta", "link"]
+            .into_iter()
+            .collect()
+    });
+
     let mut b = ammonia::Builder::default();
     b.tags(tags.clone());
     b.generic_attributes(generic.clone());
     b.tag_attributes(per_tag.clone());
     b.url_schemes(schemes.clone());
+    b.clean_content_tags(clean_content.clone());
+    // Keep relative URLs (e.g. `<a href="../../base/help/sum">`,
+    // `<img src="figures/x.png">`) so the rewriter and the extension's
+    // image rewriter can convert them downstream. Default Deny would
+    // strip them before either could run.
+    b.url_relative(ammonia::UrlRelative::PassThrough);
     b.clean(html).to_string()
 }
 
@@ -148,5 +180,52 @@ mod tests {
         let out = sanitize_help_html(html);
         assert!(out.contains(r#"src="figures/x.png""#));
         assert!(out.contains(r#"alt="x""#));
+    }
+
+    #[test]
+    fn keeps_relative_a_href() {
+        // url_relative(PassThrough) means the rewriter and the extension
+        // can both see relative URLs and convert them downstream.
+        let html = r#"<a href="../../base/help/sum">sum</a>"#;
+        let out = sanitize_help_html(html);
+        assert!(out.contains(r#"href="../../base/help/sum""#));
+    }
+
+    #[test]
+    fn keeps_raven_help_scheme() {
+        let html = r#"<a href="raven-help://topic/base/sum">sum</a>"#;
+        let out = sanitize_help_html(html);
+        assert!(out.contains(r#"href="raven-help://topic/base/sum""#));
+    }
+
+    #[test]
+    fn strips_title_content() {
+        // Without title in clean_content_tags, ammonia would keep the
+        // "R: ..." inner text and leak it into the rendered body.
+        let html = r#"<html><head><title>R: Foo</title></head><body><h2>Body</h2></body></html>"#;
+        let out = sanitize_help_html(html);
+        assert!(!out.contains("R: Foo"), "title content must be stripped: {}", out);
+        assert!(out.contains("<h2>Body</h2>"));
+    }
+
+    #[test]
+    fn strips_decorative_rd_header_table() {
+        // The `<table><tr><td>topic {pkg}</td><td>R Documentation</td></tr></table>`
+        // chrome at the top of every Rd2HTML page is duplicate of the
+        // editor tab title; strip it.
+        let html = r#"<table style="width: 100%;"><tr><td>filter {dplyr}</td><td style="text-align: right;">R Documentation</td></tr></table><h2>Subset rows</h2>"#;
+        let out = sanitize_help_html(html);
+        assert!(!out.contains("R Documentation"), "decorative table must be removed: {}", out);
+        assert!(!out.contains("filter {dplyr}"), "decorative table must be removed: {}", out);
+        assert!(out.contains("<h2>Subset rows</h2>"));
+    }
+
+    #[test]
+    fn strip_decorative_table_does_not_eat_real_tables() {
+        // A table with multiple rows or different content should NOT be stripped.
+        let html = r#"<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>"#;
+        let out = sanitize_help_html(html);
+        assert!(out.contains("<table>"));
+        assert!(out.contains("<td>c</td>"));
     }
 }

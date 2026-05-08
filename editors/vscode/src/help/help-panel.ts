@@ -162,6 +162,9 @@ export class HelpPanel {
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
+                // Cmd/Ctrl-F opens VS Code's native find widget for the
+                // webview's rendered HTML.
+                enableFindWidget: true,
                 localResourceRoots: [
                     dist_root,
                     ...extra_roots.map((p) => vscode.Uri.file(p)),
@@ -325,21 +328,6 @@ export class HelpPanel {
                     msg.payload.anchor,
                 );
                 break;
-            case 'open-external': {
-                try {
-                    const u = vscode.Uri.parse(msg.payload.url);
-                    if (
-                        u.scheme === 'http' ||
-                        u.scheme === 'https' ||
-                        u.scheme === 'mailto'
-                    ) {
-                        void vscode.env.openExternal(u);
-                    }
-                } catch {
-                    // ignore — malformed URL
-                }
-                break;
-            }
             case 'report-error':
                 console.warn('[Raven help webview]', msg.payload.message);
                 break;

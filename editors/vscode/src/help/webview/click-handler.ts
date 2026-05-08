@@ -70,14 +70,19 @@ export function classifyAndDispatch(
     }
 
     // External URLs — https, http, mailto.
+    //
+    // Hand-off to VS Code's built-in webview link handling. VS Code shows a
+    // single "Do you want to open this URL?" trust prompt and then opens
+    // the user's default browser. If we preventDefault and post an
+    // open-external message, both that path and our manual openExternal
+    // call fire — the user gets a duplicate browser-open AND a stray
+    // dialog. Returning false here is the documented webview pattern.
     if (
         rawHref.startsWith('https://') ||
         rawHref.startsWith('http://') ||
         rawHref.startsWith('mailto:')
     ) {
-        event.preventDefault();
-        postMessage({ type: 'open-external', payload: { url: rawHref } });
-        return true;
+        return false;
     }
 
     // Everything else (javascript:, data:, file://, relative paths, other

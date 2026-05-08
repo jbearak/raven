@@ -60,13 +60,7 @@ describe('help messages', () => {
         expect(isWebviewToExtensionMessage(msg)).toBe(true);
     });
 
-    test('webview->ext open-external, report-error, scroll, ready', () => {
-        expect(
-            isWebviewToExtensionMessage({
-                type: 'open-external',
-                payload: { url: 'https://example.com' },
-            }),
-        ).toBe(true);
+    test('webview->ext report-error, scroll, ready', () => {
         expect(
             isWebviewToExtensionMessage({
                 type: 'report-error',
@@ -85,6 +79,18 @@ describe('help messages', () => {
                 payload: {},
             }),
         ).toBe(true);
+    });
+
+    test('webview->ext rejects open-external (no longer in protocol)', () => {
+        // External-link clicks defer to VS Code's native webview handler;
+        // posting open-external would race with it and produce duplicate
+        // browser-opens. The validator must reject the type.
+        expect(
+            isWebviewToExtensionMessage({
+                type: 'open-external',
+                payload: { url: 'https://example.com' },
+            }),
+        ).toBe(false);
     });
 
     test('rejects malformed', () => {

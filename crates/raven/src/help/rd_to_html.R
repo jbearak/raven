@@ -27,4 +27,8 @@ cat("topic\t", canonical_topic, "\n", sep = "", file = con)
 cat("package\t", resolved_pkg, "\n", sep = "", file = con)
 cat("helpDir\t", help_dir, "\n", sep = "", file = con)
 for (lp in lib_paths) cat("libPath\t", lp, "\n", sep = "", file = con)
-tools::Rd2HTML(rd, out = stdout(), package = resolved_pkg)
+# dynamic = TRUE makes Rd2HTML emit `<a href="../../<pkg>/help/<topic>">`
+# anchors for cross-references. Default static mode emits only inline
+# `<code>` for those, which leaves the rendered page with no clickable
+# links; the rewriter has nothing to convert.
+tools::Rd2HTML(rd, out = stdout(), package = resolved_pkg, dynamic = TRUE)

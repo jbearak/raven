@@ -159,9 +159,6 @@
             disabled={!state.canForward}
             title="Forward"
         >→</button>
-        {#if state.phase === 'viewing' && state.current}
-            <span class="topic-label">{state.current.package}::{state.current.topic}</span>
-        {/if}
     </header>
 
     {#if state.phase === 'loading'}
@@ -189,6 +186,9 @@
                 role="document"
                 tabindex="-1"
             >
+                <p class="topic-attribution">
+                    <code>{state.current.package}::{state.current.topic}</code>
+                </p>
                 {@html state.current.html}
             </div>
         {:else if state.phase === 'idle'}

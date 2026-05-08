@@ -97,48 +97,45 @@ describe('webview link click', () => {
         });
     });
 
-    // ---- External URLs → open-external ----
+    // ---- External URLs → defer to VS Code's webview default handling ----
+    //
+    // Returning false (no preventDefault, no postMessage) lets VS Code's
+    // built-in webview link handler take over: it shows a single trust
+    // prompt and opens the URL in the default browser. Posting our own
+    // open-external would race with VS Code's handler and produce a
+    // duplicate browser open + stray dialog.
 
-    test('https:// → open-external', () => {
+    test('https:// → defers to VS Code (no preventDefault, no postMessage)', () => {
         const url = 'https://www.r-project.org/';
         const a = makeAnchor(`<a href="${url}">x</a>`);
         const post = mock(() => {});
         const ev = makeEvent(a);
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
-        expect(handled).toBe(true);
-        expect(ev.preventDefault).toHaveBeenCalled();
-        expect(post).toHaveBeenCalledWith({
-            type: 'open-external',
-            payload: { url },
-        });
+        expect(handled).toBe(false);
+        expect(ev.preventDefault).not.toHaveBeenCalled();
+        expect(post).not.toHaveBeenCalled();
     });
 
-    test('http:// → open-external', () => {
+    test('http:// → defers to VS Code', () => {
         const url = 'http://example.com/docs';
         const a = makeAnchor(`<a href="${url}">x</a>`);
         const post = mock(() => {});
         const ev = makeEvent(a);
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
-        expect(handled).toBe(true);
-        expect(ev.preventDefault).toHaveBeenCalled();
-        expect(post).toHaveBeenCalledWith({
-            type: 'open-external',
-            payload: { url },
-        });
+        expect(handled).toBe(false);
+        expect(ev.preventDefault).not.toHaveBeenCalled();
+        expect(post).not.toHaveBeenCalled();
     });
 
-    test('mailto: → open-external', () => {
+    test('mailto: → defers to VS Code', () => {
         const url = 'mailto:someone@example.com';
         const a = makeAnchor(`<a href="${url}">x</a>`);
         const post = mock(() => {});
         const ev = makeEvent(a);
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
-        expect(handled).toBe(true);
-        expect(ev.preventDefault).toHaveBeenCalled();
-        expect(post).toHaveBeenCalledWith({
-            type: 'open-external',
-            payload: { url },
-        });
+        expect(handled).toBe(false);
+        expect(ev.preventDefault).not.toHaveBeenCalled();
+        expect(post).not.toHaveBeenCalled();
     });
 
     // ---- #anchor only → native scroll (no preventDefault, no postMessage) ----

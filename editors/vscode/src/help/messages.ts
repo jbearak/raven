@@ -45,10 +45,13 @@ export type NavigatePayload = {
     anchor: string | null;
 };
 
+// External-link clicks (https/http/mailto) are intentionally NOT in the
+// wire protocol: VS Code's webview already handles those natively (single
+// trust prompt + browser open). Posting our own open-external message
+// would race with VS Code's handler and produce a duplicate browser open.
 export type WebviewToExtensionMessage =
     | { type: 'webview-ready'; payload: Record<string, never> }
     | { type: 'navigate'; payload: NavigatePayload }
-    | { type: 'open-external'; payload: { url: string } }
     | { type: 'report-error'; payload: { message: string } }
     | { type: 'scroll'; payload: { y: number } }
     | { type: 'back'; payload: Record<string, never> }
@@ -65,7 +68,6 @@ const EXTENSION_TO_WEBVIEW_TYPES = new Set<ExtensionToWebviewMessage['type']>([
 const WEBVIEW_TO_EXTENSION_TYPES = new Set<WebviewToExtensionMessage['type']>([
     'webview-ready',
     'navigate',
-    'open-external',
     'report-error',
     'scroll',
     'back',
@@ -145,10 +147,6 @@ export function isWebviewToExtensionMessage(value: unknown): value is WebviewToE
                 typeof payload.package === 'string' &&
                 (payload.anchor === null || typeof payload.anchor === 'string')
             );
-        }
-        case 'open-external': {
-            const payload = p as Record<string, unknown>;
-            return typeof payload.url === 'string';
         }
         case 'report-error': {
             const payload = p as Record<string, unknown>;

@@ -87,6 +87,17 @@ main {
     line-height: 1.5;
 }
 
+.help-content .topic-attribution {
+    margin: 0 0 12px 0;
+    opacity: 0.7;
+    font-size: 0.9em;
+}
+
+.help-content .topic-attribution code {
+    background: transparent;
+    padding: 0;
+}
+
 .help-content h1,
 .help-content h2,
 .help-content h3 {

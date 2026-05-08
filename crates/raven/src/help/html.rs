@@ -230,13 +230,23 @@ fn get_help_html_inner(
         });
     }
 
-    // 8) Sanitize and rewrite (catch_unwind around sanitize).
+    // 8) Rewrite cross-reference URLs FIRST, then sanitize.
+    //
+    // The rewriter converts `<a href="../../<pkg>/help/<topic>">` (relative,
+    // produced by Rd2HTML(dynamic = TRUE)) into `raven-help://...`, which is
+    // an explicit allowlisted scheme. Running it before sanitization means
+    // ammonia sees a scheme it recognizes and keeps the href; running it
+    // after would mean ammonia stripped the relative href first and the
+    // rewriter had nothing to convert.
+    //
+    // The rewriter is a regex-only transform on `<a href>` and is safe to
+    // run on raw R output — it cannot introduce dangerous tags or scripts.
     let html_raw = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let sanitized = std::panic::catch_unwind(|| sanitize_help_html(&html_raw))
+    let rewritten_raw = rewrite_help_html(&html_raw, &canonical_pkg);
+    let rewritten = std::panic::catch_unwind(|| sanitize_help_html(&rewritten_raw))
         .map_err(|_| HelpHtmlError::RenderFailed {
             message: "ammonia panic".into(),
         })?;
-    let rewritten = rewrite_help_html(&sanitized, &canonical_pkg);
 
     // 9) Title from first <h2>.
     let title = extract_h2_title(&rewritten).unwrap_or_else(|| canonical_topic.clone());
@@ -359,6 +369,37 @@ mod tests {
         assert!(res.html.contains("Arithmetic Mean") || res.title.contains("Mean"));
         assert!(res.help_dir.ends_with("help"));
         assert!(!res.lib_paths.is_empty());
+    }
+
+    #[test]
+    fn renders_clickable_cross_references() {
+        // Regression for the smoke-test bug where every link in the rendered
+        // help page lost its href: Rd2HTML default mode emits `<code>` instead
+        // of `<a>` for cross-references, so even with a working rewriter
+        // there were no anchors to convert. The fix passes `dynamic = TRUE`
+        // to Rd2HTML and runs the rewriter before ammonia.
+        //
+        // `mean` is reliable because base::weighted.mean and base::colMeans
+        // are always referenced in its See Also section.
+        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let res = get_help_html("mean", Some("base"), &r).expect("render");
+        assert!(
+            res.html.contains("raven-help://topic/base/weighted.mean"),
+            "expected rewritten cross-reference to weighted.mean; html was:\n{}",
+            res.html
+        );
+        // Decorative `<title>R: ...</title>` chrome must be stripped.
+        assert!(
+            !res.html.contains("R: Arithmetic Mean"),
+            "decorative title chrome must not leak into rendered body; html was:\n{}",
+            res.html
+        );
+        // Decorative one-row `topic {pkg}` / `R Documentation` table must be stripped.
+        assert!(
+            !res.html.contains("R Documentation"),
+            "decorative R Documentation table must be removed; html was:\n{}",
+            res.html
+        );
     }
 
     #[test]
