@@ -100,10 +100,6 @@ local({
         # who never opted in don't see the "install arrow" message.
         return(invisible(NULL))
     }
-    if (!requireNamespace("arrow", quietly = TRUE)) {
-        .raven_log("data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")")
-        return(invisible(NULL))
-    }
     if (!dir.exists(.raven_dv_dir)) {
         tryCatch(dir.create(.raven_dv_dir, recursive = TRUE, showWarnings = FALSE),
                  error = function(e) {})
@@ -271,6 +267,10 @@ local({
     }
 
     .raven_view <- function(x, title) {
+        if (!requireNamespace("arrow", quietly = TRUE)) {
+            stop("Raven data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")",
+                 call. = FALSE)
+        }
         # Resolve panel name.
         panel_name <- if (!missing(title) && !is.null(title)) {
             as.character(title)[[1L]]

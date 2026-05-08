@@ -27,10 +27,15 @@ describe('bootstrap profile: data viewer block', () => {
         expect(plotLocal).toBeGreaterThan(closeOfDvLocal);
     });
 
-    test('checks for the arrow package and skips when missing', () => {
+    test('defers the arrow package check until View is called', () => {
         const dvIdx = src.indexOf('# Raven data viewer block');
         const slice = src.slice(dvIdx);
-        expect(slice).toContain('requireNamespace("arrow"');
+        const viewIdx = slice.indexOf('.raven_view <- function');
+        const arrowCheckIdx = slice.indexOf('requireNamespace("arrow"');
+        const assignIdx = slice.indexOf('assign("View"');
+        expect(viewIdx).toBeGreaterThan(-1);
+        expect(arrowCheckIdx).toBeGreaterThan(viewIdx);
+        expect(assignIdx).toBeGreaterThan(arrowCheckIdx);
     });
 
     test('overrides View in globalenv', () => {
@@ -67,16 +72,16 @@ describe('bootstrap profile: data viewer block', () => {
         expect(slice).toContain('RAVEN_DATA_VIEWER_DIR');
     });
 
-    test('checks RAVEN_DATA_VIEWER_DIR BEFORE the arrow requireNamespace check', () => {
-        // The data viewer being disabled must not fire the "install arrow"
-        // message at terminal startup.
+    test('checks RAVEN_DATA_VIEWER_DIR before installing the View override', () => {
+        // The data viewer being disabled must not install Raven's View()
+        // override.
         const dvIdx = src.indexOf('# Raven data viewer block');
         const slice = src.slice(dvIdx);
         const dirCheckIdx = slice.indexOf('RAVEN_DATA_VIEWER_DIR');
-        const arrowCheckIdx = slice.indexOf('requireNamespace("arrow"');
+        const assignIdx = slice.indexOf('assign("View"');
         expect(dirCheckIdx).toBeGreaterThan(-1);
-        expect(arrowCheckIdx).toBeGreaterThan(-1);
-        expect(dirCheckIdx).toBeLessThan(arrowCheckIdx);
+        expect(assignIdx).toBeGreaterThan(-1);
+        expect(dirCheckIdx).toBeLessThan(assignIdx);
     });
 
     test('panelName truncation does not double-append the ellipsis', () => {

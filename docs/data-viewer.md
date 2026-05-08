@@ -119,8 +119,8 @@ directory is swept of files older than 24 hours.
 ## Requirements
 
 - The R [`arrow`](https://arrow.apache.org/docs/r/) package
-  (`install.packages("arrow")`). If it's missing, the bootstrap logs
-  a one-time warning and `View()` retains its default base behavior.
+  (`install.packages("arrow")`). If it's missing, Raven reports that
+  requirement when you call `View()`.
 - A Raven-managed R terminal (the standard "R" terminal profile in
   Raven, or one launched via Raven's send-to-R commands). Plain R
   terminals you opened outside Raven won't have the override
@@ -132,7 +132,7 @@ directory is swept of files older than 24 hours.
   was started by Raven (the terminal profile dropdown's "R (Raven)"
   entry, or via send-to-R). Confirm `requireNamespace("arrow")`
   returns `TRUE`. Check `raven.dataViewer.enabled` is true.
-- **"data viewer requires the 'arrow' package" message.** Run
+- **"Raven data viewer requires the 'arrow' package" message.** Run
   `install.packages("arrow")` in the same R installation.
 - **The `Labels` toggle doesn't change a column.** The column has no
   label metadata. For `haven_labelled` columns, this means
