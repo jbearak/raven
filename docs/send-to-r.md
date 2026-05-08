@@ -158,3 +158,33 @@ bootstrap profile via `R_PROFILE_USER`.
 - **httpgd console message about installing or upgrading.** Follow the printed
   `install.packages("httpgd")` instructions. Plots fall back to R's default
   graphics device until httpgd is available.
+
+## Data Viewer
+
+When `raven.dataViewer.enabled` is `true` (the default), Raven overrides R's
+`View()` so calls in a Raven-managed R terminal open in a virtualized grid
+panel that scales smoothly to multi-million-row data frames.
+
+```r
+View(mtcars)
+View(head(iris, 50))
+View(my_df, "Custom panel name")
+```
+
+Other classes raise an error in R, mirroring Positron:
+
+```r
+> View(1)
+Error in `View()`:
+! Can't `View()` an object of class `numeric`
+```
+
+The toolbar offers a Labels toggle (factor codes ↔ levels, plus
+`haven_labelled` value labels), a Format toggle with a digits dropdown,
+and a Columns popover for hide/show. `Cmd/Ctrl+C` copies a rectangular
+selection as TSV honoring the active toggles.
+
+Requires the [`arrow`](https://arrow.apache.org/docs/r/) R package.
+
+See [docs/data-viewer.md](./data-viewer.md) for full settings and
+behavior.

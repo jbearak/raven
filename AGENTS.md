@@ -13,6 +13,7 @@ User-facing:
 - `docs/diagnostics.md`
 - `docs/indentation.md`
 - `docs/send-to-r.md`
+- `docs/data-viewer.md`
 - `docs/help-viewer.md`
 - `docs/document-outline.md`
 - `docs/configuration.md`
