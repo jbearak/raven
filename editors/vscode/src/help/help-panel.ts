@@ -171,7 +171,14 @@ export class HelpPanel {
         const nonce = crypto.randomBytes(16).toString('base64');
         panel.webview.html = build_html(panel.webview, this.context.extensionUri, nonce);
         panel.webview.onDidReceiveMessage((msg) => this.on_webview_message(msg));
+        // Capture `panel` in the closure so the listener is a no-op when this
+        // panel is no longer the active one (e.g. after
+        // update_resource_roots_if_needed dispose-and-recreates internally).
+        // Otherwise an internal recreate would null this.panel after
+        // create_panel set it to the new panel, and would notify
+        // options.onDisposed even though the HelpPanel is still alive.
         panel.onDidDispose(() => {
+            if (this.panel !== panel) return;
             this.panel = null;
             this.theme_sub?.dispose();
             this.theme_sub = null;
@@ -283,20 +290,20 @@ export class HelpPanel {
         }
         const is_subset = lib_paths.every((p) => this.current_lib_paths.includes(p));
         if (is_subset) return;
-        // Dispose and recreate with expanded roots. onDisposed fires, which
-        // would normally notify the owner — suppress that by temporarily
-        // unlinking the onDisposed hook here by directly disposing and
-        // recreating (the panel field is reset in the dispose listener, which
-        // fires synchronously in most VS Code environments). We update
-        // current_lib_paths first so create_panel sees the new value.
+        // Dispose-and-recreate is required because VS Code does not allow
+        // mutating localResourceRoots after panel creation. The
+        // onDidDispose listener captures the old `panel` in its closure
+        // and skips its body when `this.panel !== panel`, so the recreate
+        // below safely replaces the internal panel without notifying
+        // options.onDisposed(). We dispose the theme listener before
+        // create_panel overwrites it; otherwise the old subscription
+        // would leak (the listener bail-out also skips theme_sub.dispose()).
         this.current_lib_paths = lib_paths;
-        // Dispose the old panel. The onDidDispose listener sets this.panel =
-        // null and calls options.onDisposed(), but we immediately recreate
-        // below, so the caller (the owner's singleton ref) will remain valid.
-        this.panel.dispose();
-        // panel is now null (set by onDidDispose synchronously or async).
-        // Recreate with the new roots.
+        const old_panel = this.panel;
+        this.theme_sub?.dispose();
+        this.theme_sub = null;
         this.create_panel(this.current_lib_paths);
+        old_panel.dispose();
     }
 
     private post(msg: ExtensionToWebviewMessage): void {
