@@ -144,11 +144,16 @@ impl HelpCache {
     ///
     /// **Note:** This method blocks on R subprocess I/O. Callers on an async
     /// runtime should use `tokio::task::spawn_blocking`.
-    pub fn get_or_fetch(&self, topic: &str, package: Option<&str>) -> Option<String> {
+    pub fn get_or_fetch(
+        &self,
+        topic: &str,
+        package: Option<&str>,
+        r_path: &std::path::Path,
+    ) -> Option<String> {
         if let Some(cached) = self.get(topic, package) {
             return cached;
         }
-        let result = get_help(topic, package);
+        let result = get_help(topic, package, r_path);
         self.insert(topic, package, result.clone());
         result
     }
@@ -169,6 +174,7 @@ impl HelpCache {
         &self,
         topic: &str,
         package: Option<&str>,
+        r_path: &std::path::Path,
     ) -> Option<HashMap<String, String>> {
         let key = cache_key(topic, package);
 
@@ -182,7 +188,7 @@ impl HelpCache {
         }
 
         // Cache miss — fetch help text and parse arguments
-        let help_text = self.get_or_fetch(topic, package);
+        let help_text = self.get_or_fetch(topic, package, r_path);
         let args = match help_text {
             Some(text) => {
                 let map = extract_arguments_from_help(&text);
@@ -344,12 +350,24 @@ fn kill_process_by_pid(_pid: u32) {
 ///
 /// ```no_run
 /// // Attempt to get help for `mean` from the base package
-/// if let Some(text) = raven::help::get_help("mean", Some("base")) {
+/// # let r_path = std::path::Path::new("R");
+/// if let Some(text) = raven::help::get_help("mean", Some("base"), r_path) {
 ///     assert!(text.contains("Usage:"));
 /// }
 /// ```
-pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
+pub fn get_help(topic: &str, package: Option<&str>, r_path: &std::path::Path) -> Option<String> {
     log::trace!("get_help: topic={}, package={:?}", topic, package);
+
+    if !super::validate::is_valid_help_topic(topic) {
+        log::trace!("get_help: topic {:?} failed validation", topic);
+        return None;
+    }
+    if let Some(p) = package {
+        if !crate::r_subprocess::is_valid_package_name(p) {
+            log::trace!("get_help: package {:?} failed validation", p);
+            return None;
+        }
+    }
 
     let r_code = r#"
 args <- commandArgs(trailingOnly = TRUE)
@@ -364,7 +382,7 @@ txt <- capture.output(
 cat(paste(txt, collapse = "\n"))
 "#;
 
-    let mut cmd = Command::new("R");
+    let mut cmd = Command::new(r_path);
     cmd.args([
         "--slave",
         "--no-save",
@@ -592,14 +610,19 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
 /// ```no_run
 /// use raven::help::get_function_signature;
 ///
-/// let sig = get_function_signature("mean", "base");
+/// # let r_path = std::path::Path::new("R");
+/// let sig = get_function_signature("mean", "base", r_path);
 /// if let Some(s) = sig {
 ///     println!("{}", s);
 /// }
 /// ```
 #[allow(dead_code)] // Used in tests, may be useful in the future
-pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
-    let help_text = get_help(topic, Some(package))?;
+pub fn get_function_signature(
+    topic: &str,
+    package: &str,
+    r_path: &std::path::Path,
+) -> Option<String> {
+    let help_text = get_help(topic, Some(package), r_path)?;
     extract_signature_from_help(&help_text)
 }
 
@@ -1163,11 +1186,13 @@ Arguments:
         // get_or_fetch should return cached content without calling get_help().
         // We verify this by pre-populating the cache with synthetic help text
         // that R would never produce, then checking get_or_fetch returns it.
+        // r_path is required by the signature but never invoked on a cache hit.
         let cache = HelpCache::with_max_entries(10);
         let synthetic = "SYNTHETIC_HELP_TEXT_NOT_FROM_R";
         cache.insert("fake_topic", Some("fake_pkg"), Some(synthetic.to_string()));
 
-        let result = cache.get_or_fetch("fake_topic", Some("fake_pkg"));
+        let dummy_r = std::path::Path::new("R");
+        let result = cache.get_or_fetch("fake_topic", Some("fake_pkg"), dummy_r);
         assert_eq!(
             result,
             Some(synthetic.to_string()),
@@ -1181,7 +1206,14 @@ Arguments:
         // cache the negative result so subsequent calls don't spawn R again.
         let cache = HelpCache::with_max_entries(10);
 
-        let _ = cache.get_or_fetch("no_such_func", Some("nonexistent_pkg_xyzzy"));
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
+        let _ = cache.get_or_fetch("no_such_func", Some("nonexistent_pkg_xyzzy"), &r);
 
         let cached = cache.get("no_such_func", Some("nonexistent_pkg_xyzzy"));
         assert_eq!(
@@ -1196,6 +1228,13 @@ Arguments:
         // End-to-end test: a negative entry expires after TTL, and a subsequent
         // get_or_fetch() re-populates the cache (rather than returning stale data
         // or permanently treating the topic as missing).
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
+        };
         let cache = HelpCache::with_max_entries_and_ttl(10, Duration::from_millis(50));
 
         // Simulate a failed lookup by inserting a negative entry directly
@@ -1219,7 +1258,7 @@ Arguments:
 
         // get_or_fetch() should re-fetch from R (which will fail again for this
         // fake package) and re-populate the cache with a fresh negative entry
-        let result = cache.get_or_fetch("some_func", Some("nonexistent_pkg_xyzzy"));
+        let result = cache.get_or_fetch("some_func", Some("nonexistent_pkg_xyzzy"), &r);
         assert!(
             result.is_none(),
             "R should still not find this fake package"
@@ -1555,15 +1594,17 @@ Value:
 "#;
         cache.insert("test_fn", Some("test_pkg"), Some(help_text.to_string()));
 
-        // First call should parse and cache
-        let args1 = cache.get_arguments("test_fn", Some("test_pkg"));
+        // First call should parse and cache; r_path is required by signature
+        // but never invoked since the help text is already in the cache.
+        let dummy_r = std::path::Path::new("R");
+        let args1 = cache.get_arguments("test_fn", Some("test_pkg"), dummy_r);
         assert!(args1.is_some());
         let args1 = args1.unwrap();
         assert_eq!(args1.len(), 2);
         assert_eq!(args1.get("x").unwrap(), "first arg.");
 
         // Second call should return cached result (same content)
-        let args2 = cache.get_arguments("test_fn", Some("test_pkg"));
+        let args2 = cache.get_arguments("test_fn", Some("test_pkg"), dummy_r);
         assert!(args2.is_some());
         assert_eq!(args2.unwrap(), args1);
     }
@@ -1576,8 +1617,10 @@ Value:
         let help_text = "Test\n\nDescription:\n\n     A test.\n\nValue:\n\n     Result.\n";
         cache.insert("no_args_fn", Some("pkg"), Some(help_text.to_string()));
 
-        // Should return None and cache the negative result
-        let args = cache.get_arguments("no_args_fn", Some("pkg"));
+        // Should return None and cache the negative result; r_path never invoked
+        // since the help text (which has no Arguments section) is pre-populated.
+        let dummy_r = std::path::Path::new("R");
+        let args = cache.get_arguments("no_args_fn", Some("pkg"), dummy_r);
         assert!(args.is_none());
 
         // Verify the negative result is cached (check arguments cache directly)
@@ -1600,8 +1643,9 @@ Value:
         let help_text = "Test\n\nDescription:\n\n     A test.\n\nArguments:\n\n       x: an arg.\n\nValue:\n\n     Result.\n";
         cache1.insert("fn1", Some("pkg"), Some(help_text.to_string()));
 
-        // Fetch arguments through clone
-        let args = cache2.get_arguments("fn1", Some("pkg"));
+        // Fetch arguments through clone; r_path never invoked since cache is pre-populated.
+        let dummy_r = std::path::Path::new("R");
+        let args = cache2.get_arguments("fn1", Some("pkg"), dummy_r);
         assert!(args.is_some());
 
         // Verify it's visible through original

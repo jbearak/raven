@@ -3507,10 +3507,16 @@ impl LanguageServer for Backend {
             .iter()
             .map(|(uri, doc)| (uri.clone(), doc.text()))
             .collect();
+        // Resolve R executable path; falls back to "R" (PATH lookup) when not configured.
+        let r_path: std::path::PathBuf = state
+            .cross_file_config
+            .packages_r_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("R"));
         drop(state);
         // Run in spawn_blocking since get_help() calls R subprocess (blocking I/O)
         match tokio::task::spawn_blocking(move || {
-            handlers::completion_item_resolve(item, &help_cache, &document_contents)
+            handlers::completion_item_resolve(item, &help_cache, &document_contents, &r_path)
         })
         .await
         {
