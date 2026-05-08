@@ -282,6 +282,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_returning_uncacheable_error_does_not_poison_in_flight() {
+        // Regression: if the Owner returns a non-cacheable error (e.g. the
+        // outer `tokio::time::timeout` mapped to `HelpHtmlError::Timeout`),
+        // the Owner branch must still remove the `in_flight` entry and
+        // broadcast so subsequent callers start a fresh fetch instead of
+        // subscribing to a sender that no surviving clone will ever fire.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let c = Arc::new(HtmlHelpCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let calls1 = calls.clone();
+        let res1 = c
+            .get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls1.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Mirror what the production fetch closure returns when
+                    // its inner `tokio::time::timeout` fires: a non-cacheable
+                    // `Timeout` error.
+                    Err::<HelpHtml, _>(HelpHtmlError::Timeout)
+                }
+            })
+            .await;
+        assert!(matches!(res1, Err(HelpHtmlError::Timeout)));
+
+        // After the Owner returned, in_flight must be empty and the LRU must
+        // not have cached the Timeout (it's classified as non-cacheable).
+        assert!(c.in_flight.lock().unwrap().is_empty(), "in_flight must be cleaned up after Err(Timeout)");
+        assert!(c.get("filter", Some("dplyr")).is_none(), "Timeout must not be LRU-cached");
+
+        // A second caller for the same key must trigger a fresh fetch (not
+        // hang on a subscriber waiting for a sender that won't ever fire).
+        let calls2 = calls.clone();
+        let res2 = c
+            .get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await;
+        assert!(matches!(res2, Ok(_)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "second caller must run a fresh fetch — Owner cleanup must have removed the in_flight entry"
+        );
+    }
+
+    #[tokio::test]
     async fn drain_during_inflight_does_not_evict_new_owner() {
         // Regression: when `drain()` ran mid-fetch, the original Owner's
         // unconditional `map.remove(&key)` would also evict the next Owner's

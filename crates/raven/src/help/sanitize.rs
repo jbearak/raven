@@ -165,10 +165,15 @@ fn build_ammonia_sanitized(html: &str) -> String {
     // global url_schemes (needed for `<img src>`). `data:` link navigation
     // is a known XSS / phishing vector and the CSP / click handler are
     // secondary defenses; the sanitizer should be the primary gate.
+    //
+    // Compare on `as_bytes()` to keep the prefix check UTF-8-safe — R help
+    // legitimately ships hrefs with non-ASCII bytes (e.g. relative links
+    // like `doc/é`), and indexing the `&str` directly with `[..5]` would
+    // panic if byte 5 fell inside a multibyte character.
     b.attribute_filter(|element, attribute, value| {
         if element.eq_ignore_ascii_case("a") && attribute.eq_ignore_ascii_case("href") {
-            let trimmed = value.trim_start();
-            if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("data:") {
+            let bytes = value.trim_start().as_bytes();
+            if bytes.len() >= 5 && bytes[..5].eq_ignore_ascii_case(b"data:") {
                 return None;
             }
         }
@@ -316,6 +321,30 @@ mod tests {
             "data: src on <img> must be preserved: {}",
             out
         );
+    }
+
+    #[test]
+    fn allows_non_ascii_href_without_panic() {
+        // Regression: an earlier version did `trimmed[..5]` on the href,
+        // which is a byte slice — for hrefs whose first non-ASCII char
+        // straddles byte index 5 (e.g. "doc/é", 6 bytes UTF-8) it would
+        // panic inside ammonia's attribute filter and turn a valid help
+        // page into a render failure. R help legitimately emits non-ASCII
+        // relative hrefs, so the prefix check must be UTF-8-safe.
+        let cases = [
+            r##"<a href="doc/é">x</a>"##,
+            r##"<a href="#xxxé">x</a>"##,
+            r##"<a href="café">x</a>"##,
+            r##"<a href="日本語">x</a>"##,
+        ];
+        for html in cases {
+            // Must not panic and must preserve the anchor tag.
+            let out = sanitize_help_html(html);
+            assert!(
+                out.contains("<a "),
+                "non-ASCII href must survive sanitization: {html} -> {out}"
+            );
+        }
     }
 
     #[test]

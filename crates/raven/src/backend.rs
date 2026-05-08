@@ -1567,32 +1567,43 @@ impl LanguageServer for Backend {
                     return Ok(Some(help_html_to_json(cached)));
                 }
 
-                // Outer `tokio::time::timeout` belt-and-suspenders: the inner
-                // `get_help_html` already has a 10-second watchdog over its R
-                // subprocess, but per AGENTS.md every R subprocess call awaited
-                // by an LSP handler must additionally be bounded by
-                // `HELP_LOOKUP_TIMEOUT` so an unforeseen lock or kill failure
-                // can't freeze the execute_command dispatcher.
-                let fetch = cache.get_or_fetch(topic, package, move |t, p| async move {
-                    tokio::task::spawn_blocking(move || {
-                        crate::help::get_help_html(&t, p.as_deref(), &r_path)
+                // Belt-and-suspenders timeout: bound the R subprocess await
+                // with `HELP_LOOKUP_TIMEOUT` so an unforeseen lock or kill
+                // failure inside `get_help_html`'s own watchdog can't freeze
+                // the execute_command dispatcher.
+                //
+                // The timeout MUST live inside the fetch closure rather than
+                // around the outer `cache.get_or_fetch(...).await`. Wrapping
+                // the outer call would, on timeout, drop the `get_or_fetch`
+                // future mid-flight — and if this caller happens to be the
+                // single-flight Owner, its post-fetch cleanup (remove the
+                // `in_flight` entry, broadcast to subscribers) never runs.
+                // The map's surviving `Sender` clone keeps the broadcast
+                // channel open with no remaining sender to ever publish,
+                // poisoning the key until `drain()` clears it. Putting the
+                // timeout inside guarantees the Owner always reaches its
+                // cleanup branch and broadcasts `Err(Timeout)` to any
+                // waiting subscribers. `Timeout` is non-cacheable, so the
+                // next caller starts a fresh fetch.
+                let result = cache
+                    .get_or_fetch(topic, package, move |t, p| async move {
+                        let task = tokio::task::spawn_blocking(move || {
+                            crate::help::get_help_html(&t, p.as_deref(), &r_path)
+                        });
+                        match tokio::time::timeout(
+                            crate::handlers::HELP_LOOKUP_TIMEOUT,
+                            task,
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(_)) => Err(crate::help::HelpHtmlError::RenderFailed {
+                                message: "spawn_blocking joined with error".into(),
+                            }),
+                            Err(_) => Err(crate::help::HelpHtmlError::Timeout),
+                        }
                     })
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(crate::help::HelpHtmlError::RenderFailed {
-                            message: "spawn_blocking joined with error".into(),
-                        })
-                    })
-                });
-                let result = match tokio::time::timeout(
-                    crate::handlers::HELP_LOOKUP_TIMEOUT,
-                    fetch,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(crate::help::HelpHtmlError::Timeout),
-                };
+                    .await;
 
                 Ok(Some(help_html_to_json(result)))
             }
