@@ -56,7 +56,7 @@
         title="Number of digits when Format is on."
     >
         {#each Array.from({ length: 16 }, (_, i) => i) as d (d)}
-            <option value={d}>{d}</option>
+            <option value={d}>{d} digits</option>
         {/each}
     </select>
 

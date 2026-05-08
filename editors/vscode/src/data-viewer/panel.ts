@@ -29,6 +29,8 @@ export class DataViewerPanel {
     private reader: ArrowSliceReader;
     private filePath: string;
     private generation = 0;
+    private webviewReady = false;
+    private webviewInitialized = false;
     private dictionaries: Record<number, string[]> = {};
     private columns: ColumnSchema[] = [];
     private layoutHash = '';
@@ -78,7 +80,6 @@ export class DataViewerPanel {
         const panel = new DataViewerPanel(
             panelName, webviewPanel, reader, filePath, store, settings, disposeHook,
         );
-        await panel.sendInit();
         return panel;
     }
 
@@ -90,41 +91,59 @@ export class DataViewerPanel {
         const prevPath = this.filePath;
         this.reader = reader;
         this.filePath = filePath;
-        await this.sendReplace();
+        if (this.webviewReady) await this.sendReplace();
         await prevReader.close();
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
     }
 
     reveal(): void { this.webviewPanel.reveal(); }
 
-    private async sendInit(): Promise<void> {
-        this.columns = this.reader.schema.columns;
-        this.layoutHash = schemaHash(this.columns);
-        this.layout = (await this.store.load(this.panelName, this.layoutHash))
+    private async sendInit(): Promise<boolean> {
+        const generation = this.generation;
+        const reader = this.reader;
+        const columns = reader.schema.columns;
+        const layoutHash = schemaHash(columns);
+        const layout = (await this.store.load(this.panelName, layoutHash))
             ?? { columnWidths: {}, hiddenColumns: [] };
+        if (generation !== this.generation || reader !== this.reader) return false;
+        this.columns = columns;
+        this.layoutHash = layoutHash;
+        this.layout = layout;
         this.dictionaries = this.collectDictionaries();
         const msg: ExtensionToWebview = {
             type: 'init',
-            panelGeneration: this.generation,
-            nrow: this.reader.nrow,
+            panelGeneration: generation,
+            nrow: reader.nrow,
             columns: this.columns,
             layout: this.layout,
             settings: this.settings,
             dictionaries: this.dictionaries,
         };
         await this.webviewPanel.webview.postMessage(msg);
+        this.webviewInitialized = true;
+        return true;
     }
 
     private async sendReplace(): Promise<void> {
-        this.columns = this.reader.schema.columns;
-        this.layoutHash = schemaHash(this.columns);
-        this.layout = (await this.store.load(this.panelName, this.layoutHash))
+        if (!this.webviewInitialized) {
+            await this.sendInit();
+            return;
+        }
+        const generation = this.generation;
+        const reader = this.reader;
+        const columns = reader.schema.columns;
+        const layoutHash = schemaHash(columns);
+        const layout = (await this.store.load(this.panelName, layoutHash))
             ?? { columnWidths: {}, hiddenColumns: [] };
+        if (generation !== this.generation || reader !== this.reader) return;
+        this.columns = columns;
+        this.layoutHash = layoutHash;
+        this.layout = layout;
         this.dictionaries = this.collectDictionaries();
         const msg: ExtensionToWebview = {
             type: 'replace',
-            panelGeneration: this.generation,
-            nrow: this.reader.nrow,
+            panelGeneration: generation,
+            nrow: reader.nrow,
             columns: this.columns,
             layout: this.layout,
             dictionaries: this.dictionaries,
@@ -141,6 +160,11 @@ export class DataViewerPanel {
     }
 
     private async handle(m: WebviewToExtension): Promise<void> {
+        if (m.type === 'webviewReady') {
+            this.webviewReady = true;
+            await this.sendInit();
+            return;
+        }
         if (m.panelGeneration !== this.generation) return;
         // Capture generation BEFORE any await so a replace mid-fetch causes
         // us to drop the stale response rather than post under the new

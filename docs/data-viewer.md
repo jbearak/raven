@@ -37,7 +37,7 @@ expression opens a new tab.
 ## Toolbar
 
 ```text
-[Labels: off|on] [Format: off|on] [digits ▾] | [Columns ▾] | rows: 12,345  cols: 17/24
+[Labels: off|on] [Format: off|on] [3 digits ▾] | [Columns ▾] | rows: 12,345  cols: 17/24
 ```
 
 ### Labels

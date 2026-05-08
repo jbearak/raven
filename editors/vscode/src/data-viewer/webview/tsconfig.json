@@ -6,7 +6,8 @@
         "noEmit": true,
         "types": [],
         "module": "ESNext",
-        "moduleResolution": "Bundler"
+        "moduleResolution": "Bundler",
+        "verbatimModuleSyntax": true
     },
     "include": ["**/*.ts", "../messages.ts", "../wire-format.ts", "../arrow-reader.ts"],
     "exclude": ["../../../node_modules"]

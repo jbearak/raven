@@ -1,11 +1,10 @@
 /**
  * Protocol types for the data-viewer postMessage channel.
  *
- * Every message in either direction carries the panel's monotonic
- * `panelGeneration`. Receivers drop messages tagged with an older
- * generation than the receiver's current one — this is how stale
- * `getRows` / `copy` / `labels` responses are filtered out after a
- * `replace`.
+ * Every message after the initial `webviewReady` handshake carries the
+ * panel's monotonic `panelGeneration`. Receivers drop messages tagged with
+ * an older generation than the receiver's current one — this is how stale
+ * `getRows` / `copy` / `labels` responses are filtered out after a `replace`.
  */
 
 import type { Cell } from './wire-format';
@@ -76,6 +75,9 @@ export type ExtensionToWebview =
     };
 
 export type WebviewToExtension =
+    | {
+        type: 'webviewReady';
+    }
     | {
         type: 'getRows';
         panelGeneration: number;

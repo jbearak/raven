@@ -13,11 +13,28 @@
     import { Selection } from './selection-model';
     import { formatCell } from './cell-render';
     import Toolbar from './Toolbar.svelte';
+    type PersistedState = {
+        panelGeneration: number;
+        nrow: number;
+        columns: ColumnSchema[];
+        dictionaries: Record<number, string[]>;
+        layout: Layout;
+        settings: Settings;
+        labelsOn: boolean;
+        formatOn: boolean;
+        digits: number;
+        visibleRows: Cell[][];
+        visibleRangeStart: number;
+    };
 
     interface Props {
-        vscode: { postMessage(msg: WebviewToExtension): void };
+        vscode: {
+            postMessage(msg: WebviewToExtension): void;
+            setState?(state: PersistedState): void;
+        };
+        initialState?: PersistedState;
     }
-    let { vscode }: Props = $props();
+    let { vscode, initialState: restored }: Props = $props();
 
     // ----- Panel state -----------------------------------------------------
     let panelGeneration = $state(0);
@@ -47,6 +64,22 @@
     /** Loaded windows in display: parallel to columnsForRender's order. */
     let visibleRows = $state<Cell[][]>([]);
     let visibleRangeStart = $state(0);
+    function restorePersistedState(state: PersistedState | undefined): void {
+        if (!state) return;
+        panelGeneration = state.panelGeneration;
+        nrow = state.nrow;
+        columns = state.columns;
+        dictionaries = state.dictionaries;
+        layout = state.layout;
+        settings = state.settings;
+        labelsOn = state.labelsOn;
+        formatOn = state.formatOn;
+        digits = state.digits;
+        visibleRows = state.visibleRows;
+        visibleRangeStart = state.visibleRangeStart;
+    }
+    // svelte-ignore state_referenced_locally
+    restorePersistedState(restored);
 
     // ----- Derived ---------------------------------------------------------
     const hiddenSet = $derived(new Set(layout.hiddenColumns));
@@ -93,12 +126,16 @@
             }
         };
         window.addEventListener('message', handler);
+        vscode.postMessage({ type: 'webviewReady' });
         return () => window.removeEventListener('message', handler);
     });
 
     function applyInitOrReplace(
         m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>,
     ): void {
+        const sameDataset =
+            m.nrow === nrow
+            && sameColumns(m.columns, columns);
         panelGeneration = m.panelGeneration;
         nrow = m.nrow;
         columns = m.columns;
@@ -110,10 +147,13 @@
         }
         rowCache.clear();
         resolvedLabels = {};
-        visibleRows = [];
-        visibleRangeStart = 0;
+        if (!sameDataset) {
+            visibleRows = [];
+            visibleRangeStart = 0;
+        }
         selection.clear();
         bumpSelection();
+        persistWebviewState();
         scheduleFetchVisible();
     }
 
@@ -131,6 +171,7 @@
         if (range.start === m.start && range.end === m.end) {
             visibleRows = m.rows;
             visibleRangeStart = m.start;
+            persistWebviewState();
         }
     }
 
@@ -166,12 +207,14 @@
         if (range.end <= range.start) {
             visibleRows = [];
             visibleRangeStart = range.start;
+            persistWebviewState();
             return;
         }
         const cached = rowCache.get(range.start, range.end);
         if (cached) {
             visibleRows = cached;
             visibleRangeStart = range.start;
+            persistWebviewState();
             return;
         }
         viewportGeneration += 1;
@@ -272,8 +315,29 @@
         // refetching.
         rowCache.clear();
         visibleRows = [];
+        persistWebviewState();
         scheduleFetchVisible();
     }
+
+    function persistWebviewState(): void {
+        vscode.setState?.({
+            panelGeneration,
+            nrow,
+            columns,
+            dictionaries,
+            layout,
+            settings,
+            labelsOn,
+            formatOn,
+            digits,
+            visibleRows,
+            visibleRangeStart,
+        });
+    }
+
+    $effect(() => {
+        persistWebviewState();
+    });
 
     function widthOf(index: number): number {
         return layout.columnWidths[index] ?? 120;
@@ -346,6 +410,16 @@
         const out: number[] = [];
         for (const i of all) if (i >= start && i < end) out.push(i);
         return out;
+    }
+
+    function sameColumns(a: ColumnSchema[], b: ColumnSchema[]): boolean {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i].name !== b[i].name || a[i].arrowType !== b[i].arrowType) {
+                return false;
+            }
+        }
+        return true;
     }
 </script>
 
