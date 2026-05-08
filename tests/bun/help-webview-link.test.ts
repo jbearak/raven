@@ -17,6 +17,19 @@ function makeEvent(target: EventTarget | null): {
 describe('webview link click', () => {
     // ---- raven-help:// → navigate ----
 
+    test('raven-help://topic/base/sum → navigate, plain pkg/topic', () => {
+        const a = makeAnchor('<a href="raven-help://topic/base/sum">x</a>');
+        const post = mock(() => {});
+        const ev = makeEvent(a);
+        const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
+        expect(handled).toBe(true);
+        expect(ev.preventDefault).toHaveBeenCalled();
+        expect(post).toHaveBeenCalledWith({
+            type: 'navigate',
+            payload: { topic: 'sum', package: 'base', anchor: null },
+        });
+    });
+
     test('raven-help:// → navigate, percent-decoded ([)', () => {
         const a = makeAnchor('<a href="raven-help://topic/base/%5B">x</a>');
         const post = mock(() => {});
@@ -227,6 +240,21 @@ describe('webview link click', () => {
 
     test('raven-help://topic//foo (empty pkg) → report-error', () => {
         const a = makeAnchor('<a href="raven-help://topic//foo">x</a>');
+        const post = mock(() => {});
+        const ev = makeEvent(a);
+        const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
+        expect(handled).toBe(true);
+        expect(ev.preventDefault).toHaveBeenCalled();
+        const call = (post as ReturnType<typeof mock>).mock.calls[0][0] as {
+            type: string;
+        };
+        expect(call.type).toBe('report-error');
+    });
+
+    test('raven-help://topic/base/%ZZ (invalid percent) → report-error', () => {
+        // Spec asks for a malformed URL that the URL parser/decoder rejects.
+        // %ZZ is not valid percent-encoding; decodeURIComponent throws URIError.
+        const a = makeAnchor('<a href="raven-help://topic/base/%ZZ">x</a>');
         const post = mock(() => {});
         const ev = makeEvent(a);
         const handled = classifyAndDispatch(ev, a.getAttribute('href'), false, post);
