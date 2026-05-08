@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, mock, afterEach } from 'bun:test';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
@@ -157,5 +157,22 @@ describe('ArrowSliceReader: high-cardinality dictionary fallback', () => {
         expect(out[0]).toBe('zip-000');
         expect(out[1]).toBe('zip-001');
         expect(out[5]).toBe('zip-005');
+    });
+});
+
+describe('ArrowSliceReader: large-file guard', () => {
+    // Regression test: open() must not use readFile(), which Node.js caps at
+    // ~2 GiB. If readFile is ever reintroduced it will throw here, reproducing
+    // the "File size greater than 2 GiB" error seen during smoke testing.
+    afterEach(() => { mock.restore(); });
+
+    test('open() succeeds even when readFile is broken', async () => {
+        mock.module('node:fs/promises', () => ({
+            ...require('node:fs/promises'),
+            readFile: () => Promise.reject(new Error('File size (4000394954) is greater than 2 GiB')),
+        }));
+        const r = await ArrowSliceReader.open(FIX('multibatch.arrow'));
+        expect(r.nrow).toBeGreaterThan(0);
+        await r.close();
     });
 });
