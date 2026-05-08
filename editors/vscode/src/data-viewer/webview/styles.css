@@ -253,4 +253,8 @@ html, body, #root {
 }
 .header-row .cell.rowname-col {
     z-index: 3; /* above sticky body cells */
+    /* rowColWidth uses ch units; keep this font weight aligned with body
+       row-number cells so the sticky header doesn't shift every header
+       separator slightly to the right. */
+    font-weight: 400;
 }
