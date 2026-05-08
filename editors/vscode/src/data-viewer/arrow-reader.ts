@@ -124,10 +124,23 @@ export class ArrowSliceReader {
         const batchStarts = new Uint32Array(starts);
         const nrow = acc;
 
+        // Schema-level "raven.fields" KV: a JSON map { columnName: { metaKey: metaValue } }.
+        // R arrow's public API doesn't expose per-field metadata writes, so
+        // the bootstrap profile encodes per-column metadata into this single
+        // schema-level entry. Per-field Field.metadata (when present from
+        // any non-R producer) takes precedence.
+        const schemaMd: Map<string, string> | undefined = reader.schema.metadata;
+        const ravenFieldsRaw = schemaMd?.get('raven.fields');
+        const ravenFields: Record<string, Record<string, string>> =
+            ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
+
         // Pass 2: build the schema, sampling first-batch dictionaries for
         // dict-encoded columns.
         const cols: ColumnSchema[] = reader.schema.fields.map((f: any) => {
             const md: Map<string, string> = f.metadata;
+            const fieldMd = ravenFields[f.name] ?? {};
+            const lookup = (key: string): string | undefined =>
+                md.get(key) ?? fieldMd[key];
             const arrowType = String(f.type);
             const isDict = arrowType.startsWith('Dictionary');
             let dictLen = 0;
@@ -142,16 +155,16 @@ export class ArrowSliceReader {
                 }
             }
             const variableLabel =
-                md.get('raven.variable_label') ?? md.get('label') ?? undefined;
-            const valueLabelsRaw = md.get('raven.value_labels');
+                lookup('raven.variable_label') ?? md.get('label') ?? undefined;
+            const valueLabelsRaw = lookup('raven.value_labels');
             const valueLabels = valueLabelsRaw ? safeParseJson(valueLabelsRaw) : undefined;
             return {
                 name: f.name,
                 arrowType,
-                originalClass: md.get('raven.original_class') ?? undefined,
+                originalClass: lookup('raven.original_class') ?? undefined,
                 variableLabel,
                 valueLabels,
-                formatStata: md.get('raven.format') ?? undefined,
+                formatStata: lookup('raven.format') ?? undefined,
                 dictionary,
                 dictionaryShipped: isDict && dictLen <= threshold,
                 isInteger: /^Int\d+$/.test(arrowType),
@@ -264,8 +277,8 @@ function upperBoundLE(starts: Uint32Array, v: number): number {
     return ans;
 }
 
-function safeParseJson(s: string): Record<string, string> | undefined {
-    try { return JSON.parse(s); } catch { return undefined; }
+function safeParseJson<T = any>(s: string): T | undefined {
+    try { return JSON.parse(s) as T; } catch { return undefined; }
 }
 
 /** True iff the i-th cell of `data` is null. Arrow JS sometimes ships an

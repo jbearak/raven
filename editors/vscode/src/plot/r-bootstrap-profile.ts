@@ -243,15 +243,28 @@ local({
     }
 
     .raven_write_arrow <- function(df, file_path) {
-        # Build a Table; then attach per-field metadata.
+        # Per-field metadata isn't settable through the public R arrow API
+        # (Field$create's metadata arg raises "metadata= is currently
+        # ignored" through 2025-era versions). Encode per-field metadata
+        # as a single JSON blob attached to the schema-level KV metadata
+        # under the key "raven.fields"; the JS reader unpacks it into
+        # ColumnSchema fields.
         tbl <- arrow::arrow_table(df)
-        for (i in seq_along(tbl$schema$fields)) {
-            fld <- tbl$schema$fields[[i]]
-            md <- .raven_field_metadata(fld$name, df[[fld$name]])
-            if (length(md) > 0L) {
-                new_fld <- arrow::field(fld$name, fld$type, metadata = md)
-                tbl$schema$fields[[i]] <- new_fld
-            }
+        per_field <- list()
+        for (nm in names(df)) {
+            md <- .raven_field_metadata(nm, df[[nm]])
+            if (length(md) > 0L) per_field[[nm]] <- md
+        }
+        if (length(per_field) > 0L) {
+            entries <- vapply(names(per_field), function(nm) {
+                fld <- per_field[[nm]]
+                kv <- vapply(names(fld), function(k) {
+                    paste0(.raven_json_str(k), ":", .raven_json_str(fld[[k]]))
+                }, character(1L))
+                paste0(.raven_json_str(nm), ":{", paste(kv, collapse = ","), "}")
+            }, character(1L))
+            json <- paste0("{", paste(entries, collapse = ","), "}")
+            tbl <- tbl$ReplaceSchemaMetadata(list("raven.fields" = json))
         }
         arrow::write_feather(tbl, file_path, chunk_size = 65536L)
     }
