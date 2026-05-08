@@ -3,12 +3,14 @@
 //! - `text` — plain Rd2txt rendering used by hover/completion.
 //! - `validate` — input validation for help topic names.
 
+mod cache;
 mod rewrite;
 mod sanitize;
 mod text;
 mod types;
 mod validate;
 
+pub use cache::HtmlHelpCache;
 pub use rewrite::rewrite_help_html;
 pub use sanitize::sanitize_help_html;
 pub use text::*;
