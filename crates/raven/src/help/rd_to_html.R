@@ -9,7 +9,11 @@ rd <- utils:::.getHelpFile(h)
 help_path <- as.character(h)
 help_dir <- dirname(help_path)
 resolved_pkg <- basename(dirname(help_dir))
-# "\\alias" in R source is \a (BEL) + "lias"; use "\\\\alias" for a literal backslash.
+# When this script is invoked via R -e, one level of backslash escaping
+# is stripped before R's parser sees the source. So "\\alias" arrives
+# as "\alias" — and \a is BEL, leaving "BEL+lias" rather than the
+# literal "\alias" we want. Use "\\\\alias" so the parser sees "\\alias"
+# (one literal backslash) after stripping.
 aliases <- vapply(
   Filter(function(x) attr(x, "Rd_tag") == "\\\\alias", rd),
   function(x) as.character(x[[1]]),

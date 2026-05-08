@@ -7,7 +7,9 @@ use std::path::PathBuf;
 pub struct HelpHtml {
     /// Canonical topic name (first `\alias` from the Rd object).
     pub topic: String,
-    /// Canonical package name (R's `attr(rd, "package")`).
+    /// Canonical package name. Derived from the help file path
+    /// (`basename(dirname(dirname(help_path)))` in `rd_to_html.R`) because
+    /// R 4.6+ no longer populates `attr(rd, "package")`.
     pub package: String,
     /// Title from the rendered HTML's first `<h2>`, or canonical topic name.
     pub title: String,
