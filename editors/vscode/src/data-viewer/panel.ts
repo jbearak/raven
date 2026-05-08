@@ -86,10 +86,12 @@ export class DataViewerPanel {
      *  is bumped so any in-flight reply is dropped. */
     async replace(reader: ArrowSliceReader, filePath: string): Promise<void> {
         this.generation += 1;
+        const prevReader = this.reader;
         const prevPath = this.filePath;
         this.reader = reader;
         this.filePath = filePath;
         await this.sendReplace();
+        await prevReader.close();
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
     }
 
@@ -258,6 +260,7 @@ export class DataViewerPanel {
     }
 
     private async dispose(): Promise<void> {
+        await this.reader.close();
         try { await fs.unlink(this.filePath); } catch { /* ignore */ }
         this.disposeHook();
     }

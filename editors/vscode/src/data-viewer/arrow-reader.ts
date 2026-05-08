@@ -2,18 +2,22 @@
  * ArrowSliceReader — opens one Apache Arrow IPC (file format) file and
  * serves row windows on demand.
  *
- * Loading model: the file is read into a Buffer at open time and handed
- * to apache-arrow's RecordBatchFileReader. Decoding of individual record
- * batches is lazy — only the requested batch's requested columns are
- * materialized into JS arrays. RSS is bounded by the file size plus the
- * decoded-batch LRU cache.
+ * Loading model: the file is opened as a FileHandle and handed to
+ * apache-arrow's AsyncRecordBatchFileReader, which reads only the IPC
+ * footer at open time and issues seek+read syscalls per batch on demand.
+ * The full file is never loaded into memory, so files larger than the
+ * Node.js Buffer 2 GiB limit are handled correctly. RSS is bounded by
+ * the decoded-batch LRU cache rather than the file size.
+ *
+ * Call close() when done to release the underlying FileHandle.
  *
  * The exact API surface used here is pinned by
  * tests/bun/data-viewer-arrow-spike.test.ts.
  */
 
-import { readFile } from 'node:fs/promises';
-import { RecordBatchFileReader } from 'apache-arrow';
+import { open as fsOpen } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import { AsyncRecordBatchFileReader } from 'apache-arrow';
 import {
     Cell,
     encodeNumber,
@@ -82,6 +86,7 @@ export class ArrowSliceReader {
     onBatchLoad?: (batchIndex: number) => void;
 
     private readonly reader: any;
+    private readonly fileHandle: FileHandle;
     /** Cache of loaded record batches so repeat reads of the same window
      *  don't re-decode. Keyed by batch index; bounded by entry count
      *  (decoded batches are typed-array-backed and modest in size). */
@@ -89,8 +94,9 @@ export class ArrowSliceReader {
     private static readonly BATCH_CACHE_MAX = 16;
     private latestViewportGen = 0;
 
-    private constructor(reader: any, schema: ReaderSchema, nrow: number, batchStarts: Uint32Array) {
+    private constructor(reader: any, fileHandle: FileHandle, schema: ReaderSchema, nrow: number, batchStarts: Uint32Array) {
         this.reader = reader;
+        this.fileHandle = fileHandle;
         this.schema = schema;
         this.nrow = nrow;
         this.batchStarts = batchStarts;
@@ -99,15 +105,14 @@ export class ArrowSliceReader {
     /**
      * Open a file and pre-index its batches.
      *
-     * Throws if the file cannot be read or the IPC footer can't be parsed.
-     * Once opened, the reader owns the underlying byte buffer; later
-     * deletion of the file on disk doesn't affect reads.
+     * Throws if the file cannot be opened or the IPC footer can't be parsed.
+     * The FileHandle is kept open for the lifetime of the reader; call
+     * close() to release it. Files larger than the Node.js Buffer 2 GiB
+     * limit are supported because the file is never fully loaded into memory.
      */
     static async open(filePath: string, opts: OpenOptions = {}): Promise<ArrowSliceReader> {
-        // Asynchronous read: a multi-hundred-MB Arrow file would otherwise
-        // stall the VS Code extension host's event loop for the duration.
-        const buf = await readFile(filePath);
-        const reader = await (RecordBatchFileReader.from(buf) as any).open();
+        const fh = await fsOpen(filePath, 'r');
+        const reader = await (await (AsyncRecordBatchFileReader.from(fh) as any)).open();
         const threshold = opts.dictionaryThreshold ?? DEFAULT_DICTIONARY_THRESHOLD;
 
         // Pass 1: build batchStarts and pre-cache batches we need to count
@@ -117,9 +122,9 @@ export class ArrowSliceReader {
         const numBatches = reader.numRecordBatches;
         const starts: number[] = [0];
         let acc = 0;
-        const firstBatch = numBatches > 0 ? reader.readRecordBatch(0) : null;
+        const firstBatch = numBatches > 0 ? await reader.readRecordBatch(0) : null;
         for (let i = 0; i < numBatches; i++) {
-            const b = i === 0 ? firstBatch : reader.readRecordBatch(i);
+            const b = i === 0 ? firstBatch : await reader.readRecordBatch(i);
             acc += b.numRows;
             starts.push(acc);
         }
@@ -175,6 +180,7 @@ export class ArrowSliceReader {
 
         return new ArrowSliceReader(
             reader,
+            fh,
             { columns: cols },
             nrow,
             batchStarts,
@@ -185,7 +191,11 @@ export class ArrowSliceReader {
         this.latestViewportGen = g;
     }
 
-    private getBatch(i: number): any {
+    async close(): Promise<void> {
+        await this.fileHandle.close();
+    }
+
+    private async getBatch(i: number): Promise<any> {
         const cached = this.batchCache.get(i);
         if (cached) {
             // LRU touch.
@@ -193,7 +203,7 @@ export class ArrowSliceReader {
             this.batchCache.set(i, cached);
             return cached;
         }
-        const b = this.reader.readRecordBatch(i);
+        const b = await this.reader.readRecordBatch(i);
         this.onBatchLoad?.(i);
         this.batchCache.set(i, b);
         while (this.batchCache.size > ArrowSliceReader.BATCH_CACHE_MAX) {
@@ -225,7 +235,7 @@ export class ArrowSliceReader {
             if (req.viewportGeneration < this.latestViewportGen) {
                 return { rows: [], stale: true };
             }
-            const batch = this.getBatch(bi);
+            const batch = await this.getBatch(bi);
             const batchRowStart = this.batchStarts[bi];
             const localLo = Math.max(0, start - batchRowStart);
             const localHi = Math.min(batch.numRows, end - batchRowStart);
@@ -252,7 +262,7 @@ export class ArrowSliceReader {
         const out: Record<number, string> = {};
         // Any batch that has the column will share the same dictionary
         // (we don't currently support per-batch dictionary deltas).
-        const batch = this.getBatch(0);
+        const batch = await this.getBatch(0);
         const child = batch.getChild(field.name);
         const dict = (child as any).data?.[0]?.dictionary;
         if (!dict) return out;
