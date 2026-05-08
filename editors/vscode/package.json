@@ -636,6 +636,35 @@
           ],
           "default": "beside",
           "description": "Initial editor column when the R help viewer first opens. Once you move the panel, Raven leaves it where you put it."
+        },
+        "raven.dataViewer.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the View() override for Raven-managed R terminals. When true, View(df) and View(matrix) open in a Raven data viewer panel. Other classes raise the Positron-style error. Requires the arrow R package."
+        },
+        "raven.dataViewer.missingValueStyle": {
+          "type": "string",
+          "enum": ["foreground", "background", "none"],
+          "enumDescriptions": [
+            "Color the cell text for NA / NaN.",
+            "Tint the cell background for NA / NaN.",
+            "Render missing values like any other cell."
+          ],
+          "default": "foreground",
+          "description": "How the data viewer highlights NA / NaN cells."
+        },
+        "raven.dataViewer.maxStoredLayouts": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 0,
+          "description": "Maximum number of persisted column-layout entries (per panel name × schema hash) before LRU eviction."
+        },
+        "raven.dataViewer.defaultDigits": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 15,
+          "description": "Initial digits used by the data viewer's Format toggle."
         }
       }
     }

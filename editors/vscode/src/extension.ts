@@ -22,6 +22,7 @@ import {
 } from './pathCompletionTriggers';
 import { register_r_terminal, register_send_to_r_commands } from './send-to-r';
 import { PlotServices } from './plot';
+import { registerDataViewer, dataViewerDirOf } from './data-viewer';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -157,8 +158,19 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // Plot services (session server + viewer panel) for managed R terminals.
     // Constructed before raven.restart registration so the closure has a live
     // reference, not just a temporal-dead-zone forward binding.
-    const plot_services = new PlotServices(context);
+    //
+    // The session server's loopback /view-data route only accepts files
+    // under the data-viewer storage directory; passing '' disables it.
+    const data_viewer_enabled = vscode.workspace.getConfiguration('raven.dataViewer')
+        .get<boolean>('enabled', true);
+    const plot_services = new PlotServices(
+        context,
+        data_viewer_enabled ? dataViewerDirOf(context) : '',
+    );
     active_plot_services = plot_services;
+    if (data_viewer_enabled) {
+        void registerDataViewer(context, plot_services.server, dataViewerDirOf(context));
+    }
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //
