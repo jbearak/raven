@@ -64,6 +64,10 @@ async function buildSvelteWebview(name, entry) {
                 'help-viewer',
                 path.join(root, 'src', 'help', 'webview', 'main.ts'),
             ),
+            buildSvelteWebview(
+                'data-viewer',
+                path.join(root, 'src', 'data-viewer', 'webview', 'main.ts'),
+            ),
         ]);
     } catch (err) {
         console.error(err);
