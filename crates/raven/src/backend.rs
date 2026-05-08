@@ -4742,6 +4742,15 @@ async fn run_libpath_consumer(
                     touched.len()
                 );
 
+                // Bust help caches before invalidating the package library so
+                // any concurrent hover/completion requests see a clean slate and
+                // re-fetch from R rather than returning stale HTML or text help.
+                {
+                    let state = state_arc.read().await;
+                    state.help_cache.drain();
+                    state.html_help_cache.drain();
+                }
+
                 // Invalidate the package cache and learn which combined_exports
                 // aggregates were dropped as a side effect. A document loading
                 // a meta-package like `tidyverse` needs revalidation when
@@ -4879,6 +4888,14 @@ async fn run_libpath_consumer(
                      force-republishing diagnostics",
                     allow_recovery
                 );
+
+                // The watcher is gone so we can no longer track installs or
+                // upgrades; any cached help content may now be stale.
+                {
+                    let state = state_arc.read().await;
+                    state.help_cache.drain();
+                    state.html_help_cache.drain();
+                }
 
                 let open_uris = prepare_dropped_recovery(&state_arc).await;
                 for uri in open_uris {

@@ -211,6 +211,24 @@ impl HelpCache {
         args
     }
 
+    /// Clear all cached help entries (positive, negative, and arguments).
+    ///
+    /// Called when libpath changes invalidate the help corpus (package install,
+    /// uninstall, or upgrade). Drops in-flight entries too — concurrent owner
+    /// tasks will simply have their broadcast subscribers see `RecvError::Closed`
+    /// once the senders are dropped, mapping to a transient `RenderFailed`.
+    pub fn drain(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.arguments.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.in_flight.lock() {
+            guard.clear();
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().map(|c| c.len()).unwrap_or(0)
@@ -1846,5 +1864,54 @@ Value:
         );
         let errno = std::io::Error::last_os_error().raw_os_error();
         assert_eq!(errno, Some(libc::ESRCH), "expected ESRCH; got errno {:?}", errno);
+    }
+
+    #[test]
+    fn test_help_cache_drain_clears_all_sub_caches() {
+        let cache = HelpCache::with_max_entries(10);
+
+        // Populate the main help-text cache (positive entry)
+        cache.insert("mean", Some("base"), Some("help text".to_string()));
+        assert_eq!(cache.len(), 1);
+
+        // Populate the arguments cache by inserting help text that has an
+        // Arguments section and calling get_arguments (which will cache the
+        // parsed result); r_path is unused because the help text is already
+        // in the main cache.
+        let help_text = "mean\n\nDescription:\n\n     Mean.\n\nArguments:\n\n       x: numeric vector.\n";
+        cache.insert("mean_with_args", Some("base"), Some(help_text.to_string()));
+        let dummy_r = std::path::Path::new("R");
+        let _ = cache.get_arguments("mean_with_args", Some("base"), dummy_r);
+        {
+            let guard = cache.arguments.read().unwrap();
+            assert_eq!(guard.len(), 1, "arguments cache should have one entry before drain");
+        }
+
+        // Also insert a negative cache entry
+        cache.insert("nonexistent", Some("pkg"), None);
+
+        // Drain everything
+        cache.drain();
+
+        // All sub-caches must be empty
+        assert_eq!(cache.len(), 0, "inner cache should be empty after drain");
+        {
+            let guard = cache.arguments.read().unwrap();
+            assert_eq!(guard.len(), 0, "arguments cache should be empty after drain");
+        }
+        {
+            let guard = cache.in_flight.lock().unwrap();
+            assert_eq!(guard.len(), 0, "in_flight map should be empty after drain");
+        }
+
+        // Cache misses after drain (not Some(None) for the negative entry)
+        assert!(
+            cache.get("mean", Some("base")).is_none(),
+            "positive entry should be a cache miss after drain"
+        );
+        assert!(
+            cache.get("nonexistent", Some("pkg")).is_none(),
+            "negative entry should be a cache miss after drain"
+        );
     }
 }
