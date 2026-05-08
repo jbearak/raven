@@ -261,20 +261,102 @@
     }
 
     // ----- Selection + copy ----------------------------------------------
+    /** Active drag mode. Set on pointerdown and cleared on global pointerup
+     *  so a drag that begins on a column header doesn't get hijacked by a
+     *  cell's pointerenter handler (and vice versa). */
+    type DragMode = 'cell' | 'column' | 'row' | null;
+    let dragMode: DragMode = null;
+
     function onCellPointerDown(row: number, col: number, e: PointerEvent): void {
+        if (e.button !== 0) return;
+        dragMode = 'cell';
         if (e.shiftKey) selection.focus(row, col);
         else selection.anchor(row, col);
         bumpSelection();
     }
 
     function onCellPointerEnter(row: number, col: number, e: PointerEvent): void {
+        if (dragMode !== 'cell') return;
         if ((e.buttons & 1) !== 1) return;
         selection.focus(row, col);
         bumpSelection();
     }
 
+    function onColHeaderPointerDown(colIdx: number, e: PointerEvent): void {
+        if (e.button !== 0) return;
+        dragMode = 'column';
+        if (nrow === 0) return;
+        if (e.shiftKey) selection.focus(nrow - 1, colIdx);
+        else {
+            selection.anchor(0, colIdx);
+            selection.focus(nrow - 1, colIdx);
+        }
+        bumpSelection();
+    }
+
+    function onColHeaderPointerEnter(colIdx: number, e: PointerEvent): void {
+        if (dragMode !== 'column') return;
+        if ((e.buttons & 1) !== 1) return;
+        if (nrow === 0) return;
+        selection.focus(nrow - 1, colIdx);
+        bumpSelection();
+    }
+
+    function onRowHeaderPointerDown(absRow: number, e: PointerEvent): void {
+        if (e.button !== 0) return;
+        dragMode = 'row';
+        if (visibleCols.length === 0) return;
+        const minCol = visibleCols[0];
+        const maxCol = visibleCols[visibleCols.length - 1];
+        if (e.shiftKey) selection.focus(absRow, maxCol);
+        else {
+            selection.anchor(absRow, minCol);
+            selection.focus(absRow, maxCol);
+        }
+        bumpSelection();
+    }
+
+    function onRowHeaderPointerEnter(absRow: number, e: PointerEvent): void {
+        if (dragMode !== 'row') return;
+        if ((e.buttons & 1) !== 1) return;
+        if (visibleCols.length === 0) return;
+        const maxCol = visibleCols[visibleCols.length - 1];
+        selection.focus(absRow, maxCol);
+        bumpSelection();
+    }
+
+    function onWindowPointerUp(): void {
+        dragMode = null;
+    }
+
+    function copySelection(): void {
+        const r = selection.rect();
+        if (!r) return;
+        const colIndices = selection.colIndices()
+            ?? rangeFilter(r.colStart, r.colEnd, visibleCols);
+        if (colIndices.length === 0) return;
+        const requestId = ++nextRequestId;
+        const msg: WebviewToExtension = {
+            type: 'copy',
+            panelGeneration,
+            requestId,
+            range: {
+                rowStart: r.rowStart, rowEnd: r.rowEnd,
+                colIndices,
+            },
+            labelsOn, formatOn, digits,
+        };
+        copyStatus = 'copying';
+        copyStatusMsg = 'Copying...';
+        vscode.postMessage(msg);
+    }
+
     function onKeyDown(e: KeyboardEvent): void {
         const meta = e.metaKey || e.ctrlKey;
+        if (e.key === 'Escape' && contextMenu) {
+            closeContextMenu();
+            return;
+        }
         if (meta && (e.key === 'a' || e.key === 'A')) {
             e.preventDefault();
             selection.selectAll(nrow, visibleCols);
@@ -282,26 +364,102 @@
             return;
         }
         if (meta && (e.key === 'c' || e.key === 'C')) {
-            const r = selection.rect();
-            if (!r) return;
+            if (!selection.rect()) return;
             e.preventDefault();
-            const colIndices = selection.colIndices()
-                ?? rangeFilter(r.colStart, r.colEnd, visibleCols);
-            const requestId = ++nextRequestId;
-            const msg: WebviewToExtension = {
-                type: 'copy',
-                panelGeneration,
-                requestId,
-                range: {
-                    rowStart: r.rowStart, rowEnd: r.rowEnd,
-                    colIndices,
-                },
-                labelsOn, formatOn, digits,
-            };
-            copyStatus = 'copying';
-            copyStatusMsg = 'Copying...';
-            vscode.postMessage(msg);
+            copySelection();
         }
+    }
+
+    // ----- Context menu ---------------------------------------------------
+    type ContextTarget =
+        | { kind: 'cell'; row: number; col: number }
+        | { kind: 'column'; col: number }
+        | { kind: 'row'; row: number };
+    let contextMenu = $state<{ x: number; y: number } | null>(null);
+
+    /** Find the cell/header context for a right-click target. Returns null
+     *  when the click is on whitespace, the toolbar, the corner, or any
+     *  other non-data element — in which case we suppress the default menu
+     *  but show nothing. */
+    function classifyContextTarget(target: EventTarget | null): ContextTarget | null {
+        if (!(target instanceof Element)) return null;
+        const cell = target.closest('[data-grid-target]');
+        if (!(cell instanceof HTMLElement)) return null;
+        const kind = cell.dataset.gridTarget;
+        if (kind === 'cell') {
+            const row = Number(cell.dataset.row);
+            const col = Number(cell.dataset.col);
+            if (!Number.isFinite(row) || !Number.isFinite(col)) return null;
+            return { kind: 'cell', row, col };
+        }
+        if (kind === 'col-header') {
+            const col = Number(cell.dataset.col);
+            if (!Number.isFinite(col)) return null;
+            return { kind: 'column', col };
+        }
+        if (kind === 'row-header') {
+            const row = Number(cell.dataset.row);
+            if (!Number.isFinite(row)) return null;
+            return { kind: 'row', row };
+        }
+        return null;
+    }
+
+    function onContextMenu(e: MouseEvent): void {
+        e.preventDefault();
+        const target = classifyContextTarget(e.target);
+        if (!target) {
+            contextMenu = null;
+            return;
+        }
+        // If the click lands outside the current selection, move the
+        // selection to the clicked target before showing the menu — matches
+        // typical spreadsheet behavior.
+        const inRect = (() => {
+            const r = selection.rect();
+            if (!r) return false;
+            switch (target.kind) {
+                case 'cell':
+                    return target.row >= r.rowStart && target.row < r.rowEnd
+                        && target.col >= r.colStart && target.col < r.colEnd;
+                case 'column':
+                    return target.col >= r.colStart && target.col < r.colEnd;
+                case 'row':
+                    return target.row >= r.rowStart && target.row < r.rowEnd;
+            }
+        })();
+        if (!inRect) {
+            switch (target.kind) {
+                case 'cell':
+                    selection.anchor(target.row, target.col);
+                    break;
+                case 'column':
+                    if (nrow > 0) {
+                        selection.anchor(0, target.col);
+                        selection.focus(nrow - 1, target.col);
+                    }
+                    break;
+                case 'row':
+                    if (visibleCols.length > 0) {
+                        const minCol = visibleCols[0];
+                        const maxCol = visibleCols[visibleCols.length - 1];
+                        selection.anchor(target.row, minCol);
+                        selection.focus(target.row, maxCol);
+                    }
+                    break;
+            }
+            bumpSelection();
+        }
+        contextMenu = { x: e.clientX, y: e.clientY };
+    }
+
+    function closeContextMenu(): void {
+        contextMenu = null;
+    }
+
+    function onContextCopy(): void {
+        copySelection();
+        closeContextMenu();
     }
 
     // ----- Layout persistence --------------------------------------------
@@ -375,6 +533,22 @@
             && col >= r.colStart && col < r.colEnd;
     }
 
+    function isColSelected(col: number): boolean {
+        // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+        selectionVersion;
+        const r = selection.rect();
+        if (!r) return false;
+        return col >= r.colStart && col < r.colEnd;
+    }
+
+    function isRowSelected(row: number): boolean {
+        // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+        selectionVersion;
+        const r = selection.rect();
+        if (!r) return false;
+        return row >= r.rowStart && row < r.rowEnd;
+    }
+
     function getDictForCol(colIdx: number): string[] | undefined {
         return dictionaries[colIdx];
     }
@@ -445,9 +619,16 @@
     }
 </script>
 
-<svelte:window onkeydown={onKeyDown} />
+<svelte:window onkeydown={onKeyDown} onpointerup={onWindowPointerUp} />
 
-<div class="data-viewer">
+<!-- Suppress the platform context menu everywhere in the panel; show our
+     own only when the click lands on a cell, column header, or row
+     header. -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="data-viewer"
+     oncontextmenu={onContextMenu}
+     onclick={() => { if (contextMenu) closeContextMenu(); }}>
     <Toolbar
         bind:labelsOn
         bind:formatOn
@@ -469,12 +650,17 @@
         <div class="grid" style="height: {totalGridHeight + ROW_HEIGHT}px;">
             <!-- Header row (sticky top) -->
             <div class="header-row">
-                <div class="cell header rowname-col" style="width: {rowColWidth};">#</div>
+                <div class="cell header rowname-col corner-cell" style="width: {rowColWidth};">#</div>
                 {#each visibleCols as colIdx (colIdx)}
                     {@const col = columns[colIdx]}
-                    <div class="cell header"
+                    <div class="cell header col-header
+                            {isColSelected(colIdx) ? 'selected-header' : ''}"
+                         data-grid-target="col-header"
+                         data-col={colIdx}
                          style="width: {widthOf(colIdx)}px;"
                          title={col.variableLabel ? `${col.name}: ${col.variableLabel}` : col.name}
+                         onpointerdown={(e) => onColHeaderPointerDown(colIdx, e)}
+                         onpointerenter={(e) => onColHeaderPointerEnter(colIdx, e)}
                     >
                         {col.name}
                     </div>
@@ -485,7 +671,16 @@
                 {#each visibleRows as rowCells, rowOffset (visibleRangeStart + rowOffset)}
                     {@const absRow = visibleRangeStart + rowOffset}
                     <div class="data-row" style="height: {ROW_HEIGHT}px;">
-                        <div class="cell rowname-col" style="width: {rowColWidth};">{absRow + 1}</div>
+                        <div class="cell rowname-col row-header
+                                {isRowSelected(absRow) ? 'selected-header' : ''}"
+                             data-grid-target="row-header"
+                             data-row={absRow}
+                             style="width: {rowColWidth};"
+                             onpointerdown={(e) => onRowHeaderPointerDown(absRow, e)}
+                             onpointerenter={(e) => onRowHeaderPointerEnter(absRow, e)}
+                        >
+                            {absRow + 1}
+                        </div>
                         {#each visibleCols as colIdx, ci (colIdx)}
                             {@const col = columns[colIdx]}
                             {@const cell = rowCells[ci]}
@@ -505,6 +700,9 @@
                                 {isInRect(absRow, colIdx) ? 'selected' : ''}"
                                  role="gridcell"
                                  tabindex="-1"
+                                 data-grid-target="cell"
+                                 data-row={absRow}
+                                 data-col={colIdx}
                                  style="width: {widthOf(colIdx)}px;"
                                  onpointerdown={(e) => onCellPointerDown(absRow, colIdx, e)}
                                  onpointerenter={(e) => onCellPointerEnter(absRow, colIdx, e)}
@@ -517,6 +715,19 @@
             </div>
         </div>
     </div>
+    {#if contextMenu}
+        <div class="context-menu"
+             role="menu"
+             style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
+            <button type="button"
+                    class="context-menu-item"
+                    role="menuitem"
+                    disabled={!selection.rect()}
+                    onclick={onContextCopy}>
+                Copy
+            </button>
+        </div>
+    {/if}
 </div>
 
 <style>

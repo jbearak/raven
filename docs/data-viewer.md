@@ -75,10 +75,18 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 
 - Click a cell, shift-click another to extend the rectangle.
 - Click-drag also extends.
+- Click a column header to select that column; click-drag across
+  column headers to select multiple contiguous columns.
+- Click a row-number gutter cell to select that row; click-drag across
+  row headers to select multiple contiguous rows.
 - `Cmd/Ctrl+A` selects every row across all currently-visible columns.
 - `Cmd/Ctrl+C` copies the selection as TSV. Copying respects the
   active Labels / Format / digits state — what you see is what you
   copy.
+- Right-click a cell, column header, or row header to show a Copy menu
+  (which copies the current selection, or the right-clicked target if
+  the click landed outside the selection). The platform's default
+  Cut/Copy/Paste menu is suppressed elsewhere in the panel.
 - A 5,000,000-cell hard cap protects against accidental huge clipboard
   writes; over the cap the panel shows a toast and refuses the copy.
 

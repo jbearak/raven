@@ -221,6 +221,9 @@ html, body, #root {
     cursor: default;
     border-bottom: 2px solid var(--vscode-panel-border, #ccc);
 }
+.cell.col-header {
+    cursor: pointer;
+}
 .cell.numeric {
     text-align: right;
     font-variant-numeric: tabular-nums;
@@ -251,10 +254,60 @@ html, body, #root {
     cursor: default;
     border-right: 1px solid var(--vscode-panel-border, #ccc);
 }
+.cell.row-header {
+    cursor: pointer;
+}
+.cell.corner-cell {
+    cursor: default;
+}
 .header-row .cell.rowname-col {
     z-index: 3; /* above sticky body cells */
     /* rowColWidth uses ch units; keep this font weight aligned with body
        row-number cells so the sticky header doesn't shift every header
        separator slightly to the right. */
     font-weight: 400;
+}
+
+/* Tint headers when their column / row intersects the selection. Lower
+   alpha than the cell highlight so the band doesn't compete with the
+   actual selected rectangle. */
+.cell.selected-header {
+    background: var(--vscode-list-activeSelectionBackground,
+                 var(--vscode-editor-selectionBackground, rgba(173, 214, 255, 0.6)));
+    color: var(--vscode-list-activeSelectionForeground, inherit);
+}
+
+/* ---------- Context menu ---------- */
+
+.context-menu {
+    position: fixed;
+    min-width: 140px;
+    padding: 4px 0;
+    background: var(--vscode-menu-background, #fff);
+    color: var(--vscode-menu-foreground, #1f1f1f);
+    border: 1px solid var(--vscode-menu-border, #ccc);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    z-index: 30;
+    user-select: none;
+}
+.context-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: inherit;
+    padding: 5px 14px;
+    font: inherit;
+    cursor: pointer;
+}
+.context-menu-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.context-menu-item:not(:disabled):hover,
+.context-menu-item:not(:disabled):focus {
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #fff));
+    outline: none;
 }
