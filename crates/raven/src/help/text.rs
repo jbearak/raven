@@ -302,6 +302,17 @@ impl Default for HelpCache {
 /// blocking threads indefinitely.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Returns the effective timeout, overridable by `RAVEN_HELP_TIMEOUT_MS` for tests.
+fn timeout_from_env() -> Duration {
+    match std::env::var("RAVEN_HELP_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(ms) => Duration::from_millis(ms),
+        None => HELP_TIMEOUT,
+    }
+}
+
 /// Kill a process by PID. Used by the help subprocess watchdog on timeout.
 ///
 /// On Unix, sends SIGKILL directly. On Windows, delegates to `taskkill /F`.
@@ -356,6 +367,32 @@ pub(crate) fn kill_process_by_pid(_pid: u32) {
 /// }
 /// ```
 pub fn get_help(topic: &str, package: Option<&str>, r_path: &std::path::Path) -> Option<String> {
+    let r_code = r#"
+args <- commandArgs(trailingOnly = TRUE)
+topic <- args[1]
+pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
+txt <- capture.output(
+  tools::Rd2txt(
+    utils:::.getHelpFile(help(topic, package = (pkg))),
+    options = list(underline_titles = FALSE)
+  )
+)
+cat(paste(txt, collapse = "\n"))
+"#;
+    get_help_inner(topic, package, r_path, r_code)
+}
+
+/// Inner implementation that accepts the R script as a parameter.
+///
+/// This allows tests to inject custom R code (e.g., `Sys.sleep(60)` for timeout
+/// testing) without duplicating the full implementation. The public `get_help`
+/// always passes the built-in R snippet.
+fn get_help_inner(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &std::path::Path,
+    r_code: &str,
+) -> Option<String> {
     log::trace!("get_help: topic={}, package={:?}", topic, package);
 
     if !super::validate::is_valid_help_topic(topic) {
@@ -369,18 +406,7 @@ pub fn get_help(topic: &str, package: Option<&str>, r_path: &std::path::Path) ->
         }
     }
 
-    let r_code = r#"
-args <- commandArgs(trailingOnly = TRUE)
-topic <- args[1]
-pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
-txt <- capture.output(
-  tools::Rd2txt(
-    utils:::.getHelpFile(help(topic, package = (pkg))),
-    options = list(underline_titles = FALSE)
-  )
-)
-cat(paste(txt, collapse = "\n"))
-"#;
+    let timeout = timeout_from_env();
 
     let mut cmd = Command::new(r_path);
     cmd.args([
@@ -437,17 +463,17 @@ cat(paste(txt, collapse = "\n"))
         buf
     });
 
-    // Watchdog thread: kills the subprocess after HELP_TIMEOUT if it hasn't
-    // exited. An atomic flag prevents killing a recycled PID after the child
-    // has already exited naturally.
+    // Watchdog thread: kills the subprocess after the configured timeout if it
+    // hasn't exited. An atomic flag prevents killing a recycled PID after the
+    // child has already exited naturally.
     let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exited_clone = exited.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(HELP_TIMEOUT);
+        std::thread::sleep(timeout);
         if !exited_clone.load(std::sync::atomic::Ordering::SeqCst) {
             log::trace!(
                 "get_help: timeout after {:?}, killing pid {}",
-                HELP_TIMEOUT,
+                timeout,
                 child_pid
             );
             kill_process_by_pid(child_pid);
@@ -488,8 +514,7 @@ cat(paste(txt, collapse = "\n"))
             log::trace!("get_help: wait error: {}", e);
             None
         }
-    }
-}
+    }}
 
 /// Extracts the first function signature from R help text.
 ///
@@ -929,6 +954,43 @@ fn finalize_description(parts: &[String]) -> String {
     let joined = parts.join(" ");
     let normalized = joined.split_whitespace().collect::<Vec<_>>().join(" ");
     r_quotes_to_markdown(&normalized)
+}
+
+/// Test-only entry point that injects custom R code instead of the built-in snippet.
+///
+/// Used by timeout tests to inject hanging R code (e.g., `Sys.sleep(60)`) without
+/// touching the public API or duplicating the full implementation.
+#[cfg(test)]
+pub(crate) fn get_help_with_code(
+    topic: &str,
+    package: Option<&str>,
+    r_path: &std::path::Path,
+    r_code: &str,
+) -> Option<String> {
+    get_help_inner(topic, package, r_path, r_code)
+}
+
+/// RAII guard that sets an environment variable on creation and removes it on drop.
+///
+/// Keeps env-var mutations local to a single test even in the presence of panics.
+#[cfg(test)]
+struct EnvGuard(&'static str);
+
+#[cfg(test)]
+impl EnvGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        // SAFETY: single-threaded test context; we restore in Drop.
+        unsafe { std::env::set_var(key, val) };
+        EnvGuard(key)
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: mirrors the set_var above.
+        unsafe { std::env::remove_var(self.0) };
+    }
 }
 
 #[cfg(test)]
@@ -1684,5 +1746,33 @@ Value:
             let _ = h.await.unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Verifies that `get_help` returns `None` when R hangs, and that it does
+    /// so well within 1 second.
+    ///
+    /// Uses a 200 ms timeout (via `RAVEN_HELP_TIMEOUT_MS`) and injects a
+    /// `Sys.sleep(60)` snippet via `get_help_with_code`.  The env var is
+    /// removed via RAII after the test.
+    ///
+    /// Marked `#[ignore]` because it mutates a process-wide env var; run explicitly
+    /// with `-- --include-ignored --test-threads=1` to avoid interference with
+    /// parallel tests.
+    #[test]
+    #[ignore]
+    fn get_help_timeout_returns_none() {
+        let r = match crate::r_subprocess::RSubprocess::new(None) {
+            Some(s) => s.r_path().clone(),
+            None => { eprintln!("skip: no R"); return; }
+        };
+        let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
+        let start = std::time::Instant::now();
+        let res = get_help_with_code("mean", Some("base"), &r, "Sys.sleep(60)");
+        let elapsed = start.elapsed();
+        assert!(res.is_none(), "expected None, got {res:?}");
+        assert!(
+            elapsed.as_millis() < 1000,
+            "timeout test took too long: {elapsed:?}"
+        );
     }
 }
