@@ -7253,6 +7253,15 @@ mod refresh_packages_tests {
                 .expect("execute_command must return Some")
         }
 
+        fn binary_available_on_path(binary: &str) -> bool {
+            std::process::Command::new(binary)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn unset_r_path_falls_back_to_path_lookup() {
             // Regression for the smoke-test bug where leaving raven.packages.rPath
@@ -7263,9 +7272,10 @@ mod refresh_packages_tests {
             //
             // Skip on hosts without R on PATH: the production fallback correctly
             // returns r-unavailable when `Command::new("R")` cannot spawn, so the
-            // assertion below would fail spuriously on R-less CI runners. Skip
-            // mirrors the pattern used by other R-using tests in this crate.
-            if crate::r_subprocess::RSubprocess::new(None).is_none() {
+            // assertion below would fail spuriously on R-less CI runners. Probe
+            // the same plain PATH lookup the handler uses, not broader R
+            // autodiscovery locations.
+            if !binary_available_on_path("R") {
                 eprintln!("skip: no R on PATH");
                 return;
             }
@@ -7286,6 +7296,12 @@ mod refresh_packages_tests {
                     "stale 'set raven.packages.rPath' wording leaked through: {resp:?}"
                 );
             }
+        }
+
+        #[test]
+        fn r_path_skip_probe_uses_plain_path_lookup() {
+            let missing = "__raven_missing_r_binary_for_path_probe__";
+            assert!(!binary_available_on_path(missing));
         }
 
         #[tokio::test]

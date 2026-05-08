@@ -84,17 +84,42 @@ impl HtmlHelpCache {
     }
 
     pub fn insert(&self, topic: &str, package: Option<&str>, result: Result_) {
+        if let Ok(mut guard) = self.inner.write() {
+            Self::insert_locked(&mut guard, topic, package, result);
+        }
+    }
+
+    fn insert_locked(
+        guard: &mut LruCache<String, Entry>,
+        topic: &str,
+        package: Option<&str>,
+        result: Result_,
+    ) {
         let entry = Entry {
             result: result.clone(),
             cached_at: Instant::now(),
         };
+        guard.push(cache_key(topic, package), entry.clone());
+        if let Ok(ref h) = result {
+            let canon = cache_key(&h.topic, Some(&h.package));
+            guard.push(canon, entry);
+        }
+    }
+
+    fn insert_if_generation_current(
+        &self,
+        topic: &str,
+        package: Option<&str>,
+        result: Result_,
+        expected_generation: u64,
+    ) -> bool {
         if let Ok(mut guard) = self.inner.write() {
-            guard.push(cache_key(topic, package), entry.clone());
-            if let Ok(ref h) = result {
-                let canon = cache_key(&h.topic, Some(&h.package));
-                guard.push(canon, entry);
+            if self.generation.load(Ordering::SeqCst) == expected_generation {
+                Self::insert_locked(&mut guard, topic, package, result);
+                return true;
             }
         }
+        false
     }
 
     /// Return a cached result if one exists, otherwise call `fetch` exactly once
@@ -163,19 +188,18 @@ impl HtmlHelpCache {
                 let result = fetch(topic.to_string(), package.map(str::to_string)).await;
 
                 // 4) Cache if the result is worth keeping AND a `drain()` did
-                //    not fire while we were fetching. A drain bumps
-                //    `generation`, so a mismatched snapshot means our result
-                //    reflects a pre-drain libpath / package state and must
-                //    not be written back into the freshly-cleared LRU.
-                //    Subscribers still receive the broadcast below — they
-                //    issued their request before the drain too.
+                //    not fire while we were fetching. The generation check is
+                //    performed while holding the LRU write lock, so it is
+                //    ordered with `drain()`'s clear: either this insert happens
+                //    before the clear, or it observes the new generation and
+                //    skips. Subscribers still receive the broadcast below —
+                //    they issued their request before the drain too.
                 let cacheable = match &result {
                     Ok(_) => true,
                     Err(e) => e.is_cacheable(),
                 };
-                let still_current = self.generation.load(Ordering::SeqCst) == gen_at_start;
-                if cacheable && still_current {
-                    self.insert(topic, package, result.clone());
+                if cacheable {
+                    self.insert_if_generation_current(topic, package, result.clone(), gen_at_start);
                 }
 
                 // 5) Remove in-flight entry, then broadcast to waiting subscribers.
@@ -210,12 +234,10 @@ impl HtmlHelpCache {
     /// instead of subscribing to (and trusting) a result that began before the
     /// libpath changed.
     ///
-    /// Bumps `generation` BEFORE clearing so any in-flight Owner that
-    /// observes `drain()` after its post-fetch generation load sees a
-    /// mismatched value and skips its LRU insert. Bumping first also means
-    /// a fresh post-drain Owner that reads the snapshot before our clears
-    /// finish will already see the new generation, so its insert is gated
-    /// correctly.
+    /// Bumps `generation` BEFORE clearing. Owners compare their start
+    /// generation while holding the same LRU write lock used here, so a
+    /// pre-drain result can only be inserted before this clear or skipped
+    /// after it; it cannot repopulate the LRU after the clear.
     pub fn drain(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut guard) = self.inner.write() {
@@ -386,6 +408,62 @@ mod tests {
 
         // Now the LRU should hold Owner 2's fresh result.
         assert!(c.get("filter", Some("dplyr")).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drain_generation_check_is_atomic_with_lru_insert() {
+        // Regression: checking `generation` before acquiring the LRU write
+        // lock still lets a drain clear the cache between the check and the
+        // write. This pins the interleaving by holding the LRU lock while the
+        // Owner completes its fetch, then simulating drain's generation bump
+        // and clear before allowing the Owner's insert path to continue.
+        use std::sync::atomic::{AtomicBool, Ordering as StdOrdering};
+        use tokio::sync::Notify;
+
+        let c = Arc::new(HtmlHelpCache::new());
+        let owner_started = Arc::new(Notify::new());
+        let owner_unblock = Arc::new(Notify::new());
+        let fetch_returned = Arc::new(AtomicBool::new(false));
+
+        let c1 = c.clone();
+        let started = owner_started.clone();
+        let unblock = owner_unblock.clone();
+        let returned = fetch_returned.clone();
+        let owner = tokio::spawn(async move {
+            c1.get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let started = started.clone();
+                let unblock = unblock.clone();
+                let returned = returned.clone();
+                async move {
+                    started.notify_one();
+                    unblock.notified().await;
+                    returned.store(true, StdOrdering::SeqCst);
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await
+        });
+
+        owner_started.notified().await;
+
+        let mut lru_guard = c.inner.write().expect("LRU write lock");
+        owner_unblock.notify_one();
+        while !fetch_returned.load(StdOrdering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Simulate the ordering inside `drain()` after the Owner's fetch has
+        // returned but before its LRU write can acquire the lock.
+        c.generation.fetch_add(1, Ordering::SeqCst);
+        lru_guard.clear();
+        drop(lru_guard);
+
+        let _ = owner.await.unwrap();
+        assert!(
+            c.get("filter", Some("dplyr")).is_none(),
+            "Owner must not repopulate the LRU after a drain generation bump and clear"
+        );
     }
 
     #[tokio::test]
