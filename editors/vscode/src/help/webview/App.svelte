@@ -116,7 +116,7 @@
                 const url = new URL(href);
                 // path is /<pkg>/<topic>
                 const parts = url.pathname.replace(/^\//, '').split('/');
-                if (parts.length < 2) {
+                if (parts.length < 2 || !parts[0] || !parts[1]) {
                     throw new Error(`Malformed raven-help URL: ${href}`);
                 }
                 const pkg = decodeURIComponent(parts[0]);
