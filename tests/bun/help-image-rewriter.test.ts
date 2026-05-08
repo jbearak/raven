@@ -57,4 +57,15 @@ describe('image-rewriter', () => {
         const out = rewriteImageSrcs(`<img src="file:///etc/passwd">`, c);
         expect(out).toContain('src=""');
     });
+
+    test('relative src for a missing file is dropped', () => {
+        const c: RewriteContext = {
+            helpDir: '/lib/dplyr/help',
+            libPaths: ['/lib'],
+            asWebviewUri: (abs) => `webview-uri:${abs}`,
+            fileExists: (abs) => abs !== '/lib/dplyr/help/figures/missing.png',
+        };
+        const out = rewriteImageSrcs(`<img src="figures/missing.png">`, c);
+        expect(out).toContain('src=""');
+    });
 });

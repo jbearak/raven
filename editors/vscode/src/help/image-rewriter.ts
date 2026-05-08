@@ -10,9 +10,10 @@ export type RewriteContext = {
     /** Convert an absolute filesystem path to a webview URI. Injected by the
      * panel host (it has access to the actual `webview.asWebviewUri`). */
     asWebviewUri(absPath: string): string;
-    /** Test-time hook for verifying the resolved file exists; in production
-     * always returns true and the webview surfaces a broken-image icon for
-     * missing files. */
+    /** Existence check. The webview would render a broken-image glyph for a
+     * missing local file, so we drop the src instead — preferring an empty
+     * `<img>` over a 404 indicator. Production wires this to `fs.existsSync`;
+     * tests stub it. */
     fileExists(absPath: string): boolean;
 };
 
@@ -56,5 +57,6 @@ function classifyAndResolve(src: string, ctx: RewriteContext): string {
     const canonHelpDir = path.resolve(ctx.helpDir);
     const rel = path.relative(canonHelpDir, abs);
     if (rel.startsWith('..') || path.isAbsolute(rel)) return '';
+    if (!ctx.fileExists(abs)) return '';
     return ctx.asWebviewUri(abs);
 }
