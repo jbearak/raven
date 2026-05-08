@@ -52,9 +52,8 @@
     const hiddenSet = $derived(new Set(layout.hiddenColumns));
     const visibleCols = $derived<number[]>(
         columns
-            .map((c, i) => ({ c, i }))
-            .filter(({ c }) => !hiddenSet.has(c.name))
-            .map(({ i }) => i),
+            .map((_c, i) => i)
+            .filter(i => !hiddenSet.has(i)),
     );
     const totalGridHeight = $derived(nrow * ROW_HEIGHT);
 
@@ -254,17 +253,17 @@
         }, 250);
     }
 
-    function onResizeColumn(name: string, width: number): void {
+    function onResizeColumn(index: number, width: number): void {
         layout = {
             ...layout,
-            columnWidths: { ...layout.columnWidths, [name]: width },
+            columnWidths: { ...layout.columnWidths, [index]: width },
         };
         persistLayout();
     }
 
-    function onToggleColumn(name: string, hidden: boolean): void {
+    function onToggleColumn(index: number, hidden: boolean): void {
         const set = new Set(layout.hiddenColumns);
-        if (hidden) set.add(name); else set.delete(name);
+        if (hidden) set.add(index); else set.delete(index);
         layout = { ...layout, hiddenColumns: Array.from(set) };
         persistLayout();
         // Cached row windows were decoded for the previous visible-column
@@ -276,8 +275,8 @@
         scheduleFetchVisible();
     }
 
-    function widthOf(c: ColumnSchema): number {
-        return layout.columnWidths[c.name] ?? 120;
+    function widthOf(index: number): number {
+        return layout.columnWidths[index] ?? 120;
     }
 
     function isInRect(row: number, col: number): boolean {
@@ -376,7 +375,7 @@
                 {#each visibleCols as colIdx (colIdx)}
                     {@const col = columns[colIdx]}
                     <div class="cell header"
-                         style="width: {widthOf(col)}px;"
+                         style="width: {widthOf(colIdx)}px;"
                          title={col.variableLabel ? `${col.name}: ${col.variableLabel}` : col.name}
                     >
                         {col.name}
@@ -406,7 +405,7 @@
                                 {decoded.missing ? 'missing-' + settings.missingValueStyle : ''}
                                 {col.isInteger || col.arrowType.startsWith('Float') ? 'numeric' : ''}
                                 {isInRect(absRow, colIdx) ? 'selected' : ''}"
-                                 style="width: {widthOf(col)}px;"
+                                 style="width: {widthOf(colIdx)}px;"
                                  onpointerdown={(e) => onCellPointerDown(absRow, colIdx, e)}
                                  onpointerenter={(e) => onCellPointerEnter(absRow, colIdx, e)}
                             >

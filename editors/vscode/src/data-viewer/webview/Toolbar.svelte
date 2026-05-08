@@ -9,7 +9,7 @@
         nrow: number;
         columns: ColumnSchema[];
         layout: Layout;
-        onToggleColumn: (name: string, hidden: boolean) => void;
+        onToggleColumn: (index: number, hidden: boolean) => void;
     }
     let { labelsOn = $bindable(), formatOn = $bindable(), digits = $bindable(),
           nrow, columns, layout, onToggleColumn }: Props = $props();
@@ -17,14 +17,16 @@
     let popoverOpen = $state(false);
 
     const hiddenSet = $derived(new Set(layout.hiddenColumns));
-    const visibleCount = $derived(columns.filter(c => !hiddenSet.has(c.name)).length);
+    const visibleCount = $derived(
+        columns.filter((_c, i) => !hiddenSet.has(i)).length,
+    );
 
     function close(): void { popoverOpen = false; }
 
-    function onToggle(name: string, e: Event): void {
+    function onToggle(index: number, e: Event): void {
         const checked = (e.target as HTMLInputElement).checked;
         // checked = visible; hidden = !checked
-        onToggleColumn(name, !checked);
+        onToggleColumn(index, !checked);
     }
 </script>
 
@@ -71,12 +73,12 @@
                     <button type="button" class="popover-close" onclick={close}>×</button>
                 </div>
                 <div class="popover-body">
-                    {#each columns as col (col.name)}
+                    {#each columns as col, i (i)}
                         <label class="column-row">
                             <input
                                 type="checkbox"
-                                checked={!hiddenSet.has(col.name)}
-                                onchange={(e) => onToggle(col.name, e)}
+                                checked={!hiddenSet.has(i)}
+                                onchange={(e) => onToggle(i, e)}
                             />
                             <span class="column-name">{col.name}</span>
                             <span class="column-type">{col.arrowType}</span>

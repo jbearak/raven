@@ -12,10 +12,14 @@ import type { Cell } from './wire-format';
 import type { ColumnSchema } from './arrow-reader';
 
 export type Layout = {
-    /** Per-column-name pixel widths. */
-    columnWidths: Record<string, number>;
-    /** Hidden column names. */
-    hiddenColumns: string[];
+    /** Per-column pixel widths, keyed by the column's index in the
+     *  current schema. Indices are stable for a given schema hash, and
+     *  unlike names they don't collide when a data frame has duplicate
+     *  column names (e.g. via `data.frame(x = 1, x = 2,
+     *  check.names = FALSE)`). */
+    columnWidths: Record<number, number>;
+    /** Hidden column indices. */
+    hiddenColumns: number[];
 };
 
 export type Settings = {

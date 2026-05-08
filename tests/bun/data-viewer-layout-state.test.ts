@@ -15,7 +15,7 @@ class MemKV {
     keys(): string[] { return Array.from(this.m.keys()); }
 }
 
-const layout = (): Layout => ({ columnWidths: { x: 100 }, hiddenColumns: [] });
+const layout = (): Layout => ({ columnWidths: { 0: 100 }, hiddenColumns: [] });
 
 describe('schemaHash', () => {
     test('stable across calls', () => {
@@ -62,10 +62,10 @@ describe('LayoutStore', () => {
     });
 
     test('different schemaHash gives a separate slot', async () => {
-        await store.save('mtcars', 'h1', { columnWidths: { x: 1 }, hiddenColumns: [] });
-        await store.save('mtcars', 'h2', { columnWidths: { x: 2 }, hiddenColumns: [] });
-        expect((await store.load('mtcars', 'h1'))!.columnWidths.x).toBe(1);
-        expect((await store.load('mtcars', 'h2'))!.columnWidths.x).toBe(2);
+        await store.save('mtcars', 'h1', { columnWidths: { 0: 1 }, hiddenColumns: [] });
+        await store.save('mtcars', 'h2', { columnWidths: { 0: 2 }, hiddenColumns: [] });
+        expect((await store.load('mtcars', 'h1'))!.columnWidths[0]).toBe(1);
+        expect((await store.load('mtcars', 'h2'))!.columnWidths[0]).toBe(2);
     });
 
     test('LRU evicts oldest when capacity exceeded', async () => {
