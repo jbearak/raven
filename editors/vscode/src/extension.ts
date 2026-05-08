@@ -6,6 +6,7 @@ import {
     LanguageClientOptions,
     ServerOptions,
 } from 'vscode-languageclient/node';
+import { activateHelpViewer, wrapHoverWithHelpTrust } from './help';
 import { registerAutoCloseFix } from './autoCloseFix';
 import {
     getInitializationOptions as buildInitializationOptions,
@@ -117,6 +118,13 @@ export function activate(context: vscode.ExtensionContext) {
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions,
+        middleware: {
+            provideHover: (document, position, token, next) =>
+                wrapHoverWithHelpTrust(async (doc, pos, tok) => {
+                    const result = await next(doc, pos, tok);
+                    return result as vscode.Hover | null | undefined;
+                })(document, position, token),
+        },
     };
 
     client = new LanguageClient(
@@ -127,6 +135,9 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     client.start();
+
+    // Activate help viewer (registers raven.openHelpPanel, raven.help.back, raven.help.forward).
+    activateHelpViewer(context, client);
 
     // Plot services (session server + viewer panel) for managed R terminals.
     // Constructed before raven.restart registration so the closure has a live

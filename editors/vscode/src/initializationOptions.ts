@@ -81,6 +81,7 @@ export interface RavenInitializationOptions {
     indentation?: {
         style?: "rstudio" | "rstudio-minus" | "off";
     };
+    helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
 
 function isExplicitlyConfigured<T>(config: RavenWorkspaceConfiguration, key: string): boolean {
@@ -309,6 +310,11 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     const indentationStyle = getExplicitSetting<"rstudio" | "rstudio-minus" | "off">(config, 'indentation.style');
     if (indentationStyle !== undefined) {
         options.indentation = { style: indentationStyle };
+    }
+
+    const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
+    if (helpViewerColumn !== undefined) {
+        options.helpViewer = { viewColumn: helpViewerColumn };
     }
 
     return options;

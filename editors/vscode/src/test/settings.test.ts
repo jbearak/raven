@@ -119,6 +119,8 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'completion.triggerOnOpenParen', jsonPath: ['completion', 'triggerOnOpenParen'], type: 'boolean' },
     // Indentation settings
     { vsCodeKey: 'indentation.style', jsonPath: ['indentation', 'style'], type: 'enum', enumValues: ['rstudio', 'rstudio-minus', 'off'] as const },
+    // Help viewer settings
+    { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
 
 /**
