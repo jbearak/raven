@@ -1510,6 +1510,7 @@ impl LanguageServer for Backend {
                 let topic = params.arguments.first().and_then(|v| v.as_str()).unwrap_or("");
                 let package = params.arguments.get(1).and_then(|v| v.as_str());
 
+                // Validation runs first — defense-in-depth before any cache or R access.
                 if !crate::help::is_valid_help_topic(topic) {
                     return Ok(Some(serde_json::json!({
                         "ok": false,
@@ -1534,6 +1535,12 @@ impl LanguageServer for Backend {
                     (cache, r_path)
                 };
 
+                // Probe the cache before checking r_path: a cached positive entry
+                // must be served even if R is no longer configured.
+                if let Some(cached) = cache.get(topic, package) {
+                    return Ok(Some(help_html_to_json(cached)));
+                }
+
                 let Some(r_path) = r_path else {
                     return Ok(Some(serde_json::json!({
                         "ok": false,
@@ -1556,23 +1563,7 @@ impl LanguageServer for Backend {
                     })
                     .await;
 
-                let json = match result {
-                    Ok(h) => serde_json::json!({
-                        "ok": true,
-                        "topic": h.topic,
-                        "package": h.package,
-                        "title": h.title,
-                        "html": h.html,
-                        "helpDir": h.help_dir,
-                        "libPaths": h.lib_paths,
-                    }),
-                    Err(e) => serde_json::json!({
-                        "ok": false,
-                        "reason": e.reason(),
-                        "message": format!("{:?}", e),
-                    }),
-                };
-                Ok(Some(json))
+                Ok(Some(help_html_to_json(result)))
             }
             other => {
                 log::warn!("execute_command: unknown command '{other}'");
@@ -3836,6 +3827,31 @@ impl LanguageServer for Backend {
         );
 
         Ok(Some(vec![edit]))
+    }
+}
+
+/// Convert a `get_help_html` result into the LSP JSON response for `raven.getHelpHtml`.
+///
+/// Used by the `execute_command` dispatcher both for cache hits and for the
+/// `get_or_fetch` path, keeping the JSON shape in exactly one place.
+fn help_html_to_json(
+    result: std::result::Result<crate::help::HelpHtml, crate::help::HelpHtmlError>,
+) -> serde_json::Value {
+    match result {
+        Ok(h) => serde_json::json!({
+            "ok": true,
+            "topic": h.topic,
+            "package": h.package,
+            "title": h.title,
+            "html": h.html,
+            "helpDir": h.help_dir,
+            "libPaths": h.lib_paths,
+        }),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "reason": e.reason(),
+            "message": format!("{e}"),
+        }),
     }
 }
 
@@ -7249,6 +7265,45 @@ mod refresh_packages_tests {
             assert_eq!(resp["reason"], "invalid-topic");
         }
 
+        /// Cache hit is served even when R is not configured.
+        ///
+        /// Positive entries cached from an earlier session (when R was available)
+        /// must not be silently bypassed just because `packages_r_path` is now
+        /// `None`.  The handler must probe the cache before the r_path guard.
+        #[tokio::test]
+        async fn cached_entry_served_without_r() {
+            use std::path::PathBuf;
+            use crate::help::HelpHtml;
+
+            let backend = make_backend_no_r();
+
+            // Pre-populate the cache with a synthetic positive entry.
+            let synthetic = HelpHtml {
+                topic: "synthetic".into(),
+                package: "fake".into(),
+                title: "Synthetic Help".into(),
+                html: "<p>cached</p>".into(),
+                help_dir: PathBuf::from("/fake/lib/fake/help"),
+                lib_paths: vec![PathBuf::from("/fake/lib")],
+            };
+            {
+                let state = backend.state.read().await;
+                state.html_help_cache.insert("synthetic", Some("fake"), Ok(synthetic));
+            }
+
+            // With no r_path configured, a miss would return r-unavailable.
+            // The cache probe must intercept first.
+            let resp = run_command(
+                &backend,
+                vec![serde_json::json!("synthetic"), serde_json::json!("fake")],
+            )
+            .await;
+            assert_eq!(resp["ok"], true, "expected cache hit, got: {resp:?}");
+            assert_eq!(resp["topic"], "synthetic");
+            assert_eq!(resp["package"], "fake");
+            assert_eq!(resp["html"], "<p>cached</p>");
+        }
+
         /// R-required happy-path test: renders `mean` from `base`.
         ///
         /// Skips automatically when no R binary is available on PATH,
@@ -7274,6 +7329,16 @@ mod refresh_packages_tests {
                 resp["html"].as_str().is_some_and(|h| !h.is_empty()),
                 "html must be non-empty"
             );
+            assert!(
+                resp["helpDir"].as_str().is_some_and(|s| !s.is_empty()),
+                "helpDir must be a non-empty string, got {:?}",
+                resp["helpDir"]
+            );
+            let lib_paths = resp["libPaths"].as_array().expect("libPaths must be array");
+            assert!(!lib_paths.is_empty(), "libPaths must be non-empty");
+            for p in lib_paths {
+                assert!(p.is_string(), "libPaths element must be a string, got {p:?}");
+            }
         }
     }
 }

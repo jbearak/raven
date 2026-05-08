@@ -40,6 +40,22 @@ pub enum HelpHtmlError {
     TooLarge,
 }
 
+impl std::fmt::Display for HelpHtmlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no help found for topic"),
+            Self::PackageNotInstalled => write!(f, "package not installed"),
+            Self::InvalidTopic { message } => write!(f, "invalid topic: {message}"),
+            Self::RenderFailed { message } => write!(f, "render failed: {message}"),
+            Self::Timeout => write!(f, "R subprocess timed out"),
+            Self::RUnavailable { message } => write!(f, "R unavailable: {message}"),
+            Self::TooLarge => write!(f, "help output exceeded the size cap"),
+        }
+    }
+}
+
+impl std::error::Error for HelpHtmlError {}
+
 impl HelpHtmlError {
     /// Stable string identifier for the LSP response's `reason` field.
     pub fn reason(&self) -> &'static str {
