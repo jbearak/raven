@@ -41246,5 +41246,12 @@ mod issue_149_utf16_handlers {
     fn test_build_help_panel_link_topic_with_dot() {
         let link = build_help_panel_link("print.default", "base");
         assert!(link.contains("`base::print.default`"));
+        // Round-trip: encoded args must decode back to ["print.default", "base"]
+        let after_q = &link[link.find('?').unwrap() + 1..link.find(')').unwrap()];
+        let decoded = percent_encoding::percent_decode_str(after_q)
+            .decode_utf8()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(parsed, vec!["print.default".to_string(), "base".to_string()]);
     }
 }
