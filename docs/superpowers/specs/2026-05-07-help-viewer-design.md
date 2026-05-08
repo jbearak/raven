@@ -87,9 +87,10 @@ Goals:
 8. Real subprocess-timeout test coverage for both the new `get_help_html` and
    the existing `get_help` (the latter is currently uncovered).
 9. Server-side HTML sanitization (allowlist of help-relevant tags via the
-   `ammonia` crate or equivalent) before returning HTML to the extension.
-   Defense in depth on top of CSP; protects against malformed Rd that injects
-   `<form>`, `<iframe>`, `<object>`, or other tags CSP doesn't constrain.
+   `ammonia` crate — committed dependency, see "HTML sanitization") before
+   returning HTML to the extension. Defense in depth on top of CSP;
+   protects against malformed Rd that injects `<form>`, `<iframe>`,
+   `<object>`, or other tags CSP doesn't constrain.
 10. Topic-name validation (new `is_valid_help_topic()` helper) that accepts
     legitimate operator topics (`[`, `[[`, `+`, `%in%`, `if`, `?`, etc.) but
     rejects shell metacharacters, control characters, and oversized inputs.
@@ -217,11 +218,26 @@ file outgrows itself; see "Implementation notes" below):
     not constructed as `<libpath>/<pkg>/help`. R is the authority on
     where its help assets live; this works for unusual installs (binary
     packages with custom layouts, `R CMD INSTALL --prefix`, etc.).
+- **Tempfile lifetime**: the metadata tempfile is created server-side
+  before the R subprocess is spawned (using `tempfile::NamedTempFile`),
+  and its absolute path is the third argument passed to R. The
+  `NamedTempFile` is held by an RAII guard for the entire fetch — its
+  `Drop` impl removes the file on:
+  - Normal completion (after metadata is read).
+  - R subprocess spawn failure.
+  - R timeout / watchdog kill.
+  - Stdout cap exceeded.
+  - Owner task panic or cancellation (the RAII guard is dropped on
+    unwind).
+  - Metadata parse failure (the guard outlives the parse step).
+
+  This guarantees no orphaned tempfiles regardless of the failure
+  path. Cleanup errors during `Drop` are logged at `trace` level and
+  ignored.
 - After R returns, the function:
-  1. Reads the tempfile (absolute path generated server-side via
-     `tempfile()` equivalent before spawning R) and parses the
-     `key\tvalue` lines.
-  2. Removes the tempfile (best effort; errors logged but not fatal).
+  1. Reads the tempfile and parses the `key\tvalue` lines.
+  2. Validates required keys (`topic`, `package`, `helpDir`, at least
+     one `libPath`).
   3. **On metadata parse failure** — empty file, missing required
      keys, or unreadable — returns `HelpHtmlError::RenderFailed`. No
      "fallback to canonical libpath" recovery; the result is too
@@ -260,22 +276,12 @@ Under `editors/vscode/src/help/`:
     recreated on the next request. No separate polling RPC. (`libPaths`
     appears on every response for simplicity; consumers should treat the
     most recent one as authoritative.)
-  - On each `load` from the server, runs the image-rewrite pass:
-    1. For each `<img src="...">`: if the src is absolute http(s), drop
-       the `src` (set to empty). Remote images in help are rare and
-       create a tracking surface; we'd rather show a broken icon than
-       contact the network silently.
-    2. Otherwise, the src is treated as relative to the response's
-       `helpDir`. Compute the absolute path and canonicalize.
-    3. Verify the canonicalized absolute path is **under the response's
-       `helpDir` itself** (not just under any libpath root). This blocks
-       both `\figure{../../etc/passwd}` traversal and cross-package
-       references like `<img src="../../OTHERPKG/help/figures/x.png">` —
-       a malicious package shouldn't be able to fingerprint or reference
-       another package's assets.
-    4. If validated, rewrite to
-       `webview.asWebviewUri(vscode.Uri.file(absPath)).toString()`.
-       Otherwise, set `src=""`.
+  - On each `load` from the server, runs the image-rewrite pass per the
+    classification rules in the **Image serving** section below
+    (`data:` passes through, remote schemes drop, relative paths
+    resolve under `helpDir` with traversal guards). The Extension
+    panel manager hosts the implementation; the Image serving section
+    is the authoritative spec.
 - `messages.ts`: typed wire protocol mirroring `plot/messages.ts`, with runtime
   type guards and no DOM/VS Code imports.
 - `index.ts`:
@@ -294,21 +300,21 @@ Under `editors/vscode/src/help/webview/`:
   Both buttons send messages to the extension; the extension owns history
   state. The webview never decides what topic to load.
 - Click handler on the help-content area uses **a single delegated listener
-  on the help-content root** that calls `event.preventDefault()` for **every
-  anchor click**, then dispatches:
-  - `raven-help://topic/<pkg>/<topic>[#anchor]` (path segments are
-    percent-decoded once before passing to the extension): post
-    `navigate { topic, package, anchor? }` to extension.
+  on the help-content root**. Behavior depends on the link kind:
+  - `raven-help://topic/<pkg>/<topic>[#anchor]`: `preventDefault()`,
+    percent-decode each path segment and the anchor exactly once, then
+    post `navigate { topic, package, anchor? }` to extension.
   - `https://...` / `http://...` / `mailto:...` (allowed protocols only):
-    post `open-external { url }` to extension. The extension validates the
-    URL parses cleanly and that its scheme is allowlisted before calling
-    `vscode.env.openExternal`.
-  - `#anchor` (in-page): no `preventDefault()` for this case — let the
-    browser scroll natively. Distinguished by the absence of any `://`
-    and a leading `#`.
+    `preventDefault()`, post `open-external { url }`. Extension
+    validates the URL parses cleanly and that its scheme is
+    allowlisted before calling `vscode.env.openExternal`.
+  - `#anchor` (in-page only — leading `#`, no scheme, no path):
+    **no `preventDefault()`** — let the browser scroll natively.
   - Anything else (other schemes, `javascript:`, malformed URLs, relative
-    paths the server rewriter missed): `preventDefault()` and post
-    `report-error` to the extension for telemetry. Never navigates.
+    paths the server rewriter missed, or anchors carrying
+    `data-raven-dropped="1"` from server-side neutralization):
+    `preventDefault()`, post `report-error` to the extension for
+    telemetry. Never navigates.
 
 ## LSP protocol surface
 
@@ -627,18 +633,40 @@ TTL 300s, drained on libpath-change events) and adds **single-flight
 de-duplication**:
 
 - An `Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<HelpHtmlResultShared>>>>`
-  holds in-flight fetches keyed by `cache_key(topic, package)`. The shared
-  payload is `Arc<Result<HelpHtml, HelpHtmlError>>` so all subscribers
-  share one allocation.
+  holds in-flight fetches keyed by `cache_key(topic_request, package_request)`.
+  The shared payload is `Arc<Result<HelpHtml, HelpHtmlError>>` so all
+  subscribers share one allocation.
 - On a cache miss, a caller acquires the in-flight mutex, then:
-  - If no entry exists, inserts a fresh `broadcast::Sender` and proceeds
-    to spawn R as the **owner** of this fetch.
+  - If no entry exists for the **requested** key, inserts a fresh
+    `broadcast::Sender` and proceeds to spawn R as the **owner** of this
+    fetch.
   - If an entry exists, calls `sender.subscribe()` to get a receiver,
     drops the mutex, and `await`s the receiver. No second subprocess.
+- **Canonical-key convergence**: when R resolves the request, the
+  response carries `(canonical_topic, canonical_package)` which may
+  differ from the requested values (alias case). On a successful fetch
+  the cache writes the result **under BOTH keys** (requested and
+  canonical); subsequent requests with either alias hit the cache. This
+  costs an extra `lru::push()` per uncached fetch and avoids running R a
+  second time when a user navigates between two aliases that resolve to
+  the same Rd.
+- **Cache-key lookup order** (for a request `(t, p)`):
+  1. Probe cache at `cache_key(t, p)` — return on hit.
+  2. Probe in-flight map at `cache_key(t, p)` — subscribe on hit.
+  3. Spawn R. On success, write the result to BOTH `cache_key(t, p)`
+     and `cache_key(canonical_topic, canonical_package)`.
+  
+  We do not pre-resolve `(t, p)` → canonical before the cache probe
+  (that would require a second R round-trip). Two requests for two
+  different aliases of the same page will each spawn R **once** the
+  first time; from the second onward, both keys are populated.
 - When the owner completes:
   1. Decides whether the result should be **cached** based on the
      classification table below.
-  2. If cacheable: writes to the LRU cache.
+  2. If cacheable: writes to the LRU cache under the requested key
+     **and** the canonical key (positive results) or just the requested
+     key (negative results — the canonical key is unknown when R
+     reports the topic doesn't exist).
   3. Broadcasts the shared result on the channel.
   4. Removes the in-flight entry from the map.
 - **Sender-dropped behavior**: the owner is held in a `tokio::spawn` task
