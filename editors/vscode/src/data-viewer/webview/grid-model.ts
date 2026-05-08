@@ -14,13 +14,23 @@ export function cappedScrollHeight(totalGridHeight: number): number {
 }
 
 /** Map a physical scrollTop (in the capped container) to the logical
- *  scrollTop that visibleRange() expects. Identity when content fits. */
+ *  scrollTop that visibleRange() expects. Identity when content fits.
+ *
+ *  The physical scroll range is [0, MAX_SCROLL_PX + rowHeight - viewportHeight]
+ *  and the logical scroll range is [0, totalGridHeight + rowHeight - viewportHeight],
+ *  so we scale between those two maxima (not between MAX_SCROLL_PX and
+ *  totalGridHeight) to reach the very last row when scrolled to the bottom. */
 export function logicalScrollTop(
     scrollTop: number,
     totalGridHeight: number,
+    viewportHeight: number,
+    rowHeight: number,
 ): number {
     if (totalGridHeight <= MAX_SCROLL_PX) return scrollTop;
-    return (scrollTop / MAX_SCROLL_PX) * totalGridHeight;
+    const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
+    if (maxPhysical <= 0) return 0;
+    const maxLogical = totalGridHeight + rowHeight - viewportHeight;
+    return (scrollTop / maxPhysical) * maxLogical;
 }
 
 /** Map a logical pixel offset (visibleRangeStart × rowHeight) back to a
@@ -28,9 +38,14 @@ export function logicalScrollTop(
 export function visualOffsetPx(
     logicalOffsetPx: number,
     totalGridHeight: number,
+    viewportHeight: number,
+    rowHeight: number,
 ): number {
     if (totalGridHeight <= MAX_SCROLL_PX) return logicalOffsetPx;
-    return (logicalOffsetPx / totalGridHeight) * MAX_SCROLL_PX;
+    const maxLogical = totalGridHeight + rowHeight - viewportHeight;
+    if (maxLogical <= 0) return 0;
+    const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
+    return (logicalOffsetPx / maxLogical) * maxPhysical;
 }
 
 export type VisibleArgs = {

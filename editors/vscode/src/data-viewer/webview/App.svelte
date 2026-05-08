@@ -190,7 +190,7 @@
         inflight.delete(m.requestId);
         rowCache.put(m.start, m.end, m.rows);
         const range = visibleRange({
-            scrollTop: logicalScrollTop(scrollTop, totalGridHeight),
+            scrollTop: logicalScrollTop(scrollTop, totalGridHeight, viewportHeight, ROW_HEIGHT),
             viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
         });
         if (range.start === m.start && range.end === m.end) {
@@ -228,7 +228,7 @@
     // ----- Fetching -------------------------------------------------------
     const scheduleFetchVisible = coalesceScroll(() => {
         const range = visibleRange({
-            scrollTop: logicalScrollTop(scrollTop, totalGridHeight),
+            scrollTop: logicalScrollTop(scrollTop, totalGridHeight, viewportHeight, ROW_HEIGHT),
             viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
         });
         if (range.end <= range.start) {
@@ -691,7 +691,7 @@
                 {/each}
             </div>
             <!-- Data rows -->
-            <div class="rows" style="transform: translateY({visualOffsetPx(visibleRangeStart * ROW_HEIGHT, totalGridHeight)}px);">
+            <div class="rows" style="transform: translateY({visualOffsetPx(visibleRangeStart * ROW_HEIGHT, totalGridHeight, viewportHeight, ROW_HEIGHT)}px);">
                 {#each visibleRows as rowCells, rowOffset (visibleRangeStart + rowOffset)}
                     {@const absRow = visibleRangeStart + rowOffset}
                     <div class="data-row" style="height: {ROW_HEIGHT}px;">

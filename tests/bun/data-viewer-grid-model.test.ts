@@ -48,6 +48,10 @@ describe('visibleRange', () => {
 describe('scroll height capping', () => {
     const SMALL = MAX_SCROLL_PX - 1;
     const LARGE = MAX_SCROLL_PX * 16; // ~240 M px — 10 M rows × 24 px
+    const VH = 600;   // typical viewport height
+    const RH = 24;    // row height
+    const maxPhysical = MAX_SCROLL_PX + RH - VH;   // real browser max scrollTop
+    const maxLogicalLarge = LARGE + RH - VH;
 
     test('cappedScrollHeight: small dataset is unchanged', () => {
         expect(cappedScrollHeight(SMALL)).toBe(SMALL);
@@ -57,46 +61,56 @@ describe('scroll height capping', () => {
     });
 
     test('logicalScrollTop: identity when content fits', () => {
-        expect(logicalScrollTop(1234, SMALL)).toBe(1234);
+        expect(logicalScrollTop(1234, SMALL, VH, RH)).toBe(1234);
     });
     test('logicalScrollTop: top of large dataset', () => {
-        expect(logicalScrollTop(0, LARGE)).toBe(0);
+        expect(logicalScrollTop(0, LARGE, VH, RH)).toBe(0);
     });
-    test('logicalScrollTop: bottom of large dataset maps to totalGridHeight', () => {
-        expect(logicalScrollTop(MAX_SCROLL_PX, LARGE)).toBe(LARGE);
+    test('logicalScrollTop: browser max scrollTop maps to maxLogical', () => {
+        expect(logicalScrollTop(maxPhysical, LARGE, VH, RH)).toBeCloseTo(maxLogicalLarge);
     });
     test('logicalScrollTop: midpoint maps proportionally', () => {
-        expect(logicalScrollTop(MAX_SCROLL_PX / 2, LARGE)).toBe(LARGE / 2);
+        expect(logicalScrollTop(maxPhysical / 2, LARGE, VH, RH)).toBeCloseTo(maxLogicalLarge / 2);
     });
 
     test('visualOffsetPx: identity when content fits', () => {
-        expect(visualOffsetPx(5000, SMALL)).toBe(5000);
+        expect(visualOffsetPx(5000, SMALL, VH, RH)).toBe(5000);
     });
-    test('visualOffsetPx: logical bottom maps to MAX_SCROLL_PX', () => {
-        expect(visualOffsetPx(LARGE, LARGE)).toBe(MAX_SCROLL_PX);
+    test('visualOffsetPx: maxLogical maps to maxPhysical', () => {
+        expect(visualOffsetPx(maxLogicalLarge, LARGE, VH, RH)).toBeCloseTo(maxPhysical);
     });
     test('visualOffsetPx: midpoint maps proportionally', () => {
-        expect(visualOffsetPx(LARGE / 2, LARGE)).toBe(MAX_SCROLL_PX / 2);
+        expect(visualOffsetPx(maxLogicalLarge / 2, LARGE, VH, RH)).toBeCloseTo(maxPhysical / 2);
     });
 
     test('round-trip: logicalScrollTop → visibleRange → visualOffsetPx stays consistent', () => {
-        const ROW_HEIGHT = 24;
         const nrow = 10_000_000;
-        const totalGridHeight = nrow * ROW_HEIGHT;
+        const totalGridHeight = nrow * RH;
         // Simulate scrolled to 75 % of the capped container
-        const scrollTop = MAX_SCROLL_PX * 0.75;
-        const logical = logicalScrollTop(scrollTop, totalGridHeight);
+        const scrollTop = maxPhysical * 0.75;
+        const logical = logicalScrollTop(scrollTop, totalGridHeight, VH, RH);
         const range = visibleRange({
-            scrollTop: logical, viewportHeight: 600,
-            rowHeight: ROW_HEIGHT, nrow, overscan: 0,
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 0,
         });
         // The first visible row should be near 75 % of nrow
         expect(range.start).toBeGreaterThan(nrow * 0.74);
         expect(range.start).toBeLessThan(nrow * 0.76);
-        // And its visual position should be near 75 % of MAX_SCROLL_PX
-        const visual = visualOffsetPx(range.start * ROW_HEIGHT, totalGridHeight);
-        expect(visual).toBeGreaterThan(MAX_SCROLL_PX * 0.74);
-        expect(visual).toBeLessThan(MAX_SCROLL_PX * 0.76);
+        // And its visual position should be near 75 % of maxPhysical
+        const visual = visualOffsetPx(range.start * RH, totalGridHeight, VH, RH);
+        expect(visual).toBeGreaterThan(maxPhysical * 0.74);
+        expect(visual).toBeLessThan(maxPhysical * 0.76);
+    });
+
+    test('bottom: max scrollTop reaches the last row', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        const logical = logicalScrollTop(maxPhysical, totalGridHeight, VH, RH);
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        expect(range.end).toBe(nrow);
     });
 });
 
