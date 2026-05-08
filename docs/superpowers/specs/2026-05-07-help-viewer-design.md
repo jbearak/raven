@@ -851,7 +851,7 @@ v1.
    - Operator topics in cross-refs are percent-encoded:
      `../../base/help/[` → `raven-help://topic/base/%5B`.
    - `../../base/topic/foo` (older format) rewritten to the same scheme.
-   - `../../<pkg>/doc/<vignette>.html` left unchanged (vignettes out of v1).
+   - `../../<pkg>/doc/<vignette>.html` neutralized (vignettes out of v1).
    - `https://example.com/...`, `mailto:...`, `#examples` pass through.
    - `<img src="figures/foo.png">` is left for the extension; not mangled by
      the server.

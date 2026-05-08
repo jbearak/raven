@@ -168,7 +168,8 @@ mod tests {
     fn vignette_links_neutralized() {
         let html = r#"<a href="../../dplyr/doc/intro.html">vignette</a>"#;
         let out = rewrite_help_html(html, "dplyr");
-        assert!(out.contains("data-raven-dropped=\"1\"") || out.contains("javascript:void(0)"));
+        assert!(out.contains(r#"href="javascript:void(0)""#));
+        assert!(out.contains(r#"data-raven-dropped="1""#));
         assert!(!out.contains("href=\"../../dplyr/doc/intro.html\""));
     }
 
