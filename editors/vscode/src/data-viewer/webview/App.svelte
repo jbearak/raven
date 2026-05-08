@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onDestroy, onMount } from 'svelte';
     import type {
         ExtensionToWebview,
         Layout,
@@ -44,6 +44,10 @@
     let layout = $state<Layout>({ columnWidths: {}, hiddenColumns: [] });
     let settings = $state<Settings>({
         missingValueStyle: 'foreground', defaultDigits: 3,
+    });
+
+    onDestroy(() => {
+        postLifecycle('destroy');
     });
 
     // ----- Toolbar state ---------------------------------------------------
@@ -98,6 +102,18 @@
     let copyStatusTimer: ReturnType<typeof setTimeout> | null = null;
     function bumpSelection() { selectionVersion++; }
 
+    function postLifecycle(event: string): void {
+        vscode.postMessage({
+            type: 'lifecycle',
+            event,
+            panelGeneration,
+            nrow,
+            columns: columns.length,
+            visibleRows: visibleRows.length,
+            timestamp: Date.now(),
+        });
+    }
+
     // ----- Pending getLabels for high-cardinality columns -----------------
     /** Per-column resolved label cache (for Labels=on on high-cardinality
      *  dictionary cols where dictionaries[colIdx] isn't shipped). */
@@ -105,6 +121,7 @@
 
     // ----- Message handling -----------------------------------------------
     onMount(() => {
+        postLifecycle('mount');
         const handler = (ev: MessageEvent<ExtensionToWebview>) => {
             const m = ev.data;
             if (!m || typeof m !== 'object') return;
@@ -134,7 +151,8 @@
         m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>,
     ): void {
         const sameDataset =
-            m.nrow === nrow
+            m.panelGeneration === panelGeneration
+            && m.nrow === nrow
             && sameColumns(m.columns, columns);
         panelGeneration = m.panelGeneration;
         nrow = m.nrow;
@@ -154,6 +172,7 @@
         selection.clear();
         bumpSelection();
         persistWebviewState();
+        postLifecycle(m.type);
         scheduleFetchVisible();
     }
 
@@ -172,6 +191,7 @@
             visibleRows = m.rows;
             visibleRangeStart = m.start;
             persistWebviewState();
+            postLifecycle('rows');
         }
     }
 

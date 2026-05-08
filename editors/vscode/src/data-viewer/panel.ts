@@ -23,6 +23,8 @@ import { LayoutStore, schemaHash } from './layout-state';
 import { build_csp } from './csp';
 import { render_tsv, ResolvedLabels } from './tsv';
 
+let dataViewerTraceOutput: vscode.OutputChannel | undefined;
+
 export class DataViewerPanel {
     readonly panelName: string;
     private readonly webviewPanel: vscode.WebviewPanel;
@@ -35,6 +37,7 @@ export class DataViewerPanel {
     private columns: ColumnSchema[] = [];
     private layoutHash = '';
     private layout: Layout = { columnWidths: {}, hiddenColumns: [] };
+    private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     private constructor(
         panelName: string,
@@ -80,6 +83,7 @@ export class DataViewerPanel {
         const panel = new DataViewerPanel(
             panelName, webviewPanel, reader, filePath, store, settings, disposeHook,
         );
+        panel.trace('create', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         return panel;
     }
 
@@ -91,6 +95,7 @@ export class DataViewerPanel {
         const prevPath = this.filePath;
         this.reader = reader;
         this.filePath = filePath;
+        this.trace('replace', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         if (this.webviewReady) await this.sendReplace();
         await prevReader.close();
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
@@ -119,6 +124,11 @@ export class DataViewerPanel {
             settings: this.settings,
             dictionaries: this.dictionaries,
         };
+        this.trace('post-init', {
+            generation,
+            nrow: reader.nrow,
+            columns: this.columns.length,
+        });
         await this.webviewPanel.webview.postMessage(msg);
         this.webviewInitialized = true;
         return true;
@@ -148,6 +158,11 @@ export class DataViewerPanel {
             layout: this.layout,
             dictionaries: this.dictionaries,
         };
+        this.trace('post-replace', {
+            generation,
+            nrow: reader.nrow,
+            columns: this.columns.length,
+        });
         await this.webviewPanel.webview.postMessage(msg);
     }
 
@@ -161,8 +176,19 @@ export class DataViewerPanel {
 
     private async handle(m: WebviewToExtension): Promise<void> {
         if (m.type === 'webviewReady') {
+            this.trace('webview-ready', { generation: this.generation });
             this.webviewReady = true;
             await this.sendInit();
+            return;
+        }
+        if (m.type === 'lifecycle') {
+            this.trace(`webview-${m.event}`, {
+                generation: m.panelGeneration,
+                nrow: m.nrow,
+                columns: m.columns,
+                visibleRows: m.visibleRows,
+                timestamp: m.timestamp,
+            });
             return;
         }
         if (m.panelGeneration !== this.generation) return;
@@ -173,6 +199,14 @@ export class DataViewerPanel {
         switch (m.type) {
             case 'getRows': {
                 this.reader.setLatestViewportGeneration(m.viewportGeneration);
+                this.trace('get-rows', {
+                    generation: m.panelGeneration,
+                    requestId: m.requestId,
+                    viewportGeneration: m.viewportGeneration,
+                    start: m.start,
+                    end: m.end,
+                    columns: m.columns.length,
+                });
                 const out = await this.reader.getRows({
                     start: m.start,
                     end: m.end,
@@ -190,6 +224,14 @@ export class DataViewerPanel {
                     rows: out.rows,
                     stale: out.stale,
                 };
+                this.trace('post-rows', {
+                    generation: gen,
+                    requestId: m.requestId,
+                    start: m.start,
+                    end: m.end,
+                    rows: out.rows.length,
+                    stale: out.stale,
+                });
                 await this.webviewPanel.webview.postMessage(reply);
                 return;
             }
@@ -284,9 +326,27 @@ export class DataViewerPanel {
     }
 
     private async dispose(): Promise<void> {
+        this.trace('dispose', {});
         await this.reader.close();
         try { await fs.unlink(this.filePath); } catch { /* ignore */ }
         this.disposeHook();
+    }
+
+    private trace(event: string, details: Record<string, unknown>): void {
+        const traceLevel = vscode.workspace.getConfiguration('raven')
+            .get<string>('trace.server', 'off');
+        if (traceLevel === 'off') return;
+        const payload = {
+            traceId: this.traceId,
+            panelName: this.panelName,
+            event,
+            ...details,
+        };
+        console.info('[Raven data viewer]', payload);
+        if (!dataViewerTraceOutput) {
+            dataViewerTraceOutput = vscode.window.createOutputChannel('Raven Data Viewer');
+        }
+        dataViewerTraceOutput.appendLine(JSON.stringify(payload));
     }
 }
 

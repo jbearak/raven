@@ -79,6 +79,15 @@ export type WebviewToExtension =
         type: 'webviewReady';
     }
     | {
+        type: 'lifecycle';
+        event: string;
+        panelGeneration: number;
+        nrow: number;
+        columns: number;
+        visibleRows: number;
+        timestamp: number;
+    }
+    | {
         type: 'getRows';
         panelGeneration: number;
         requestId: number;
