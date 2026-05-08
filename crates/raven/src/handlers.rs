@@ -9927,11 +9927,9 @@ async fn get_help_cached(
 /// The encoded JSON args (which drive the actual click) are unaffected.
 fn build_help_panel_link(topic: &str, package: &str) -> String {
     let arg_json = serde_json::json!([topic, package]).to_string();
-    let arg_encoded = percent_encoding::utf8_percent_encode(
-        &arg_json,
-        percent_encoding::NON_ALPHANUMERIC,
-    )
-    .to_string();
+    let arg_encoded =
+        percent_encoding::utf8_percent_encode(&arg_json, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
     let label_topic = topic.replace('`', "");
     let label_package = package.replace('`', "");
     format!("**[`{label_package}::{label_topic}`](command:raven.openHelpPanel?{arg_encoded})**\n\n")
@@ -13213,8 +13211,7 @@ x <- "#;
 
         // First call — R subprocess will fail (no such package), should cache None
         let empty_docs = std::collections::HashMap::new();
-        let resolved =
-            super::completion_item_resolve(item.clone(), &cache, &empty_docs, &r);
+        let resolved = super::completion_item_resolve(item.clone(), &cache, &empty_docs, &r);
         assert!(
             resolved.documentation.is_none(),
             "Should have no documentation for nonexistent package"
@@ -31290,7 +31287,9 @@ result <- my_func(1, 2)"#;
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "result <- dplyr::filter(df, x > 1)";
-        state.documents.insert(uri.clone(), Document::new(code, None));
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
 
         // Position the cursor on the `f` of `filter` (column 16 of the
         // 0-indexed line: "result <- dplyr::filter(...)"
@@ -41348,7 +41347,10 @@ mod issue_149_utf16_handlers {
             .decode_utf8()
             .unwrap();
         let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
-        assert_eq!(parsed, vec!["print.default".to_string(), "base".to_string()]);
+        assert_eq!(
+            parsed,
+            vec!["print.default".to_string(), "base".to_string()]
+        );
     }
 
     #[test]

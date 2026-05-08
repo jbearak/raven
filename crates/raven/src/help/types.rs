@@ -92,11 +92,20 @@ mod tests {
     fn cacheable_classification() {
         assert!(HelpHtmlError::NotFound.is_cacheable());
         assert!(HelpHtmlError::PackageNotInstalled.is_cacheable());
-        assert!(HelpHtmlError::InvalidTopic { message: "x".into() }.is_cacheable());
-        assert!(HelpHtmlError::RenderFailed { message: "x".into() }.is_cacheable());
+        assert!(HelpHtmlError::InvalidTopic {
+            message: "x".into()
+        }
+        .is_cacheable());
+        assert!(HelpHtmlError::RenderFailed {
+            message: "x".into()
+        }
+        .is_cacheable());
         assert!(HelpHtmlError::TooLarge.is_cacheable());
         assert!(!HelpHtmlError::Timeout.is_cacheable());
-        assert!(!HelpHtmlError::RUnavailable { message: "x".into() }.is_cacheable());
+        assert!(!HelpHtmlError::RUnavailable {
+            message: "x".into()
+        }
+        .is_cacheable());
     }
 
     #[test]
@@ -105,18 +114,30 @@ mod tests {
         // `validReasons` set in `editors/vscode/src/help/messages.ts`
         // accepts. A typo here breaks the wire protocol silently.
         assert_eq!(HelpHtmlError::NotFound.reason(), "not-found");
-        assert_eq!(HelpHtmlError::PackageNotInstalled.reason(), "package-not-installed");
         assert_eq!(
-            HelpHtmlError::InvalidTopic { message: "x".into() }.reason(),
+            HelpHtmlError::PackageNotInstalled.reason(),
+            "package-not-installed"
+        );
+        assert_eq!(
+            HelpHtmlError::InvalidTopic {
+                message: "x".into()
+            }
+            .reason(),
             "invalid-topic"
         );
         assert_eq!(
-            HelpHtmlError::RenderFailed { message: "x".into() }.reason(),
+            HelpHtmlError::RenderFailed {
+                message: "x".into()
+            }
+            .reason(),
             "render-failed"
         );
         assert_eq!(HelpHtmlError::Timeout.reason(), "timeout");
         assert_eq!(
-            HelpHtmlError::RUnavailable { message: "x".into() }.reason(),
+            HelpHtmlError::RUnavailable {
+                message: "x".into()
+            }
+            .reason(),
             "r-unavailable"
         );
         assert_eq!(HelpHtmlError::TooLarge.reason(), "too-large");

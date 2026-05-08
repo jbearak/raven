@@ -34,10 +34,9 @@ pub fn rewrite_help_html(html: &str, _source_pkg: &str) -> String {
                 let pkg_e = canon_segment(&pkg);
                 let topic_e = canon_segment(&topic);
                 let url = match anchor {
-                    Some(a) => format!(
-                        "raven-help://topic/{pkg_e}/{topic_e}#{}",
-                        canon_segment(&a)
-                    ),
+                    Some(a) => {
+                        format!("raven-help://topic/{pkg_e}/{topic_e}#{}", canon_segment(&a))
+                    }
                     None => format!("raven-help://topic/{pkg_e}/{topic_e}"),
                 };
                 format!("{prefix}{url}{suffix}")
@@ -85,10 +84,7 @@ fn classify_href(href: &str) -> HrefKind {
         let kind = parts.next();
         let tail = parts.next();
         if let (Some(pkg), Some(kind), Some(tail)) = (pkg, kind, tail) {
-            if (kind == "help" || kind == "topic")
-                && !pkg.is_empty()
-                && !tail.is_empty()
-            {
+            if (kind == "help" || kind == "topic") && !pkg.is_empty() && !tail.is_empty() {
                 let (topic, anchor) = match tail.split_once('#') {
                     Some((t, a)) => (t.to_string(), Some(a.to_string())),
                     None => (tail.to_string(), None),

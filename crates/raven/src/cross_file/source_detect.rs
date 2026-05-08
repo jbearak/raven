@@ -982,38 +982,14 @@ fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, V
 /// - `pmap`/`pwalk` — X is a list of vectors, not a single vector.
 /// - `map_if`/`map_at` — `(X, predicate-or-selector, FUN, ...)`, FUN at position 2.
 const APPLY_BARE_NAMES: &[&str] = &[
-    "sapply",
-    "lapply",
-    "vapply",
-    "mapply",
-    "map",
-    "walk",
-    "imap",
-    "iwalk",
-    "map_chr",
-    "map_int",
-    "map_dbl",
-    "map_lgl",
-    "map_raw",
-    "map_dfr",
-    "map_dfc",
-    "map_vec",
+    "sapply", "lapply", "vapply", "mapply", "map", "walk", "imap", "iwalk", "map_chr", "map_int",
+    "map_dbl", "map_lgl", "map_raw", "map_dfr", "map_dfc", "map_vec",
 ];
 
 /// Apply-family functions accepted under the `purrr::` namespace.
 const APPLY_PURRR_NAMES: &[&str] = &[
-    "map",
-    "walk",
-    "imap",
-    "iwalk",
-    "map_chr",
-    "map_int",
-    "map_dbl",
-    "map_lgl",
-    "map_raw",
-    "map_dfr",
-    "map_dfc",
-    "map_vec",
+    "map", "walk", "imap", "iwalk", "map_chr", "map_int", "map_dbl", "map_lgl", "map_raw",
+    "map_dfr", "map_dfc", "map_vec",
 ];
 
 /// Return `(x_position, fun_position)` describing where in the call's
@@ -2238,8 +2214,7 @@ library(ggplot2)"#;
     #[test]
     fn test_apply_var_single_arrow_assignment() {
         // Same-file variable assigned exactly once via `<-` to a c() of strings.
-        let code =
-            "libs <- c(\"dplyr\", \"tidyr\")\nsapply(libs, require, character.only = TRUE)";
+        let code = "libs <- c(\"dplyr\", \"tidyr\")\nsapply(libs, require, character.only = TRUE)";
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 2);
@@ -2251,8 +2226,7 @@ library(ggplot2)"#;
 
     #[test]
     fn test_apply_var_equals_assignment() {
-        let code =
-            "libs = c(\"dplyr\", \"tidyr\")\nsapply(libs, library, character.only = TRUE)";
+        let code = "libs = c(\"dplyr\", \"tidyr\")\nsapply(libs, library, character.only = TRUE)";
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 2);
@@ -2391,7 +2365,8 @@ library(ggplot2)"#;
     #[test]
     fn test_apply_issue_172_exact_example() {
         // Issue #172 — exact pattern from the report.
-        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
+        let code =
+            "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 3);
@@ -2405,7 +2380,8 @@ library(ggplot2)"#;
 
     #[test]
     fn test_apply_issue_172_via_extract_metadata() {
-        let code = "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
+        let code =
+            "libs <- c(\"lib1\", \"lib2\", \"lib3\")\nsapply(libs, require, character.only = TRUE)";
         let meta = crate::cross_file::extract_metadata(code);
         let pkgs: Vec<&str> = meta
             .library_calls

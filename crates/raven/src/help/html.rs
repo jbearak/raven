@@ -189,9 +189,11 @@ fn get_help_html_inner(
         }
     };
 
-    let stdout_bytes = stdout_thread.join().unwrap_or(Err(HelpHtmlError::RenderFailed {
-        message: "stdout thread panicked".into(),
-    }))?;
+    let stdout_bytes = stdout_thread
+        .join()
+        .unwrap_or(Err(HelpHtmlError::RenderFailed {
+            message: "stdout thread panicked".into(),
+        }))?;
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
 
     let status = wait_result.map_err(|e| HelpHtmlError::RenderFailed {
@@ -216,9 +218,10 @@ fn get_help_html_inner(
     }
 
     // 7) Parse metadata tempfile.
-    let meta_text = std::fs::read_to_string(&meta_path).map_err(|e| HelpHtmlError::RenderFailed {
-        message: format!("metadata read: {e}"),
-    })?;
+    let meta_text =
+        std::fs::read_to_string(&meta_path).map_err(|e| HelpHtmlError::RenderFailed {
+            message: format!("metadata read: {e}"),
+        })?;
     drop(meta); // RAII cleanup
     let mut meta_topic = None;
     let mut meta_pkg = None;
@@ -272,9 +275,11 @@ fn get_help_html_inner(
     let html_raw = String::from_utf8_lossy(&stdout_bytes).to_string();
     let stripped_raw = strip_dead_links(&html_raw);
     let rewritten_raw = rewrite_help_html(&stripped_raw, &canonical_pkg);
-    let rewritten = std::panic::catch_unwind(|| sanitize_help_html(&rewritten_raw))
-        .map_err(|_| HelpHtmlError::RenderFailed {
-            message: "ammonia panic".into(),
+    let rewritten =
+        std::panic::catch_unwind(|| sanitize_help_html(&rewritten_raw)).map_err(|_| {
+            HelpHtmlError::RenderFailed {
+                message: "ammonia panic".into(),
+            }
         })?;
 
     // 9) Title from first <h2>.
@@ -403,7 +408,10 @@ mod tests {
 
     #[test]
     fn renders_base_mean() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("mean", Some("base"), &r).expect("render");
         assert_eq!(res.package, "base");
         assert!(res.html.contains("Arithmetic Mean") || res.title.contains("Mean"));
@@ -421,7 +429,10 @@ mod tests {
         //
         // `mean` is reliable because base::weighted.mean and base::colMeans
         // are always referenced in its See Also section.
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("mean", Some("base"), &r).expect("render");
         assert!(
             res.html.contains("raven-help://topic/base/weighted.mean"),
@@ -452,14 +463,23 @@ mod tests {
 
     #[test]
     fn unknown_topic_returns_not_found() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("definitely_not_a_real_topic_zzz", Some("base"), &r);
-        assert!(matches!(res, Err(HelpHtmlError::NotFound) | Err(HelpHtmlError::RenderFailed { .. })));
+        assert!(matches!(
+            res,
+            Err(HelpHtmlError::NotFound) | Err(HelpHtmlError::RenderFailed { .. })
+        ));
     }
 
     #[test]
     fn unknown_package_returns_package_not_installed() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("filter", Some("totally_not_installed_pkg_xyz"), &r);
         assert!(matches!(
             res,
@@ -469,7 +489,10 @@ mod tests {
 
     #[test]
     fn operator_topic_works() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("[", Some("base"), &r).expect("render");
         assert_eq!(res.package, "base");
     }
@@ -484,9 +507,15 @@ mod tests {
         // length 0 and `.getHelpFile()` then throws "argument is of length
         // zero". The fix in rd_to_html.R falls back to `help(topic)` when
         // the package-qualified search returns nothing.
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("plot.default", Some("base"), &r).expect("render");
-        assert_eq!(res.package, "graphics", "fallback must resolve to graphics, not base");
+        assert_eq!(
+            res.package, "graphics",
+            "fallback must resolve to graphics, not base"
+        );
         assert_eq!(res.topic, "plot.default");
     }
 
@@ -495,9 +524,15 @@ mod tests {
         // Aliases are another flavor of the misattribution: `finite` is an
         // alias for `is.finite` in base, but graphics::plot.default emits
         // `graphics/help/finite` for it. The fallback resolves the alias.
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("finite", Some("graphics"), &r).expect("render");
-        assert_eq!(res.package, "base", "alias must resolve to base, not graphics");
+        assert_eq!(
+            res.package, "base",
+            "alias must resolve to base, not graphics"
+        );
     }
 
     #[test]
@@ -509,7 +544,10 @@ mod tests {
         // before the cross-reference rewriter runs (the rewriter converts
         // unknown hrefs to javascript:void(0) which would prevent strip-by-href
         // from matching), so the actual rendered HTML must contain neither.
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let res = get_help_html("mean", Some("base"), &r).expect("render");
         assert!(
             !res.html.contains("Run examples"),
@@ -543,7 +581,10 @@ mod tests {
     #[test]
     #[ignore]
     fn stdout_cap_returns_too_large() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let _guard = EnvGuard::set("RAVEN_HELP_HTML_MAX_BYTES", "1024");
         let res = get_help_html("mean", Some("base"), &r);
         assert!(
@@ -565,7 +606,10 @@ mod tests {
     #[test]
     #[ignore]
     fn get_help_html_timeout() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
         let start = std::time::Instant::now();
         let res = get_help_html_with_code("mean", Some("base"), &r, "Sys.sleep(60)");
@@ -593,7 +637,10 @@ mod tests {
     #[test]
     #[ignore]
     fn get_help_html_timeout_reaps_process() {
-        let Some(r) = r_path() else { eprintln!("skip: no R"); return; };
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
         let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
 
         let pid_capture = AtomicU32::new(0);
@@ -624,6 +671,11 @@ mod tests {
             kill_result
         );
         let errno = std::io::Error::last_os_error().raw_os_error();
-        assert_eq!(errno, Some(libc::ESRCH), "expected ESRCH; got errno {:?}", errno);
+        assert_eq!(
+            errno,
+            Some(libc::ESRCH),
+            "expected ESRCH; got errno {:?}",
+            errno
+        );
     }
 }

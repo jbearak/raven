@@ -90,10 +90,8 @@ fn strip_run_examples_link(html: &str) -> std::borrow::Cow<'_, str> {
 fn strip_index_link(html: &str) -> std::borrow::Cow<'_, str> {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?is)\s*<a\b[^>]*\bhref=['"]00Index\.html['"][^>]*>\s*Index\s*</a>"#,
-        )
-        .expect("valid regex")
+        regex::Regex::new(r#"(?is)\s*<a\b[^>]*\bhref=['"]00Index\.html['"][^>]*>\s*Index\s*</a>"#)
+            .expect("valid regex")
     });
     re.replace(html, "")
 }
@@ -106,17 +104,47 @@ fn build_ammonia_sanitized(html: &str) -> String {
 
     let tags = TAGS.get_or_init(|| {
         [
-            "h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "pre", "blockquote", "hr",
-            "table", "thead", "tbody", "tr", "th", "td", "caption", "dl", "dt", "dd",
-            "ul", "ol", "li", "a", "code", "em", "strong", "i", "b", "span", "br",
-            "sub", "sup", "img",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "p",
+            "div",
+            "pre",
+            "blockquote",
+            "hr",
+            "table",
+            "thead",
+            "tbody",
+            "tr",
+            "th",
+            "td",
+            "caption",
+            "dl",
+            "dt",
+            "dd",
+            "ul",
+            "ol",
+            "li",
+            "a",
+            "code",
+            "em",
+            "strong",
+            "i",
+            "b",
+            "span",
+            "br",
+            "sub",
+            "sup",
+            "img",
         ]
         .into_iter()
         .collect()
     });
-    let generic = GENERIC_ATTRS.get_or_init(|| {
-        ["class", "id", "title", "style"].into_iter().collect()
-    });
+    let generic =
+        GENERIC_ATTRS.get_or_init(|| ["class", "id", "title", "style"].into_iter().collect());
     let per_tag = TAG_ATTRS.get_or_init(|| {
         let mut m = HashMap::new();
         m.insert("a", ["href"].into_iter().collect());
@@ -125,10 +153,7 @@ fn build_ammonia_sanitized(html: &str) -> String {
             ["src", "alt", "width", "height"].into_iter().collect(),
         );
         for tag in ["table", "th", "td"] {
-            m.insert(
-                tag,
-                ["colspan", "rowspan", "align"].into_iter().collect(),
-            );
+            m.insert(tag, ["colspan", "rowspan", "align"].into_iter().collect());
         }
         m
     });
@@ -351,7 +376,11 @@ mod tests {
     fn drops_data_url_on_a_href_case_and_whitespace_insensitive() {
         // Defense-in-depth: case variation and leading whitespace must not
         // smuggle a `data:` href past the filter.
-        for raw_href in [r#"DATA:text/html,x"#, r#"  data:text/html,x"#, r#"Data:text/html,x"#] {
+        for raw_href in [
+            r#"DATA:text/html,x"#,
+            r#"  data:text/html,x"#,
+            r#"Data:text/html,x"#,
+        ] {
             let html = format!(r#"<a href="{raw_href}">x</a>"#);
             let out = sanitize_help_html(&html);
             assert!(
@@ -367,7 +396,11 @@ mod tests {
         // "R: ..." inner text and leak it into the rendered body.
         let html = r#"<html><head><title>R: Foo</title></head><body><h2>Body</h2></body></html>"#;
         let out = sanitize_help_html(html);
-        assert!(!out.contains("R: Foo"), "title content must be stripped: {}", out);
+        assert!(
+            !out.contains("R: Foo"),
+            "title content must be stripped: {}",
+            out
+        );
         assert!(out.contains("<h2>Body</h2>"));
     }
 
@@ -378,8 +411,16 @@ mod tests {
         // editor tab title; strip it.
         let html = r#"<table style="width: 100%;"><tr><td>filter {dplyr}</td><td style="text-align: right;">R Documentation</td></tr></table><h2>Subset rows</h2>"#;
         let out = sanitize_help_html(html);
-        assert!(!out.contains("R Documentation"), "decorative table must be removed: {}", out);
-        assert!(!out.contains("filter {dplyr}"), "decorative table must be removed: {}", out);
+        assert!(
+            !out.contains("R Documentation"),
+            "decorative table must be removed: {}",
+            out
+        );
+        assert!(
+            !out.contains("filter {dplyr}"),
+            "decorative table must be removed: {}",
+            out
+        );
         assert!(out.contains("<h2>Subset rows</h2>"));
     }
 
@@ -399,8 +440,16 @@ mod tests {
         // viewer, so strip the whole paragraph.
         let html = r#"<h3>Examples</h3><p><a href='../Example/plot'>Run examples</a></p><pre>plot(1:10)</pre>"#;
         let out = strip_dead_links(html);
-        assert!(!out.contains("Run examples"), "Run examples must be stripped: {}", out);
-        assert!(!out.contains("../Example/"), "Example href must be gone: {}", out);
+        assert!(
+            !out.contains("Run examples"),
+            "Run examples must be stripped: {}",
+            out
+        );
+        assert!(
+            !out.contains("../Example/"),
+            "Example href must be gone: {}",
+            out
+        );
         assert!(out.contains("<h3>Examples</h3>"));
         assert!(out.contains("plot(1:10)"));
     }
@@ -419,9 +468,17 @@ mod tests {
         // Strip the link AND its leading whitespace, leaving the package/version text.
         let html = r#"<hr><div style="text-align: center;">[Package <em>base</em> version 4.6.0 <a href="00Index.html">Index</a>]</div>"#;
         let out = strip_dead_links(html);
-        assert!(!out.contains("00Index.html"), "Index href must be gone: {}", out);
+        assert!(
+            !out.contains("00Index.html"),
+            "Index href must be gone: {}",
+            out
+        );
         assert!(!out.contains(">Index<"), "Index text must be gone: {}", out);
-        assert!(out.contains("[Package <em>base</em> version 4.6.0]"), "footer text preserved: {}", out);
+        assert!(
+            out.contains("[Package <em>base</em> version 4.6.0]"),
+            "footer text preserved: {}",
+            out
+        );
     }
 
     #[test]

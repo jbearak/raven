@@ -1511,7 +1511,11 @@ impl LanguageServer for Backend {
                 Ok(Some(serde_json::json!({ "cleared": cleared })))
             }
             "raven.getHelpHtml" => {
-                let topic = params.arguments.first().and_then(|v| v.as_str()).unwrap_or("");
+                let topic = params
+                    .arguments
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
                 // Distinguish missing (absent or JSON null) from wrong-type
                 // (e.g. a number) so a malformed second argument doesn't
@@ -1590,11 +1594,7 @@ impl LanguageServer for Backend {
                         let task = tokio::task::spawn_blocking(move || {
                             crate::help::get_help_html(&t, p.as_deref(), &r_path)
                         });
-                        match tokio::time::timeout(
-                            crate::handlers::HELP_LOOKUP_TIMEOUT,
-                            task,
-                        )
-                        .await
+                        match tokio::time::timeout(crate::handlers::HELP_LOOKUP_TIMEOUT, task).await
                         {
                             Ok(Ok(r)) => r,
                             Ok(Err(_)) => Err(crate::help::HelpHtmlError::RenderFailed {
@@ -7187,8 +7187,8 @@ mod refresh_packages_tests {
     mod get_help_html_command {
         use std::sync::mpsc;
         use std::sync::Arc;
-        use tower_lsp::{LanguageServer, LspService};
         use tower_lsp::lsp_types::{ExecuteCommandParams, InitializeParams, InitializeResult};
+        use tower_lsp::{LanguageServer, LspService};
 
         use super::super::{Backend, RequestCancellationRegistry};
 
@@ -7240,10 +7240,7 @@ mod refresh_packages_tests {
         }
 
         /// Helper: invoke `raven.getHelpHtml` with the given args and return the response value.
-        async fn run_command(
-            backend: &Backend,
-            args: Vec<serde_json::Value>,
-        ) -> serde_json::Value {
+        async fn run_command(backend: &Backend, args: Vec<serde_json::Value>) -> serde_json::Value {
             let params = ExecuteCommandParams {
                 command: "raven.getHelpHtml".into(),
                 arguments: args,
@@ -7264,10 +7261,14 @@ mod refresh_packages_tests {
             // even on machines with R on PATH. The handler must mirror the hover
             // path's fallback to PathBuf::from("R") so PATH-resolved R is used.
             //
-            // This test asserts only the negative — the handler must not return
-            // the rPath-unset error message — because we cannot assume R is on
-            // PATH in every CI environment. A clean miss may produce
-            // render-failed/not-found instead, which is the right shape.
+            // Skip on hosts without R on PATH: the production fallback correctly
+            // returns r-unavailable when `Command::new("R")` cannot spawn, so the
+            // assertion below would fail spuriously on R-less CI runners. Skip
+            // mirrors the pattern used by other R-using tests in this crate.
+            if crate::r_subprocess::RSubprocess::new(None).is_none() {
+                eprintln!("skip: no R on PATH");
+                return;
+            }
             let backend = make_backend_no_r();
             let resp = run_command(
                 &backend,
@@ -7294,7 +7295,10 @@ mod refresh_packages_tests {
             let backend = make_backend_no_r();
             let resp = run_command(
                 &backend,
-                vec![serde_json::json!("with\nnewline"), serde_json::json!("base")],
+                vec![
+                    serde_json::json!("with\nnewline"),
+                    serde_json::json!("base"),
+                ],
             )
             .await;
             assert_eq!(resp["ok"], false);
@@ -7331,8 +7335,8 @@ mod refresh_packages_tests {
         /// PATH-fallback subprocess work.
         #[tokio::test]
         async fn cached_entry_served_without_r() {
-            use std::path::PathBuf;
             use crate::help::HelpHtml;
+            use std::path::PathBuf;
 
             let backend = make_backend_no_r();
 
@@ -7347,7 +7351,9 @@ mod refresh_packages_tests {
             };
             {
                 let state = backend.state.read().await;
-                state.html_help_cache.insert("synthetic", Some("fake"), Ok(synthetic));
+                state
+                    .html_help_cache
+                    .insert("synthetic", Some("fake"), Ok(synthetic));
             }
 
             // With no r_path configured, a miss would return r-unavailable.
@@ -7370,8 +7376,7 @@ mod refresh_packages_tests {
         /// `crates/raven/src/help/html.rs`.
         #[tokio::test(flavor = "multi_thread")]
         async fn happy_path_renders_base_mean_when_r_is_available() {
-            let Some(r) =
-                crate::r_subprocess::RSubprocess::new(None).map(|s| s.r_path().clone())
+            let Some(r) = crate::r_subprocess::RSubprocess::new(None).map(|s| s.r_path().clone())
             else {
                 eprintln!("skip: no R");
                 return;
@@ -7396,7 +7401,10 @@ mod refresh_packages_tests {
             let lib_paths = resp["libPaths"].as_array().expect("libPaths must be array");
             assert!(!lib_paths.is_empty(), "libPaths must be non-empty");
             for p in lib_paths {
-                assert!(p.is_string(), "libPaths element must be a string, got {p:?}");
+                assert!(
+                    p.is_string(),
+                    "libPaths element must be a string, got {p:?}"
+                );
             }
         }
     }

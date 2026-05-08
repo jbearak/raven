@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,16 @@ pub struct HtmlHelpCache {
     /// for the owner to broadcast its result, so only one R subprocess runs
     /// per `(topic, package)` at a time.
     in_flight: Arc<Mutex<HashMap<String, broadcast::Sender<ResultShared>>>>,
+    /// Monotonic counter bumped by `drain()`. The Owner snapshots this value
+    /// before fetching and skips its post-fetch LRU insert if the counter
+    /// has changed — meaning a libpath / package change happened during the
+    /// fetch and the rendered HTML is now stale w.r.t. the new corpus.
+    /// Without this gate, a pre-drain Owner finishing after `drain()` would
+    /// repopulate the freshly-cleared LRU with stale data, and a pre-drain
+    /// Owner finishing after a fresh post-drain Owner would overwrite the
+    /// fresh entry. Subscribers still receive the broadcast even when the
+    /// insert is skipped — they made their request before the drain too.
+    generation: Arc<AtomicU64>,
 }
 
 fn cache_key(topic: &str, package: Option<&str>) -> String {
@@ -55,6 +66,7 @@ impl HtmlHelpCache {
             inner: Arc::new(RwLock::new(LruCache::new(cap))),
             negative_ttl,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -112,6 +124,12 @@ impl HtmlHelpCache {
         }
 
         let key = cache_key(topic, package);
+        // Snapshot the generation BEFORE the in_flight probe so that any
+        // `drain()` ordered after this point will be observed at insert time
+        // and force-skip our LRU write. A pre-drain snapshot can never be
+        // larger than the post-drain value, so a missed comparison can only
+        // err on the side of skipping (= safe).
+        let gen_at_start = self.generation.load(Ordering::SeqCst);
 
         // 2) In-flight probe / register.
         enum Role {
@@ -144,12 +162,19 @@ impl HtmlHelpCache {
             Role::Owner(sender) => {
                 let result = fetch(topic.to_string(), package.map(str::to_string)).await;
 
-                // 4) Cache if the result is worth keeping.
+                // 4) Cache if the result is worth keeping AND a `drain()` did
+                //    not fire while we were fetching. A drain bumps
+                //    `generation`, so a mismatched snapshot means our result
+                //    reflects a pre-drain libpath / package state and must
+                //    not be written back into the freshly-cleared LRU.
+                //    Subscribers still receive the broadcast below — they
+                //    issued their request before the drain too.
                 let cacheable = match &result {
                     Ok(_) => true,
                     Err(e) => e.is_cacheable(),
                 };
-                if cacheable {
+                let still_current = self.generation.load(Ordering::SeqCst) == gen_at_start;
+                if cacheable && still_current {
                     self.insert(topic, package, result.clone());
                 }
 
@@ -184,7 +209,15 @@ impl HtmlHelpCache {
     /// `HelpCache::drain` — so a freshly-arriving caller starts a new fetch
     /// instead of subscribing to (and trusting) a result that began before the
     /// libpath changed.
+    ///
+    /// Bumps `generation` BEFORE clearing so any in-flight Owner that
+    /// observes `drain()` after its post-fetch generation load sees a
+    /// mismatched value and skips its LRU insert. Bumping first also means
+    /// a fresh post-drain Owner that reads the snapshot before our clears
+    /// finish will already see the new generation, so its insert is gated
+    /// correctly.
     pub fn drain(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut guard) = self.inner.write() {
             guard.clear();
         }
@@ -282,6 +315,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_during_fetch_skips_stale_lru_insert() {
+        // Regression: an Owner that started fetching BEFORE `drain()` must
+        // not write its result back into the freshly-cleared LRU. Otherwise
+        // the next caller would hit a stale entry that reflects a pre-drain
+        // libpath / package state.
+        use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+        use tokio::sync::Notify;
+
+        let c = Arc::new(HtmlHelpCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner_started = Arc::new(Notify::new());
+        let owner_unblock = Arc::new(Notify::new());
+
+        // Owner: begins, signals it has registered, then waits to be unblocked.
+        let c1 = c.clone();
+        let calls1 = calls.clone();
+        let started = owner_started.clone();
+        let unblock = owner_unblock.clone();
+        let owner = tokio::spawn(async move {
+            c1.get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls1.clone();
+                let started = started.clone();
+                let unblock = unblock.clone();
+                async move {
+                    calls.fetch_add(1, StdOrdering::SeqCst);
+                    started.notify_one();
+                    unblock.notified().await;
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await
+        });
+
+        // Wait until the Owner has registered its in_flight sender.
+        owner_started.notified().await;
+
+        // Drain mid-flight: bumps generation, clears LRU and in_flight.
+        c.drain();
+
+        // Release the Owner — its post-fetch insert must be skipped.
+        owner_unblock.notify_one();
+        let _ = owner.await.unwrap();
+
+        // The LRU must still be empty: the Owner's pre-drain result is stale
+        // and must not repopulate the cache.
+        assert!(
+            c.get("filter", Some("dplyr")).is_none(),
+            "pre-drain Owner must not repopulate the LRU after drain()"
+        );
+
+        // A subsequent caller must trigger a fresh fetch (call counter
+        // increments to 2 — Owner 1 pre-drain and a new Owner 2).
+        let calls2 = calls.clone();
+        let res2 = c
+            .get_or_fetch("filter", Some("dplyr"), move |_t, _p| {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, StdOrdering::SeqCst);
+                    Ok::<_, HelpHtmlError>(ok_help("filter", "dplyr"))
+                }
+            })
+            .await;
+        assert!(matches!(res2, Ok(_)));
+        assert_eq!(
+            calls.load(StdOrdering::SeqCst),
+            2,
+            "second caller must run a fresh fetch — Owner 1's stale result must not have populated the LRU"
+        );
+
+        // Now the LRU should hold Owner 2's fresh result.
+        assert!(c.get("filter", Some("dplyr")).is_some());
+    }
+
+    #[tokio::test]
     async fn owner_returning_uncacheable_error_does_not_poison_in_flight() {
         // Regression: if the Owner returns a non-cacheable error (e.g. the
         // outer `tokio::time::timeout` mapped to `HelpHtmlError::Timeout`),
@@ -310,8 +417,14 @@ mod tests {
 
         // After the Owner returned, in_flight must be empty and the LRU must
         // not have cached the Timeout (it's classified as non-cacheable).
-        assert!(c.in_flight.lock().unwrap().is_empty(), "in_flight must be cleaned up after Err(Timeout)");
-        assert!(c.get("filter", Some("dplyr")).is_none(), "Timeout must not be LRU-cached");
+        assert!(
+            c.in_flight.lock().unwrap().is_empty(),
+            "in_flight must be cleaned up after Err(Timeout)"
+        );
+        assert!(
+            c.get("filter", Some("dplyr")).is_none(),
+            "Timeout must not be LRU-cached"
+        );
 
         // A second caller for the same key must trigger a fresh fetch (not
         // hang on a subscriber waiting for a sender that won't ever fire).

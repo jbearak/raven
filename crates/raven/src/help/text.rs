@@ -445,7 +445,8 @@ fn get_help_inner(
             log::trace!("get_help: wait error: {}", e);
             None
         }
-    }}
+    }
+}
 
 /// Extracts the first function signature from R help text.
 ///
@@ -1693,7 +1694,10 @@ Value:
     fn get_help_timeout_returns_none() {
         let r = match crate::r_subprocess::RSubprocess::new(None) {
             Some(s) => s.r_path().clone(),
-            None => { eprintln!("skip: no R"); return; }
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
         };
         let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
         let start = std::time::Instant::now();
@@ -1721,7 +1725,10 @@ Value:
     fn get_help_timeout_reaps_process() {
         let r = match crate::r_subprocess::RSubprocess::new(None) {
             Some(s) => s.r_path().clone(),
-            None => { eprintln!("skip: no R"); return; }
+            None => {
+                eprintln!("skip: no R");
+                return;
+            }
         };
         let _guard = EnvGuard::set("RAVEN_HELP_TIMEOUT_MS", "200");
 
@@ -1750,7 +1757,12 @@ Value:
             kill_result
         );
         let errno = std::io::Error::last_os_error().raw_os_error();
-        assert_eq!(errno, Some(libc::ESRCH), "expected ESRCH; got errno {:?}", errno);
+        assert_eq!(
+            errno,
+            Some(libc::ESRCH),
+            "expected ESRCH; got errno {:?}",
+            errno
+        );
     }
 
     #[test]
@@ -1765,13 +1777,18 @@ Value:
         // Arguments section and calling get_arguments (which will cache the
         // parsed result); r_path is unused because the help text is already
         // in the main cache.
-        let help_text = "mean\n\nDescription:\n\n     Mean.\n\nArguments:\n\n       x: numeric vector.\n";
+        let help_text =
+            "mean\n\nDescription:\n\n     Mean.\n\nArguments:\n\n       x: numeric vector.\n";
         cache.insert("mean_with_args", Some("base"), Some(help_text.to_string()));
         let dummy_r = std::path::Path::new("R");
         let _ = cache.get_arguments("mean_with_args", Some("base"), dummy_r);
         {
             let guard = cache.arguments.read().unwrap();
-            assert_eq!(guard.len(), 1, "arguments cache should have one entry before drain");
+            assert_eq!(
+                guard.len(),
+                1,
+                "arguments cache should have one entry before drain"
+            );
         }
 
         // Also insert a negative cache entry
@@ -1784,7 +1801,11 @@ Value:
         assert_eq!(cache.len(), 0, "inner cache should be empty after drain");
         {
             let guard = cache.arguments.read().unwrap();
-            assert_eq!(guard.len(), 0, "arguments cache should be empty after drain");
+            assert_eq!(
+                guard.len(),
+                0,
+                "arguments cache should be empty after drain"
+            );
         }
 
         // Cache misses after drain (not Some(None) for the negative entry)
