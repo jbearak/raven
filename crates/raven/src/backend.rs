@@ -1530,24 +1530,24 @@ impl LanguageServer for Backend {
 
                 let (cache, r_path) = {
                     let state = self.state.read().await;
-                    let r_path = state.cross_file_config.packages_r_path.clone();
+                    // Mirror the hover handler: fall back to "R" (PATH lookup) when
+                    // raven.packages.rPath is unset. The setting is opt-in for users
+                    // with non-default R installs; the default expectation is that
+                    // `R` resolves through PATH like every other R-spawning code path.
+                    let r_path = state
+                        .cross_file_config
+                        .packages_r_path
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from("R"));
                     let cache = state.html_help_cache.clone();
                     (cache, r_path)
                 };
 
-                // Probe the cache before checking r_path: a cached positive entry
-                // must be served even if R is no longer configured.
+                // Probe the cache before spawning R: a cached positive entry
+                // is returned without re-running the subprocess.
                 if let Some(cached) = cache.get(topic, package) {
                     return Ok(Some(help_html_to_json(cached)));
                 }
-
-                let Some(r_path) = r_path else {
-                    return Ok(Some(serde_json::json!({
-                        "ok": false,
-                        "reason": "r-unavailable",
-                        "message": "R not configured (set raven.packages.rPath)",
-                    })));
-                };
 
                 let result = cache
                     .get_or_fetch(topic, package, move |t, p| async move {
@@ -7218,16 +7218,35 @@ mod refresh_packages_tests {
                 .expect("execute_command must return Some")
         }
 
-        #[tokio::test]
-        async fn r_unavailable_when_packages_r_path_is_none() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn unset_r_path_falls_back_to_path_lookup() {
+            // Regression for the smoke-test bug where leaving raven.packages.rPath
+            // unset (the documented default — auto-detect) made the help panel
+            // show "r-unavailable: R not configured (set raven.packages.rPath)"
+            // even on machines with R on PATH. The handler must mirror the hover
+            // path's fallback to PathBuf::from("R") so PATH-resolved R is used.
+            //
+            // This test asserts only the negative — the handler must not return
+            // the rPath-unset error message — because we cannot assume R is on
+            // PATH in every CI environment. A clean miss may produce
+            // render-failed/not-found instead, which is the right shape.
             let backend = make_backend_no_r();
             let resp = run_command(
                 &backend,
                 vec![serde_json::json!("mean"), serde_json::json!("base")],
             )
             .await;
-            assert_eq!(resp["ok"], false);
-            assert_eq!(resp["reason"], "r-unavailable");
+            if resp["ok"] == false {
+                assert_ne!(
+                    resp["reason"], "r-unavailable",
+                    "handler must not bail with r-unavailable when PATH could provide R; got: {resp:?}"
+                );
+                let msg = resp["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("set raven.packages.rPath"),
+                    "stale 'set raven.packages.rPath' wording leaked through: {resp:?}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -7265,11 +7284,13 @@ mod refresh_packages_tests {
             assert_eq!(resp["reason"], "invalid-topic");
         }
 
-        /// Cache hit is served even when R is not configured.
+        /// Cache hit is served without spawning R.
         ///
-        /// Positive entries cached from an earlier session (when R was available)
-        /// must not be silently bypassed just because `packages_r_path` is now
-        /// `None`.  The handler must probe the cache before the r_path guard.
+        /// Positive entries cached from an earlier session must be served
+        /// straight from the LRU before the handler resolves an R path or
+        /// spawns a subprocess. The cache probe runs after r_path resolution
+        /// in the handler but before any fetch, so a hit short-circuits the
+        /// PATH-fallback subprocess work.
         #[tokio::test]
         async fn cached_entry_served_without_r() {
             use std::path::PathBuf;

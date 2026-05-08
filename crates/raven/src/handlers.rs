@@ -9984,6 +9984,34 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         end: ts_point_to_lsp_position(&text, node.end_position()),
     };
 
+    // Explicit `pkg::name` / `pkg:::name` qualifier wins over the cross-file
+    // scope's name resolution. Without this, hovering `filter` in
+    // `dplyr::filter()` would resolve to whichever `filter` the workspace
+    // scope happened to surface (often `base`/`stats::filter`), and the
+    // bold help-panel link would point at the wrong package.
+    if let Some(qualifier_pkg) = find_namespace_context(&node, &text) {
+        let pkg_owned = qualifier_pkg.to_string();
+        let mut value = build_help_panel_link(name, &pkg_owned);
+        if let Some(help_text) =
+            get_help_cached(&state.help_cache, name, Some(&pkg_owned), r_path.clone()).await
+        {
+            value.push_str(&format!("```\n{}\n```", help_text));
+        } else {
+            // No help text available — still show the qualified heading + a
+            // 'from {pkg}' attribution so the user sees we honored the
+            // qualifier even when R doesn't have a topic for it.
+            value.push_str(&format!("```r\n{}\n```\n", name));
+            value.push_str(&format!("\nfrom {{{}}}", pkg_owned));
+        }
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(node_range),
+        });
+    }
+
     // Try cross-file symbols (includes local scope with definition extraction)
     log::trace!("Calling get_cross_file_symbols for hover");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
@@ -31222,6 +31250,48 @@ result <- my_func(1, 2)"#;
             }
         }
         // Note: We don't assert hover_result.is_some() because R might not be available in CI
+    }
+
+    #[test]
+    fn test_hover_namespace_qualifier_wins_over_scope_lookup() {
+        // Regression for the smoke-test bug where hovering `filter` in
+        // `dplyr::filter()` rendered "from {base}" because the cross-file
+        // scope returned `base::filter` (or similar) before the qualifier
+        // was checked. The qualifier MUST win — the bold help-panel link
+        // and the attribution string must both reference dplyr.
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "result <- dplyr::filter(df, x > 1)";
+        state.documents.insert(uri.clone(), Document::new(code, None));
+
+        // Position the cursor on the `f` of `filter` (column 16 of the
+        // 0-indexed line: "result <- dplyr::filter(...)"
+        //                  0         1
+        //                  0123456789012345678
+        // d-p-l-y-r-:-:-f-i-l-t-e-r → 'f' is at column 17).
+        let position = Position::new(0, 17);
+        let hover_result = hover_blocking(&state, &uri, position);
+
+        // We don't require R to be reachable — the qualifier-driven branch
+        // produces a hover string whether or not the help cache has data.
+        let hover = hover_result.expect("hover must return for a known qualified call");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            // The bold link must encode dplyr as the package, not base/stats.
+            assert!(
+                value.starts_with("**[`dplyr::filter`](command:raven.openHelpPanel?"),
+                "expected bold link to dplyr::filter, got: {}",
+                value
+            );
+            assert!(
+                !value.contains("from {base}") && !value.contains("from {stats}"),
+                "qualifier-driven hover must not attribute to base/stats: {}",
+                value
+            );
+        } else {
+            panic!("Expected markup content");
+        }
     }
 
     #[test]
