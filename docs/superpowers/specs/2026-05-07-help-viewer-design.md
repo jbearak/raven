@@ -39,7 +39,7 @@ The product shape was settled in the 2026-05-07 brainstorm:
 
 Goals:
 
-1. New `get_help_html(topic, package, r_path) -> Option<HelpHtml>` in `help.rs`
+1. New `get_help_html(topic, package, r_path) -> Result<HelpHtml, HelpHtmlError>` in `help.rs`
    that spawns R and runs
    `tools::Rd2HTML(utils:::.getHelpFile(help(topic, package = (pkg))), ...)`.
    Mirrors the existing `get_help()` synchronous-watchdog timeout pattern (the
@@ -133,7 +133,7 @@ Non-goals for v1:
                               │ get_help_html (Rust)            │   │  Webview (Svelte)  │
                               │ • validate topic / package      │   │  • render HTML     │
                               │ • spawn R via configured r_path │   │  • intercept clicks│
-                              │ • Rd2HTML + meta JSON in 1 call │   │    (preventDefault │
+                              │ • Rd2HTML + tempfile metadata   │   │    (preventDefault │
                               │ • cap stdout at 8 MiB           │   │     for all anchors│
                               │ • sanitize (ammonia)            │   │     except #anchor)│
                               │ • rewrite cross-refs            │   │  • back / forward  │
@@ -177,9 +177,11 @@ file outgrows itself; see "Implementation notes" below):
   literal string).
 
   ```r
+  # Argument order is fixed: [1]=topic, [2]=package-or-empty, [3]=tempfile path.
+  # The caller MUST pass three positional args; pass "" for an absent package.
   args <- commandArgs(trailingOnly = TRUE)
   topic <- args[1]
-  pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
+  pkg <- if (nzchar(args[2])) args[2] else NULL
   meta_path <- args[3]  # absolute path to per-request tempfile
   rd <- utils:::.getHelpFile(help(topic, package = (pkg)))
   resolved_pkg <- attr(rd, "package")
