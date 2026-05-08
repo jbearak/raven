@@ -13,9 +13,7 @@ mod types;
 mod validate;
 
 pub use cache::HtmlHelpCache;
-pub use html::{get_help_html, HELP_HTML_MAX_BYTES, HELP_HTML_TIMEOUT};
-pub use rewrite::rewrite_help_html;
-pub use sanitize::sanitize_help_html;
+pub use html::get_help_html;
 pub use text::*;
 pub use types::{HelpHtml, HelpHtmlError};
 pub use validate::is_valid_help_topic;

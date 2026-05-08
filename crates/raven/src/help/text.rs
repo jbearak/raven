@@ -31,11 +31,6 @@ struct CachedHelp {
 /// Type alias to reduce complexity of the nested generics in `HelpCache.arguments`.
 type ArgumentsCache = LruCache<String, Option<HashMap<String, String>>>;
 
-/// Shared result type used by the single-flight in-flight map. `Arc` lets
-/// multiple waiters receive the same `Option<String>` without cloning the
-/// (potentially large) help text string more than once.
-type ResultShared = std::sync::Arc<Option<String>>;
-
 /// Bounded cache for help content. Uses LRU eviction to prevent unbounded
 /// memory growth in long-running LSP sessions.
 ///
@@ -52,12 +47,6 @@ type ResultShared = std::sync::Arc<Option<String>>;
 /// Also caches structured argument maps (parameter name → description) parsed
 /// from the "Arguments:" section of rendered help text. This avoids re-parsing
 /// help text on every `completionItem/resolve` request for parameter documentation.
-///
-/// The `in_flight` map provides single-flight deduplication for `get_or_fetch_async`:
-/// concurrent requests for the same key share a single fetcher invocation via a
-/// `broadcast` channel. The `std::sync::Mutex` (not a `tokio` mutex) keeps the
-/// lock duration minimal — we only hold it long enough to read/write the map entry,
-/// never across an `.await`.
 #[derive(Clone)]
 pub struct HelpCache {
     inner: Arc<RwLock<LruCache<String, CachedHelp>>>,
@@ -66,11 +55,6 @@ pub struct HelpCache {
     /// negative cache entries (no arguments found or no help available).
     arguments: Arc<RwLock<ArgumentsCache>>,
     negative_ttl: Duration,
-    /// In-flight map for single-flight deduplication in `get_or_fetch_async`.
-    /// Keyed by the same composite key as `inner`. The broadcast sender is
-    /// inserted by the "owner" task and removed once the result is stored in the
-    /// LRU cache and broadcast to any waiting "subscriber" tasks.
-    in_flight: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<ResultShared>>>>,
 }
 
 /// Builds a cache key from a topic and optional package.
@@ -214,17 +198,12 @@ impl HelpCache {
     /// Clear all cached help entries (positive, negative, and arguments).
     ///
     /// Called when libpath changes invalidate the help corpus (package install,
-    /// uninstall, or upgrade). Drops in-flight entries too — concurrent owner
-    /// tasks will simply have their broadcast subscribers see `RecvError::Closed`
-    /// once the senders are dropped, mapping to a transient `RenderFailed`.
+    /// uninstall, or upgrade).
     pub fn drain(&self) {
         if let Ok(mut guard) = self.inner.write() {
             guard.clear();
         }
         if let Ok(mut guard) = self.arguments.write() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.in_flight.lock() {
             guard.clear();
         }
     }
@@ -240,63 +219,6 @@ impl HelpCache {
             inner: Arc::new(RwLock::new(LruCache::new(cap))),
             arguments: Arc::new(RwLock::new(LruCache::new(cap))),
             negative_ttl,
-            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-
-    /// Async, single-flight version of `get_or_fetch`.
-    ///
-    /// On a cache miss, runs the provided fetcher exactly once for concurrent
-    /// callers requesting the same key. The fetcher is async and receives
-    /// `(topic, package)`.
-    ///
-    /// This method never holds `in_flight` across an `.await` — the `std::sync::Mutex`
-    /// is locked only for the brief map lookup/insert/remove operations.
-    pub async fn get_or_fetch_async<F, Fut>(
-        &self,
-        topic: &str,
-        package: Option<&str>,
-        fetch: F,
-    ) -> Option<String>
-    where
-        F: FnOnce(String, Option<String>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Option<String>> + Send + 'static,
-    {
-        if let Some(cached) = self.get(topic, package) {
-            return cached;
-        }
-        let key = cache_key(topic, package);
-        enum Role {
-            Owner(tokio::sync::broadcast::Sender<ResultShared>),
-            Subscriber(tokio::sync::broadcast::Receiver<ResultShared>),
-        }
-        let role = {
-            let mut map = self.in_flight.lock().expect("in_flight lock");
-            match map.get(&key) {
-                Some(s) => Role::Subscriber(s.subscribe()),
-                None => {
-                    let (tx, _) = tokio::sync::broadcast::channel(1);
-                    map.insert(key.clone(), tx.clone());
-                    Role::Owner(tx)
-                }
-            }
-        };
-        match role {
-            Role::Subscriber(mut rx) => match rx.recv().await {
-                Ok(shared) => (*shared).clone(),
-                Err(_) => None,
-            },
-            Role::Owner(sender) => {
-                let result = fetch(topic.to_string(), package.map(str::to_string)).await;
-                self.insert(topic, package, result.clone());
-                let shared = std::sync::Arc::new(result.clone());
-                {
-                    let mut map = self.in_flight.lock().expect("in_flight lock");
-                    map.remove(&key);
-                }
-                let _ = sender.send(shared);
-                result
-            }
         }
     }
 
@@ -1762,35 +1684,6 @@ Value:
         );
     }
 
-    #[tokio::test]
-    async fn async_get_or_fetch_dedups_concurrent_misses() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let c = std::sync::Arc::new(HelpCache::new());
-        let calls = std::sync::Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::new();
-        for _ in 0..5 {
-            let c = c.clone();
-            let calls = calls.clone();
-            handles.push(tokio::spawn(async move {
-                c.get_or_fetch_async("mean", Some("base"), move |_t, _p| {
-                    let calls = calls.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        Some("fake help".to_string())
-                    }
-                })
-                .await
-            }));
-        }
-        for h in handles {
-            let _ = h.await.unwrap();
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
     /// Verifies that `get_help` returns `None` when R hangs, and that it does
     /// so well within 1 second.
     ///
@@ -1898,10 +1791,6 @@ Value:
         {
             let guard = cache.arguments.read().unwrap();
             assert_eq!(guard.len(), 0, "arguments cache should be empty after drain");
-        }
-        {
-            let guard = cache.in_flight.lock().unwrap();
-            assert_eq!(guard.len(), 0, "in_flight map should be empty after drain");
         }
 
         // Cache misses after drain (not Some(None) for the negative entry)
