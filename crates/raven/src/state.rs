@@ -567,6 +567,7 @@ pub struct WorldState {
 
     // Caches
     pub help_cache: crate::help::HelpCache,
+    pub html_help_cache: crate::help::HtmlHelpCache,
     pub signature_cache: Arc<SignatureCache>,
     pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
@@ -673,6 +674,7 @@ impl WorldState {
 
             // Caches
             help_cache: crate::help::HelpCache::new(),
+            html_help_cache: crate::help::HtmlHelpCache::new(),
             signature_cache: Arc::new(SignatureCache::new(500, 200)),
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),

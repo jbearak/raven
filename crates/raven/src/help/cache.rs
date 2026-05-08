@@ -26,6 +26,7 @@ struct Entry {
     cached_at: Instant,
 }
 
+#[derive(Clone)]
 pub struct HtmlHelpCache {
     inner: Arc<RwLock<LruCache<String, Entry>>>,
     negative_ttl: Duration,
