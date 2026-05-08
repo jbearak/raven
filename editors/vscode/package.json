@@ -75,6 +75,18 @@
       {
         "command": "raven.terminal.sourceFile",
         "title": "Raven: Terminal - Source File"
+      },
+      {
+        "command": "raven.openHelpPanel",
+        "title": "Raven: Open R Help Panel"
+      },
+      {
+        "command": "raven.help.back",
+        "title": "Raven: Help Back"
+      },
+      {
+        "command": "raven.help.forward",
+        "title": "Raven: Help Forward"
       }
     ],
     "keybindings": [
@@ -614,6 +626,16 @@
           ],
           "default": "beside",
           "description": "Initial editor column when the plot viewer first opens. Once you move the panel, Raven leaves it where you put it."
+        },
+        "raven.help.viewerColumn": {
+          "type": "string",
+          "enum": ["active", "beside"],
+          "enumDescriptions": [
+            "Open the help viewer in the active editor column.",
+            "Open the help viewer beside the active editor."
+          ],
+          "default": "beside",
+          "description": "Initial editor column when the R help viewer first opens. Once you move the panel, Raven leaves it where you put it."
         }
       }
     }
