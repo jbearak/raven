@@ -96,23 +96,27 @@ View(copy_me)
 # labels on every column and non-trivial value-label sets on four columns —
 # the canonical real-world read_sav() stress test for the Labels toggle.
 if (requireNamespace("haven", quietly = TRUE)) {
-  f        <- system.file("files/electric.sav", package = "foreign")
-  electric <- haven::read_sav(f)
+  f <- system.file("files/electric.sav", package = "foreign")
+  if (!nzchar(f)) {
+    message("Skipping Western Electric section: electric.sav not found (foreign package missing?).")
+  } else {
+    electric <- haven::read_sav(f)
 
-  View(electric)
-  # Expected:
-  #   hover any column header  → tooltip shows the variable label
-  #                              (e.g. "FIRSTCHD: FIRST CHD EVENT",
-  #                               "VITAL10: STATUS AT TEN YEARS")
-  #   Labels toggle ON         → four columns swap codes for strings:
-  #     FIRSTCHD   1 → "NO CHD", 2 → "SUDDEN  DEATH", 3 → "NONFATALMI",
-  #                5 → "FATAL   MI",  6 → "OTHER   CHD"
-  #     DAYOFWK    1 → "SUNDAY" … 7 → "SATURDAY", 9 → "MISSING"
-  #     VITAL10    0 → "ALIVE", 1 → "DEAD"
-  #     FAMHXCVR   "Y" → "YES", "N" → "NO"
-  #   Labels toggle OFF        → raw codes reappear in all four columns
-  #   Remaining 9 columns (AGE, DBP58, CHOL58, …) carry variable labels only:
-  #     toggle has no visible effect; variable-label tooltip still works
+    View(electric)
+    # Expected:
+    #   hover any column header  → tooltip shows "<NAME>: <variable label>"
+    #                              (e.g. "FIRSTCHD: FIRST CHD EVENT",
+    #                               "VITAL10: STATUS AT TEN YEARS")
+    #   Labels toggle ON         → four columns swap codes for strings:
+    #     FIRSTCHD   1 → "NO CHD", 2 → "SUDDEN  DEATH", 3 → "NONFATALMI",
+    #                5 → "FATAL   MI",  6 → "OTHER   CHD"
+    #     DAYOFWK    1 → "SUNDAY" … 7 → "SATURDAY", 9 → "MISSING"
+    #     VITAL10    0 → "ALIVE", 1 → "DEAD"
+    #     FAMHXCVR   "Y" → "YES", "N" → "NO"
+    #   Labels toggle OFF        → raw codes reappear in all four columns
+    #   Remaining 9 columns (AGE, DBP58, CHOL58, …) carry variable labels only:
+    #     toggle has no visible effect; variable-label tooltip still works
+  }
 } else {
   message("Skipping Western Electric section: install 'haven' to run it.")
 }

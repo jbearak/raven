@@ -763,7 +763,7 @@
                     >
                         <span class="col-name">{col.name}</span>
                         {#if col.variableLabel}
-                            <span class="col-tooltip" role="tooltip">{col.variableLabel}</span>
+                            <span class="col-tooltip" role="tooltip">{col.name}: {col.variableLabel}</span>
                         {/if}
                         <!-- svelte-ignore a11y_no_static_element_interactions -->
                         <div class="resize-handle"
