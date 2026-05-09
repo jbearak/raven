@@ -23,7 +23,7 @@ When you open any file, Raven:
 2. Resolves which symbols are available at each position in each file
 3. Provides completions, diagnostics, hover, and go-to-definition using the full graph
 
-This happens automatically — no configuration needed for standard `source()` patterns.
+This happens automatically for standard `source()` patterns.
 
 ## Automatic source() Detection
 

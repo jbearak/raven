@@ -4,7 +4,7 @@ Raven provides intelligent indentation for R code through a two-tier system.
 
 ## Overview
 
-Both tiers are active by default — no configuration needed.
+Both tiers are active by default.
 
 | Tier | What It Does | How It Works |
 |------|-------------|--------------|

@@ -25,7 +25,7 @@ Raven is the only R LSP that traces `source()` chains across a project: it build
 
 ## R session integration
 
-Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations we and our users have run into — described below.
+Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations our team has run into — described below.
 
 These comparisons are based on reading the current upstream sources (links cited inline). Where the underlying behavior has been changed recently — e.g. the data viewer's row cap — we note that.
 
