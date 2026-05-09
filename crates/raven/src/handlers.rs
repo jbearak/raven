@@ -649,7 +649,24 @@ fn call_callee_identifier(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     let children = crate::parser_pool::non_extra_children(node, &mut cursor);
     let callee = children.first().copied()?;
-    (callee.kind() == "identifier").then_some(callee)
+    if callee.kind() == "identifier" {
+        return Some(callee);
+    }
+    namespace_operator_member_identifier(callee)
+}
+
+fn namespace_operator_member_identifier(node: Node) -> Option<Node> {
+    if node.kind() != "namespace_operator" {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+    children
+        .iter()
+        .rev()
+        .copied()
+        .find(|child| child.kind() == "identifier")
 }
 
 fn push_function_token(node: Node, text: &str, tokens: &mut Vec<AbsoluteSemanticToken>) {
@@ -12032,6 +12049,17 @@ mod tests {
                 (0, 0, 3),  // add definition
                 (1, 10, 3), // add call
                 (1, 19, 4), // mean call
+            ]
+        );
+    }
+    #[test]
+    fn test_semantic_tokens_namespace_qualified_call_heads() {
+        let code = "graphics::plot(1)\npkg:::internal(1)";
+        assert_eq!(
+            semantic_token_spans(code),
+            vec![
+                (0, 10, 4), // plot, not graphics
+                (1, 6, 8),  // internal, not pkg
             ]
         );
     }
