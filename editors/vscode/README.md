@@ -1,10 +1,17 @@
-# Raven - R Language Server
+# Raven — R Extension for VS Code
 
-A language server for R, JAGS, and Stan with cross-file awareness.
+Raven is an R extension for VS Code, plus a standalone language server for other LSP-compatible editors.
 
-> Raven follows `source()` chains to provide workspace-wide completions, go-to-definition across files, position-aware scope resolution, and diagnostics that understand your project structure — all without running R.
+The extension integrates an R console, plot viewer, data viewer, and help viewer. Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R reliably even over `tmux` and SSH, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
+
+The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. We're not aware of another R language server that combines `source()`-chain tracing with position-aware package scope; if you know of one, we'd like to hear about it.
+
+> [!NOTE]
+> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](#coexistence-with-vscode-r-and-positron) below. The language server and help viewer are unaffected.
 
 ## Features
+
+### Code intelligence
 
 - **[Completions](https://github.com/jbearak/raven/blob/main/docs/completion.md)** — Symbols, packages, and function parameters — across files
 - **Go-to-definition** — Jump to definitions across file boundaries
@@ -19,6 +26,13 @@ A language server for R, JAGS, and Stan with cross-file awareness.
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **Syntax highlighting** — JAGS and Stan (R highlighting is built into VS Code)
 
+### R session integration
+
+- **[R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
+- **[Plot viewer](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
+- **[Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
+- **[Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
+
 > [!NOTE]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation.
 
@@ -28,6 +42,8 @@ Key settings (all under the `raven.*` prefix):
 
 | Setting | Default | Description |
 |---|---|---|
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). |
+| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). The help viewer activates regardless of `raven.rConsole.activation`. |
 | `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
 | `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
 | `raven.packages.enabled` | `true` | Enable package function awareness |
@@ -37,13 +53,19 @@ Key settings (all under the `raven.*` prefix):
 
 See the [full configuration reference](https://github.com/jbearak/raven/blob/main/docs/configuration.md) for all options.
 
-## Using with vscode-R
+## Coexistence with vscode-R and Positron
 
-To run R code, view plots, and access other interactive features, install [vscode-R](https://github.com/REditorSupport/vscode-R) alongside Raven. Disable its language server to avoid duplicate completions:
+Raven's R-console features (R console, plot viewer, data viewer) and REditorSupport's [vscode-R](https://github.com/REditorSupport/vscode-R) cover overlapping ground. By default `raven.rConsole.activation` is `"auto"`, which means: if vscode-R is enabled, or you're running inside Positron, Raven's R-console features step aside automatically. Raven's help viewer and language server activate either way.
+
+Set `"enabled"` to override and run both extensions' R-session features at once — you'll then own any keybinding or `View()`-override conflicts.
+
+If you want to run vscode-R's language server alongside Raven (for example, to use its `lintr` diagnostics), keep its language-server feature off:
 
 ```json
 "r.lsp.enabled": false
 ```
+
+For a deeper comparison see [docs/comparison.md](https://github.com/jbearak/raven/blob/main/docs/comparison.md).
 
 ## Using with Sight (Stata)
 

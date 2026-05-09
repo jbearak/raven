@@ -24,6 +24,13 @@ import { register_r_terminal, register_send_to_r_commands, get_or_create_r_termi
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
 import type { DataViewerManager } from './data-viewer/manager';
+import {
+    detectAutoDisableReason,
+    notifyAutoDisable,
+    readRConsoleActivation,
+    registerActivationReactivity,
+    resolveRConsoleActivation,
+} from './r-console-activation';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -165,22 +172,24 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // Activate help viewer (registers raven.openHelpPanel, raven.help.back, raven.help.forward).
     activateHelpViewer(context, client);
 
-    // Plot services (session server + viewer panel) for managed R terminals.
-    // Constructed before raven.restart registration so the closure has a live
-    // reference, not just a temporal-dead-zone forward binding.
-    //
-    // The session server's loopback /view-data route only accepts files
-    // under the data-viewer storage directory; passing '' disables it.
-    const data_viewer_enabled = vscode.workspace.getConfiguration('raven.dataViewer')
-        .get<boolean>('enabled', true);
-    const plot_services = new PlotServices(
-        context,
-        data_viewer_enabled ? dataViewerDirOf(context) : '',
-    );
-    active_plot_services = plot_services;
+    // R-console activation gating. The R console, plot viewer, and data viewer
+    // share one umbrella — `raven.rConsole.activation`. Default `auto` steps
+    // aside when REditorSupport (R) is enabled or VS Code is running as
+    // Positron, so Raven supplements rather than fights existing R-session
+    // setups. The help viewer activates regardless and is wired above.
+    const r_console_resolved = resolveRConsoleActivation();
     let data_viewer_manager: DataViewerManager | undefined;
-    if (data_viewer_enabled) {
+    if (r_console_resolved === 'enabled') {
+        // Plot services (session server + viewer panel) for managed R terminals.
+        // Constructed before raven.restart registration so the closure has a live
+        // reference, not just a temporal-dead-zone forward binding.
+        const plot_services = new PlotServices(context, dataViewerDirOf(context));
+        active_plot_services = plot_services;
         data_viewer_manager = registerDataViewer(context, plot_services.server, dataViewerDirOf(context));
+
+        // Register R terminal and send-to-R commands
+        register_r_terminal(context, plot_services);
+        register_send_to_r_commands(context);
     }
 
     // Register restart command — re-reads trace config so changed settings take effect.
@@ -225,12 +234,15 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
 
-    // Register R terminal and send-to-R commands
-    register_r_terminal(context, plot_services);
-    register_send_to_r_commands(context);
+    // If `auto` chose to disable, surface a one-time popover so the user knows
+    // why their R console / plot viewer / data viewer didn't activate.
+    if (r_console_resolved === 'disabled' && readRConsoleActivation() === 'auto') {
+        void notifyAutoDisable(context, detectAutoDisableReason());
+    }
 
-    // Warn if REditorSupport is also installed (keybinding conflict)
-    checkRExtensionConflict(context);
+    // Listen for setting changes and REditorSupport extension toggles, and
+    // prompt the user to reload when the resolved activation flips.
+    registerActivationReactivity(context, r_console_resolved);
 
     // Register activity signal listeners for cross-file revalidation prioritization
     context.subscriptions.push(
@@ -362,25 +374,6 @@ async function ensureWordSeparators(wordSeparators: string) {
             await config.update(`[${languageId}]`, updatedLanguageConfig, vscode.ConfigurationTarget.Global);
         }
     }
-}
-
-const R_EXTENSION_CONFLICT_DISMISSED = 'raven.rExtensionConflictDismissed';
-
-function checkRExtensionConflict(context: vscode.ExtensionContext) {
-    if (context.globalState.get<boolean>(R_EXTENSION_CONFLICT_DISMISSED)) return;
-
-    const rExt = vscode.extensions.getExtension('REditorSupport.r');
-    if (!rExt) return;
-
-    vscode.window.showInformationMessage(
-        'Both Raven and REditorSupport (R) are installed with the same Cmd+Enter / Ctrl+Enter keybinding. Only one will handle the shortcut, but which one depends on load order. You can control this in the Keybindings editor.',
-        'Got it',
-        'Don\'t show again'
-    ).then(choice => {
-        if (choice === 'Don\'t show again') {
-            context.globalState.update(R_EXTENSION_CONFLICT_DISMISSED, true);
-        }
-    });
 }
 
 let active_plot_services: PlotServices | null = null;

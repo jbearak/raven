@@ -2,11 +2,6 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 
 suite('Raven plot settings', () => {
-    test('raven.plot.enabled defaults to true', () => {
-        const cfg = vscode.workspace.getConfiguration('raven.plot');
-        assert.strictEqual(cfg.get<boolean>('enabled'), true);
-    });
-
     test('raven.plot.viewerColumn defaults to "beside"', () => {
         const cfg = vscode.workspace.getConfiguration('raven.plot');
         assert.strictEqual(cfg.get<string>('viewerColumn'), 'beside');
