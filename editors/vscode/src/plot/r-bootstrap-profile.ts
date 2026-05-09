@@ -466,29 +466,44 @@ local({
         invisible(NULL)
     }
 
-    # Helper: post a /plot-warning and then open the original graphics device.
-    # Installed as options(device=) so the VS Code popup fires on the first
-    # plot attempt rather than at session start, avoiding startup noise.
+    # Helper: defer the VS Code popup to the user's first plot attempt, and
+    # warn on every subsequent plot until httpgd is installed. Combines:
+    #   - A permanent PDF fallback in options(device=) so plot() never errors
+    #     with "no active device" — output is discarded since there's no UI
+    #     to render to until httpgd is available.
+    #   - Hooks on plot.new and grid.newpage so the warning fires on every
+    #     plot (base R + grid/ggplot2), not just the first.
+    # The VS Code popup is posted only on the first plot to avoid stacking
+    # notifications. Both the hook and the popup self-disable once httpgd
+    # becomes available, so installing it mid-session doesn't require a
+    # restart.
     .raven_deferred_warn <- function(msg, reason) {
         .raven_original_device <- getOption("device")
         options(device = function() {
-            # Self-remove before doing anything so re-entrant calls are safe.
-            options(device = .raven_original_device)
-            .raven_post("/plot-warning", paste0(
-                "{",
-                "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
-                "\\"reason\\":", .raven_json_str(reason), ",",
-                "\\"message\\":", .raven_json_str(msg),
-                "}"
-            ))
-            warning(msg, call. = FALSE)
-            # Try to open the original device; if that fails (e.g. the
-            # terminal has no native graphics device), fall back to a
-            # temporary PDF so R always has something to render to.
-            tryCatch(grDevices::dev.new(), error = function(e) {
-                try(grDevices::pdf(tempfile(fileext = ".pdf")), silent = TRUE)
-            })
+            try(grDevices::pdf(tempfile(fileext = ".pdf")), silent = TRUE)
         })
+        .raven_first_plot <- TRUE
+        .raven_warn_hook <- function(...) {
+            # Once httpgd is available, become a no-op so plots flow through
+            # to the VS Code panel normally.
+            if (requireNamespace("httpgd", quietly = TRUE) &&
+                utils::packageVersion("httpgd") >= "2.0.2") {
+                return(invisible(NULL))
+            }
+            if (.raven_first_plot) {
+                .raven_post("/plot-warning", paste0(
+                    "{",
+                    "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
+                    "\\"reason\\":", .raven_json_str(reason), ",",
+                    "\\"message\\":", .raven_json_str(msg),
+                    "}"
+                ))
+                .raven_first_plot <<- FALSE
+            }
+            warning(msg, call. = FALSE)
+        }
+        setHook("plot.new", .raven_warn_hook)
+        setHook("grid.newpage", .raven_warn_hook)
         .raven_original_device
     }
 
