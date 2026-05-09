@@ -93,6 +93,7 @@ export class ArrowSliceReader {
     private batchCache = new Map<number, any>();
     private static readonly BATCH_CACHE_MAX = 16;
     private latestViewportGen = 0;
+    private closed = false;
 
     private constructor(reader: any, fileHandle: FileHandle, schema: ReaderSchema, nrow: number, batchStarts: Uint32Array) {
         this.reader = reader;
@@ -199,6 +200,8 @@ export class ArrowSliceReader {
     }
 
     async close(): Promise<void> {
+        if (this.closed) return;
+        this.closed = true;
         await this.fileHandle.close();
     }
 

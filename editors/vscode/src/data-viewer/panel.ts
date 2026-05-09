@@ -33,6 +33,7 @@ export class DataViewerPanel {
     private generation = 0;
     private webviewReady = false;
     private webviewInitialized = false;
+    private disposed = false;
     private dictionaries: Record<number, string[]> = {};
     private columns: ColumnSchema[] = [];
     private layoutHash = '';
@@ -88,8 +89,19 @@ export class DataViewerPanel {
     }
 
     /** Replace the underlying reader. Old file is deleted; old generation
-     *  is bumped so any in-flight reply is dropped. */
+     *  is bumped so any in-flight reply is dropped.
+     *
+     *  Disposal can race with replace: the user may close the tab while a
+     *  replace is in flight. If disposal happens before the swap, we own
+     *  cleaning up the new reader/file (dispose() can't see them yet). If it
+     *  happens after the swap, dispose() closes the new reader and unlinks
+     *  the new path, but the old reader/file is still ours to clean up. */
     async replace(reader: ArrowSliceReader, filePath: string): Promise<void> {
+        if (this.disposed) {
+            await reader.close().catch(() => undefined);
+            try { await fs.unlink(filePath); } catch { /* ignore */ }
+            return;
+        }
         this.generation += 1;
         const prevReader = this.reader;
         const prevPath = this.filePath;
@@ -97,7 +109,7 @@ export class DataViewerPanel {
         this.filePath = filePath;
         this.trace('replace', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         if (this.webviewReady) await this.sendReplace();
-        await prevReader.close();
+        await prevReader.close().catch(() => undefined);
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
     }
 
@@ -175,6 +187,18 @@ export class DataViewerPanel {
     }
 
     private async handle(m: WebviewToExtension): Promise<void> {
+        if (this.disposed) return;
+        try {
+            await this.handleInner(m);
+        } catch (err) {
+            // Reader operations can reject with EBADF if dispose() closes the
+            // FileHandle mid-await. Swallow those — the webview is gone.
+            if (this.disposed) return;
+            throw err;
+        }
+    }
+
+    private async handleInner(m: WebviewToExtension): Promise<void> {
         if (m.type === 'webviewReady') {
             this.trace('webview-ready', { generation: this.generation });
             this.webviewReady = true;
@@ -326,8 +350,10 @@ export class DataViewerPanel {
     }
 
     private async dispose(): Promise<void> {
+        if (this.disposed) return;
+        this.disposed = true;
         this.trace('dispose', {});
-        await this.reader.close();
+        await this.reader.close().catch(() => undefined);
         try { await fs.unlink(this.filePath); } catch { /* ignore */ }
         this.disposeHook();
     }

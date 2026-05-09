@@ -176,3 +176,15 @@ describe('ArrowSliceReader: large-file guard', () => {
         await r.close();
     });
 });
+
+describe('ArrowSliceReader: idempotent close', () => {
+    // Calling close() twice is safe — panel.dispose() and panel.replace()
+    // can race on the same reader when the user closes the tab during a
+    // View() replace. The second call must be a no-op rather than rejecting
+    // with EBADF from the underlying FileHandle.
+    test('close() is a no-op on the second call', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        await r.close();
+        await r.close();
+    });
+});
