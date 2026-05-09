@@ -4,7 +4,7 @@ Raven is an R extension for VS Code, plus a standalone [language server](https:/
 
 The VS Code extension integrates an [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md). Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R reliably even over `tmux` and SSH, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
-The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. We're not aware of another R language server that combines `source()`-chain tracing with position-aware package scope; if you know of one, we'd like to hear about it.
+The language server analyzes your code in realtime, without running it. It completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 
 > [!NOTE]
 > If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Comparison: Coexistence](docs/comparison.md#coexistence). The language server and help viewer are unaffected.
