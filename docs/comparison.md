@@ -23,6 +23,11 @@ Compares Raven's language server against the language servers and code-intellige
 
 Among the R LSPs we've surveyed, Raven is the only one that traces `source()` chains across a project: it builds a dependency graph and resolves what's in scope at each cursor position based on the actual order of execution, rather than treating the workspace as one flat symbol set. That makes its completions, diagnostics, and navigation reflect actual execution order in multi-file scripted projects, including circular-dependency and scope-violation detection. The analysis is static; Raven does spawn R subprocesses on demand for package metadata (exports, NAMESPACE entries, function signatures), but it doesn't need a live R session to compute scope.
 
+### What REditorSupport's language server offers that Raven doesn't
+
+- **lintr diagnostics** — Style checks and correctness linters (e.g. `object_usage_linter`, `line_length_linter`, `trailing_whitespace_linter`) via the [`lintr`](https://lintr.r-lib.org/) package. Raven has no style linting.
+- **Session-aware completions** — When the session watcher is enabled, REditorSupport can complete symbols from the live R session's `globalenv()`, including column names from data frames that only exist at runtime. Raven's completions are purely static.
+
 ## R session integration
 
 Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations our team has run into — described below.
@@ -48,6 +53,15 @@ Raven's `View()` writes the frame to an Apache Arrow IPC (Feather v2) file, and 
 REditorSupport's hover is rendered server-side by [`languageserver`](https://github.com/REditorSupport/languageserver), which is itself an R package running inside its own R process. When the hover handler can't resolve a symbol from the in-file scope, it calls `workspace$get_help(token, package)`, which tries [`guess_namespace(topic)`](https://github.com/REditorSupport/languageserver/blob/master/R/workspace.R) against the language server's *workspace-flat* set of attached packages. That set is built by parsing `library()` / `require()` / `pacman::p_load()` calls out of source files and `library()`-ing the named packages inside the language server's own R process — but only for files the user has opened (`didOpen`), with one exception: if the project is an R package (has a `DESCRIPTION` file), `R/*.R` is also pre-scanned at startup. For an ordinary scripted project, `library()` calls in files the user hasn't opened are invisible to the hover; across files the user *has* opened, the package set is unioned without regard to where the cursor is. When `guess_namespace` doesn't return a single match, the handler falls through to `utils::help((topic))` with no `package` argument, which returns matches across **every** installed package — so hovering over `filter` in a script that's loaded `dplyr` can fall through to a multi-package result that includes `dplyr::filter`, `stats::filter`, and other same-named topics.
 
 Raven takes a different approach. Its language server is a separate Rust process that statically traces `library()` / `require()` calls in the file at the cursor and across the `source()` chain — including files the user hasn't opened — plus namespace qualifiers (`pkg::fn`) and `@lsp-*` directives, to compute which package is in scope at the cursor position. It then shows a single help link for that package. Raven does spawn R subprocesses to read package metadata (exports, NAMESPACE entries, function signatures), but the disambiguation logic itself is static — it doesn't depend on whether the user has opened, run, or attached anything. See [Help Viewer](./help-viewer.md).
+
+### What REditorSupport's VS Code extension offers that Raven doesn't
+
+- **Workspace viewer** — A sidebar panel that introspects the live R session, showing objects in `globalenv()` with their types and dimensions, plus attached and loaded namespaces. Objects can be viewed or removed directly from the panel.
+- **htmlwidget / Shiny viewer** — Interactive HTML output (plotly, DT, profvis, etc.) and Shiny apps render in VS Code webview panels.
+- **R Markdown support** — Chunk highlighting, chunk navigation, run-chunk / run-above CodeLens buttons, and R Markdown preview.
+- **List / environment viewer** — `View()` on lists and environments opens a collapsible tree view. Raven's `View()` only handles data frames and matrices.
+
+If you're interested in any of these, please [file an issue](https://github.com/jbearak/raven/issues) or submit a PR.
 
 ## Coexistence
 
