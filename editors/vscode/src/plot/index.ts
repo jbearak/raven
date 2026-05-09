@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { PlotEvent, RSessionEvent, RSessionServer } from '../r-session-server';
+import { RSessionEvent, RSessionServer } from '../r-session-server';
 import { PlotViewerPanel } from './plot-viewer-panel';
 
 /**
@@ -110,15 +110,13 @@ export class PlotServices {
     }
 
     private on_server_event(event: RSessionEvent): void {
-        // PlotServices only handles plot-related events; the data viewer
-        // manager subscribes separately for view-data-requested.
-        if (event.type === 'view-data-requested') return;
-        const e = event as PlotEvent;
-        if (e.type === 'plot-available') {
-            const panel = this.get_or_create_panel(e.sessionId);
+        if (event.type === 'plot-available') {
+            const panel = this.get_or_create_panel(event.sessionId);
             panel.notifyPlotAvailable();
-        } else if (e.type === 'session-ended') {
-            this.panels.get(e.sessionId)?.notifySessionEnded();
+        } else if (event.type === 'session-ended') {
+            this.panels.get(event.sessionId)?.notifySessionEnded();
+        } else if (event.type === 'plot-warning') {
+            vscode.window.showWarningMessage(event.message);
         }
     }
 

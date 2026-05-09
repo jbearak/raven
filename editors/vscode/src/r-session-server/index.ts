@@ -5,13 +5,14 @@ import * as path from 'path';
 import {
     DataViewerWarningEvent,
     PlotEvent,
+    PlotWarningEvent,
     RSessionEvent,
     RSessionEventListener,
     SessionInfo,
     ViewDataEvent,
 } from './types';
 
-export type { DataViewerWarningEvent, PlotEvent, RSessionEvent, RSessionEventListener, SessionInfo, ViewDataEvent };
+export type { DataViewerWarningEvent, PlotEvent, PlotWarningEvent, RSessionEvent, RSessionEventListener, SessionInfo, ViewDataEvent };
 /** @deprecated Use {@link RSessionEventListener}. */
 export type PlotEventListener = RSessionEventListener;
 
@@ -120,6 +121,10 @@ export class RSessionServer {
             this.read_json_body(req, res, body => this.handle_data_viewer_warning(body, res));
             return;
         }
+        if (url === '/plot-warning') {
+            this.read_json_body(req, res, body => this.handle_plot_warning(body, res));
+            return;
+        }
         res.writeHead(404).end();
     }
 
@@ -142,6 +147,24 @@ export class RSessionServer {
             reason,
             message,
         });
+        res.writeHead(200).end();
+    }
+
+    private handle_plot_warning(body: unknown, res: http.ServerResponse): void {
+        if (!body || typeof body !== 'object') {
+            res.writeHead(400).end();
+            return;
+        }
+        const b = body as Record<string, unknown>;
+        const sessionId = typeof b.sessionId === 'string' ? b.sessionId : '';
+        const reason = (b.reason === 'missing-httpgd' || b.reason === 'outdated-httpgd')
+            ? b.reason : '';
+        const message = typeof b.message === 'string' ? b.message : '';
+        if (!sessionId || !reason || !message) {
+            res.writeHead(400).end();
+            return;
+        }
+        this.emit({ type: 'plot-warning', sessionId, reason, message });
         res.writeHead(200).end();
     }
 

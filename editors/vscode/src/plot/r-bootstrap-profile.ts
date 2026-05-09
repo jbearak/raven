@@ -350,7 +350,11 @@ local({
 
 # Plot bridge block — depends on httpgd. Independent of the data viewer
 # block above; if httpgd is missing, View() still works.
+# Skip entirely in non-interactive R processes (e.g. R CMD INSTALL subprocesses
+# spawned by install.packages): those inherit R_PROFILE_USER but must not load
+# or lock the httpgd namespace.
 local({
+    if (!interactive()) return(invisible(NULL))
     .raven_log <- function(msg) {
         message(paste0("Raven: ", msg))
     }
@@ -394,13 +398,29 @@ local({
 
     # 2. Verify httpgd >= 2.0.2 is available.
     if (!requireNamespace("httpgd", quietly = TRUE)) {
-        .raven_log("plots require the httpgd package. Install with: install.packages(\\"httpgd\\")")
+        .raven_msg <- "To view plots in VS Code, install the httpgd package: install.packages(\\"httpgd\\")"
+        .raven_log(.raven_msg)
+        .raven_post("/plot-warning", paste0(
+            "{",
+            "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
+            "\\"reason\\":\\"missing-httpgd\\",",
+            "\\"message\\":", .raven_json_str(.raven_msg),
+            "}"
+        ))
         return(invisible(NULL))
     }
     if (!(utils::packageVersion("httpgd") >= "2.0.2")) {
-        .raven_log(paste0(
-            "httpgd >= 2.0.2 is required (found ",
-            as.character(utils::packageVersion("httpgd")), "). Run: install.packages(\\"httpgd\\")"
+        .raven_msg <- paste0(
+            "To view plots in VS Code, update httpgd to >= 2.0.2 (installed: ",
+            as.character(utils::packageVersion("httpgd")), "): install.packages(\\"httpgd\\")"
+        )
+        .raven_log(.raven_msg)
+        .raven_post("/plot-warning", paste0(
+            "{",
+            "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
+            "\\"reason\\":\\"outdated-httpgd\\",",
+            "\\"message\\":", .raven_json_str(.raven_msg),
+            "}"
         ))
         return(invisible(NULL))
     }
