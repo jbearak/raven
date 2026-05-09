@@ -1,6 +1,6 @@
 # Raven
 
-R language support for VS Code with cross-file code intelligence (completions, diagnostics, navigation), an [R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md), and [plot](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md), [data](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md), and [help](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md) viewers.
+R language support with cross-file code intelligence (completions, diagnostics, navigation), an [R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md), and [plot](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md), [data](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md), and [help](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md) viewers.
 
 The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 

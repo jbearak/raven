@@ -1,6 +1,6 @@
-# Raven — R Extension & Language Server
+# Raven
 
-R language support for VS Code with cross-file code intelligence (completions, diagnostics, navigation), an [R console](docs/r-console.md), and [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers. The [language server](https://github.com/Microsoft/language-server-protocol) also runs standalone in [other editors](docs/editor-integrations.md).
+Raven is an R language server with cross-file code intelligence (completions, diagnostics, navigation), plus a VS Code extension that adds an [R console](docs/r-console.md) and [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers on top. The language server also runs in any LSP-compatible [editor](docs/editor-integrations.md).
 
 The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 
