@@ -350,7 +350,11 @@ local({
 
 # Plot bridge block — depends on httpgd. Independent of the data viewer
 # block above; if httpgd is missing, View() still works.
+# Skip entirely in non-interactive R processes (e.g. R CMD INSTALL subprocesses
+# spawned by install.packages): those inherit R_PROFILE_USER but must not load
+# or lock the httpgd namespace.
 local({
+    if (!interactive()) return(invisible(NULL))
     .raven_log <- function(msg) {
         message(paste0("Raven: ", msg))
     }
@@ -392,85 +396,154 @@ local({
         paste0("\\"", x, "\\"")
     }
 
-    # 2. Verify httpgd >= 2.0.2 is available.
+    # 2. Start httpgd device, post session-ready, and register the
+    #    plot-available callback. Factored out so it can be called both at
+    #    startup and by the retry callback after install.packages("httpgd").
+    .raven_init_httpgd <- function() {
+        tryCatch({
+            httpgd::hgd(host = "127.0.0.1", port = 0, token = TRUE, silent = TRUE)
+        }, error = function(e) {
+            .raven_log(paste0("could not start httpgd: ", conditionMessage(e)))
+        })
+
+        .raven_details <- tryCatch(httpgd::hgd_details(), error = function(e) NULL)
+        if (is.null(.raven_details)) {
+            .raven_log("httpgd_details() unavailable; aborting plot bridge")
+            return(invisible(NULL))
+        }
+
+        .raven_session_id <- Sys.getenv("RAVEN_R_SESSION_ID")
+        if (!nzchar(.raven_session_id)) return(invisible(NULL))
+
+        # 3. POST session-ready.
+        .raven_post("/session-ready", paste0(
+            "{",
+            "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+            "\\"httpgdHost\\":", .raven_json_str(as.character(.raven_details$host)), ",",
+            "\\"httpgdPort\\":", as.integer(.raven_details$port), ",",
+            "\\"httpgdToken\\":", .raven_json_str(as.character(.raven_details$token)),
+            "}"
+        ))
+
+        # 4. addTaskCallback to push plot-available on state changes.
+        #    The hgd state function was removed in httpgd 2.0; query the /state
+        #    HTTP endpoint via httpgd::hgd_url(endpoint = "state") instead.
+        .raven_state <- list(hsize = -1L, upid = -1L)
+        addTaskCallback(function(...) {
+            tryCatch({
+                state_url <- httpgd::hgd_url(endpoint = "state")
+                body <- tryCatch({
+                    con <- url(state_url, open = "r")
+                    on.exit(close(con), add = TRUE)
+                    paste(readLines(con, warn = FALSE), collapse = "")
+                }, error = function(e) "")
+                hsize_match <- regmatches(body, regexpr('"hsize"\\\\s*:\\\\s*-?\\\\d+', body))
+                upid_match  <- regmatches(body, regexpr('"upid"\\\\s*:\\\\s*-?\\\\d+',  body))
+                if (length(hsize_match) == 1L && length(upid_match) == 1L) {
+                    hsize <- as.integer(sub('.*:\\\\s*', '', hsize_match))
+                    upid  <- as.integer(sub('.*:\\\\s*', '', upid_match))
+                    if (!is.na(hsize) && !is.na(upid) &&
+                        (hsize != .raven_state$hsize || upid != .raven_state$upid)) {
+                        .raven_state$hsize <<- hsize
+                        .raven_state$upid  <<- upid
+                        if (hsize > 0L) {
+                            .raven_post("/plot-available", paste0(
+                                "{",
+                                "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+                                "\\"hsize\\":", hsize, ",",
+                                "\\"upid\\":", upid,
+                                "}"
+                            ))
+                        }
+                    }
+                }
+            }, error = function(e) {
+                .raven_log(paste0("plot-available callback error: ", conditionMessage(e)))
+            })
+            TRUE
+        }, name = "raven-plot-bridge")
+
+        invisible(NULL)
+    }
+
+    # Helper: defer the VS Code popup to the user's first plot attempt, and
+    # warn on every subsequent plot until httpgd is installed. Combines:
+    #   - A permanent PDF fallback in options(device=) so plot() never errors
+    #     with "no active device" — output is discarded since there's no UI
+    #     to render to until httpgd is available.
+    #   - Hooks on plot.new and grid.newpage so the warning fires on every
+    #     plot (base R + grid/ggplot2), not just the first.
+    # The VS Code popup is posted only on the first plot to avoid stacking
+    # notifications. Both the hook and the popup self-disable once httpgd
+    # becomes available, so installing it mid-session doesn't require a
+    # restart.
+    .raven_deferred_warn <- function(msg, reason) {
+        .raven_original_device <- getOption("device")
+        options(device = function() {
+            try(grDevices::pdf(tempfile(fileext = ".pdf")), silent = TRUE)
+        })
+        .raven_first_plot <- TRUE
+        .raven_warn_hook <- function(...) {
+            # Once httpgd is available, become a no-op so plots flow through
+            # to the VS Code panel normally.
+            if (requireNamespace("httpgd", quietly = TRUE) &&
+                utils::packageVersion("httpgd") >= "2.0.2") {
+                return(invisible(NULL))
+            }
+            if (.raven_first_plot) {
+                .raven_post("/plot-warning", paste0(
+                    "{",
+                    "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
+                    "\\"reason\\":", .raven_json_str(reason), ",",
+                    "\\"message\\":", .raven_json_str(msg),
+                    "}"
+                ))
+                .raven_first_plot <<- FALSE
+            }
+            warning(msg, call. = FALSE)
+        }
+        setHook("plot.new", .raven_warn_hook)
+        setHook("grid.newpage", .raven_warn_hook)
+        .raven_original_device
+    }
+
+    .raven_register_httpgd_retry <- function(.raven_original_device) {
+        # Retry after each R expression: initialize the plot bridge as soon as
+        # httpgd is available and new enough (e.g. after install.packages("httpgd")).
+        addTaskCallback(function(...) {
+            if (!requireNamespace("httpgd", quietly = TRUE)) return(TRUE)
+            if (!(utils::packageVersion("httpgd") >= "2.0.2")) return(TRUE)
+            # Remove the device wrapper now that httpgd is ready.
+            options(device = .raven_original_device)
+            .raven_init_httpgd()
+            FALSE
+        }, name = "raven-httpgd-pending")
+    }
+
+    # 5. Verify httpgd >= 2.0.2 is available.
     if (!requireNamespace("httpgd", quietly = TRUE)) {
-        .raven_log("plots require the httpgd package. Install with: install.packages(\\"httpgd\\")")
+        # Console: full context. Popup: short enough to fit on one VS Code
+        # notification line without the user needing to expand it.
+        .raven_log("To view R plots in VS Code, install the httpgd package: install.packages(\\"httpgd\\")")
+        # Show the VS Code popup only when the user first tries to plot, not at
+        # session start, to avoid overwhelming new users during setup.
+        .raven_original_device <- .raven_deferred_warn(
+            "To view R plots in VS Code: install.packages(\\"httpgd\\")", "missing-httpgd")
+        .raven_register_httpgd_retry(.raven_original_device)
         return(invisible(NULL))
     }
     if (!(utils::packageVersion("httpgd") >= "2.0.2")) {
         .raven_log(paste0(
-            "httpgd >= 2.0.2 is required (found ",
-            as.character(utils::packageVersion("httpgd")), "). Run: install.packages(\\"httpgd\\")"
+            "To view R plots in VS Code, update httpgd to >= 2.0.2 (installed: ",
+            as.character(utils::packageVersion("httpgd")), "): install.packages(\\"httpgd\\")"
         ))
+        .raven_original_device <- .raven_deferred_warn(
+            "To view R plots in VS Code, update httpgd: install.packages(\\"httpgd\\")", "outdated-httpgd")
+        .raven_register_httpgd_retry(.raven_original_device)
         return(invisible(NULL))
     }
 
-    # 3. Start httpgd device.
-    tryCatch({
-        httpgd::hgd(host = "127.0.0.1", port = 0, token = TRUE, silent = TRUE)
-    }, error = function(e) {
-        .raven_log(paste0("could not start httpgd: ", conditionMessage(e)))
-    })
-
-    .raven_details <- tryCatch(httpgd::hgd_details(), error = function(e) NULL)
-    if (is.null(.raven_details)) {
-        .raven_log("httpgd_details() unavailable; aborting plot bridge")
-        return(invisible(NULL))
-    }
-
-    .raven_session_id <- Sys.getenv("RAVEN_R_SESSION_ID")
-    if (!nzchar(.raven_session_id)) {
-        return(invisible(NULL))
-    }
-
-    # 4. POST session-ready.
-    .raven_post("/session-ready", paste0(
-        "{",
-        "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
-        "\\"httpgdHost\\":", .raven_json_str(as.character(.raven_details$host)), ",",
-        "\\"httpgdPort\\":", as.integer(.raven_details$port), ",",
-        "\\"httpgdToken\\":", .raven_json_str(as.character(.raven_details$token)),
-        "}"
-    ))
-
-    # 5. addTaskCallback to push plot-available on state changes.
-    #    The hgd state function was removed in httpgd 2.0; query the /state
-    #    HTTP endpoint via httpgd::hgd_url(endpoint = "state") instead.
-    .raven_state <- list(hsize = -1L, upid = -1L)
-    addTaskCallback(function(...) {
-        tryCatch({
-            state_url <- httpgd::hgd_url(endpoint = "state")
-            body <- tryCatch({
-                con <- url(state_url, open = "r")
-                on.exit(close(con), add = TRUE)
-                paste(readLines(con, warn = FALSE), collapse = "")
-            }, error = function(e) "")
-            hsize_match <- regmatches(body, regexpr('"hsize"\\\\s*:\\\\s*-?\\\\d+', body))
-            upid_match  <- regmatches(body, regexpr('"upid"\\\\s*:\\\\s*-?\\\\d+',  body))
-            if (length(hsize_match) == 1L && length(upid_match) == 1L) {
-                hsize <- as.integer(sub('.*:\\\\s*', '', hsize_match))
-                upid  <- as.integer(sub('.*:\\\\s*', '', upid_match))
-                if (!is.na(hsize) && !is.na(upid) &&
-                    (hsize != .raven_state$hsize || upid != .raven_state$upid)) {
-                    .raven_state$hsize <<- hsize
-                    .raven_state$upid  <<- upid
-                    if (hsize > 0L) {
-                        .raven_post("/plot-available", paste0(
-                            "{",
-                            "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
-                            "\\"hsize\\":", hsize, ",",
-                            "\\"upid\\":", upid,
-                            "}"
-                        ))
-                    }
-                }
-            }
-        }, error = function(e) {
-            .raven_log(paste0("plot-available callback error: ", conditionMessage(e)))
-        })
-        TRUE
-    }, name = "raven-plot-bridge")
-
+    .raven_init_httpgd()
     invisible(NULL)
 })
 `;

@@ -36,5 +36,12 @@ export type DataViewerWarningEvent = {
     message: string;
 };
 
-export type RSessionEvent = PlotEvent | ViewDataEvent | DataViewerWarningEvent;
+export type PlotWarningEvent = {
+    type: 'plot-warning';
+    sessionId: string;
+    reason: 'missing-httpgd' | 'outdated-httpgd';
+    message: string;
+};
+
+export type RSessionEvent = PlotEvent | ViewDataEvent | DataViewerWarningEvent | PlotWarningEvent;
 export type RSessionEventListener = (event: RSessionEvent) => void;
