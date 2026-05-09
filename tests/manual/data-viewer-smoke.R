@@ -34,8 +34,8 @@ if (requireNamespace("haven", quietly = TRUE)) {
 
 # ── 2b. Synthetic haven_labelled (variable labels + value labels) ─────────────
 # Builds a tibble with explicit value labels so the Labels toggle has something
-# to swap in. Stand-in for a haven::read_sav / read_dta workflow without needing
-# a real .sav / .dta file on disk.
+# to swap in. Minimal controlled example — for a real-world .sav label
+# round-trip test see section 5 (Western Electric study, no download needed).
 if (requireNamespace("haven", quietly = TRUE)) {
   labelled_demo <- data.frame(
     id       = 1:6,
@@ -87,3 +87,32 @@ View(copy_me)
 # Paste into Excel / Google Sheets / LibreOffice Calc.
 # Expected: 5 tab-separated columns, 1000 data rows + 1 header row;
 #           booleans, dates, and decimals round-trip without mangling.
+
+
+# ── 5. Western Electric study via haven (real SPSS + value labels) ────────────
+# foreign::electric.sav is bundled with base-R's `foreign` package (always
+# present, no download). It is a real SPSS file from the Western Electric /
+# WCGS cardiovascular study: 240 participants × 13 columns, with variable
+# labels on every column and non-trivial value-label sets on four columns —
+# the canonical real-world read_sav() stress test for the Labels toggle.
+if (requireNamespace("haven", quietly = TRUE)) {
+  f        <- system.file("files/electric.sav", package = "foreign")
+  electric <- haven::read_sav(f)
+
+  View(electric)
+  # Expected:
+  #   hover any column header  → tooltip shows the variable label
+  #                              (e.g. "FIRSTCHD: FIRST CHD EVENT",
+  #                               "VITAL10: STATUS AT TEN YEARS")
+  #   Labels toggle ON         → four columns swap codes for strings:
+  #     FIRSTCHD   1 → "NO CHD", 2 → "SUDDEN  DEATH", 3 → "NONFATALMI",
+  #                5 → "FATAL   MI",  6 → "OTHER   CHD"
+  #     DAYOFWK    1 → "SUNDAY" … 7 → "SATURDAY", 9 → "MISSING"
+  #     VITAL10    0 → "ALIVE", 1 → "DEAD"
+  #     FAMHXCVR   "Y" → "YES", "N" → "NO"
+  #   Labels toggle OFF        → raw codes reappear in all four columns
+  #   Remaining 9 columns (AGE, DBP58, CHOL58, …) carry variable labels only:
+  #     toggle has no visible effect; variable-label tooltip still works
+} else {
+  message("Skipping Western Electric section: install 'haven' to run it.")
+}
