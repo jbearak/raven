@@ -466,22 +466,45 @@ local({
         invisible(NULL)
     }
 
+    # Helper: post a /plot-warning and then open the original graphics device.
+    # Installed as options(device=) so the VS Code popup fires on the first
+    # plot attempt rather than at session start, avoiding startup noise.
+    .raven_deferred_warn <- function(msg, reason) {
+        .raven_original_device <- getOption("device")
+        options(device = function() {
+            # Self-remove before doing anything so re-entrant calls are safe.
+            options(device = .raven_original_device)
+            .raven_post("/plot-warning", paste0(
+                "{",
+                "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
+                "\\"reason\\":", .raven_json_str(reason), ",",
+                "\\"message\\":", .raven_json_str(msg),
+                "}"
+            ))
+            dev_fn <- if (is.function(.raven_original_device)) {
+                .raven_original_device
+            } else {
+                match.fun(.raven_original_device)
+            }
+            dev_fn()
+        })
+        .raven_original_device
+    }
+
     # 5. Verify httpgd >= 2.0.2 is available.
     if (!requireNamespace("httpgd", quietly = TRUE)) {
         .raven_msg <- "To view plots in VS Code, install the httpgd package: install.packages(\\"httpgd\\")"
         .raven_log(.raven_msg)
-        .raven_post("/plot-warning", paste0(
-            "{",
-            "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
-            "\\"reason\\":\\"missing-httpgd\\",",
-            "\\"message\\":", .raven_json_str(.raven_msg),
-            "}"
-        ))
+        # Show the VS Code popup only when the user first tries to plot, not at
+        # session start, to avoid overwhelming new users during setup.
+        .raven_original_device <- .raven_deferred_warn(.raven_msg, "missing-httpgd")
         # Retry after each R expression: initialize the plot bridge as soon as
         # httpgd is available (e.g. after install.packages("httpgd")).
         addTaskCallback(function(...) {
             if (!requireNamespace("httpgd", quietly = TRUE)) return(TRUE)
             if (!(utils::packageVersion("httpgd") >= "2.0.2")) return(FALSE)
+            # Remove the device wrapper now that httpgd is ready.
+            options(device = .raven_original_device)
             .raven_init_httpgd()
             FALSE
         }, name = "raven-httpgd-pending")
@@ -493,13 +516,7 @@ local({
             as.character(utils::packageVersion("httpgd")), "): install.packages(\\"httpgd\\")"
         )
         .raven_log(.raven_msg)
-        .raven_post("/plot-warning", paste0(
-            "{",
-            "\\"sessionId\\":", .raven_json_str(Sys.getenv("RAVEN_R_SESSION_ID")), ",",
-            "\\"reason\\":\\"outdated-httpgd\\",",
-            "\\"message\\":", .raven_json_str(.raven_msg),
-            "}"
-        ))
+        .raven_deferred_warn(.raven_msg, "outdated-httpgd")
         return(invisible(NULL))
     }
 
