@@ -69,20 +69,27 @@ describe("choose_send_transport", () => {
       expected: "tempfile",
     },
 
-    // auto with threshold below 2 is degenerate but well-defined: everything → tempfile
+    // auto clamps below-minimum thresholds up to 2 to match the package.json schema
     {
-      name: "auto with threshold=1 sends single-line code via temp file (degenerate)",
+      name: "auto with threshold=1 clamps to 2 (single-line still pastes)",
       code: lines(1),
+      sendMethod: "auto",
+      threshold: 1,
+      expected: "direct-paste",
+    },
+    {
+      name: "auto with threshold=1 clamps to 2 (2 lines → tempfile)",
+      code: lines(2),
       sendMethod: "auto",
       threshold: 1,
       expected: "tempfile",
     },
     {
-      name: "auto with threshold=0 clamps to 1 (single-line → tempfile)",
+      name: "auto with threshold=0 clamps to 2 (single-line still pastes)",
       code: lines(1),
       sendMethod: "auto",
       threshold: 0,
-      expected: "tempfile",
+      expected: "direct-paste",
     },
 
     // paste mode ignores threshold

@@ -20,7 +20,7 @@ export function choose_send_transport(
         return n_lines > 1 ? 'bracketed-paste' : 'direct-paste';
     }
 
-    const threshold = Math.max(1, Math.floor(autoTempFileThresholdLines));
+    const threshold = Math.max(2, Math.floor(autoTempFileThresholdLines));
     if (n_lines >= threshold) {
         return 'tempfile';
     }
