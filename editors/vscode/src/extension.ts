@@ -180,9 +180,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     active_plot_services = plot_services;
     let data_viewer_manager: DataViewerManager | undefined;
     if (data_viewer_enabled) {
-        void registerDataViewer(context, plot_services.server, dataViewerDirOf(context)).then(m => {
-            data_viewer_manager = m;
-        });
+        data_viewer_manager = registerDataViewer(context, plot_services.server, dataViewerDirOf(context));
     }
 
     // Register restart command — re-reads trace config so changed settings take effect.

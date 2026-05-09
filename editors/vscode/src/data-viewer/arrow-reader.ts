@@ -112,79 +112,86 @@ export class ArrowSliceReader {
      */
     static async open(filePath: string, opts: OpenOptions = {}): Promise<ArrowSliceReader> {
         const fh = await fsOpen(filePath, 'r');
-        const reader = await (await (AsyncRecordBatchFileReader.from(fh) as any)).open();
-        const threshold = opts.dictionaryThreshold ?? DEFAULT_DICTIONARY_THRESHOLD;
+        try {
+            const reader = await (await (AsyncRecordBatchFileReader.from(fh) as any)).open();
+            const threshold = opts.dictionaryThreshold ?? DEFAULT_DICTIONARY_THRESHOLD;
 
-        // Pass 1: build batchStarts and pre-cache batches we need to count
-        // dictionary cardinalities. We have to peek at one batch per
-        // dictionary-encoded column to read its dictionary length, since
-        // the schema alone doesn't reveal cardinality.
-        const numBatches = reader.numRecordBatches;
-        const starts: number[] = [0];
-        let acc = 0;
-        const firstBatch = numBatches > 0 ? await reader.readRecordBatch(0) : null;
-        for (let i = 0; i < numBatches; i++) {
-            const b = i === 0 ? firstBatch : await reader.readRecordBatch(i);
-            acc += b.numRows;
-            starts.push(acc);
-        }
-        const batchStarts = new Uint32Array(starts);
-        const nrow = acc;
-
-        // Schema-level "raven.fields" KV: a JSON map { columnName: { metaKey: metaValue } }.
-        // R arrow's public API doesn't expose per-field metadata writes, so
-        // the bootstrap profile encodes per-column metadata into this single
-        // schema-level entry. Per-field Field.metadata (when present from
-        // any non-R producer) takes precedence.
-        const schemaMd: Map<string, string> | undefined = reader.schema.metadata;
-        const ravenFieldsRaw = schemaMd?.get('raven.fields');
-        const ravenFields: Record<string, Record<string, string>> =
-            ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
-
-        // Pass 2: build the schema, sampling first-batch dictionaries for
-        // dict-encoded columns.
-        const cols: ColumnSchema[] = reader.schema.fields.map((f: any) => {
-            const md: Map<string, string> = f.metadata;
-            const fieldMd = ravenFields[f.name] ?? {};
-            const lookup = (key: string): string | undefined =>
-                md.get(key) ?? fieldMd[key];
-            const arrowType = String(f.type);
-            const isDict = arrowType.startsWith('Dictionary');
-            let dictLen = 0;
-            let dictionary: string[] | undefined;
-            if (isDict && firstBatch) {
-                const child = firstBatch.getChild(f.name);
-                const dict = (child as any).data?.[0]?.dictionary;
-                dictLen = dict?.length ?? 0;
-                if (dictLen <= threshold) {
-                    dictionary = [];
-                    for (let i = 0; i < dictLen; i++) dictionary.push(dict.get(i) as string);
-                }
+            // Pass 1: build batchStarts and pre-cache batches we need to count
+            // dictionary cardinalities. We have to peek at one batch per
+            // dictionary-encoded column to read its dictionary length, since
+            // the schema alone doesn't reveal cardinality.
+            const numBatches = reader.numRecordBatches;
+            const starts: number[] = [0];
+            let acc = 0;
+            const firstBatch = numBatches > 0 ? await reader.readRecordBatch(0) : null;
+            for (let i = 0; i < numBatches; i++) {
+                const b = i === 0 ? firstBatch : await reader.readRecordBatch(i);
+                acc += b.numRows;
+                starts.push(acc);
             }
-            const variableLabel =
-                lookup('raven.variable_label') ?? md.get('label') ?? undefined;
-            const valueLabelsRaw = lookup('raven.value_labels');
-            const valueLabels = valueLabelsRaw ? safeParseJson(valueLabelsRaw) : undefined;
-            return {
-                name: f.name,
-                arrowType,
-                originalClass: lookup('raven.original_class') ?? undefined,
-                variableLabel,
-                valueLabels,
-                formatStata: lookup('raven.format') ?? undefined,
-                dictionary,
-                dictionaryShipped: isDict && dictLen <= threshold,
-                isInteger: /^Int\d+$/.test(arrowType),
-            };
-        });
+            const batchStarts = new Uint32Array(starts);
+            const nrow = acc;
 
-        return new ArrowSliceReader(
-            reader,
-            fh,
-            { columns: cols },
-            nrow,
-            batchStarts,
-        );
+            // Schema-level "raven.fields" KV: a JSON map { columnName: { metaKey: metaValue } }.
+            // R arrow's public API doesn't expose per-field metadata writes, so
+            // the bootstrap profile encodes per-column metadata into this single
+            // schema-level entry. Per-field Field.metadata (when present from
+            // any non-R producer) takes precedence.
+            const schemaMd: Map<string, string> | undefined = reader.schema.metadata;
+            const ravenFieldsRaw = schemaMd?.get('raven.fields');
+            const ravenFields: Record<string, Record<string, string>> =
+                ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
+
+            // Pass 2: build the schema, sampling first-batch dictionaries for
+            // dict-encoded columns.
+            const cols: ColumnSchema[] = reader.schema.fields.map((f: any) => {
+                const md: Map<string, string> = f.metadata;
+                const fieldMd = ravenFields[f.name] ?? {};
+                const lookup = (key: string): string | undefined =>
+                    md.get(key) ?? fieldMd[key];
+                const arrowType = String(f.type);
+                const isDict = arrowType.startsWith('Dictionary');
+                let dictLen = 0;
+                let dictionary: string[] | undefined;
+                if (isDict && firstBatch) {
+                    const child = firstBatch.getChild(f.name);
+                    const dict = (child as any).data?.[0]?.dictionary;
+                    dictLen = dict?.length ?? 0;
+                    if (dictLen <= threshold) {
+                        dictionary = [];
+                        for (let i = 0; i < dictLen; i++) dictionary.push(dict.get(i) as string);
+                    }
+                }
+                const variableLabel =
+                    lookup('raven.variable_label') ?? md.get('label') ?? undefined;
+                const valueLabelsRaw = lookup('raven.value_labels');
+                const valueLabels = valueLabelsRaw ? safeParseJson(valueLabelsRaw) : undefined;
+                return {
+                    name: f.name,
+                    arrowType,
+                    originalClass: lookup('raven.original_class') ?? undefined,
+                    variableLabel,
+                    valueLabels,
+                    formatStata: lookup('raven.format') ?? undefined,
+                    dictionary,
+                    dictionaryShipped: isDict && dictLen <= threshold,
+                    isInteger: /^Int\d+$/.test(arrowType),
+                };
+            });
+
+            return new ArrowSliceReader(
+                reader,
+                fh,
+                { columns: cols },
+                nrow,
+                batchStarts,
+            );
+        } catch (err) {
+            // Ownership of fh only transfers when construction succeeds; on any
+            // failure between fsOpen and the new ArrowSliceReader, close it here.
+            await fh.close().catch(() => undefined);
+            throw err;
+        }
     }
 
     setLatestViewportGeneration(g: number): void {
@@ -311,7 +318,10 @@ function encodeArrowCell(child: any, row: number, arrowType: string, tz: string)
         return data.values[row] as number;
     }
     if (arrowType.startsWith('Int')) {
-        return child.get(row) ?? null;
+        const v = child.get(row);
+        if (v === null || v === undefined) return null;
+        // Int64 columns yield bigint; Cell type and JSON.stringify can't carry it.
+        return typeof v === 'bigint' ? Number(v) : (v as number);
     }
     if (arrowType.startsWith('Float')) {
         const v = child.get(row);
@@ -327,7 +337,12 @@ function encodeArrowCell(child: any, row: number, arrowType: string, tz: string)
     if (arrowType.startsWith('Date')) {
         const data = child.data[0];
         if (isNullAt(data, row)) return null;
-        return encodeDate(data.values[row] as number);
+        const raw = data.values[row];
+        // Date32 stores days since epoch as int32; Date64 stores ms since epoch as int64 (bigint).
+        if (typeof raw === 'bigint') {
+            return encodeDate(Number(raw / 86_400_000n));
+        }
+        return encodeDate(raw as number);
     }
     if (arrowType.startsWith('Timestamp')) {
         const data = child.data[0];

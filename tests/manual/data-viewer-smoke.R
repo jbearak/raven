@@ -13,20 +13,22 @@ View(big)
 
 # ── 2. NHANES via haven (variable labels + Labels toggle) ─────────────────────
 # install.packages("haven")   # if needed
-library(haven)
+if (requireNamespace("haven", quietly = TRUE)) {
+  # Downloads ~500 KB; skip if already cached.
+  url  <- "https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/DEMO_J.XPT"
+  dest <- tempfile(fileext = ".xpt")
+  download.file(url, dest, mode = "wb")
+  nhanes <- haven::read_xpt(dest)   # labelled vectors with variable-label attrs
 
-# Downloads ~500 KB; skip if already cached.
-url  <- "https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/DEMO_J.XPT"
-dest <- tempfile(fileext = ".xpt")
-download.file(url, dest, mode = "wb")
-nhanes <- read_xpt(dest)   # labelled vectors with variable-label attrs
+  str(nhanes[1:3])            # confirm <labelled> with label attr
 
-str(nhanes[1:3])            # confirm <labelled> with label attr
-
-View(nhanes)
-# Expected:
-#   hover a column header  → tooltip shows variable label
-#   Labels toggle ON       → numeric codes swap for label strings (e.g. 1 → "Male")
+  View(nhanes)
+  # Expected:
+  #   hover a column header  → tooltip shows variable label
+  #   Labels toggle ON       → numeric codes swap for label strings (e.g. 1 → "Male")
+} else {
+  message("Skipping NHANES section: install 'haven' to run it.")
+}
 
 
 # ── 3. Format toggle: digits=2 vs digits=6 ────────────────────────────────────

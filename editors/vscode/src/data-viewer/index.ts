@@ -13,11 +13,11 @@ import type { RSessionServer } from '../r-session-server';
 
 const STALE_MAX_AGE_MS = 24 * 3600 * 1000;
 
-export async function registerDataViewer(
+export function registerDataViewer(
     context: vscode.ExtensionContext,
     server: RSessionServer,
     dataViewerDir: string,
-): Promise<DataViewerManager> {
+): DataViewerManager {
     const cap = vscode.workspace.getConfiguration('raven.dataViewer')
         .get<number>('maxStoredLayouts', 10000);
     const store = new LayoutStore(context.globalState as any, cap);
@@ -33,10 +33,6 @@ export async function registerDataViewer(
 
     const manager = new DataViewerManager(context.extensionUri, store, settings);
 
-    // Best-effort: ensure the directory exists, then sweep stale files.
-    try { await fs.mkdir(dataViewerDir, { recursive: true }); } catch { /* ignore */ }
-    void sweep_stale(dataViewerDir, STALE_MAX_AGE_MS);
-
     context.subscriptions.push({
         dispose: server.onEvent(e => {
             if (e.type === 'view-data-requested') {
@@ -46,6 +42,14 @@ export async function registerDataViewer(
             }
         }),
     });
+
+    // Best-effort background setup: ensure the directory exists, then sweep
+    // stale files. Returning the manager synchronously means tests / consumers
+    // never observe a window where the manager is undefined; the directory is
+    // (re)created lazily by callers that actually write into it.
+    void fs.mkdir(dataViewerDir, { recursive: true })
+        .then(() => sweep_stale(dataViewerDir, STALE_MAX_AGE_MS))
+        .catch(() => undefined);
 
     return manager;
 }
