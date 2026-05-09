@@ -591,6 +591,17 @@
           "maximum": 5000,
           "description": "Debounce window for batching library path filesystem events, in milliseconds. Larger values reduce redundant work during bulk installs (e.g. renv::restore); smaller values respond faster."
         },
+        "raven.packages.packageMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "enabled", "disabled"],
+          "enumDescriptions": [
+            "Detect automatically: enable package mode when a DESCRIPTION file is found at the workspace root.",
+            "Always enable package mode (for non-standard package layouts without DESCRIPTION).",
+            "Never enable package mode, even if DESCRIPTION exists."
+          ],
+          "description": "Controls R package workspace mode. When active, all R/*.R files are treated as mutually visible (flat namespace), and imports from NAMESPACE/roxygen suppress undefined-variable diagnostics."
+        },
         "raven.symbols.workspaceMaxResults": {
           "type": "number",
           "default": 1000,

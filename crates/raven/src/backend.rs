@@ -338,6 +338,13 @@ pub(crate) fn parse_cross_file_config(
         if let Some(v) = packages.get("watchDebounceMs").and_then(|v| v.as_u64()) {
             config.packages_watch_debounce_ms = v.clamp(100, 5000);
         }
+        if let Some(v) = packages.get("packageMode").and_then(|v| v.as_str()) {
+            config.package_mode = match v {
+                "enabled" => crate::cross_file::config::PackageMode::Enabled,
+                "disabled" => crate::cross_file::config::PackageMode::Disabled,
+                _ => crate::cross_file::config::PackageMode::Auto,
+            };
+        }
     }
 
     log::info!("Cross-file configuration loaded from LSP settings:");
@@ -1259,7 +1266,7 @@ impl LanguageServer for Backend {
 
                 // Apply results when scan completes
                 match scan_result {
-                    Ok((index, imports, cross_file_entries, new_index_entries)) => {
+                    Ok((index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model)) => {
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
                             let mut state = state_clone.write().await;
@@ -1268,6 +1275,8 @@ impl LanguageServer for Backend {
                                 imports,
                                 cross_file_entries,
                                 new_index_entries,
+                                pkg_workspace,
+                                pkg_ns_model,
                             );
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
@@ -2539,6 +2548,44 @@ impl LanguageServer for Backend {
                 state.document_store.update(&uri, changes, version).await;
             }
 
+            // Rebuild roxygen namespace model when an R/*.R file changes in a
+            // roxygen-managed package. This ensures @import/@importFrom edits
+            // take effect immediately without waiting for DESCRIPTION/NAMESPACE touch.
+            if let Some(ref pkg) = state.package_workspace {
+                if pkg.roxygen_managed {
+                    if let Ok(file_path) = uri.to_file_path() {
+                        if file_path.starts_with(pkg.root.join("R")) {
+                            let root = pkg.root.clone();
+                            let r_dir = root.join("R");
+                            let mut roxygen_files = Vec::new();
+                            if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                                        // Use open document content if available (authoritative)
+                                        let content = if let Ok(u) = Url::from_file_path(&path) {
+                                            state.documents.get(&u).map(|d| d.text())
+                                        } else {
+                                            None
+                                        };
+                                        let content = content.or_else(|| std::fs::read_to_string(&path).ok());
+                                        if let Some(content) = content {
+                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                                            roxygen_files.push((path.display().to_string(), ns));
+                                        }
+                                    }
+                                }
+                            }
+                            let ns_model = crate::package_namespace::namespace_model_from_roxygen(&roxygen_files);
+                            // Replace workspace_imports entirely from the namespace model.
+                            // In package mode, the model is the sole source of truth.
+                            state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                            state.package_namespace_model = Some(ns_model);
+                        }
+                    }
+                }
+            }
+
             // Compute new interface_hash after applying changes
             // Use document_store which has artifacts computed with metadata (including declared symbols)
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
@@ -3264,6 +3311,80 @@ impl LanguageServer for Backend {
             // outside the open-document neighborhood; refresh the pin set so
             // newly unreachable URIs become LRU-evictable again.
             state.recompute_open_neighborhood_pins();
+
+            // Check if DESCRIPTION or NAMESPACE changed — rebuild package namespace model
+            let pkg_files_changed = params.changes.iter().any(|c| {
+                c.uri
+                    .to_file_path()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_owned()))
+                    .is_some_and(|name| name == "DESCRIPTION" || name == "NAMESPACE")
+            });
+            if pkg_files_changed {
+                use crate::cross_file::config::PackageMode;
+                let mode = state.cross_file_config.package_mode;
+                if mode != PackageMode::Disabled {
+                    if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
+                        let new_ws = match mode {
+                            PackageMode::Auto => crate::package_namespace::detect_package_workspace(&root),
+                            PackageMode::Enabled => {
+                                crate::package_namespace::detect_package_workspace(&root).or_else(|| {
+                                    Some(crate::package_namespace::PackageWorkspace {
+                                        name: "unknown".to_string(),
+                                        root: root.clone(),
+                                        roxygen_managed: false,
+                                    })
+                                })
+                            }
+                            PackageMode::Disabled => unreachable!(),
+                        };
+                        if let Some(ref ws) = new_ws {
+                            let ns_model = if ws.roxygen_managed {
+                                let r_dir = root.join("R");
+                                let mut roxygen_files = Vec::new();
+                                if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                                                roxygen_files.push((path.display().to_string(), ns));
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
+                            } else {
+                                crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE"))
+                            };
+                            // Replace workspace_imports entirely from the namespace model.
+                            state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                            state.package_namespace_model = Some(ns_model);
+                            log::info!("Rebuilt package namespace model after DESCRIPTION/NAMESPACE change");
+                        } else {
+                            // DESCRIPTION removed or invalid — exit package mode
+                            state.package_namespace_model = None;
+                            state.workspace_imports = std::sync::Arc::new(Vec::new());
+                        }
+                        state.package_workspace = new_ws;
+                        // Force republish for all open R files
+                        let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
+                        for open_uri in &open_keys {
+                            if !affected_set.contains(open_uri) {
+                                affected_set.insert(open_uri.clone());
+                                affected.push(open_uri.clone());
+                            }
+                        }
+                        state.diagnostics_gate.mark_force_republish_many(open_keys.iter());
+                    }
+                } else {
+                    // Disabled: clear package state if it was somehow set
+                    state.package_workspace = None;
+                    state.package_namespace_model = None;
+                    state.workspace_imports = std::sync::Arc::new(Vec::new());
+                }
+            }
+
             (to_update, affected)
         };
 
@@ -7200,6 +7321,8 @@ mod refresh_packages_tests {
             Vec::new(),
             std::collections::HashMap::new(),
             new_entries,
+            None,
+            None,
         );
 
         // Sanity: MASS uncached before any prefetch.

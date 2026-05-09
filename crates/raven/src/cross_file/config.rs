@@ -110,6 +110,20 @@ pub struct CrossFileConfig {
     pub backward_dependencies: BackwardDependencyMode,
     /// Maximum nodes visited during transitive dependent search (caps DFS in dense graphs).
     pub max_transitive_dependents_visited: usize,
+    /// Package mode: auto (detect DESCRIPTION), enabled (always), disabled (never).
+    pub package_mode: PackageMode,
+}
+
+/// Controls whether R package workspace mode is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackageMode {
+    /// Detect automatically from DESCRIPTION file presence.
+    #[default]
+    Auto,
+    /// Always enable package mode (for non-standard layouts).
+    Enabled,
+    /// Never enable package mode even if DESCRIPTION exists.
+    Disabled,
 }
 
 impl Default for CrossFileConfig {
@@ -166,6 +180,7 @@ impl Default for CrossFileConfig {
             hoist_globals_in_functions: true,
             backward_dependencies: BackwardDependencyMode::Auto,
             max_transitive_dependents_visited: 200,
+            package_mode: PackageMode::Auto,
         }
     }
 }

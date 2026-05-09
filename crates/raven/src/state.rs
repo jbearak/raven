@@ -595,6 +595,12 @@ pub struct WorldState {
     /// dependency mode, undefined variable diagnostics are deferred for files
     /// without explicit backward directives until this flag is true.
     pub workspace_scan_complete: bool,
+    /// R package workspace metadata (Some when DESCRIPTION detected at root).
+    /// Enables mutual visibility for R/*.R files and namespace-based import resolution.
+    pub package_workspace: Option<crate::package_namespace::PackageWorkspace>,
+    /// Package namespace model (exports, imports, full_imports).
+    /// Built from roxygen annotations or NAMESPACE file when in package mode.
+    pub package_namespace_model: Option<crate::package_namespace::PackageNamespaceModel>,
 }
 
 impl WorldState {
@@ -692,6 +698,8 @@ impl WorldState {
             libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_complete: false,
+            package_workspace: None,
+            package_namespace_model: None,
         }
     }
 
@@ -956,9 +964,39 @@ impl WorldState {
         imports: Vec<(String, String)>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
+        pkg_workspace: Option<crate::package_namespace::PackageWorkspace>,
+        pkg_ns_model: Option<crate::package_namespace::PackageNamespaceModel>,
     ) {
         self.workspace_index = index;
         self.workspace_imports = Arc::new(imports);
+
+        // Apply package_mode setting
+        use crate::cross_file::config::PackageMode;
+        match self.cross_file_config.package_mode {
+            PackageMode::Disabled => {
+                self.package_workspace = None;
+                self.package_namespace_model = None;
+                // Don't use package-derived imports for diagnostic suppression
+                self.workspace_imports = Arc::new(Vec::new());
+            }
+            PackageMode::Enabled => {
+                // Force package mode even without detection
+                self.package_workspace = pkg_workspace.or_else(|| {
+                    self.workspace_folders.first()
+                        .and_then(|u| u.to_file_path().ok())
+                        .map(|root| crate::package_namespace::PackageWorkspace {
+                            name: "unknown".to_string(),
+                            root,
+                            roxygen_managed: false,
+                        })
+                });
+                self.package_namespace_model = pkg_ns_model;
+            }
+            PackageMode::Auto => {
+                self.package_workspace = pkg_workspace;
+                self.package_namespace_model = pkg_ns_model;
+            }
+        }
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -1096,9 +1134,11 @@ impl WorldState {
 ///
 /// Returns:
 /// - `HashMap<Url, Document>` - Legacy index for backward compatibility
-/// - `Vec<String>` - Workspace imports from NAMESPACE
+/// - `Vec<(String, String)>` - Workspace imports from NAMESPACE
 /// - `HashMap<Url, crate::cross_file::workspace_index::IndexEntry>` - Cross-file entries (legacy)
 /// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
+/// - `Option<PackageWorkspace>` - Package workspace metadata (if DESCRIPTION found)
+/// - `Option<PackageNamespaceModel>` - Package namespace model (if package mode)
 ///
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
 pub type WorkspaceScanResult = (
@@ -1106,6 +1146,8 @@ pub type WorkspaceScanResult = (
     Vec<(String, String)>,
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
+    Option<crate::package_namespace::PackageWorkspace>,
+    Option<crate::package_namespace::PackageNamespaceModel>,
 );
 
 /// Result of processing a single workspace file (used by parallel scan).
@@ -1358,7 +1400,45 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         cross_file_entries.len(),
         new_index_entries.len()
     );
-    (index, imports, cross_file_entries, new_index_entries)
+
+    // Detect R package workspace
+    let (pkg_workspace, pkg_ns_model) = if let Some(root) = folders.first().and_then(|u| u.to_file_path().ok()) {
+        if let Some(ws) = crate::package_namespace::detect_package_workspace(&root) {
+            log::info!("Package mode detected: {} (roxygen_managed={})", ws.name, ws.roxygen_managed);
+            let ns_model = if ws.roxygen_managed {
+                // Parse roxygen namespace tags from all R/*.R files
+                let r_dir = root.join("R");
+                let mut roxygen_files = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                                roxygen_files.push((path.display().to_string(), ns));
+                            }
+                        }
+                    }
+                }
+                crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
+            } else {
+                crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE"))
+            };
+            // Merge namespace model imports into the workspace imports list
+            for (pkg, sym) in &ns_model.imports {
+                if !imports.iter().any(|(p, s)| p == pkg && s == sym) {
+                    imports.push((pkg.clone(), sym.clone()));
+                }
+            }
+            (Some(ws), Some(ns_model))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    (index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model)
 }
 
 /// Directories to skip during workspace scanning.

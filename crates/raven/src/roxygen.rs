@@ -1127,3 +1127,287 @@ mod prop_tests {
         }
     }
 }
+
+// ============================================================================
+// Roxygen namespace tag extraction (for R package mode)
+// ============================================================================
+
+/// Namespace-relevant information extracted from roxygen blocks in a single file.
+#[derive(Debug, Clone, Default)]
+pub struct RoxygenNamespace {
+    /// Symbols exported via `@export` (the name of the function/variable
+    /// defined immediately after the roxygen block).
+    pub exports: Vec<String>,
+    /// Packages imported wholesale via `@import pkg`.
+    pub imports: Vec<String>,
+    /// `(package, symbol)` pairs from `@importFrom pkg sym1 sym2 ...`.
+    pub import_from: Vec<(String, String)>,
+}
+
+/// Extract namespace-relevant roxygen tags (`@export`, `@import`, `@importFrom`)
+/// from all roxygen blocks in a file.
+///
+/// For `@export`, the exported symbol name is the identifier defined on the
+/// first non-blank, non-comment line after the roxygen block (function or
+/// assignment target).
+pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
+    let mut ns = RoxygenNamespace::default();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if !trimmed.starts_with("#'") {
+            i += 1;
+            continue;
+        }
+
+        // We're in a roxygen block — collect all contiguous #' lines
+        let mut has_export = false;
+        let block_start = i;
+        while i < lines.len() && lines[i].trim_start().starts_with("#'") {
+            let tag_line = lines[i].trim_start().strip_prefix("#'").unwrap_or("").trim();
+
+            if tag_line == "@export" || tag_line.starts_with("@export ") {
+                has_export = true;
+            } else if let Some(rest) = tag_line.strip_prefix("@import ") {
+                // @import pkg1 pkg2 ...
+                for pkg in rest.split_whitespace() {
+                    if !pkg.is_empty() {
+                        ns.imports.push(pkg.to_string());
+                    }
+                }
+            } else if tag_line == "@import" {
+                // bare @import with no args — ignore
+            } else if let Some(rest) = tag_line.strip_prefix("@importFrom ") {
+                // @importFrom pkg sym1 sym2 ...
+                let mut parts = rest.split_whitespace();
+                if let Some(pkg) = parts.next() {
+                    for sym in parts {
+                        if !sym.is_empty() {
+                            ns.import_from.push((pkg.to_string(), sym.to_string()));
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        let _ = block_start; // suppress unused warning
+
+        // If @export was found, extract the symbol name from the next definition
+        if has_export {
+            // Skip blank lines and comments after the block
+            while i < lines.len() {
+                let next = lines[i].trim();
+                if next.is_empty() || (next.starts_with('#') && !next.starts_with("#'")) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if i < lines.len() {
+                if let Some(name) = extract_definition_name(lines[i]) {
+                    ns.exports.push(name);
+                }
+            }
+        }
+    }
+    ns
+}
+
+/// Extract the symbol name from a line that defines a function or variable.
+///
+/// Handles patterns like:
+/// - `foo <- function(...)`
+/// - `foo = function(...)`
+/// - `foo <- value`
+/// - `"foo" <- function(...)` (quoted names)
+/// - `foo <<- value`
+/// - `setGeneric("foo", ...)` (extracts first string arg)
+fn extract_definition_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    // Try to find assignment operator (check <<- before <- to avoid mismatch)
+    let (name_part, _) = if let Some(pos) = trimmed.find("<<-") {
+        (&trimmed[..pos], &trimmed[pos + 3..])
+    } else if let Some(pos) = trimmed.find("<-") {
+        (&trimmed[..pos], &trimmed[pos + 2..])
+    } else {
+        // Try `=` but only if it's not inside parens (not a function arg)
+        if let Some(pos) = find_toplevel_equals(trimmed) {
+            (&trimmed[..pos], &trimmed[pos + 1..])
+        } else {
+            // Could be setGeneric("name", ...), setMethod("name", ...), setClass("name", ...)
+            // Try to extract the first quoted string argument
+            if let Some(name) = extract_first_string_arg(trimmed) {
+                return Some(name);
+            }
+            return extract_first_identifier(trimmed);
+        }
+    };
+
+    let name = name_part.trim();
+    // Handle quoted names
+    let name = name
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Extract the first quoted string argument from a function call like `setGeneric("foo", ...)`.
+fn extract_first_string_arg(line: &str) -> Option<String> {
+    let open = line.find('(')?;
+    let after = &line[open + 1..];
+    let after = after.trim_start();
+    // Check for quoted string
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = after[1..].find(quote)?;
+    let name = &after[1..1 + end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Find `=` that's not inside parentheses (to distinguish assignment from function args).
+fn find_toplevel_equals(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => {
+                // Make sure it's not == or !=
+                if i > 0 && s.as_bytes().get(i - 1) == Some(&b'!') {
+                    continue;
+                }
+                if s.as_bytes().get(i + 1) == Some(&b'=') {
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract the first R identifier from a line (for setGeneric etc.).
+fn extract_first_identifier(line: &str) -> Option<String> {
+    let mut chars = line.chars().peekable();
+    // Skip whitespace
+    while chars.peek().map_or(false, |c| c.is_whitespace()) {
+        chars.next();
+    }
+    // Collect identifier chars
+    let mut name = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '.' || c == '_' {
+            name.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(test)]
+mod namespace_tag_tests {
+    use super::*;
+
+    #[test]
+    fn export_before_function() {
+        let content = "#' Title\n#' @export\nfoo <- function(x) x + 1\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn export_before_assignment() {
+        let content = "#' A constant\n#' @export\nMY_CONST <- 42\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["MY_CONST"]);
+    }
+
+    #[test]
+    fn import_package() {
+        let content = "#' @import dplyr\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.imports, vec!["dplyr"]);
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn import_from() {
+        let content = "#' @importFrom dplyr mutate filter\n#' @export\nbar <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.import_from.len(), 2);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
+    }
+
+    #[test]
+    fn multiple_blocks() {
+        let content = r#"#' @export
+foo <- function() {}
+
+#' @importFrom tidyr pivot_longer
+#' @export
+bar <- function() {}
+"#;
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo", "bar"]);
+        assert_eq!(ns.import_from, vec![("tidyr".into(), "pivot_longer".into())]);
+    }
+
+    #[test]
+    fn no_roxygen() {
+        let content = "foo <- function() {}\nbar <- 1\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.exports.is_empty());
+        assert!(ns.imports.is_empty());
+        assert!(ns.import_from.is_empty());
+    }
+
+    #[test]
+    fn quoted_name() {
+        let content = "#' @export\n\"%>%\" <- function(lhs, rhs) rhs(lhs)\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["%>%"]);
+    }
+
+    #[test]
+    fn double_arrow_assignment() {
+        let content = "#' @export\nfoo <<- function(x) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn set_generic() {
+        let content = "#' @export\nsetGeneric(\"myGeneric\", function(x) standardGeneric(\"myGeneric\"))\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["myGeneric"]);
+    }
+
+    #[test]
+    fn set_method_single_quotes() {
+        let content = "#' @export\nsetMethod('show', 'MyClass', function(object) cat(object@name))\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["show"]);
+    }
+}

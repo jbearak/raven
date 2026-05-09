@@ -18,7 +18,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, cross_file_entries, new_index_entries, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Should find 1 .R file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
@@ -32,7 +32,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, cross_file_entries, new_index_entries, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Should find 1 .r file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
@@ -48,7 +48,7 @@ mod workspace_scan_tests {
         fs::write(temp_dir.path().join("lowercase.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, cross_file_entries, new_index_entries, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 2, "Should find both .R and .r files");
         assert_eq!(cross_file_entries.len(), 2, "Should have 2 cross-file entries");
@@ -69,7 +69,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "my_func <- function() { 42 }").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, _, cross_file_entries, new_index_entries, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(cross_file_entries.len(), 1);
         assert_eq!(new_index_entries.len(), 1);
@@ -97,7 +97,7 @@ mod workspace_scan_tests {
         fs::write(subdir.join("nested.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, _, new_index_entries, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 2, "Should find files in root and subdirectory");
         assert_eq!(new_index_entries.len(), 2, "Should have 2 new index entries");
@@ -115,7 +115,7 @@ my_func <- function(x) { x + 1 }
 "#).unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, _, _, new_index_entries, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(new_index_entries.len(), 1);
         
@@ -171,7 +171,7 @@ mod jags_stan_indexing_tests {
         fs::write(dir.join("readme.txt"), "not indexed").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) =
+        let (index, _, cross_file_entries, new_index_entries, _, _) =
             scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         // All R, JAGS, and Stan files should be indexed (4 total), .txt excluded
@@ -199,7 +199,7 @@ mod jags_stan_indexing_tests {
         fs::write(dir.join("upper.STAN"), "data { int N; }").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
-        let (index, _, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, _, _, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 3, "Should index uppercase JAGS/BUGS/STAN extensions");
     }
@@ -258,7 +258,7 @@ mod jags_stan_indexing_property_tests {
             fs::write(&file_path, "model { x ~ dnorm(0, 1) }").unwrap();
 
             let workspace_url = Url::from_file_path(dir).unwrap();
-            let (index, _, _, new_index_entries) =
+            let (index, _, _, new_index_entries, _, _) =
                 scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
             // The file must be present in the index

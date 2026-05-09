@@ -250,6 +250,16 @@ impl CrossFileWorkspaceIndex {
         self.inner.read().ok().map(|g| g.cap().get()).unwrap_or(0)
     }
 
+    /// Iterate all entries (URI, IndexEntry) without LRU promotion.
+    /// Used by package mode to collect symbols from all R/*.R files.
+    pub fn entries(&self) -> Vec<(Url, IndexEntry)> {
+        self.inner
+            .read()
+            .ok()
+            .map(|g| g.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.
     ///
     /// Also updates the `user_cap` baseline so `set_pinned_uris` will

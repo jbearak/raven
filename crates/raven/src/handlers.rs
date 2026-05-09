@@ -129,6 +129,13 @@ pub(crate) struct DiagnosticsSnapshot {
     /// mutate the cache. The snapshot is owned by a single tokio task; no
     /// `Sync` bound is required.
     pub(crate) parent_prefix_cache: std::cell::RefCell<scope::ParentPrefixCache>,
+    /// In package mode: top-level symbol names from other R/*.R files.
+    /// These are available via mutual visibility (flat namespace) and suppress
+    /// undefined-variable diagnostics.
+    pub(crate) package_internal_symbols: HashSet<String>,
+    /// In package mode: packages imported wholesale via `import(pkg)` in NAMESPACE
+    /// or `@import pkg` in roxygen. All exports of these packages are available.
+    pub(crate) package_full_imports: Vec<String>,
 }
 
 impl DiagnosticsSnapshot {
@@ -249,6 +256,12 @@ impl DiagnosticsSnapshot {
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
+            package_internal_symbols: collect_package_internal_symbols(state, uri),
+            package_full_imports: state
+                .package_namespace_model
+                .as_ref()
+                .map(|m| m.full_imports.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -291,6 +304,54 @@ impl DiagnosticsSnapshot {
             &mut cache,
         )
     }
+}
+
+/// Collect top-level symbols from other `R/*.R` files when in package mode.
+///
+/// Returns an empty set if the workspace is not an R package or if the
+/// queried URI is not under the package's `R/` directory.
+///
+/// Uses `ContentProvider` to prefer open-document artifacts (authoritative)
+/// over stale workspace-index entries.
+fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> HashSet<String> {
+    let Some(ref pkg) = state.package_workspace else {
+        return HashSet::new();
+    };
+
+    // Check if the queried URI is under the package's R/ directory
+    let Ok(file_path) = uri.to_file_path() else {
+        return HashSet::new();
+    };
+    let r_dir = pkg.root.join("R");
+    if !file_path.starts_with(&r_dir) {
+        return HashSet::new();
+    }
+
+    let content_provider = state.content_provider();
+
+    // Collect candidate URIs from the workspace index (R/*.R files only)
+    let candidate_uris: Vec<Url> = state
+        .cross_file_workspace_index
+        .uris()
+        .into_iter()
+        .filter(|u| {
+            u != uri
+                && u.to_file_path()
+                    .ok()
+                    .is_some_and(|p| p.starts_with(&r_dir))
+        })
+        .collect();
+
+    // Resolve artifacts through ContentProvider (prefers open documents)
+    let mut symbols = HashSet::new();
+    for other_uri in &candidate_uris {
+        if let Some(artifacts) = content_provider.get_artifacts(other_uri) {
+            for name in artifacts.exported_interface.keys() {
+                symbols.insert(name.to_string());
+            }
+        }
+    }
+    symbols
 }
 
 /// Compute diagnostics from a pre-built snapshot (no lock held).
@@ -5172,6 +5233,11 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
 
+        // Package mode: suppress diagnostics for symbols from other R/*.R files
+        if snapshot.package_internal_symbols.contains(name.as_str()) {
+            continue;
+        }
+
         // Advance the stream cursor and query visibility. Fall back to
         // the legacy snapshot.get_scope path if stream construction
         // failed (no artifacts for the queried URI).
@@ -5239,12 +5305,18 @@ fn collect_undefined_variables_from_snapshot(
         }
 
         if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
-            let position_aware_packages: Vec<String> = scope
+            let mut position_aware_packages: Vec<String> = scope
                 .inherited_packages
                 .iter()
                 .chain(scope.loaded_packages.iter())
                 .cloned()
                 .collect();
+            // In package mode, full_imports packages are always available
+            for pkg in &snapshot.package_full_imports {
+                if !position_aware_packages.contains(pkg) {
+                    position_aware_packages.push(pkg.clone());
+                }
+            }
 
             if is_package_export(&name, &position_aware_packages, &snapshot.package_library) {
                 continue;
@@ -9276,6 +9348,43 @@ pub fn completion(
             &mut items,
             &mut seen_names,
         );
+    }
+
+    // Add package-internal symbols (from other R/*.R files in package mode)
+    if state.package_workspace.is_some() {
+        if let Ok(file_path) = uri.to_file_path() {
+            let r_dir = state.package_workspace.as_ref().unwrap().root.join("R");
+            if file_path.starts_with(&r_dir) {
+                let content_provider = state.content_provider();
+                for (other_uri, _) in state.workspace_index_new.iter() {
+                    if &other_uri == uri {
+                        continue;
+                    }
+                    if let Ok(other_path) = other_uri.to_file_path() {
+                        if !other_path.starts_with(&r_dir) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                    if let Some(artifacts) = content_provider.get_artifacts(&other_uri) {
+                        for (name, symbol) in artifacts.exported_interface.iter() {
+                            if seen_names.contains(name.as_ref()) {
+                                continue;
+                            }
+                            push_scoped_symbol_completion(
+                                state,
+                                uri,
+                                name.as_ref(),
+                                symbol,
+                                &mut items,
+                                &mut seen_names,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Filter out reserved words from identifier completions

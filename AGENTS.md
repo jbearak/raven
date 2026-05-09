@@ -9,6 +9,7 @@ IMPORTANT: Treat this as a living document, but **prefer code comments over Lear
 User-facing:
 - `README.md`
 - `docs/cross-file.md`
+- `docs/r-package-dev.md`
 - `docs/directives.md`
 - `docs/diagnostics.md`
 - `docs/indentation.md`
