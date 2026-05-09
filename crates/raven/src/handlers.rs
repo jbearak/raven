@@ -548,26 +548,20 @@ struct AbsoluteSemanticToken {
     length: u32,
 }
 
-/// Compute full-document semantic tokens for an open R document.
+/// Compute full-document semantic tokens for a parsed R syntax tree.
 ///
 /// Raven keeps this intentionally narrow: the legend contains only the standard
 /// LSP `function` token type, and this provider emits tokens for function
 /// definition names and function-call heads. The result augments VS Code's
 /// TextMate syntax highlighting rather than replacing it.
-pub fn semantic_tokens_full(state: &WorldState, uri: &Url) -> Option<SemanticTokens> {
-    let doc = state.get_document(uri)?;
-    if doc.file_type != FileType::R {
-        return None;
-    }
-
-    let tree = doc.tree.as_ref()?;
-    let text = doc.text();
-    Some(semantic_tokens_for_r_tree(tree.root_node(), &text))
+pub fn semantic_tokens_full(tree: &tree_sitter::Tree, text: &str) -> SemanticTokens {
+    semantic_tokens_for_r_tree(tree.root_node(), text)
 }
 
 fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
     let mut absolute_tokens = Vec::new();
-    collect_r_function_semantic_tokens(root, text, &mut absolute_tokens);
+    let lines: Vec<&str> = text.lines().collect();
+    collect_r_function_semantic_tokens(root, text, &lines, &mut absolute_tokens);
     SemanticTokens {
         result_id: None,
         data: encode_semantic_tokens(absolute_tokens),
@@ -577,21 +571,22 @@ fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
 fn collect_r_function_semantic_tokens(
     node: Node,
     text: &str,
+    lines: &[&str],
     tokens: &mut Vec<AbsoluteSemanticToken>,
 ) {
     if let Some(function_name) = function_definition_name_node(node, text) {
-        push_function_token(function_name, text, tokens);
+        push_function_token(function_name, lines, tokens);
     }
 
     if node.kind() == "call" {
         if let Some(callee) = call_callee_identifier(node) {
-            push_function_token(callee, text, tokens);
+            push_function_token(callee, lines, tokens);
         }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_r_function_semantic_tokens(child, text, tokens);
+        collect_r_function_semantic_tokens(child, text, lines, tokens);
     }
 }
 
@@ -669,14 +664,14 @@ fn namespace_operator_member_identifier(node: Node) -> Option<Node> {
         .find(|child| child.kind() == "identifier")
 }
 
-fn push_function_token(node: Node, text: &str, tokens: &mut Vec<AbsoluteSemanticToken>) {
+fn push_function_token(node: Node, lines: &[&str], tokens: &mut Vec<AbsoluteSemanticToken>) {
     let start = node.start_position();
     let end = node.end_position();
     if start.row != end.row {
         return;
     }
 
-    let line_text = text.lines().nth(start.row).unwrap_or("");
+    let line_text = lines.get(start.row).copied().unwrap_or("");
     let start_utf16 = crate::utf16::byte_offset_to_utf16_column(line_text, start.column);
     let end_utf16 = crate::utf16::byte_offset_to_utf16_column(line_text, end.column);
     let length = end_utf16.saturating_sub(start_utf16);

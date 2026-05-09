@@ -3552,11 +3552,25 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        let state = self.state.read().await;
-        Ok(
-            handlers::semantic_tokens_full(&state, &params.text_document.uri)
-                .map(SemanticTokensResult::Tokens),
-        )
+        let (tree, text) = {
+            let state = self.state.read().await;
+            let doc = match state.get_document(&params.text_document.uri) {
+                Some(doc) => doc,
+                None => return Ok(None),
+            };
+            if doc.file_type != crate::file_type::FileType::R {
+                return Ok(None);
+            }
+            let tree = match &doc.tree {
+                Some(tree) => tree.clone(),
+                None => return Ok(None),
+            };
+            (tree, doc.text())
+        };
+
+        Ok(Some(SemanticTokensResult::Tokens(
+            handlers::semantic_tokens_full(&tree, &text),
+        )))
     }
 
     /// Searches workspace symbols that match the provided query string.
