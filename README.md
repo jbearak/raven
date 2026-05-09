@@ -2,9 +2,9 @@
 
 Raven is an R extension for VS Code, plus a standalone [language server](https://github.com/Microsoft/language-server-protocol) for other LSP-compatible editors (Zed, Neovim, and AI agents).
 
-The VS Code extension integrates an [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md). Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R more reliably and renders large data frames without freezing the editor.
+The VS Code extension integrates an [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md). Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R reliably even over `tmux` and SSH, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
-The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. No other R language server does this.
+The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. We're not aware of another R language server that combines `source()`-chain tracing with position-aware package scope; if you know of one, we'd like to hear about it.
 
 > [!NOTE]
 > If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Comparison: Coexistence](docs/comparison.md#coexistence). The language server and help viewer are unaffected.
@@ -37,7 +37,7 @@ When you open `main.R`, Raven:
 3. Provides completions, hover, and go-to-definition for `helper_function`
 4. Only shows `helper_function` as available *after* the `source()` line
 
-And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it and resolves the full chain in both directions.
+For statically detectable `source()` patterns, opening `utils.R` directly is enough — Raven discovers that `main.R` sources it and resolves the chain in both directions.
 
 ## Features
 
@@ -58,10 +58,10 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 
 ### R session integration
 
-- **[R console](docs/r-console.md)** — Interactive R console with statement detection and reliable large-block sending; supports R, arf, and radian
+- **[R console](docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
 - **[Plot viewer](docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
-- **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; scales smoothly to multi-million-row data frames
-- **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function actually in scope at the cursor, not every same-named function across your library
+- **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
+- **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
 
 > [!NOTE]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation. See [Document Outline](docs/document-outline.md#jags-and-stan-model-structure).

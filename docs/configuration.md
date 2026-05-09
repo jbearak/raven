@@ -1,6 +1,6 @@
 # Configuration
 
-All settings can be configured via VS Code settings or LSP initialization options. Search for "raven" in Settings (Cmd/Ctrl-,) to see all options.
+Most settings are exposed as VS Code settings — search for "raven" in Settings (Cmd/Ctrl-,). A handful of advanced server-side knobs are only available via LSP initialization options; those are noted in the tables below.
 
 ## Diagnostics
 
@@ -14,14 +14,14 @@ All settings can be configured via VS Code settings or LSP initialization option
 |---|---|---|
 | `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
 | `raven.crossFile.backwardDependencies` | `"auto"` | How backward dependencies are resolved. `"auto"`: infer from workspace scan. `"explicit"`: require `@lsp-sourced-by` directives. See [Backward Dependency Modes](cross-file.md#backward-dependency-modes) |
-| `raven.crossFile.hoistGlobalsInFunctions` | `true` | Hoist global definitions inside function bodies (late-binding semantics). See [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting) |
+| `raven.crossFile.hoistGlobalsInFunctions` | `true` | Hoist global definitions inside function bodies (late-binding semantics). See [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting). *LSP init-only — not exposed in the VS Code Settings UI.* |
 | `raven.crossFile.assumeCallSite` | `"end"` | Default call site when not specified by directive (`"end"` or `"start"`) |
 | `raven.crossFile.maxBackwardDepth` | `10` | Maximum depth for backward directive traversal |
 | `raven.crossFile.maxForwardDepth` | `10` | Maximum depth for forward source() traversal |
 | `raven.crossFile.maxChainDepth` | `20` | Maximum total chain depth (emits diagnostic when exceeded) |
 | `raven.crossFile.maxRevalidationsPerTrigger` | `10` | Max open documents to revalidate per change |
 | `raven.crossFile.revalidationDebounceMs` | `200` | Debounce delay for dependent file diagnostics (ms) |
-| `raven.crossFile.editedFileDebounceMs` | `50` | Debounce delay for the actively-edited file (ms) |
+| `raven.crossFile.editedFileDebounceMs` | `50` | Debounce delay for the actively-edited file (ms). *LSP init-only — not exposed in the VS Code Settings UI.* |
 
 ## Diagnostic Severity Settings
 
@@ -62,7 +62,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.plot.viewerColumn` | `beside` | Initial editor column for the shared plot viewer panel when the first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. See [Plot Viewer](plot-viewer.md). |
+| `raven.plot.viewerColumn` | `beside` | Initial editor column for an R session's plot viewer panel when its first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. See [Plot Viewer](plot-viewer.md). |
 
 ## Help Viewer Settings
 

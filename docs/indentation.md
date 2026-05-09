@@ -1,6 +1,6 @@
 # Smart Indentation
 
-Raven provides intelligent indentation for R code through a two-tier system.
+Raven provides AST-aware indentation for R code through a two-tier system.
 
 ## Overview
 
@@ -18,8 +18,8 @@ When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces t
 1. You press Enter in an R file
 2. VS Code applies Tier 1 rules (basic regex indentation)
 3. Raven's LSP analyzes the tree-sitter AST at your cursor position
-4. The LSP returns a TextEdit that replaces the indentation with the correct amount
-5. Your cursor lands at the precise column for your code style
+4. The LSP returns a TextEdit that replaces the indentation with the configured amount for the surrounding construct
+5. Your cursor lands at the column computed for the configured indentation style
 
 ## Configuration
 
@@ -86,7 +86,7 @@ result <- function_call(first_arg,
 
 ### Pipe Chains
 
-All continuation lines in a pipe chain align relative to the chain start:
+Continuation lines in a pipe chain align relative to the chain start:
 
 ```r
 result <- data %>%

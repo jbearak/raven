@@ -3,18 +3,19 @@
 Raven includes a data viewer that overrides R's `View()` so calls in a
 Raven-managed R terminal open a virtualized grid in a VS Code webview
 instead of the default backup viewer. The grid streams row windows from
-disk, so it scales smoothly to multi-million-row data frames.
+disk, keeping scrolling responsive on multi-million-row data frames.
 
 ## Why we built this
 
-Most VS Code R extensions transport data frames from R to the webview by
-serializing the entire frame to JSON and shipping it into the page in one
-shot. That works for small frames but freezes the editor — and sometimes
-the whole VS Code window — on large ones. Raven serializes the frame to
-an Apache Arrow IPC (Feather v2) file and decodes only the rows currently
-visible, so opening a multi-million-row data frame is an O(1) operation
-regardless of size. See [Comparison: Data viewer](./comparison.md#data-viewer)
-for details.
+Many webview-based R data viewers transport data frames from R to the
+webview by serializing the entire frame to JSON and shipping it into the
+page in one shot. That works for small frames but can freeze the editor
+on large ones; in some reported cases, large `View()` calls have hung the
+whole VS Code window. Raven serializes the frame to an Apache Arrow IPC
+(Feather v2) file and decodes only the rows currently visible, so the
+webview's memory and decode time scale with the visible viewport rather
+than the size of the frame. See
+[Comparison: Data viewer](./comparison.md#data-viewer) for details.
 
 > [!NOTE]
 > The data viewer is reached through Raven's R console: it activates only

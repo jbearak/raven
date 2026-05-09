@@ -2,9 +2,9 @@
 
 Raven is an R extension for VS Code, plus a standalone language server for other LSP-compatible editors.
 
-The extension integrates an R console, plot viewer, data viewer, and help viewer. Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R more reliably and renders large data frames without freezing the editor.
+The extension integrates an R console, plot viewer, data viewer, and help viewer. Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R reliably even over `tmux` and SSH, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
-The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. No other R language server does this.
+The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. We're not aware of another R language server that combines `source()`-chain tracing with position-aware package scope; if you know of one, we'd like to hear about it.
 
 > [!NOTE]
 > If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](#coexistence-with-vscode-r-and-positron) below. The language server and help viewer are unaffected.
@@ -28,10 +28,10 @@ The language server brings cross-file code intelligence to R: completions, diagn
 
 ### R session integration
 
-- **[R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md)** — Interactive R console with statement detection and reliable large-block sending; supports R, arf, and radian
+- **[R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
 - **[Plot viewer](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
-- **[Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; scales smoothly to multi-million-row data frames
-- **[Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md)** — Scope-aware R help: hovering shows the function actually in scope at the cursor, not every same-named function across your library
+- **[Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
+- **[Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
 
 > [!NOTE]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation.
@@ -43,6 +43,7 @@ Key settings (all under the `raven.*` prefix):
 | Setting | Default | Description |
 |---|---|---|
 | `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). |
+| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). The help viewer activates regardless of `raven.rConsole.activation`. |
 | `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
 | `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
 | `raven.packages.enabled` | `true` | Enable package function awareness |

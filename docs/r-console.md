@@ -2,7 +2,7 @@
 
 Raven provides an integrated R console inside VS Code, plus commands to send R code from the editor to that console for execution. It supports the standard R console as well as [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) — modern third-party R consoles with syntax highlighting and richer interactive features.
 
-The R console is the entry point to Raven's [plot viewer](./plot-viewer.md) and [data viewer](./data-viewer.md): plots produced in this console render in a VS Code panel via httpgd, and `View(df)` opens Raven's high-performance data viewer instead of R's default. Raven's [help viewer](./help-viewer.md) works independently of the R console.
+The R console is the entry point to Raven's [plot viewer](./plot-viewer.md) and [data viewer](./data-viewer.md): plots produced in this console render in a VS Code panel via httpgd, and `View(df)` opens Raven's data viewer instead of R's default. Raven's [help viewer](./help-viewer.md) works independently of the R console.
 
 > [!NOTE]
 > Whether the R console activates is controlled by `raven.rConsole.activation` (default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore its plot and data viewers — steps aside automatically to avoid disrupting your existing R-session setup. See [Comparison](./comparison.md#coexistence) for details.
@@ -22,7 +22,7 @@ The `raven.rTerminal.program` setting controls which program is launched:
 | **radian** | Python-based R console with syntax highlighting, multiline editing, and mouse support |
 
 > [!TIP]
-> Both [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) provide a significantly better interactive experience than the standard R console: syntax highlighting, multiline editing, popup completions, and `Ctrl+R` history search. Note that radian is no longer under active development; its author [recommends arf](https://github.com/randy3k/radian) as the successor.
+> Both [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) add interactive features the standard R console lacks: syntax highlighting, multiline editing, popup completions, and `Ctrl+R` history search. radian is no longer under active development; arf is its successor.
 
 The selected program must be available on your PATH.
 
@@ -56,7 +56,7 @@ Code sent via the Terminal submenu follows the same send method as the main comm
 
 ## Statement Detection
 
-When no text is selected, **Run Line or Selection** intelligently detects complete R statements spanning multiple lines. The extension recognizes:
+When no text is selected, **Run Line or Selection** uses heuristics to detect complete R statements spanning multiple lines. The extension recognizes:
 
 - **Unmatched brackets** — `(`, `[`, `{` that haven't been closed
 - **Trailing operators** — lines ending with `+`, `-`, `*`, `/`, `|>`, `%>%`, `%any%`, `||`, `&&`, `|`, `&`, `~`, `=`, `<-`, `->`, `,`, `::`, `:::`
@@ -93,13 +93,13 @@ By default, the cursor advances to the next line after sending a single statemen
 By default (`auto`), Raven pastes short blocks directly and switches to a temporary file once a block has at least `raven.sendToR.autoTempFileThresholdLines` lines (≥ N — default 25, so paste up to 24 lines, temp-file 25 or more), running it with `source()`. Override this with `raven.sendToR.sendMethod`:
 
 - **`paste`** — always pastes. For multi-line code, uses bracketed paste mode to deliver the block as a single unit.
-- **`tempfile`** — always writes to a temp file and runs `source()`. Use this for maximum consistency, or when even single-line paste is unreliable.
+- **`tempfile`** — always writes to a temp file and runs `source()`. Use this when you want larger and smaller sends to follow the same `source()` path, or when even single-line paste is unreliable.
 
 ### Why `auto` switches to a temp file for larger blocks
 
-Pasting works well for short blocks. For longer blocks it gets slow — the terminal feeds characters to R's stdin one at a time, so code that would run instantly via `source()` can take noticeably longer to type out. Pasting can also be unreliable over remote sessions (SSH, VS Code Remote, mosh): if too many lines arrive at once they sometimes get garbled.
+Pasting works well for short blocks. For longer blocks it gets slow — the terminal feeds characters to R's stdin one at a time, so code that would start executing sooner via `source()` can take noticeably longer to type out. Pasting can also be unreliable over remote sessions (SSH, VS Code Remote, mosh): if too many lines arrive at once they sometimes get garbled.
 
-Writing larger blocks to a temp file and `source()`-ing them sidesteps both: R reads from disk, so there is no paste-buffer slowdown and no remote-terminal garbling. `source(echo = TRUE)` also produces cleaner output, with `+` continuation prompts matching how R normally displays interactive input.
+Writing larger blocks to a temp file and `source()`-ing them sidesteps both, avoiding the inter-line paste delay and bracketed-paste compatibility issues for those blocks. `source(echo = TRUE)` also produces cleaner output, with `+` continuation prompts matching how R normally displays interactive input.
 
 The cutover point is controlled by `raven.sendToR.autoTempFileThresholdLines` — a block with at least this many lines (≥ N) goes through a temp file; smaller blocks are pasted. The default of 25 is arbitrary but reasonable — most blocks below it paste fast and reliably on a local terminal. Lower it for slow remote connections; raise it if you prefer to see your code echoed in the terminal. Setting it to 2 reproduces the prior behavior of always temp-filing any multi-line block.
 

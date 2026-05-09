@@ -1,6 +1,6 @@
 # Cross-File & Package Awareness
 
-Raven builds a dependency graph of your R project and uses it to provide accurate completions, diagnostics, and navigation across file boundaries. This page explains how the system works.
+Raven builds a dependency graph of your R project and uses it to provide scope-aware completions, diagnostics, and navigation across file boundaries. This page explains how the system works.
 
 ## How It Works
 
@@ -18,7 +18,7 @@ result <- helper_function(42)  # Raven knows this comes from utils.R
 helper_function <- function(x) { x * 2 }
 ```
 
-When you open any file, Raven:
+When you open a file in a workspace with detectable `source()` patterns, Raven:
 1. Scans the workspace for `source()` calls and builds a dependency graph
 2. Resolves which symbols are available at each position in each file
 3. Provides completions, diagnostics, hover, and go-to-definition using the full graph
@@ -144,7 +144,7 @@ source("a.R")  # Symbols from a.R available after this line
 y <- foo()     # foo() from a.R is now in scope
 ```
 
-This applies to both `source()` calls and forward directives. The scope model ensures that completions and diagnostics reflect what would actually be available at runtime.
+This applies to both `source()` calls and forward directives. The scope model aims to reflect runtime availability for the statically determinable cases — see [Symbol Recognition](#symbol-recognition) below for what's covered.
 
 ## Symbol Recognition
 
