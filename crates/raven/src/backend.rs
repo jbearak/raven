@@ -576,6 +576,19 @@ fn build_completion_trigger_chars(trigger_on_open_paren: bool) -> Vec<String> {
     chars
 }
 
+fn semantic_tokens_capability() -> SemanticTokensServerCapabilities {
+    SemanticTokensOptions {
+        work_done_progress_options: WorkDoneProgressOptions::default(),
+        legend: SemanticTokensLegend {
+            token_types: vec![SemanticTokenType::FUNCTION],
+            token_modifiers: vec![],
+        },
+        range: None,
+        full: Some(SemanticTokensFullOptions::Bool(true)),
+    }
+    .into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancellableRequestKind {
     GotoDefinition,
@@ -1166,6 +1179,7 @@ impl LanguageServer for Backend {
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
                 ),
+                semantic_tokens_provider: Some(semantic_tokens_capability()),
                 execute_command_provider: Some(tower_lsp::lsp_types::ExecuteCommandOptions {
                     commands: vec![],
                     ..Default::default()
@@ -3532,6 +3546,17 @@ impl LanguageServer for Backend {
                 Err(tower_lsp::jsonrpc::Error::internal_error())
             }
         }
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let state = self.state.read().await;
+        Ok(
+            handlers::semantic_tokens_full(&state, &params.text_document.uri)
+                .map(SemanticTokensResult::Tokens),
+        )
     }
 
     /// Searches workspace symbols that match the provided query string.

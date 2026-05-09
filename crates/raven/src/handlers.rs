@@ -534,6 +534,176 @@ fn is_delimiter_only(s: &str) -> bool {
 fn utf16_len(s: &str) -> u32 {
     s.chars().map(|c| c.len_utf16() as u32).sum()
 }
+// ============================================================================
+// Semantic Tokens
+// ============================================================================
+
+/// Token type index for `SemanticTokenType::FUNCTION` in Raven's semantic-token legend.
+const SEMANTIC_TOKEN_TYPE_FUNCTION: u32 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct AbsoluteSemanticToken {
+    line: u32,
+    start: u32,
+    length: u32,
+}
+
+/// Compute full-document semantic tokens for an open R document.
+///
+/// Raven keeps this intentionally narrow: the legend contains only the standard
+/// LSP `function` token type, and this provider emits tokens for function
+/// definition names and function-call heads. The result augments VS Code's
+/// TextMate syntax highlighting rather than replacing it.
+pub fn semantic_tokens_full(state: &WorldState, uri: &Url) -> Option<SemanticTokens> {
+    let doc = state.get_document(uri)?;
+    if doc.file_type != FileType::R {
+        return None;
+    }
+
+    let tree = doc.tree.as_ref()?;
+    let text = doc.text();
+    Some(semantic_tokens_for_r_tree(tree.root_node(), &text))
+}
+
+fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
+    let mut absolute_tokens = Vec::new();
+    collect_r_function_semantic_tokens(root, text, &mut absolute_tokens);
+    SemanticTokens {
+        result_id: None,
+        data: encode_semantic_tokens(absolute_tokens),
+    }
+}
+
+fn collect_r_function_semantic_tokens(
+    node: Node,
+    text: &str,
+    tokens: &mut Vec<AbsoluteSemanticToken>,
+) {
+    if let Some(function_name) = function_definition_name_node(node, text) {
+        push_function_token(function_name, text, tokens);
+    }
+
+    if node.kind() == "call" {
+        if let Some(callee) = call_callee_identifier(node) {
+            push_function_token(callee, text, tokens);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_r_function_semantic_tokens(child, text, tokens);
+    }
+}
+
+fn function_definition_name_node<'a>(node: Node<'a>, text: &str) -> Option<Node<'a>> {
+    if node.kind() != "binary_operator" && node.kind() != "right_assignment" {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+    if children.len() < 3 {
+        return None;
+    }
+
+    let lhs = children[0];
+    let op = children[1];
+    let rhs = children[2];
+    let op_text = node_text(op, text);
+
+    if matches!(op_text, "<-" | "=" | "<<-")
+        && lhs.kind() == "identifier"
+        && contains_function_definition(rhs)
+    {
+        return Some(lhs);
+    }
+
+    if matches!(op_text, "->" | "->>")
+        && rhs.kind() == "identifier"
+        && contains_function_definition(lhs)
+    {
+        return Some(rhs);
+    }
+
+    None
+}
+
+fn contains_function_definition(node: Node) -> bool {
+    if node.kind() == "function_definition" {
+        return true;
+    }
+
+    if node.kind() != "parenthesized_expression" {
+        return false;
+    }
+
+    let mut cursor = node.walk();
+    let has_function_definition = node
+        .children(&mut cursor)
+        .filter(|child| child.is_named())
+        .any(contains_function_definition);
+    has_function_definition
+}
+
+fn call_callee_identifier(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+    let callee = children.first().copied()?;
+    (callee.kind() == "identifier").then_some(callee)
+}
+
+fn push_function_token(node: Node, text: &str, tokens: &mut Vec<AbsoluteSemanticToken>) {
+    let start = node.start_position();
+    let end = node.end_position();
+    if start.row != end.row {
+        return;
+    }
+
+    let line_text = text.lines().nth(start.row).unwrap_or("");
+    let start_utf16 = crate::utf16::byte_offset_to_utf16_column(line_text, start.column);
+    let end_utf16 = crate::utf16::byte_offset_to_utf16_column(line_text, end.column);
+    let length = end_utf16.saturating_sub(start_utf16);
+    if length == 0 {
+        return;
+    }
+
+    tokens.push(AbsoluteSemanticToken {
+        line: start.row as u32,
+        start: start_utf16,
+        length,
+    });
+}
+
+fn encode_semantic_tokens(mut absolute_tokens: Vec<AbsoluteSemanticToken>) -> Vec<SemanticToken> {
+    absolute_tokens.sort_unstable();
+    absolute_tokens.dedup();
+
+    let mut encoded = Vec::with_capacity(absolute_tokens.len());
+    let mut previous_line = 0;
+    let mut previous_start = 0;
+
+    for token in absolute_tokens {
+        let delta_line = token.line.saturating_sub(previous_line);
+        let delta_start = if delta_line == 0 {
+            token.start.saturating_sub(previous_start)
+        } else {
+            token.start
+        };
+
+        encoded.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: SEMANTIC_TOKEN_TYPE_FUNCTION,
+            token_modifiers_bitset: 0,
+        });
+
+        previous_line = token.line;
+        previous_start = token.start;
+    }
+
+    encoded
+}
 
 // ============================================================================
 // Banner-Style Section Helpers
@@ -11833,6 +12003,81 @@ mod tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         parser.parse(code, None).unwrap()
+    }
+
+    fn semantic_token_spans(code: &str) -> Vec<(u32, u32, u32)> {
+        let tree = parse_r_code(code);
+        let tokens = semantic_tokens_for_r_tree(tree.root_node(), code).data;
+        let mut spans = Vec::new();
+        let mut line = 0;
+        let mut start = 0;
+        for token in tokens {
+            line += token.delta_line;
+            start = if token.delta_line == 0 {
+                start + token.delta_start
+            } else {
+                token.delta_start
+            };
+            spans.push((line, start, token.length));
+        }
+        spans
+    }
+
+    #[test]
+    fn test_semantic_tokens_function_definition_and_call_heads() {
+        let code = "add <- function(x) x\nresult <- add(1) + mean(x)";
+        assert_eq!(
+            semantic_token_spans(code),
+            vec![
+                (0, 0, 3),  // add definition
+                (1, 10, 3), // add call
+                (1, 19, 4), // mean call
+            ]
+        );
+    }
+
+    #[test]
+    fn test_semantic_tokens_skip_plain_variable_assignments() {
+        let code = "x <- 1\ny <- x + 2";
+        assert!(semantic_token_spans(code).is_empty());
+    }
+
+    #[test]
+    fn test_semantic_tokens_right_assigned_function_definitions() {
+        let code = "(function(y) y) -> g\n(function(z) z) ->> h";
+        assert_eq!(semantic_token_spans(code), vec![(0, 19, 1), (1, 20, 1)]);
+    }
+
+    #[test]
+    fn test_semantic_tokens_encode_same_line_multiple_calls() {
+        let code = "a(); bc()";
+        let tree = parse_r_code(code);
+        let tokens = semantic_tokens_for_r_tree(tree.root_node(), code).data;
+        assert_eq!(
+            tokens,
+            vec![
+                SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: SEMANTIC_TOKEN_TYPE_FUNCTION,
+                    token_modifiers_bitset: 0,
+                },
+                SemanticToken {
+                    delta_line: 0,
+                    delta_start: 5,
+                    length: 2,
+                    token_type: SEMANTIC_TOKEN_TYPE_FUNCTION,
+                    token_modifiers_bitset: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_semantic_tokens_use_utf16_columns() {
+        let code = "x <- \"😀\"; mean(1)";
+        assert_eq!(semantic_token_spans(code), vec![(0, 11, 4)]);
     }
 
     #[test]
