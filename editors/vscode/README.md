@@ -59,7 +59,7 @@ Raven's R-console features (R console, plot viewer, data viewer) and REditorSupp
 
 Set `"enabled"` to override and run both extensions' R-session features at once — you'll then own any keybinding or `View()`-override conflicts.
 
-If you want to run vscode-R's language server alongside Raven (for example, to use its `lintr` diagnostics), keep its language-server feature off:
+REditorSupport's `lintr` diagnostics are provided by its language server. If you want lintr alongside Raven, leave `r.lsp.enabled` at its default (`true`) — both language servers will run, with some overlap in completions and diagnostics. If you don't need lintr and only want vscode-R for its R-session features, disable its language server:
 
 ```json
 "r.lsp.enabled": false

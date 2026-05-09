@@ -51,16 +51,4 @@ Raven takes a different approach. Its language server is a separate Rust process
 
 ## Coexistence
 
-Raven's data viewer and plot viewer are reached *through* its R console: the R console boots a profile that overrides `View()` (data viewer) and starts httpgd (plot viewer). When Raven's R console isn't activated, neither of those viewers is wired up — `View(df)` and `plot(...)` go to whatever R session your other extension manages.
-
-Raven's help viewer operates independently of the R console: it shells out to R on demand to render `Rd → HTML`, so it works whether or not Raven's R console is active. Help remains available independently of `raven.rConsole.activation`, provided Raven can run the configured R executable.
-
-With the default `raven.rConsole.activation: "auto"`, the R console (and therefore its plot and data viewers) steps aside automatically when the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is enabled or VS Code is running as Positron, so Raven stays out of the way of your existing R-session setup. Set the value explicitly to `"enabled"` if you want both extensions' R-session features active at once; you'll then be responsible for any keybinding or `View()`-override conflicts that result. Set `"disabled"` to never activate Raven's R-session features even when no other R extension is present.
-
-If you want to run REditorSupport's language server alongside Raven (for example, to use `lintr` diagnostics), keep its language-server feature off:
-
-```json
-"r.lsp.enabled": false
-```
-
-See [Editor Integrations](./editor-integrations.md) for setup details across editors.
+See [Coexistence with Other R Extensions](./coexistence.md) for how Raven's R-session features interact with the REditorSupport (R) extension and Positron, how `raven.rConsole.activation` works, and how to run REditorSupport's lintr alongside Raven.

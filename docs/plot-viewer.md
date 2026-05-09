@@ -3,7 +3,7 @@
 Raven shows plots from its managed R terminal directly in VS Code via a built-in viewer panel. The viewer is backed by [httpgd](https://nx10.dev/httpgd/), a headless graphics device for R that exposes plots over a local HTTP/WebSocket server. Each R session gets its own plot panel with independent history, theme-aware backgrounds, and export to PNG, SVG, or PDF.
 
 > [!NOTE]
-> The plot viewer is reached through Raven's R console: it activates only when Raven's R console activates (`raven.rConsole.activation`, default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore the plot viewer — steps aside automatically. See [Comparison: Coexistence](./comparison.md#coexistence) for details.
+> The plot viewer is reached through Raven's R console: it activates only when Raven's R console activates (`raven.rConsole.activation`, default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore the plot viewer — steps aside automatically. See [Coexistence](./coexistence.md) for details.
 
 ## Prerequisites
 

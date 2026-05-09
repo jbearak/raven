@@ -56,7 +56,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport (R) extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Comparison: Coexistence](comparison.md#coexistence). |
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport (R) extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Coexistence](coexistence.md). |
 
 ## Plot Settings
 

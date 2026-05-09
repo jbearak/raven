@@ -23,7 +23,7 @@ than the size of the frame. See
 > `auto`). When the REditorSupport (R) extension is enabled or VS Code is
 > running as Positron, Raven's R console — and therefore the data viewer
 > — steps aside automatically. See
-> [Comparison: Coexistence](./comparison.md#coexistence) for details.
+> [Coexistence](./coexistence.md) for details.
 
 ## What it shows
 
