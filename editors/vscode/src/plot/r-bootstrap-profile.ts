@@ -482,9 +482,12 @@ local({
                 "}"
             ))
             warning(msg, call. = FALSE)
-            # dev.new() reads getOption("device") internally (now restored).
-            # Errors are suppressed: the warning above is the user signal.
-            tryCatch(grDevices::dev.new(), error = function(e) invisible(NULL))
+            # Try to open the original device; if that fails (e.g. the
+            # terminal has no native graphics device), fall back to a
+            # temporary PDF so R always has something to render to.
+            tryCatch(grDevices::dev.new(), error = function(e) {
+                try(grDevices::pdf(tempfile(fileext = ".pdf")), silent = TRUE)
+            })
         })
         .raven_original_device
     }
@@ -497,7 +500,7 @@ local({
         # Show the VS Code popup only when the user first tries to plot, not at
         # session start, to avoid overwhelming new users during setup.
         .raven_original_device <- .raven_deferred_warn(
-            "To view R plots: install.packages(\\"httpgd\\")", "missing-httpgd")
+            "To view R plots in VS Code: install.packages(\\"httpgd\\")", "missing-httpgd")
         # Retry after each R expression: initialize the plot bridge as soon as
         # httpgd is available (e.g. after install.packages("httpgd")).
         addTaskCallback(function(...) {
@@ -516,7 +519,7 @@ local({
             as.character(utils::packageVersion("httpgd")), "): install.packages(\\"httpgd\\")"
         ))
         .raven_deferred_warn(
-            "To view R plots, update httpgd: install.packages(\\"httpgd\\")", "outdated-httpgd")
+            "To view R plots in VS Code, update httpgd: install.packages(\\"httpgd\\")", "outdated-httpgd")
         return(invisible(NULL))
     }
 
