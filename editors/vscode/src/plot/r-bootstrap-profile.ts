@@ -481,10 +481,10 @@ local({
                 "\\"message\\":", .raven_json_str(msg),
                 "}"
             ))
-            # dev.new() reads getOption("device") internally, which is now
-            # restored to the original, so it opens the right device without
-            # needing to call the opener directly via match.fun.
-            grDevices::dev.new()
+            warning(msg, call. = FALSE)
+            # dev.new() reads getOption("device") internally (now restored).
+            # Errors are suppressed: the warning above is the user signal.
+            tryCatch(grDevices::dev.new(), error = function(e) invisible(NULL))
         })
         .raven_original_device
     }
