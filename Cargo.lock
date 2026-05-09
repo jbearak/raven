@@ -1327,6 +1327,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "streaming-iterator",
  "tempfile",
  "tokio",
  "tokio-util",

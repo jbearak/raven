@@ -3567,10 +3567,15 @@ impl LanguageServer for Backend {
             };
             (tree, doc.text())
         };
-
-        Ok(Some(SemanticTokensResult::Tokens(
-            handlers::semantic_tokens_full(&tree, &text),
-        )))
+        match tokio::task::spawn_blocking(move || handlers::semantic_tokens_full(&tree, &text))
+            .await
+        {
+            Ok(tokens) => Ok(Some(SemanticTokensResult::Tokens(tokens))),
+            Err(e) => {
+                log::trace!("semantic_tokens_full: spawn_blocking failed: {e}");
+                Err(tower_lsp::jsonrpc::Error::internal_error())
+            }
+        }
     }
 
     /// Searches workspace symbols that match the provided query string.

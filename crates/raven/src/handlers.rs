@@ -9,9 +9,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
+use streaming_iterator::StreamingIterator;
 use tower_lsp::lsp_types::*;
 use tree_sitter::Node;
 use tree_sitter::Point;
+use tree_sitter::Query;
+use tree_sitter::QueryCursor;
 
 use crate::content_provider::ContentProvider;
 use crate::cross_file::dependency::compute_inherited_working_directory;
@@ -560,7 +563,7 @@ pub fn semantic_tokens_full(tree: &tree_sitter::Tree, text: &str) -> SemanticTok
 
 fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
     let mut absolute_tokens = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = text.split('\n').collect();
     collect_r_function_semantic_tokens(root, text, &lines, &mut absolute_tokens);
     SemanticTokens {
         result_id: None,
@@ -569,101 +572,68 @@ fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
 }
 
 fn collect_r_function_semantic_tokens(
-    node: Node,
+    root: Node,
     text: &str,
     lines: &[&str],
     tokens: &mut Vec<AbsoluteSemanticToken>,
 ) {
-    if let Some(function_name) = function_definition_name_node(node, text) {
-        push_function_token(function_name, lines, tokens);
-    }
-
-    if node.kind() == "call" {
-        if let Some(callee) = call_callee_identifier(node) {
-            push_function_token(callee, lines, tokens);
+    let mut cursor = QueryCursor::new();
+    let query = semantic_function_query();
+    let function_capture = capture_index(query, "function");
+    let value_capture = capture_index(query, "value");
+    let mut matches = cursor.matches(query, root, text.as_bytes());
+    while let Some(query_match) = {
+        matches.advance();
+        matches.get()
+    } {
+        match query_match.pattern_index {
+            0 | 1 => {
+                let mut function_node = None;
+                let mut value_node = None;
+                for capture in query_match.captures {
+                    if capture.index == function_capture {
+                        function_node = Some(capture.node);
+                    } else if capture.index == value_capture {
+                        value_node = Some(capture.node);
+                    }
+                }
+                if let (Some(function_node), Some(value_node)) = (function_node, value_node) {
+                    if value_is_function_definition(value_node) {
+                        push_function_token(function_node, lines, tokens);
+                    }
+                }
+            }
+            _ => {
+                for capture in query_match.captures {
+                    if capture.index == function_capture {
+                        push_function_token(capture.node, lines, tokens);
+                    }
+                }
+            }
         }
     }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_r_function_semantic_tokens(child, text, lines, tokens);
-    }
 }
 
-fn function_definition_name_node<'a>(node: Node<'a>, text: &str) -> Option<Node<'a>> {
-    if node.kind() != "binary_operator" && node.kind() != "right_assignment" {
-        return None;
-    }
-
-    let mut cursor = node.walk();
-    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-    if children.len() < 3 {
-        return None;
-    }
-
-    let lhs = children[0];
-    let op = children[1];
-    let rhs = children[2];
-    let op_text = node_text(op, text);
-
-    if matches!(op_text, "<-" | "=" | "<<-")
-        && lhs.kind() == "identifier"
-        && contains_function_definition(rhs)
-    {
-        return Some(lhs);
-    }
-
-    if matches!(op_text, "->" | "->>")
-        && rhs.kind() == "identifier"
-        && contains_function_definition(lhs)
-    {
-        return Some(rhs);
-    }
-
-    None
+fn capture_index(query: &Query, name: &str) -> u32 {
+    query
+        .capture_names()
+        .iter()
+        .position(|capture_name| *capture_name == name)
+        .expect("semantic token query capture must exist") as u32
 }
 
-fn contains_function_definition(node: Node) -> bool {
+fn value_is_function_definition(node: Node) -> bool {
     if node.kind() == "function_definition" {
         return true;
     }
-
     if node.kind() != "parenthesized_expression" {
         return false;
     }
 
     let mut cursor = node.walk();
-    let has_function_definition = node
-        .children(&mut cursor)
-        .filter(|child| child.is_named())
-        .any(contains_function_definition);
-    has_function_definition
+    let contains_function_definition = node.children(&mut cursor).any(value_is_function_definition);
+    contains_function_definition
 }
-
-fn call_callee_identifier(node: Node) -> Option<Node> {
-    let mut cursor = node.walk();
-    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-    let callee = children.first().copied()?;
-    if callee.kind() == "identifier" {
-        return Some(callee);
-    }
-    namespace_operator_member_identifier(callee)
-}
-
-fn namespace_operator_member_identifier(node: Node) -> Option<Node> {
-    if node.kind() != "namespace_operator" {
-        return None;
-    }
-
-    let mut cursor = node.walk();
-    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-    children
-        .iter()
-        .rev()
-        .copied()
-        .find(|child| child.kind() == "identifier")
-}
-
 fn push_function_token(node: Node, lines: &[&str], tokens: &mut Vec<AbsoluteSemanticToken>) {
     let start = node.start_position();
     let end = node.end_position();
@@ -672,9 +642,10 @@ fn push_function_token(node: Node, lines: &[&str], tokens: &mut Vec<AbsoluteSema
     }
 
     let line_text = lines.get(start.row).copied().unwrap_or("");
-    let start_utf16 = crate::utf16::byte_offset_to_utf16_column(line_text, start.column);
-    let end_utf16 = crate::utf16::byte_offset_to_utf16_column(line_text, end.column);
-    let length = end_utf16.saturating_sub(start_utf16);
+    let Some((start_utf16, length)) = byte_span_to_utf16_span(line_text, start.column, end.column)
+    else {
+        return;
+    };
     if length == 0 {
         return;
     }
@@ -686,6 +657,70 @@ fn push_function_token(node: Node, lines: &[&str], tokens: &mut Vec<AbsoluteSema
     });
 }
 
+fn byte_span_to_utf16_span(line: &str, start_byte: usize, end_byte: usize) -> Option<(u32, u32)> {
+    if start_byte > end_byte || end_byte > line.len() {
+        return None;
+    }
+
+    if line.as_bytes()[..end_byte].is_ascii() {
+        return Some((start_byte as u32, (end_byte - start_byte) as u32));
+    }
+
+    let mut utf16_col: u32 = 0;
+    let mut start_utf16 = None;
+    let mut end_utf16 = None;
+
+    for (byte_idx, ch) in line.char_indices() {
+        if start_utf16.is_none() && byte_idx >= start_byte {
+            start_utf16 = Some(utf16_col);
+        }
+        if byte_idx >= end_byte {
+            end_utf16 = Some(utf16_col);
+            break;
+        }
+        utf16_col += ch.len_utf16() as u32;
+    }
+
+    let start_utf16 = start_utf16.unwrap_or(utf16_col);
+    let end_utf16 = end_utf16.unwrap_or(utf16_col);
+    Some((start_utf16, end_utf16.saturating_sub(start_utf16)))
+}
+
+fn semantic_function_query() -> &'static Query {
+    static QUERY: OnceLock<Query> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        let language: tree_sitter::Language = tree_sitter_r::LANGUAGE.into();
+        Query::new(
+            &language,
+            r#"
+            (binary_operator
+              lhs: (identifier) @function
+              operator: [
+                "<-"
+                "="
+                "<<-"
+              ]
+              rhs: (_) @value)
+
+            (binary_operator
+              lhs: (_) @value
+              operator: [
+                "->"
+                "->>"
+              ]
+              rhs: (identifier) @function)
+
+            (call
+              function: (identifier) @function)
+
+            (call
+              function: (namespace_operator
+                rhs: (identifier) @function))
+            "#,
+        )
+        .expect("semantic token query must compile")
+    })
+}
 fn encode_semantic_tokens(mut absolute_tokens: Vec<AbsoluteSemanticToken>) -> Vec<SemanticToken> {
     absolute_tokens.sort_unstable();
     absolute_tokens.dedup();
@@ -12069,6 +12104,18 @@ mod tests {
     fn test_semantic_tokens_right_assigned_function_definitions() {
         let code = "(function(y) y) -> g\n(function(z) z) ->> h";
         assert_eq!(semantic_token_spans(code), vec![(0, 19, 1), (1, 20, 1)]);
+    }
+
+    #[test]
+    fn test_semantic_tokens_nested_parenthesized_function_definitions() {
+        let code = "f <- ((function(x) x))\n((function(y) y)) -> g";
+        assert_eq!(semantic_token_spans(code), vec![(0, 0, 1), (1, 21, 1)]);
+    }
+
+    #[test]
+    fn test_semantic_tokens_skip_function_definition_arguments() {
+        let code = "f <- wrapper(function(x) x)";
+        assert_eq!(semantic_token_spans(code), vec![(0, 5, 7)]);
     }
 
     #[test]

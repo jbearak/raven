@@ -33,6 +33,7 @@ indexmap = "2.2"
 regex = "1.10.0"
 rayon = "1.10"
 ropey = "1.6"
+streaming-iterator = "0.1"
 lru = "0.16"
 notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
 percent-encoding = "2"
