@@ -257,6 +257,7 @@ export function register_r_terminal(
                 shellPath: program,
                 shellArgs: ['--no-save', '--no-restore'],
                 env: plot_env?.env,
+                isTransient: true,
             });
             if (plot_env) {
                 pending_profile_session_ids.push({
@@ -301,11 +302,17 @@ export async function get_or_create_r_terminal(): Promise<vscode.Terminal> {
 async function create_r_terminal(): Promise<vscode.Terminal> {
     const program = await resolve_program();
     const plot_env = await get_plot_terminal_env();
+    // Opt out of VS Code's terminal restoration. Without isTransient, a restart
+    // replays scrollback and relaunches R in the same pane, but the R process
+    // is fresh (no objects/history) and the baked-in port/token env vars point
+    // at a session server from the previous activation that no longer exists,
+    // so plot/data-viewer integration silently posts to a dead server.
     const terminal = vscode.window.createTerminal({
         name: TERMINAL_NAME,
         shellPath: program,
         shellArgs: ['--no-save', '--no-restore'],
         env: plot_env?.env,
+        isTransient: true,
     });
     profile_terminals.add(terminal);
     last_active_terminal = terminal;
