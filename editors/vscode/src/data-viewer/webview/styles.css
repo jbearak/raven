@@ -224,6 +224,44 @@ html, body, #root {
 .cell.col-header {
     cursor: default;
     position: relative;
+    /* Override .cell's overflow: hidden so the variable-label tooltip can
+       overflow below the header row. The column name still ellipses via
+       .col-name below. */
+    overflow: visible;
+}
+.cell.col-header > .col-name {
+    display: block;
+    width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* Variable-label tooltip that appears on header hover. The native HTML
+   title attribute has a long delay (~700 ms) and renders as an OS tooltip
+   that's easy to miss in a dense grid; this CSS-driven tooltip is
+   immediate and theme-aware. */
+.col-tooltip {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 5;
+    margin-top: 2px;
+    max-width: 360px;
+    padding: 4px 8px;
+    background: var(--vscode-editorHoverWidget-background, #252526);
+    color: var(--vscode-editorHoverWidget-foreground, #cccccc);
+    border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+    font-weight: 400;
+    font-size: 12px;
+    line-height: 16px;
+    white-space: normal;
+    pointer-events: none;
+}
+.cell.col-header:hover > .col-tooltip {
+    display: block;
 }
 
 .resize-handle {

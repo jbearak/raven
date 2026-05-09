@@ -757,11 +757,14 @@
                          data-grid-target="col-header"
                          data-col={colIdx}
                          style="width: {widthOf(colIdx)}px;"
-                         title={col.variableLabel ? `${col.name}: ${col.variableLabel}` : col.name}
+                         aria-label={col.variableLabel ? `${col.name}: ${col.variableLabel}` : col.name}
                          onpointerdown={(e) => onColHeaderPointerDown(colIdx, e)}
                          onpointerenter={(e) => onColHeaderPointerEnter(colIdx, e)}
                     >
-                        {col.name}
+                        <span class="col-name">{col.name}</span>
+                        {#if col.variableLabel}
+                            <span class="col-tooltip" role="tooltip">{col.variableLabel}</span>
+                        {/if}
                         <!-- svelte-ignore a11y_no_static_element_interactions -->
                         <div class="resize-handle"
                              onpointerdown={(e) => onResizeHandlePointerDown(colIdx, e)}></div>

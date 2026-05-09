@@ -11,23 +11,53 @@ big <- as.data.frame(
 View(big)
 
 
-# ── 2. NHANES via haven (variable labels + Labels toggle) ─────────────────────
-# install.packages("haven")   # if needed
+# ── 2. NHANES via haven (variable labels only) ────────────────────────────────
+# SAS XPORT files carry variable labels but not value labels — those live in a
+# separate SAS format catalog (.sas7bcat) that NHANES doesn't ship. Use this
+# section to exercise variable labels; section 2b below exercises value labels.
 if (requireNamespace("haven", quietly = TRUE)) {
   # Downloads ~500 KB; skip if already cached.
   url  <- "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2017/DataFiles/DEMO_J.xpt"
   dest <- tempfile(fileext = ".xpt")
   download.file(url, dest, mode = "wb")
-  nhanes <- haven::read_xpt(dest)   # labelled vectors with variable-label attrs
-
-  str(nhanes[1:3])            # confirm <labelled> with label attr
+  nhanes <- haven::read_xpt(dest)
 
   View(nhanes)
   # Expected:
-  #   hover a column header  → tooltip shows variable label
-  #   Labels toggle ON       → numeric codes swap for label strings (e.g. 1 → "Male")
+  #   hover a column header  → tooltip shows "<NAME>: <variable label>"
+  #                            (e.g. "RIAGENDR: Gender")
+  #   Labels toggle ON       → no visible change (NHANES XPT has no value labels)
 } else {
   message("Skipping NHANES section: install 'haven' to run it.")
+}
+
+
+# ── 2b. Synthetic haven_labelled (variable labels + value labels) ─────────────
+# Builds a tibble with explicit value labels so the Labels toggle has something
+# to swap in. Stand-in for a haven::read_sav / read_dta workflow without needing
+# a real .sav / .dta file on disk.
+if (requireNamespace("haven", quietly = TRUE)) {
+  labelled_demo <- data.frame(
+    id       = 1:6,
+    sex      = haven::labelled(
+      c(1, 2, 1, 2, 1, 2),
+      labels = c(Male = 1, Female = 2),
+      label  = "Sex of the participant"
+    ),
+    handedness = haven::labelled(
+      c(1L, 2L, 1L, 3L, 2L, 1L),
+      labels = c(Right = 1L, Left = 2L, Ambidextrous = 3L),
+      label  = "Self-reported handedness"
+    ),
+    score    = c(0.71, 0.42, 0.85, 0.13, 0.66, 0.30)
+  )
+
+  View(labelled_demo)
+  # Expected:
+  #   hover "sex" header     → tooltip shows "sex: Sex of the participant"
+  #   Labels toggle ON       → sex column shows "Male" / "Female" instead of 1 / 2
+  #                            handedness shows "Right" / "Left" / "Ambidextrous"
+  #   Labels toggle OFF      → numeric codes are visible again
 }
 
 
