@@ -306,7 +306,7 @@ fn main() {
     let mut last: Option<(usize, usize, usize, usize)> = None;
     for _ in 0..3 {
         let t = Instant::now();
-        let (index, imports, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
+        let (index, imports, cf, new_idx, _, _) = scan_workspace(&[folder.clone()], 20);
         let elapsed = t.elapsed();
         runs.push(elapsed);
         last = Some((index.len(), imports.len(), cf.len(), new_idx.len()));
@@ -333,10 +333,10 @@ fn main() {
     let mut apply_runs = Vec::new();
     for _ in 0..3 {
         // Fresh scan each time so the inputs aren't moved
-        let (index, imports, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
+        let (index, imports, cf, new_idx, _, _) = scan_workspace(&[folder.clone()], 20);
         let mut state = make_state(&workspace);
         let t = Instant::now();
-        state.apply_workspace_index(index, imports, cf, new_idx);
+        state.apply_workspace_index(index, imports, cf, new_idx, None, None);
         apply_runs.push(t.elapsed());
     }
     apply_runs.sort();
@@ -442,8 +442,8 @@ fn main() {
     // Phase 6: scripts/data.r diagnostics — POST-scan (workspace index applied)
     // ------------------------------------------------------------------
     println!("[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):");
-    let (index, imports, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
-    state.apply_workspace_index(index, imports, cf, new_idx);
+    let (index, imports, cf, new_idx, _, _) = scan_workspace(&[folder.clone()], 20);
+    state.apply_workspace_index(index, imports, cf, new_idx, None, None);
     // Warmup
     for _ in 0..3 {
         let _ = diagnostics_via_snapshot_profile(&state, &target_uri, &cancel);

@@ -195,6 +195,7 @@ impl CrossFileConfig {
             || self.hoist_globals_in_functions != other.hoist_globals_in_functions
             || self.backward_dependencies != other.backward_dependencies
             || self.max_transitive_dependents_visited != other.max_transitive_dependents_visited
+            || self.package_mode != other.package_mode
     }
 }
 

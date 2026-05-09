@@ -46,7 +46,7 @@ fn main() {
     // ── Phase 1: scan_workspace (cold filesystem) ──
     eprintln!("\n=== Phase 1: scan_workspace (cold) ===");
     let t0 = Instant::now();
-    let (index, imports, cross_file_entries, new_index_entries) =
+    let (index, imports, cross_file_entries, new_index_entries, _, _) =
         scan_workspace(&[workspace_url.clone()], 20);
     let scan_time = t0.elapsed();
     eprintln!(
@@ -67,7 +67,7 @@ fn main() {
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
+    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries, None, None);
     let apply_time = t1.elapsed();
     eprintln!("  {:?}", apply_time);
     eprintln!(
@@ -136,7 +136,7 @@ fn main() {
     // ── Phase 4: scan_workspace (warm filesystem) ──
     eprintln!("\n=== Phase 4: scan_workspace (warm) ===");
     let t4 = Instant::now();
-    let (index2, _, _, _) = scan_workspace(&[workspace_url.clone()], 20);
+    let (index2, _, _, _, _, _) = scan_workspace(&[workspace_url.clone()], 20);
     let scan_warm_time = t4.elapsed();
     eprintln!("  {:?} ({} files)", scan_warm_time, index2.len());
 

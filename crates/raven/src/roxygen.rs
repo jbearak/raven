@@ -1280,11 +1280,11 @@ fn extract_first_string_arg(line: &str) -> Option<String> {
 
 /// Find `=` that's not inside parentheses (to distinguish assignment from function args).
 fn find_toplevel_equals(s: &str) -> Option<usize> {
-    let mut depth = 0;
+    let mut depth: usize = 0;
     for (i, c) in s.char_indices() {
         match c {
             '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
             '=' if depth == 0 => {
                 // Make sure it's not == or !=
                 if i > 0 && s.as_bytes().get(i - 1) == Some(&b'!') {

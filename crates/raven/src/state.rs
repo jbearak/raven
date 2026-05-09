@@ -990,7 +990,16 @@ impl WorldState {
                             roxygen_managed: false,
                         })
                 });
-                self.package_namespace_model = pkg_ns_model;
+                // Ensure namespace model is consistent: if we synthesized a
+                // fallback workspace, provide a default model so downstream
+                // code never sees Some(workspace) + None(model).
+                self.package_namespace_model = pkg_ns_model.or_else(|| {
+                    if self.package_workspace.is_some() {
+                        Some(crate::package_namespace::PackageNamespaceModel::default())
+                    } else {
+                        None
+                    }
+                });
             }
             PackageMode::Auto => {
                 self.package_workspace = pkg_workspace;

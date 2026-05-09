@@ -64,6 +64,7 @@ fn detect_roxygen_usage(workspace_root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(&r_dir) else {
         return false;
     };
+    let pattern = regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex");
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -77,7 +78,7 @@ fn detect_roxygen_usage(workspace_root: &Path) -> bool {
             continue;
         }
         if let Ok(content) = std::fs::read_to_string(&path) {
-            if content.contains("#' @export") {
+            if pattern.is_match(&content) {
                 return true;
             }
         }

@@ -56,8 +56,8 @@ fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
     }
 
     // Run workspace scan and apply index (populates cross-file state)
-    let (index, imports, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
-    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
+    let (index, imports, cross_file_entries, new_index_entries, _, _) = scan_workspace(&[folder_url], 20);
+    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries, None, None);
 
     state
 }

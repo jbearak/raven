@@ -2551,10 +2551,12 @@ impl LanguageServer for Backend {
             // Rebuild roxygen namespace model when an R/*.R file changes in a
             // roxygen-managed package. This ensures @import/@importFrom edits
             // take effect immediately without waiting for DESCRIPTION/NAMESPACE touch.
+            let mut package_namespace_changed = false;
             if let Some(ref pkg) = state.package_workspace {
                 if pkg.roxygen_managed {
                     if let Ok(file_path) = uri.to_file_path() {
                         if file_path.starts_with(pkg.root.join("R")) {
+                            let old_imports = state.workspace_imports.clone();
                             let root = pkg.root.clone();
                             let r_dir = root.join("R");
                             let mut roxygen_files = Vec::new();
@@ -2579,7 +2581,9 @@ impl LanguageServer for Backend {
                             let ns_model = crate::package_namespace::namespace_model_from_roxygen(&roxygen_files);
                             // Replace workspace_imports entirely from the namespace model.
                             // In package mode, the model is the sole source of truth.
-                            state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                            let new_imports = std::sync::Arc::new(ns_model.imports.clone());
+                            package_namespace_changed = *old_imports != *new_imports;
+                            state.workspace_imports = new_imports;
                             state.package_namespace_model = Some(ns_model);
                         }
                     }
@@ -2649,6 +2653,20 @@ impl LanguageServer for Backend {
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
                     affected.insert(child);
+                }
+            }
+            // When the roxygen namespace model changed, all open package R
+            // files need revalidation so @import/@importFrom edits propagate.
+            if package_namespace_changed {
+                if let Some(ref pkg) = state.package_workspace {
+                    let r_dir = pkg.root.join("R");
+                    for open_uri in state.documents.keys() {
+                        if let Ok(p) = open_uri.to_file_path() {
+                            if p.starts_with(&r_dir) {
+                                affected.insert(open_uri.clone());
+                            }
+                        }
+                    }
                 }
             }
             // Convert to Vec for sorting
@@ -2999,9 +3017,65 @@ impl LanguageServer for Backend {
                 .unwrap_or(state.cross_file_config.packages_enabled);
 
             // Apply new config if parsed
+            let package_mode_changed = new_config
+                .as_ref()
+                .map(|c| c.package_mode != state.cross_file_config.package_mode)
+                .unwrap_or(false);
             if let Some(config) = new_config {
                 state.resize_caches(&config);
                 state.cross_file_config = config;
+            }
+
+            // If package_mode changed, rebuild package-related state
+            if package_mode_changed {
+                use crate::cross_file::config::PackageMode;
+                let mode = state.cross_file_config.package_mode;
+                if mode == PackageMode::Disabled {
+                    state.package_workspace = None;
+                    state.package_namespace_model = None;
+                    state.workspace_imports = std::sync::Arc::new(Vec::new());
+                } else if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
+                    let new_ws = match mode {
+                        PackageMode::Auto => crate::package_namespace::detect_package_workspace(&root),
+                        PackageMode::Enabled => {
+                            crate::package_namespace::detect_package_workspace(&root).or_else(|| {
+                                Some(crate::package_namespace::PackageWorkspace {
+                                    name: "unknown".to_string(),
+                                    root: root.clone(),
+                                    roxygen_managed: false,
+                                })
+                            })
+                        }
+                        PackageMode::Disabled => unreachable!(),
+                    };
+                    if let Some(ref ws) = new_ws {
+                        let ns_model = if ws.roxygen_managed {
+                            let r_dir = root.join("R");
+                            let mut roxygen_files = Vec::new();
+                            if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                                            roxygen_files.push((path.display().to_string(), ns));
+                                        }
+                                    }
+                                }
+                            }
+                            crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
+                        } else {
+                            crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE"))
+                        };
+                        state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                        state.package_namespace_model = Some(ns_model);
+                    } else {
+                        state.package_namespace_model = None;
+                        state.workspace_imports = std::sync::Arc::new(Vec::new());
+                    }
+                    state.package_workspace = new_ws;
+                }
+                log::info!("Rebuilt package state after packageMode change to {:?}", mode);
             }
 
             // Apply new symbol config if parsed
@@ -3313,12 +3387,13 @@ impl LanguageServer for Backend {
             state.recompute_open_neighborhood_pins();
 
             // Check if DESCRIPTION or NAMESPACE changed — rebuild package namespace model
-            let pkg_files_changed = params.changes.iter().any(|c| {
-                c.uri
-                    .to_file_path()
-                    .ok()
-                    .and_then(|p| p.file_name().map(|n| n.to_owned()))
-                    .is_some_and(|name| name == "DESCRIPTION" || name == "NAMESPACE")
+            let workspace_root = state.workspace_folders.first().and_then(|u| u.to_file_path().ok());
+            let pkg_files_changed = workspace_root.as_ref().is_some_and(|root| {
+                params.changes.iter().any(|c| {
+                    c.uri.to_file_path().ok().is_some_and(|p| {
+                        p == root.join("DESCRIPTION") || p == root.join("NAMESPACE")
+                    })
+                })
             });
             if pkg_files_changed {
                 use crate::cross_file::config::PackageMode;
@@ -3375,7 +3450,10 @@ impl LanguageServer for Backend {
                                 affected.push(open_uri.clone());
                             }
                         }
-                        state.diagnostics_gate.mark_force_republish_many(open_keys.iter());
+                        // Mark force-republish only for URIs in the affected
+                        // set (not all open docs) to avoid orphaned markers
+                        // when the async path later truncates via cap.
+                        state.diagnostics_gate.mark_force_republish_many(affected.iter());
                     }
                 } else {
                     // Disabled: clear package state if it was somehow set

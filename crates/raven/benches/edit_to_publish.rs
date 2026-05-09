@@ -160,9 +160,9 @@ fn build_state(workspace: &Path) -> (WorldState, Arc<Url>) {
             .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
     }
 
-    let (index, imports, cross_file_entries, new_index_entries) =
+    let (index, imports, cross_file_entries, new_index_entries, _, _) =
         scan_workspace(&[folder_url.clone()], 20);
-    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
+    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries, None, None);
 
     (state, Arc::new(folder_url))
 }

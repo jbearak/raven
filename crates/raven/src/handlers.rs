@@ -9351,12 +9351,12 @@ pub fn completion(
     }
 
     // Add package-internal symbols (from other R/*.R files in package mode)
-    if state.package_workspace.is_some() {
+    if let Some(ref pkg) = state.package_workspace {
         if let Ok(file_path) = uri.to_file_path() {
-            let r_dir = state.package_workspace.as_ref().unwrap().root.join("R");
+            let r_dir = pkg.root.join("R");
             if file_path.starts_with(&r_dir) {
                 let content_provider = state.content_provider();
-                for (other_uri, _) in state.workspace_index_new.iter() {
+                for other_uri in state.cross_file_workspace_index.uris() {
                     if &other_uri == uri {
                         continue;
                     }
