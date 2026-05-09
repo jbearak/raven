@@ -493,11 +493,13 @@ local({
 
     # 5. Verify httpgd >= 2.0.2 is available.
     if (!requireNamespace("httpgd", quietly = TRUE)) {
-        .raven_msg <- "To view plots in VS Code, install the httpgd package: install.packages(\\"httpgd\\")"
-        .raven_log(.raven_msg)
+        # Console: full context. Popup: short enough to fit on one VS Code
+        # notification line without the user needing to expand it.
+        .raven_log("To view R plots in VS Code, install the httpgd package: install.packages(\\"httpgd\\")")
         # Show the VS Code popup only when the user first tries to plot, not at
         # session start, to avoid overwhelming new users during setup.
-        .raven_original_device <- .raven_deferred_warn(.raven_msg, "missing-httpgd")
+        .raven_original_device <- .raven_deferred_warn(
+            "To view R plots: install.packages(\\"httpgd\\")", "missing-httpgd")
         # Retry after each R expression: initialize the plot bridge as soon as
         # httpgd is available (e.g. after install.packages("httpgd")).
         addTaskCallback(function(...) {
@@ -511,12 +513,12 @@ local({
         return(invisible(NULL))
     }
     if (!(utils::packageVersion("httpgd") >= "2.0.2")) {
-        .raven_msg <- paste0(
-            "To view plots in VS Code, update httpgd to >= 2.0.2 (installed: ",
+        .raven_log(paste0(
+            "To view R plots in VS Code, update httpgd to >= 2.0.2 (installed: ",
             as.character(utils::packageVersion("httpgd")), "): install.packages(\\"httpgd\\")"
-        )
-        .raven_log(.raven_msg)
-        .raven_deferred_warn(.raven_msg, "outdated-httpgd")
+        ))
+        .raven_deferred_warn(
+            "To view R plots, update httpgd: install.packages(\\"httpgd\\")", "outdated-httpgd")
         return(invisible(NULL))
     }
 
