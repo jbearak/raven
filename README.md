@@ -1,8 +1,8 @@
-# Raven — R language server and VS Code extension
+# Raven — R Extension & Language Server
 
-Raven is an R extension for VS Code, plus a standalone [language server](https://github.com/Microsoft/language-server-protocol) for other LSP-compatible editors (Zed, Neovim, and AI agents).
+R language support for VS Code with cross-file code intelligence (completions, diagnostics, navigation), an [R console](docs/r-console.md), and [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers. The [language server](https://github.com/Microsoft/language-server-protocol) also runs standalone in [other editors](docs/editor-integrations.md).
 
-The language server analyzes your code in realtime. It completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it. The VS Code extension bundles the language server alongside an integrated [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md).
+The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 
 Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), [Positron](https://github.com/posit-dev/positron), and RStudio, Raven's language server is the only one that traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order of execution at each cursor position. Of those three, REditorSupport is the only other VS Code option; against REditorSupport specifically, Raven adds RStudio-style indentation on Enter without disturbing the surrounding code, sends large blocks of code to R faster, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
