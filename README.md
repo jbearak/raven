@@ -1,10 +1,10 @@
-# Raven — R Extension for VS Code, and Language Server
+# Raven — R language server and VS Code extension
 
 Raven is an R extension for VS Code, plus a standalone [language server](https://github.com/Microsoft/language-server-protocol) for other LSP-compatible editors (Zed, Neovim, and AI agents).
 
-The VS Code extension integrates an [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md). Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R reliably even over `tmux` and SSH, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
+The language server analyzes your code in realtime. It completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it. The VS Code extension bundles the language server alongside an integrated [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md).
 
-The language server analyzes your code in realtime, without running it. It completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
+Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven's language server traces `source()` chains to resolve what's in scope at each cursor position, rather than treating the workspace as a flat set of top-level symbols. Raven also sends large blocks of code to R faster, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
 > [!NOTE]
 > If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Comparison: Coexistence](docs/comparison.md#coexistence). The language server and help viewer are unaffected.
