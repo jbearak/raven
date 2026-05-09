@@ -17,6 +17,7 @@ async function r_with_httpgd_available(): Promise<boolean> {
             cmd: [
                 R_BIN,
                 '--vanilla',
+                '--slave',
                 '--quiet',
                 '-e',
                 'cat(requireNamespace("httpgd", quietly = TRUE) && utils::packageVersion("httpgd") >= "2.0.2")',
@@ -117,11 +118,10 @@ describe('R bootstrap end-to-end (real R subprocess)', () => {
             const proc = spawn({
                 cmd: [
                     R_BIN,
+                    '--interactive',
                     '--quiet',
                     '--no-save',
                     '--no-restore',
-                    '-e',
-                    'invisible(NULL)',
                 ],
                 cwd: tmp,
                 env: {
@@ -132,9 +132,12 @@ describe('R bootstrap end-to-end (real R subprocess)', () => {
                     RAVEN_SESSION_TOKEN: 'test-token-deadbeef',
                     RAVEN_R_SESSION_ID: 'test-session-id-1',
                 },
+                stdin: 'pipe',
                 stdout: 'pipe',
                 stderr: 'pipe',
             });
+            proc.stdin.write('invisible(NULL)\nq("no")\n');
+            proc.stdin.end();
             // Wait for the /session-ready POST before tearing down the
             // capture server, instead of a flaky fixed-timer sleep.
             const ready = await cap.waitForRequest(

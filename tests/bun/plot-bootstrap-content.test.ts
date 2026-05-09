@@ -19,6 +19,34 @@ describe('generate_profile_source', () => {
         expect(src).toMatch(/packageVersion\("httpgd"\) >= "2\.0\.2"/);
     });
 
+    test('retries plot bridge initialization after outdated httpgd is updated', () => {
+        const retry_helper = src.match(
+            /\.raven_register_httpgd_retry <- function\(\.raven_original_device\) \{[\s\S]*?\n    \}/,
+        )?.[0];
+        const outdated_branch = src.match(
+            /if \(!\(utils::packageVersion\("httpgd"\) >= "2\.0\.2"\)\) \{[\s\S]*?return\(invisible\(NULL\)\)\n    \}/,
+        )?.[0];
+
+        expect(retry_helper).toBeDefined();
+        expect(retry_helper).toContain('addTaskCallback(function(...)');
+        expect(retry_helper).toContain(
+            'if (!(utils::packageVersion("httpgd") >= "2.0.2")) return(TRUE)',
+        );
+        expect(retry_helper).toContain(
+            'options(device = .raven_original_device)',
+        );
+        expect(retry_helper).toContain('.raven_init_httpgd()');
+        expect(retry_helper).toContain('name = "raven-httpgd-pending"');
+
+        expect(outdated_branch).toBeDefined();
+        expect(outdated_branch).toContain(
+            '.raven_original_device <- .raven_deferred_warn',
+        );
+        expect(outdated_branch).toContain(
+            '.raven_register_httpgd_retry(.raven_original_device)',
+        );
+    });
+
     test('starts httpgd::hgd with localhost host and ephemeral port', () => {
         expect(src).toMatch(/httpgd::hgd\(/);
         expect(src).toMatch(/host = "127\.0\.0\.1"/);
