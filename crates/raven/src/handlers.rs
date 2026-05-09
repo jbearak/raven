@@ -586,30 +586,25 @@ fn collect_r_function_semantic_tokens(
         matches.advance();
         matches.get()
     } {
-        match query_match.pattern_index {
-            0 | 1 => {
-                let mut function_node = None;
-                let mut value_node = None;
-                for capture in query_match.captures {
-                    if capture.index == function_capture {
-                        function_node = Some(capture.node);
-                    } else if capture.index == value_capture {
-                        value_node = Some(capture.node);
-                    }
-                }
-                if let (Some(function_node), Some(value_node)) = (function_node, value_node) {
-                    if value_is_function_definition(value_node) {
-                        push_function_token(function_node, lines, tokens);
-                    }
+        let mut function_node = None;
+        let mut value_node = None;
+        for capture in query_match.captures {
+            if capture.index == function_capture {
+                function_node = Some(capture.node);
+            } else if capture.index == value_capture {
+                value_node = Some(capture.node);
+            }
+        }
+        let Some(function_node) = function_node else {
+            continue;
+        };
+        match value_node {
+            Some(value_node) => {
+                if value_is_function_definition(value_node) {
+                    push_function_token(function_node, lines, tokens);
                 }
             }
-            _ => {
-                for capture in query_match.captures {
-                    if capture.index == function_capture {
-                        push_function_token(capture.node, lines, tokens);
-                    }
-                }
-            }
+            None => push_function_token(function_node, lines, tokens),
         }
     }
 }
