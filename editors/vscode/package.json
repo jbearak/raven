@@ -261,12 +261,18 @@
             "tempfile"
           ],
           "enumDescriptions": [
-            "Paste single-line code directly and use a temporary file for multi-line blocks.",
+            "Paste short blocks directly; write blocks with ≥ raven.sendToR.autoTempFileThresholdLines lines to a temp file and run with source().",
             "Paste code directly. Multi-line blocks use bracketed paste mode.",
             "Write code to a temporary file and run source() for both single-line and multi-line sends."
           ],
           "default": "auto",
-          "description": "Controls how Raven sends code to R. 'auto' pastes single-line code directly and uses a temp file for multi-line blocks. 'paste' always pastes, using bracketed paste mode for multi-line code. 'tempfile' always writes to a temp file and runs source()."
+          "description": "Controls how Raven sends code to R. 'auto' pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N). 'paste' always pastes, using bracketed paste mode for multi-line code. 'tempfile' always writes to a temp file and runs source()."
+        },
+        "raven.sendToR.autoTempFileThresholdLines": {
+          "type": "integer",
+          "default": 25,
+          "minimum": 2,
+          "markdownDescription": "Line-count threshold at which `auto` send mode switches from pasting to writing the code to a temporary file. A block with **≥ N lines** is written to a temp file and run with `source()`; a block with fewer than N lines is pasted directly. So `25` (the default) means: paste up to 24 lines, temp-file 25 or more. Set to `2` to reproduce the prior behavior of always temp-filing any multi-line block. Lower it on slow remote connections (SSH, VS Code Remote) where large pastes can be garbled; raise it if you prefer to see your code echoed in the terminal. Has no effect when `sendMethod` is `paste` or `tempfile`."
         },
         "raven.server.path": {
           "type": "string",

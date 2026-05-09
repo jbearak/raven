@@ -4,6 +4,7 @@ export type SendTransport = 'direct-paste' | 'bracketed-paste' | 'tempfile';
 export function choose_send_transport(
     code: string,
     sendMethod: SendMethod,
+    autoTempFileThresholdLines: number,
 ): SendTransport {
     const normalized = sendMethod === 'paste' || sendMethod === 'tempfile'
         ? sendMethod
@@ -13,14 +14,18 @@ export function choose_send_transport(
         return 'tempfile';
     }
 
-    const is_multiline = code.includes('\n');
-    if (normalized === 'paste' && is_multiline) {
-        return 'bracketed-paste';
+    const n_lines = code.split('\n').length;
+
+    if (normalized === 'paste') {
+        return n_lines > 1 ? 'bracketed-paste' : 'direct-paste';
     }
 
-    if (normalized === 'auto' && is_multiline) {
+    const threshold = Math.max(1, Math.floor(autoTempFileThresholdLines));
+    if (n_lines >= threshold) {
         return 'tempfile';
     }
-
+    if (n_lines > 1) {
+        return 'bracketed-paste';
+    }
     return 'direct-paste';
 }
