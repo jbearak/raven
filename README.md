@@ -37,7 +37,7 @@ When you open `main.R`, Raven:
 3. Provides completions, hover, and go-to-definition for `helper_function`
 4. Only shows `helper_function` as available *after* the `source()` line
 
-And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it and resolves the full chain in both directions — no configuration needed.
+And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it and resolves the full chain in both directions.
 
 ## Features
 
