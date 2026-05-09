@@ -94,13 +94,13 @@
         "command": "raven.runLineOrSelection",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "editorTextFocus && editorLangId == r"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
       },
       {
         "command": "raven.sourceFile",
         "key": "shift+ctrl+enter",
         "mac": "shift+cmd+enter",
-        "when": "editorTextFocus && editorLangId == r"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
       }
     ],
     "submenus": [
@@ -118,7 +118,7 @@
       "editor/title": [
         {
           "submenu": "raven.sendToR",
-          "when": "editorLangId == r",
+          "when": "editorLangId == r && raven.rConsoleEnabled",
           "group": "navigation"
         }
       ],
@@ -627,7 +627,7 @@
             "Activate Raven's R console, plot viewer, and data viewer unless the REditorSupport (R) extension is enabled or VS Code is running as Positron."
           ],
           "default": "auto",
-          "description": "Controls when Raven's R console (and the plot and data viewers it powers) activates. The help viewer is unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/comparison.md#coexistence."
+          "description": "Controls when Raven's R console (and the plot and data viewers it powers) activates. The help viewer is unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
         },
         "raven.plot.viewerColumn": {
           "type": "string",

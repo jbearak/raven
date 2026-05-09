@@ -17,6 +17,7 @@ User-facing:
 - `docs/data-viewer.md`
 - `docs/help-viewer.md`
 - `docs/document-outline.md`
+- `docs/coexistence.md`
 - `docs/configuration.md`
 
 Maintainer/internal:

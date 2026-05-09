@@ -23,6 +23,11 @@ Compares Raven's language server against the language servers and code-intellige
 
 Among the R LSPs we've surveyed, Raven is the only one that traces `source()` chains across a project: it builds a dependency graph and resolves what's in scope at each cursor position based on the actual order of execution, rather than treating the workspace as one flat symbol set. That makes its completions, diagnostics, and navigation reflect actual execution order in multi-file scripted projects, including circular-dependency and scope-violation detection. The analysis is static; Raven does spawn R subprocesses on demand for package metadata (exports, NAMESPACE entries, function signatures), but it doesn't need a live R session to compute scope.
 
+### What REditorSupport's language server offers that Raven doesn't
+
+- **lintr diagnostics** — Style checks and correctness linters (e.g. `object_usage_linter`, `line_length_linter`, `trailing_whitespace_linter`) via the [`lintr`](https://lintr.r-lib.org/) package. Raven has no style linting.
+- **Session-aware completions** — When the session watcher is enabled, REditorSupport can complete symbols from the live R session's `globalenv()`, including column names from data frames that only exist at runtime. Raven's completions are purely static.
+
 ## R session integration
 
 Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations our team has run into — described below.
@@ -49,18 +54,15 @@ REditorSupport's hover is rendered server-side by [`languageserver`](https://git
 
 Raven takes a different approach. Its language server is a separate Rust process that statically traces `library()` / `require()` calls in the file at the cursor and across the `source()` chain — including files the user hasn't opened — plus namespace qualifiers (`pkg::fn`) and `@lsp-*` directives, to compute which package is in scope at the cursor position. It then shows a single help link for that package. Raven does spawn R subprocesses to read package metadata (exports, NAMESPACE entries, function signatures), but the disambiguation logic itself is static — it doesn't depend on whether the user has opened, run, or attached anything. See [Help Viewer](./help-viewer.md).
 
+### What REditorSupport's VS Code extension offers that Raven doesn't
+
+- **Workspace viewer** — A sidebar panel that introspects the live R session, showing objects in `globalenv()` with their types and dimensions, plus attached and loaded namespaces. Objects can be viewed or removed directly from the panel.
+- **htmlwidget / Shiny viewer** — Interactive HTML output (plotly, DT, profvis, etc.) and Shiny apps render in VS Code webview panels.
+- **R Markdown support** — Chunk highlighting, chunk navigation, run-chunk / run-above CodeLens buttons, and R Markdown preview.
+- **List / environment viewer** — `View()` on lists and environments opens a collapsible tree view. Raven's `View()` only handles data frames and matrices.
+
+If you're interested in any of these, please [file an issue](https://github.com/jbearak/raven/issues) or submit a PR.
+
 ## Coexistence
 
-Raven's data viewer and plot viewer are reached *through* its R console: the R console boots a profile that overrides `View()` (data viewer) and starts httpgd (plot viewer). When Raven's R console isn't activated, neither of those viewers is wired up — `View(df)` and `plot(...)` go to whatever R session your other extension manages.
-
-Raven's help viewer operates independently of the R console: it shells out to R on demand to render `Rd → HTML`, so it works whether or not Raven's R console is active. Help remains available independently of `raven.rConsole.activation`, provided Raven can run the configured R executable.
-
-With the default `raven.rConsole.activation: "auto"`, the R console (and therefore its plot and data viewers) steps aside automatically when the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is enabled or VS Code is running as Positron, so Raven stays out of the way of your existing R-session setup. Set the value explicitly to `"enabled"` if you want both extensions' R-session features active at once; you'll then be responsible for any keybinding or `View()`-override conflicts that result. Set `"disabled"` to never activate Raven's R-session features even when no other R extension is present.
-
-If you want to run REditorSupport's language server alongside Raven (for example, to use `lintr` diagnostics), keep its language-server feature off:
-
-```json
-"r.lsp.enabled": false
-```
-
-See [Editor Integrations](./editor-integrations.md) for setup details across editors.
+See [Coexistence with Other R Extensions](./coexistence.md) for how Raven's R-session features interact with the REditorSupport (R) extension and Positron, how `raven.rConsole.activation` works, and how to run REditorSupport's lintr alongside Raven.

@@ -1,4 +1,6 @@
 import * as assert from 'assert';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
     isPositron,
@@ -61,5 +63,33 @@ suite('Raven R-console activation', () => {
         assert.strictEqual(isPositron('Visual Studio Code'), false);
         assert.strictEqual(isPositron('Cursor'), false);
         assert.strictEqual(isPositron('Code - OSS'), false);
+    });
+
+    test('R-console editor affordances are hidden unless the resolved activation context is enabled', () => {
+        const package_json_path = path.join(__dirname, '..', '..', 'package.json');
+        const package_json = JSON.parse(fs.readFileSync(package_json_path, 'utf8')) as {
+            contributes: {
+                keybindings: Array<{ command: string; when?: string }>;
+                menus: { 'editor/title': Array<{ submenu: string; when?: string }> };
+            };
+        };
+
+        const editor_menu = package_json.contributes.menus['editor/title']
+            .find(item => item.submenu === 'raven.sendToR');
+        assert.ok(editor_menu, 'editor/title should contribute the Send to R submenu');
+        assert.ok(
+            editor_menu.when?.includes('raven.rConsoleEnabled'),
+            'Send to R editor toolbar submenu must require the resolved R-console context key',
+        );
+
+        for (const command of ['raven.runLineOrSelection', 'raven.sourceFile']) {
+            const binding = package_json.contributes.keybindings
+                .find(item => item.command === command);
+            assert.ok(binding, `${command} should have a keybinding`);
+            assert.ok(
+                binding.when?.includes('raven.rConsoleEnabled'),
+                `${command} keybinding must require the resolved R-console context key`,
+            );
+        }
     });
 });

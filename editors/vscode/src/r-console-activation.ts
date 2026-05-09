@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
  * when the REditorSupport (R) extension is enabled or VS Code is
  * running as Positron, so Raven steps aside in environments where the
  * user already has R-session integration. See
- * docs/comparison.md#coexistence for the rationale.
+ * docs/coexistence.md for the rationale.
  */
 
 export type RConsoleActivation = 'enabled' | 'disabled' | 'auto';
@@ -78,7 +78,7 @@ export async function notifyAutoDisable(
     );
     if (choice === LEARN_MORE) {
         await vscode.env.openExternal(
-            vscode.Uri.parse('https://github.com/jbearak/raven/blob/main/docs/comparison.md#coexistence'),
+            vscode.Uri.parse('https://github.com/jbearak/raven/blob/main/docs/coexistence.md'),
         );
     } else if (choice === OPEN_SETTINGS) {
         await vscode.commands.executeCommand(
