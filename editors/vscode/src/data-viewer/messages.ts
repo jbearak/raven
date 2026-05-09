@@ -116,6 +116,10 @@ export type WebviewToExtension =
         labelsOn: boolean;
         formatOn: boolean;
         digits: number;
+        /** When true, prepend a tab-separated row of column names so the
+         *  paste lands with headers. Set by the webview for column /
+         *  select-all selections. */
+        includeHeader: boolean;
     };
 
 /** Hard cap on the number of cells the extension will materialize for a

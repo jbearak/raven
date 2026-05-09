@@ -11,23 +11,53 @@ big <- as.data.frame(
 View(big)
 
 
-# ── 2. NHANES via haven (variable labels + Labels toggle) ─────────────────────
-# install.packages("haven")   # if needed
+# ── 2. NHANES via haven (variable labels only) ────────────────────────────────
+# SAS XPORT files carry variable labels but not value labels — those live in a
+# separate SAS format catalog (.sas7bcat) that NHANES doesn't ship. Use this
+# section to exercise variable labels; section 2b below exercises value labels.
 if (requireNamespace("haven", quietly = TRUE)) {
   # Downloads ~500 KB; skip if already cached.
-  url  <- "https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/DEMO_J.XPT"
+  url  <- "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2017/DataFiles/DEMO_J.xpt"
   dest <- tempfile(fileext = ".xpt")
   download.file(url, dest, mode = "wb")
-  nhanes <- haven::read_xpt(dest)   # labelled vectors with variable-label attrs
-
-  str(nhanes[1:3])            # confirm <labelled> with label attr
+  nhanes <- haven::read_xpt(dest)
 
   View(nhanes)
   # Expected:
-  #   hover a column header  → tooltip shows variable label
-  #   Labels toggle ON       → numeric codes swap for label strings (e.g. 1 → "Male")
+  #   hover a column header  → tooltip shows "<NAME>: <variable label>"
+  #                            (e.g. "RIAGENDR: Gender")
+  #   Labels toggle ON       → no visible change (NHANES XPT has no value labels)
 } else {
   message("Skipping NHANES section: install 'haven' to run it.")
+}
+
+
+# ── 2b. Synthetic haven_labelled (variable labels + value labels) ─────────────
+# Builds a tibble with explicit value labels so the Labels toggle has something
+# to swap in. Minimal controlled example — for a real-world .sav label
+# round-trip test see section 5 (Western Electric study, no download needed).
+if (requireNamespace("haven", quietly = TRUE)) {
+  labelled_demo <- data.frame(
+    id       = 1:6,
+    sex      = haven::labelled(
+      c(1, 2, 1, 2, 1, 2),
+      labels = c(Male = 1, Female = 2),
+      label  = "Sex of the participant"
+    ),
+    handedness = haven::labelled(
+      c(1L, 2L, 1L, 3L, 2L, 1L),
+      labels = c(Right = 1L, Left = 2L, Ambidextrous = 3L),
+      label  = "Self-reported handedness"
+    ),
+    score    = c(0.71, 0.42, 0.85, 0.13, 0.66, 0.30)
+  )
+
+  View(labelled_demo)
+  # Expected:
+  #   hover "sex" header     → tooltip shows "sex: Sex of the participant"
+  #   Labels toggle ON       → sex column shows "Male" / "Female" instead of 1 / 2
+  #                            handedness shows "Right" / "Left" / "Ambidextrous"
+  #   Labels toggle OFF      → numeric codes are visible again
 }
 
 
@@ -57,3 +87,36 @@ View(copy_me)
 # Paste into Excel / Google Sheets / LibreOffice Calc.
 # Expected: 5 tab-separated columns, 1000 data rows + 1 header row;
 #           booleans, dates, and decimals round-trip without mangling.
+
+
+# ── 5. Western Electric study via haven (real SPSS + value labels) ────────────
+# foreign::electric.sav is bundled with base-R's `foreign` package (always
+# present, no download). It is a real SPSS file from the Western Electric /
+# WCGS cardiovascular study: 240 participants × 13 columns, with variable
+# labels on every column and non-trivial value-label sets on four columns —
+# the canonical real-world read_sav() stress test for the Labels toggle.
+if (requireNamespace("haven", quietly = TRUE)) {
+  f <- system.file("files/electric.sav", package = "foreign")
+  if (!nzchar(f)) {
+    message("Skipping Western Electric section: electric.sav not found (foreign package missing?).")
+  } else {
+    electric <- haven::read_sav(f)
+
+    View(electric)
+    # Expected:
+    #   hover any column header  → tooltip shows "<NAME>: <variable label>"
+    #                              (e.g. "FIRSTCHD: FIRST CHD EVENT",
+    #                               "VITAL10: STATUS AT TEN YEARS")
+    #   Labels toggle ON         → four columns swap codes for strings:
+    #     FIRSTCHD   1 → "NO CHD", 2 → "SUDDEN  DEATH", 3 → "NONFATALMI",
+    #                5 → "FATAL   MI",  6 → "OTHER   CHD"
+    #     DAYOFWK    1 → "SUNDAY" … 7 → "SATURDAY", 9 → "MISSING"
+    #     VITAL10    0 → "ALIVE", 1 → "DEAD"
+    #     FAMHXCVR   "Y" → "YES", "N" → "NO"
+    #   Labels toggle OFF        → raw codes reappear in all four columns
+    #   Remaining 9 columns (AGE, DBP58, CHOL58, …) carry variable labels only:
+    #     toggle has no visible effect; variable-label tooltip still works
+  }
+} else {
+  message("Skipping Western Electric section: install 'haven' to run it.")
+}

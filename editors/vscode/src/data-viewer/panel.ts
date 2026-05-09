@@ -333,7 +333,7 @@ export class DataViewerPanel {
 
         const tsv = render_tsv(
             got.rows, m.range.colIndices, this.columns, this.dictionaries,
-            m.labelsOn, m.formatOn, m.digits, resolved,
+            m.labelsOn, m.formatOn, m.digits, resolved, m.includeHeader,
         );
         try {
             await vscode.env.clipboard.writeText(tsv);
