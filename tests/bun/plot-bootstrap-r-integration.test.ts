@@ -17,7 +17,7 @@ async function r_with_httpgd_available(): Promise<boolean> {
             cmd: [
                 R_BIN,
                 '--vanilla',
-                '--slave',
+                '--no-echo',
                 '--quiet',
                 '-e',
                 'cat(requireNamespace("httpgd", quietly = TRUE) && utils::packageVersion("httpgd") >= "2.0.2")',
