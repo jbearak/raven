@@ -694,7 +694,9 @@
   },
   "overrides": {
     "serialize-javascript": "^7.0.3",
-    "uuid": ">=14.0.0"
+    "uuid": ">=14.0.0",
+    "fast-uri": ">=3.1.2",
+    "diff": ">=8.0.3"
   },
   "devDependencies": {
     "@types/jsdom": "^28.0.1",
