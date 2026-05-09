@@ -1,6 +1,8 @@
 <script lang="ts">
     import type { ColumnSchema } from '../arrow-reader';
     import type { Layout } from '../messages';
+    import { hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
+    import { describeShape } from './shape-description';
 
     interface Props {
         labelsOn: boolean;
@@ -9,17 +11,18 @@
         nrow: number;
         columns: ColumnSchema[];
         layout: Layout;
+        objectClass?: string;
         onToggleColumn: (index: number, hidden: boolean) => void;
     }
     let { labelsOn = $bindable(), formatOn = $bindable(), digits = $bindable(),
-          nrow, columns, layout, onToggleColumn }: Props = $props();
+          nrow, columns, layout, objectClass, onToggleColumn }: Props = $props();
 
     let popoverOpen = $state(false);
 
     const hiddenSet = $derived(new Set(layout.hiddenColumns));
-    const visibleCount = $derived(
-        columns.filter((_c, i) => !hiddenSet.has(i)).length,
-    );
+    const hiddenCount = $derived(layout.hiddenColumns.length);
+    const formatHasEffect = $derived(hasFormatEffect(columns));
+    const labelsHasEffect = $derived(hasLabelsEffect(columns));
 
     function close(): void { popoverOpen = false; }
 
@@ -31,40 +34,56 @@
 </script>
 
 <div class="toolbar">
-    <button
-        type="button"
-        class="toggle {labelsOn ? 'on' : ''}"
-        onclick={() => labelsOn = !labelsOn}
-        title="Display label strings instead of numeric codes for factors and labelled columns."
-    >
-        Labels: {labelsOn ? 'on' : 'off'}
-    </button>
+    {#if labelsHasEffect}
+        <button
+            type="button"
+            class="toggle {labelsOn ? 'on' : ''}"
+            aria-pressed={labelsOn}
+            onclick={() => labelsOn = !labelsOn}
+            title="Display label strings instead of numeric codes for factors and labelled columns."
+        >
+            Labels
+        </button>
+    {/if}
 
-    <button
-        type="button"
-        class="toggle {formatOn ? 'on' : ''}"
-        onclick={() => formatOn = !formatOn}
-        title="Round non-integer numeric columns to N digits."
-    >
-        Format: {formatOn ? 'on' : 'off'}
-    </button>
+    {#if formatHasEffect}
+        <button
+            type="button"
+            class="toggle {formatOn ? 'on' : ''}"
+            aria-pressed={formatOn}
+            onclick={() => formatOn = !formatOn}
+            title="Round non-integer numeric columns to N digits."
+        >
+            Format
+        </button>
 
-    <select
-        class="digits"
-        bind:value={digits}
-        disabled={!formatOn}
-        title="Number of digits when Format is on."
-    >
-        {#each Array.from({ length: 16 }, (_, i) => i) as d (d)}
-            <option value={d}>{d} digits</option>
-        {/each}
-    </select>
+        <select
+            class="digits"
+            bind:value={digits}
+            disabled={!formatOn}
+            title="Number of digits when Format is on."
+        >
+            {#each Array.from({ length: 16 }, (_, i) => i) as d (d)}
+                <option value={d}>{d} digits</option>
+            {/each}
+        </select>
+    {/if}
 
     <span class="separator"></span>
 
     <div class="columns-popover-wrapper">
-        <button type="button" class="popover-button" onclick={() => popoverOpen = !popoverOpen}>
+        <button
+            type="button"
+            class="popover-button"
+            onclick={() => popoverOpen = !popoverOpen}
+            title={hiddenCount > 0
+                ? `Show / hide columns (${hiddenCount} hidden)`
+                : 'Show / hide columns'}
+        >
             Columns ▾
+            {#if hiddenCount > 0}
+                <span class="hidden-count-badge" aria-hidden="true">{hiddenCount}</span>
+            {/if}
         </button>
         {#if popoverOpen}
             <div class="popover" role="dialog">
@@ -90,5 +109,5 @@
     </div>
 
     <span class="spacer"></span>
-    <span class="counter">rows: {nrow.toLocaleString()} &nbsp;cols: {visibleCount}/{columns.length}</span>
+    <span class="counter">{describeShape(objectClass, nrow, columns.length)}</span>
 </div>

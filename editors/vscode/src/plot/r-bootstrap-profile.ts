@@ -231,14 +231,21 @@ local({
         if (nzchar(vlj)) md[["raven.value_labels"]] <- vlj
         oc <- paste(class(col), collapse = "/")
         if (nzchar(oc)) md[["raven.original_class"]] <- oc
-        fmt <- attr(col, "format.stata")
-        if (!is.null(fmt) && nzchar(as.character(fmt))) {
-            md[["raven.format"]] <- as.character(fmt)
+        # Source-file format string. Try Stata, SAS (haven::read_xpt),
+        # SPSS (haven::read_sav) in that order; the first non-empty wins.
+        # Used downstream to detect integer-formatted Float columns
+        # (e.g. SAS "F8.0" — stored as double, intended as integer).
+        for (attr_nm in c("format.stata", "format.sas", "format.spss")) {
+            fmt <- attr(col, attr_nm)
+            if (!is.null(fmt) && nzchar(as.character(fmt))) {
+                md[["raven.format"]] <- as.character(fmt)
+                break
+            }
         }
         md
     }
 
-    .raven_write_arrow <- function(df, file_path) {
+    .raven_write_arrow <- function(df, file_path, schema_md = list()) {
         # Per-field metadata isn't settable through the public R arrow API
         # (Field$create's metadata arg raises "metadata= is currently
         # ignored" through 2025-era versions). Encode per-field metadata
@@ -251,6 +258,7 @@ local({
             md <- .raven_field_metadata(nm, df[[nm]])
             if (length(md) > 0L) per_field[[nm]] <- md
         }
+        meta <- as.list(schema_md)
         if (length(per_field) > 0L) {
             entries <- vapply(names(per_field), function(nm) {
                 fld <- per_field[[nm]]
@@ -259,9 +267,9 @@ local({
                 }, character(1L))
                 paste0(.raven_json_str(nm), ":{", paste(kv, collapse = ","), "}")
             }, character(1L))
-            json <- paste0("{", paste(entries, collapse = ","), "}")
-            tbl <- tbl$ReplaceSchemaMetadata(list("raven.fields" = json))
+            meta[["raven.fields"]] <- paste0("{", paste(entries, collapse = ","), "}")
         }
+        if (length(meta) > 0L) tbl <- tbl$ReplaceSchemaMetadata(meta)
         # apache-arrow JS does not ship LZ4/Zstd codecs, so write uncompressed.
         arrow::write_feather(tbl, file_path, chunk_size = 65536L, compression = "uncompressed")
     }
@@ -297,6 +305,8 @@ local({
                  paste(class(x), collapse = "/"), "\`", call. = FALSE)
         }
 
+        obj_class <- paste(class(x), collapse = "/")
+
         df <- if (is.matrix(x)) {
             d <- as.data.frame(x, stringsAsFactors = FALSE)
             if (.raven_meaningful_rownames(x)) {
@@ -316,9 +326,12 @@ local({
                                    format(as.numeric(Sys.time()) * 1e6, scientific = FALSE),
                                    "-", sample.int(.Machine$integer.max, 1L), ".arrow"))
 
-        tryCatch(.raven_write_arrow(df, path), error = function(e) {
-            stop("data viewer write failed: ", conditionMessage(e), call. = FALSE)
-        })
+        tryCatch(
+            .raven_write_arrow(df, path,
+                               schema_md = list("raven.object_class" = obj_class)),
+            error = function(e) {
+                stop("data viewer write failed: ", conditionMessage(e), call. = FALSE)
+            })
 
         body <- paste0(
             "{",

@@ -20,6 +20,7 @@ import {
     WebviewToExtension,
 } from './messages';
 import { LayoutStore, schemaHash } from './layout-state';
+import { ToolbarState, ToolbarStateStore } from './toolbar-state';
 import { build_csp } from './csp';
 import { render_tsv, ResolvedLabels } from './tsv';
 
@@ -36,7 +37,6 @@ export class DataViewerPanel {
     private disposed = false;
     private dictionaries: Record<number, string[]> = {};
     private columns: ColumnSchema[] = [];
-    private layoutHash = '';
     private layout: Layout = { columnWidths: {}, hiddenColumns: [] };
     private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -46,6 +46,7 @@ export class DataViewerPanel {
         reader: ArrowSliceReader,
         filePath: string,
         private readonly store: LayoutStore,
+        private readonly toolbarStore: ToolbarStateStore,
         private readonly settings: Settings,
         private readonly disposeHook: () => void,
     ) {
@@ -64,6 +65,7 @@ export class DataViewerPanel {
         reader: ArrowSliceReader,
         filePath: string,
         store: LayoutStore,
+        toolbarStore: ToolbarStateStore,
         settings: Settings,
         extensionUri: vscode.Uri,
         disposeHook: () => void,
@@ -82,7 +84,7 @@ export class DataViewerPanel {
         );
         webviewPanel.webview.html = build_html(webviewPanel.webview, extensionUri);
         const panel = new DataViewerPanel(
-            panelName, webviewPanel, reader, filePath, store, settings, disposeHook,
+            panelName, webviewPanel, reader, filePath, store, toolbarStore, settings, disposeHook,
         );
         panel.trace('create', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         return panel;
@@ -115,17 +117,26 @@ export class DataViewerPanel {
 
     reveal(): void { this.webviewPanel.reveal(); }
 
+    private defaultToolbar(): ToolbarState {
+        return {
+            labelsOn: true,
+            formatOn: true,
+            digits: this.settings.defaultDigits,
+        };
+    }
+
     private async sendInit(): Promise<boolean> {
         const generation = this.generation;
         const reader = this.reader;
         const columns = reader.schema.columns;
         const layoutHash = schemaHash(columns);
-        const layout = (await this.store.load(this.panelName, layoutHash))
-            ?? { columnWidths: {}, hiddenColumns: [] };
+        const [layout, toolbar] = await Promise.all([
+            this.store.load(this.panelName, layoutHash),
+            this.toolbarStore.load(this.panelName, layoutHash),
+        ]);
         if (generation !== this.generation || reader !== this.reader) return false;
         this.columns = columns;
-        this.layoutHash = layoutHash;
-        this.layout = layout;
+        this.layout = layout ?? { columnWidths: {}, hiddenColumns: [] };
         this.dictionaries = this.collectDictionaries();
         const msg: ExtensionToWebview = {
             type: 'init',
@@ -133,13 +144,19 @@ export class DataViewerPanel {
             nrow: reader.nrow,
             columns: this.columns,
             layout: this.layout,
+            toolbar: toolbar ?? this.defaultToolbar(),
             settings: this.settings,
             dictionaries: this.dictionaries,
+            schemaHash: layoutHash,
+            objectClass: reader.schema.objectClass,
         };
         this.trace('post-init', {
             generation,
             nrow: reader.nrow,
             columns: this.columns.length,
+            schemaHash: layoutHash,
+            loadedLayoutHidden: this.layout.hiddenColumns,
+            loadedToolbar: toolbar ?? null,
         });
         await this.webviewPanel.webview.postMessage(msg);
         this.webviewInitialized = true;
@@ -155,12 +172,13 @@ export class DataViewerPanel {
         const reader = this.reader;
         const columns = reader.schema.columns;
         const layoutHash = schemaHash(columns);
-        const layout = (await this.store.load(this.panelName, layoutHash))
-            ?? { columnWidths: {}, hiddenColumns: [] };
+        const [layout, toolbar] = await Promise.all([
+            this.store.load(this.panelName, layoutHash),
+            this.toolbarStore.load(this.panelName, layoutHash),
+        ]);
         if (generation !== this.generation || reader !== this.reader) return;
         this.columns = columns;
-        this.layoutHash = layoutHash;
-        this.layout = layout;
+        this.layout = layout ?? { columnWidths: {}, hiddenColumns: [] };
         this.dictionaries = this.collectDictionaries();
         const msg: ExtensionToWebview = {
             type: 'replace',
@@ -168,12 +186,18 @@ export class DataViewerPanel {
             nrow: reader.nrow,
             columns: this.columns,
             layout: this.layout,
+            toolbar: toolbar ?? this.defaultToolbar(),
             dictionaries: this.dictionaries,
+            schemaHash: layoutHash,
+            objectClass: reader.schema.objectClass,
         };
         this.trace('post-replace', {
             generation,
             nrow: reader.nrow,
             columns: this.columns.length,
+            schemaHash: layoutHash,
+            loadedLayoutHidden: this.layout.hiddenColumns,
+            loadedToolbar: toolbar ?? null,
         });
         await this.webviewPanel.webview.postMessage(msg);
     }
@@ -213,6 +237,32 @@ export class DataViewerPanel {
                 visibleRows: m.visibleRows,
                 timestamp: m.timestamp,
             });
+            return;
+        }
+        // Save messages are keyed by their carried schemaHash, not by the
+        // panel's current generation. A debounced saveLayout/saveToolbar
+        // can land after a replace bumped the generation; it's still valid
+        // for the schemaHash it was tagged with at schedule time.
+        if (m.type === 'saveLayout') {
+            this.trace('save-layout', {
+                schemaHash: m.schemaHash,
+                hidden: m.layout.hiddenColumns,
+                widths: Object.keys(m.layout.columnWidths).length,
+            });
+            if (m.schemaHash) {
+                this.layout = m.layout;
+                await this.store.save(this.panelName, m.schemaHash, m.layout);
+            }
+            return;
+        }
+        if (m.type === 'saveToolbar') {
+            this.trace('save-toolbar', {
+                schemaHash: m.schemaHash,
+                toolbar: m.toolbar,
+            });
+            if (m.schemaHash) {
+                await this.toolbarStore.save(this.panelName, m.schemaHash, m.toolbar);
+            }
             return;
         }
         if (m.panelGeneration !== this.generation) return;
@@ -270,11 +320,6 @@ export class DataViewerPanel {
                     labels,
                 };
                 await this.webviewPanel.webview.postMessage(reply);
-                return;
-            }
-            case 'saveLayout': {
-                this.layout = m.layout;
-                await this.store.save(this.panelName, this.layoutHash, m.layout);
                 return;
             }
             case 'copy': {

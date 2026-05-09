@@ -16,6 +16,7 @@ import * as fs from 'node:fs/promises';
 import { ArrowSliceReader } from './arrow-reader';
 import { DataViewerPanel } from './panel';
 import { LayoutStore } from './layout-state';
+import { ToolbarStateStore } from './toolbar-state';
 import { Settings } from './messages';
 import { sweep_stale } from './sweep';
 import type { ViewDataEvent } from '../r-session-server/types';
@@ -27,6 +28,7 @@ export class DataViewerManager {
     constructor(
         private readonly extensionUri: vscode.Uri,
         private readonly store: LayoutStore,
+        private readonly toolbarStore: ToolbarStateStore,
         private readonly settings: () => Settings,
     ) {}
 
@@ -41,7 +43,8 @@ export class DataViewerManager {
                     return;
                 }
                 const panel = await DataViewerPanel.create(
-                    e.panelName, reader, e.filePath, this.store, this.settings(),
+                    e.panelName, reader, e.filePath,
+                    this.store, this.toolbarStore, this.settings(),
                     this.extensionUri,
                     () => { this.panels.delete(e.panelName); },
                 );

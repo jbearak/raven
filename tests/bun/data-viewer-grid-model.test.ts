@@ -233,6 +233,16 @@ describe('formatCell', () => {
         expect(formatCell(1.23456, floatCol, undefined, false, true, 2))
             .toEqual({ text: '1.23', missing: false });
     });
+    test('float column with integer-valued cell skips toFixed (Format on)', () => {
+        // Many SPSS/SAS files store integer-valued data as Float64; we
+        // don't want to render "5" as "5.000".
+        expect(formatCell(5, floatCol, undefined, false, true, 3))
+            .toEqual({ text: '5', missing: false });
+    });
+    test('float column with negative integer-valued cell skips toFixed', () => {
+        expect(formatCell(-42, floatCol, undefined, false, true, 3))
+            .toEqual({ text: '-42', missing: false });
+    });
     test('null cell is missing', () => {
         expect(formatCell(null, floatCol, undefined, false, false, 3))
             .toEqual({ text: '', missing: true });

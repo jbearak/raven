@@ -25,6 +25,7 @@ import {
     encodeDate,
     encodeTimestampMicros,
 } from './wire-format';
+import { formatDeclaresInteger } from './format-string';
 
 /** Default cardinality threshold above which a dictionary is not shipped
  *  in the init/replace message. The webview must request labels on demand
@@ -42,8 +43,10 @@ export type ColumnSchema = {
     /** Value labels for non-dictionary numeric/string columns (haven_labelled
      *  via raven.value_labels). Looked up by stringified cell value. */
     valueLabels?: Record<string, string>;
-    /** Stata format string (captured but unused in v1). */
-    formatStata?: string;
+    /** Source-file format string (Stata %w.dC, SAS/SPSS F8.0, etc.).
+     *  Used to detect integer-display Float columns so Format doesn't
+     *  render "5" as "5.000". See format-string.ts. */
+    format?: string;
     /** Dictionary level strings, present iff dictionaryShipped. */
     dictionary?: string[];
     /** True iff this column is dictionary-encoded AND its dictionary fits
@@ -55,6 +58,10 @@ export type ColumnSchema = {
 
 export type ReaderSchema = {
     columns: ColumnSchema[];
+    /** `paste(class(x), collapse = "/")` of the original R object passed to
+     *  `View(x)` — slash-joined class chain. Absent when the Arrow file
+     *  came from a non-R producer (e.g. test fixtures). */
+    objectClass?: string;
 };
 
 export type GetRowsRequest = {
@@ -142,6 +149,7 @@ export class ArrowSliceReader {
             const ravenFieldsRaw = schemaMd?.get('raven.fields');
             const ravenFields: Record<string, Record<string, string>> =
                 ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
+            const objectClass = schemaMd?.get('raven.object_class') || undefined;
 
             // Pass 2: build the schema, sampling first-batch dictionaries for
             // dict-encoded columns.
@@ -167,23 +175,27 @@ export class ArrowSliceReader {
                     lookup('raven.variable_label') ?? md.get('label') ?? undefined;
                 const valueLabelsRaw = lookup('raven.value_labels');
                 const valueLabels = valueLabelsRaw ? safeParseJson(valueLabelsRaw) : undefined;
+                const format = lookup('raven.format') ?? undefined;
+                const isIntType = /^Int\d+$/.test(arrowType);
+                const isFloatIntFormatted =
+                    arrowType.startsWith('Float') && formatDeclaresInteger(format);
                 return {
                     name: f.name,
                     arrowType,
                     originalClass: lookup('raven.original_class') ?? undefined,
                     variableLabel,
                     valueLabels,
-                    formatStata: lookup('raven.format') ?? undefined,
+                    format,
                     dictionary,
                     dictionaryShipped: isDict && dictLen <= threshold,
-                    isInteger: /^Int\d+$/.test(arrowType),
+                    isInteger: isIntType || isFloatIntFormatted,
                 };
             });
 
             return new ArrowSliceReader(
                 reader,
                 fh,
-                { columns: cols },
+                { columns: cols, objectClass },
                 nrow,
                 batchStarts,
             );

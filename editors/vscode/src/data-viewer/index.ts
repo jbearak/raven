@@ -7,6 +7,7 @@ import { join } from 'node:path';
 
 import { DataViewerManager } from './manager';
 import { LayoutStore } from './layout-state';
+import { ToolbarStateStore } from './toolbar-state';
 import type { Settings } from './messages';
 import { sweep_stale } from './sweep';
 import type { RSessionServer } from '../r-session-server';
@@ -21,6 +22,7 @@ export function registerDataViewer(
     const cap = vscode.workspace.getConfiguration('raven.dataViewer')
         .get<number>('maxStoredLayouts', 10000);
     const store = new LayoutStore(context.globalState as any, cap);
+    const toolbarStore = new ToolbarStateStore(context.globalState as any, cap);
 
     const settings = (): Settings => {
         const cfg = vscode.workspace.getConfiguration('raven.dataViewer');
@@ -31,7 +33,7 @@ export function registerDataViewer(
         };
     };
 
-    const manager = new DataViewerManager(context.extensionUri, store, settings);
+    const manager = new DataViewerManager(context.extensionUri, store, toolbarStore, settings);
 
     context.subscriptions.push({
         dispose: server.onEvent(e => {

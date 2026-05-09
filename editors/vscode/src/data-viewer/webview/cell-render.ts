@@ -43,6 +43,10 @@ export function formatCell(
         if (lbl !== undefined) return { text: lbl, missing: false };
     }
     if (typeof cell === 'number' && col && !col.isInteger && formatOn) {
+        // Skip rounding for cells that already are integer-valued — many
+        // SPSS/SAS/Stata files store integer-valued data as Float64. Avoids
+        // displaying "5" as "5.000".
+        if (Number.isInteger(cell)) return { text: String(cell), missing: false };
         return { text: cell.toFixed(digits), missing: false };
     }
     return { text: String(cell), missing: false };

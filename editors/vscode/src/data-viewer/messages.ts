@@ -9,6 +9,7 @@
 
 import type { Cell } from './wire-format';
 import type { ColumnSchema } from './arrow-reader';
+import type { ToolbarState } from './toolbar-state';
 
 export type Layout = {
     /** Per-column pixel widths, keyed by the column's index in the
@@ -33,8 +34,15 @@ export type ExtensionToWebview =
         nrow: number;
         columns: ColumnSchema[];
         layout: Layout;
+        toolbar: ToolbarState;
         settings: Settings;
         dictionaries: Record<number, string[]>;
+        /** schemaHash for the active dataset. Echoed back by saveLayout
+         *  / saveToolbar so the host stores under the hash that was
+         *  current when the user toggled, even if a later replace
+         *  swapped the dataset before the debounce fired. */
+        schemaHash: string;
+        objectClass?: string;
     }
     | {
         type: 'rows';
@@ -59,7 +67,10 @@ export type ExtensionToWebview =
         nrow: number;
         columns: ColumnSchema[];
         layout: Layout;
+        toolbar: ToolbarState;
         dictionaries: Record<number, string[]>;
+        schemaHash: string;
+        objectClass?: string;
     }
     | {
         type: 'copyDone';
@@ -106,7 +117,17 @@ export type WebviewToExtension =
     | {
         type: 'saveLayout';
         panelGeneration: number;
+        /** schemaHash for the dataset the layout was captured against —
+         *  used as the store key so a debounced save that lands after a
+         *  replace still goes to the right slot. */
+        schemaHash: string;
         layout: Layout;
+    }
+    | {
+        type: 'saveToolbar';
+        panelGeneration: number;
+        schemaHash: string;
+        toolbar: ToolbarState;
     }
     | {
         type: 'copy';
