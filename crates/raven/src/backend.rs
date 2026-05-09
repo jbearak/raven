@@ -1266,7 +1266,7 @@ impl LanguageServer for Backend {
 
                 // Apply results when scan completes
                 match scan_result {
-                    Ok((index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model)) => {
+                    Ok((index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)) => {
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
                             let mut state = state_clone.write().await;
@@ -1278,6 +1278,8 @@ impl LanguageServer for Backend {
                                 pkg_workspace,
                                 pkg_ns_model,
                             );
+                            state.roxygen_tags_cache = roxygen_cache;
+                            state.rebuild_package_internal_symbols_cache();
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
                             // and snapshot trigger versions while we hold the lock.
@@ -2556,35 +2558,15 @@ impl LanguageServer for Backend {
                 if pkg.roxygen_managed {
                     if let Ok(file_path) = uri.to_file_path() {
                         if file_path.starts_with(pkg.root.join("R")) {
-                            let old_imports = state.workspace_imports.clone();
-                            let root = pkg.root.clone();
-                            let r_dir = root.join("R");
-                            let mut roxygen_files = Vec::new();
-                            if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                                for entry in entries.flatten() {
-                                    let path = entry.path();
-                                    if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                                        // Use open document content if available (authoritative)
-                                        let content = if let Ok(u) = Url::from_file_path(&path) {
-                                            state.documents.get(&u).map(|d| d.text())
-                                        } else {
-                                            None
-                                        };
-                                        let content = content.or_else(|| std::fs::read_to_string(&path).ok());
-                                        if let Some(content) = content {
-                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                            roxygen_files.push((path.display().to_string(), ns));
-                                        }
-                                    }
-                                }
+                            // Re-extract roxygen tags only from the changed file
+                            // (its content is already in memory from the edit).
+                            let content = state.documents.get(&uri).map(|d| d.text());
+                            if let Some(content) = content {
+                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                                state.roxygen_tags_cache.insert(file_path, ns);
                             }
-                            let ns_model = crate::package_namespace::namespace_model_from_roxygen(&roxygen_files);
-                            // Replace workspace_imports entirely from the namespace model.
-                            // In package mode, the model is the sole source of truth.
-                            let new_imports = std::sync::Arc::new(ns_model.imports.clone());
-                            package_namespace_changed = *old_imports != *new_imports;
-                            state.workspace_imports = new_imports;
-                            state.package_namespace_model = Some(ns_model);
+                            // Rebuild namespace model from the per-file cache (no I/O).
+                            package_namespace_changed = state.rebuild_namespace_model_from_cache();
                         }
                     }
                 }
@@ -2614,6 +2596,10 @@ impl LanguageServer for Backend {
                     old_interface_hash,
                     new_interface_hash
                 );
+                // Rebuild the cached package-internal symbols when exports change.
+                if state.package_workspace.is_some() {
+                    state.rebuild_package_internal_symbols_cache();
+                }
             }
 
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
@@ -2664,6 +2650,26 @@ impl LanguageServer for Backend {
                         if let Ok(p) = open_uri.to_file_path() {
                             if p.starts_with(&r_dir) {
                                 affected.insert(open_uri.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // In package mode, when the exported interface of an R/*.R file
+            // changes, other open R/ files depend on it via mutual visibility
+            // (not the source() graph). Revalidate them so added/removed
+            // symbols propagate to undefined-variable diagnostics.
+            if interface_changed && !package_namespace_changed {
+                if let Some(ref pkg) = state.package_workspace {
+                    if let Ok(fp) = uri.to_file_path() {
+                        let r_dir = pkg.root.join("R");
+                        if fp.starts_with(&r_dir) {
+                            for open_uri in state.documents.keys() {
+                                if let Ok(p) = open_uri.to_file_path() {
+                                    if p.starts_with(&r_dir) {
+                                        affected.insert(open_uri.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -3052,13 +3058,19 @@ impl LanguageServer for Backend {
                         let ns_model = if ws.roxygen_managed {
                             let r_dir = root.join("R");
                             let mut roxygen_files = Vec::new();
+                            state.roxygen_tags_cache.clear();
                             if let Ok(entries) = std::fs::read_dir(&r_dir) {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
                                     if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                        // Prefer open document content
+                                        let content = Url::from_file_path(&path).ok()
+                                            .and_then(|u| state.documents.get(&u).map(|d| d.text()))
+                                            .or_else(|| std::fs::read_to_string(&path).ok());
+                                        if let Some(content) = content {
                                             let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                            roxygen_files.push((path.display().to_string(), ns));
+                                            roxygen_files.push((path.display().to_string(), ns.clone()));
+                                            state.roxygen_tags_cache.insert(path, ns);
                                         }
                                     }
                                 }
@@ -3074,6 +3086,7 @@ impl LanguageServer for Backend {
                         state.workspace_imports = std::sync::Arc::new(Vec::new());
                     }
                     state.package_workspace = new_ws;
+                    state.rebuild_package_internal_symbols_cache();
                 }
                 log::info!("Rebuilt package state after packageMode change to {:?}", mode);
             }
@@ -3417,13 +3430,19 @@ impl LanguageServer for Backend {
                             let ns_model = if ws.roxygen_managed {
                                 let r_dir = root.join("R");
                                 let mut roxygen_files = Vec::new();
+                                state.roxygen_tags_cache.clear();
                                 if let Ok(entries) = std::fs::read_dir(&r_dir) {
                                     for entry in entries.flatten() {
                                         let path = entry.path();
                                         if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                            // Prefer open document content
+                                            let content = Url::from_file_path(&path).ok()
+                                                .and_then(|u| state.documents.get(&u).map(|d| d.text()))
+                                                .or_else(|| std::fs::read_to_string(&path).ok());
+                                            if let Some(content) = content {
                                                 let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                                roxygen_files.push((path.display().to_string(), ns));
+                                                roxygen_files.push((path.display().to_string(), ns.clone()));
+                                                state.roxygen_tags_cache.insert(path, ns);
                                             }
                                         }
                                     }
@@ -3442,6 +3461,7 @@ impl LanguageServer for Backend {
                             state.workspace_imports = std::sync::Arc::new(Vec::new());
                         }
                         state.package_workspace = new_ws;
+                        state.rebuild_package_internal_symbols_cache();
                         // Force republish for all open R files
                         let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
                         for open_uri in &open_keys {

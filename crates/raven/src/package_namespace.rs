@@ -58,6 +58,27 @@ pub fn detect_package_workspace(workspace_root: &Path) -> Option<PackageWorkspac
     })
 }
 
+/// Like [`detect_package_workspace`] but determines `roxygen_managed` from
+/// pre-loaded file contents rather than re-reading from disk. Use this when
+/// file content is already available (e.g. after a parallel workspace scan).
+pub fn detect_package_workspace_with_content<'a>(
+    workspace_root: &Path,
+    r_file_contents: impl Iterator<Item = &'a str>,
+) -> Option<PackageWorkspace> {
+    let description_path = workspace_root.join("DESCRIPTION");
+    let content = std::fs::read_to_string(&description_path).ok()?;
+    let name = parse_dcf_field(&content, "Package")?;
+
+    let pattern = regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex");
+    let roxygen_managed = r_file_contents.into_iter().any(|c| pattern.is_match(c));
+
+    Some(PackageWorkspace {
+        name,
+        root: workspace_root.to_path_buf(),
+        roxygen_managed,
+    })
+}
+
 /// Check if any `R/*.R` file contains `#' @export`.
 fn detect_roxygen_usage(workspace_root: &Path) -> bool {
     let r_dir = workspace_root.join("R");

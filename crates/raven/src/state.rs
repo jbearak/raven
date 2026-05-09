@@ -601,6 +601,14 @@ pub struct WorldState {
     /// Package namespace model (exports, imports, full_imports).
     /// Built from roxygen annotations or NAMESPACE file when in package mode.
     pub package_namespace_model: Option<crate::package_namespace::PackageNamespaceModel>,
+    /// Per-file roxygen namespace tag cache. Keyed by file path so that
+    /// `did_change` can re-extract tags for only the changed file and rebuild
+    /// the namespace model from the cache without any filesystem I/O.
+    pub roxygen_tags_cache: HashMap<PathBuf, crate::roxygen::RoxygenNamespace>,
+    /// Cached set of package-internal symbol names (top-level exports from
+    /// other R/*.R files). Updated incrementally when workspace index entries
+    /// change, avoiding O(package_files) work on every diagnostic/completion.
+    pub package_internal_symbols_cache: Arc<HashSet<String>>,
 }
 
 impl WorldState {
@@ -700,6 +708,8 @@ impl WorldState {
             workspace_scan_complete: false,
             package_workspace: None,
             package_namespace_model: None,
+            roxygen_tags_cache: HashMap::new(),
+            package_internal_symbols_cache: Arc::new(HashSet::new()),
         }
     }
 
@@ -713,6 +723,58 @@ impl WorldState {
     pub fn clear_help_caches(&self) {
         self.help_cache.drain();
         self.html_help_cache.drain();
+    }
+
+    /// Rebuild the package namespace model from the in-memory roxygen tags cache.
+    /// No filesystem I/O — uses only the cached per-file tags.
+    /// Returns whether the namespace model changed (imports or full_imports).
+    pub fn rebuild_namespace_model_from_cache(&mut self) -> bool {
+        let old_imports = self.workspace_imports.clone();
+        let old_full_imports = self
+            .package_namespace_model
+            .as_ref()
+            .map(|m| &m.full_imports);
+        let roxygen_files: Vec<(String, crate::roxygen::RoxygenNamespace)> = self
+            .roxygen_tags_cache
+            .iter()
+            .map(|(path, ns)| (path.display().to_string(), ns.clone()))
+            .collect();
+        let ns_model = crate::package_namespace::namespace_model_from_roxygen(&roxygen_files);
+        let new_imports = Arc::new(ns_model.imports.clone());
+        let imports_changed = *old_imports != *new_imports;
+        let full_imports_changed = old_full_imports != Some(&ns_model.full_imports);
+        self.workspace_imports = new_imports;
+        self.package_namespace_model = Some(ns_model);
+        imports_changed || full_imports_changed
+    }
+
+    /// Rebuild the cached package-internal symbols set from the workspace index.
+    /// Call after workspace index entries change in package mode.
+    pub fn rebuild_package_internal_symbols_cache(&mut self) {
+        let Some(ref pkg) = self.package_workspace else {
+            if !self.package_internal_symbols_cache.is_empty() {
+                self.package_internal_symbols_cache = Arc::new(HashSet::new());
+            }
+            return;
+        };
+        let r_dir = pkg.root.join("R");
+        let content_provider = self.content_provider();
+        let mut symbols = HashSet::new();
+        for other_uri in self.cross_file_workspace_index.uris() {
+            if let Ok(p) = other_uri.to_file_path() {
+                if !p.starts_with(&r_dir) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            if let Some(artifacts) = content_provider.get_artifacts(&other_uri) {
+                for name in artifacts.exported_interface.keys() {
+                    symbols.insert(name.to_string());
+                }
+            }
+        }
+        self.package_internal_symbols_cache = Arc::new(symbols);
     }
 
     /// Create a content provider for this state
@@ -1157,6 +1219,7 @@ pub type WorkspaceScanResult = (
     HashMap<Url, crate::workspace_index::IndexEntry>,
     Option<crate::package_namespace::PackageWorkspace>,
     Option<crate::package_namespace::PackageNamespaceModel>,
+    HashMap<PathBuf, crate::roxygen::RoxygenNamespace>,
 );
 
 /// Result of processing a single workspace file (used by parallel scan).
@@ -1411,27 +1474,51 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     );
 
     // Detect R package workspace
-    let (pkg_workspace, pkg_ns_model) = if let Some(root) = folders.first().and_then(|u| u.to_file_path().ok()) {
-        if let Some(ws) = crate::package_namespace::detect_package_workspace(&root) {
+    let (pkg_workspace, pkg_ns_model, roxygen_cache) = if let Some(root) = folders.first().and_then(|u| u.to_file_path().ok()) {
+        // Collect R/*.R file contents from the already-loaded index entries
+        // to avoid re-reading from disk for roxygen detection.
+        let r_dir = root.join("R");
+        let r_file_contents: Vec<String> = new_index_entries
+            .iter()
+            .filter_map(|(uri, entry)| {
+                uri.to_file_path().ok().and_then(|p| {
+                    if p.starts_with(&r_dir)
+                        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
+                    {
+                        Some(entry.contents.to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        let ws = crate::package_namespace::detect_package_workspace_with_content(
+            &root,
+            r_file_contents.iter().map(|s| s.as_str()),
+        );
+        if let Some(ws) = ws {
             log::info!("Package mode detected: {} (roxygen_managed={})", ws.name, ws.roxygen_managed);
-            let ns_model = if ws.roxygen_managed {
-                // Parse roxygen namespace tags from all R/*.R files
-                let r_dir = root.join("R");
+            let (ns_model, cache) = if ws.roxygen_managed {
+                // Use content already loaded during the parallel scan instead of
+                // re-reading R/*.R files from disk.
                 let mut roxygen_files = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                roxygen_files.push((path.display().to_string(), ns));
-                            }
+                let mut cache = HashMap::new();
+                for (uri, entry) in &new_index_entries {
+                    if let Ok(path) = uri.to_file_path() {
+                        if path.starts_with(&r_dir)
+                            && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
+                        {
+                            let content = entry.contents.to_string();
+                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                            roxygen_files.push((path.display().to_string(), ns.clone()));
+                            cache.insert(path, ns);
                         }
                     }
                 }
-                crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
+                (crate::package_namespace::namespace_model_from_roxygen(&roxygen_files), cache)
             } else {
-                crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE"))
+                (crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE")), HashMap::new())
             };
             // Merge namespace model imports into the workspace imports list
             for (pkg, sym) in &ns_model.imports {
@@ -1439,15 +1526,15 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
                     imports.push((pkg.clone(), sym.clone()));
                 }
             }
-            (Some(ws), Some(ns_model))
+            (Some(ws), Some(ns_model), cache)
         } else {
-            (None, None)
+            (None, None, HashMap::new())
         }
     } else {
-        (None, None)
+        (None, None, HashMap::new())
     };
 
-    (index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model)
+    (index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)
 }
 
 /// Directories to skip during workspace scanning.
