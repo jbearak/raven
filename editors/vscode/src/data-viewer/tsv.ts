@@ -88,6 +88,9 @@ function format_cell_for_tsv(
         if (lbl !== undefined) return sanitize(lbl);
     }
     if (typeof cell === 'number' && col && !col.isInteger && formatOn) {
+        // Match cell-render: don't add trailing zeros for integer-valued
+        // cells (common in SPSS/SAS files that store ints as Float64).
+        if (Number.isInteger(cell)) return String(cell);
         return cell.toFixed(digits);
     }
     return sanitize(String(cell));

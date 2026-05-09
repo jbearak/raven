@@ -33,9 +33,19 @@ describe('render_tsv', () => {
         const rows = [[1, 1.234567, 0, 1] as any];
         const tsv = render_tsv(rows, [0, 1, 2, 3], cols, dictionaries, false, true, 2);
         // Integer 'i' unaffected; float 'v' rounded to 2; factor 'f' shows
-        // 1-based code; value-labelled 'lab' (Float64) is rounded since
-        // Labels=off → no label substitution kicks in.
-        expect(tsv).toBe('1\t1.23\t1\t1.00');
+        // 1-based code; value-labelled 'lab' (Float64) holds the integer
+        // value 1, which skips toFixed (per-cell integer-skip) so it
+        // shows "1" rather than "1.00".
+        expect(tsv).toBe('1\t1.23\t1\t1');
+    });
+
+    test('Format on with integer-valued float cells does not add trailing zeros', () => {
+        const rows = [[1, 5, 0, 0] as any];
+        const tsv = render_tsv(rows, [0, 1, 2, 3], cols, dictionaries, false, true, 3);
+        // i=1 (Int32), v=5 (Float64 integer-valued → skips toFixed),
+        // f=0 (factor → 1-based code "1"), lab=0 (Float64 integer-valued
+        // with Labels=off → skips toFixed → "0").
+        expect(tsv).toBe('1\t5\t1\t0');
     });
 
     test('NaN / Inf / Date / ts sentinels render as readable strings', () => {

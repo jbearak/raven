@@ -26,6 +26,7 @@
         labelsOn: boolean;
         formatOn: boolean;
         digits: number;
+        objectClass?: string;
         visibleRows: Cell[][];
         visibleRangeStart: number;
     };
@@ -45,17 +46,22 @@
     let columns = $state<ColumnSchema[]>([]);
     let dictionaries = $state<Record<number, string[]>>({});
     let layout = $state<Layout>({ columnWidths: {}, hiddenColumns: [] });
+    let currentSchemaHash = '';
     let settings = $state<Settings>({
         missingValueStyle: 'foreground', defaultDigits: 3,
     });
+    let objectClass = $state<string | undefined>(undefined);
 
     onDestroy(() => {
         postLifecycle('destroy');
     });
 
     // ----- Toolbar state ---------------------------------------------------
-    let labelsOn = $state(false);
-    let formatOn = $state(false);
+    // Defaults are ON; restorePersistedState (below) overwrites for panels
+    // with saved state, so a user who has toggled either off keeps that
+    // preference across reloads.
+    let labelsOn = $state(true);
+    let formatOn = $state(true);
     let digits = $state(3);
 
     // ----- Row data + virtualization --------------------------------------
@@ -82,6 +88,7 @@
         labelsOn = state.labelsOn;
         formatOn = state.formatOn;
         digits = state.digits;
+        objectClass = state.objectClass;
         visibleRows = state.visibleRows;
         visibleRangeStart = state.visibleRangeStart;
     }
@@ -223,10 +230,15 @@
         columns = m.columns;
         layout = m.layout;
         dictionaries = m.dictionaries;
+        objectClass = m.objectClass;
+        currentSchemaHash = m.schemaHash;
         if (m.type === 'init' && 'settings' in m) {
             settings = m.settings;
-            digits = m.settings.defaultDigits;
         }
+        labelsOn = m.toolbar.labelsOn;
+        formatOn = m.toolbar.formatOn;
+        digits = m.toolbar.digits;
+        toolbarBootstrapped = true;
         rowCache.clear();
         resolvedLabels = {};
         if (!sameDataset) {
@@ -415,12 +427,19 @@
         if (!resizeDrag) return;
         const delta = e.clientX - resizeDrag.startX;
         const newWidth = Math.max(30, resizeDrag.startWidth + delta);
-        onResizeColumn(resizeDrag.colIdx, newWidth);
+        // Update visually during the drag; persistence happens once on
+        // pointer-up so we don't post a save message per pointer event.
+        layout = {
+            ...layout,
+            columnWidths: { ...layout.columnWidths, [resizeDrag.colIdx]: newWidth },
+        };
     }
 
     function onWindowPointerUp(): void {
+        const wasResizing = dragMode === 'resize' && resizeDrag !== null;
         dragMode = null;
         resizeDrag = null;
+        if (wasResizing) persistLayout();
     }
 
     function copySelection(): void {
@@ -558,25 +577,27 @@
     }
 
     // ----- Layout persistence --------------------------------------------
-    let saveLayoutTimer: ReturnType<typeof setTimeout> | null = null;
+    // Save synchronously on every committed mutation: each toggle is one
+    // click, and column-width drags call us only on pointer-up. Posting
+    // immediately means there's no pending timer to lose if the user
+    // closes the panel right after acting (the webview JS context dies
+    // with the iframe and any setTimeout debounce dies with it).
     function persistLayout(): void {
-        if (saveLayoutTimer) clearTimeout(saveLayoutTimer);
-        saveLayoutTimer = setTimeout(() => {
-            const msg: WebviewToExtension = {
-                type: 'saveLayout',
-                panelGeneration,
-                layout,
-            };
-            vscode.postMessage(msg);
-        }, 250);
-    }
-
-    function onResizeColumn(index: number, width: number): void {
-        layout = {
-            ...layout,
-            columnWidths: { ...layout.columnWidths, [index]: width },
+        // Snapshot the layout out of Svelte 5's $state proxy before
+        // posting. postMessage uses structured cloning, which silently
+        // fails to serialize reactive proxies — the message gets posted
+        // but never reaches the extension's onDidReceiveMessage handler.
+        // Spreading into a plain object avoids that.
+        const msg: WebviewToExtension = {
+            type: 'saveLayout',
+            panelGeneration,
+            schemaHash: currentSchemaHash,
+            layout: {
+                columnWidths: { ...layout.columnWidths },
+                hiddenColumns: [...layout.hiddenColumns],
+            },
         };
-        persistLayout();
+        vscode.postMessage(msg);
     }
 
     function onToggleColumn(index: number, hidden: boolean): void {
@@ -605,10 +626,34 @@
             labelsOn,
             formatOn,
             digits,
+            objectClass,
             visibleRows,
             visibleRangeStart,
         });
     }
+
+    // ----- Toolbar persistence -------------------------------------------
+    // `toolbarBootstrapped` is a plain `let` (not $state) so the persistence
+    // $effect doesn't subscribe to it. The first $effect run sees `false`
+    // and skips, avoiding a save of the pre-init defaults that would clobber
+    // whatever's stored in the host. applyInitOrReplace flips it true once
+    // the host has supplied the loaded-or-default toolbar state.
+    let toolbarBootstrapped = false;
+    function persistToolbar(): void {
+        const msg: WebviewToExtension = {
+            type: 'saveToolbar',
+            panelGeneration,
+            schemaHash: currentSchemaHash,
+            toolbar: { labelsOn, formatOn, digits },
+        };
+        vscode.postMessage(msg);
+    }
+    $effect(() => {
+        // Subscribe to the toolbar state.
+        void labelsOn; void formatOn; void digits;
+        if (!toolbarBootstrapped) return;
+        persistToolbar();
+    });
 
     $effect(() => {
         persistWebviewState();
@@ -731,6 +776,7 @@
         nrow={nrow}
         columns={columns}
         layout={layout}
+        objectClass={objectClass}
         onToggleColumn={onToggleColumn}
     />
     {#if copyStatus !== ''}

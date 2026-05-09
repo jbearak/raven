@@ -47,8 +47,7 @@ html, body, #root {
     color: var(--vscode-button-foreground, #fff);
 }
 .toolbar .toggle:hover {
-    background: var(--vscode-button-hoverBackground, #1177bb);
-    color: var(--vscode-button-foreground, #fff);
+    border-color: var(--vscode-focusBorder, var(--vscode-button-hoverBackground, #1177bb));
 }
 
 .toolbar .digits {
@@ -93,8 +92,21 @@ html, body, #root {
     font: inherit;
 }
 .popover-button:hover {
-    background: var(--vscode-button-hoverBackground, #1177bb);
-    color: var(--vscode-button-foreground, #fff);
+    border-color: var(--vscode-focusBorder, var(--vscode-button-hoverBackground, #1177bb));
+}
+.popover-button .hidden-count-badge {
+    display: inline-block;
+    margin-left: 6px;
+    min-width: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: var(--vscode-badge-background, #4d4d4d);
+    color: var(--vscode-badge-foreground, #fff);
+    font-size: 10px;
+    line-height: 14px;
+    text-align: center;
+    vertical-align: baseline;
+    font-variant-numeric: tabular-nums;
 }
 
 .popover {

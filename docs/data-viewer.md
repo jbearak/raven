@@ -37,13 +37,20 @@ expression opens a new tab.
 ## Toolbar
 
 ```text
-[Labels: off|on] [Format: off|on] [3 digits ▾] | [Columns ▾] | rows: 12,345  cols: 17/24
+[Labels] [Format] [3 digits ▾] | [Columns ▾ <7>] | rows: 12,345
 ```
+
+Each toggle is filled when active; clicking flips it. The Labels and
+Format buttons are hidden entirely when no column in the current data
+set would be affected by them — e.g. an all-integer matrix hides both,
+while a frame with only factors hides Format but keeps Labels. The
+small badge on `Columns` shows the count of currently hidden columns
+(absent when none are hidden).
 
 ### Labels
 
-When `on`, columns with labels render their labels instead of raw
-values:
+Defaults to **on** in new panels. When on, columns with labels render
+their labels instead of raw values:
 
 - `factor` columns swap the integer code (1-based, matching
   `as.integer(factor_col)` in R) for the level string.
@@ -59,11 +66,20 @@ column-header tooltip, regardless of the toggle.
 
 ### Format
 
-When `on`, non-integer numeric columns are rounded to the digits chosen
-in the dropdown (default 3, range 0–15). Integer columns, dates,
-timestamps, factors, and string columns are unaffected. `NaN` and ±Inf
-are rendered as `NaN` / `Inf` / `-Inf` literally — they aren't
-formatted away.
+Defaults to **on** in new panels. When on, non-integer numeric columns
+are rounded to the digits chosen in the dropdown (default 3, range 0–15).
+Integer columns, dates, timestamps, factors, and string columns are
+unaffected. `NaN` and ±Inf are rendered as `NaN` / `Inf` / `-Inf`
+literally — they aren't formatted away.
+
+A Float column that the source file flagged as integer-display (Stata
+`%w.0f`, SAS/SPSS `F8.0`, `COMMA10.0`, `Z3.`, etc.) is treated like an
+integer column — Format does nothing to it, and the toggle is hidden
+when no other column would be affected. Independently, a single
+integer-valued cell inside an otherwise-decimal Float column (e.g. `5`
+in a column whose other rows are `1.5`, `2.25`) is rendered as `5` —
+not `5.000` — to avoid the misleading trailing-zero look common in
+SPSS/SAS files that store integer-valued data as doubles.
 
 ### Columns popover
 
@@ -103,7 +119,7 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 | `raven.dataViewer.enabled` | `true` | Override `View()` in the Raven-managed R terminal. Set to `false` to disable the viewer entirely. |
 | `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colorize the text), `background` (tint the cell), or `none`. |
 | `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |
-| `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on. |
+| `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). |
 
 Changes apply to newly-opened panels.
 
