@@ -26,7 +26,11 @@ REditorSupport's language server provides [`lintr`](https://lintr.r-lib.org/) di
 
 If you want both, leave `r.lsp.enabled` at its default (`true`). Both language servers will run, with some overlap in completions and diagnostics.
 
-If you only need Raven's language intelligence and want REditorSupport solely for its R-session features, disable its language server so the two don't compete:
+If you don't need lintr, Raven can replace REditorSupport entirely. Raven's R-session features offer some advantages over REditorSupport's equivalents: the R console sends large blocks via a temp-file `source()` instead of line-by-line paste (faster and more reliable), and the data viewer stays responsive on multi-million-row frames (REditorSupport's data viewer serializes the entire frame to JSON and loads it into the webview at once, so it caps at 100 rows by default to avoid freezing VS Code). See [Comparison](./comparison.md#r-session-integration) for details.
+
+One reason to keep REditorSupport installed is its workspace viewer — a sidebar panel that introspects your active R session, showing live objects, their types, and dimensions. Raven doesn't have an equivalent. If you're interested in a workspace viewer or lintr integration in Raven, please [file an issue](https://github.com/jbearak/raven/issues) — I haven't built these because in nearly two decades of using R I haven't relied on either, but I'd consider them if there's interest.
+
+If you keep REditorSupport installed but don't need its language server (e.g. you only want the workspace viewer), you can disable it to avoid the overhead of running two LSPs:
 
 ```json
 "r.lsp.enabled": false
