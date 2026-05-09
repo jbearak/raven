@@ -15,30 +15,6 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 
 Raven's sister project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
 
-## Quick Start
-
-Raven tracks `source()` chains and understands scope. Consider this project:
-
-```r
-# main.R
-source("utils.R")
-result <- helper_function(42)  # Raven knows helper_function comes from utils.R
-```
-
-```r
-# utils.R
-helper_function <- function(x) { x * 2 }
-```
-
-When you open `main.R`, Raven:
-
-1. Detects the `source("utils.R")` call
-2. Indexes symbols from `utils.R`
-3. Provides completions, hover, and go-to-definition for `helper_function`
-4. Only shows `helper_function` as available *after* the `source()` line
-
-For statically detectable `source()` patterns, opening `utils.R` directly is enough — Raven discovers that `main.R` sources it and resolves the chain in both directions.
-
 ## Features
 
 ### Code intelligence
