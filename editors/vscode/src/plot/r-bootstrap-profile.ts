@@ -481,12 +481,10 @@ local({
                 "\\"message\\":", .raven_json_str(msg),
                 "}"
             ))
-            dev_fn <- if (is.function(.raven_original_device)) {
-                .raven_original_device
-            } else {
-                match.fun(.raven_original_device)
-            }
-            dev_fn()
+            # dev.new() reads getOption("device") internally, which is now
+            # restored to the original, so it opens the right device without
+            # needing to call the opener directly via match.fun.
+            grDevices::dev.new()
         })
         .raven_original_device
     }
