@@ -1,6 +1,11 @@
-# Send to R
+# R Console
 
-The extension provides an interactive R console and commands to send R code directly from the editor to R for execution. It supports the standard R console as well as [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) — modern third-party R consoles with syntax highlighting and richer interactive features.
+Raven provides an integrated R console inside VS Code, plus commands to send R code from the editor to that console for execution. It supports the standard R console as well as [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) — modern third-party R consoles with syntax highlighting and richer interactive features.
+
+The R console is the entry point to Raven's [plot viewer](./plot-viewer.md) and [data viewer](./data-viewer.md): plots produced in this console render in a VS Code panel via httpgd, and `View(df)` opens Raven's high-performance data viewer instead of R's default. Raven's [help viewer](./help-viewer.md) works independently of the R console.
+
+> [!NOTE]
+> Whether the R console activates is controlled by `raven.rConsole.activation` (default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore its plot and data viewers — steps aside automatically to avoid disrupting your existing R-session setup. See [Comparison](./comparison.md#coexistence) for details.
 
 ## R Terminal Profile
 
@@ -90,7 +95,7 @@ By default (`auto`), Raven pastes short blocks directly and switches to a tempor
 - **`paste`** — always pastes. For multi-line code, uses bracketed paste mode to deliver the block as a single unit.
 - **`tempfile`** — always writes to a temp file and runs `source()`. Use this for maximum consistency, or when even single-line paste is unreliable.
 
-**Why `auto` switches to a temp file for larger blocks**
+### Why `auto` switches to a temp file for larger blocks
 
 Pasting works well for short blocks. For longer blocks it gets slow — the terminal feeds characters to R's stdin one at a time, so code that would run instantly via `source()` can take noticeably longer to type out. Pasting can also be unreliable over remote sessions (SSH, VS Code Remote, mosh): if too many lines arrive at once they sometimes get garbled.
 
@@ -98,96 +103,14 @@ Writing larger blocks to a temp file and `source()`-ing them sidesteps both: R r
 
 The cutover point is controlled by `raven.sendToR.autoTempFileThresholdLines` — a block with at least this many lines (≥ N) goes through a temp file; smaller blocks are pasted. The default of 25 is arbitrary but reasonable — most blocks below it paste fast and reliably on a local terminal. Lower it for slow remote connections; raise it if you prefer to see your code echoed in the terminal. Setting it to 2 reproduces the prior behavior of always temp-filing any multi-line block.
 
-REditorSupport pastes directly for all code. If you prefer that behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
+For a comparison with how the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) sends code, see [Comparison: R console](./comparison.md#r-console). If you prefer paste-everywhere behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
 
 ## Configuration Options
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `raven.rConsole.activation` | enum | `"auto"` | When Raven's R console activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). |
 | `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"`, `"arf"`, or `"radian"` |
 | `raven.sendToR.advanceCursorOnSend` | boolean | `true` | Advance cursor to next line after sending a single statement |
 | `raven.sendToR.sendMethod` | enum | `"auto"` | How code is sent to R: `"auto"`, `"paste"`, or `"tempfile"` |
 | `raven.sendToR.autoTempFileThresholdLines` | integer | `25` | In `auto` mode, blocks with **≥ N lines** use a temp file; smaller blocks are pasted (so `25` means: paste up to 24 lines, temp-file 25 or more) |
-
-## Plot Viewer
-
-When `raven.plot.enabled` is `true` (the default), Raven shows plots from the
-managed R terminal directly in VS Code via a built-in viewer.
-
-### Prerequisites
-
-Install the [httpgd](https://nx10.dev/httpgd/) R package, version `2.0.2` or
-newer:
-
-```r
-install.packages("httpgd")
-```
-
-No other R packages are required. Standard R, [arf](https://github.com/eitsupi/arf),
-and [radian](https://github.com/randy3k/radian) all work because Raven loads its
-bootstrap profile via `R_PROFILE_USER`.
-
-### Behavior
-
-- Run any plotting code in the Raven R terminal (e.g., `plot(1:10)`, `ggplot(...) + geom_point()`).
-- The first plot from each R session opens its own "Raven Plot Viewer" panel
-  in the column configured by `raven.plot.viewerColumn` (default: `beside`).
-  The second session's panel is "Raven Plot Viewer 2", the third "Raven Plot
-  Viewer 3", and so on (numbered per VS Code window). Each R terminal
-  therefore gets a separate viewer with its own plot history.
-- Subsequent plots from the same session update that session's panel without
-  stealing focus from your editor.
-- The viewer toolbar provides previous/next history navigation, remove
-  current plot, copy to clipboard, save (PNG/SVG/PDF), and open externally.
-  Right-clicking a plot copies it to the clipboard as PNG.
-- If your terminal exits (R session ends), the last rendered plot stays
-  visible with an "R session ended" indicator and must be closed manually.
-- When a new R session is started or the panel is reopened, a subsequent
-  plot from that new session will recreate the plot panel.
-
-### Settings
-
-| Setting | Default | Description |
-| --- | --- | --- |
-| `raven.plot.enabled` | `true` | Enable the plot viewer for Raven-managed terminals. |
-| `raven.plot.viewerColumn` | `beside` | Initial column when a new viewer opens. |
-
-### Troubleshooting
-
-- **No viewer appears.** Confirm httpgd is installed (`packageVersion("httpgd")`)
-  and that you're running R inside a terminal launched via Raven (the terminal
-  profile dropdown's "R (Raven)" entry, or any of Raven's send-to-R commands).
-  Plots from terminals you opened manually outside Raven won't trigger the viewer.
-- **httpgd console message about installing or upgrading.** Follow the printed
-  `install.packages("httpgd")` instructions. Plots fall back to R's default
-  graphics device until httpgd is available.
-
-## Data Viewer
-
-When `raven.dataViewer.enabled` is `true` (the default), Raven overrides R's
-`View()` so calls in a Raven-managed R terminal open in a virtualized grid
-panel that scales smoothly to multi-million-row data frames.
-
-```r
-View(mtcars)
-View(head(iris, 50))
-View(my_df, "Custom panel name")
-```
-
-Other classes raise an error in R, mirroring Positron:
-
-```r
-> View(1)
-Error in `View()`:
-! Can't `View()` an object of class `numeric`
-```
-
-The toolbar offers a Labels toggle (factor codes ↔ levels, plus
-`haven_labelled` value labels), a Format toggle with a digits dropdown,
-and a Columns popover for hide/show. `Cmd/Ctrl+C` copies a rectangular
-selection as TSV honoring the active toggles.
-
-Requires the [`arrow`](https://arrow.apache.org/docs/r/) R package.
-
-See [docs/data-viewer.md](./data-viewer.md) for full settings and
-behavior.

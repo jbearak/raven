@@ -1,14 +1,19 @@
-# Raven - Language Server for R
+# Raven — R Extension for VS Code, and Language Server
 
-An open-source [Language Server Protocol (LSP)](https://github.com/Microsoft/language-server-protocol) implementation for R, with a corresponding extension for [VS Code](https://github.com/Microsoft/vscode).
+Raven is an R extension for VS Code, plus a standalone [language server](https://github.com/Microsoft/language-server-protocol) for other LSP-compatible editors (Zed, Neovim, and AI agents).
 
-> **tl;dr**: Raven brings **cross-file intelligence** to R coding. It follows `source()` chains to provide **workspace-wide completions**, **go-to-definition across files**, **position-aware scope resolution**, and **diagnostics that understand your project structure** — all without running R.
+The VS Code extension integrates an [R console](docs/r-console.md), [plot viewer](docs/plot-viewer.md), [data viewer](docs/data-viewer.md), and [help viewer](docs/help-viewer.md). Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), Raven sends large blocks of code to R more reliably and renders large data frames without freezing the editor.
+
+The language server brings cross-file code intelligence to R: completions, diagnostics, and navigation that follow `source()` chains across files and are aware of which packages are loaded at the cursor. No other R language server does this.
+
+> [!NOTE]
+> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Comparison: Coexistence](docs/comparison.md#coexistence). The language server and help viewer are unaffected.
 
 > **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
 
 > **Quick Start:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r), or download from the [releases page](https://github.com/jbearak/raven/releases). See [Installation](#installation) for details.
 
-Raven works with VS Code, its forks, and any editor with an LSP client. Raven's sister project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
+Raven's sister project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
 
 ## Quick Start
 
@@ -26,6 +31,7 @@ helper_function <- function(x) { x * 2 }
 ```
 
 When you open `main.R`, Raven:
+
 1. Detects the `source("utils.R")` call
 2. Indexes symbols from `utils.R`
 3. Provides completions, hover, and go-to-definition for `helper_function`
@@ -34,6 +40,8 @@ When you open `main.R`, Raven:
 And if you open `utils.R` directly, Raven automatically discovers that `main.R` sources it and resolves the full chain in both directions — no configuration needed.
 
 ## Features
+
+### Code intelligence
 
 - **[Completions](docs/completion.md)** — Symbols, packages, and function parameters — across files
 - **Go-to-definition** — Jump to definitions across file boundaries
@@ -44,16 +52,23 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
-- **[Send to R](docs/send-to-r.md)** — Interactive R console with statement detection; supports R, arf, and radian
-- **Plot viewer** — Plots from the Raven-managed R terminal appear in a VS Code panel via [httpgd](https://nx10.dev/httpgd/). History navigation, save (PNG/SVG/PDF), and theme-aware background.
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **Syntax highlighting** — JAGS and Stan (R highlighting is built into VS Code)
+
+### R session integration
+
+- **[R console](docs/r-console.md)** — Interactive R console with statement detection and reliable large-block sending; supports R, arf, and radian
+- **[Plot viewer](docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
+- **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; scales smoothly to multi-million-row data frames
+- **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function actually in scope at the cursor, not every same-named function across your library
 
 > [!NOTE]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation. See [Document Outline](docs/document-outline.md#jags-and-stan-model-structure).
 
 ## Documentation
+
+**Code intelligence:**
 
 - [Cross-File & Package Awareness](docs/cross-file.md) — How Raven understands multi-file projects
 - [Directives](docs/directives.md) — All `@lsp-*` directive syntax
@@ -62,6 +77,16 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 - [Find References](docs/find-references.md) — Cross-file reference finding
 - [Document Outline](docs/document-outline.md) — Hierarchical symbol view
 - [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
+
+**R session integration:**
+
+- [R Console](docs/r-console.md) — Interactive console, send-to-R commands, send method
+- [Plot Viewer](docs/plot-viewer.md) — httpgd-backed plot panel
+- [Data Viewer](docs/data-viewer.md) — Arrow-backed `View()` replacement
+- [Help Viewer](docs/help-viewer.md) — Scope-aware R help
+
+**Setup and reference:**
+
 - [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
 - [Configuration](docs/configuration.md) — All settings and options
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
@@ -76,7 +101,7 @@ And if you open `utils.R` directly, Raven automatically discovers that `main.R` 
 
 ## How Raven Compares
 
-Raven is a static analysis tool that provides scope-aware intelligence for R — without requiring a running R session. For a detailed feature comparison with RStudio, Positron (Ark), and REditorSupport/languageserver, see [docs/comparison.md](docs/comparison.md).
+For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
 
 ## Development
 

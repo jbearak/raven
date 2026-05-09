@@ -2,6 +2,13 @@
 
 The extension provides a built-in help viewer that renders R help (Rd) documentation directly in VS Code. When you click on a function name in a hover, the help panel opens beside the editor and displays the topic's documentation, usage, arguments, and examples. Navigate across topics via cross-references, with full back/forward history support.
 
+## Why we built this
+
+Raven's help viewer uses the language server's scope analysis to disambiguate which package's help to show. If you hover over `filter(...)` after `library(dplyr)`, Raven opens `dplyr::filter` — not `stats::filter`, even though both functions exist with the same name. The scope-aware resolution looks at namespace qualifiers (`pkg::fn`), `library()` / `require()` calls in this file and any sourced files, package imports declared via `@lsp-*` directives, and the standard package-search-path order. See [Comparison: Hover help](./comparison.md#hover-help) for how this differs from other R hover implementations.
+
+> [!NOTE]
+> The help viewer activates regardless of `raven.rConsole.activation`. Unlike the plot and data viewers, the help viewer doesn't need a running R session managed by Raven — it shells out to R on demand to render Rd documentation as HTML.
+
 ## How to open it
 
 There are two ways to trigger the help viewer:

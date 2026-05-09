@@ -5,6 +5,25 @@ Raven-managed R terminal open a virtualized grid in a VS Code webview
 instead of the default backup viewer. The grid streams row windows from
 disk, so it scales smoothly to multi-million-row data frames.
 
+## Why we built this
+
+Most VS Code R extensions transport data frames from R to the webview by
+serializing the entire frame to JSON and shipping it into the page in one
+shot. That works for small frames but freezes the editor — and sometimes
+the whole VS Code window — on large ones. Raven serializes the frame to
+an Apache Arrow IPC (Feather v2) file and decodes only the rows currently
+visible, so opening a multi-million-row data frame is an O(1) operation
+regardless of size. See [Comparison: Data viewer](./comparison.md#data-viewer)
+for details.
+
+> [!NOTE]
+> The data viewer is reached through Raven's R console: it activates only
+> when Raven's R console activates (`raven.rConsole.activation`, default:
+> `auto`). When the REditorSupport (R) extension is enabled or VS Code is
+> running as Positron, Raven's R console — and therefore the data viewer
+> — steps aside automatically. See
+> [Comparison: Coexistence](./comparison.md#coexistence) for details.
+
 ## What it shows
 
 - `data.frame` (including `tibble` and `data.table` subclasses).
@@ -116,10 +135,11 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `raven.dataViewer.enabled` | `true` | Override `View()` in the Raven-managed R terminal. Set to `false` to disable the viewer entirely. |
 | `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colorize the text), `background` (tint the cell), or `none`. |
 | `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |
 | `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). |
+
+The data viewer's overall enable/disable is controlled by `raven.rConsole.activation` — there is no separate `raven.dataViewer.enabled` toggle.
 
 Changes apply to newly-opened panels.
 
@@ -162,7 +182,10 @@ directory is swept of files older than 24 hours.
 - **Nothing happens when I call `View(df)`.** Check that the terminal
   was started by Raven (the terminal profile dropdown's "R (Raven)"
   entry, or via send-to-R). Confirm `requireNamespace("arrow")`
-  returns `TRUE`. Check `raven.dataViewer.enabled` is true.
+  returns `TRUE`. Check `raven.rConsole.activation`: if it's
+  `"disabled"`, or `"auto"` while REditorSupport (R) is enabled or
+  you're in Positron, Raven's R console — and the data viewer — won't
+  activate.
 - **"Raven data viewer requires the 'arrow' package" warning.** Run
   `install.packages("arrow")` in the same R installation.
 - **The `Labels` toggle doesn't change a column.** The column has no

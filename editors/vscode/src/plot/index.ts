@@ -3,12 +3,13 @@ import { RSessionEvent, RSessionServer } from '../r-session-server';
 import { PlotViewerPanel } from './plot-viewer-panel';
 
 /**
- * Per-window plot services. Lazily started on first managed terminal
- * creation when raven.plot.enabled is true; disposed on extension
- * deactivation. Intentionally NOT torn down by raven.restart — existing
- * Raven-managed R terminals already hold the current session port/token
- * in their environment, so cycling the server would leave them POSTing
- * to a dead port until the user closes them.
+ * Per-window plot services. Constructed only when Raven's R console is
+ * active (see `raven.rConsole.activation`); started lazily on the first
+ * managed-terminal creation; disposed on extension deactivation.
+ * Intentionally NOT torn down by raven.restart — existing Raven-managed R
+ * terminals already hold the current session port/token in their
+ * environment, so cycling the server would leave them POSTing to a dead
+ * port until the user closes them.
  *
  * Owns one `PlotViewerPanel` per R session. The first /plot-available
  * event for a session creates that session's panel; closing the panel
@@ -23,42 +24,23 @@ export class PlotServices {
     private readonly session_indices = new Map<string, number>();
     private next_panel_index = 1;
     private detach_session_listener: (() => void) | null = null;
-    private config_subscription: vscode.Disposable | null = null;
     private started = false;
     private start_failed = false;
 
     /**
      * @param dataViewerDir
-     *   When non-empty, the loopback session server's /view-data route
-     *   accepts files under this absolute path. Pass '' (default) to
-     *   disable the data viewer entirely (route returns 404).
+     *   The absolute path the loopback session server's /view-data route
+     *   accepts files under. The data viewer is gated by the same
+     *   `raven.rConsole.activation` setting as the rest of the R console,
+     *   so when this constructor runs the data viewer is always active.
      */
-    constructor(context: vscode.ExtensionContext, dataViewerDir: string = '') {
+    constructor(context: vscode.ExtensionContext, dataViewerDir: string) {
         this.server = new RSessionServer(dataViewerDir);
         this.context = context;
         this.detach_session_listener = this.server.onEvent(e => this.on_server_event(e));
-        this.config_subscription = vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('raven.plot.enabled') && !this.isEnabled()) {
-                // User disabled the plot viewer: tear down the running server
-                // and any open panels so future terminals don't pick up plot
-                // bootstrap env, and existing webviews close. Re-enabling later
-                // re-starts on the next ensureStarted() call.
-                void this.shutdown_for_disable();
-            }
-        });
-    }
-
-    isEnabled(): boolean {
-        return vscode.workspace.getConfiguration('raven.plot').get<boolean>('enabled', true);
     }
 
     async ensureStarted(): Promise<boolean> {
-        // Re-check enablement on every call: a previously-started server must
-        // not keep handing out plot env after the user disables the setting.
-        if (!this.isEnabled()) {
-            if (this.started) await this.shutdown_for_disable();
-            return false;
-        }
         if (this.started) return true;
         if (this.start_failed) return false;
         try {
@@ -85,20 +67,9 @@ export class PlotServices {
     async dispose(): Promise<void> {
         this.detach_session_listener?.();
         this.detach_session_listener = null;
-        this.config_subscription?.dispose();
-        this.config_subscription = null;
         this.dispose_all_panels();
         await this.server.stop();
         this.started = false;
-    }
-
-    private async shutdown_for_disable(): Promise<void> {
-        this.dispose_all_panels();
-        this.session_indices.clear();
-        this.next_panel_index = 1;
-        await this.server.stop();
-        this.started = false;
-        this.start_failed = false;
     }
 
     private dispose_all_panels(): void {

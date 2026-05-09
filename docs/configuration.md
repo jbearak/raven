@@ -42,7 +42,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | Setting | Default | Description |
 |---|---|---|
 | `raven.packages.enabled` | `true` | Enable package function awareness |
-| `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls. Must point to vanilla `R` — not `radian` or `arf`, which are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses for package introspection. For the interactive terminal program, see [`raven.rTerminal.program`](send-to-r.md#choosing-the-r-program). |
+| `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls. Must point to vanilla `R` — not `radian` or `arf`, which are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses for package introspection. For the interactive terminal program, see [`raven.rTerminal.program`](r-console.md#choosing-the-r-program). |
 | `raven.packages.additionalLibraryPaths` | `[]` | Additional R library paths for package discovery |
 | `raven.packages.missingPackageSeverity` | `"warning"` | Severity for missing package diagnostics (`"off"` to disable) |
 | `raven.packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on install/remove |
@@ -52,12 +52,17 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 
 **Raven: Refresh package cache** (`raven.refreshPackages`) — re-runs `.libPaths()`, rebuilds the package library, restarts the filesystem watcher, clears the cache, and republishes diagnostics. Use after `renv::activate()`, `.libPaths()` changes, or if the watcher misses an event.
 
+## R Console Activation
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport (R) extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Comparison: Coexistence](comparison.md#coexistence). |
+
 ## Plot Settings
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.plot.enabled` | `true` | Enable Raven's httpgd-backed plot viewer for Raven-managed R terminals. Requires the `httpgd` R package (>= 2.0.2). See [Send to R → Plot Viewer](send-to-r.md#plot-viewer). |
-| `raven.plot.viewerColumn` | `beside` | Initial editor column for the shared plot viewer panel when the first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. |
+| `raven.plot.viewerColumn` | `beside` | Initial editor column for the shared plot viewer panel when the first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. See [Plot Viewer](plot-viewer.md). |
 
 ## Help Viewer Settings
 

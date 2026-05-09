@@ -1,6 +1,10 @@
-# Comparison with Other R Language Servers
+# Comparison with Other R Tools
 
-This page compares Raven with other tools that provide R language intelligence.
+This page compares Raven with other R tools across two dimensions: **language intelligence** (what the language server provides — completions, diagnostics, navigation) and **R session integration** (the R console, plot viewer, data viewer, and help viewer that ship as part of Raven's VS Code extension).
+
+## Language intelligence
+
+Compares Raven's language server against the language servers and code-intelligence systems in RStudio IDE, [Positron](https://github.com/posit-dev/positron) (via [Ark](https://github.com/posit-dev/ark)), and [REditorSupport/languageserver](https://github.com/REditorSupport/languageserver) (the R-package-based LSP that powers the [REditorSupport (R) VS Code extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) and various other LSP clients).
 
 | Feature | Raven | RStudio IDE | Positron (Ark) | REditorSupport/languageserver |
 |---|---|---|---|---|
@@ -15,14 +19,46 @@ This page compares Raven with other tools that provide R language intelligence.
 | **Editor support** | Any LSP client (VS Code, Zed, Neovim, etc.) | RStudio only | Positron only (LSP not currently exposed to other clients) | Any LSP client (vscode-R, ESS, Sublime, etc.) |
 | **Performance model** | Fast startup, low memory; no R session overhead | Tied to R session lifetime | Tied to R kernel startup | Tied to R session startup |
 
-## When to choose Raven
+### When to choose Raven for language intelligence
 
 Raven is the only R LSP that traces `source()` chains across a project: it builds a dependency graph and resolves what's in scope at each cursor position based on the actual order of execution, rather than treating the workspace as one flat symbol set. That makes its completions, diagnostics, and navigation correct for multi-file scripted projects, including circular-dependency and scope-violation detection. All of it works statically, without an R session.
 
+## R session integration
+
+Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations we and our users have run into — described below.
+
+These comparisons are based on reading the current upstream sources (links cited inline). Where the underlying behavior has been changed recently — e.g. the data viewer's row cap — we note that.
+
+### R console
+
+REditorSupport sends code from the editor to R via VS Code's [`terminal.sendText()` API](https://code.visualstudio.com/api/references/vscode-api#Terminal.sendText) — that is, by simulating typing into the integrated terminal. Its implementation in [`vscode-R/src/rTerminal.ts`](https://github.com/REditorSupport/vscode-R/blob/master/src/rTerminal.ts) splits multi-line code on newlines and `await`s an `rtermSendDelay` (default 8 ms) between lines, optionally wrapping the block in bracketed-paste sequences. Pasting a 1,000-line block costs at minimum 8 seconds of forced delay before R has parsed anything, and reliability of bracketed paste over remote sessions (SSH, mosh, VS Code Remote) depends on the user's terminal stack — some intermediate layers strip or split bracketed-paste markers.
+
+Raven's `sendMethod` (default `auto`) pastes short blocks directly and switches to a temp-file `source()` once a block reaches `raven.sendToR.autoTempFileThresholdLines` (default 25). The temp-file path bypasses the typing-simulation pipe entirely: R reads the file from disk, so there's no inter-line delay and no bracketed-paste compatibility risk. See [R Console: Send method](./r-console.md#send-method) for details and override options.
+
+### Data viewer
+
+REditorSupport's `View()` overrides recently moved into an in-tree R helper package, [`sess`](https://github.com/REditorSupport/vscode-R/tree/master/sess). The data-viewer path serializes the data frame to a JSON file via [`jsonlite::write_json`](https://github.com/REditorSupport/vscode-R/blob/master/sess/R/hooks.R) and loads it into a webview that renders the rows with ag-Grid. Historically, calling `View()` on a large frame could cause VS Code to hang or run out of memory while the JSON was generated and parsed (issues [#1288](https://github.com/REditorSupport/vscode-R/issues/1288), [#1463](https://github.com/REditorSupport/vscode-R/issues/1463)). The current implementation defends against that by capping the view at 100 rows by default (`getOption("sess.row_limit", 100)`) — so very large frames no longer hang the editor, but you also no longer see all rows unless you opt into a higher limit.
+
+Raven's `View()` writes the frame to an Apache Arrow IPC (Feather v2) file and the webview decodes only the row windows currently visible. Memory and time scale with the visible viewport, not with the size of the frame, so opening multi-million-row data frames is fast and there's no row cap to opt around. See [Data Viewer](./data-viewer.md) for the full implementation.
+
+### Hover help
+
+REditorSupport's hover is rendered server-side by `languageserver`. When the hover handler can't resolve a symbol locally, it calls `workspace$get_help(token, package)`, which tries [`guess_namespace(topic)`](https://github.com/REditorSupport/languageserver/blob/master/R/workspace.R) over the language server's own loaded-package list. If that returns nothing, it falls through to `utils::help((topic))` with no `package` argument, and `utils::help()` without a package returns matches across **every** installed package. The hover then renders all of them — which means hovering over `filter` in a script that's loaded `dplyr` can show the `dplyr::filter`, `stats::filter`, and any other installed-package `filter` help links side by side, even though only one is in scope at the cursor.
+
+Raven's hover uses the language server's scope analysis to determine which package the function actually resolves to at the cursor — based on `library()` / `require()` calls in this file and any sourced files, namespace qualifiers (`pkg::fn`), `@lsp-*` directives, and the standard package search path — then shows a single link to that package's help page. See [Help Viewer](./help-viewer.md).
+
 ## Coexistence
 
-Raven can run alongside other R extensions. See [Editor Integrations](editor-integrations.md) for setup details. In VS Code, you can keep [vscode-R](https://github.com/REditorSupport/vscode-R) installed for its interactive features (running code, viewing plots) while using Raven for code intelligence:
+Raven's data viewer and plot viewer are reached *through* its R console: the R console boots a profile that overrides `View()` (data viewer) and starts httpgd (plot viewer). When Raven's R console isn't activated, neither of those viewers is wired up — `View(df)` and `plot(...)` go to whatever R session your other extension manages.
+
+Raven's help viewer operates independently of the R console: it shells out to R on demand to render `Rd → HTML`, so it works whether or not Raven's R console is active. Help is always-on regardless of `raven.rConsole.activation`.
+
+With the default `raven.rConsole.activation: "auto"`, the R console (and therefore its plot and data viewers) steps aside automatically when the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is enabled or VS Code is running as Positron — so Raven supplements your existing R-session setup rather than fighting it. Set the value explicitly to `"enabled"` if you want both extensions' R-session features active at once; you'll then be responsible for any keybinding or `View()`-override conflicts that result. Set `"disabled"` to never activate Raven's R-session features even when no other R extension is present.
+
+If you want to run REditorSupport's language server alongside Raven (for example, to use `lintr` diagnostics), keep its language-server feature off:
 
 ```json
 "r.lsp.enabled": false
 ```
+
+See [Editor Integrations](./editor-integrations.md) for setup details across editors.
