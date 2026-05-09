@@ -1,0 +1,147 @@
+/**
+ * End-to-end smoke tests for the R data viewer. Requires:
+ *   - R on PATH
+ *   - The `arrow` R package installed
+ *
+ * Skipped automatically when R is not found in the system PATH or when
+ * the `arrow` package is not installed.
+ *
+ * Tests run sequentially and share a single Raven R terminal created on
+ * first call to `api.sendToRTerminal`. The terminal persists for the
+ * suite duration — we do not dispose it to avoid interfering with the
+ * extension's module-level state.
+ */
+
+import * as assert from 'assert';
+import * as vscode from 'vscode';
+import { spawnSync } from 'child_process';
+import type { RavenExtensionApi } from '../extension';
+import { activate, sleep } from './helper';
+
+async function pollForPanel(
+    api: RavenExtensionApi,
+    panelName: string,
+    timeoutMs = 60000,
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (api.getDataViewerPanelNames().includes(panelName)) return true;
+        await sleep(500);
+    }
+    return false;
+}
+
+suite('data-viewer smoke tests', function (this: Mocha.Suite) {
+    // Each test may need to wait for R startup + arrow write + HTTP round-trip.
+    this.timeout(120000);
+
+    let api: RavenExtensionApi;
+
+    suiteSetup(async function (this: Mocha.Context) {
+        // Skip the whole suite if R is not reachable on the system PATH.
+        const r_check = spawnSync('R', ['--version'], { timeout: 5000 });
+        if (r_check.error) {
+            this.skip();
+            return;
+        }
+
+        // Skip if the `arrow` R package is not installed — without it the
+        // bootstrap profile's View() override is a no-op.
+        const arrow_check = spawnSync(
+            'R', ['--vanilla', '-q', '--no-echo', '-e',
+                'if (!requireNamespace("arrow", quietly=TRUE)) quit(status=1)'],
+            { timeout: 10000 },
+        );
+        if (arrow_check.status !== 0) {
+            this.skip();
+            return;
+        }
+
+        await activate();
+        const ext = vscode.extensions.getExtension<RavenExtensionApi>('jbearak.raven-r');
+        if (!ext) { this.skip(); return; }
+        if (!ext.isActive) await ext.activate();
+        api = ext.exports as RavenExtensionApi;
+
+        // Small wait for the async data-viewer setup (mkdir + stale sweep) that
+        // runs after activate() returns.
+        await sleep(500);
+    });
+
+    suiteTeardown(async function () {
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+    });
+
+    test('View(mtcars) opens a panel titled "mtcars" with the expected columns', async function () {
+        await api.sendToRTerminal('View(mtcars)');
+
+        const appeared = await pollForPanel(api, 'mtcars');
+        assert.ok(appeared, 'data viewer panel "mtcars" did not appear within 60 s');
+
+        const cols = api.getDataViewerPanelColumnNames('mtcars');
+        assert.ok(Array.isArray(cols), 'expected column names array for "mtcars" panel');
+
+        // mtcars ships with R and always has these 11 columns in order.
+        const expected = ['mpg', 'cyl', 'disp', 'hp', 'drat', 'wt', 'qsec', 'vs', 'am', 'gear', 'carb'];
+        assert.deepStrictEqual(
+            cols,
+            expected,
+            `unexpected columns; got: ${JSON.stringify(cols)}`,
+        );
+    });
+
+    test('View(head(mtcars, 5)) opens a second panel without replacing "mtcars"', async function () {
+        await api.sendToRTerminal('View(head(mtcars, 5))');
+
+        const appeared = await pollForPanel(api, 'head(mtcars, 5)');
+        assert.ok(appeared, 'data viewer panel "head(mtcars, 5)" did not appear within 60 s');
+
+        const names = api.getDataViewerPanelNames();
+        assert.ok(
+            names.includes('mtcars'),
+            `"mtcars" panel must still exist; panels: ${JSON.stringify(names)}`,
+        );
+        assert.ok(
+            names.includes('head(mtcars, 5)'),
+            `"head(mtcars, 5)" panel must exist; panels: ${JSON.stringify(names)}`,
+        );
+    });
+
+    test('View(mtcars) a second time replaces the existing tab rather than opening a new one', async function () {
+        const before = api.getDataViewerPanelNames().slice();
+
+        await api.sendToRTerminal('View(mtcars)');
+
+        // Poll until the panel count stops changing, then assert it equals the
+        // count from before the command (replace, not create).
+        //
+        // Since the "mtcars" panel already exists, a correct implementation
+        // replaces in-place and no new entry is added to the manager's map.
+        // We give up to 45 s for R to write the Arrow file and POST.
+        const deadline = Date.now() + 45000;
+        let stable = 0;
+        let last = api.getDataViewerPanelNames().length;
+        while (Date.now() < deadline) {
+            await sleep(1000);
+            const current = api.getDataViewerPanelNames().length;
+            if (current === last) {
+                stable += 1;
+                if (stable >= 3) break; // 3 consecutive stable seconds
+            } else {
+                stable = 0;
+                last = current;
+            }
+        }
+
+        const after = api.getDataViewerPanelNames();
+        assert.strictEqual(
+            after.length,
+            before.length,
+            `expected ${before.length} panels after replace; got ${after.length}: ${JSON.stringify(after)}`,
+        );
+        assert.ok(
+            after.includes('mtcars'),
+            `"mtcars" panel must still be open after replace; panels: ${JSON.stringify(after)}`,
+        );
+    });
+});

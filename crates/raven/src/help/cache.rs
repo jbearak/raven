@@ -83,6 +83,7 @@ impl HtmlHelpCache {
         None
     }
 
+    #[cfg(test)]
     pub fn insert(&self, topic: &str, package: Option<&str>, result: Result_) {
         if let Ok(mut guard) = self.inner.write() {
             Self::insert_locked(&mut guard, topic, package, result);

@@ -179,12 +179,17 @@ async function get_plot_terminal_env(): Promise<{ env: RavenPlotEnv; sessionId: 
     }
 
     const previous = process.env.R_PROFILE_USER;
+    const data_viewer_dir = vscode.workspace.getConfiguration('raven.dataViewer')
+        .get<boolean>('enabled', true)
+        ? path.join(storage_dir, 'data-viewer')
+        : '';
     const env = build_terminal_env({
         profile_path,
         session_port: plot_services.server.port,
         session_token: plot_services.server.token,
         r_session_id: sessionId,
         previous_r_profile_user: previous && previous.length > 0 ? previous : undefined,
+        data_viewer_dir,
     });
     return { env, sessionId };
 }

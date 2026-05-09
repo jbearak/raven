@@ -20,8 +20,10 @@ import {
     shouldTriggerDirectivePathSuggest,
     shouldTriggerNestedPathSuggest,
 } from './pathCompletionTriggers';
-import { register_r_terminal, register_send_to_r_commands } from './send-to-r';
+import { register_r_terminal, register_send_to_r_commands, get_or_create_r_terminal } from './send-to-r';
 import { PlotServices } from './plot';
+import { registerDataViewer, dataViewerDirOf } from './data-viewer';
+import type { DataViewerManager } from './data-viewer/manager';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -98,6 +100,15 @@ function sendActivityNotification() {
 export interface RavenExtensionApi {
     /** Returns the live LSP client once activation has installed it. */
     getLanguageClient(): LanguageClient | undefined;
+    /**
+     * Creates (or reuses) a Raven-managed R terminal with the bootstrap
+     * profile injected, then sends `code` to it. Used by integration tests.
+     */
+    sendToRTerminal(code: string): Promise<void>;
+    /** Names of currently-open data viewer panels. Used by integration tests. */
+    getDataViewerPanelNames(): string[];
+    /** Column names for a named data viewer panel. Used by integration tests. */
+    getDataViewerPanelColumnNames(panelName: string): string[] | undefined;
 }
 
 export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
@@ -157,8 +168,20 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // Plot services (session server + viewer panel) for managed R terminals.
     // Constructed before raven.restart registration so the closure has a live
     // reference, not just a temporal-dead-zone forward binding.
-    const plot_services = new PlotServices(context);
+    //
+    // The session server's loopback /view-data route only accepts files
+    // under the data-viewer storage directory; passing '' disables it.
+    const data_viewer_enabled = vscode.workspace.getConfiguration('raven.dataViewer')
+        .get<boolean>('enabled', true);
+    const plot_services = new PlotServices(
+        context,
+        data_viewer_enabled ? dataViewerDirOf(context) : '',
+    );
     active_plot_services = plot_services;
+    let data_viewer_manager: DataViewerManager | undefined;
+    if (data_viewer_enabled) {
+        data_viewer_manager = registerDataViewer(context, plot_services.server, dataViewerDirOf(context));
+    }
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //
@@ -263,6 +286,13 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     return {
         getLanguageClient: () => client,
+        sendToRTerminal: async (code: string) => {
+            const terminal = await get_or_create_r_terminal();
+            terminal.sendText(code, true);
+        },
+        getDataViewerPanelNames: () => data_viewer_manager?.getPanelNames() ?? [],
+        getDataViewerPanelColumnNames: (panelName: string) =>
+            data_viewer_manager?.getPanelColumnNames(panelName),
     };
 }
 

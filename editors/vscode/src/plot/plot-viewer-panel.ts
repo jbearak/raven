@@ -7,7 +7,7 @@ import {
     isWebviewToExtensionMessage,
     SaveFormat,
 } from './messages';
-import { PlotSessionServer } from './session-server';
+import { RSessionServer } from '../r-session-server';
 import { download_to_buffer } from './http-download';
 import { csp_sources_for_external_base } from './csp';
 
@@ -29,8 +29,8 @@ function build_html(
     const css_uri = webview.asWebviewUri(
         vscode.Uri.joinPath(extension_uri, 'dist', 'webviews', 'plot-viewer', 'index.css'),
     );
-    // Loopback hosts must match those accepted by PlotSessionServer for
-    // httpgdHost (see session-server.ts allowedHosts): 127.0.0.1, localhost,
+    // Loopback hosts must match those accepted by RSessionServer for
+    // httpgdHost (see r-session-server/index.ts allowedHosts): 127.0.0.1, localhost,
     // and ::1. If the CSP omits one, webview fetches and websocket connects
     // to that host fail silently.
     const loopbackHttp = 'http://127.0.0.1:* http://localhost:* http://[::1]:*';
@@ -89,7 +89,7 @@ export class PlotViewerPanel {
 
     constructor(
         private readonly context: vscode.ExtensionContext,
-        private readonly server: PlotSessionServer,
+        private readonly server: RSessionServer,
         private readonly sessionId: string,
         private readonly panelIndex: number,
         private readonly options: PlotViewerPanelOptions,

@@ -1,0 +1,328 @@
+/* Data viewer webview styles. Theme-aware via VS Code CSS vars. */
+
+html, body, #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: var(--vscode-editor-background, #fff);
+    color: var(--vscode-editor-foreground, #1f1f1f);
+    font-family: var(--vscode-font-family, system-ui);
+    font-size: var(--vscode-font-size, 13px);
+}
+
+.data-viewer {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+}
+
+/* ---------- Toolbar ---------- */
+
+.toolbar {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--vscode-sideBar-background, #f3f3f3);
+    border-bottom: 1px solid var(--vscode-panel-border, #ccc);
+    flex: 0 0 auto;
+}
+
+.toolbar .toggle {
+    background: transparent;
+    border: 1px solid var(--vscode-button-border, transparent);
+    color: var(--vscode-foreground, #1f1f1f);
+    padding: 3px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.toolbar .toggle.on {
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+}
+.toolbar .toggle:hover {
+    background: var(--vscode-button-hoverBackground, #1177bb);
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.toolbar .digits {
+    height: 26px;
+    padding: 0 6px;
+    background: var(--vscode-input-background, #fff);
+    color: var(--vscode-input-foreground, #1f1f1f);
+    border: 1px solid var(--vscode-input-border, #ccc);
+    border-radius: 3px;
+}
+.toolbar .digits:disabled {
+    opacity: 0.4;
+}
+
+.toolbar .separator {
+    width: 1px;
+    height: 18px;
+    background: var(--vscode-panel-border, #ccc);
+    margin: 0 4px;
+}
+
+.toolbar .spacer { flex: 1 1 auto; }
+
+.toolbar .counter {
+    font-variant-numeric: tabular-nums;
+    color: var(--vscode-descriptionForeground, #888);
+}
+
+/* ---------- Columns popover ---------- */
+
+.columns-popover-wrapper {
+    position: relative;
+}
+
+.popover-button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--vscode-foreground, #1f1f1f);
+    padding: 3px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+}
+.popover-button:hover {
+    background: var(--vscode-button-hoverBackground, #1177bb);
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.popover {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    min-width: 240px;
+    max-height: 50vh;
+    overflow: auto;
+    background: var(--vscode-menu-background, #fff);
+    color: var(--vscode-menu-foreground, #1f1f1f);
+    border: 1px solid var(--vscode-menu-border, #ccc);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    z-index: 10;
+}
+.popover-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--vscode-menu-border, #ccc);
+    font-weight: 600;
+}
+.popover-close {
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 16px;
+}
+.popover-body {
+    padding: 4px 0;
+}
+.column-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+.column-row:hover {
+    background: var(--vscode-list-hoverBackground, #e8e8e8);
+}
+.column-name { flex: 1 1 auto; }
+.column-type {
+    color: var(--vscode-descriptionForeground, #888);
+    font-size: 11px;
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+/* ---------- Toast ---------- */
+
+.toast {
+    position: absolute;
+    top: 50px;
+    right: 16px;
+    padding: 6px 12px;
+    border-radius: 3px;
+    background: var(--vscode-notifications-background, #fff);
+    color: var(--vscode-notifications-foreground, #1f1f1f);
+    border: 1px solid var(--vscode-notifications-border, #ccc);
+    font-size: 12px;
+    z-index: 20;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}
+.toast-error { background: var(--vscode-inputValidation-errorBackground, #f44); color: var(--vscode-inputValidation-errorForeground, #fff); }
+.toast-copying { opacity: 0.7; }
+
+/* ---------- Grid ---------- */
+
+.viewport {
+    flex: 1 1 auto;
+    overflow: auto;
+    outline: none;
+    position: relative;
+}
+
+.grid {
+    position: relative;
+    width: max-content;
+    min-width: 100%;
+}
+
+.header-row {
+    position: sticky;
+    top: 0;
+    display: flex;
+    background: var(--vscode-editor-background, #fff);
+    border-bottom: 1px solid var(--vscode-panel-border, #ccc);
+    z-index: 2;
+    height: 28px;
+}
+
+.rows {
+    display: flex;
+    flex-direction: column;
+    will-change: transform;
+}
+
+.data-row {
+    display: flex;
+    border-bottom: 1px solid var(--vscode-tree-tableColumnsBorder, #f0f0f0);
+}
+.data-row:hover {
+    background: var(--vscode-list-hoverBackground, #f7f7f7);
+}
+
+.cell {
+    padding: 4px 8px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    border-right: 1px solid var(--vscode-tree-tableColumnsBorder, #f0f0f0);
+    box-sizing: border-box;
+    line-height: 16px;
+    cursor: default;
+    user-select: none;
+}
+.cell.header {
+    font-weight: 600;
+    background: var(--vscode-editor-background, #fff);
+    color: var(--vscode-foreground, #1f1f1f);
+    cursor: default;
+    border-bottom: 2px solid var(--vscode-panel-border, #ccc);
+}
+.cell.col-header {
+    cursor: default;
+    position: relative;
+}
+
+.resize-handle {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 1;
+}
+.resize-handle:hover {
+    background: var(--vscode-panel-border, #ccc);
+    opacity: 0.5;
+}
+.cell.numeric {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.cell.selected {
+    background: var(--vscode-editor-selectionBackground, rgba(173, 214, 255, 0.6));
+    color: var(--vscode-editor-selectionForeground, inherit);
+}
+
+.cell.missing-foreground {
+    color: var(--vscode-errorForeground, #ce5050);
+    font-style: italic;
+}
+.cell.missing-background {
+    background: var(--vscode-inputValidation-warningBackground, rgba(255, 220, 130, 0.4));
+}
+
+/* Sticky first (rownumber) column.
+   Width is set dynamically via inline style in App.svelte (calc(Nch + 16px))
+   so it fits the widest row number without truncation. */
+.cell.rowname-col {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    text-align: right;
+    background: var(--vscode-editor-background, #fff);
+    color: var(--vscode-descriptionForeground, #888);
+    cursor: default;
+    border-right: 1px solid var(--vscode-panel-border, #ccc);
+}
+.cell.row-header {
+    cursor: default;
+}
+.cell.corner-cell {
+    cursor: default;
+}
+.header-row .cell.rowname-col {
+    z-index: 3; /* above sticky body cells */
+    /* rowColWidth uses ch units; keep this font weight aligned with body
+       row-number cells so the sticky header doesn't shift every header
+       separator slightly to the right. */
+    font-weight: 400;
+}
+
+/* Tint headers when their column / row intersects the selection. Lower
+   alpha than the cell highlight so the band doesn't compete with the
+   actual selected rectangle. */
+.cell.selected-header {
+    background: var(--vscode-list-activeSelectionBackground,
+                 var(--vscode-editor-selectionBackground, rgba(173, 214, 255, 0.6)));
+    color: var(--vscode-list-activeSelectionForeground, inherit);
+}
+
+/* ---------- Context menu ---------- */
+
+.context-menu {
+    position: fixed;
+    min-width: 140px;
+    padding: 4px 0;
+    background: var(--vscode-menu-background, #fff);
+    color: var(--vscode-menu-foreground, #1f1f1f);
+    border: 1px solid var(--vscode-menu-border, #ccc);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    z-index: 30;
+    user-select: none;
+}
+.context-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: inherit;
+    padding: 5px 14px;
+    font: inherit;
+    cursor: pointer;
+}
+.context-menu-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.context-menu-item:not(:disabled):hover,
+.context-menu-item:not(:disabled):focus {
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #fff));
+    outline: none;
+}

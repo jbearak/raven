@@ -1,11 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { PlotSessionServer } from '../../editors/vscode/src/plot/session-server';
+import { RSessionServer } from '../../editors/vscode/src/r-session-server';
 
 describe('POST /session-ready', () => {
-    let server: PlotSessionServer;
+    let server: RSessionServer;
 
     beforeEach(async () => {
-        server = new PlotSessionServer();
+        server = new RSessionServer();
         await server.start();
     });
     afterEach(async () => { await server.stop(); });

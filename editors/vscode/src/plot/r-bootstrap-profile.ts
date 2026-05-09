@@ -9,6 +9,10 @@ export type BuildEnvInputs = {
     session_token: string;
     r_session_id: string;
     previous_r_profile_user: string | undefined;
+    /** Absolute path to the per-extension data-viewer storage directory.
+     *  The R View() override writes its Arrow files here. May be empty
+     *  when the data viewer is disabled. */
+    data_viewer_dir?: string;
 };
 
 export type RavenPlotEnv = {
@@ -17,6 +21,7 @@ export type RavenPlotEnv = {
     RAVEN_SESSION_PORT: string;
     RAVEN_SESSION_TOKEN: string;
     RAVEN_R_SESSION_ID: string;
+    RAVEN_DATA_VIEWER_DIR: string;
 };
 
 export function build_terminal_env(inputs: BuildEnvInputs): RavenPlotEnv {
@@ -26,6 +31,7 @@ export function build_terminal_env(inputs: BuildEnvInputs): RavenPlotEnv {
         RAVEN_SESSION_PORT: String(inputs.session_port),
         RAVEN_SESSION_TOKEN: inputs.session_token,
         RAVEN_R_SESSION_ID: inputs.r_session_id,
+        RAVEN_DATA_VIEWER_DIR: inputs.data_viewer_dir ?? '',
     };
 }
 
@@ -56,6 +62,281 @@ export async function write_profile_file(
 export function generate_profile_source(): string {
     return `# Raven bootstrap profile. Do not edit; regenerated each terminal launch.
 
+# Source the user's original .Rprofile exactly once, before either bridge,
+# so neither block needs to gate on profile-loaded state and the data viewer
+# block isn't suppressed by a plot-bridge early return.
+local({
+    .raven_log <- function(msg) message(paste0("Raven: ", msg))
+    .raven_orig <- Sys.getenv("RAVEN_ORIGINAL_R_PROFILE_USER")
+    .raven_candidate <- if (nzchar(.raven_orig)) {
+        .raven_orig
+    } else if (file.exists(".Rprofile")) {
+        ".Rprofile"
+    } else if (file.exists("~/.Rprofile")) {
+        path.expand("~/.Rprofile")
+    } else {
+        ""
+    }
+    if (nzchar(.raven_candidate) && file.access(.raven_candidate, mode = 4) == 0) {
+        tryCatch(sys.source(.raven_candidate, envir = globalenv()),
+                  error = function(e) {
+                      .raven_log(paste0(
+                          "could not source user profile '", .raven_candidate,
+                          "': ", conditionMessage(e)
+                      ))
+                  })
+    }
+})
+
+# Raven data viewer block — overrides View() in globalenv so the Raven
+# extension renders data.frames and matrices in a virtualized webview.
+# Independent of the plot bridge: a missing httpgd does not affect this.
+local({
+    .raven_log <- function(msg) message(paste0("Raven: ", msg))
+
+    .raven_dv_dir <- Sys.getenv("RAVEN_DATA_VIEWER_DIR")
+    if (!nzchar(.raven_dv_dir)) {
+        # Data viewer is disabled in this terminal — stay silent so users
+        # who never opted in don't see the "install arrow" message.
+        return(invisible(NULL))
+    }
+    if (!dir.exists(.raven_dv_dir)) {
+        tryCatch(dir.create(.raven_dv_dir, recursive = TRUE, showWarnings = FALSE),
+                 error = function(e) {})
+    }
+
+    .raven_session_id <- Sys.getenv("RAVEN_R_SESSION_ID")
+
+    # ----- helpers ---------------------------------------------------------
+
+    .raven_post <- function(path, body_str) {
+        port <- as.integer(Sys.getenv("RAVEN_SESSION_PORT"))
+        token <- Sys.getenv("RAVEN_SESSION_TOKEN")
+        if (is.na(port) || port <= 0L || !nzchar(token)) return(invisible(NULL))
+        tryCatch({
+            con <- socketConnection(host = "127.0.0.1", port = port,
+                                     blocking = TRUE, open = "r+b", timeout = 2)
+            on.exit(close(con), add = TRUE)
+            body_bytes <- charToRaw(body_str)
+            hdr <- paste0(
+                "POST ", path, " HTTP/1.0\\r\\n",
+                "Host: 127.0.0.1\\r\\n",
+                "X-Raven-Session-Token: ", token, "\\r\\n",
+                "Content-Type: application/json\\r\\n",
+                "Content-Length: ", length(body_bytes), "\\r\\n",
+                "Connection: close\\r\\n",
+                "\\r\\n"
+            )
+            writeBin(charToRaw(hdr), con)
+            writeBin(body_bytes, con)
+            flush(con)
+            invisible(NULL)
+        }, error = function(e) {
+            .raven_log(paste0("data viewer POST failed: ", conditionMessage(e)))
+        })
+    }
+
+    .raven_json_str <- function(x) {
+        x <- gsub("\\\\\\\\", "\\\\\\\\\\\\\\\\", x, fixed = TRUE)
+        x <- gsub("\\"", "\\\\\\"", x, fixed = TRUE)
+        x <- gsub("\\n", "\\\\n", x, fixed = TRUE)
+        x <- gsub("\\r", "\\\\r", x, fixed = TRUE)
+        x <- gsub("\\t", "\\\\t", x, fixed = TRUE)
+        paste0("\\"", x, "\\"")
+    }
+
+    .raven_truncate_utf8 <- function(s, max_bytes = 1024L) {
+        if (length(s) == 0L || is.na(s)) return(s)
+        # Treat each element scalar.
+        out <- s
+        bytes <- nchar(s, type = "bytes")
+        too_long <- which(!is.na(bytes) & bytes > max_bytes)
+        for (i in too_long) {
+            chars <- s[i]
+            # Successively shorter substrings until under the byte limit
+            # by codepoint count. UTF-8 worst case 4 bytes per char.
+            keep <- as.integer(max_bytes / 4L)
+            while (keep > 0L && nchar(substr(chars, 1L, keep), type = "bytes") > max_bytes - 3L) {
+                keep <- keep - 1L
+            }
+            out[i] <- paste0(substr(chars, 1L, keep), "\\u2026")
+        }
+        out
+    }
+
+    # Detect non-auto-generated rownames (non-NULL, character, and not the
+    # default "1".."N" sequence).
+    .raven_meaningful_rownames <- function(x) {
+        rn <- rownames(x)
+        if (is.null(rn)) return(FALSE)
+        n <- nrow(x)
+        if (length(rn) != n) return(FALSE)
+        any(rn != as.character(seq_len(n)))
+    }
+
+    # Pre-encode one column for arrow:
+    # - factor: keep as-is (arrow handles dictionary)
+    # - haven_labelled: strip class, keep underlying numeric/character
+    # - integer/double/logical/character/Date/POSIXct: keep
+    # - list / S4 / complex / raw / unrecognized: format() per element,
+    #   1 KiB-truncated
+    .raven_encode_col <- function(col) {
+        cls <- class(col)
+        if (is.factor(col)) return(col)
+        if ("haven_labelled" %in% cls) {
+            x <- unclass(col)
+            attr(x, "label") <- attr(col, "label")
+            attr(x, "labels") <- attr(col, "labels")
+            return(x)
+        }
+        if (is.integer(col) || is.double(col) || is.logical(col) ||
+            is.character(col) || inherits(col, "Date") || inherits(col, "POSIXct")) {
+            return(col)
+        }
+        # Fallback: stringify with bounded length.
+        out <- vapply(col, function(v) {
+            if (is.null(v) || (length(v) == 1L && is.na(v))) return(NA_character_)
+            tryCatch(.raven_truncate_utf8(format(v))[1L], error = function(e) NA_character_)
+        }, character(1L))
+        out
+    }
+
+    .raven_value_labels_json <- function(col) {
+        if (is.factor(col)) {
+            lv <- levels(col)
+            if (length(lv) == 0L) return("")
+            # 1-based codes mapped to level strings (matches as.integer(factor))
+            entries <- vapply(seq_along(lv), function(i) {
+                paste0("\\"", as.character(i), "\\":", .raven_json_str(lv[[i]]))
+            }, character(1L))
+            return(paste0("{", paste(entries, collapse = ","), "}"))
+        }
+        labs <- attr(col, "labels")
+        if (is.null(labs)) labs <- attr(col, "value.labels")
+        if (is.null(labs) || is.null(names(labs))) return("")
+        entries <- vapply(seq_along(labs), function(i) {
+            key <- as.character(labs[[i]])
+            paste0(.raven_json_str(key), ":", .raven_json_str(names(labs)[[i]]))
+        }, character(1L))
+        paste0("{", paste(entries, collapse = ","), "}")
+    }
+
+    .raven_field_metadata <- function(name, col) {
+        md <- list()
+        lbl <- attr(col, "label")
+        if (!is.null(lbl) && nzchar(as.character(lbl))) {
+            md[["raven.variable_label"]] <- as.character(lbl)
+        }
+        vlj <- .raven_value_labels_json(col)
+        if (nzchar(vlj)) md[["raven.value_labels"]] <- vlj
+        oc <- paste(class(col), collapse = "/")
+        if (nzchar(oc)) md[["raven.original_class"]] <- oc
+        fmt <- attr(col, "format.stata")
+        if (!is.null(fmt) && nzchar(as.character(fmt))) {
+            md[["raven.format"]] <- as.character(fmt)
+        }
+        md
+    }
+
+    .raven_write_arrow <- function(df, file_path) {
+        # Per-field metadata isn't settable through the public R arrow API
+        # (Field$create's metadata arg raises "metadata= is currently
+        # ignored" through 2025-era versions). Encode per-field metadata
+        # as a single JSON blob attached to the schema-level KV metadata
+        # under the key "raven.fields"; the JS reader unpacks it into
+        # ColumnSchema fields.
+        tbl <- arrow::arrow_table(df)
+        per_field <- list()
+        for (nm in names(df)) {
+            md <- .raven_field_metadata(nm, df[[nm]])
+            if (length(md) > 0L) per_field[[nm]] <- md
+        }
+        if (length(per_field) > 0L) {
+            entries <- vapply(names(per_field), function(nm) {
+                fld <- per_field[[nm]]
+                kv <- vapply(names(fld), function(k) {
+                    paste0(.raven_json_str(k), ":", .raven_json_str(fld[[k]]))
+                }, character(1L))
+                paste0(.raven_json_str(nm), ":{", paste(kv, collapse = ","), "}")
+            }, character(1L))
+            json <- paste0("{", paste(entries, collapse = ","), "}")
+            tbl <- tbl$ReplaceSchemaMetadata(list("raven.fields" = json))
+        }
+        # apache-arrow JS does not ship LZ4/Zstd codecs, so write uncompressed.
+        arrow::write_feather(tbl, file_path, chunk_size = 65536L, compression = "uncompressed")
+    }
+
+    .raven_view <- function(x, title) {
+        if (!requireNamespace("arrow", quietly = TRUE)) {
+            msg <- "Raven data viewer requires the 'arrow' package. Install with: install.packages(\\"arrow\\")"
+            warning(msg, call. = FALSE)
+            .raven_post("/data-viewer-warning", paste0(
+                "{",
+                "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+                "\\"reason\\":\\"missing-arrow\\",",
+                "\\"message\\":", .raven_json_str(msg),
+                "}"
+            ))
+            return(invisible(NULL))
+        }
+        # Resolve panel name.
+        panel_name <- if (!missing(title) && !is.null(title)) {
+            as.character(title)[[1L]]
+        } else {
+            s <- tryCatch(deparse1(substitute(x), collapse = " "),
+                          error = function(e) "View")
+            if (nchar(s, type = "bytes") > 256L) {
+                # truncate_utf8 already appends a single "…" when it cuts.
+                s <- .raven_truncate_utf8(s, 256L)
+            }
+            s
+        }
+
+        if (!is.data.frame(x) && !is.matrix(x)) {
+            stop("Can't \`View()\` an object of class \`",
+                 paste(class(x), collapse = "/"), "\`", call. = FALSE)
+        }
+
+        df <- if (is.matrix(x)) {
+            d <- as.data.frame(x, stringsAsFactors = FALSE)
+            if (.raven_meaningful_rownames(x)) {
+                d <- cbind(rowname = rownames(x), d, stringsAsFactors = FALSE)
+            }
+            rownames(d) <- NULL
+            d
+        } else {
+            x
+        }
+        # Pre-encode every column.
+        for (nm in names(df)) df[[nm]] <- .raven_encode_col(df[[nm]])
+
+        nr <- nrow(df)
+        path <- file.path(.raven_dv_dir,
+                           paste0(.raven_session_id, "-",
+                                   format(as.numeric(Sys.time()) * 1e6, scientific = FALSE),
+                                   "-", sample.int(.Machine$integer.max, 1L), ".arrow"))
+
+        tryCatch(.raven_write_arrow(df, path), error = function(e) {
+            stop("data viewer write failed: ", conditionMessage(e), call. = FALSE)
+        })
+
+        body <- paste0(
+            "{",
+            "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
+            "\\"panelName\\":", .raven_json_str(panel_name), ",",
+            "\\"filePath\\":", .raven_json_str(path), ",",
+            "\\"nrow\\":", as.character(nr),
+            "}"
+        )
+        .raven_post("/view-data", body)
+        invisible(NULL)
+    }
+
+    assign("View", .raven_view, envir = globalenv())
+})
+
+# Plot bridge block — depends on httpgd. Independent of the data viewer
+# block above; if httpgd is missing, View() still works.
 local({
     .raven_log <- function(msg) {
         message(paste0("Raven: ", msg))
@@ -96,27 +377,6 @@ local({
         x <- gsub("\\\\\\\\", "\\\\\\\\\\\\\\\\", x, fixed = TRUE)
         x <- gsub("\\"", "\\\\\\"", x, fixed = TRUE)
         paste0("\\"", x, "\\"")
-    }
-
-    # 1. Source the original user profile if any.
-    .raven_orig <- Sys.getenv("RAVEN_ORIGINAL_R_PROFILE_USER")
-    .raven_candidate <- if (nzchar(.raven_orig)) {
-        .raven_orig
-    } else if (file.exists(".Rprofile")) {
-        ".Rprofile"
-    } else if (file.exists("~/.Rprofile")) {
-        path.expand("~/.Rprofile")
-    } else {
-        ""
-    }
-    if (nzchar(.raven_candidate) && file.access(.raven_candidate, mode = 4) == 0) {
-        tryCatch(sys.source(.raven_candidate, envir = globalenv()),
-                  error = function(e) {
-                      .raven_log(paste0(
-                          "could not source user profile '", .raven_candidate,
-                          "': ", conditionMessage(e)
-                      ))
-                  })
     }
 
     # 2. Verify httpgd >= 2.0.2 is available.

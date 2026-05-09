@@ -1,0 +1,14 @@
+{
+    "extends": "../../../tsconfig.json",
+    "compilerOptions": {
+        "lib": ["ES2020", "DOM"],
+        "rootDir": "..",
+        "noEmit": true,
+        "types": [],
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "verbatimModuleSyntax": true
+    },
+    "include": ["**/*.ts", "../messages.ts", "../wire-format.ts", "../arrow-reader.ts"],
+    "exclude": ["../../../node_modules"]
+}
