@@ -89,4 +89,43 @@ describe('render_tsv', () => {
         );
         expect(tsv).toBe('6');  // 5 + 1
     });
+
+    test('includeHeader prepends a tab-separated row of column names', () => {
+        const rows = [
+            [1, 1.5, 0, 1] as any,
+            [2, 2.25, 1, 2] as any,
+        ];
+        const tsv = render_tsv(
+            rows, [0, 1, 2, 3], cols, dictionaries, false, false, 3, {}, true,
+        );
+        expect(tsv).toBe('i\tv\tf\tlab\n1\t1.5\t1\t1\n2\t2.25\t2\t2');
+    });
+
+    test('includeHeader honors the colIndices order, not schema order', () => {
+        const rows = [[2.25, 1] as any];
+        // Copy columns in reverse: v then i.
+        const tsv = render_tsv(
+            rows, [1, 0], cols, dictionaries, false, false, 3, {}, true,
+        );
+        expect(tsv).toBe('v\ti\n2.25\t1');
+    });
+
+    test('includeHeader sanitizes tabs / newlines in column names', () => {
+        const dirty: ColumnSchema = {
+            name: 'has\ttab\nname', arrowType: 'Utf8', isInteger: false,
+            dictionaryShipped: false,
+        };
+        const rows = [['x'] as any];
+        const tsv = render_tsv(
+            rows, [0], [dirty], {}, false, false, 3, {}, true,
+        );
+        expect(tsv).toBe('has tab name\nx');
+    });
+
+    test('includeHeader on empty rows still emits the header line', () => {
+        const tsv = render_tsv(
+            [], [0, 1], cols, dictionaries, false, false, 3, {}, true,
+        );
+        expect(tsv).toBe('i\tv');
+    });
 });

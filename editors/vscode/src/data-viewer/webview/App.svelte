@@ -148,9 +148,68 @@
             }
         };
         window.addEventListener('message', handler);
+        // macOS dispatches Cmd-A and Cmd-C through the Edit menu's responder
+        // chain rather than as a JS keydown event. Chromium responds by
+        // calling document.execCommand('selectAll') / firing a 'copy' event
+        // directly, so the window-level keydown listener never sees them.
+        // Catch both via the synthesized DOM events instead — this is what
+        // actually fires for Cmd shortcuts on macOS, while Ctrl shortcuts
+        // continue to flow through the keydown path.
+        document.addEventListener('selectionchange', onSelectionChange);
+        document.addEventListener('copy', onDocumentCopy);
         vscode.postMessage({ type: 'webviewReady' });
-        return () => window.removeEventListener('message', handler);
+        // Pull focus into the iframe so Cmd/Ctrl+A and Cmd/Ctrl+C reach the
+        // window-level keydown handler. Without this, the panel can mount
+        // without focus inside the iframe (e.g. opened via R's View() while
+        // the editor still has focus); keystrokes would then never reach
+        // our handler and Cmd+A would fall back to the browser's default
+        // "select all webview text" behavior.
+        focusViewport();
+        return () => {
+            window.removeEventListener('message', handler);
+            document.removeEventListener('selectionchange', onSelectionChange);
+            document.removeEventListener('copy', onDocumentCopy);
+        };
     });
+
+    /** Fires after Cmd-A / Edit > Select All (which Chromium implements via
+     *  document.execCommand('selectAll'), bypassing keydown on macOS).
+     *  When we observe the document gaining a body-spanning native
+     *  selection we suppress it and run our grid select-all instead.
+     *
+     *  A user-initiated drag-select keeps both endpoints inside the same
+     *  text node, so the containsNode(body) check only matches the
+     *  synthetic "select all". */
+    function onSelectionChange(): void {
+        const sel = window.getSelection?.();
+        if (!sel || sel.rangeCount === 0) return;
+        if (sel.isCollapsed) return;
+        const root = document.body;
+        if (!root) return;
+        if (!sel.containsNode(root, true)) return;
+        sel.removeAllRanges();
+        if (visibleCols.length > 0 && nrow > 0) {
+            selection.selectAll(nrow, visibleCols);
+            bumpSelection();
+        }
+    }
+
+    /** Fires for Cmd-C / Edit > Copy on macOS regardless of whether
+     *  keydown reached us. We always intercept and write our TSV to the
+     *  clipboard via the extension host (the webview can't access
+     *  navigator.clipboard reliably under the default CSP). */
+    function onDocumentCopy(e: ClipboardEvent): void {
+        if (!selection.rect()) return;
+        e.preventDefault();
+        copySelection();
+    }
+
+    /** Pull keyboard focus to the grid viewport so Cmd/Ctrl shortcuts
+     *  reach our window-level keydown handler. Called on mount and on
+     *  every pointer interaction inside the panel. */
+    function focusViewport(): void {
+        viewportEl?.focus({ preventScroll: true });
+    }
 
     function applyInitOrReplace(
         m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>,
@@ -275,9 +334,10 @@
 
     function onCellPointerDown(row: number, col: number, e: PointerEvent): void {
         if (e.button !== 0) return;
+        focusViewport();
         dragMode = 'cell';
         if (e.shiftKey) selection.focus(row, col);
-        else selection.anchor(row, col);
+        else selection.anchor(row, col, 'cells');
         bumpSelection();
     }
 
@@ -290,11 +350,12 @@
 
     function onColHeaderPointerDown(colIdx: number, e: PointerEvent): void {
         if (e.button !== 0) return;
+        focusViewport();
         dragMode = 'column';
         if (nrow === 0) return;
         if (e.shiftKey) selection.focus(nrow - 1, colIdx);
         else {
-            selection.anchor(0, colIdx);
+            selection.anchor(0, colIdx, 'columns');
             selection.focus(nrow - 1, colIdx);
         }
         bumpSelection();
@@ -310,15 +371,27 @@
 
     function onRowHeaderPointerDown(absRow: number, e: PointerEvent): void {
         if (e.button !== 0) return;
+        focusViewport();
         dragMode = 'row';
         if (visibleCols.length === 0) return;
         const minCol = visibleCols[0];
         const maxCol = visibleCols[visibleCols.length - 1];
         if (e.shiftKey) selection.focus(absRow, maxCol);
         else {
-            selection.anchor(absRow, minCol);
+            selection.anchor(absRow, minCol, 'rows');
             selection.focus(absRow, maxCol);
         }
+        bumpSelection();
+    }
+
+    /** Top-left corner cell ("#") behaves as the "select all" affordance,
+     *  matching spreadsheet conventions. Always sets selection kind to
+     *  'all' so a copy includes the column-header row. */
+    function onCornerPointerDown(e: PointerEvent): void {
+        if (e.button !== 0) return;
+        focusViewport();
+        if (visibleCols.length === 0 || nrow === 0) return;
+        selection.selectAll(nrow, visibleCols);
         bumpSelection();
     }
 
@@ -366,6 +439,7 @@
                 colIndices,
             },
             labelsOn, formatOn, digits,
+            includeHeader: selection.includesHeader(),
         };
         copyStatus = 'copying';
         copyStatusMsg = 'Copying...';
@@ -452,11 +526,11 @@
         if (!inRect) {
             switch (target.kind) {
                 case 'cell':
-                    selection.anchor(target.row, target.col);
+                    selection.anchor(target.row, target.col, 'cells');
                     break;
                 case 'column':
                     if (nrow > 0) {
-                        selection.anchor(0, target.col);
+                        selection.anchor(0, target.col, 'columns');
                         selection.focus(nrow - 1, target.col);
                     }
                     break;
@@ -464,7 +538,7 @@
                     if (visibleCols.length > 0) {
                         const minCol = visibleCols[0];
                         const maxCol = visibleCols[visibleCols.length - 1];
-                        selection.anchor(target.row, minCol);
+                        selection.anchor(target.row, minCol, 'rows');
                         selection.focus(target.row, maxCol);
                     }
                     break;
@@ -671,7 +745,11 @@
         <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
             <!-- Header row (sticky top) -->
             <div class="header-row">
-                <div class="cell header rowname-col corner-cell" style="width: {rowColWidth};">#</div>
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div class="cell header rowname-col corner-cell"
+                     style="width: {rowColWidth};"
+                     title="Select all"
+                     onpointerdown={onCornerPointerDown}>#</div>
                 {#each visibleCols as colIdx (colIdx)}
                     {@const col = columns[colIdx]}
                     <div class="cell header col-header

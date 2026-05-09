@@ -79,10 +79,16 @@ same `View(mtcars)` opened tomorrow remembers the layout.
   column headers to select multiple contiguous columns.
 - Click a row-number gutter cell to select that row; click-drag across
   row headers to select multiple contiguous rows.
-- `Cmd/Ctrl+A` selects every row across all currently-visible columns.
+- Click the `#` corner cell (top-left) to select the whole table.
+- `Cmd/Ctrl+A` selects every row across all currently-visible columns
+  (equivalent to clicking `#`).
 - `Cmd/Ctrl+C` copies the selection as TSV. Copying respects the
   active Labels / Format / digits state — what you see is what you
   copy.
+- Column-header selections and whole-table selections (via `#` or
+  `Cmd/Ctrl+A`) include the column-name row when copied. Cell and
+  row-header selections copy data only, matching spreadsheet
+  conventions.
 - Right-click a cell, column header, or row header to show a Copy menu
   (which copies the current selection, or the right-clicked target if
   the click landed outside the selection). The platform's default

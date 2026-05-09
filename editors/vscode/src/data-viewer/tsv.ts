@@ -23,8 +23,15 @@ export function render_tsv(
     formatOn: boolean,
     digits: number,
     resolvedLabels: ResolvedLabels = {},
+    includeHeader: boolean = false,
 ): string {
     const lines: string[] = [];
+    if (includeHeader) {
+        const header = colIndices
+            .map(i => sanitize(columns[i]?.name ?? ''))
+            .join('\t');
+        lines.push(header);
+    }
     for (const row of rows) {
         const parts: string[] = [];
         for (let j = 0; j < row.length; j++) {

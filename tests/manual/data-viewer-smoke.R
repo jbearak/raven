@@ -15,7 +15,7 @@ View(big)
 # install.packages("haven")   # if needed
 if (requireNamespace("haven", quietly = TRUE)) {
   # Downloads ~500 KB; skip if already cached.
-  url  <- "https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/DEMO_J.XPT"
+  url  <- "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2017/DataFiles/DEMO_J.xpt"
   dest <- tempfile(fileext = ".xpt")
   download.file(url, dest, mode = "wb")
   nhanes <- haven::read_xpt(dest)   # labelled vectors with variable-label attrs

@@ -273,7 +273,7 @@ html, body, #root {
     cursor: default;
 }
 .cell.corner-cell {
-    cursor: default;
+    cursor: pointer;
 }
 .header-row .cell.rowname-col {
     z-index: 3; /* above sticky body cells */
