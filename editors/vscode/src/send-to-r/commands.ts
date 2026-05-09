@@ -87,7 +87,7 @@ async function handle_send(mode: SendMode): Promise<void> {
     if (mode === 'file') {
         terminal.sendText(code);
     } else {
-        send_code(terminal, code, get_send_method());
+        send_code(terminal, code, get_send_options());
     }
 
     if (advance_to_line !== null) {
@@ -114,7 +114,7 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
     if (mode === 'file') {
         terminal.sendText(code);
     } else {
-        send_code(terminal, code, get_send_method());
+        send_code(terminal, code, get_send_options());
     }
 
     if (advance_to_line !== null) {
@@ -122,18 +122,30 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
     }
 }
 
-function get_send_method(): SendMethod {
-    return vscode.workspace
-        .getConfiguration('raven.sendToR')
-        .get<SendMethod>('sendMethod', 'auto');
+interface SendOptions {
+    sendMethod: SendMethod;
+    autoTempFileThresholdLines: number;
+}
+
+function get_send_options(): SendOptions {
+    const config = vscode.workspace.getConfiguration('raven.sendToR');
+    return {
+        sendMethod: config.get<SendMethod>('sendMethod', 'auto'),
+        autoTempFileThresholdLines: config.get<number>('autoTempFileThresholdLines', 25),
+    };
 }
 
 function send_code(
     terminal: vscode.Terminal,
     code: string,
-    sendMethod: SendMethod,
+    options: SendOptions,
 ): void {
-    switch (choose_send_transport(code, sendMethod)) {
+    const transport = choose_send_transport(
+        code,
+        options.sendMethod,
+        options.autoTempFileThresholdLines,
+    );
+    switch (transport) {
         case 'direct-paste':
             terminal.sendText(code);
             return;

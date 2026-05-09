@@ -47,7 +47,7 @@ A toolbar button (▶) appears in the editor title bar for R files, providing qu
 - **Main commands** — Send code to the managed R (Raven) terminal. If no R terminal is open, one is created automatically.
 - **Terminal submenu** — Send code to whatever terminal is currently active in VS Code, regardless of type. This is useful for sending commands to R running inside `tmux`, a Docker container, or any other terminal session that isn't the extension's built-in R terminal.
 
-Code sent via the Terminal submenu follows the same send method as the main commands. By default, Raven pastes single-line code directly and writes multi-line code to a temporary file, executing it with `source()`. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
+Code sent via the Terminal submenu follows the same send method as the main commands. By default, Raven pastes short blocks directly and writes longer blocks to a temporary file, executing them with `source()`. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
 
 ## Statement Detection
 
@@ -85,16 +85,18 @@ By default, the cursor advances to the next line after sending a single statemen
 
 ## Send Method
 
-By default (`auto`), Raven pastes single-line code directly and writes multi-line code to a temporary file, executing it with `source()`. Override this with `raven.sendToR.sendMethod`:
+By default (`auto`), Raven pastes short blocks directly and switches to a temporary file once a block has at least `raven.sendToR.autoTempFileThresholdLines` lines (≥ N — default 25, so paste up to 24 lines, temp-file 25 or more), running it with `source()`. Override this with `raven.sendToR.sendMethod`:
 
 - **`paste`** — always pastes. For multi-line code, uses bracketed paste mode to deliver the block as a single unit.
 - **`tempfile`** — always writes to a temp file and runs `source()`. Use this for maximum consistency, or when even single-line paste is unreliable.
 
-**Why Raven defaults to temp files for multi-line code**
+**Why `auto` switches to a temp file for larger blocks**
 
-When multi-line code is pasted, the terminal delivers characters to R's stdin faster than readline can process them, which can silently drop or corrupt lines. This affects the standard R console as well as arf and radian. Writing to a temp file sidesteps this entirely: R reads from disk rather than stdin, so there is no terminal paste-buffer race, no practical paste-size limit from stdin buffering, and no sensitivity to connection speed.
+Pasting works well for short blocks. For longer blocks it gets slow — the terminal feeds characters to R's stdin one at a time, so code that would run instantly via `source()` can take noticeably longer to type out. Pasting can also be unreliable over remote sessions (SSH, VS Code Remote, mosh): if too many lines arrive at once they sometimes get garbled.
 
-`source(echo = TRUE)` also produces cleaner output: code is echoed line-by-line with `+` continuation prompts, matching how R normally displays interactive input.
+Writing larger blocks to a temp file and `source()`-ing them sidesteps both: R reads from disk, so there is no paste-buffer slowdown and no remote-terminal garbling. `source(echo = TRUE)` also produces cleaner output, with `+` continuation prompts matching how R normally displays interactive input.
+
+The cutover point is controlled by `raven.sendToR.autoTempFileThresholdLines` — a block with at least this many lines (≥ N) goes through a temp file; smaller blocks are pasted. The default of 25 is arbitrary but reasonable — most blocks below it paste fast and reliably on a local terminal. Lower it for slow remote connections; raise it if you prefer to see your code echoed in the terminal. Setting it to 2 reproduces the prior behavior of always temp-filing any multi-line block.
 
 REditorSupport pastes directly for all code. If you prefer that behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
 
@@ -105,6 +107,7 @@ REditorSupport pastes directly for all code. If you prefer that behavior — for
 | `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"`, `"arf"`, or `"radian"` |
 | `raven.sendToR.advanceCursorOnSend` | boolean | `true` | Advance cursor to next line after sending a single statement |
 | `raven.sendToR.sendMethod` | enum | `"auto"` | How code is sent to R: `"auto"`, `"paste"`, or `"tempfile"` |
+| `raven.sendToR.autoTempFileThresholdLines` | integer | `25` | In `auto` mode, blocks with **≥ N lines** use a temp file; smaller blocks are pasted (so `25` means: paste up to 24 lines, temp-file 25 or more) |
 
 ## Plot Viewer
 
