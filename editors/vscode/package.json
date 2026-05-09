@@ -94,13 +94,13 @@
         "command": "raven.runLineOrSelection",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "editorTextFocus && editorLangId == r"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
       },
       {
         "command": "raven.sourceFile",
         "key": "shift+ctrl+enter",
         "mac": "shift+cmd+enter",
-        "when": "editorTextFocus && editorLangId == r"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
       }
     ],
     "submenus": [
@@ -118,7 +118,7 @@
       "editor/title": [
         {
           "submenu": "raven.sendToR",
-          "when": "editorLangId == r",
+          "when": "editorLangId == r && raven.rConsoleEnabled",
           "group": "navigation"
         }
       ],

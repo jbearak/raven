@@ -43,6 +43,7 @@ function getInitializationOptions(): RavenInitializationOptions {
 }
 
 let client: LanguageClient;
+const R_CONSOLE_ENABLED_CONTEXT = 'raven.rConsoleEnabled';
 const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
 const DOT_IN_WORD_LANGUAGE_IDS = ['r', 'jags'] as const;
 
@@ -178,6 +179,11 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // Positron, so Raven supplements rather than fights existing R-session
     // setups. The help viewer activates regardless and is wired above.
     const r_console_resolved = resolveRConsoleActivation();
+    void vscode.commands.executeCommand(
+        'setContext',
+        R_CONSOLE_ENABLED_CONTEXT,
+        r_console_resolved === 'enabled',
+    );
     let data_viewer_manager: DataViewerManager | undefined;
     if (r_console_resolved === 'enabled') {
         // Plot services (session server + viewer panel) for managed R terminals.
