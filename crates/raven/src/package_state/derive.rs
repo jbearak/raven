@@ -101,24 +101,36 @@ fn merge_namespace_model(
     // tags to the package-wide namespace model — mirroring the path filter
     // used by `build_scope_contribution`.
     let r_dir = workspace_root.join("R");
+
+    // Dedup against a HashSet rather than scanning the accumulating Vec —
+    // previously each insert did a linear scan of the growing `imports`
+    // Vec (O(files × imports²) overall). Mirrors the strategy used by
+    // `namespace_model_from_roxygen`. We seed each set with the entries
+    // already parsed out of NAMESPACE so roxygen tags that duplicate
+    // NAMESPACE entries aren't re-appended.
+    let mut seen_imports: std::collections::HashSet<(String, String)> =
+        model.imports.iter().cloned().collect();
+    let mut seen_full: std::collections::HashSet<String> =
+        model.full_imports.iter().cloned().collect();
+
     for (path, facts) in r_file_facts {
         if !path.starts_with(&r_dir) {
             continue;
         }
         for sym in &facts.roxygen_namespace.exports {
-            if !model.exports.contains(sym) {
-                model.exports.insert(sym.clone());
-            }
+            // `exports` is a HashSet, so `insert` is idempotent and O(1)
+            // — no need for a prior `contains` check.
+            model.exports.insert(sym.clone());
         }
         // RoxygenNamespace::import_from → PackageNamespaceModel::imports (Vec<(pkg, sym)>)
         for (pkg, sym) in &facts.roxygen_namespace.import_from {
-            if !model.imports.iter().any(|(p, s)| p == pkg && s == sym) {
+            if seen_imports.insert((pkg.clone(), sym.clone())) {
                 model.imports.push((pkg.clone(), sym.clone()));
             }
         }
         // RoxygenNamespace::imports (full package imports) → PackageNamespaceModel::full_imports
         for pkg in &facts.roxygen_namespace.imports {
-            if !model.full_imports.contains(pkg) {
+            if seen_full.insert(pkg.clone()) {
                 model.full_imports.push(pkg.clone());
             }
         }
@@ -492,5 +504,130 @@ mod tests {
             "NAMESPACE without DESCRIPTION must not inject importFrom symbols");
         assert!(s.scope_contribution.full_imports.is_empty(),
             "NAMESPACE without DESCRIPTION must not inject full imports");
+    }
+
+    // ------------------------------------------------------------------
+    // merge_namespace_model correctness & perf regression
+    // ------------------------------------------------------------------
+
+    /// Roxygen tags duplicated across R files must dedupe in the merged
+    /// namespace model, and the NAMESPACE-seeded entries must also be
+    /// deduped against (no double-counting).
+    #[test]
+    fn merge_namespace_model_dedupes_duplicate_import_from_and_full_imports() {
+        use std::path::PathBuf;
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: pkg\n");
+        inputs.namespace = Some(NamespaceInput {
+            path: "/work/pkg/NAMESPACE".into(),
+            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
+        });
+        // Three R files each repeating the same @importFrom and @import
+        // tags that NAMESPACE already provides.
+        for n in 0..3 {
+            let path: PathBuf = format!("/work/pkg/R/file{}.R", n).into();
+            let text: Arc<str> = "\
+#' @importFrom dplyr filter
+#' @import ggplot2
+foo <- function() 1
+"
+            .to_string()
+            .into();
+            inputs.r_files.insert(
+                path,
+                RFileInput {
+                    kind: RFileKind::Source,
+                    origin: ContentOrigin::Disk,
+                    text: text.clone(),
+                    content_digest: ContentDigest::of(&text),
+                },
+            );
+        }
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let ns = s.namespace_model.as_ref().expect("namespace model built");
+
+        let filter_count = ns
+            .imports
+            .iter()
+            .filter(|(p, sym)| p == "dplyr" && sym == "filter")
+            .count();
+        assert_eq!(
+            filter_count, 1,
+            "(dplyr, filter) must appear exactly once after dedupe; got: {:?}",
+            ns.imports,
+        );
+
+        let ggplot_count = ns.full_imports.iter().filter(|p| p.as_str() == "ggplot2").count();
+        assert_eq!(
+            ggplot_count, 1,
+            "ggplot2 must appear exactly once in full_imports after dedupe; got: {:?}",
+            ns.full_imports,
+        );
+    }
+
+    /// Perf regression: `merge_namespace_model` must not be quadratic in
+    /// the number of `@importFrom` entries contributed across R files.
+    ///
+    /// Before the HashSet dedup fix, a 500-file package with ~5 imports
+    /// each (2500 total) would linear-scan the growing Vec on every
+    /// insertion: ~2500 × ~1250 average Vec length ≈ 3M pair comparisons
+    /// per derive — observed at multiple ms under the write lock.
+    /// 5 seconds is an extremely generous ceiling chosen to be robust on
+    /// the slowest CI hardware; a quadratic regression would blow past it.
+    #[test]
+    fn merge_namespace_model_is_linear_in_total_imports() {
+        use std::path::PathBuf;
+
+        let n_files = 500usize;
+        let imports_per_file = 10usize;
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: pkg\n");
+        for f in 0..n_files {
+            // Each file gets a unique set of `@importFrom` pairs (no dedupe
+            // shortcut across files) plus a few shared pairs (exercise the
+            // dedupe path on the already-seen set).
+            let mut body = String::new();
+            for i in 0..imports_per_file {
+                body.push_str(&format!(
+                    "#' @importFrom pkg{}_of_{} sym{}\n",
+                    i % 20,
+                    f,
+                    i,
+                ));
+            }
+            body.push_str("foo <- function() 1\n");
+            let path: PathBuf = format!("/work/pkg/R/file{}.R", f).into();
+            let text: Arc<str> = body.into();
+            inputs.r_files.insert(
+                path,
+                RFileInput {
+                    kind: RFileKind::Source,
+                    origin: ContentOrigin::Disk,
+                    text: text.clone(),
+                    content_digest: ContentDigest::of(&text),
+                },
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let _ = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "derive_package_state took {:?} for {} files × {} imports — \
+             suspected quadratic regression in merge_namespace_model",
+            elapsed,
+            n_files,
+            imports_per_file,
+        );
     }
 }
