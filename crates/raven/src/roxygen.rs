@@ -1171,24 +1171,24 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
 
             if tag_line == "@export" {
                 has_export = true;
-            } else if let Some(rest) = tag_line.strip_prefix("@export ") {
+            } else if tag_line.starts_with("@export") && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace()) {
                 has_export = true;
-                let name = rest.trim();
+                let name = tag_line[7..].trim();
                 if !name.is_empty() {
                     explicit_export_names.push(name.to_string());
                 }
-            } else if let Some(rest) = tag_line.strip_prefix("@import ") {
+            } else if tag_line.starts_with("@import") && !tag_line.starts_with("@importFrom") && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace()) {
                 // @import pkg1 pkg2 ...
-                for pkg in rest.split_whitespace() {
+                for pkg in tag_line[7..].split_whitespace() {
                     if !pkg.is_empty() {
                         ns.imports.push(pkg.to_string());
                     }
                 }
             } else if tag_line == "@import" {
                 // bare @import with no args — ignore
-            } else if let Some(rest) = tag_line.strip_prefix("@importFrom ") {
+            } else if tag_line.starts_with("@importFrom") && tag_line.as_bytes().get(11).map_or(false, |b| b.is_ascii_whitespace()) {
                 // @importFrom pkg sym1 sym2 ...
-                let mut parts = rest.split_whitespace();
+                let mut parts = tag_line[11..].split_whitespace();
                 if let Some(pkg) = parts.next() {
                     for sym in parts {
                         if !sym.is_empty() {
@@ -1531,5 +1531,30 @@ bar <- function() {}
         // When explicit names exist, they override auto-detection
         assert!(ns.exports.contains(&"alias".to_string()));
         assert_eq!(ns.exports.len(), 1);
+    }
+
+    #[test]
+    fn export_with_tab_separator() {
+        // @export followed by a tab should still be recognized
+        let content = "#' @export\tfoo_name\nbar <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo_name"]);
+    }
+
+    #[test]
+    fn import_with_tab_separator() {
+        // @import followed by a tab should still be recognized
+        let content = "#' @import\tdplyr\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.imports, vec!["dplyr"]);
+    }
+
+    #[test]
+    fn import_from_with_tab_separator() {
+        // @importFrom followed by a tab should still be recognized
+        let content = "#' @importFrom\tdplyr\tmutate filter\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
     }
 }

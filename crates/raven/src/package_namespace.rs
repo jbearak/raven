@@ -49,6 +49,7 @@ pub struct PackageNamespaceModel {
 /// Returns `Some(PackageWorkspace)` if a valid DESCRIPTION file with a
 /// `Package:` field exists at `workspace_root`. The `roxygen_managed` flag
 /// is set by scanning `R/*.R` files for `#' @export`.
+#[cfg(test)]
 pub fn detect_package_workspace(workspace_root: &Path) -> Option<PackageWorkspace> {
     let description_path = workspace_root.join("DESCRIPTION");
     let content = std::fs::read_to_string(&description_path).ok()?;
@@ -85,6 +86,7 @@ pub fn detect_package_workspace_with_content<'a>(
 }
 
 /// Check if any `R/*.R` file contains `#' @export`.
+#[cfg(test)]
 fn detect_roxygen_usage(workspace_root: &Path) -> bool {
     let r_dir = workspace_root.join("R");
     let Ok(entries) = std::fs::read_dir(&r_dir) else {
@@ -245,9 +247,14 @@ fn count_unquoted_parens(s: &str) -> (usize, usize) {
 
 fn normalize_multiline(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
+    let mut depth: usize = 0; // cumulative unbalanced open-paren depth
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            if depth > 0 {
+                // Inside unbalanced parens — skip blank line
+                continue;
+            }
             out.push('\n');
             continue;
         }
@@ -255,35 +262,31 @@ fn normalize_multiline(content: &str) -> String {
         let effective = strip_trailing_comment(trimmed);
         let effective = effective.trim();
         if effective.is_empty() || effective.starts_with('#') {
-            // Pure comment line — but if we're inside an unbalanced directive, skip it
-            if out.ends_with('\n') {
-                let last_line_start = out[..out.len() - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let last_line = &out[last_line_start..out.len() - 1];
-                let (open, close) = count_unquoted_parens(last_line);
-                if open > close {
-                    // Inside unbalanced parens — skip comment line entirely
-                    continue;
-                }
+            if depth > 0 {
+                // Inside unbalanced parens — skip comment line entirely
+                continue;
             }
             out.push_str(trimmed);
             out.push('\n');
             continue;
         }
-        // If previous line has unbalanced parens, join
-        if out.ends_with('\n') {
-            let last_line_start = out[..out.len() - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let last_line = &out[last_line_start..out.len() - 1];
-            let (open, close) = count_unquoted_parens(last_line);
-            if open > close {
-                // Remove trailing newline and append this line
-                out.pop(); // remove '\n'
-                out.push_str(effective);
-                out.push('\n');
-                continue;
+        // If we're inside unbalanced parens, join to previous line
+        if depth > 0 {
+            // Remove trailing newline and append this line
+            if out.ends_with('\n') {
+                out.pop();
             }
+            out.push_str(effective);
+            out.push('\n');
+        } else {
+            out.push_str(effective);
+            out.push('\n');
         }
-        out.push_str(effective);
-        out.push('\n');
+        // Update depth from the current accumulated last line
+        let last_line_start = out[..out.len() - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let last_line = &out[last_line_start..out.len() - 1];
+        let (open, close) = count_unquoted_parens(last_line);
+        depth = open.saturating_sub(close);
     }
     out
 }
@@ -483,5 +486,24 @@ S3method(print, myclass)
         let model = namespace_model_from_content(content);
         assert!(model.exports.contains("[.myclass"), "should unquote generic in S3method");
         assert!(model.exports.contains("print.my.class"), "should unquote class in S3method");
+    }
+
+    #[test]
+    fn namespace_multiline_with_blank_line() {
+        // Blank lines inside a multiline directive should not break joining
+        let content = "importFrom(dplyr,\n\n  mutate,\n  filter)\nexport(foo)\n";
+        let model = namespace_model_from_content(content);
+        assert!(model.imports.contains(&("dplyr".into(), "mutate".into())),
+            "blank line inside multiline directive should not break parsing");
+        assert!(model.imports.contains(&("dplyr".into(), "filter".into())));
+        assert!(model.exports.contains("foo"));
+    }
+
+    #[test]
+    fn namespace_multiline_with_multiple_blank_lines() {
+        // Multiple blank lines inside a multiline directive
+        let content = "importFrom(dplyr,\n\n\n  mutate)\n";
+        let model = namespace_model_from_content(content);
+        assert!(model.imports.contains(&("dplyr".into(), "mutate".into())));
     }
 }
