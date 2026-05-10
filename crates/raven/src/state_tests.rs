@@ -503,7 +503,7 @@ mod package_cache_cleanup_tests {
     #[test]
     fn rebuild_namespace_model_removes_deleted_file_imports() {
         let mut state = WorldState::new(Vec::new());
-        state.package_workspace = Some(crate::package_namespace::PackageWorkspace {
+        state.package_state.workspace = Some(crate::package_namespace::PackageWorkspace {
             name: "testpkg".to_string(),
             root: PathBuf::from("/tmp/testpkg"),
             roxygen_managed: true,

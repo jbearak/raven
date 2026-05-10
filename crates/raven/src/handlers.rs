@@ -252,7 +252,7 @@ impl DiagnosticsSnapshot {
                 // In package mode, workspace_imports (importFrom) should only
                 // suppress diagnostics for files under R/ — test files,
                 // vignettes, and scripts must use library() explicitly.
-                let suppress_for_this_file = state.package_workspace.as_ref().map_or(
+                let suppress_for_this_file = state.package_workspace().map_or(
                     true, // non-package mode: preserve legacy behavior (suppress for all)
                     |pkg| uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
                 );
@@ -273,7 +273,7 @@ impl DiagnosticsSnapshot {
             package_full_imports: {
                 // Only provide NAMESPACE imports for files under R/ — test files,
                 // vignettes, and scripts must use library() explicitly.
-                let in_r_dir = state.package_workspace.as_ref().is_some_and(|pkg| {
+                let in_r_dir = state.package_workspace().is_some_and(|pkg| {
                     uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
                 });
                 if in_r_dir {
@@ -340,7 +340,7 @@ fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> Arc<HashSe
     // NOTE: empty_base_exports() returns an *empty* HashSet (the name is historical).
     // This is correct — when not in package mode or outside R/, we want an empty set
     // so no symbols are suppressed from diagnostics.
-    let Some(ref pkg) = state.package_workspace else {
+    let Some(pkg) = state.package_workspace() else {
         return empty_base_exports().clone();
     };
 
@@ -9356,7 +9356,7 @@ pub fn completion(
     }
 
     // Add package-internal symbols (from other R/*.R files in package mode)
-    if let Some(ref pkg) = state.package_workspace {
+    if let Some(pkg) = state.package_workspace() {
         if let Ok(file_path) = uri.to_file_path() {
             let r_dir = pkg.root.join("R");
             if file_path.starts_with(&r_dir) {

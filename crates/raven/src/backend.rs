@@ -1289,7 +1289,7 @@ impl LanguageServer for Backend {
                             }
                             // Rebuild namespace model from the merged cache so open files'
                             // fresher roxygen tags are reflected in workspace_imports.
-                            if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
+                            if state.package_workspace().is_some_and(|p| p.roxygen_managed) {
                                 state.rebuild_namespace_model_from_cache();
                             }
                             state.rebuild_package_internal_symbols_cache();
@@ -1894,7 +1894,7 @@ impl LanguageServer for Backend {
                 // updated exports immediately (open doc is now authoritative).
                 // Only rebuild if the file is under R/ — files outside R/ don't
                 // contribute to the package-internal symbols cache.
-                if let Some(ref pkg) = state.package_workspace {
+                if let Some(pkg) = state.package_workspace() {
                     if uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R"))) {
                         state.rebuild_package_internal_symbols_cache();
                     }
@@ -1909,7 +1909,7 @@ impl LanguageServer for Backend {
             // (e.g., external edit), revalidate sibling R/ files so they pick
             // up added/removed symbols via mutual visibility.
             if interface_changed {
-                if let Some(ref pkg) = state.package_workspace {
+                if let Some(pkg) = state.package_workspace() {
                     if let Ok(fp) = uri.to_file_path() {
                         let r_dir = pkg.root.join("R");
                         if fp.starts_with(&r_dir) {
@@ -2596,7 +2596,7 @@ impl LanguageServer for Backend {
             // roxygen-managed package. This ensures @import/@importFrom edits
             // take effect immediately without waiting for DESCRIPTION/NAMESPACE touch.
             let mut package_namespace_changed = false;
-            let pkg_r_dir = state.package_workspace.as_ref().map(|pkg| pkg.root.join("R"));
+            let pkg_r_dir = state.package_workspace().map(|pkg| pkg.root.join("R"));
             if let Some(r_dir) = pkg_r_dir {
                 if let Ok(file_path) = uri.to_file_path() {
                     if file_path.starts_with(&r_dir) {
@@ -2629,7 +2629,7 @@ impl LanguageServer for Backend {
                                         || !ns.imports.is_empty()
                                         || !ns.import_from.is_empty()
                                 });
-                                if let Some(ref mut pkg) = state.package_workspace {
+                                if let Some(ref mut pkg) = state.package_state.workspace {
                                     if pkg.roxygen_managed != any_tags {
                                         pkg.roxygen_managed = any_tags;
                                         log::info!(
@@ -2639,12 +2639,12 @@ impl LanguageServer for Backend {
                                         );
                                     }
                                 }
-                                if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
+                                if state.package_workspace().is_some_and(|p| p.roxygen_managed) {
                                     // If transitioning false→true, populate cache from
                                     // all R/*.R files (open docs + file cache) so the
                                     // model isn't built from just the one edited file.
                                     if state.roxygen_tags_cache.len() <= 1 {
-                                        if let Some(ref pkg) = state.package_workspace {
+                                        if let Some(pkg) = state.package_workspace() {
                                             let pkg_r_dir2 = pkg.root.join("R");
                                             // Scan open documents for roxygen tags
                                             let open_r_uris: Vec<Url> = state.documents.keys()
@@ -2689,7 +2689,7 @@ impl LanguageServer for Backend {
                                     }
                                     package_namespace_changed =
                                         state.rebuild_namespace_model_from_cache();
-                                } else if state.package_workspace.is_some() {
+                                } else if state.package_workspace().is_some() {
                                     // roxygen_managed transitioned to false: fall back to
                                     // NAMESPACE file for import information.
                                     // Clear the cache so a future false→true transition
@@ -2698,7 +2698,7 @@ impl LanguageServer for Backend {
                                     // Avoid blocking I/O under the write lock: try the file
                                     // cache first, fall back to empty model (the watcher task
                                     // will pick up the NAMESPACE file on next change).
-                                    let ns_model = state.package_workspace.as_ref()
+                                    let ns_model = state.package_workspace()
                                         .and_then(|pkg| {
                                             let ns_uri = Url::from_file_path(pkg.root.join("NAMESPACE")).ok()?;
                                             state.cross_file_file_cache.get(&ns_uri)
@@ -2743,7 +2743,7 @@ impl LanguageServer for Backend {
                 // Rebuild the cached package-internal symbols when exports change.
                 // Only rebuild if the file is under R/ — files outside R/ don't
                 // contribute to the package-internal symbols cache.
-                if let Some(ref pkg) = state.package_workspace {
+                if let Some(pkg) = state.package_workspace() {
                     if uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R"))) {
                         state.rebuild_package_internal_symbols_cache();
                     }
@@ -2792,7 +2792,7 @@ impl LanguageServer for Backend {
             // When the roxygen namespace model changed, all open package R
             // files need revalidation so @import/@importFrom edits propagate.
             if package_namespace_changed {
-                if let Some(ref pkg) = state.package_workspace {
+                if let Some(pkg) = state.package_workspace() {
                     let r_dir = pkg.root.join("R");
                     for open_uri in state.documents.keys() {
                         if let Ok(p) = open_uri.to_file_path() {
@@ -2808,7 +2808,7 @@ impl LanguageServer for Backend {
             // (not the source() graph). Revalidate them so added/removed
             // symbols propagate to undefined-variable diagnostics.
             if interface_changed && !package_namespace_changed {
-                if let Some(ref pkg) = state.package_workspace {
+                if let Some(pkg) = state.package_workspace() {
                     if let Ok(fp) = uri.to_file_path() {
                         let r_dir = pkg.root.join("R");
                         if fp.starts_with(&r_dir) {
@@ -3046,7 +3046,7 @@ impl LanguageServer for Backend {
         // The cache rebuild is sufficient: siblings pick up the updated cache on
         // their next diagnostic cycle (edit or reopen). Eagerly republishing all
         // siblings on every close would be expensive and disruptive.
-        if let Some(ref pkg) = state.package_workspace {
+        if let Some(pkg) = state.package_workspace() {
             if let Ok(p) = uri.to_file_path() {
                 if p.starts_with(pkg.root.join("R")) {
                     // Refresh roxygen_tags_cache from the on-disk snapshot
@@ -3232,7 +3232,7 @@ impl LanguageServer for Backend {
                 use crate::cross_file::config::PackageMode;
                 let mode = state.cross_file_config.package_mode;
                 if mode == PackageMode::Disabled {
-                    state.package_workspace = None;
+                    state.package_state.workspace = None;
                     state.package_namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
                     state.package_internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
@@ -3394,7 +3394,7 @@ impl LanguageServer for Backend {
                 state.package_namespace_model = None;
                 state.workspace_imports = std::sync::Arc::new(Vec::new());
             }
-            state.package_workspace = new_ws;
+            state.package_state.workspace = new_ws;
             state.rebuild_package_internal_symbols_cache();
             log::info!("Rebuilt package state after packageMode change to {:?}", mode);
         }
@@ -3634,7 +3634,7 @@ impl LanguageServer for Backend {
                         state.cross_file_meta.remove(uri);
 
                         // Remove stale roxygen tags for deleted R/*.R files
-                        if let Some(ref pkg) = state.package_workspace {
+                        if let Some(pkg) = state.package_workspace() {
                             if pkg.roxygen_managed {
                                 if let Ok(p) = uri.to_file_path() {
                                     if p.starts_with(pkg.root.join("R")) {
@@ -3658,8 +3658,8 @@ impl LanguageServer for Backend {
             if to_update.is_empty() {
                 // Rebuild package caches after deletions so stale symbols
                 // and imports from deleted R/*.R files are removed.
-                if state.package_workspace.is_some() {
-                    if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
+                if state.package_workspace().is_some() {
+                    if state.package_workspace().is_some_and(|p| p.roxygen_managed) {
                         // Check if roxygen_managed should transition to false
                         // (last file with tags was deleted).
                         let any_tags = state.roxygen_tags_cache.values().any(|ns| {
@@ -3668,14 +3668,14 @@ impl LanguageServer for Backend {
                                 || !ns.import_from.is_empty()
                         });
                         if !any_tags {
-                            if let Some(ref mut pkg) = state.package_workspace {
+                            if let Some(ref mut pkg) = state.package_state.workspace {
                                 pkg.roxygen_managed = false;
                                 log::info!("roxygen_managed transitioned to false after file deletion");
                             }
                             // Clear cache so future false→true transition repopulates.
                             state.roxygen_tags_cache.clear();
                             // Fall back to NAMESPACE file (try file cache first)
-                            let ns_model = state.package_workspace.as_ref()
+                            let ns_model = state.package_workspace()
                                 .and_then(|pkg| {
                                     let ns_uri = Url::from_file_path(pkg.root.join("NAMESPACE")).ok()?;
                                     state.cross_file_file_cache.get(&ns_uri)
@@ -3850,7 +3850,7 @@ impl LanguageServer for Backend {
                     state.package_namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
                 }
-                state.package_workspace = new_ws;
+                state.package_state.workspace = new_ws;
                 state.rebuild_package_internal_symbols_cache();
                 // Force republish for all open R files
                 let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
@@ -3865,7 +3865,7 @@ impl LanguageServer for Backend {
                 );
             } else {
                 let mut state = self.state.write().await;
-                state.package_workspace = None;
+                state.package_state.workspace = None;
                 state.package_namespace_model = None;
                 state.workspace_imports = std::sync::Arc::new(Vec::new());
                 state.rebuild_package_internal_symbols_cache();
@@ -4068,7 +4068,7 @@ impl LanguageServer for Backend {
                 // (e.g. git checkout) propagate to the namespace model.
                 {
                     let mut state = state_arc.write().await;
-                    if let Some(ref pkg) = state.package_workspace {
+                    if let Some(pkg) = state.package_workspace() {
                         let r_dir_for_check = pkg.root.join("R");
                         let has_r_files = uris_to_update.iter().any(|u| {
                             u.to_file_path().ok().is_some_and(|p| p.starts_with(&r_dir_for_check))
@@ -4107,7 +4107,7 @@ impl LanguageServer for Backend {
                                     || !ns.imports.is_empty()
                                     || !ns.import_from.is_empty()
                             });
-                            if let Some(ref mut pkg) = state.package_workspace {
+                            if let Some(ref mut pkg) = state.package_state.workspace {
                                 if pkg.roxygen_managed != any_tags {
                                     pkg.roxygen_managed = any_tags;
                                     ns_changed = true;
@@ -4121,7 +4121,7 @@ impl LanguageServer for Backend {
                             if ns_changed {
                                 state.rebuild_namespace_model_from_cache();
                                 // Add all open R/ files to affected set
-                                let r_dir = state.package_workspace.as_ref().unwrap().root.join("R");
+                                let r_dir = state.package_workspace().unwrap().root.join("R");
                                 for open_uri in state.documents.keys() {
                                     if let Ok(p) = open_uri.to_file_path() {
                                         if p.starts_with(&r_dir) && affected_for_async_set.insert(open_uri.clone()) {

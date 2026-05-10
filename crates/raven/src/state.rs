@@ -595,9 +595,8 @@ pub struct WorldState {
     /// dependency mode, undefined variable diagnostics are deferred for files
     /// without explicit backward directives until this flag is true.
     pub workspace_scan_complete: bool,
-    /// R package workspace metadata (Some when DESCRIPTION detected at root).
-    /// Enables mutual visibility for R/*.R files and namespace-based import resolution.
-    pub package_workspace: Option<crate::package_namespace::PackageWorkspace>,
+    /// Container for all derived R package mode state. See package_state.rs.
+    pub package_state: crate::package_state::PackageState,
     /// Package namespace model (exports, imports, full_imports).
     /// Built from roxygen annotations or NAMESPACE file when in package mode.
     pub package_namespace_model: Option<crate::package_namespace::PackageNamespaceModel>,
@@ -609,6 +608,13 @@ pub struct WorldState {
     /// other R/*.R files). Updated incrementally when workspace index entries
     /// change, avoiding O(package_files) work on every diagnostic/completion.
     pub package_internal_symbols_cache: Arc<HashSet<String>>,
+}
+
+impl WorldState {
+    /// Passthrough for legacy `state.package_workspace` reads.
+    pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
+        self.package_state.workspace.as_ref()
+    }
 }
 
 impl WorldState {
@@ -706,7 +712,7 @@ impl WorldState {
             libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_complete: false,
-            package_workspace: None,
+            package_state: crate::package_state::PackageState::new(),
             package_namespace_model: None,
             roxygen_tags_cache: HashMap::new(),
             package_internal_symbols_cache: Arc::new(HashSet::new()),
@@ -782,7 +788,7 @@ impl WorldState {
     /// open URIs from the workspace index scan and merge their live exports
     /// separately.
     pub fn rebuild_package_internal_symbols_cache(&mut self) {
-        let Some(ref pkg) = self.package_workspace else {
+        let Some(pkg) = self.package_workspace() else {
             if !self.package_internal_symbols_cache.is_empty() {
                 self.package_internal_symbols_cache = Arc::new(HashSet::new());
             }
@@ -1072,7 +1078,7 @@ impl WorldState {
         use crate::cross_file::config::PackageMode;
         match self.cross_file_config.package_mode {
             PackageMode::Disabled => {
-                self.package_workspace = None;
+                self.package_state.workspace = None;
                 self.package_namespace_model = None;
                 // Intentionally clear workspace_imports: "disabled" means full script-mode
                 // behavior — NAMESPACE-derived imports are a package concept and should not
@@ -1081,7 +1087,7 @@ impl WorldState {
             }
             PackageMode::Enabled => {
                 // Force package mode even without detection
-                self.package_workspace = pkg_workspace.or_else(|| {
+                self.package_state.workspace = pkg_workspace.or_else(|| {
                     self.workspace_folders.first()
                         .and_then(|u| u.to_file_path().ok())
                         .map(|root| crate::package_namespace::PackageWorkspace {
@@ -1094,7 +1100,7 @@ impl WorldState {
                 // fallback workspace, provide a default model so downstream
                 // code never sees Some(workspace) + None(model).
                 self.package_namespace_model = pkg_ns_model.or_else(|| {
-                    if self.package_workspace.is_some() {
+                    if self.package_workspace().is_some() {
                         Some(crate::package_namespace::PackageNamespaceModel::default())
                     } else {
                         None
@@ -1107,7 +1113,7 @@ impl WorldState {
                 }
             }
             PackageMode::Auto => {
-                self.package_workspace = pkg_workspace;
+                self.package_state.workspace = pkg_workspace;
                 self.package_namespace_model = pkg_ns_model;
                 // Update workspace_imports from the namespace model so roxygen-derived
                 // imports take precedence over the legacy NAMESPACE-file parse.
