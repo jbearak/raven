@@ -3438,6 +3438,18 @@ impl LanguageServer for Backend {
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
                         state.cross_file_meta.remove(uri);
+
+                        // Remove stale roxygen tags for deleted R/*.R files
+                        if let Some(ref pkg) = state.package_workspace {
+                            if pkg.roxygen_managed {
+                                if let Ok(p) = uri.to_file_path() {
+                                    if p.starts_with(pkg.root.join("R")) {
+                                        state.roxygen_tags_cache.remove(&p);
+                                    }
+                                }
+                            }
+                        }
+
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
                     }
                     _ => {}
@@ -3450,6 +3462,15 @@ impl LanguageServer for Backend {
             // has added newly reachable open documents. For DELETED-only
             // batches, the graph is already updated here, so cap and mark now.
             if to_update.is_empty() {
+                // Rebuild package caches after deletions so stale symbols
+                // and imports from deleted R/*.R files are removed.
+                if state.package_workspace.is_some() {
+                    if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
+                        state.rebuild_namespace_model_from_cache();
+                    }
+                    state.rebuild_package_internal_symbols_cache();
+                }
+
                 cap_watched_file_revalidations(
                     &mut affected,
                     &state.cross_file_activity,

@@ -494,3 +494,60 @@ mod preservation {
         }
     }
 }
+
+#[cfg(test)]
+mod package_cache_cleanup_tests {
+    use super::super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn rebuild_namespace_model_removes_deleted_file_imports() {
+        let mut state = WorldState::new(Vec::new());
+        state.package_workspace = Some(crate::package_namespace::PackageWorkspace {
+            name: "testpkg".to_string(),
+            root: PathBuf::from("/tmp/testpkg"),
+            roxygen_managed: true,
+        });
+
+        // Simulate two files with roxygen tags
+        state.roxygen_tags_cache.insert(
+            PathBuf::from("/tmp/testpkg/R/a.R"),
+            crate::roxygen::RoxygenNamespace {
+                exports: vec!["foo".into()],
+                imports: vec!["ggplot2".into()],
+                import_from: vec![("dplyr".into(), "mutate".into())],
+            },
+        );
+        state.roxygen_tags_cache.insert(
+            PathBuf::from("/tmp/testpkg/R/b.R"),
+            crate::roxygen::RoxygenNamespace {
+                exports: vec!["bar".into()],
+                imports: vec![],
+                import_from: vec![("tidyr".into(), "pivot_longer".into())],
+            },
+        );
+
+        state.rebuild_namespace_model_from_cache();
+        let model = state.package_namespace_model.as_ref().unwrap();
+        assert!(model.full_imports.contains(&"ggplot2".to_string()));
+        assert!(model.imports.contains(&("tidyr".into(), "pivot_longer".into())));
+
+        // Simulate deletion of b.R by removing from cache
+        state.roxygen_tags_cache.remove(&PathBuf::from("/tmp/testpkg/R/b.R"));
+        state.rebuild_namespace_model_from_cache();
+
+        let model = state.package_namespace_model.as_ref().unwrap();
+        // ggplot2 should still be there (from a.R)
+        assert!(model.full_imports.contains(&"ggplot2".to_string()));
+        // tidyr import should be gone (was only in b.R)
+        assert!(!model.imports.contains(&("tidyr".into(), "pivot_longer".into())));
+    }
+
+    #[test]
+    fn rebuild_internal_symbols_cache_empty_when_no_package() {
+        let mut state = WorldState::new(Vec::new());
+        // No package_workspace set
+        state.rebuild_package_internal_symbols_cache();
+        assert!(state.package_internal_symbols_cache.is_empty());
+    }
+}

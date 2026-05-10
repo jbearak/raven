@@ -316,16 +316,16 @@ impl DiagnosticsSnapshot {
 /// O(package_files) work on every diagnostic snapshot build.
 fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> Arc<HashSet<String>> {
     let Some(ref pkg) = state.package_workspace else {
-        return Arc::new(HashSet::new());
+        return empty_base_exports().clone();
     };
 
     // Check if the queried URI is under the package's R/ directory
     let Ok(file_path) = uri.to_file_path() else {
-        return Arc::new(HashSet::new());
+        return empty_base_exports().clone();
     };
     let r_dir = pkg.root.join("R");
     if !file_path.starts_with(&r_dir) {
-        return Arc::new(HashSet::new());
+        return empty_base_exports().clone();
     }
 
     // Use the cached set. We could subtract the current file's own exports,
