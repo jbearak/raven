@@ -30,6 +30,27 @@ run_analysis <- function(data) {
 
 Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in mutual visibility.
 
+### Tests directory awareness
+
+Files under `tests/testthat/` get one-way read access to package-internal
+symbols (`R/*.R`) and to symbols imported via NAMESPACE/roxygen. Tests can
+call internal package functions without "undefined variable" diagnostics.
+Symbols defined in test files are not visible from `R/*.R`.
+
+```r
+# R/helpers.R
+process_data <- function(df) { ... }
+
+# tests/testthat/test-helpers.R
+test_that("process_data works", {
+  result <- process_data(mtcars)  # No diagnostic — helper visible from tests
+  expect_equal(nrow(result), nrow(mtcars))
+})
+```
+
+In contrast, a function defined in `tests/testthat/test-helpers.R` is **not**
+visible to `R/helpers.R` — visibility flows tests → R/ but not back.
+
 ### Roxygen Namespace Tags
 
 When roxygen is detected, Raven parses these tags from source:
