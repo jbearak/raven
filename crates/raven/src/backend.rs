@@ -3516,7 +3516,7 @@ impl LanguageServer for Backend {
         }
 
         // Collect URIs to update and affected open documents
-        let (uris_to_update, mut affected_open_docs, pkg_rebuild_info): (Vec<Url>, Vec<Url>, Option<(std::path::PathBuf, crate::cross_file::config::PackageMode)>) = {
+        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (Vec<Url>, Vec<Url>, Vec<(Url, bool)>) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
             let mut affected: Vec<Url> = Vec::new();
@@ -3597,15 +3597,19 @@ impl LanguageServer for Backend {
                         state.cross_file_workspace_index.invalidate(uri);
                         state.cross_file_meta.remove(uri);
 
-                        // Remove stale roxygen tags for deleted R/*.R files
-                        if let Some(pkg) = state.package_workspace() {
-                            if pkg.roxygen_managed {
-                                if let Ok(p) = uri.to_file_path() {
-                                    if p.starts_with(pkg.root.join("R")) {
-                                        state.package_state.roxygen_tags_cache.remove(&p);
-                                    }
-                                }
-                            }
+                        // Update package inputs for deleted R/*.R or DESCRIPTION/NAMESPACE files.
+                        // The event-driven path in the post-loop block handles the derive.
+                        // (Accumulated here; apply_package_event called once after the loop.)
+                        {
+                            let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                uri: uri.clone(),
+                                on_disk_text: None,
+                                deleted: true,
+                            };
+                            crate::package_state::event::translate(
+                                &mut state.package_inputs,
+                                event,
+                            );
                         }
 
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
@@ -3620,39 +3624,11 @@ impl LanguageServer for Backend {
             // has added newly reachable open documents. For DELETED-only
             // batches, the graph is already updated here, so cap and mark now.
             if to_update.is_empty() {
-                // Rebuild package caches after deletions so stale symbols
-                // and imports from deleted R/*.R files are removed.
-                if state.package_workspace().is_some() {
-                    if state.package_workspace().is_some_and(|p| p.roxygen_managed) {
-                        // Check if roxygen_managed should transition to false
-                        // (last file with tags was deleted).
-                        let any_tags = state.package_state.roxygen_tags_cache.values().any(|ns| {
-                            !ns.exports.is_empty()
-                                || !ns.imports.is_empty()
-                                || !ns.import_from.is_empty()
-                        });
-                        if !any_tags {
-                            if let Some(ref mut pkg) = state.package_state.workspace {
-                                pkg.roxygen_managed = false;
-                                log::info!("roxygen_managed transitioned to false after file deletion");
-                            }
-                            // Clear cache so future false→true transition repopulates.
-                            state.package_state.roxygen_tags_cache.clear();
-                            // Fall back to NAMESPACE file (try file cache first)
-                            let ns_model = state.package_workspace()
-                                .and_then(|pkg| {
-                                    let ns_uri = Url::from_file_path(pkg.root.join("NAMESPACE")).ok()?;
-                                    state.cross_file_file_cache.get(&ns_uri)
-                                        .map(|content| crate::package_namespace::namespace_model_from_content(&content))
-                                })
-                                .unwrap_or_default();
-                            state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                            state.package_state.namespace_model = Some(ns_model);
-                        } else {
-                            state.rebuild_namespace_model_from_cache();
-                        }
-                    }
-                    state.rebuild_package_internal_symbols_cache();
+                // Derive package state after processing all deletions.
+                // The translate calls above accumulated input mutations; now
+                // derive the final state from the updated inputs.
+                if state.package_inputs.workspace_root.is_some() {
+                    state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
                 }
 
                 cap_watched_file_revalidations(
@@ -3671,168 +3647,82 @@ impl LanguageServer for Backend {
             // newly unreachable URIs become LRU-evictable again.
             state.recompute_open_neighborhood_pins();
 
-            // Gather info needed for package rebuild (I/O happens outside lock below)
-            let pkg_rebuild_info: Option<(std::path::PathBuf, crate::cross_file::config::PackageMode)> = {
+            // Identify DESCRIPTION/NAMESPACE changes for the event-driven path.
+            // Content is read outside the lock (spawn_blocking) below.
+            let pkg_manifest_changes: Vec<(Url, bool)> = {
                 let workspace_root = state.workspace_folders.first().and_then(|u| u.to_file_path().ok());
-                let pkg_files_changed = workspace_root.as_ref().is_some_and(|root| {
-                    params.changes.iter().any(|c| {
-                        c.uri.to_file_path().ok().is_some_and(|p| {
-                            p == root.join("DESCRIPTION") || p == root.join("NAMESPACE")
+                workspace_root.map(|root| {
+                    params.changes.iter()
+                        .filter_map(|c| {
+                            let p = c.uri.to_file_path().ok()?;
+                            if p == root.join("DESCRIPTION") || p == root.join("NAMESPACE") {
+                                Some((c.uri.clone(), c.typ == FileChangeType::DELETED))
+                            } else {
+                                None
+                            }
                         })
-                    })
-                });
-                if pkg_files_changed {
-                    workspace_root.map(|root| (root, state.cross_file_config.package_mode))
-                } else {
-                    None
-                }
+                        .collect()
+                }).unwrap_or_default()
             };
 
-            (to_update, affected, pkg_rebuild_info)
+            (to_update, affected, pkg_manifest_changes)
         };
 
-        // --- Package namespace rebuild: file I/O outside the write lock ---
-        // Pre-read R/*.R files and detect package workspace without holding
-        // the lock, then re-acquire to apply results.
-        if let Some((root, mode)) = pkg_rebuild_info {
-            use crate::cross_file::config::PackageMode;
-            if mode != PackageMode::Disabled {
-                // Perform all disk I/O on a blocking thread to avoid stalling
-                // the tokio worker (packages can have hundreds of R files).
-                let root_clone = root.clone();
-                let (pkg_name, disk_r_files, has_roxygen, namespace_content) =
-                    tokio::task::spawn_blocking(move || {
-                        let pkg_name = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                            .ok()
-                            .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
-
-                        let r_dir = root_clone.join("R");
-                        let mut disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
-                        let mut has_roxygen = false;
-                        if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                                    let content = std::fs::read_to_string(&path).ok();
-                                    if !has_roxygen {
-                                        if let Some(ref c) = content {
-                                            if crate::roxygen::has_roxygen_namespace_tags(c) {
-                                                has_roxygen = true;
-                                            }
-                                        }
-                                    }
-                                    disk_r_files.push((path, content));
-                                }
-                            }
-                        }
-
-                        // Determine NAMESPACE content for non-roxygen packages.
-                        // We can't know roxygen_managed until we've scanned, so
-                        // read NAMESPACE unconditionally (cheap single file).
-                        let namespace_content = std::fs::read_to_string(root_clone.join("NAMESPACE")).ok();
-
-                        (pkg_name, disk_r_files, has_roxygen, namespace_content)
-                    })
-                    .await
-                    .unwrap_or((None, Vec::new(), false, None));
-
-                let new_ws = match (mode, pkg_name) {
-                    (PackageMode::Auto, Some(name)) => Some(crate::package_namespace::PackageWorkspace {
-                        name,
-                        root: root.clone(),
-                        roxygen_managed: has_roxygen,
-                    }),
-                    (PackageMode::Auto, None) => None,
-                    (PackageMode::Enabled, name) => Some(crate::package_namespace::PackageWorkspace {
-                        name: name.unwrap_or_else(|| "unknown".to_string()),
-                        root: root.clone(),
-                        roxygen_managed: has_roxygen,
-                    }),
-                    (PackageMode::Disabled, _) => unreachable!(),
-                };
-
-                // Re-acquire write lock to apply results
-                let mut state = self.state.write().await;
-                // Supplement disk-only has_roxygen with open document content
-                // (an unsaved file may have the only roxygen tags).
-                let has_roxygen_from_open = if !has_roxygen {
-                    let r_dir_check = root.join("R");
-                    state.documents.keys().any(|u| {
-                        u.to_file_path().ok().is_some_and(|p| {
-                            p.starts_with(&r_dir_check)
-                                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                                && state.documents.get(u).is_some_and(|d| crate::roxygen::has_roxygen_namespace_tags(&d.text()))
+        // --- Package manifest (DESCRIPTION/NAMESPACE) event-driven update ---
+        // For each changed manifest file, read content outside the lock then
+        // translate into package input mutations and re-derive state.
+        if !pkg_manifest_changes.is_empty() {
+            let mut manifest_contents: Vec<(Url, Option<std::sync::Arc<str>>, bool)> = Vec::new();
+            for (uri, deleted) in &pkg_manifest_changes {
+                let on_disk_text = if *deleted {
+                    None
+                } else {
+                    let path = uri.to_file_path().ok();
+                    if let Some(path) = path {
+                        let path_clone = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::read_to_string(path_clone).ok()
+                                .map(|s| std::sync::Arc::from(s.as_str()))
                         })
-                    })
-                } else {
-                    true
-                };
-                // Update roxygen_managed on the workspace if open docs changed it
-                let new_ws = new_ws.map(|mut ws| {
-                    ws.roxygen_managed = has_roxygen_from_open;
-                    ws
-                });
-                if let Some(ref ws) = new_ws {
-                    let ns_model = if ws.roxygen_managed {
-                        // Rebuild cache without clearing — for open documents,
-                        // did_change may have inserted fresher entries while we
-                        // were doing I/O. Only overwrite entries for files whose
-                        // content we can authoritatively determine.
-                        let disk_paths: std::collections::HashSet<std::path::PathBuf> = disk_r_files.iter().map(|(p, _)| p.clone()).collect();
-                        // Remove entries for files no longer on disk AND not open.
-                        // Open files are authoritative even if deleted from disk.
-                        let open_paths: std::collections::HashSet<std::path::PathBuf> = state
-                            .documents.keys()
-                            .filter_map(|u| u.to_file_path().ok())
-                            .collect();
-                        state.package_state.roxygen_tags_cache.retain(|p, _| {
-                            disk_paths.contains(p) || open_paths.contains(p)
-                        });
-                        for (path, disk_content) in &disk_r_files {
-                            // Prefer open document content over disk read
-                            let content = Url::from_file_path(path).ok()
-                                .and_then(|u| state.documents.get(&u).map(|d| d.text()))
-                                .or_else(|| disk_content.clone());
-                            if let Some(content) = content {
-                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                state.package_state.roxygen_tags_cache.insert(path.clone(), ns);
-                            }
-                        }
-                        // Build model from the full cache (includes retained open-only entries)
-                        state.rebuild_namespace_model_from_cache();
-                        state.package_namespace_model().cloned().unwrap_or_default()
+                        .await
+                        .unwrap_or(None)
                     } else {
-                        match namespace_content {
-                            Some(ref content) => crate::package_namespace::namespace_model_from_content(content),
-                            None => crate::package_namespace::PackageNamespaceModel::default(),
-                        }
-                    };
-                    state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                    state.package_state.namespace_model = Some(ns_model);
-                    log::info!("Rebuilt package namespace model after DESCRIPTION/NAMESPACE change");
-                } else {
-                    state.package_state.namespace_model = None;
-                    state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
+                        None
+                    }
+                };
+                manifest_contents.push((uri.clone(), on_disk_text, *deleted));
+            }
+
+            // Apply manifest events under write lock
+            let mut state = self.state.write().await;
+            let mut deltas = Vec::new();
+            for (uri, on_disk_text, deleted) in manifest_contents {
+                let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                    uri,
+                    on_disk_text,
+                    deleted,
+                };
+                if let Some(delta) = crate::package_state::event::translate(
+                    &mut state.package_inputs,
+                    event,
+                ) {
+                    deltas.push(delta);
                 }
-                state.package_state.workspace = new_ws;
-                state.rebuild_package_internal_symbols_cache();
-                // Force republish for all open R files
+            }
+            if !deltas.is_empty() {
+                let batch = crate::package_state::PackageInputDelta::Batch(deltas);
+                state.apply_package_event(&batch);
+                log::info!("Updated package state after DESCRIPTION/NAMESPACE change");
+                // Force republish for all open R files so namespace model
+                // changes propagate (they're not dependency-graph neighbors of
+                // DESCRIPTION/NAMESPACE so the sync pass didn't add them).
                 let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
                 state.diagnostics_gate.mark_force_republish_many(open_keys.iter());
-                // Ensure these URIs are included in the diagnostic publishing
-                // pass — they aren't dependency-graph neighbors of DESCRIPTION/
-                // NAMESPACE, so the sync pass didn't add them.
                 drop(state);
                 let existing: std::collections::HashSet<Url> = affected_open_docs.iter().cloned().collect();
                 affected_open_docs.extend(
                     open_keys.into_iter().filter(|u| !existing.contains(u))
                 );
-            } else {
-                let mut state = self.state.write().await;
-                state.package_state.workspace = None;
-                state.package_state.namespace_model = None;
-                state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
-                state.rebuild_package_internal_symbols_cache();
             }
         }
 
@@ -4025,67 +3915,55 @@ impl LanguageServer for Backend {
                     log::trace!("Updated workspace index for: {}", uri);
                 }
 
-                // Rebuild package internal symbols cache after workspace
-                // index updates so completions reflect new/changed files.
-                // Also update roxygen tags cache for non-open R/*.R files
-                // so that @import/@importFrom changes from external edits
-                // (e.g. git checkout) propagate to the namespace model.
+                // Update package inputs and derive state for CREATED/CHANGED R/*.R
+                // files so roxygen tag changes from external edits (e.g. git
+                // checkout) propagate to the namespace model and internal symbols.
                 {
                     let mut state = state_arc.write().await;
-                    if let Some(pkg) = state.package_workspace() {
-                        let r_dir_for_check = pkg.root.join("R");
-                        let has_r_files = uris_to_update.iter().any(|u| {
-                            u.to_file_path().ok().is_some_and(|p| p.starts_with(&r_dir_for_check))
-                        });
-                        // Scan roxygen tags for non-open R/*.R files regardless of
-                        // roxygen_managed — external edits (e.g. git checkout) may
-                        // add/remove the first/last roxygen tags, flipping the flag.
-                        if has_r_files {
-                            let r_dir = pkg.root.join("R");
-                            let mut ns_changed = false;
-                            for uri in &uris_to_update {
-                                if state.documents.contains_key(uri) {
-                                    continue; // open docs are authoritative
-                                }
-                                if let Ok(p) = uri.to_file_path() {
-                                    if p.starts_with(&r_dir)
-                                        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                                    {
-                                        if let Some(content) = state.cross_file_file_cache.get(uri) {
-                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                            let changed = state
-                                                .package_state.roxygen_tags_cache
-                                                .get(&p)
-                                                .map_or(true, |old| *old != ns);
-                                            if changed {
-                                                state.package_state.roxygen_tags_cache.insert(p, ns);
-                                                ns_changed = true;
-                                            }
-                                        }
-                                    }
-                                }
+                    let r_dir_for_check = state.package_inputs.workspace_root
+                        .clone()
+                        .map(|root| root.join("R"));
+                    let has_r_files = r_dir_for_check.as_ref().is_some_and(|r_dir| {
+                        uris_to_update.iter().any(|u| {
+                            u.to_file_path().ok().is_some_and(|p| p.starts_with(r_dir))
+                        })
+                    });
+                    if has_r_files {
+                        let mut deltas = Vec::new();
+                        let mut ns_changed = false;
+                        let old_ns_model = state.package_state.namespace_model.clone();
+                        for uri in &uris_to_update {
+                            if state.documents.contains_key(uri) {
+                                continue; // open docs are authoritative; skip
                             }
-                            // Recompute roxygen_managed from the full cache
-                            let any_tags = state.package_state.roxygen_tags_cache.values().any(|ns| {
-                                !ns.exports.is_empty()
-                                    || !ns.imports.is_empty()
-                                    || !ns.import_from.is_empty()
-                            });
-                            if let Some(ref mut pkg) = state.package_state.workspace {
-                                if pkg.roxygen_managed != any_tags {
-                                    pkg.roxygen_managed = any_tags;
-                                    ns_changed = true;
-                                    log::info!(
-                                        "watched-files: roxygen_managed transitioned to {} for package {}",
-                                        any_tags,
-                                        pkg.name
-                                    );
-                                }
+                            // Use the file cache content (already inserted above).
+                            let on_disk_text: Option<std::sync::Arc<str>> = state
+                                .cross_file_file_cache
+                                .get(uri)
+                                .map(|s| std::sync::Arc::from(s.as_str()));
+                            let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                uri: uri.clone(),
+                                on_disk_text,
+                                deleted: false,
+                            };
+                            if let Some(delta) = crate::package_state::event::translate(
+                                &mut state.package_inputs,
+                                event,
+                            ) {
+                                deltas.push(delta);
                             }
-                            if ns_changed {
-                                state.rebuild_namespace_model_from_cache();
-                                // Add all open R/ files to affected set
-                                let r_dir = state.package_workspace().unwrap().root.join("R");
+                        }
+                        if !deltas.is_empty() {
+                            let batch = crate::package_state::PackageInputDelta::Batch(deltas);
+                            state.apply_package_event(&batch);
+                            ns_changed = state.package_state.namespace_model != old_ns_model;
+                        }
+                        if ns_changed {
+                            // Namespace model changed (e.g. roxygen tags changed in an
+                            // external edit). Add all open R/ files to affected set so
+                            // their @import diagnostics are refreshed.
+                            if let Some(ref root) = state.package_inputs.workspace_root.clone() {
+                                let r_dir = root.join("R");
                                 for open_uri in state.documents.keys() {
                                     if let Ok(p) = open_uri.to_file_path() {
                                         if p.starts_with(&r_dir) && affected_for_async_set.insert(open_uri.clone()) {
@@ -4094,10 +3972,6 @@ impl LanguageServer for Backend {
                                     }
                                 }
                             }
-                        }
-                        // Only rebuild if R/ files were in the batch
-                        if has_r_files {
-                            state.rebuild_package_internal_symbols_cache();
                         }
                     }
                 }
