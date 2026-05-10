@@ -733,18 +733,34 @@ impl WorldState {
         let old_full_imports = self
             .package_namespace_model
             .as_ref()
-            .map(|m| &m.full_imports);
-        let roxygen_files: Vec<(String, crate::roxygen::RoxygenNamespace)> = self
-            .roxygen_tags_cache
-            .iter()
-            .map(|(path, ns)| (path.display().to_string(), ns.clone()))
-            .collect();
-        let ns_model = crate::package_namespace::namespace_model_from_roxygen(&roxygen_files);
-        let new_imports = Arc::new(ns_model.imports.clone());
+            .map(|m| m.full_imports.clone());
+
+        // Build the model directly from cache references — no Vec allocation
+        // or RoxygenNamespace cloning needed.
+        let mut model = crate::package_namespace::PackageNamespaceModel::default();
+        let mut seen_imports: HashSet<(String, String)> = HashSet::new();
+        let mut seen_full: HashSet<String> = HashSet::new();
+        for ns in self.roxygen_tags_cache.values() {
+            for sym in &ns.exports {
+                model.exports.insert(sym.clone());
+            }
+            for (pkg, sym) in &ns.import_from {
+                if seen_imports.insert((pkg.clone(), sym.clone())) {
+                    model.imports.push((pkg.clone(), sym.clone()));
+                }
+            }
+            for pkg in &ns.imports {
+                if seen_full.insert(pkg.clone()) {
+                    model.full_imports.push(pkg.clone());
+                }
+            }
+        }
+
+        let new_imports = Arc::new(model.imports.clone());
         let imports_changed = *old_imports != *new_imports;
-        let full_imports_changed = old_full_imports != Some(&ns_model.full_imports);
+        let full_imports_changed = old_full_imports.as_ref() != Some(&model.full_imports);
         self.workspace_imports = new_imports;
-        self.package_namespace_model = Some(ns_model);
+        self.package_namespace_model = Some(model);
         imports_changed || full_imports_changed
     }
 

@@ -1294,7 +1294,7 @@ fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
                     if i > 0 && matches!(bytes.get(i - 1), Some(b'!') | Some(b'>') | Some(b'<')) {
                         // skip
                     } else if bytes.get(i + 1) == Some(&b'=') {
-                        // skip
+                        i += 1; // skip second '=' so it isn't re-examined
                     } else {
                         return Some((i, 1));
                     }
@@ -1465,6 +1465,17 @@ bar <- function() {}
         let content = "#' @export\nsetMethod('show', 'MyClass', function(object) cat(object@name))\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["show"]);
+    }
+
+    #[test]
+    fn find_assignment_op_skips_double_equals() {
+        // The second '=' in '==' must not be returned as an assignment operator.
+        assert_eq!(find_assignment_op("x == 5"), None);
+        assert_eq!(find_assignment_op("if (x == y) z"), None);
+        // Regular = assignment still works
+        assert_eq!(find_assignment_op("z = 1"), Some((2, 1)));
+        // == followed by a later assignment
+        assert_eq!(find_assignment_op("a == b; c <- 1"), Some((10, 2)));
     }
 
     #[test]

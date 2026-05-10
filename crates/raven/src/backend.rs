@@ -2909,8 +2909,12 @@ impl LanguageServer for Backend {
         // In package mode, rebuild the internal symbols cache so stale
         // exports from the closed file's editing session are replaced by
         // the workspace index's on-disk snapshot.
-        if state.package_workspace.is_some() {
-            state.rebuild_package_internal_symbols_cache();
+        if let Some(ref pkg) = state.package_workspace {
+            if let Ok(p) = uri.to_file_path() {
+                if p.starts_with(pkg.root.join("R")) {
+                    state.rebuild_package_internal_symbols_cache();
+                }
+            }
         }
 
         // Refresh the pin set now that the open set has shrunk; URIs reachable
@@ -3123,32 +3127,40 @@ impl LanguageServer for Backend {
         // --- Package mode rebuild: file I/O outside the write lock ---
         if let Some((root, mode)) = pkg_mode_rebuild_info {
             use crate::cross_file::config::PackageMode;
-            // Read DESCRIPTION once to get the package name
-            let pkg_name = std::fs::read_to_string(root.join("DESCRIPTION"))
-                .ok()
-                .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
+            // Perform all disk I/O on a blocking thread to avoid stalling
+            // the tokio worker (packages can have hundreds of R files).
+            let root_clone = root.clone();
+            let (pkg_name, disk_r_files, has_roxygen, namespace_content) =
+                tokio::task::spawn_blocking(move || {
+                    let pkg_name = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                        .ok()
+                        .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
 
-            // Read all R/*.R files in a single pass (avoids double-read from
-            // detect_roxygen_usage + subsequent tag extraction).
-            let r_dir = root.join("R");
-            let mut disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
-            let mut has_roxygen = false;
-            if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                        let content = std::fs::read_to_string(&path).ok();
-                        if !has_roxygen {
-                            if let Some(ref c) = content {
-                                if c.contains("#' @export") {
-                                    has_roxygen = true;
+                    let r_dir = root_clone.join("R");
+                    let mut disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
+                    let mut has_roxygen = false;
+                    if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                                let content = std::fs::read_to_string(&path).ok();
+                                if !has_roxygen {
+                                    if let Some(ref c) = content {
+                                        if c.contains("#' @export") {
+                                            has_roxygen = true;
+                                        }
+                                    }
                                 }
+                                disk_r_files.push((path, content));
                             }
                         }
-                        disk_r_files.push((path, content));
                     }
-                }
-            }
+
+                    let namespace_content = std::fs::read_to_string(root_clone.join("NAMESPACE")).ok();
+                    (pkg_name, disk_r_files, has_roxygen, namespace_content)
+                })
+                .await
+                .unwrap_or((None, Vec::new(), false, None));
 
             let new_ws = match (mode, pkg_name) {
                 (PackageMode::Auto, Some(name)) => Some(crate::package_namespace::PackageWorkspace {
@@ -3163,12 +3175,6 @@ impl LanguageServer for Backend {
                     roxygen_managed: has_roxygen,
                 }),
                 (PackageMode::Disabled, _) => unreachable!(),
-            };
-
-            let namespace_content: Option<String> = if new_ws.as_ref().is_some_and(|ws| !ws.roxygen_managed) {
-                std::fs::read_to_string(root.join("NAMESPACE")).ok()
-            } else {
-                None
             };
 
             // Re-acquire lock to apply results
@@ -3513,32 +3519,44 @@ impl LanguageServer for Backend {
         if let Some((root, mode)) = pkg_rebuild_info {
             use crate::cross_file::config::PackageMode;
             if mode != PackageMode::Disabled {
-                // Read DESCRIPTION once to get the package name
-                let pkg_name = std::fs::read_to_string(root.join("DESCRIPTION"))
-                    .ok()
-                    .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
+                // Perform all disk I/O on a blocking thread to avoid stalling
+                // the tokio worker (packages can have hundreds of R files).
+                let root_clone = root.clone();
+                let (pkg_name, disk_r_files, has_roxygen, namespace_content) =
+                    tokio::task::spawn_blocking(move || {
+                        let pkg_name = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                            .ok()
+                            .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
 
-                // Read all R/*.R files in a single pass (used for both
-                // roxygen detection and tag extraction — avoids double-read).
-                let r_dir = root.join("R");
-                let mut disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
-                let mut has_roxygen = false;
-                if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                            let content = std::fs::read_to_string(&path).ok();
-                            if !has_roxygen {
-                                if let Some(ref c) = content {
-                                    if c.contains("#' @export") {
-                                        has_roxygen = true;
+                        let r_dir = root_clone.join("R");
+                        let mut disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
+                        let mut has_roxygen = false;
+                        if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                                    let content = std::fs::read_to_string(&path).ok();
+                                    if !has_roxygen {
+                                        if let Some(ref c) = content {
+                                            if c.contains("#' @export") {
+                                                has_roxygen = true;
+                                            }
+                                        }
                                     }
+                                    disk_r_files.push((path, content));
                                 }
                             }
-                            disk_r_files.push((path, content));
                         }
-                    }
-                }
+
+                        // Determine NAMESPACE content for non-roxygen packages.
+                        // We can't know roxygen_managed until we've scanned, so
+                        // read NAMESPACE unconditionally (cheap single file).
+                        let namespace_content = std::fs::read_to_string(root_clone.join("NAMESPACE")).ok();
+
+                        (pkg_name, disk_r_files, has_roxygen, namespace_content)
+                    })
+                    .await
+                    .unwrap_or((None, Vec::new(), false, None));
 
                 let new_ws = match (mode, pkg_name) {
                     (PackageMode::Auto, Some(name)) => Some(crate::package_namespace::PackageWorkspace {
@@ -3555,13 +3573,6 @@ impl LanguageServer for Backend {
                     (PackageMode::Disabled, _) => unreachable!(),
                 };
 
-                // Pre-read NAMESPACE file content for non-roxygen packages
-                let namespace_content: Option<String> = if new_ws.as_ref().is_some_and(|ws| !ws.roxygen_managed) {
-                    std::fs::read_to_string(root.join("NAMESPACE")).ok()
-                } else {
-                    None
-                };
-
                 // Re-acquire write lock to apply results
                 let mut state = self.state.write().await;
                 if let Some(ref ws) = new_ws {
@@ -3572,8 +3583,15 @@ impl LanguageServer for Backend {
                         // were doing I/O. Only overwrite entries for files whose
                         // content we can authoritatively determine.
                         let disk_paths: std::collections::HashSet<std::path::PathBuf> = disk_r_files.iter().map(|(p, _)| p.clone()).collect();
-                        // Remove entries for files no longer on disk
-                        state.roxygen_tags_cache.retain(|p, _| disk_paths.contains(p));
+                        // Remove entries for files no longer on disk AND not open.
+                        // Open files are authoritative even if deleted from disk.
+                        let open_paths: std::collections::HashSet<std::path::PathBuf> = state
+                            .documents.keys()
+                            .filter_map(|u| u.to_file_path().ok())
+                            .collect();
+                        state.roxygen_tags_cache.retain(|p, _| {
+                            disk_paths.contains(p) || open_paths.contains(p)
+                        });
                         for (path, disk_content) in &disk_r_files {
                             // Prefer open document content over disk read
                             let content = Url::from_file_path(path).ok()
@@ -3608,11 +3626,10 @@ impl LanguageServer for Backend {
                 // pass — they aren't dependency-graph neighbors of DESCRIPTION/
                 // NAMESPACE, so the sync pass didn't add them.
                 drop(state);
-                for uri in open_keys {
-                    if !affected_open_docs.contains(&uri) {
-                        affected_open_docs.push(uri);
-                    }
-                }
+                let existing: std::collections::HashSet<Url> = affected_open_docs.iter().cloned().collect();
+                affected_open_docs.extend(
+                    open_keys.into_iter().filter(|u| !existing.contains(u))
+                );
             } else {
                 let mut state = self.state.write().await;
                 state.package_workspace = None;
