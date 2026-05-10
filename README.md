@@ -47,7 +47,6 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 **Code intelligence:**
 
 - [Cross-File & Package Awareness](docs/cross-file.md) — How Raven understands multi-file projects
-- [R Package Development](docs/r-package-dev.md) — Mutual visibility, roxygen, and NAMESPACE support
 - [Directives](docs/directives.md) — All `@lsp-*` directive syntax
 - [Diagnostics](docs/diagnostics.md) — What's reported and how to suppress
 - [Completions](docs/completion.md) — What's offered and scope rules

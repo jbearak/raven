@@ -41,7 +41,8 @@ For dynamic or conditional paths that Raven can't detect, use [directives](direc
 
 Raven recognizes `library()`, `require()`, and `loadNamespace()` calls and makes package exports available for completions, hover, and diagnostics.
 
-> **Developing an R package?** See [R Package Development](r-package-dev.md) for how Raven handles `R/*.R` mutual visibility, roxygen annotations, and NAMESPACE imports.
+> [!TIP]
+> **Developing an R package?** When Raven detects a `DESCRIPTION` file at the workspace root, it switches to package mode — all `R/*.R` files become mutually visible without `source()` calls, and `@import`/`@importFrom` annotations suppress undefined-variable diagnostics. See [R Package Development](r-package-dev.md).
 
 ### How It Works
 
