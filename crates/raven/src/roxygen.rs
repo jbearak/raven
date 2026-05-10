@@ -1475,6 +1475,31 @@ fn extract_first_identifier(line: &str) -> Option<String> {
     }
 }
 
+/// Extract top-level definition names from R source text.
+///
+/// Delegates to `cross_file::scope::compute_artifacts` so the result agrees
+/// with the workspace index. Uses a synthetic `memory:///` URI for the call.
+pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> {
+    use tree_sitter::Parser;
+    let mut parser = Parser::new();
+    if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_err() {
+        return std::collections::BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return std::collections::BTreeSet::new();
+    };
+    let uri = match tower_lsp::lsp_types::Url::parse("memory:///derive.R") {
+        Ok(u) => u,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+    let artifacts = crate::cross_file::scope::compute_artifacts(&uri, &tree, text);
+    artifacts
+        .exported_interface
+        .keys()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod namespace_tag_tests {
     use super::*;
@@ -1765,5 +1790,14 @@ bar <- function() {}
         assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
         assert!(ns.imports.contains(&"ggplot2".to_string()));
         assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn extract_top_level_defs_finds_assigned_names() {
+        let text = "foo <- function() 1\nbar = function(x) x\nbaz <- 42\n";
+        let defs = extract_top_level_defs(text);
+        assert!(defs.contains("foo"), "got: {:?}", defs);
+        assert!(defs.contains("bar"), "got: {:?}", defs);
+        assert!(defs.contains("baz"), "got: {:?}", defs);
     }
 }

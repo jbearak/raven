@@ -6,15 +6,39 @@ use super::*;
 use crate::package_namespace::parse_dcf_field_pub;
 
 pub fn derive_package_state(
-    _prev: &PackageState,
+    prev: &PackageState,
     inputs: &PackageInputs,
     _delta: &PackageInputDelta,
 ) -> PackageState {
     let workspace = effective_workspace(inputs);
+    let r_file_facts = derive_r_file_facts(&prev.r_file_facts, &inputs.r_files);
     PackageState {
         workspace,
+        r_file_facts,
         ..PackageState::default()
     }
+}
+
+fn derive_r_file_facts(
+    prev: &BTreeMap<PathBuf, RFileFacts>,
+    inputs: &BTreeMap<PathBuf, RFileInput>,
+) -> BTreeMap<PathBuf, RFileFacts> {
+    let mut out = BTreeMap::new();
+    for (path, file) in inputs {
+        let reuse = prev
+            .get(path)
+            .filter(|cached| cached.content_digest == file.content_digest);
+        let facts = match reuse {
+            Some(cached) => cached.clone(),
+            None => RFileFacts {
+                roxygen_namespace: crate::roxygen::extract_roxygen_namespace_tags(&file.text),
+                top_level_defs: Arc::new(crate::roxygen::extract_top_level_defs(&file.text)),
+                content_digest: file.content_digest,
+            },
+        };
+        out.insert(path.clone(), facts);
+    }
+    out
 }
 
 fn effective_workspace(inputs: &PackageInputs) -> Option<PackageWorkspace> {
@@ -116,5 +140,46 @@ mod tests {
             &PackageInputDelta::Initial,
         );
         assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
+    }
+
+    #[test]
+    fn memoization_reuses_cached_facts_on_unchanged_content() {
+        let path: PathBuf = "/work/pkg/R/foo.R".into();
+        let text: Arc<str> = "foo <- function() 1\n".into();
+        let digest = ContentDigest::of(&text);
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(path.clone(), RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: digest,
+        });
+        let s1 = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        let s2 = derive_package_state(&s1, &inputs, &PackageInputDelta::Initial);
+        let f1 = s1.r_file_facts.get(&path).unwrap();
+        let f2 = s2.r_file_facts.get(&path).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&f1.top_level_defs, &f2.top_level_defs));
+    }
+
+    #[test]
+    fn memoization_recomputes_on_content_change() {
+        let path: PathBuf = "/work/pkg/R/foo.R".into();
+        let text1: Arc<str> = "foo <- function() 1\n".into();
+        let text2: Arc<str> = "foo <- function() 2\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(path.clone(), RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text: text1.clone(),
+            content_digest: ContentDigest::of(&text1),
+        });
+        let s1 = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        let entry = inputs.r_files.get_mut(&path).unwrap();
+        entry.text = text2.clone();
+        entry.content_digest = ContentDigest::of(&text2);
+        let s2 = derive_package_state(&s1, &inputs, &PackageInputDelta::Initial);
+        let f1 = s1.r_file_facts.get(&path).unwrap();
+        let f2 = s2.r_file_facts.get(&path).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&f1.top_level_defs, &f2.top_level_defs));
     }
 }
