@@ -229,6 +229,10 @@ pub struct RFileFacts {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageScopeContribution {
+    /// The workspace root for this package, if known. Carried here so that
+    /// scope-injection logic (Phase 5) can check whether the queried file is
+    /// under `R/` or `tests/testthat/` without requiring a separate parameter.
+    pub workspace_root: Option<PathBuf>,
     pub r_internal_symbols: Arc<BTreeSet<String>>,
     pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
     pub full_imports: Arc<BTreeSet<String>>,

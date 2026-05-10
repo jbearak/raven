@@ -59,6 +59,7 @@ fn build_scope_contribution(
         None => (BTreeMap::new(), BTreeSet::new()),
     };
     PackageScopeContribution {
+        workspace_root: Some(ws.root.clone()),
         r_internal_symbols: Arc::new(r_internal_symbols),
         imported_symbols: Arc::new(imported_symbols),
         full_imports: Arc::new(full_imports),
