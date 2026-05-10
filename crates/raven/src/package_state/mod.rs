@@ -203,3 +203,91 @@ pub enum PackageInputDelta {
     SettingChanged,
     Batch(Vec<PackageInputDelta>),
 }
+
+// ============== PATH HELPERS ==============
+
+use std::path::Path;
+
+/// Returns `Some(kind)` if `path` is a package source/test file we track,
+/// based on the workspace root. Returns `None` otherwise.
+///
+/// Rules:
+/// - `<root>/R/**/*.R` (or `*.r`) → `Source`
+/// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
+/// - everything else → `None`
+pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind> {
+    let rel = path.strip_prefix(workspace_root).ok()?;
+    let mut comps = rel.components();
+    let first = comps.next()?.as_os_str().to_str()?;
+
+    let is_r_extension = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("R" | "r"),
+    );
+    if !is_r_extension {
+        return None;
+    }
+
+    match first {
+        "R" => Some(RFileKind::Source),
+        "tests" => {
+            let second = comps.next()?.as_os_str().to_str()?;
+            if second == "testthat" {
+                Some(RFileKind::Test)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if `path` is anywhere inside the package workspace.
+pub fn is_inside_package(path: &Path, workspace_root: &Path) -> bool {
+    path.starts_with(workspace_root)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn r_source_path_recognizes_R_dir() {
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/R/utils.R"), Path::new("/work/pkg")),
+            Some(RFileKind::Source),
+        );
+    }
+
+    #[test]
+    fn r_source_path_recognizes_testthat() {
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/testthat/test-utils.R"), Path::new("/work/pkg")),
+            Some(RFileKind::Test),
+        );
+    }
+
+    #[test]
+    fn r_source_path_rejects_non_R_files() {
+        let root = Path::new("/work/pkg");
+        assert_eq!(is_r_source_path(Path::new("/work/pkg/R/utils.txt"), root), None);
+        assert_eq!(is_r_source_path(Path::new("/work/pkg/inst/data.R"), root), None);
+        assert_eq!(is_r_source_path(Path::new("/elsewhere/utils.R"), root), None);
+    }
+
+    #[test]
+    fn r_source_path_handles_lowercase_extension() {
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/R/utils.r"), Path::new("/work/pkg")),
+            Some(RFileKind::Source),
+        );
+    }
+
+    #[test]
+    fn r_source_path_recognizes_subdirs_in_R() {
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/R/unix/utils.R"), Path::new("/work/pkg")),
+            Some(RFileKind::Source),
+        );
+    }
+}
