@@ -848,6 +848,48 @@ impl Backend {
     }
 }
 
+/// Collect open R/*.R and tests/testthat/ siblings of `closing_uri` whose
+/// diagnostics must refresh after a package-mode visibility change triggered
+/// by `did_close`. Filters out the closing URI and non-package files,
+/// enforces `max_revalidations_per_trigger` (priority-ordered via
+/// `cross_file_activity`), then snapshots each survivor's `(version, revision)`
+/// for the `run_debounced_diagnostics` freshness guard.
+///
+/// Returned as a `Vec` (not a `HashSet`) because the caller iterates in the
+/// post-cap, post-priority order to spawn one debounced diagnostic task per
+/// sibling.
+fn collect_close_fanout_siblings(
+    state: &WorldState,
+    closing_uri: &Url,
+    workspace_root: &std::path::Path,
+) -> Vec<(Url, Option<i32>, Option<u64>)> {
+    let mut candidates: Vec<Url> = state
+        .documents
+        .keys()
+        .filter(|open_uri| *open_uri != closing_uri)
+        .filter(|open_uri| {
+            open_uri.to_file_path().ok().is_some_and(|p| {
+                crate::package_state::is_r_source_path(&p, workspace_root).is_some()
+            })
+        })
+        .cloned()
+        .collect();
+    cap_watched_file_revalidations(
+        &mut candidates,
+        &state.cross_file_activity,
+        state.cross_file_config.max_revalidations_per_trigger,
+    );
+    candidates
+        .into_iter()
+        .filter_map(|sibling_uri| {
+            state
+                .documents
+                .get(&sibling_uri)
+                .map(|doc| (sibling_uri, doc.version, Some(doc.revision)))
+        })
+        .collect()
+}
+
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
 /// per-trigger cap before any force-republish markers are created.
 fn cap_watched_file_revalidations(
@@ -3101,41 +3143,15 @@ impl LanguageServer for Backend {
             // When an unsaved buffer with buffer-only symbols (e.g. a freshly
             // added function) closes, those symbols leave `r_internal_symbols`
             // and any open sibling that referenced them needs its diagnostics
-            // recomputed. Mirrors the watched-file fanout above.
+            // recomputed. Mirrors the watched-file fanout above (including
+            // `max_revalidations_per_trigger`).
             let mut sibling_fanout: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
             let pkg_visibility_changed =
                 state.package_state.namespace_model != old_ns_model
                     || state.package_state.scope_contribution != old_contribution;
             if pkg_visibility_changed {
                 if let Some(root) = state.package_inputs.workspace_root.clone() {
-                    let mut candidates: Vec<Url> = state
-                        .documents
-                        .keys()
-                        .filter(|open_uri| *open_uri != uri)
-                        .filter(|open_uri| {
-                            open_uri.to_file_path().ok().is_some_and(|p| {
-                                crate::package_state::is_r_source_path(&p, &root).is_some()
-                            })
-                        })
-                        .cloned()
-                        .collect();
-                    // Bound the burst when many package files are open
-                    // (e.g. "close all"); reuse the same cap and priority
-                    // ordering enforced for the watched-file fanout.
-                    cap_watched_file_revalidations(
-                        &mut candidates,
-                        &state.cross_file_activity,
-                        state.cross_file_config.max_revalidations_per_trigger,
-                    );
-                    for sibling_uri in candidates {
-                        if let Some(doc) = state.documents.get(&sibling_uri) {
-                            sibling_fanout.push((
-                                sibling_uri,
-                                doc.version,
-                                Some(doc.revision),
-                            ));
-                        }
-                    }
+                    sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
                 }
                 if !sibling_fanout.is_empty() {
                     state
@@ -6171,6 +6187,133 @@ mod tests {
             cap_watched_file_revalidations(&mut affected, &activity, 0);
 
             assert!(affected.is_empty());
+        }
+    }
+
+    /// Regression tests for `collect_close_fanout_siblings`, which decides
+    /// which open package files get force-republished when a sibling closes
+    /// and the close changes package-mode visibility.
+    mod close_fanout_siblings {
+        use super::super::collect_close_fanout_siblings;
+        use crate::state::{Document, WorldState};
+        use std::path::PathBuf;
+        use tower_lsp::lsp_types::Url;
+
+        fn pkg_root() -> PathBuf {
+            PathBuf::from("/work/pkg")
+        }
+
+        fn r_uri(name: &str) -> Url {
+            Url::from_file_path(pkg_root().join("R").join(name)).unwrap()
+        }
+
+        fn make_state_with_open_pkg_docs(names: &[&str]) -> WorldState {
+            let mut state = WorldState::new(vec![]);
+            state.workspace_folders.push(Url::from_file_path(pkg_root()).unwrap());
+            // Deterministic cap for tests; explicit overrides come per-test.
+            state.cross_file_config.max_revalidations_per_trigger = 10;
+            for name in names {
+                state
+                    .documents
+                    .insert(r_uri(name), Document::new("x <- 1\n", Some(1)));
+            }
+            state
+        }
+
+        #[test]
+        fn fanout_excludes_the_closing_uri() {
+            let state = make_state_with_open_pkg_docs(&["a.R", "b.R", "c.R"]);
+            let closing = r_uri("a.R");
+
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert_eq!(fanout.len(), 2, "should fan out to the two non-closing siblings");
+            assert!(
+                fanout.iter().all(|(u, _, _)| u != &closing),
+                "fanout must not include the closing URI"
+            );
+            assert!(fanout.iter().any(|(u, _, _)| u == &r_uri("b.R")));
+            assert!(fanout.iter().any(|(u, _, _)| u == &r_uri("c.R")));
+        }
+
+        #[test]
+        fn fanout_filters_out_files_outside_the_package_layout() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
+            // Same workspace root, but not under R/ or tests/testthat/.
+            let scratch = Url::from_file_path(pkg_root().join("scratch.R")).unwrap();
+            state
+                .documents
+                .insert(scratch.clone(), Document::new("y <- 2\n", Some(1)));
+            // Different workspace entirely.
+            let outside = Url::from_file_path("/other/proj/foo.R").unwrap();
+            state
+                .documents
+                .insert(outside.clone(), Document::new("z <- 3\n", Some(1)));
+
+            let closing = r_uri("a.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert!(
+                fanout.iter().all(|(u, _, _)| u != &scratch && u != &outside),
+                "files outside R/ and tests/testthat/ must not appear in fanout"
+            );
+        }
+
+        #[test]
+        fn fanout_includes_testthat_siblings() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
+            let test_uri = Url::from_file_path(
+                pkg_root().join("tests").join("testthat").join("test-a.R"),
+            )
+            .unwrap();
+            state
+                .documents
+                .insert(test_uri.clone(), Document::new("expect_equal(1, 1)\n", Some(1)));
+
+            let closing = r_uri("a.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert!(
+                fanout.iter().any(|(u, _, _)| u == &test_uri),
+                "tests/testthat/ siblings should refresh on R/ close"
+            );
+        }
+
+        #[test]
+        fn fanout_respects_max_revalidations_per_trigger() {
+            let names: Vec<String> = (0..20).map(|i| format!("f{i}.R")).collect();
+            let names_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut state = make_state_with_open_pkg_docs(&names_refs);
+            state.cross_file_config.max_revalidations_per_trigger = 3;
+
+            let closing = r_uri("f0.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert_eq!(
+                fanout.len(),
+                3,
+                "fanout must be capped at max_revalidations_per_trigger \
+                 to bound diagnostic bursts on close-all"
+            );
+        }
+
+        #[test]
+        fn fanout_snapshots_each_siblings_version_and_revision() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
+            // Insert a sibling with a specific version/revision pair.
+            let b = r_uri("b.R");
+            let mut doc_b = Document::new("y <- 2\n", Some(7));
+            doc_b.revision = 42;
+            state.documents.insert(b.clone(), doc_b);
+
+            let closing = r_uri("a.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            let (got_uri, got_version, got_revision) =
+                fanout.into_iter().find(|(u, _, _)| u == &b).expect("b.R in fanout");
+            assert_eq!(got_uri, b);
+            assert_eq!(got_version, Some(7));
+            assert_eq!(got_revision, Some(42));
         }
     }
 
