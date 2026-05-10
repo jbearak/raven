@@ -132,11 +132,7 @@ proptest! {
             &inputs,
             &PackageInputDelta::Initial,
         );
-        // Compare derived fields. Phase-1 legacy fields (workspace_imports,
-        // internal_symbols_cache, roxygen_tags_cache, namespace_model on
-        // PackageState — yes, namespace_model lives in both legacy and
-        // derived form right now during Phase 2; the new derive sets the
-        // namespace_model field, so it's part of derived state).
+        // Compare all derived fields.
         prop_assert_eq!(&state.workspace, &from_scratch.workspace);
         prop_assert_eq!(&state.namespace_model, &from_scratch.namespace_model);
         prop_assert_eq!(&state.r_file_facts, &from_scratch.r_file_facts);

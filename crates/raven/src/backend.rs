@@ -1278,9 +1278,8 @@ impl LanguageServer for Backend {
                                 pkg_workspace,
                                 pkg_ns_model,
                             );
-                            // Suppress unused warning: roxygen_cache was used for legacy
-                            // roxygen_tags_cache population which is now replaced by the
-                            // event-driven path via apply_package_event below.
+                            // roxygen_cache is unused: the event-driven path via
+                            // apply_package_event handles roxygen state derivation.
                             drop(roxygen_cache);
 
                             // --- Phase 3.9: Populate package_inputs and derive ---
@@ -2677,8 +2676,7 @@ impl LanguageServer for Backend {
             }
 
             // Update package state via event-driven path when an R/*.R file
-            // changes in a package workspace. This replaces the legacy
-            // roxygen_tags_cache mutation + rebuild_namespace_model_from_cache.
+            // changes in a package workspace.
             let mut package_namespace_changed = false;
             {
                 let text: std::sync::Arc<str> = state.documents.get(&uri)

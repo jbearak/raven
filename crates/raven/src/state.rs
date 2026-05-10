@@ -610,20 +610,6 @@ impl WorldState {
         self.package_state.namespace_model.as_ref()
     }
 
-    /// Passthrough for legacy `state.roxygen_tags_cache` immutable reads.
-    pub fn roxygen_tags_cache(
-        &self,
-    ) -> &std::collections::HashMap<std::path::PathBuf, crate::roxygen::RoxygenNamespace> {
-        &self.package_state.roxygen_tags_cache
-    }
-
-    /// Passthrough for legacy `state.roxygen_tags_cache` mutable access.
-    pub fn roxygen_tags_cache_mut(
-        &mut self,
-    ) -> &mut std::collections::HashMap<std::path::PathBuf, crate::roxygen::RoxygenNamespace> {
-        &mut self.package_state.roxygen_tags_cache
-    }
-
     /// Apply a `PackageInputDelta` produced by an event handler.
     /// Caller has already mutated `self.package_inputs` to reflect the event.
     /// This method recomputes derived state via `derive_package_state`.
@@ -639,8 +625,6 @@ impl WorldState {
             namespace_model: new.namespace_model,
             r_file_facts: new.r_file_facts,
             scope_contribution: new.scope_contribution,
-            // roxygen_tags_cache has no consumer; leave it empty (removed in Phase 5b.6).
-            roxygen_tags_cache: std::collections::HashMap::new(),
         };
     }
 }
@@ -997,13 +981,9 @@ impl WorldState {
         self.load_workspace_namespace();
     }
 
-    /// Apply pre-scanned workspace index results (for non-blocking initialization)
+    /// Apply pre-scanned workspace index results (for non-blocking initialization).
     ///
     /// **Validates: Requirements 11.1, 13.1**
-    ///
-    /// Note: The per-file roxygen cache (`roxygen_tags_cache`) is merged by the
-    /// caller after this returns (still under the same write lock) so that open
-    /// files' fresher did_change entries aren't overwritten by scan-time data.
     pub fn apply_workspace_index(
         &mut self,
         index: HashMap<Url, Document>,
