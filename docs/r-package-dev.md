@@ -49,7 +49,8 @@ test_that("process_data works", {
 ```
 
 In contrast, a function defined in `tests/testthat/test-helpers.R` is **not**
-visible to `R/helpers.R` — visibility flows tests → R/ but not back.
+visible to `R/helpers.R` — symbols in `R/` are visible from `tests/testthat/`,
+but not the other way around.
 
 ### Roxygen Namespace Tags
 
@@ -107,15 +108,19 @@ Values for `packageMode`:
 
 ### NAMESPACE without DESCRIPTION no longer suppresses diagnostics
 
+Package mode activates when the workspace root contains a `DESCRIPTION` file
+with a valid `Package:` field. `NAMESPACE` presence is optional and does not
+affect activation — it is used (when present) to resolve imported symbols,
+but its absence does not disable package mode.
+
 Prior to this version, a workspace containing a `NAMESPACE` file but no
 `DESCRIPTION` would still have its `import()` and `importFrom()` directives
-parsed and used to suppress undefined-variable diagnostics. Now: package
-mode activates only when both `DESCRIPTION` (with a `Package:` field) and
-`NAMESPACE` are present. Non-package workspaces run as script mode regardless
-of `NAMESPACE` presence.
+parsed and used to suppress undefined-variable diagnostics. That behavior was
+removed: non-package workspaces (no `DESCRIPTION` with a `Package:` field)
+run as script mode regardless of `NAMESPACE` presence.
 
-If you need this behavior, set `"raven.packages.packageMode": "enabled"` to
-force package mode, which activates even without a `DESCRIPTION` file.
+If you need package-mode behavior in a workspace without `DESCRIPTION`, set
+`"raven.packages.packageMode": "enabled"` to force package mode.
 
 ## Known Limitations
 

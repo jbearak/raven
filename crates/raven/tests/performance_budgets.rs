@@ -598,10 +598,12 @@ fn derive_package_state_500_file_keystroke_budget() {
     }
     times.sort();
     let median = times[times.len() / 2];
-    let p99 = times[(times.len() * 99 / 100).min(times.len() - 1)];
-    eprintln!("derive_package_state 500-file: median={:?} p99={:?}", median, p99);
+    // With only 20 samples, (len * 99 / 100) always picks the last element,
+    // so report it as `max` rather than misleadingly labeling it `p99`.
+    let max = times.last().cloned().unwrap();
+    eprintln!("derive_package_state 500-file: median={:?} max={:?}", median, max);
     // Generous budget; tighten later. The point of the test is to catch
     // pathological regressions.
     assert!(median.as_millis() < 50, "median {:?} exceeds 50ms", median);
-    assert!(p99.as_millis() < 200, "p99 {:?} exceeds 200ms", p99);
+    assert!(max.as_millis() < 200, "max {:?} exceeds 200ms", max);
 }

@@ -7,6 +7,7 @@
 use super::*;
 use std::path::Path;
 
+#[derive(Debug)]
 pub enum HandlerEvent {
     DidOpen { uri: tower_lsp::lsp_types::Url, version: i32, text: Arc<str> },
     DidChange { uri: tower_lsp::lsp_types::Url, version: i32, text: Arc<str> },
@@ -24,6 +25,18 @@ pub fn translate(
     inputs: &mut PackageInputs,
     event: HandlerEvent,
 ) -> Option<PackageInputDelta> {
+    // Events that can fire before a workspace root is known (or that don't
+    // require one) are handled up front. Previously, the early
+    // `let Some(root) = ... else { return None }` dropped these silently.
+    match event {
+        HandlerEvent::SettingChanged { new_mode } => {
+            inputs.package_mode = new_mode;
+            return Some(PackageInputDelta::SettingChanged);
+        }
+        HandlerEvent::Initial => return Some(PackageInputDelta::Initial),
+        _ => {}
+    }
+
     let Some(root) = inputs.workspace_root.clone() else { return None };
     match event {
         HandlerEvent::DidOpen { uri, version, text }
@@ -70,11 +83,8 @@ pub fn translate(
             on_disk_text,
             deleted,
         } => translate_watched(inputs, &root, uri, on_disk_text, deleted),
-        HandlerEvent::SettingChanged { new_mode } => {
-            inputs.package_mode = new_mode;
-            Some(PackageInputDelta::SettingChanged)
-        }
-        HandlerEvent::Initial => Some(PackageInputDelta::Initial),
+        // SettingChanged/Initial handled above.
+        HandlerEvent::SettingChanged { .. } | HandlerEvent::Initial => None,
     }
 }
 
@@ -87,7 +97,16 @@ fn translate_watched(
 ) -> Option<PackageInputDelta> {
     let path = uri.to_file_path().ok()?;
 
-    if path == root.join("DESCRIPTION") {
+    // Normalize root and path once so comparisons against `<root>/DESCRIPTION`
+    // and `<root>/NAMESPACE` aren't foiled by symlinks, casing, or trailing
+    // separators. `canonicalize` requires the target to exist; fall back to
+    // the original path on failure (e.g. when the file has just been deleted).
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let canonical_desc = canonical_root.join("DESCRIPTION");
+    let canonical_ns = canonical_root.join("NAMESPACE");
+
+    if canonical_path == canonical_desc || path == root.join("DESCRIPTION") {
         inputs.description = if deleted {
             None
         } else {
@@ -96,7 +115,7 @@ fn translate_watched(
         return Some(PackageInputDelta::DescriptionChanged);
     }
 
-    if path == root.join("NAMESPACE") {
+    if canonical_path == canonical_ns || path == root.join("NAMESPACE") {
         inputs.namespace = if deleted {
             None
         } else {
@@ -226,5 +245,27 @@ mod tests {
             uri: uri.clone(), on_disk_text: None,
         });
         assert!(inputs.r_files.is_empty());
+    }
+
+    #[test]
+    fn setting_changed_without_workspace_root_is_applied() {
+        let mut inputs = PackageInputs::default();
+        assert!(inputs.workspace_root.is_none());
+        // Start in the default Auto mode.
+        assert_eq!(inputs.package_mode, PackageMode::Auto);
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::SettingChanged { new_mode: PackageMode::Disabled },
+        );
+        assert!(matches!(delta, Some(PackageInputDelta::SettingChanged)));
+        assert_eq!(inputs.package_mode, PackageMode::Disabled);
+    }
+
+    #[test]
+    fn initial_without_workspace_root_emits_initial() {
+        let mut inputs = PackageInputs::default();
+        assert!(inputs.workspace_root.is_none());
+        let delta = translate(&mut inputs, HandlerEvent::Initial);
+        assert!(matches!(delta, Some(PackageInputDelta::Initial)));
     }
 }

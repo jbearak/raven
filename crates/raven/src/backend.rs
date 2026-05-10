@@ -3293,28 +3293,56 @@ impl LanguageServer for Backend {
             state.package_inputs.namespace = ns_text.map(|text| {
                 crate::package_state::NamespaceInput { path: root.join("NAMESPACE"), text }
             });
-            // Ensure r_files includes all currently-open R/*.R documents
-            // (workspace scan may have already populated non-open ones).
+            // Hydrate r_files from the workspace index first (includes closed
+            // R/*.R siblings already scanned to disk) so a packageMode switch
+            // doesn't leave closed files out of the derived package state.
+            // Then overlay open documents as ContentOrigin::Open. Mirrors the
+            // scan-completion hydration in the `Ok((index, ...))` branch
+            // above so both code paths produce the same set of inputs.
             let open_uris_for_mode: Vec<Url> = state.documents.keys().cloned().collect();
-            for uri in &open_uris_for_mode {
+            let open_uri_set: std::collections::HashSet<Url> =
+                open_uris_for_mode.iter().cloned().collect();
+
+            let ws_uris: Vec<Url> = state.workspace_index_new.uris();
+            for uri in &ws_uris {
+                if open_uri_set.contains(uri) {
+                    // Handled by the open-document overlay below.
+                    continue;
+                }
                 if let Ok(path) = uri.to_file_path() {
                     if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
-                        if !state.package_inputs.r_files.contains_key(&path) {
-                            let text: std::sync::Arc<str> = state.documents.get(uri)
-                                .map(|d| d.text())
-                                .unwrap_or_default()
-                                .into();
-                            let version = state.documents.get(uri)
-                                .and_then(|d| d.version)
-                                .unwrap_or(0);
+                        if let Some(entry) = state.workspace_index_new.get(uri) {
+                            let text: std::sync::Arc<str> = entry.contents.to_string().into();
                             let digest = crate::package_state::ContentDigest::of(&text);
                             state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
                                 kind,
-                                origin: crate::package_state::ContentOrigin::Open { version },
+                                origin: crate::package_state::ContentOrigin::Disk,
                                 text,
                                 content_digest: digest,
                             });
                         }
+                    }
+                }
+            }
+
+            // Overlay open documents: they are authoritative (unsaved edits).
+            for uri in &open_uris_for_mode {
+                if let Ok(path) = uri.to_file_path() {
+                    if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                        let text: std::sync::Arc<str> = state.documents.get(uri)
+                            .map(|d| d.text())
+                            .unwrap_or_default()
+                            .into();
+                        let version = state.documents.get(uri)
+                            .and_then(|d| d.version)
+                            .unwrap_or(0);
+                        let digest = crate::package_state::ContentDigest::of(&text);
+                        state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
+                            kind,
+                            origin: crate::package_state::ContentOrigin::Open { version },
+                            text,
+                            content_digest: digest,
+                        });
                     }
                 }
             }

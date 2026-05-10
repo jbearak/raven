@@ -2936,8 +2936,12 @@ pub(crate) fn get_cross_file_scope(
     line: u32,
     column: u32,
     cancel: &DiagCancelToken,
-    // Package-mode contribution (plumbing only in Phase 4; Phase 5 wires the
-    // actual scope injection). Pass `None` until Phase 5.
+    // Package-mode contribution: production LSP/diagnostics paths now pass
+    // `Some(&state.package_state.scope_contribution)` (see
+    // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
+    // internal and imported symbols are injected into the resolved scope.
+    // `None` is an explicit opt-out used by tests and non-package-mode
+    // contexts; it is no longer a "wire it up later" placeholder.
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> scope::ScopeAtPosition {
     let content_provider = state.content_provider();
@@ -2986,8 +2990,12 @@ pub(crate) fn get_cross_file_scope_with_cache(
     column: u32,
     cancel: &DiagCancelToken,
     prefix_cache: &mut scope::ParentPrefixCache,
-    // Package-mode contribution (plumbing only in Phase 4; Phase 5 wires the
-    // actual scope injection). Pass `None` until Phase 5.
+    // Package-mode contribution: production LSP/diagnostics paths now pass
+    // `Some(&state.package_state.scope_contribution)` (see
+    // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
+    // internal and imported symbols are injected into the resolved scope.
+    // `None` is an explicit opt-out used by tests and non-package-mode
+    // contexts; it is no longer a "wire it up later" placeholder.
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> scope::ScopeAtPosition {
     let content_provider = state.content_provider();

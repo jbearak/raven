@@ -75,7 +75,14 @@ fn apply(inputs: &mut PackageInputs, mutation: &Mutation) -> PackageInputDelta {
             if let Some(prev) = inputs.r_files.remove(path) {
                 PackageInputDelta::RFileDeleted { path: path.clone(), kind: prev.kind }
             } else {
-                PackageInputDelta::Initial
+                // Absent-path deletion is a no-op: no inputs changed. An empty
+                // `Batch` expresses that exactly, without conflating the
+                // situation with `Initial` (a fresh activation) or forcing a
+                // new enum variant. The delta is advisory — see the doc
+                // comment on `derive_package_state` — so this choice only
+                // affects how observers reading the delta interpret the
+                // event.
+                PackageInputDelta::Batch(Vec::new())
             }
         }
         Mutation::SetNamespace { text } => {

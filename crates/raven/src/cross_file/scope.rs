@@ -4116,11 +4116,16 @@ fn append_package_contribution(
     let pkg_uri = Url::parse("package:///internal")
         .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
 
+    // `PackageScopeContribution` does not (yet) carry per-symbol metadata, so
+    // we cannot classify injected symbols as function vs. variable. Default
+    // to `Variable` — the neutral choice — so non-function imports and
+    // assignments aren't misclassified as functions. When
+    // `PackageScopeContribution` propagates kind metadata, use it here.
     for sym in contrib.r_internal_symbols.iter() {
         let name: Arc<str> = Arc::from(sym.as_str());
         symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
             name,
-            kind: SymbolKind::Function,
+            kind: SymbolKind::Variable,
             source_uri: pkg_uri.clone(),
             defined_line: 0,
             defined_column: 0,
@@ -4133,7 +4138,7 @@ fn append_package_contribution(
         let name: Arc<str> = Arc::from(sym.as_str());
         symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
             name,
-            kind: SymbolKind::Function,
+            kind: SymbolKind::Variable,
             source_uri: pkg_uri.clone(),
             defined_line: 0,
             defined_column: 0,
@@ -17257,7 +17262,11 @@ y <- filter(df)"#;
 // Phase 5a integration tests: PackageScopeContribution → scope injection
 // ============================================================================
 
-#[cfg(test)]
+// These tests use hard-coded POSIX file URLs (e.g. `file:///work/pkg/...`).
+// On Windows, `Url::to_file_path()` rejects such URLs, so gate the module
+// to Unix-only rather than teaching every test to build platform-specific
+// URIs.
+#[cfg(all(test, unix))]
 mod package_contribution_tests {
     use super::*;
     use crate::package_state::PackageScopeContribution;
@@ -17369,7 +17378,9 @@ mod package_contribution_tests {
             scope_with_contrib.symbols.keys().collect::<Vec<_>>()
         );
         let sym = scope_with_contrib.symbols.get("helper").unwrap();
-        assert_eq!(sym.kind, SymbolKind::Function);
+        // `PackageScopeContribution` does not carry per-symbol kind metadata,
+        // so injected symbols default to `Variable` (the neutral choice).
+        assert_eq!(sym.kind, SymbolKind::Variable);
         assert!(
             sym.source_uri.as_str().starts_with("package:"),
             "synthetic symbol source_uri must use package: scheme, got {}",
@@ -17554,7 +17565,9 @@ mod package_contribution_tests {
             scope_with_contrib.symbols.keys().collect::<Vec<_>>()
         );
         let sym = scope_with_contrib.symbols.get("helper").unwrap();
-        assert_eq!(sym.kind, SymbolKind::Function);
+        // `PackageScopeContribution` does not carry per-symbol kind metadata,
+        // so injected symbols default to `Variable` (the neutral choice).
+        assert_eq!(sym.kind, SymbolKind::Variable);
         assert!(
             sym.source_uri.as_str().starts_with("package:"),
             "synthetic symbol source_uri must use package: scheme, got {}",

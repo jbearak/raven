@@ -4,7 +4,24 @@
 
 use super::*;
 use crate::package_namespace::parse_dcf_field_pub;
+use std::path::Path;
 
+/// Pure derivation from `PackageInputs` to `PackageState`.
+///
+/// # Why `_delta` is ignored
+///
+/// The `_delta` parameter is intentionally unused: this function always
+/// performs a full from-scratch recomputation over `inputs`. Any incremental
+/// speedup comes from memoization *inside* the function (per-file facts are
+/// reused when the `ContentDigest` matches `prev`), not from delta-driven
+/// short-circuiting at the call boundary.
+///
+/// This contract is exercised by
+/// `proptest_machine::advisory_delta_does_not_affect_correctness`, which
+/// asserts that passing `Initial` instead of the "correct" delta still yields
+/// the same `PackageState`. Future maintainers must not introduce
+/// delta-driven branches here: callers treat the delta as advisory and
+/// correctness must not depend on which variant is passed.
 pub fn derive_package_state(
     prev: &PackageState,
     inputs: &PackageInputs,
@@ -12,8 +29,12 @@ pub fn derive_package_state(
 ) -> PackageState {
     let workspace = effective_workspace(inputs);
     let r_file_facts = derive_r_file_facts(&prev.r_file_facts, &inputs.r_files);
-    let namespace_model = if workspace.is_some() {
-        Some(merge_namespace_model(inputs.namespace.as_ref(), &r_file_facts))
+    let namespace_model = if let Some(ws) = workspace.as_ref() {
+        Some(merge_namespace_model(
+            inputs.namespace.as_ref(),
+            &r_file_facts,
+            &ws.root,
+        ))
     } else {
         None
     };
@@ -69,16 +90,21 @@ fn build_scope_contribution(
 fn merge_namespace_model(
     namespace: Option<&NamespaceInput>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
+    workspace_root: &Path,
 ) -> PackageNamespaceModel {
     let mut model = match namespace {
         Some(ns) => crate::package_namespace::namespace_model_from_content(&ns.text),
         None => PackageNamespaceModel::default(),
     };
-    // Union roxygen-derived imports/exports from R/ source files.
-    // (We don't filter by `kind == Source` here yet — Task 2.9 covers that
-    // via `scope_contribution`. Roxygen tags from any tracked file
-    // contribute to the namespace model since R's namespace is package-wide.)
-    for (_, facts) in r_file_facts {
+    // Union roxygen-derived imports/exports from R/ source files only.
+    // Test files (tests/testthat/*) must never contribute @export/@importFrom
+    // tags to the package-wide namespace model — mirroring the path filter
+    // used by `build_scope_contribution`.
+    let r_dir = workspace_root.join("R");
+    for (path, facts) in r_file_facts {
+        if !path.starts_with(&r_dir) {
+            continue;
+        }
         for sym in &facts.roxygen_namespace.exports {
             if !model.exports.contains(sym) {
                 model.exports.insert(sym.clone());
@@ -314,6 +340,41 @@ mod tests {
         });
         let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
         assert!(!s.scope_contribution.r_internal_symbols.contains("test_helper"));
+    }
+
+    #[test]
+    fn namespace_model_excludes_roxygen_from_test_files() {
+        // A test file carrying roxygen tags must NOT contribute to the
+        // package-wide namespace model — mirrors the path filter in
+        // `build_scope_contribution`.
+        let test_path: PathBuf = "/work/pkg/tests/testthat/test-utils.R".into();
+        let text: Arc<str> = concat!(
+            "#' @export\n",
+            "#' @importFrom dplyr filter\n",
+            "#' @import ggplot2\n",
+            "leaked <- function() 1\n",
+        )
+        .into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(test_path, RFileInput {
+            kind: RFileKind::Test,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: ContentDigest::of(&text),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        let m = s.namespace_model.as_ref().unwrap();
+        assert!(!m.exports.contains("leaked"), "test-file @export leaked: {:?}", m.exports);
+        assert!(
+            !m.imports.iter().any(|(p, s)| p == "dplyr" && s == "filter"),
+            "test-file @importFrom leaked: {:?}",
+            m.imports
+        );
+        assert!(
+            !m.full_imports.iter().any(|p| p == "ggplot2"),
+            "test-file @import leaked: {:?}",
+            m.full_imports
+        );
     }
 
     #[test]

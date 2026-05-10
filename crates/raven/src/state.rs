@@ -988,16 +988,24 @@ impl WorldState {
     ) {
         self.workspace_index = index;
 
-        // Apply package_mode setting
+        // Apply package_mode setting. We replace `self.package_state` atomically
+        // rather than mutating individual fields so that per-mode transitions
+        // never leave stale `r_file_facts` or `scope_contribution` from a
+        // prior mode. The workspace scan provides `pkg_workspace` /
+        // `pkg_ns_model`; other derived fields are rebuilt by
+        // `apply_package_event` (called by the scan completion path) from
+        // `self.package_inputs`.
         use crate::cross_file::config::PackageMode;
+        let new_workspace;
+        let new_namespace_model;
         match self.cross_file_config.package_mode {
             PackageMode::Disabled => {
-                self.package_state.workspace = None;
-                self.package_state.namespace_model = None;
+                new_workspace = None;
+                new_namespace_model = None;
             }
             PackageMode::Enabled => {
-                // Force package mode even without detection
-                self.package_state.workspace = pkg_workspace.or_else(|| {
+                // Force package mode even without detection.
+                new_workspace = pkg_workspace.or_else(|| {
                     self.workspace_folders.first()
                         .and_then(|u| u.to_file_path().ok())
                         .map(|root| crate::package_namespace::PackageWorkspace {
@@ -1009,8 +1017,8 @@ impl WorldState {
                 // Ensure namespace model is consistent: if we synthesized a
                 // fallback workspace, provide a default model so downstream
                 // code never sees Some(workspace) + None(model).
-                self.package_state.namespace_model = pkg_ns_model.or_else(|| {
-                    if self.package_workspace().is_some() {
+                new_namespace_model = pkg_ns_model.or_else(|| {
+                    if new_workspace.is_some() {
                         Some(crate::package_namespace::PackageNamespaceModel::default())
                     } else {
                         None
@@ -1018,10 +1026,20 @@ impl WorldState {
                 });
             }
             PackageMode::Auto => {
-                self.package_state.workspace = pkg_workspace;
-                self.package_state.namespace_model = pkg_ns_model;
+                new_workspace = pkg_workspace;
+                new_namespace_model = pkg_ns_model;
             }
         }
+        // Atomic replacement: all non-workspace/namespace fields reset to
+        // neutral defaults. The scan-completion caller follows this with
+        // `apply_package_event`, which repopulates `r_file_facts` and
+        // `scope_contribution` from `package_inputs` via `derive_package_state`.
+        self.package_state = crate::package_state::PackageState {
+            workspace: new_workspace,
+            namespace_model: new_namespace_model,
+            r_file_facts: std::collections::BTreeMap::new(),
+            scope_contribution: crate::package_state::PackageScopeContribution::default(),
+        };
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -1278,8 +1296,6 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
     use rayon::prelude::*;
 
-    let mut imports = Vec::new();
-
     // Get workspace root for path resolution
     let workspace_root = folders.first().cloned();
 
@@ -1289,15 +1305,6 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
             collect_file_paths(&path, &mut file_paths);
-
-            // Check for NAMESPACE file
-            let namespace_path = path.join("NAMESPACE");
-            if namespace_path.exists() && imports.is_empty() {
-                if let Ok(text) = fs::read_to_string(&namespace_path) {
-                    imports = parse_namespace_imports_from_text(&text);
-                    log::info!("Found {} imports from NAMESPACE", imports.len());
-                }
-            }
         }
     }
 
@@ -1478,7 +1485,7 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         (None, None, HashMap::new())
     };
 
-    (index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)
+    (index, Vec::new(), cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)
 }
 
 /// Directories to skip during workspace scanning.
@@ -1533,6 +1540,7 @@ fn is_stat_model_extension(path: &Path) -> bool {
 /// `apply_workspace_index` (as `_imports`, now unused) for backward compatibility
 /// with callers; the canonical import data comes from `PackageScopeContribution`
 /// derived by `derive_package_state`.
+#[allow(dead_code)]
 fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
     let mut imports = Vec::new();
 
