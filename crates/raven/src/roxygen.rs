@@ -1164,7 +1164,7 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
 
         // We're in a roxygen block — collect all contiguous #' lines
         let mut has_export = false;
-        let mut explicit_export_name: Option<String> = None;
+        let mut explicit_export_names: Vec<String> = Vec::new();
         let block_start = i;
         while i < lines.len() && lines[i].trim_start().starts_with("#'") {
             let tag_line = lines[i].trim_start().strip_prefix("#'").unwrap_or("").trim();
@@ -1175,7 +1175,7 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
                 has_export = true;
                 let name = rest.trim();
                 if !name.is_empty() {
-                    explicit_export_name = Some(name.to_string());
+                    explicit_export_names.push(name.to_string());
                 }
             } else if let Some(rest) = tag_line.strip_prefix("@import ") {
                 // @import pkg1 pkg2 ...
@@ -1203,9 +1203,9 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
 
         // If @export was found, extract the symbol name from the next definition
         if has_export {
-            if let Some(name) = explicit_export_name {
-                // Explicit @export name overrides auto-detection
-                ns.exports.push(name);
+            if !explicit_export_names.is_empty() {
+                // Explicit @export name(s) override auto-detection
+                ns.exports.extend(explicit_export_names);
             } else {
                 // Skip blank lines and comments after the block
                 while i < lines.len() {
@@ -1510,5 +1510,26 @@ bar <- function() {}
         let content = "#' @export\n\"[<-\" <- function(x, i, value) x\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["[<-"]);
+    }
+
+    #[test]
+    fn multiple_explicit_export_names() {
+        // Multiple @export tags with explicit names in one block should all be captured
+        let content = "#' @export foo\n#' @export bar\nbaz <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.exports.contains(&"foo".to_string()), "first explicit @export name should be kept");
+        assert!(ns.exports.contains(&"bar".to_string()), "second explicit @export name should be kept");
+        assert_eq!(ns.exports.len(), 2);
+    }
+
+    #[test]
+    fn mixed_bare_and_explicit_export() {
+        // A bare @export followed by @export with name: bare triggers auto-detect,
+        // explicit name is also captured
+        let content = "#' @export\n#' @export alias\nmy_func <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        // When explicit names exist, they override auto-detection
+        assert!(ns.exports.contains(&"alias".to_string()));
+        assert_eq!(ns.exports.len(), 1);
     }
 }

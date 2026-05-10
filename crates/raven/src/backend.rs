@@ -1877,6 +1877,11 @@ impl LanguageServer for Backend {
                     old_interface_hash,
                     new_interface_hash
                 );
+                // Rebuild package-internal symbols so sibling R/ files see the
+                // updated exports immediately (open doc is now authoritative).
+                if state.package_workspace.is_some() {
+                    state.rebuild_package_internal_symbols_cache();
+                }
             }
 
             // Compute affected files from dependency graph using HashSet for O(1) deduplication

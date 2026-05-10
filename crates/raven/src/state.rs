@@ -749,9 +749,11 @@ impl WorldState {
     }
 
     /// Rebuild the cached package-internal symbols set from the workspace index
-    /// AND open documents. The workspace index only contains closed files'
-    /// exports; open files' current exports must be merged from `document_store`
-    /// so that newly-defined symbols propagate to sibling diagnostics/completions.
+    /// AND open documents. Open files' exports are authoritative — the workspace
+    /// index may hold stale entries for files that are currently open (e.g., a
+    /// symbol was removed but the index hasn't been refreshed yet). We exclude
+    /// open URIs from the workspace index scan and merge their live exports
+    /// separately.
     pub fn rebuild_package_internal_symbols_cache(&mut self) {
         let Some(ref pkg) = self.package_workspace else {
             if !self.package_internal_symbols_cache.is_empty() {
@@ -760,12 +762,16 @@ impl WorldState {
             return;
         };
         let r_dir = pkg.root.join("R");
-        let mut symbols = self.cross_file_workspace_index.collect_exported_symbols(&r_dir);
-        // Merge open documents' exports (authoritative over stale index entries).
-        for uri in self.document_store.uris() {
+        let open_uris: HashSet<Url> = self.document_store.uris().into_iter().collect();
+        // Collect from workspace index, skipping open files (their entries may be stale).
+        let mut symbols =
+            self.cross_file_workspace_index
+                .collect_exported_symbols(&r_dir, &open_uris);
+        // Merge open documents' exports (authoritative).
+        for uri in &open_uris {
             if let Ok(p) = uri.to_file_path() {
                 if p.starts_with(&r_dir) {
-                    if let Some(doc) = self.document_store.get_without_touch(&uri) {
+                    if let Some(doc) = self.document_store.get_without_touch(uri) {
                         for name in doc.artifacts.exported_interface.keys() {
                             symbols.insert(name.to_string());
                         }

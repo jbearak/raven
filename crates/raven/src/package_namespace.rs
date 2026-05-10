@@ -136,8 +136,9 @@ pub fn namespace_model_from_content(content: &str) -> PackageNamespaceModel {
         }
         if let Some(args) = strip_directive(line, "export") {
             for name in split_args(args) {
+                let name = unquote(name);
                 if !name.is_empty() {
-                    model.exports.insert(name.to_string());
+                    model.exports.insert(name);
                 }
             }
         } else if let Some(args) = strip_directive(line, "exportPattern") {
@@ -150,9 +151,9 @@ pub fn namespace_model_from_content(content: &str) -> PackageNamespaceModel {
         } else if let Some(args) = strip_directive(line, "S3method") {
             let parts: Vec<&str> = split_args(args).collect();
             if parts.len() >= 2 {
-                model
-                    .exports
-                    .insert(format!("{}.{}", parts[0], parts[1]));
+                let generic = unquote(parts[0]);
+                let class = unquote(parts[1]);
+                model.exports.insert(format!("{}.{}", generic, class));
             }
         } else if let Some(args) = strip_directive(line, "importFrom") {
             let parts: Vec<&str> = split_args(args).collect();
@@ -462,5 +463,25 @@ S3method(print, myclass)
         let model = namespace_model_from_content(content);
         assert!(model.exports.contains("__PATTERN__:\"^[^#].*\""));
         assert!(model.exports.contains("foo"));
+    }
+
+    #[test]
+    fn namespace_export_unquotes_names() {
+        // export() with quoted names should strip quotes
+        let content = "export(\"%>%\")\nexport('my_func')\nexport(plain)\n";
+        let model = namespace_model_from_content(content);
+        assert!(model.exports.contains("%>%"), "should unquote double-quoted export");
+        assert!(model.exports.contains("my_func"), "should unquote single-quoted export");
+        assert!(model.exports.contains("plain"), "should keep unquoted export");
+        assert!(!model.exports.contains("\"%>%\""), "should NOT contain quoted form");
+    }
+
+    #[test]
+    fn namespace_s3method_unquotes_names() {
+        // S3method() with quoted generic/class should strip quotes
+        let content = "S3method(\"[\", myclass)\nS3method(print, \"my.class\")\n";
+        let model = namespace_model_from_content(content);
+        assert!(model.exports.contains("[.myclass"), "should unquote generic in S3method");
+        assert!(model.exports.contains("print.my.class"), "should unquote class in S3method");
     }
 }
