@@ -2665,127 +2665,27 @@ impl LanguageServer for Backend {
                 state.document_store.update(&uri, changes, version).await;
             }
 
-            // Rebuild roxygen namespace model when an R/*.R file changes in a
-            // roxygen-managed package. This ensures @import/@importFrom edits
-            // take effect immediately without waiting for DESCRIPTION/NAMESPACE touch.
+            // Update package state via event-driven path when an R/*.R file
+            // changes in a package workspace. This replaces the legacy
+            // roxygen_tags_cache mutation + rebuild_namespace_model_from_cache.
             let mut package_namespace_changed = false;
-            let pkg_r_dir = state.package_workspace().map(|pkg| pkg.root.join("R"));
-            if let Some(r_dir) = pkg_r_dir {
-                if let Ok(file_path) = uri.to_file_path() {
-                    if file_path.starts_with(&r_dir) {
-                        let content = state.documents.get(&uri).map(|d| d.text());
-                        if let Some(content) = content {
-                            // Cheap pre-check: skip full extraction when the file
-                            // has no roxygen namespace tags AND the cache already
-                            // has an empty entry (common case during normal editing
-                            // of files without roxygen annotations).
-                            let has_tags = crate::roxygen::has_roxygen_namespace_tags(&content);
-                            let cache_is_empty = state
-                                .package_state.roxygen_tags_cache
-                                .get(&file_path)
-                                .map_or(true, |ns| {
-                                    ns.exports.is_empty()
-                                        && ns.imports.is_empty()
-                                        && ns.import_from.is_empty()
-                                });
-                            if has_tags || !cache_is_empty {
-                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                            let tags_changed = state
-                                .package_state.roxygen_tags_cache
-                                .get(&file_path)
-                                .map_or(true, |old| *old != ns);
-                            if tags_changed {
-                                state.package_state.roxygen_tags_cache.insert(file_path, ns);
-                                // Recompute roxygen_managed: true if any file has tags
-                                let any_tags = state.package_state.roxygen_tags_cache.values().any(|ns| {
-                                    !ns.exports.is_empty()
-                                        || !ns.imports.is_empty()
-                                        || !ns.import_from.is_empty()
-                                });
-                                if let Some(ref mut pkg) = state.package_state.workspace {
-                                    if pkg.roxygen_managed != any_tags {
-                                        pkg.roxygen_managed = any_tags;
-                                        log::info!(
-                                            "roxygen_managed transitioned to {} for package {}",
-                                            any_tags,
-                                            pkg.name
-                                        );
-                                    }
-                                }
-                                if state.package_workspace().is_some_and(|p| p.roxygen_managed) {
-                                    // If transitioning false→true, populate cache from
-                                    // all R/*.R files (open docs + file cache) so the
-                                    // model isn't built from just the one edited file.
-                                    if state.package_state.roxygen_tags_cache.len() <= 1 {
-                                        if let Some(pkg) = state.package_workspace() {
-                                            let pkg_r_dir2 = pkg.root.join("R");
-                                            // Scan open documents for roxygen tags
-                                            let open_r_uris: Vec<Url> = state.documents.keys()
-                                                .filter(|u| u.to_file_path().ok().is_some_and(|p|
-                                                    p.starts_with(&pkg_r_dir2) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))))
-                                                .cloned().collect();
-                                            for open_uri in &open_r_uris {
-                                                if let Ok(p) = open_uri.to_file_path() {
-                                                    if !state.package_state.roxygen_tags_cache.contains_key(&p) {
-                                                        if let Some(doc) = state.documents.get(open_uri) {
-                                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&doc.text());
-                                                            state.package_state.roxygen_tags_cache.insert(p, ns);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // Snapshot content from file cache for non-open
-                                            // R/*.R files, then extract tags. Collecting
-                                            // content first avoids repeated file cache lock
-                                            // acquisition during extraction.
-                                            let cached_contents: Vec<(std::path::PathBuf, String)> = {
-                                                let cached_uris: Vec<Url> = state.cross_file_workspace_index.uris();
-                                                cached_uris.iter()
-                                                    .filter(|u| !state.documents.contains_key(u))
-                                                    .filter_map(|u| {
-                                                        let p = u.to_file_path().ok()?;
-                                                        if !p.starts_with(&pkg_r_dir2)
-                                                            || !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                                                            || state.package_state.roxygen_tags_cache.contains_key(&p)
-                                                        {
-                                                            return None;
-                                                        }
-                                                        state.cross_file_file_cache.get(u).map(|c| (p, c))
-                                                    })
-                                                    .collect()
-                                            };
-                                            for (p, content) in cached_contents {
-                                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                                state.package_state.roxygen_tags_cache.insert(p, ns);
-                                            }
-                                        }
-                                    }
-                                    package_namespace_changed =
-                                        state.rebuild_namespace_model_from_cache();
-                                } else if state.package_workspace().is_some() {
-                                    // roxygen_managed transitioned to false: fall back to
-                                    // NAMESPACE file for import information.
-                                    // Clear the cache so a future false→true transition
-                                    // correctly detects len()<=1 and repopulates.
-                                    state.package_state.roxygen_tags_cache.clear();
-                                    // Avoid blocking I/O under the write lock: try the file
-                                    // cache first, fall back to empty model (the watcher task
-                                    // will pick up the NAMESPACE file on next change).
-                                    let ns_model = state.package_workspace()
-                                        .and_then(|pkg| {
-                                            let ns_uri = Url::from_file_path(pkg.root.join("NAMESPACE")).ok()?;
-                                            state.cross_file_file_cache.get(&ns_uri)
-                                                .map(|content| crate::package_namespace::namespace_model_from_content(&content))
-                                        })
-                                        .unwrap_or_default();
-                                    state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                                    state.package_state.namespace_model = Some(ns_model);
-                                    package_namespace_changed = true;
-                                }
-                            }
-                            } // end if has_tags || !cache_is_empty
-                        }
-                    }
+            {
+                let text: std::sync::Arc<str> = state.documents.get(&uri)
+                    .map(|d| d.text())
+                    .unwrap_or_default()
+                    .into();
+                let old_ns_model = state.package_state.namespace_model.clone();
+                let event = crate::package_state::event::HandlerEvent::DidChange {
+                    uri: uri.clone(),
+                    version,
+                    text,
+                };
+                if let Some(delta) = crate::package_state::event::translate(
+                    &mut state.package_inputs,
+                    event,
+                ) {
+                    state.apply_package_event(&delta);
+                    package_namespace_changed = state.package_state.namespace_model != old_ns_model;
                 }
             }
 
@@ -2813,14 +2713,9 @@ impl LanguageServer for Backend {
                     old_interface_hash,
                     new_interface_hash
                 );
-                // Rebuild the cached package-internal symbols when exports change.
-                // Only rebuild if the file is under R/ — files outside R/ don't
-                // contribute to the package-internal symbols cache.
-                if let Some(pkg) = state.package_workspace() {
-                    if uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R"))) {
-                        state.rebuild_package_internal_symbols_cache();
-                    }
-                }
+                // Package-internal symbols are now updated by apply_package_event
+                // above (via scope_contribution → internal_symbols_cache). No
+                // separate rebuild is needed here.
             }
 
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
