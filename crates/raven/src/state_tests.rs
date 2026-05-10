@@ -510,7 +510,7 @@ mod package_cache_cleanup_tests {
         });
 
         // Simulate two files with roxygen tags
-        state.roxygen_tags_cache.insert(
+        state.package_state.roxygen_tags_cache.insert(
             PathBuf::from("/tmp/testpkg/R/a.R"),
             crate::roxygen::RoxygenNamespace {
                 exports: vec!["foo".into()],
@@ -518,7 +518,7 @@ mod package_cache_cleanup_tests {
                 import_from: vec![("dplyr".into(), "mutate".into())],
             },
         );
-        state.roxygen_tags_cache.insert(
+        state.package_state.roxygen_tags_cache.insert(
             PathBuf::from("/tmp/testpkg/R/b.R"),
             crate::roxygen::RoxygenNamespace {
                 exports: vec!["bar".into()],
@@ -533,7 +533,7 @@ mod package_cache_cleanup_tests {
         assert!(model.imports.contains(&("tidyr".into(), "pivot_longer".into())));
 
         // Simulate deletion of b.R by removing from cache
-        state.roxygen_tags_cache.remove(&PathBuf::from("/tmp/testpkg/R/b.R"));
+        state.package_state.roxygen_tags_cache.remove(&PathBuf::from("/tmp/testpkg/R/b.R"));
         state.rebuild_namespace_model_from_cache();
 
         let model = state.package_namespace_model().unwrap();

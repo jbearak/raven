@@ -597,10 +597,6 @@ pub struct WorldState {
     pub workspace_scan_complete: bool,
     /// Container for all derived R package mode state. See package_state.rs.
     pub package_state: crate::package_state::PackageState,
-    /// Per-file roxygen namespace tag cache. Keyed by file path so that
-    /// `did_change` can re-extract tags for only the changed file and rebuild
-    /// the namespace model from the cache without any filesystem I/O.
-    pub roxygen_tags_cache: HashMap<PathBuf, crate::roxygen::RoxygenNamespace>,
     /// Cached set of package-internal symbol names (top-level exports from
     /// other R/*.R files). Updated incrementally when workspace index entries
     /// change, avoiding O(package_files) work on every diagnostic/completion.
@@ -618,6 +614,20 @@ impl WorldState {
         &self,
     ) -> Option<&crate::package_namespace::PackageNamespaceModel> {
         self.package_state.namespace_model.as_ref()
+    }
+
+    /// Passthrough for legacy `state.roxygen_tags_cache` immutable reads.
+    pub fn roxygen_tags_cache(
+        &self,
+    ) -> &std::collections::HashMap<std::path::PathBuf, crate::roxygen::RoxygenNamespace> {
+        &self.package_state.roxygen_tags_cache
+    }
+
+    /// Passthrough for legacy `state.roxygen_tags_cache` mutable access.
+    pub fn roxygen_tags_cache_mut(
+        &mut self,
+    ) -> &mut std::collections::HashMap<std::path::PathBuf, crate::roxygen::RoxygenNamespace> {
+        &mut self.package_state.roxygen_tags_cache
     }
 }
 
@@ -717,7 +727,6 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
-            roxygen_tags_cache: HashMap::new(),
             package_internal_symbols_cache: Arc::new(HashSet::new()),
         }
     }
@@ -749,7 +758,7 @@ impl WorldState {
         let mut model = crate::package_namespace::PackageNamespaceModel::default();
         let mut seen_imports: HashSet<(String, String)> = HashSet::new();
         let mut seen_full: HashSet<String> = HashSet::new();
-        for ns in self.roxygen_tags_cache.values() {
+        for ns in self.package_state.roxygen_tags_cache.values() {
             for sym in &ns.exports {
                 model.exports.insert(sym.clone());
             }
