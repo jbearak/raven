@@ -12,6 +12,9 @@ pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 
+#[cfg(test)]
+mod proptest_machine;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
