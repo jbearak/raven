@@ -799,25 +799,6 @@ impl WorldState {
         self.html_help_cache.drain();
     }
 
-    /// Rebuild the package namespace model from the in-memory roxygen tags cache.
-    /// No filesystem I/O — uses only the cached per-file tags.
-    /// Returns whether the namespace model changed (imports or full_imports).
-    pub fn rebuild_namespace_model_from_cache(&mut self) -> bool {
-        self.package_state.rebuild_namespace_model_from_cache()
-    }
-
-    /// Rebuild the cached package-internal symbols set from the workspace index
-    /// AND open documents. Open files' exports are authoritative — the workspace
-    /// index may hold stale entries for files that are currently open (e.g., a
-    /// symbol was removed but the index hasn't been refreshed yet). We exclude
-    /// open URIs from the workspace index scan and merge their live exports
-    /// separately.
-    pub fn rebuild_package_internal_symbols_cache(&mut self) {
-        let workspace_index = &self.cross_file_workspace_index;
-        let document_store = &self.document_store;
-        self.package_state
-            .rebuild_internal_symbols_cache(workspace_index, document_store);
-    }
 
     /// Create a content provider for this state
     ///
