@@ -12,11 +12,51 @@ pub fn derive_package_state(
 ) -> PackageState {
     let workspace = effective_workspace(inputs);
     let r_file_facts = derive_r_file_facts(&prev.r_file_facts, &inputs.r_files);
+    let namespace_model = if workspace.is_some() {
+        Some(merge_namespace_model(inputs.namespace.as_ref(), &r_file_facts))
+    } else {
+        None
+    };
     PackageState {
         workspace,
+        namespace_model,
         r_file_facts,
         ..PackageState::default()
     }
+}
+
+fn merge_namespace_model(
+    namespace: Option<&NamespaceInput>,
+    r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
+) -> PackageNamespaceModel {
+    let mut model = match namespace {
+        Some(ns) => crate::package_namespace::namespace_model_from_content(&ns.text),
+        None => PackageNamespaceModel::default(),
+    };
+    // Union roxygen-derived imports/exports from R/ source files.
+    // (We don't filter by `kind == Source` here yet — Task 2.9 covers that
+    // via `scope_contribution`. Roxygen tags from any tracked file
+    // contribute to the namespace model since R's namespace is package-wide.)
+    for (_, facts) in r_file_facts {
+        for sym in &facts.roxygen_namespace.exports {
+            if !model.exports.contains(sym) {
+                model.exports.insert(sym.clone());
+            }
+        }
+        // RoxygenNamespace::import_from → PackageNamespaceModel::imports (Vec<(pkg, sym)>)
+        for (pkg, sym) in &facts.roxygen_namespace.import_from {
+            if !model.imports.iter().any(|(p, s)| p == pkg && s == sym) {
+                model.imports.push((pkg.clone(), sym.clone()));
+            }
+        }
+        // RoxygenNamespace::imports (full package imports) → PackageNamespaceModel::full_imports
+        for pkg in &facts.roxygen_namespace.imports {
+            if !model.full_imports.contains(pkg) {
+                model.full_imports.push(pkg.clone());
+            }
+        }
+    }
+    model
 }
 
 fn derive_r_file_facts(
@@ -181,5 +221,27 @@ mod tests {
         let f1 = s1.r_file_facts.get(&path).unwrap();
         let f2 = s2.r_file_facts.get(&path).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&f1.top_level_defs, &f2.top_level_defs));
+    }
+
+    #[test]
+    fn merge_unions_namespace_and_roxygen() {
+        let path: PathBuf = "/work/pkg/R/foo.R".into();
+        let text: Arc<str> = "#' @importFrom dplyr filter\nfoo <- function() 1\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.namespace = Some(NamespaceInput {
+            path: "/work/pkg/NAMESPACE".into(),
+            text: "importFrom(dplyr, mutate)\nimport(magrittr)\n".into(),
+        });
+        inputs.r_files.insert(path, RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: ContentDigest::of(&text),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        let m = s.namespace_model.unwrap();
+        assert!(m.imports.iter().any(|(p, n)| p == "dplyr" && n == "filter"), "missing roxygen filter: {:?}", m);
+        assert!(m.imports.iter().any(|(p, n)| p == "dplyr" && n == "mutate"), "missing NAMESPACE mutate: {:?}", m);
+        assert!(m.full_imports.iter().any(|p| p == "magrittr"), "missing magrittr: {:?}", m);
     }
 }
