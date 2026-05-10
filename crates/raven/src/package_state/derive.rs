@@ -17,11 +17,51 @@ pub fn derive_package_state(
     } else {
         None
     };
+    let scope_contribution = build_scope_contribution(&workspace, &namespace_model, &r_file_facts);
     PackageState {
         workspace,
         namespace_model,
         r_file_facts,
+        scope_contribution,
         ..PackageState::default()
+    }
+}
+
+fn build_scope_contribution(
+    workspace: &Option<PackageWorkspace>,
+    namespace_model: &Option<PackageNamespaceModel>,
+    r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
+) -> PackageScopeContribution {
+    let Some(ws) = workspace else {
+        return PackageScopeContribution::default();
+    };
+    let r_dir = ws.root.join("R");
+    // r_internal_symbols: union of top_level_defs from files under R/ only
+    // (exclude tests/testthat/* — those are kind == Test).
+    let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
+    for (path, facts) in r_file_facts {
+        if !path.starts_with(&r_dir) {
+            continue;
+        }
+        for def in facts.top_level_defs.iter() {
+            r_internal_symbols.insert(def.clone());
+        }
+    }
+    let (imported_symbols, full_imports) = match namespace_model {
+        Some(m) => {
+            let mut imp: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for (pkg, sym) in &m.imports {
+                imp.entry(sym.clone()).or_default().insert(pkg.clone());
+            }
+            let full: BTreeSet<String> = m.full_imports.iter().cloned().collect();
+            (imp, full)
+        }
+        None => (BTreeMap::new(), BTreeSet::new()),
+    };
+    PackageScopeContribution {
+        r_internal_symbols: Arc::new(r_internal_symbols),
+        imported_symbols: Arc::new(imported_symbols),
+        full_imports: Arc::new(full_imports),
     }
 }
 
@@ -243,5 +283,48 @@ mod tests {
         assert!(m.imports.iter().any(|(p, n)| p == "dplyr" && n == "filter"), "missing roxygen filter: {:?}", m);
         assert!(m.imports.iter().any(|(p, n)| p == "dplyr" && n == "mutate"), "missing NAMESPACE mutate: {:?}", m);
         assert!(m.full_imports.iter().any(|p| p == "magrittr"), "missing magrittr: {:?}", m);
+    }
+
+    #[test]
+    fn scope_contribution_includes_internal_symbols_from_r_dir() {
+        let path: PathBuf = "/work/pkg/R/utils.R".into();
+        let text: Arc<str> = "helper <- function() 1\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(path, RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: ContentDigest::of(&text),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        assert!(s.scope_contribution.r_internal_symbols.contains("helper"));
+    }
+
+    #[test]
+    fn scope_contribution_excludes_test_file_symbols() {
+        let test_path: PathBuf = "/work/pkg/tests/testthat/test-utils.R".into();
+        let text: Arc<str> = "test_helper <- function() 1\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(test_path, RFileInput {
+            kind: RFileKind::Test,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: ContentDigest::of(&text),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        assert!(!s.scope_contribution.r_internal_symbols.contains("test_helper"));
+    }
+
+    #[test]
+    fn scope_contribution_carries_imports_from_namespace() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.namespace = Some(NamespaceInput {
+            path: "/work/pkg/NAMESPACE".into(),
+            text: "importFrom(dplyr, filter)\nimportFrom(stats, filter)\n".into(),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        let pkgs = s.scope_contribution.imported_symbols.get("filter").unwrap();
+        assert!(pkgs.contains("dplyr"));
+        assert!(pkgs.contains("stats"));
     }
 }
