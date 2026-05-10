@@ -1278,21 +1278,94 @@ impl LanguageServer for Backend {
                                 pkg_workspace,
                                 pkg_ns_model,
                             );
-                            // Merge scan-time roxygen cache without overwriting entries
-                            // for currently-open files (their did_change updates are fresher).
-                            for (path, ns) in roxygen_cache {
-                                let is_open = Url::from_file_path(&path).ok()
-                                    .is_some_and(|u| state.documents.contains_key(&u));
-                                if !is_open {
-                                    state.package_state.roxygen_tags_cache.insert(path, ns);
+                            // Suppress unused warning: roxygen_cache was used for legacy
+                            // roxygen_tags_cache population which is now replaced by the
+                            // event-driven path via apply_package_event below.
+                            drop(roxygen_cache);
+
+                            // --- Phase 3.9: Populate package_inputs and derive ---
+                            // Populate package_inputs from the now-applied workspace index
+                            // so that apply_package_event derives correct package state.
+                            if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
+                                state.package_inputs.workspace_root = Some(root.clone());
+                                state.package_inputs.package_mode = state.cross_file_config.package_mode;
+
+                                // Read DESCRIPTION and NAMESPACE synchronously (post-scan settle;
+                                // files were already read during the blocking scan above).
+                                let desc_text = std::fs::read_to_string(root.join("DESCRIPTION")).ok()
+                                    .map(|t| std::sync::Arc::from(t.as_str()));
+                                let ns_text = std::fs::read_to_string(root.join("NAMESPACE")).ok()
+                                    .map(|t| std::sync::Arc::from(t.as_str()));
+
+                                state.package_inputs.description = desc_text.map(|text| {
+                                    crate::package_state::DescriptionInput {
+                                        path: root.join("DESCRIPTION"),
+                                        text,
+                                    }
+                                });
+                                state.package_inputs.namespace = ns_text.map(|text| {
+                                    crate::package_state::NamespaceInput {
+                                        path: root.join("NAMESPACE"),
+                                        text,
+                                    }
+                                });
+
+                                // Populate r_files from the workspace index (includes all scanned
+                                // R files with their content). For open documents, override the
+                                // disk entry with ContentOrigin::Open so the buffer is authoritative.
+                                let open_uris: std::collections::HashSet<Url> =
+                                    state.documents.keys().cloned().collect();
+                                let open_versions: std::collections::HashMap<Url, (i32, String)> =
+                                    open_uris.iter()
+                                        .filter_map(|u| {
+                                            let doc = state.documents.get(u)?;
+                                            Some((u.clone(), (doc.version.unwrap_or(0), doc.text())))
+                                        })
+                                        .collect();
+
+                                let mut new_r_files = std::collections::BTreeMap::new();
+                                // Collect all candidate file paths from workspace index.
+                                let ws_uris: Vec<Url> = state.workspace_index_new.uris();
+                                for uri in &ws_uris {
+                                    if let Ok(path) = uri.to_file_path() {
+                                        if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                                            // Skip open files — handle them separately below.
+                                            if open_uris.contains(uri) {
+                                                continue;
+                                            }
+                                            if let Some(entry) = state.workspace_index_new.get(uri) {
+                                                let text: std::sync::Arc<str> = entry.contents.to_string().into();
+                                                let digest = crate::package_state::ContentDigest::of(&text);
+                                                new_r_files.insert(path, crate::package_state::RFileInput {
+                                                    kind,
+                                                    origin: crate::package_state::ContentOrigin::Disk,
+                                                    text,
+                                                    content_digest: digest,
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
+                                // Override / add open documents as ContentOrigin::Open.
+                                for (uri, (version, text_str)) in &open_versions {
+                                    if let Ok(path) = uri.to_file_path() {
+                                        if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                                            let text: std::sync::Arc<str> = text_str.as_str().into();
+                                            let digest = crate::package_state::ContentDigest::of(&text);
+                                            new_r_files.insert(path, crate::package_state::RFileInput {
+                                                kind,
+                                                origin: crate::package_state::ContentOrigin::Open { version: *version },
+                                                text,
+                                                content_digest: digest,
+                                            });
+                                        }
+                                    }
+                                }
+                                state.package_inputs.r_files = new_r_files;
                             }
-                            // Rebuild namespace model from the merged cache so open files'
-                            // fresher roxygen tags are reflected in workspace_imports.
-                            if state.package_workspace().is_some_and(|p| p.roxygen_managed) {
-                                state.rebuild_namespace_model_from_cache();
-                            }
-                            state.rebuild_package_internal_symbols_cache();
+
+                            // Derive package state from the populated inputs.
+                            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
                             // and snapshot trigger versions while we hold the lock.
