@@ -87,7 +87,14 @@ After the refactor: each handler produces a `PackageInputDelta` and calls `deriv
 
 ## 5. Core types
 
-All types live in a new module `crates/raven/src/package_state.rs`. The existing `package_namespace.rs` module is reduced to: parser helpers (`parse_dcf_field`, NAMESPACE parsing) and the data type `PackageNamespaceModel`. The existing `roxygen.rs` module is unchanged in scope (extraction helpers).
+All types live in a new directory module `crates/raven/src/package_state/`, split across four files so each concept has an obvious home:
+
+- `package_state/mod.rs` — the `PackageState` aggregate plus the input/output types (`PackageInputs`, `DescriptionInput`, `NamespaceInput`, `RFileInput`, `RFileKind`, `RFileFacts`, `PackageScopeContribution`) and the advisory `PackageInputDelta` enum. Also hosts the `is_r_source_path` path classifier used by the event layer.
+- `package_state/event.rs` — the `HandlerEvent` enum and the `translate(&mut PackageInputs, HandlerEvent) -> Option<PackageInputDelta>` shim that LSP handlers call to mutate inputs.
+- `package_state/derive.rs` — `derive_package_state(prev, inputs, delta) -> PackageState`, the pure derivation (see §6).
+- `package_state/digest.rs` — `ContentDigest`, the memoization key for `RFileFacts` (see §5.2).
+
+The existing `package_namespace.rs` module now holds: `PackageWorkspace`, `PackageNamespaceModel`, package-detection (`detect_package_workspace`, `detect_package_workspace_with_content`, `detect_roxygen_usage`), the DCF field parser (`parse_dcf_field` / `parse_dcf_field_pub`), and NAMESPACE parsing (`namespace_model_from_content` plus its helpers). The existing `roxygen.rs` module is unchanged in scope (extraction helpers).
 
 ### 5.1 Inputs
 
