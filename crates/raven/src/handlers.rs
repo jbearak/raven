@@ -9017,7 +9017,21 @@ fn push_scoped_symbol_completion(
     items: &mut Vec<CompletionItem>,
     seen_names: &mut std::collections::HashSet<String>,
 ) {
-    if symbol.source_uri.as_str().starts_with("package:") || seen_names.contains(name) {
+    if seen_names.contains(name) {
+        return;
+    }
+
+    // External package-export pseudo-URIs (`package:dplyr`, `package:base`,
+    // ...) are added via the separate per-package loop later; skip them
+    // here to avoid duplicate entries. Package-internal symbols injected by
+    // `append_package_contribution` use the synthetic URI
+    // `scope::PACKAGE_INTERNAL_URI` — these are the user's OWN package's
+    // symbols (from sibling `R/*.R` files or `importFrom` NAMESPACE
+    // targets) and are NOT added anywhere else, so they must pass through
+    // this filter.
+    let is_package_internal = crate::cross_file::scope::is_package_internal_uri(&symbol.source_uri);
+    let source_uri_str = symbol.source_uri.as_str();
+    if source_uri_str.starts_with("package:") && !is_package_internal {
         return;
     }
 
@@ -9031,7 +9045,14 @@ fn push_scoped_symbol_completion(
         crate::cross_file::SymbolKind::Parameter => CompletionItemKind::FIELD,
     };
 
-    let is_cross_file = symbol.source_uri.as_str() != request_uri.as_str();
+    // Package-internal symbols come from another file in the user's
+    // package, but the contribution doesn't carry per-symbol origin — so
+    // we can't render a meaningful relative path and `compute_relative_path`
+    // would fall through to "internal" (the last path segment of
+    // `package:///internal`). Treat them like cross-file entries for sort
+    // priority but render a package-attribution detail instead of a path.
+    let is_cross_file =
+        is_package_internal || symbol.source_uri.as_str() != request_uri.as_str();
     let sort_prefix = if is_cross_file {
         SORT_PREFIX_WORKSPACE
     } else {
@@ -9039,7 +9060,7 @@ fn push_scoped_symbol_completion(
     };
 
     // Use signature if available, otherwise show source file for cross-file symbols.
-    let relative_path = if is_cross_file {
+    let relative_path = if is_cross_file && !is_package_internal {
         Some(compute_relative_path(
             &symbol.source_uri,
             state.workspace_folders.first(),
@@ -9047,15 +9068,19 @@ fn push_scoped_symbol_completion(
     } else {
         None
     };
-    let detail = match (&symbol.signature, is_cross_file) {
-        (Some(sig), _) => Some(sig.clone()),
-        (None, true) => Some(format!("from {}", relative_path.as_ref().unwrap())),
-        (None, false) => None,
+    let detail = match (&symbol.signature, is_cross_file, is_package_internal) {
+        (Some(sig), _, _) => Some(sig.clone()),
+        (None, true, true) => Some("package-internal".to_string()),
+        (None, true, false) => Some(format!("from {}", relative_path.as_ref().unwrap())),
+        (None, false, _) => None,
     };
 
     // For user-defined functions from scope, include data for
     // completionItem/resolve to locate the roxygen block for documentation.
-    let data = if kind == CompletionItemKind::FUNCTION {
+    // Package-internal symbols have a synthetic URI and no precise origin
+    // line, so omit the resolve data — the resolver can't locate a roxygen
+    // block without a real file URI.
+    let data = if kind == CompletionItemKind::FUNCTION && !is_package_internal {
         let mut json = serde_json::json!({
             "type": "user_function",
             "function_name": name_string.clone(),
@@ -9233,6 +9258,19 @@ pub fn completion(
             .iter()
             .chain(scope.loaded_packages.iter())
         {
+            if pkg_set.insert(pkg.as_str()) {
+                all_packages.push(pkg.clone());
+            }
+        }
+
+        // Also include NAMESPACE `import(pkg)` whole-package imports. Without
+        // this, the diagnostic pipeline (which already consults
+        // `scope_contribution.full_imports`, see
+        // `collect_undefined_variables_from_snapshot`) stays silent on
+        // references to those packages' exports while the completion list
+        // doesn't offer them — an asymmetry that forces users to type
+        // imported function names from memory.
+        for pkg in state.package_state.scope_contribution.full_imports.iter() {
             if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
             }
@@ -14141,6 +14179,268 @@ clean_data <- function(x) {
                 panic!("Expected CompletionResponse::Array");
             }
         });
+    }
+
+    // ========================================================================
+    // Package-mode completion: package-internal and NAMESPACE full-imports
+    // Regression tests for bugs found by the 2026-05-10 review.
+    // ========================================================================
+
+    /// Package-internal symbols (from sibling `R/*.R` files) injected via
+    /// `append_package_contribution` must appear in completions.
+    ///
+    /// Regression: `push_scoped_symbol_completion` previously filtered every
+    /// URI starting with `"package:"`, which unintentionally caught the
+    /// synthetic `package:///internal` URI used for internal symbols and
+    /// excluded the user's OWN package exports from autocomplete.
+    #[test]
+    fn test_completion_includes_package_internal_symbols() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let workspace_root = Url::parse("file:///work/pkg").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.workspace_folders = vec![workspace_root.clone()];
+            state.workspace_scan_complete = true;
+
+            // Seed the package contribution as if `R/utils.R` defined
+            // `helper_fn` and the scan has already derived the contribution.
+            let mut internal = BTreeSet::new();
+            internal.insert("helper_fn".to_string());
+            state.package_state.scope_contribution = PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                r_internal_symbols: std::sync::Arc::new(internal),
+                imported_symbols: Default::default(),
+                full_imports: Default::default(),
+            };
+
+            // Open `R/main.R` under the package.
+            let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+            let code = "result <- h";
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let completions = super::completion(&state, &uri, Position::new(0, 11), None);
+            let items = match completions.expect("completions returned") {
+                CompletionResponse::Array(items) => items,
+                other => panic!("Expected Array, got {:?}", other),
+            };
+
+            assert!(
+                items.iter().any(|i| i.label == "helper_fn"),
+                "`helper_fn` must appear in completions for a package R/ file when \
+                 r_internal_symbols carries it. labels: {:?}",
+                items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+            );
+
+            let helper = items.iter().find(|i| i.label == "helper_fn").unwrap();
+            // The synthetic `package:///internal` URI must not leak into
+            // user-visible fields — check detail doesn't say "from internal".
+            if let Some(detail) = &helper.detail {
+                assert!(
+                    !detail.contains("from internal"),
+                    "package-internal detail must not expose the synthetic URI path segment; got: {:?}",
+                    detail,
+                );
+            }
+        });
+    }
+
+    /// NAMESPACE `import(pkg)` (whole-package imports) must contribute
+    /// exports to completions, matching how they already contribute to
+    /// diagnostic suppression via `scope_contribution.full_imports`.
+    ///
+    /// Regression: the completion `all_packages` collection chained only
+    /// `inherited_packages` and `loaded_packages`, missing `full_imports`.
+    #[test]
+    fn test_completion_includes_full_imports_packages() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeSet, HashSet};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let workspace_root = Url::parse("file:///work/pkg").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.workspace_folders = vec![workspace_root.clone()];
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = true;
+
+            // Seed `ggplot2` with an export and register it as a full
+            // (whole-package) import in `scope_contribution`.
+            let mut ggplot_exports = HashSet::new();
+            ggplot_exports.insert("ggplot".to_string());
+            state
+                .package_library
+                .insert_package(PackageInfo::new("ggplot2".to_string(), ggplot_exports))
+                .await;
+            let mut full = BTreeSet::new();
+            full.insert("ggplot2".to_string());
+            state.package_state.scope_contribution = PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                r_internal_symbols: Default::default(),
+                imported_symbols: Default::default(),
+                full_imports: std::sync::Arc::new(full),
+            };
+
+            let uri = Url::parse("file:///work/pkg/R/plot.R").unwrap();
+            let code = "p <- g";
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let completions = super::completion(&state, &uri, Position::new(0, 6), None);
+            let items = match completions.expect("completions returned") {
+                CompletionResponse::Array(items) => items,
+                other => panic!("Expected Array, got {:?}", other),
+            };
+
+            assert!(
+                items.iter().any(|i| i.label == "ggplot"),
+                "NAMESPACE `import(ggplot2)` must contribute `ggplot` to completions. \
+                 labels: {:?}",
+                items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+            );
+        });
+    }
+
+    /// Diagnostic pipeline: a NAMESPACE `importFrom(tidyr, pivot_longer)`
+    /// must suppress "Undefined variable: pivot_longer" for an `R/*.R`
+    /// file under the package.
+    ///
+    /// The suppression flows through `parent_symbol_names` — the collector
+    /// pre-computes scope at `(0, 0)` via the recursive
+    /// `scope_at_position_with_graph_cached` entry point, which DOES receive
+    /// `Some(&scope_contribution)` and therefore injects both
+    /// `r_internal_symbols` and `imported_symbols`. Names in the resulting
+    /// parent set short-circuit the diagnostic loop before it reaches the
+    /// `ScopeStream` fast path. This test pins that end-to-end behavior.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_importFrom_in_package_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // `pivot_longer` is not a base-R builtin, so it's NOT filtered out
+        // by `is_builtin` — the suppression must come from the package
+        // contribution.
+        let mut imported: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut pkgs = BTreeSet::new();
+        pkgs.insert("tidyr".to_string());
+        imported.insert("pivot_longer".to_string(), pkgs);
+        state.package_state.scope_contribution = PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+            r_internal_symbols: Default::default(),
+            imported_symbols: std::sync::Arc::new(imported),
+            full_imports: Default::default(),
+        };
+
+        let code = "x <- pivot_longer(df)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        // Sanity: the baseline undefined symbol MUST still be flagged —
+        // otherwise the collector isn't running and the test is vacuous.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. messages: {:?}",
+            diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: pivot_longer"),
+            "importFrom(tidyr, pivot_longer) in the package NAMESPACE must suppress \
+             `Undefined variable: pivot_longer` for R/ files. messages: {:?}",
+            diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Package-internal symbols from `r_internal_symbols` must also suppress
+    /// the undefined-variable diagnostic in the hot ScopeStream path.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_package_internal_in_R_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut internal = BTreeSet::new();
+        internal.insert("helper_fn".to_string());
+        state.package_state.scope_contribution = PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+            r_internal_symbols: std::sync::Arc::new(internal),
+            imported_symbols: Default::default(),
+            full_imports: Default::default(),
+        };
+
+        let code = "x <- helper_fn()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: helper_fn"),
+            "r_internal_symbols must suppress undefined-variable for R/ files. \
+             messages: {:?}",
+            diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        );
     }
 
     // ========================================================================

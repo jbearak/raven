@@ -4084,6 +4084,24 @@ where
     scope
 }
 
+/// Synthetic `source_uri` used for symbols injected by
+/// [`append_package_contribution`].
+///
+/// Package-mode "contribution" symbols (package-internal defs from sibling
+/// `R/*.R` files and `importFrom` NAMESPACE targets) don't carry per-symbol
+/// file locations, so they get this stable synthetic URI instead. Downstream
+/// consumers that filter by URI scheme (completions, goto-definition, hover)
+/// should compare against this constant rather than matching `"package:"` as a
+/// prefix — that prefix also covers external package-export pseudo-URIs
+/// (`package:dplyr`, `package:base`, ...) which need different handling.
+pub const PACKAGE_INTERNAL_URI: &str = "package:///internal";
+
+/// Returns `true` when `uri` is the synthetic package-internal URI produced by
+/// [`append_package_contribution`].
+pub fn is_package_internal_uri(uri: &Url) -> bool {
+    uri.as_str() == PACKAGE_INTERNAL_URI
+}
+
 /// Inject package-mode symbols into a visible-symbol map for Phase 5a.
 ///
 /// Called only at depth 0 from `scope_at_position_with_graph_recursive`.
@@ -4095,7 +4113,7 @@ where
 /// definitions always take precedence. `full_imports` entries are intentionally
 /// skipped: enumerating their symbols requires the package library, which is
 /// handled by the existing `pkg_resolver` / combined-exports path.
-fn append_package_contribution(
+pub(crate) fn append_package_contribution(
     symbols: &mut HashMap<Arc<str>, ScopedSymbol>,
     uri: &Url,
     contrib: &crate::package_state::PackageScopeContribution,
@@ -4113,7 +4131,7 @@ fn append_package_contribution(
 
     // Use a synthetic URI scheme for package-internal symbols so consumers
     // can distinguish them from real file-backed definitions.
-    let pkg_uri = Url::parse("package:///internal")
+    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
         .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
 
     // `PackageScopeContribution` does not (yet) carry per-symbol metadata, so
