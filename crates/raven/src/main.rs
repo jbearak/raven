@@ -23,6 +23,7 @@ mod libpath_watcher;
 mod namespace_parser;
 mod package_library;
 mod package_namespace;
+mod package_state;
 mod parameter_resolver;
 mod parser_pool;
 mod perf;
