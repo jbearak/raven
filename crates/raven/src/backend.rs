@@ -2706,7 +2706,7 @@ impl LanguageServer for Backend {
                                         })
                                         .unwrap_or_default();
                                     state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                                    state.package_namespace_model = Some(ns_model);
+                                    state.package_state.namespace_model = Some(ns_model);
                                     package_namespace_changed = true;
                                 }
                             }
@@ -3233,7 +3233,7 @@ impl LanguageServer for Backend {
                 let mode = state.cross_file_config.package_mode;
                 if mode == PackageMode::Disabled {
                     state.package_state.workspace = None;
-                    state.package_namespace_model = None;
+                    state.package_state.namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
                     state.package_internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
                     state.roxygen_tags_cache.clear();
@@ -3389,9 +3389,9 @@ impl LanguageServer for Backend {
                     }
                 };
                 state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                state.package_namespace_model = Some(ns_model);
+                state.package_state.namespace_model = Some(ns_model);
             } else {
-                state.package_namespace_model = None;
+                state.package_state.namespace_model = None;
                 state.workspace_imports = std::sync::Arc::new(Vec::new());
             }
             state.package_state.workspace = new_ws;
@@ -3683,7 +3683,7 @@ impl LanguageServer for Backend {
                                 })
                                 .unwrap_or_default();
                             state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                            state.package_namespace_model = Some(ns_model);
+                            state.package_state.namespace_model = Some(ns_model);
                         } else {
                             state.rebuild_namespace_model_from_cache();
                         }
@@ -3836,7 +3836,7 @@ impl LanguageServer for Backend {
                         }
                         // Build model from the full cache (includes retained open-only entries)
                         state.rebuild_namespace_model_from_cache();
-                        state.package_namespace_model.clone().unwrap_or_default()
+                        state.package_namespace_model().cloned().unwrap_or_default()
                     } else {
                         match namespace_content {
                             Some(ref content) => crate::package_namespace::namespace_model_from_content(content),
@@ -3844,10 +3844,10 @@ impl LanguageServer for Backend {
                         }
                     };
                     state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                    state.package_namespace_model = Some(ns_model);
+                    state.package_state.namespace_model = Some(ns_model);
                     log::info!("Rebuilt package namespace model after DESCRIPTION/NAMESPACE change");
                 } else {
-                    state.package_namespace_model = None;
+                    state.package_state.namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
                 }
                 state.package_state.workspace = new_ws;
@@ -3866,7 +3866,7 @@ impl LanguageServer for Backend {
             } else {
                 let mut state = self.state.write().await;
                 state.package_state.workspace = None;
-                state.package_namespace_model = None;
+                state.package_state.namespace_model = None;
                 state.workspace_imports = std::sync::Arc::new(Vec::new());
                 state.rebuild_package_internal_symbols_cache();
             }

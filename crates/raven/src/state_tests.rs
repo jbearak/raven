@@ -528,7 +528,7 @@ mod package_cache_cleanup_tests {
         );
 
         state.rebuild_namespace_model_from_cache();
-        let model = state.package_namespace_model.as_ref().unwrap();
+        let model = state.package_namespace_model().unwrap();
         assert!(model.full_imports.contains(&"ggplot2".to_string()));
         assert!(model.imports.contains(&("tidyr".into(), "pivot_longer".into())));
 
@@ -536,7 +536,7 @@ mod package_cache_cleanup_tests {
         state.roxygen_tags_cache.remove(&PathBuf::from("/tmp/testpkg/R/b.R"));
         state.rebuild_namespace_model_from_cache();
 
-        let model = state.package_namespace_model.as_ref().unwrap();
+        let model = state.package_namespace_model().unwrap();
         // ggplot2 should still be there (from a.R)
         assert!(model.full_imports.contains(&"ggplot2".to_string()));
         // tidyr import should be gone (was only in b.R)

@@ -277,7 +277,7 @@ impl DiagnosticsSnapshot {
                     uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
                 });
                 if in_r_dir {
-                    state.package_namespace_model.as_ref()
+                    state.package_namespace_model()
                         .map(|m| m.full_imports.clone())
                         .unwrap_or_default()
                 } else {

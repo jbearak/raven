@@ -597,9 +597,6 @@ pub struct WorldState {
     pub workspace_scan_complete: bool,
     /// Container for all derived R package mode state. See package_state.rs.
     pub package_state: crate::package_state::PackageState,
-    /// Package namespace model (exports, imports, full_imports).
-    /// Built from roxygen annotations or NAMESPACE file when in package mode.
-    pub package_namespace_model: Option<crate::package_namespace::PackageNamespaceModel>,
     /// Per-file roxygen namespace tag cache. Keyed by file path so that
     /// `did_change` can re-extract tags for only the changed file and rebuild
     /// the namespace model from the cache without any filesystem I/O.
@@ -614,6 +611,13 @@ impl WorldState {
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
         self.package_state.workspace.as_ref()
+    }
+
+    /// Passthrough for legacy `state.package_namespace_model` reads.
+    pub fn package_namespace_model(
+        &self,
+    ) -> Option<&crate::package_namespace::PackageNamespaceModel> {
+        self.package_state.namespace_model.as_ref()
     }
 }
 
@@ -713,7 +717,6 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
-            package_namespace_model: None,
             roxygen_tags_cache: HashMap::new(),
             package_internal_symbols_cache: Arc::new(HashSet::new()),
         }
@@ -737,7 +740,7 @@ impl WorldState {
     pub fn rebuild_namespace_model_from_cache(&mut self) -> bool {
         let old_imports = self.workspace_imports.clone();
         let old_full_imports = self
-            .package_namespace_model
+            .package_state.namespace_model
             .as_ref()
             .map(|m| m.full_imports.clone());
 
@@ -777,7 +780,7 @@ impl WorldState {
             old_set.as_ref() != Some(&new_set)
         };
         self.workspace_imports = new_imports;
-        self.package_namespace_model = Some(model);
+        self.package_state.namespace_model = Some(model);
         imports_changed || full_imports_changed
     }
 
@@ -1079,7 +1082,7 @@ impl WorldState {
         match self.cross_file_config.package_mode {
             PackageMode::Disabled => {
                 self.package_state.workspace = None;
-                self.package_namespace_model = None;
+                self.package_state.namespace_model = None;
                 // Intentionally clear workspace_imports: "disabled" means full script-mode
                 // behavior — NAMESPACE-derived imports are a package concept and should not
                 // suppress diagnostics when the user has opted out of package mode.
@@ -1099,7 +1102,7 @@ impl WorldState {
                 // Ensure namespace model is consistent: if we synthesized a
                 // fallback workspace, provide a default model so downstream
                 // code never sees Some(workspace) + None(model).
-                self.package_namespace_model = pkg_ns_model.or_else(|| {
+                self.package_state.namespace_model = pkg_ns_model.or_else(|| {
                     if self.package_workspace().is_some() {
                         Some(crate::package_namespace::PackageNamespaceModel::default())
                     } else {
@@ -1108,16 +1111,16 @@ impl WorldState {
                 });
                 // Update workspace_imports from the namespace model so roxygen-derived
                 // imports take precedence over the legacy NAMESPACE-file parse.
-                if let Some(ref model) = self.package_namespace_model {
+                if let Some(ref model) = self.package_state.namespace_model {
                     self.workspace_imports = Arc::new(model.imports.clone());
                 }
             }
             PackageMode::Auto => {
                 self.package_state.workspace = pkg_workspace;
-                self.package_namespace_model = pkg_ns_model;
+                self.package_state.namespace_model = pkg_ns_model;
                 // Update workspace_imports from the namespace model so roxygen-derived
                 // imports take precedence over the legacy NAMESPACE-file parse.
-                if let Some(ref model) = self.package_namespace_model {
+                if let Some(ref model) = self.package_state.namespace_model {
                     self.workspace_imports = Arc::new(model.imports.clone());
                 }
             }
