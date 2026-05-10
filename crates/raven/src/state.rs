@@ -612,20 +612,13 @@ impl WorldState {
 
     /// Apply a `PackageInputDelta` produced by an event handler.
     /// Caller has already mutated `self.package_inputs` to reflect the event.
-    /// This method recomputes derived state via `derive_package_state`.
+    /// Recomputes `package_state` as a pure function of inputs.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
-        let new = crate::package_state::derive_package_state(
+        self.package_state = crate::package_state::derive_package_state(
             &self.package_state,
             &self.package_inputs,
             delta,
         );
-
-        self.package_state = crate::package_state::PackageState {
-            workspace: new.workspace,
-            namespace_model: new.namespace_model,
-            r_file_facts: new.r_file_facts,
-            scope_contribution: new.scope_contribution,
-        };
     }
 }
 
