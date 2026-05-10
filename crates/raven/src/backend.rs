@@ -3110,7 +3110,7 @@ impl LanguageServer for Backend {
             packages_enabled,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
-            pkg_mode_rebuild_info,
+            pkg_mode_io_needed,
         ) = {
             let mut state = self.state.write().await;
 
@@ -3191,19 +3191,29 @@ impl LanguageServer for Backend {
                 state.cross_file_config = config;
             }
 
-            // If package_mode changed, gather info for rebuild outside the lock.
-            let pkg_mode_rebuild_info: Option<(std::path::PathBuf, crate::cross_file::config::PackageMode)> = if package_mode_changed {
+            // If package_mode changed, apply the setting change via the event-driven
+            // path. For Disabled: translate immediately (derive yields no workspace).
+            // For Auto/Enabled: capture root for disk I/O outside the lock.
+            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
                 use crate::cross_file::config::PackageMode;
                 let mode = state.cross_file_config.package_mode;
-                if mode == PackageMode::Disabled {
-                    state.package_state.workspace = None;
-                    state.package_state.namespace_model = None;
-                    state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
-                    state.package_state.internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
-                    state.package_state.roxygen_tags_cache.clear();
-                    None
+                // Translate the setting change — updates package_inputs.package_mode.
+                let event = crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
+                if let Some(delta) = crate::package_state::event::translate(
+                    &mut state.package_inputs,
+                    event,
+                ) {
+                    if mode == PackageMode::Disabled {
+                        // Derive immediately: effective_workspace returns None for Disabled.
+                        state.apply_package_event(&delta);
+                        None
+                    } else {
+                        // Need to repopulate description/namespace from disk outside the
+                        // lock; capture root so caller can do the I/O.
+                        state.workspace_folders.first().and_then(|u| u.to_file_path().ok())
+                    }
                 } else {
-                    state.workspace_folders.first().and_then(|u| u.to_file_path().ok()).map(|root| (root, mode))
+                    None
                 }
             } else {
                 None
@@ -3253,114 +3263,63 @@ impl LanguageServer for Backend {
                 packages_enabled,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
-                pkg_mode_rebuild_info,
+                pkg_mode_io_needed,
             )
         };
 
-        // --- Package mode rebuild: file I/O outside the write lock ---
-        if let Some((root, mode)) = pkg_mode_rebuild_info {
-            use crate::cross_file::config::PackageMode;
-            // Perform all disk I/O on a blocking thread to avoid stalling
-            // the tokio worker (packages can have hundreds of R files).
+        // --- Package mode rebuild: repopulate inputs after mode switch ---
+        // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
+        // from disk (lightweight; R files are already in package_inputs from
+        // prior did_open/did_change/scan events). Then derive package state.
+        if let Some(root) = pkg_mode_io_needed {
             let root_clone = root.clone();
-            let (pkg_name, disk_r_files, has_roxygen, namespace_content) =
-                tokio::task::spawn_blocking(move || {
-                    let pkg_name = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                        .ok()
-                        .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
+            let (desc_text, ns_text) = tokio::task::spawn_blocking(move || {
+                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION")).ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE")).ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                (desc, ns)
+            })
+            .await
+            .unwrap_or((None, None));
 
-                    let r_dir = root_clone.join("R");
-                    let mut disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
-                    let mut has_roxygen = false;
-                    if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                                let content = std::fs::read_to_string(&path).ok();
-                                if !has_roxygen {
-                                    if let Some(ref c) = content {
-                                        if crate::roxygen::has_roxygen_namespace_tags(c) {
-                                            has_roxygen = true;
-                                        }
-                                    }
-                                }
-                                disk_r_files.push((path, content));
-                            }
-                        }
-                    }
-
-                    let namespace_content = std::fs::read_to_string(root_clone.join("NAMESPACE")).ok();
-                    (pkg_name, disk_r_files, has_roxygen, namespace_content)
-                })
-                .await
-                .unwrap_or((None, Vec::new(), false, None));
-
-            let new_ws = match (mode, pkg_name) {
-                (PackageMode::Auto, Some(name)) => Some(crate::package_namespace::PackageWorkspace {
-                    name,
-                    root: root.clone(),
-                    roxygen_managed: has_roxygen,
-                }),
-                (PackageMode::Auto, None) => None,
-                (PackageMode::Enabled, name) => Some(crate::package_namespace::PackageWorkspace {
-                    name: name.unwrap_or_else(|| "unknown".to_string()),
-                    root: root.clone(),
-                    roxygen_managed: has_roxygen,
-                }),
-                (PackageMode::Disabled, _) => unreachable!(),
-            };
-
-            // Re-acquire lock to apply results
+            // Re-acquire write lock to apply results
             let mut state = self.state.write().await;
-            if let Some(ref ws) = new_ws {
-                let ns_model = if ws.roxygen_managed {
-                    let mut roxygen_files = Vec::new();
-                    state.package_state.roxygen_tags_cache.clear();
-                    for (path, disk_content) in &disk_r_files {
-                        let content = Url::from_file_path(path).ok()
-                            .and_then(|u| state.documents.get(&u).map(|d| d.text()))
-                            .or_else(|| disk_content.clone());
-                        if let Some(content) = content {
-                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                            roxygen_files.push((path.display().to_string(), ns.clone()));
-                            state.package_state.roxygen_tags_cache.insert(path.clone(), ns);
+            // Repopulate description/namespace inputs with fresh disk content.
+            state.package_inputs.workspace_root = Some(root.clone());
+            state.package_inputs.description = desc_text.map(|text| {
+                crate::package_state::DescriptionInput { path: root.join("DESCRIPTION"), text }
+            });
+            state.package_inputs.namespace = ns_text.map(|text| {
+                crate::package_state::NamespaceInput { path: root.join("NAMESPACE"), text }
+            });
+            // Ensure r_files includes all currently-open R/*.R documents
+            // (workspace scan may have already populated non-open ones).
+            let open_uris_for_mode: Vec<Url> = state.documents.keys().cloned().collect();
+            for uri in &open_uris_for_mode {
+                if let Ok(path) = uri.to_file_path() {
+                    if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                        if !state.package_inputs.r_files.contains_key(&path) {
+                            let text: std::sync::Arc<str> = state.documents.get(uri)
+                                .map(|d| d.text())
+                                .unwrap_or_default()
+                                .into();
+                            let version = state.documents.get(uri)
+                                .and_then(|d| d.version)
+                                .unwrap_or(0);
+                            let digest = crate::package_state::ContentDigest::of(&text);
+                            state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
+                                kind,
+                                origin: crate::package_state::ContentOrigin::Open { version },
+                                text,
+                                content_digest: digest,
+                            });
                         }
                     }
-                    // Also include open-only R/*.R files not found on disk
-                    // (e.g., newly created unsaved buffers with roxygen tags).
-                    let r_dir = ws.root.join("R");
-                    let open_r_uris: Vec<Url> = state.documents.keys()
-                        .filter(|u| u.to_file_path().ok().is_some_and(|p|
-                            p.starts_with(&r_dir)
-                                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))))
-                        .cloned().collect();
-                    for open_uri in &open_r_uris {
-                        if let Ok(p) = open_uri.to_file_path() {
-                            if !state.package_state.roxygen_tags_cache.contains_key(&p) {
-                                if let Some(doc) = state.documents.get(open_uri) {
-                                    let ns = crate::roxygen::extract_roxygen_namespace_tags(&doc.text());
-                                    roxygen_files.push((p.display().to_string(), ns.clone()));
-                                    state.package_state.roxygen_tags_cache.insert(p, ns);
-                                }
-                            }
-                        }
-                    }
-                    crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
-                } else {
-                    match namespace_content {
-                        Some(ref content) => crate::package_namespace::namespace_model_from_content(content),
-                        None => crate::package_namespace::PackageNamespaceModel::default(),
-                    }
-                };
-                state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                state.package_state.namespace_model = Some(ns_model);
-            } else {
-                state.package_state.namespace_model = None;
-                state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
+                }
             }
-            state.package_state.workspace = new_ws;
-            state.rebuild_package_internal_symbols_cache();
-            log::info!("Rebuilt package state after packageMode change to {:?}", mode);
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+            log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
 
         // Log diagnostics_enabled change - Requirement 5.2
