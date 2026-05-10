@@ -11,6 +11,7 @@ pub mod derive;
 pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
+pub mod event;
 
 #[cfg(test)]
 mod proptest_machine;
