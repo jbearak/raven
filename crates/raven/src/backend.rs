@@ -3108,14 +3108,29 @@ impl LanguageServer for Backend {
                     || state.package_state.scope_contribution != old_contribution;
             if pkg_visibility_changed {
                 if let Some(root) = state.package_inputs.workspace_root.clone() {
-                    for (open_uri, doc) in &state.documents {
-                        if open_uri == uri {
-                            continue;
-                        }
-                        let Ok(p) = open_uri.to_file_path() else { continue };
-                        if crate::package_state::is_r_source_path(&p, &root).is_some() {
+                    let mut candidates: Vec<Url> = state
+                        .documents
+                        .keys()
+                        .filter(|open_uri| *open_uri != uri)
+                        .filter(|open_uri| {
+                            open_uri.to_file_path().ok().is_some_and(|p| {
+                                crate::package_state::is_r_source_path(&p, &root).is_some()
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    // Bound the burst when many package files are open
+                    // (e.g. "close all"); reuse the same cap and priority
+                    // ordering enforced for the watched-file fanout.
+                    cap_watched_file_revalidations(
+                        &mut candidates,
+                        &state.cross_file_activity,
+                        state.cross_file_config.max_revalidations_per_trigger,
+                    );
+                    for sibling_uri in candidates {
+                        if let Some(doc) = state.documents.get(&sibling_uri) {
                             sibling_fanout.push((
-                                open_uri.clone(),
+                                sibling_uri,
                                 doc.version,
                                 Some(doc.revision),
                             ));
