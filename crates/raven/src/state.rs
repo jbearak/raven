@@ -637,25 +637,53 @@ impl WorldState {
     /// Apply a `PackageInputDelta` produced by an event handler.
     /// Caller has already mutated `self.package_inputs` to reflect the event.
     /// This method recomputes derived state via `derive_package_state` and
-    /// preserves Phase-1 legacy fields so non-migrated handlers continue
-    /// to function correctly during the migration.
+    /// populates the legacy cache fields (`internal_symbols_cache`,
+    /// `workspace_imports`) from the new derive output so existing consumers
+    /// continue to see current data until Phase 5 deletes those fields.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
         let new = crate::package_state::derive_package_state(
             &self.package_state,
             &self.package_inputs,
             delta,
         );
-        // Phase 3 transitional: preserve legacy fields.
-        // After Phase 5 these go away and the assignment becomes
-        // `self.package_state = new`.
+
+        // Project the new scope contribution onto the legacy field shapes
+        // so existing consumers (DiagnosticsSnapshot, completion blocks) work.
+        let internal_symbols_cache: std::sync::Arc<std::collections::HashSet<String>> =
+            std::sync::Arc::new(
+                new.scope_contribution
+                    .r_internal_symbols
+                    .iter()
+                    .cloned()
+                    .collect(),
+            );
+        let workspace_imports: std::sync::Arc<Vec<(String, String)>> =
+            std::sync::Arc::new({
+                let mut v: Vec<(String, String)> = new
+                    .scope_contribution
+                    .imported_symbols
+                    .iter()
+                    .flat_map(|(sym, pkgs)| {
+                        pkgs.iter().map(move |pkg| (pkg.clone(), sym.clone()))
+                    })
+                    .collect();
+                // Deterministic ordering for any consumer that iterates
+                v.sort();
+                v.dedup();
+                v
+            });
+
         self.package_state = crate::package_state::PackageState {
             workspace: new.workspace,
             namespace_model: new.namespace_model,
             r_file_facts: new.r_file_facts,
             scope_contribution: new.scope_contribution,
-            roxygen_tags_cache: std::mem::take(&mut self.package_state.roxygen_tags_cache),
-            internal_symbols_cache: std::sync::Arc::clone(&self.package_state.internal_symbols_cache),
-            workspace_imports: std::sync::Arc::clone(&self.package_state.workspace_imports),
+            // Legacy fields populated from new derive output.
+            // roxygen_tags_cache has no consumer outside rebuild_namespace_model_from_cache
+            // (which is being deleted in Phase 3.10); leave it empty.
+            roxygen_tags_cache: std::collections::HashMap::new(),
+            internal_symbols_cache,
+            workspace_imports,
         };
     }
 }
