@@ -82,6 +82,20 @@ Values for `packageMode`:
 | Diagnostics | Position-aware (after `source()`) | All package symbols available everywhere |
 | Detection | Default for non-package workspaces | Automatic when `DESCRIPTION` exists |
 
+## Behavior: Non-Package NAMESPACE Files
+
+### NAMESPACE without DESCRIPTION no longer suppresses diagnostics
+
+Prior to this version, a workspace containing a `NAMESPACE` file but no
+`DESCRIPTION` would still have its `import()` and `importFrom()` directives
+parsed and used to suppress undefined-variable diagnostics. Now: package
+mode activates only when both `DESCRIPTION` (with a `Package:` field) and
+`NAMESPACE` are present. Non-package workspaces run as script mode regardless
+of `NAMESPACE` presence.
+
+If you need this behavior, set `"raven.packages.packageMode": "enabled"` to
+force package mode, which activates even without a `DESCRIPTION` file.
+
 ## Known Limitations
 
 - **`Collate:` ordering is not respected** — All `R/*.R` files are treated as fully mutually visible regardless of collation order. In practice this rarely matters since R's namespace mechanism doesn't enforce load order for symbol visibility.
