@@ -324,6 +324,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
             &mut cache,
+            None,
         )
     }
 }
@@ -2959,7 +2960,7 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
-    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never()).symbols
+    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never(), None).symbols
 }
 
 /// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
@@ -2997,6 +2998,9 @@ pub(crate) fn get_cross_file_scope(
     line: u32,
     column: u32,
     cancel: &DiagCancelToken,
+    // Package-mode contribution (plumbing only in Phase 4; Phase 5 wires the
+    // actual scope injection). Pass `None` until Phase 5.
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> scope::ScopeAtPosition {
     let content_provider = state.content_provider();
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
@@ -3022,6 +3026,7 @@ pub(crate) fn get_cross_file_scope(
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
+        package_contribution,
     )
 }
 
@@ -3043,6 +3048,9 @@ pub(crate) fn get_cross_file_scope_with_cache(
     column: u32,
     cancel: &DiagCancelToken,
     prefix_cache: &mut scope::ParentPrefixCache,
+    // Package-mode contribution (plumbing only in Phase 4; Phase 5 wires the
+    // actual scope injection). Pass `None` until Phase 5.
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> scope::ScopeAtPosition {
     let content_provider = state.content_provider();
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
@@ -3069,6 +3077,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
         prefix_cache,
+        package_contribution,
     )
 }
 
@@ -4588,6 +4597,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         false,
         snapshot.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
+        None,
     );
 
     {
@@ -9260,6 +9270,7 @@ pub fn completion(
         position.line,
         position.character,
         &DiagCancelToken::never(),
+        None,
     );
 
     // Add visible same-file symbols first so local definitions take precedence
@@ -10485,6 +10496,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             position.line,
             position.character,
             &DiagCancelToken::never(),
+            None,
         );
         let all_packages: Vec<String> = scope
             .inherited_packages
@@ -11076,6 +11088,7 @@ pub fn prepare_signature_help(
         position.line,
         position.character,
         &DiagCancelToken::never(),
+        None,
     );
 
     /// Try user signature, falling back to a minimal signature with source attribution.
@@ -11410,7 +11423,7 @@ pub fn goto_definition_with_cancel(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel);
+    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel, None);
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
@@ -37026,6 +37039,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             !scope_at.symbols.contains_key("xyz"),
@@ -37139,6 +37153,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         let in_loaded = scope_at.loaded_packages.contains("somepkg");
         let in_inherited = scope_at.inherited_packages.contains("somepkg");
@@ -37166,6 +37181,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_at_end.loaded_packages.contains("somepkg"),
@@ -37233,6 +37249,7 @@ source(\"helpers.R\")
                 snapshot.cross_file_config.backward_dependencies,
                 &|| false,
                 &mut cache,
+                None,
             );
             let direct = crate::cross_file::scope::scope_at_position_with_graph(
                 &uri,
@@ -37247,6 +37264,7 @@ source(\"helpers.R\")
                 snapshot.cross_file_config.hoist_globals_in_functions,
                 snapshot.cross_file_config.backward_dependencies,
                 &|| false,
+                None,
             );
 
             let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
@@ -37474,6 +37492,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
             &mut cache,
+            None,
         );
 
         // The same-file leak filter must keep `xyz` out of scope at its own RHS.
@@ -37504,6 +37523,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.hoist_globals_in_functions,
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
+            None,
         );
         let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
         let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
@@ -37585,6 +37605,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
             &mut cache,
+            None,
         );
 
         assert!(
@@ -37612,6 +37633,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.hoist_globals_in_functions,
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
+            None,
         );
         let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
         let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
