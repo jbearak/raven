@@ -7,6 +7,8 @@
 //! module, `PackageState` is read-only — it can only be replaced as a
 //! whole, never partially mutated.
 
+pub mod derive;
+pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 
