@@ -592,6 +592,9 @@ pub struct WorldState {
     pub workspace_scan_complete: bool,
     /// Container for all derived R package mode state. See package_state.rs.
     pub package_state: crate::package_state::PackageState,
+    /// Inputs to the package-mode `derive` function. Updated by event handlers
+    /// before calling `apply_package_event`. See package_state::PackageInputs.
+    pub package_inputs: crate::package_state::PackageInputs,
 }
 
 impl WorldState {
@@ -629,6 +632,31 @@ impl WorldState {
         &mut self,
     ) -> &mut std::collections::HashMap<std::path::PathBuf, crate::roxygen::RoxygenNamespace> {
         &mut self.package_state.roxygen_tags_cache
+    }
+
+    /// Apply a `PackageInputDelta` produced by an event handler.
+    /// Caller has already mutated `self.package_inputs` to reflect the event.
+    /// This method recomputes derived state via `derive_package_state` and
+    /// preserves Phase-1 legacy fields so non-migrated handlers continue
+    /// to function correctly during the migration.
+    pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
+        let new = crate::package_state::derive_package_state(
+            &self.package_state,
+            &self.package_inputs,
+            delta,
+        );
+        // Phase 3 transitional: preserve legacy fields.
+        // After Phase 5 these go away and the assignment becomes
+        // `self.package_state = new`.
+        self.package_state = crate::package_state::PackageState {
+            workspace: new.workspace,
+            namespace_model: new.namespace_model,
+            r_file_facts: new.r_file_facts,
+            scope_contribution: new.scope_contribution,
+            roxygen_tags_cache: std::mem::take(&mut self.package_state.roxygen_tags_cache),
+            internal_symbols_cache: std::sync::Arc::clone(&self.package_state.internal_symbols_cache),
+            workspace_imports: std::sync::Arc::clone(&self.package_state.workspace_imports),
+        };
     }
 }
 
@@ -727,6 +755,7 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
+            package_inputs: crate::package_state::PackageInputs::default(),
         }
     }
 
