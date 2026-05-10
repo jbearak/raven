@@ -1508,7 +1508,7 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
                     && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
                 {
                     let content = entry.contents.to_string();
-                    if !has_roxygen && content.contains("#' @export") {
+                    if !has_roxygen && crate::roxygen::has_roxygen_namespace_tags(&content) {
                         has_roxygen = true;
                     }
                     r_files.push((p, content));

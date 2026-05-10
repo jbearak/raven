@@ -1147,6 +1147,15 @@ pub struct RoxygenNamespace {
 /// Extract namespace-relevant roxygen tags (`@export`, `@import`, `@importFrom`)
 /// from all roxygen blocks in a file.
 ///
+/// Quick check: does `content` contain any roxygen namespace tag (`@export`,
+/// `@import`, or `@importFrom`)?  This avoids a full parse when we only need
+/// a boolean "is this package roxygen-managed?" signal.
+pub fn has_roxygen_namespace_tags(content: &str) -> bool {
+    content.contains("#' @export")
+        || content.contains("#' @import")
+        || content.contains("#' @importFrom")
+}
+
 /// For `@export`, the exported symbol name is the identifier defined on the
 /// first non-blank, non-comment line after the roxygen block (function or
 /// assignment target).

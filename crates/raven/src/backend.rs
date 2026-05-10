@@ -2559,25 +2559,36 @@ impl LanguageServer for Backend {
             // roxygen-managed package. This ensures @import/@importFrom edits
             // take effect immediately without waiting for DESCRIPTION/NAMESPACE touch.
             let mut package_namespace_changed = false;
-            if let Some(ref pkg) = state.package_workspace {
-                if pkg.roxygen_managed {
-                    if let Ok(file_path) = uri.to_file_path() {
-                        if file_path.starts_with(pkg.root.join("R")) {
-                            // Re-extract roxygen tags only from the changed file
-                            // (its content is already in memory from the edit).
-                            let content = state.documents.get(&uri).map(|d| d.text());
-                            if let Some(content) = content {
-                                let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                // Early-exit: skip the expensive full rebuild if this
-                                // file's namespace tags didn't actually change. This
-                                // makes the common case (editing function bodies) O(1).
-                                let tags_changed = state
-                                    .roxygen_tags_cache
-                                    .get(&file_path)
-                                    .map_or(true, |old| *old != ns);
-                                if tags_changed {
-                                    state.roxygen_tags_cache.insert(file_path, ns);
-                                    // Rebuild namespace model from the per-file cache (no I/O).
+            let pkg_r_dir = state.package_workspace.as_ref().map(|pkg| pkg.root.join("R"));
+            if let Some(r_dir) = pkg_r_dir {
+                if let Ok(file_path) = uri.to_file_path() {
+                    if file_path.starts_with(&r_dir) {
+                        let content = state.documents.get(&uri).map(|d| d.text());
+                        if let Some(content) = content {
+                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                            let tags_changed = state
+                                .roxygen_tags_cache
+                                .get(&file_path)
+                                .map_or(true, |old| *old != ns);
+                            if tags_changed {
+                                state.roxygen_tags_cache.insert(file_path, ns);
+                                // Recompute roxygen_managed: true if any file has tags
+                                let any_tags = state.roxygen_tags_cache.values().any(|ns| {
+                                    !ns.exports.is_empty()
+                                        || !ns.imports.is_empty()
+                                        || !ns.import_from.is_empty()
+                                });
+                                if let Some(ref mut pkg) = state.package_workspace {
+                                    if pkg.roxygen_managed != any_tags {
+                                        pkg.roxygen_managed = any_tags;
+                                        log::info!(
+                                            "roxygen_managed transitioned to {} for package {}",
+                                            any_tags,
+                                            pkg.name
+                                        );
+                                    }
+                                }
+                                if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
                                     package_namespace_changed =
                                         state.rebuild_namespace_model_from_cache();
                                 }
@@ -3146,7 +3157,7 @@ impl LanguageServer for Backend {
                                 let content = std::fs::read_to_string(&path).ok();
                                 if !has_roxygen {
                                     if let Some(ref c) = content {
-                                        if c.contains("#' @export") {
+                                        if crate::roxygen::has_roxygen_namespace_tags(c) {
                                             has_roxygen = true;
                                         }
                                     }
@@ -3538,7 +3549,7 @@ impl LanguageServer for Backend {
                                     let content = std::fs::read_to_string(&path).ok();
                                     if !has_roxygen {
                                         if let Some(ref c) = content {
-                                            if c.contains("#' @export") {
+                                            if crate::roxygen::has_roxygen_namespace_tags(c) {
                                                 has_roxygen = true;
                                             }
                                         }
