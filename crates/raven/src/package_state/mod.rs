@@ -16,7 +16,7 @@ pub mod event;
 #[cfg(test)]
 mod proptest_machine;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,13 +26,12 @@ use crate::roxygen::RoxygenNamespace;
 /// Derived state for R package mode. Owned by `WorldState`.
 ///
 /// Phase 5b: workspace_imports removed (Phase 5b.4); internal_symbols_cache
-/// and roxygen_tags_cache will be removed in Phase 5b.5 and 5b.6.
+/// removed (Phase 5b.5); roxygen_tags_cache will be removed in Phase 5b.6.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct PackageState {
     pub workspace: Option<PackageWorkspace>,
     pub namespace_model: Option<PackageNamespaceModel>,
     pub roxygen_tags_cache: HashMap<PathBuf, RoxygenNamespace>,
-    pub internal_symbols_cache: Arc<HashSet<String>>,
 
     // Phase 2 additions (populated by derive_package_state)
     pub r_file_facts: BTreeMap<PathBuf, RFileFacts>,
@@ -45,7 +44,6 @@ impl PackageState {
             workspace: None,
             namespace_model: None,
             roxygen_tags_cache: HashMap::new(),
-            internal_symbols_cache: Arc::new(HashSet::new()),
             r_file_facts: BTreeMap::new(),
             scope_contribution: PackageScopeContribution::default(),
         }
