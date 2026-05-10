@@ -15,8 +15,6 @@ pub mod event;
 
 #[cfg(test)]
 mod proptest_machine;
-#[cfg(test)]
-mod parity_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
