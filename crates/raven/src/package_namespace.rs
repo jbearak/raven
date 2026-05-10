@@ -11,6 +11,11 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+static ROXYGEN_EXPORT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex")
+});
 
 /// Metadata about the detected R package workspace.
 #[derive(Debug, Clone)]
@@ -69,8 +74,7 @@ pub fn detect_package_workspace_with_content<'a>(
     let content = std::fs::read_to_string(&description_path).ok()?;
     let name = parse_dcf_field(&content, "Package")?;
 
-    let pattern = regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex");
-    let roxygen_managed = r_file_contents.into_iter().any(|c| pattern.is_match(c));
+    let roxygen_managed = r_file_contents.into_iter().any(|c| ROXYGEN_EXPORT_RE.is_match(c));
 
     Some(PackageWorkspace {
         name,
@@ -85,7 +89,6 @@ fn detect_roxygen_usage(workspace_root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(&r_dir) else {
         return false;
     };
-    let pattern = regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex");
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -99,7 +102,7 @@ fn detect_roxygen_usage(workspace_root: &Path) -> bool {
             continue;
         }
         if let Ok(content) = std::fs::read_to_string(&path) {
-            if pattern.is_match(&content) {
+            if ROXYGEN_EXPORT_RE.is_match(&content) {
                 return true;
             }
         }
@@ -214,6 +217,25 @@ fn parse_dcf_field(content: &str, field: &str) -> Option<String> {
     None
 }
 
+fn count_unquoted_parens(s: &str) -> (usize, usize) {
+    let mut open = 0usize;
+    let mut close = 0usize;
+    let mut in_quote: Option<char> = None;
+    for c in s.chars() {
+        match in_quote {
+            Some(q) if c == q => { in_quote = None; }
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' => { in_quote = Some(c); }
+                '(' => { open += 1; }
+                ')' => { close += 1; }
+                _ => {}
+            }
+        }
+    }
+    (open, close)
+}
+
 fn normalize_multiline(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     for line in content.lines() {
@@ -230,8 +252,7 @@ fn normalize_multiline(content: &str) -> String {
             if out.ends_with('\n') {
                 let last_line_start = out[..out.len() - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
                 let last_line = &out[last_line_start..out.len() - 1];
-                let open: usize = last_line.chars().filter(|&c| c == '(').count();
-                let close: usize = last_line.chars().filter(|&c| c == ')').count();
+                let (open, close) = count_unquoted_parens(last_line);
                 if open > close {
                     // Inside unbalanced parens — skip comment line entirely
                     continue;
@@ -245,8 +266,7 @@ fn normalize_multiline(content: &str) -> String {
         if out.ends_with('\n') {
             let last_line_start = out[..out.len() - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let last_line = &out[last_line_start..out.len() - 1];
-            let open: usize = last_line.chars().filter(|&c| c == '(').count();
-            let close: usize = last_line.chars().filter(|&c| c == ')').count();
+            let (open, close) = count_unquoted_parens(last_line);
             if open > close {
                 // Remove trailing newline and append this line
                 out.pop(); // remove '\n'
@@ -403,5 +423,12 @@ S3method(print, myclass)
         let model = namespace_model_from_content(content);
         assert!(model.imports.contains(&("dplyr".into(), "mutate".into())));
         assert!(model.imports.contains(&("dplyr".into(), "filter".into())));
+    }
+
+    #[test]
+    fn normalize_multiline_quoted_parens() {
+        let content = "exportPattern(\"^[^(]\")\nexport(foo)\n";
+        let normalized = normalize_multiline(content);
+        assert_eq!(normalized, "exportPattern(\"^[^(]\")\nexport(foo)\n");
     }
 }

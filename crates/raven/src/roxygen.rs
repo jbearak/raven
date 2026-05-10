@@ -1286,8 +1286,8 @@ fn find_toplevel_equals(s: &str) -> Option<usize> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             '=' if depth == 0 => {
-                // Make sure it's not == or !=
-                if i > 0 && s.as_bytes().get(i - 1) == Some(&b'!') {
+                // Make sure it's not ==, !=, >=, or <=
+                if i > 0 && matches!(s.as_bytes().get(i - 1), Some(b'!') | Some(b'>') | Some(b'<')) {
                     continue;
                 }
                 if s.as_bytes().get(i + 1) == Some(&b'=') {
@@ -1409,5 +1409,13 @@ bar <- function() {}
         let content = "#' @export\nsetMethod('show', 'MyClass', function(object) cat(object@name))\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["show"]);
+    }
+
+    #[test]
+    fn find_toplevel_equals_skips_gte_and_lte() {
+        assert_eq!(find_toplevel_equals("x >= 5"), None);
+        assert_eq!(find_toplevel_equals("y <= 3"), None);
+        // Regular assignment still works
+        assert_eq!(find_toplevel_equals("z = 1"), Some(2));
     }
 }

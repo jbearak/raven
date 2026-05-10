@@ -132,7 +132,7 @@ pub(crate) struct DiagnosticsSnapshot {
     /// In package mode: top-level symbol names from other R/*.R files.
     /// These are available via mutual visibility (flat namespace) and suppress
     /// undefined-variable diagnostics.
-    pub(crate) package_internal_symbols: HashSet<String>,
+    pub(crate) package_internal_symbols: Arc<HashSet<String>>,
     /// In package mode: packages imported wholesale via `import(pkg)` in NAMESPACE
     /// or `@import pkg` in roxygen. All exports of these packages are available.
     pub(crate) package_full_imports: Vec<String>,
@@ -256,7 +256,7 @@ impl DiagnosticsSnapshot {
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
-            package_internal_symbols: collect_package_internal_symbols(state, uri),
+            package_internal_symbols: collect_package_internal_symbols(state, uri).into(),
             package_full_imports: state
                 .package_namespace_model
                 .as_ref()
@@ -314,24 +314,24 @@ impl DiagnosticsSnapshot {
 /// Uses the pre-computed `package_internal_symbols_cache` on WorldState,
 /// which is rebuilt incrementally when file interfaces change. This avoids
 /// O(package_files) work on every diagnostic snapshot build.
-fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> HashSet<String> {
+fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> Arc<HashSet<String>> {
     let Some(ref pkg) = state.package_workspace else {
-        return HashSet::new();
+        return Arc::new(HashSet::new());
     };
 
     // Check if the queried URI is under the package's R/ directory
     let Ok(file_path) = uri.to_file_path() else {
-        return HashSet::new();
+        return Arc::new(HashSet::new());
     };
     let r_dir = pkg.root.join("R");
     if !file_path.starts_with(&r_dir) {
-        return HashSet::new();
+        return Arc::new(HashSet::new());
     }
 
     // Use the cached set. We could subtract the current file's own exports,
     // but including them is harmless (they suppress false-positive diagnostics
     // for symbols the file itself defines) and avoids an extra lookup.
-    (*state.package_internal_symbols_cache).clone()
+    Arc::clone(&state.package_internal_symbols_cache)
 }
 
 /// Compute diagnostics from a pre-built snapshot (no lock held).
@@ -5160,6 +5160,9 @@ fn collect_undefined_variables_from_snapshot(
         &snapshot.parent_prefix_cache,
     );
 
+    // Reusable buffer for position-aware packages; avoids per-iteration allocation.
+    let mut position_aware_packages_buf: Vec<String> = Vec::new();
+
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
@@ -5285,20 +5288,17 @@ fn collect_undefined_variables_from_snapshot(
         }
 
         if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
-            let mut position_aware_packages: Vec<String> = scope
-                .inherited_packages
-                .iter()
-                .chain(scope.loaded_packages.iter())
-                .cloned()
-                .collect();
-            // In package mode, full_imports packages are always available
-            for pkg in &snapshot.package_full_imports {
-                if !position_aware_packages.contains(pkg) {
-                    position_aware_packages.push(pkg.clone());
-                }
-            }
+            position_aware_packages_buf.clear();
+            position_aware_packages_buf.extend(
+                scope
+                    .inherited_packages
+                    .iter()
+                    .chain(scope.loaded_packages.iter())
+                    .chain(snapshot.package_full_imports.iter())
+                    .cloned(),
+            );
 
-            if is_package_export(&name, &position_aware_packages, &snapshot.package_library) {
+            if is_package_export(&name, &position_aware_packages_buf, &snapshot.package_library) {
                 continue;
             }
 
@@ -5311,7 +5311,7 @@ fn collect_undefined_variables_from_snapshot(
             // not yet been loaded into cache — not when it is simply not installed.
             // Using package_exists() guards against treating a permanently-missing
             // package as one that will eventually be cached.
-            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
+            let package_cache_pending = position_aware_packages_buf.iter().any(|pkg| {
                 if snapshot.package_library.is_cached_sync(pkg) {
                     return false;
                 }
@@ -9336,16 +9336,20 @@ pub fn completion(
             let r_dir = pkg.root.join("R");
             if file_path.starts_with(&r_dir) {
                 // Use the pre-computed cache instead of walking the full index.
+                // Filter by typed prefix to avoid sending the full symbol set.
+                let token = get_token_at_cursor(&text, position);
                 for name in state.package_internal_symbols_cache.iter() {
+                    if !token.is_empty() && !name.starts_with(&token) {
+                        continue;
+                    }
                     if seen_names.contains(name.as_str()) {
                         continue;
                     }
-                    // Look up the symbol info from the content provider for
-                    // proper completion metadata. Fall back to a simple text
-                    // completion if the artifact lookup is too expensive.
+                    // Use VALUE (generic) rather than FUNCTION — the cache stores
+                    // names only and the symbols may be variables or functions.
                     let item = CompletionItem {
                         label: name.clone(),
-                        kind: Some(CompletionItemKind::FUNCTION),
+                        kind: Some(CompletionItemKind::VALUE),
                         detail: Some(format!("(package: {})", pkg.name)),
                         ..Default::default()
                     };

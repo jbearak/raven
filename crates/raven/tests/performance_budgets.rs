@@ -519,7 +519,7 @@ fn budget_single_file_completion() {
     }
 
     // Run workspace scan and apply index (populates cross-file state)
-    let (index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model) = scan_workspace(&[folder_url], 20);
+    let (index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, _) = scan_workspace(&[folder_url], 20);
     state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model);
 
     let uri = Url::from_file_path(workspace_path.join("file_0.R")).unwrap();
