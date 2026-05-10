@@ -549,11 +549,6 @@ pub struct WorldState {
     // Legacy fields (kept for migration compatibility)
     pub documents: HashMap<Url, Document>,
     pub workspace_index: HashMap<Url, Document>,
-    /// (package, symbol) pairs from workspace NAMESPACE importFrom() entries.
-    ///
-    /// Wrapped in `Arc` so `DiagnosticsSnapshot::build` does a refcount bump
-    /// rather than deep-cloning the entire vector on every snapshot build.
-    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
@@ -615,6 +610,11 @@ impl WorldState {
     /// Passthrough for legacy `state.package_internal_symbols_cache` reads.
     pub fn package_internal_symbols_cache(&self) -> &std::sync::Arc<std::collections::HashSet<String>> {
         &self.package_state.internal_symbols_cache
+    }
+
+    /// Passthrough for legacy `state.workspace_imports` reads.
+    pub fn workspace_imports(&self) -> &std::sync::Arc<Vec<(String, String)>> {
+        &self.package_state.workspace_imports
     }
 
     /// Passthrough for legacy `state.roxygen_tags_cache` immutable reads.
@@ -696,7 +696,6 @@ impl WorldState {
             // Legacy fields (kept for migration compatibility)
             documents: HashMap::new(),
             workspace_index: HashMap::new(),
-            workspace_imports: Arc::new(Vec::new()),
 
             // Workspace configuration
             workspace_folders: Vec::new(),
@@ -747,50 +746,7 @@ impl WorldState {
     /// No filesystem I/O — uses only the cached per-file tags.
     /// Returns whether the namespace model changed (imports or full_imports).
     pub fn rebuild_namespace_model_from_cache(&mut self) -> bool {
-        let old_imports = self.workspace_imports.clone();
-        let old_full_imports = self
-            .package_state.namespace_model
-            .as_ref()
-            .map(|m| m.full_imports.clone());
-
-        // Build the model directly from cache references — no Vec allocation
-        // or RoxygenNamespace cloning needed.
-        let mut model = crate::package_namespace::PackageNamespaceModel::default();
-        let mut seen_imports: HashSet<(String, String)> = HashSet::new();
-        let mut seen_full: HashSet<String> = HashSet::new();
-        for ns in self.package_state.roxygen_tags_cache.values() {
-            for sym in &ns.exports {
-                model.exports.insert(sym.clone());
-            }
-            for (pkg, sym) in &ns.import_from {
-                if seen_imports.insert((pkg.clone(), sym.clone())) {
-                    model.imports.push((pkg.clone(), sym.clone()));
-                }
-            }
-            for pkg in &ns.imports {
-                if seen_full.insert(pkg.clone()) {
-                    model.full_imports.push(pkg.clone());
-                }
-            }
-        }
-
-        let new_imports = Arc::new(model.imports.clone());
-        // Compare as sets to avoid false-positive change detection from
-        // non-deterministic HashMap iteration order.
-        let imports_changed = {
-            let old_set: HashSet<&(String, String)> = old_imports.iter().collect();
-            let new_set: HashSet<&(String, String)> = new_imports.iter().collect();
-            old_set != new_set
-        };
-        let full_imports_changed = {
-            let old_set: Option<HashSet<&String>> =
-                old_full_imports.as_ref().map(|v| v.iter().collect());
-            let new_set: HashSet<&String> = model.full_imports.iter().collect();
-            old_set.as_ref() != Some(&new_set)
-        };
-        self.workspace_imports = new_imports;
-        self.package_state.namespace_model = Some(model);
-        imports_changed || full_imports_changed
+        self.package_state.rebuild_namespace_model_from_cache()
     }
 
     /// Rebuild the cached package-internal symbols set from the workspace index
@@ -1063,7 +1019,7 @@ impl WorldState {
         pkg_ns_model: Option<crate::package_namespace::PackageNamespaceModel>,
     ) {
         self.workspace_index = index;
-        self.workspace_imports = Arc::new(imports);
+        self.package_state.workspace_imports = Arc::new(imports);
 
         // Apply package_mode setting
         use crate::cross_file::config::PackageMode;
@@ -1074,7 +1030,7 @@ impl WorldState {
                 // Intentionally clear workspace_imports: "disabled" means full script-mode
                 // behavior — NAMESPACE-derived imports are a package concept and should not
                 // suppress diagnostics when the user has opted out of package mode.
-                self.workspace_imports = Arc::new(Vec::new());
+                self.package_state.workspace_imports = Arc::new(Vec::new());
             }
             PackageMode::Enabled => {
                 // Force package mode even without detection
@@ -1100,7 +1056,7 @@ impl WorldState {
                 // Update workspace_imports from the namespace model so roxygen-derived
                 // imports take precedence over the legacy NAMESPACE-file parse.
                 if let Some(ref model) = self.package_state.namespace_model {
-                    self.workspace_imports = Arc::new(model.imports.clone());
+                    self.package_state.workspace_imports = Arc::new(model.imports.clone());
                 }
             }
             PackageMode::Auto => {
@@ -1109,7 +1065,7 @@ impl WorldState {
                 // Update workspace_imports from the namespace model so roxygen-derived
                 // imports take precedence over the legacy NAMESPACE-file parse.
                 if let Some(ref model) = self.package_state.namespace_model {
-                    self.workspace_imports = Arc::new(model.imports.clone());
+                    self.package_state.workspace_imports = Arc::new(model.imports.clone());
                 }
             }
         }
@@ -1137,7 +1093,7 @@ impl WorldState {
         log::info!(
             "Applied {} workspace files, {} imports, {} cross-file entries, {} new index entries",
             self.workspace_index.len(),
-            self.workspace_imports.len(),
+            self.workspace_imports().len(),
             self.cross_file_workspace_index.uris().len(),
             self.workspace_index_new.len()
         );
@@ -1205,11 +1161,11 @@ impl WorldState {
             if let Ok(folder_path) = folder_url.to_file_path() {
                 let namespace_path = folder_path.join("NAMESPACE");
                 if namespace_path.exists() {
-                    self.workspace_imports =
+                    self.package_state.workspace_imports =
                         Arc::new(parse_namespace_imports(&namespace_path, &self.library));
                     log::info!(
                         "Loaded {} workspace imports from NAMESPACE",
-                        self.workspace_imports.len()
+                        self.workspace_imports().len()
                     );
                     break; // Only process first workspace folder with NAMESPACE
                 }
@@ -1677,7 +1633,7 @@ mod tests {
         // so DiagnosticsSnapshot::build does a refcount bump rather than
         // deep-cloning the (package, symbol) Vec on every snapshot build.
         let state = WorldState::new(vec![]);
-        let arc1: Arc<Vec<(String, String)>> = state.workspace_imports.clone();
+        let arc1: Arc<Vec<(String, String)>> = state.workspace_imports().clone();
         let arc2 = arc1.clone();
         assert!(Arc::ptr_eq(&arc1, &arc2), "Arc clones must share storage");
     }

@@ -2705,7 +2705,7 @@ impl LanguageServer for Backend {
                                                 .map(|content| crate::package_namespace::namespace_model_from_content(&content))
                                         })
                                         .unwrap_or_default();
-                                    state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                                    state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
                                     state.package_state.namespace_model = Some(ns_model);
                                     package_namespace_changed = true;
                                 }
@@ -3234,7 +3234,7 @@ impl LanguageServer for Backend {
                 if mode == PackageMode::Disabled {
                     state.package_state.workspace = None;
                     state.package_state.namespace_model = None;
-                    state.workspace_imports = std::sync::Arc::new(Vec::new());
+                    state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
                     state.package_state.internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
                     state.package_state.roxygen_tags_cache.clear();
                     None
@@ -3388,11 +3388,11 @@ impl LanguageServer for Backend {
                         None => crate::package_namespace::PackageNamespaceModel::default(),
                     }
                 };
-                state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
                 state.package_state.namespace_model = Some(ns_model);
             } else {
                 state.package_state.namespace_model = None;
-                state.workspace_imports = std::sync::Arc::new(Vec::new());
+                state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
             }
             state.package_state.workspace = new_ws;
             state.rebuild_package_internal_symbols_cache();
@@ -3682,7 +3682,7 @@ impl LanguageServer for Backend {
                                         .map(|content| crate::package_namespace::namespace_model_from_content(&content))
                                 })
                                 .unwrap_or_default();
-                            state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                            state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
                             state.package_state.namespace_model = Some(ns_model);
                         } else {
                             state.rebuild_namespace_model_from_cache();
@@ -3843,12 +3843,12 @@ impl LanguageServer for Backend {
                             None => crate::package_namespace::PackageNamespaceModel::default(),
                         }
                     };
-                    state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                    state.package_state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
                     state.package_state.namespace_model = Some(ns_model);
                     log::info!("Rebuilt package namespace model after DESCRIPTION/NAMESPACE change");
                 } else {
                     state.package_state.namespace_model = None;
-                    state.workspace_imports = std::sync::Arc::new(Vec::new());
+                    state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
                 }
                 state.package_state.workspace = new_ws;
                 state.rebuild_package_internal_symbols_cache();
@@ -3867,7 +3867,7 @@ impl LanguageServer for Backend {
                 let mut state = self.state.write().await;
                 state.package_state.workspace = None;
                 state.package_state.namespace_model = None;
-                state.workspace_imports = std::sync::Arc::new(Vec::new());
+                state.package_state.workspace_imports = std::sync::Arc::new(Vec::new());
                 state.rebuild_package_internal_symbols_cache();
             }
         }

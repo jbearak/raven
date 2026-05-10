@@ -257,7 +257,7 @@ impl DiagnosticsSnapshot {
                     |pkg| uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
                 );
                 if suppress_for_this_file {
-                    state.workspace_imports.clone()
+                    state.workspace_imports().clone()
                 } else {
                     Arc::new(Vec::new())
                 }
@@ -38252,7 +38252,7 @@ my_func <- function(a = default_value) {
         state.cross_file_config.packages_enabled = true;
         state.workspace_scan_complete = true;
         // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
-        state.workspace_imports =
+        state.package_state.workspace_imports =
             std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
 
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();

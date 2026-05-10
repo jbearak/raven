@@ -576,8 +576,8 @@ mod package_cache_cleanup_tests {
             Some(ns_model),
         );
         // workspace_imports should come from the namespace model, not legacy
-        assert!(state.workspace_imports.contains(&("dplyr".into(), "mutate".into())));
-        assert!(state.workspace_imports.contains(&("tidyr".into(), "pivot_longer".into())));
-        assert!(!state.workspace_imports.contains(&("stats".into(), "lm".into())));
+        assert!(state.workspace_imports().contains(&("dplyr".into(), "mutate".into())));
+        assert!(state.workspace_imports().contains(&("tidyr".into(), "pivot_longer".into())));
+        assert!(!state.workspace_imports().contains(&("stats".into(), "lm".into())));
     }
 }
