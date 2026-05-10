@@ -7,6 +7,9 @@
 //! module, `PackageState` is read-only — it can only be replaced as a
 //! whole, never partially mutated.
 
+pub mod digest;
+pub use digest::ContentDigest;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
