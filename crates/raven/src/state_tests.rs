@@ -548,7 +548,7 @@ mod package_cache_cleanup_tests {
         let mut state = WorldState::new(Vec::new());
         // No package_workspace set
         state.rebuild_package_internal_symbols_cache();
-        assert!(state.package_internal_symbols_cache.is_empty());
+        assert!(state.package_internal_symbols_cache().is_empty());
     }
 
     #[test]

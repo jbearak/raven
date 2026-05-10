@@ -356,7 +356,7 @@ fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> Arc<HashSe
     // Use the cached set. We could subtract the current file's own exports,
     // but including them is harmless (they suppress false-positive diagnostics
     // for symbols the file itself defines) and avoids an extra lookup.
-    Arc::clone(&state.package_internal_symbols_cache)
+    Arc::clone(state.package_internal_symbols_cache())
 }
 
 /// Compute diagnostics from a pre-built snapshot (no lock held).
@@ -9363,7 +9363,7 @@ pub fn completion(
                 // Use the pre-computed cache instead of walking the full index.
                 // Filter by typed prefix to avoid sending the full symbol set.
                 let token = get_token_at_cursor(&text, position);
-                for name in state.package_internal_symbols_cache.iter() {
+                for name in state.package_internal_symbols_cache().iter() {
                     if !token.is_empty() && !name.starts_with(&token) {
                         continue;
                     }

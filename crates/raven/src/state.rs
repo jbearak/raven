@@ -597,10 +597,6 @@ pub struct WorldState {
     pub workspace_scan_complete: bool,
     /// Container for all derived R package mode state. See package_state.rs.
     pub package_state: crate::package_state::PackageState,
-    /// Cached set of package-internal symbol names (top-level exports from
-    /// other R/*.R files). Updated incrementally when workspace index entries
-    /// change, avoiding O(package_files) work on every diagnostic/completion.
-    pub package_internal_symbols_cache: Arc<HashSet<String>>,
 }
 
 impl WorldState {
@@ -614,6 +610,11 @@ impl WorldState {
         &self,
     ) -> Option<&crate::package_namespace::PackageNamespaceModel> {
         self.package_state.namespace_model.as_ref()
+    }
+
+    /// Passthrough for legacy `state.package_internal_symbols_cache` reads.
+    pub fn package_internal_symbols_cache(&self) -> &std::sync::Arc<std::collections::HashSet<String>> {
+        &self.package_state.internal_symbols_cache
     }
 
     /// Passthrough for legacy `state.roxygen_tags_cache` immutable reads.
@@ -727,7 +728,6 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
-            package_internal_symbols_cache: Arc::new(HashSet::new()),
         }
     }
 
@@ -800,31 +800,10 @@ impl WorldState {
     /// open URIs from the workspace index scan and merge their live exports
     /// separately.
     pub fn rebuild_package_internal_symbols_cache(&mut self) {
-        let Some(pkg) = self.package_workspace() else {
-            if !self.package_internal_symbols_cache.is_empty() {
-                self.package_internal_symbols_cache = Arc::new(HashSet::new());
-            }
-            return;
-        };
-        let r_dir = pkg.root.join("R");
-        let open_uris: HashSet<Url> = self.document_store.uris().into_iter().collect();
-        // Collect from workspace index, skipping open files (their entries may be stale).
-        let mut symbols =
-            self.cross_file_workspace_index
-                .collect_exported_symbols(&r_dir, &open_uris);
-        // Merge open documents' exports (authoritative).
-        for uri in &open_uris {
-            if let Ok(p) = uri.to_file_path() {
-                if p.starts_with(&r_dir) {
-                    if let Some(doc) = self.document_store.get_without_touch(uri) {
-                        for name in doc.artifacts.exported_interface.keys() {
-                            symbols.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        self.package_internal_symbols_cache = Arc::new(symbols);
+        let workspace_index = &self.cross_file_workspace_index;
+        let document_store = &self.document_store;
+        self.package_state
+            .rebuild_internal_symbols_cache(workspace_index, document_store);
     }
 
     /// Create a content provider for this state

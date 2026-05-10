@@ -3235,7 +3235,7 @@ impl LanguageServer for Backend {
                     state.package_state.workspace = None;
                     state.package_state.namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
-                    state.package_internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
+                    state.package_state.internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
                     state.package_state.roxygen_tags_cache.clear();
                     None
                 } else {
