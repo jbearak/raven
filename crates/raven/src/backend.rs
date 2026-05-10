@@ -1879,8 +1879,12 @@ impl LanguageServer for Backend {
                 );
                 // Rebuild package-internal symbols so sibling R/ files see the
                 // updated exports immediately (open doc is now authoritative).
-                if state.package_workspace.is_some() {
-                    state.rebuild_package_internal_symbols_cache();
+                // Only rebuild if the file is under R/ — files outside R/ don't
+                // contribute to the package-internal symbols cache.
+                if let Some(ref pkg) = state.package_workspace {
+                    if uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R"))) {
+                        state.rebuild_package_internal_symbols_cache();
+                    }
                 }
             }
 
@@ -2631,8 +2635,12 @@ impl LanguageServer for Backend {
                     new_interface_hash
                 );
                 // Rebuild the cached package-internal symbols when exports change.
-                if state.package_workspace.is_some() {
-                    state.rebuild_package_internal_symbols_cache();
+                // Only rebuild if the file is under R/ — files outside R/ don't
+                // contribute to the package-internal symbols cache.
+                if let Some(ref pkg) = state.package_workspace {
+                    if uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R"))) {
+                        state.rebuild_package_internal_symbols_cache();
+                    }
                 }
             }
 
