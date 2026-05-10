@@ -190,3 +190,16 @@ mod input_tests {
         assert!(inputs.r_files.is_empty());
     }
 }
+
+// ============== DELTA ==============
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageInputDelta {
+    Initial,
+    RFileChanged { path: PathBuf, kind: RFileKind },
+    RFileDeleted { path: PathBuf, kind: RFileKind },
+    NamespaceChanged,
+    DescriptionChanged,
+    SettingChanged,
+    Batch(Vec<PackageInputDelta>),
+}
