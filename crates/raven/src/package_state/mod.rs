@@ -132,3 +132,61 @@ impl PackageState {
         self.internal_symbols_cache = Arc::new(symbols);
     }
 }
+
+// ============== INPUTS ==============
+
+use crate::cross_file::config::PackageMode;
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Default)]
+pub struct PackageInputs {
+    pub workspace_root: Option<PathBuf>,
+    pub package_mode: PackageMode,
+    pub description: Option<DescriptionInput>,
+    pub namespace: Option<NamespaceInput>,
+    pub r_files: BTreeMap<PathBuf, RFileInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DescriptionInput {
+    pub path: PathBuf,
+    pub text: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NamespaceInput {
+    pub path: PathBuf,
+    pub text: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RFileInput {
+    pub kind: RFileKind,
+    pub origin: ContentOrigin,
+    pub text: Arc<str>,
+    pub content_digest: ContentDigest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum RFileKind {
+    Source,
+    Test,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContentOrigin {
+    Open { version: i32 },
+    Disk,
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn default_inputs_are_empty() {
+        let inputs = PackageInputs::default();
+        assert!(inputs.workspace_root.is_none());
+        assert!(inputs.r_files.is_empty());
+    }
+}
