@@ -9346,36 +9346,6 @@ pub fn completion(
         );
     }
 
-    // Add package-internal symbols (from other R/*.R files in package mode)
-    if let Some(pkg) = state.package_workspace() {
-        if let Ok(file_path) = uri.to_file_path() {
-            let r_dir = pkg.root.join("R");
-            if file_path.starts_with(&r_dir) {
-                // Use the pre-computed cache instead of walking the full index.
-                // Filter by typed prefix to avoid sending the full symbol set.
-                let token = get_token_at_cursor(&text, position);
-                for name in state.package_internal_symbols_cache().iter() {
-                    if !token.is_empty() && !name.starts_with(&token) {
-                        continue;
-                    }
-                    if seen_names.contains(name.as_str()) {
-                        continue;
-                    }
-                    // Use VALUE (generic) rather than FUNCTION — the cache stores
-                    // names only and the symbols may be variables or functions.
-                    let item = CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        detail: Some(format!("(package: {})", pkg.name)),
-                        ..Default::default()
-                    };
-                    seen_names.insert(name.clone());
-                    items.push(item);
-                }
-            }
-        }
-    }
-
     // Filter out reserved words from identifier completions
     // (Keywords and constants are added separately with specific CompletionItemKind)
     // Requirements 5.1, 5.2, 5.3: Reserved words should not appear as identifier completions
