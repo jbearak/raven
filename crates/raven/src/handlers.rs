@@ -5093,17 +5093,6 @@ fn collect_undefined_variables_from_snapshot(
         &text[start..end]
     };
 
-    // Map each NAMESPACE-imported symbol to the packages that export it. The
-    // suppression below only fires when at least one source package is actually
-    // installed — otherwise the import declaration is broken and the symbol
-    // should still be flagged as undefined.
-    let workspace_imports_map: HashMap<&str, Vec<&str>> = {
-        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (pkg, sym) in snapshot.workspace_imports.iter() {
-            map.entry(sym.as_str()).or_default().push(pkg.as_str());
-        }
-        map
-    };
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
@@ -5221,17 +5210,6 @@ fn collect_undefined_variables_from_snapshot(
         if is_builtin(&name) {
             continue;
         }
-        // Workspace NAMESPACE-imported symbols are suppressed only if at least
-        // one source package is actually installed. A broken import (the
-        // package mentioned in importFrom() is not on disk) must NOT silence
-        // the diagnostic — the symbol won't actually be loadable at runtime.
-        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
-            if pkgs.iter().any(|p| {
-                package_exists_memoized(p, &snapshot.package_library, &mut package_exists_memo)
-            }) {
-                continue;
-            }
-        }
 
         // Compute usage_col_utf16 once per iteration; subsequent checks
         // share it.
@@ -5253,11 +5231,6 @@ fn collect_undefined_variables_from_snapshot(
         }
 
         if parent_symbol_names.contains(name.as_str()) {
-            continue;
-        }
-
-        // Package mode: suppress diagnostics for symbols from other R/*.R files
-        if snapshot.package_internal_symbols.contains(name.as_str()) {
             continue;
         }
 
@@ -5334,7 +5307,7 @@ fn collect_undefined_variables_from_snapshot(
                     .inherited_packages
                     .iter()
                     .chain(scope.loaded_packages.iter())
-                    .chain(snapshot.package_full_imports.iter())
+                    .chain(snapshot.scope_contribution.full_imports.iter())
                     .cloned(),
             );
 
@@ -5357,7 +5330,9 @@ fn collect_undefined_variables_from_snapshot(
                 }
                 package_exists_memoized(pkg, &snapshot.package_library, &mut package_exists_memo)
             });
-            if (has_prior_library_call || has_cross_file_packages || !snapshot.package_full_imports.is_empty())
+            if (has_prior_library_call
+                || has_cross_file_packages
+                || !snapshot.scope_contribution.full_imports.is_empty())
                 && package_cache_pending
                 && is_function_call_identifier_textually(usage_node, text)
             {
