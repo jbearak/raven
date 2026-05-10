@@ -3017,49 +3017,35 @@ impl LanguageServer for Backend {
         // Close the document (legacy)
         state.close_document(uri);
 
-        // In package mode, rebuild the internal symbols cache so stale
-        // exports from the closed file's editing session are replaced by
-        // the workspace index's on-disk snapshot.
-        // NOTE: We intentionally do NOT force-revalidate sibling R/*.R files here.
-        // The cache rebuild is sufficient: siblings pick up the updated cache on
-        // their next diagnostic cycle (edit or reopen). Eagerly republishing all
-        // siblings on every close would be expensive and disruptive.
-        if let Some(pkg) = state.package_workspace() {
-            if let Ok(p) = uri.to_file_path() {
-                if p.starts_with(pkg.root.join("R")) {
-                    // Refresh roxygen_tags_cache from the on-disk snapshot
-                    // (file cache) so unsaved edits don't persist after close.
-                    // Gate: only relevant when roxygen_managed — if the package
-                    // uses a hand-written NAMESPACE, there are no roxygen tags
-                    // to reconcile. The roxygen_managed flag is flipped by
-                    // did_change and the watched-files handler, not by close.
-                    if pkg.roxygen_managed {
-                        let refreshed = state.cross_file_file_cache.get(uri)
-                            .map(|content| crate::roxygen::extract_roxygen_namespace_tags(&content));
-                        if let Some(ns) = refreshed {
-                            let tags_changed = state
-                                .package_state.roxygen_tags_cache
-                                .get(&p)
-                                .map_or(true, |old| *old != ns);
-                            if tags_changed {
-                                state.package_state.roxygen_tags_cache.insert(p.clone(), ns);
-                                state.rebuild_namespace_model_from_cache();
-                            }
-                        } else {
-                            // No file cache entry — file may have been
-                            // created unsaved. Remove stale cache entry.
-                            if state.package_state.roxygen_tags_cache.remove(&p).is_some() {
-                                state.rebuild_namespace_model_from_cache();
-                            }
-                        }
-                    }
-                    // Rebuild BEFORE invalidating: the workspace index entry
-                    // serves as the on-disk snapshot for the closed file's
-                    // exports. Invalidating first would lose those symbols.
-                    state.rebuild_package_internal_symbols_cache();
-                    // Now invalidate so the next scan re-reads from disk.
-                    state.cross_file_workspace_index.invalidate(uri);
-                }
+        // In package mode, update the package state when an R/*.R file closes
+        // so stale exports from the editing session are replaced by the
+        // on-disk snapshot. We intentionally do NOT force-revalidate sibling
+        // R/*.R files here; siblings pick up the updated state on their next
+        // diagnostic cycle (edit or reopen). Eagerly republishing all siblings
+        // on every close would be expensive and disruptive.
+        {
+            // Use the file cache as the "disk" content for the closed file:
+            // it reflects the last known on-disk state and avoids blocking I/O
+            // under the write lock.
+            let on_disk_text: Option<std::sync::Arc<str>> = state
+                .cross_file_file_cache
+                .get(uri)
+                .map(|s| std::sync::Arc::from(s.as_str()));
+            let event = crate::package_state::event::HandlerEvent::DidClose {
+                uri: uri.clone(),
+                on_disk_text,
+            };
+            if let Some(delta) = crate::package_state::event::translate(
+                &mut state.package_inputs,
+                event,
+            ) {
+                state.apply_package_event(&delta);
+            }
+        }
+        // Invalidate the workspace index entry so the next scan re-reads from disk.
+        if let Ok(p) = uri.to_file_path() {
+            if state.package_workspace().is_some_and(|pkg| p.starts_with(pkg.root.join("R"))) {
+                state.cross_file_workspace_index.invalidate(uri);
             }
         }
 
