@@ -1988,8 +1988,13 @@ impl LanguageServer for Backend {
                 std::collections::HashSet::from([uri.clone()]);
 
             // In package mode, when an R/*.R file's interface changed on open
-            // (e.g., external edit), revalidate sibling R/ files so they pick
-            // up added/removed symbols via mutual visibility.
+            // (e.g., external edit), revalidate siblings so they pick up
+            // added/removed symbols via mutual visibility. Sibling files
+            // include BOTH `R/` (two-way visible to each other) and
+            // `tests/testthat/` (one-way: sees R/ but R/ doesn't see it).
+            // `append_package_contribution` injects package-internal symbols
+            // into both kinds — so when an R/ interface changes, both kinds
+            // of open files have potentially stale diagnostics.
             if interface_changed {
                 if let Some(pkg) = state.package_workspace() {
                     if let Ok(fp) = uri.to_file_path() {
@@ -1997,7 +2002,9 @@ impl LanguageServer for Backend {
                         if fp.starts_with(&r_dir) {
                             for open_uri in state.documents.keys() {
                                 if let Ok(p) = open_uri.to_file_path() {
-                                    if p.starts_with(&r_dir) {
+                                    if crate::package_state::is_r_source_path(&p, &pkg.root)
+                                        .is_some()
+                                    {
                                         affected.insert(open_uri.clone());
                                     }
                                 }
@@ -2677,9 +2684,26 @@ impl LanguageServer for Backend {
 
             // Update package state via event-driven path when an R/*.R file
             // changes in a package workspace.
+            //
+            // Guard the potentially expensive full-document `Rope -> String ->
+            // Arc<str>` materialization behind a cheap path check. Without
+            // the guard, every keystroke on every open R file in every
+            // workspace (including non-package and scratch-file workflows)
+            // paid two full-document heap allocations just to have
+            // `translate()` short-circuit on `is_r_source_path == None`.
             let mut package_namespace_changed = false;
-            {
-                let text: std::sync::Arc<str> = state.documents.get(&uri)
+            let in_package_r_source_tree = state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .zip(uri.to_file_path().ok())
+                .is_some_and(|(root, path)| {
+                    crate::package_state::is_r_source_path(&path, root).is_some()
+                });
+            if in_package_r_source_tree {
+                let text: std::sync::Arc<str> = state
+                    .documents
+                    .get(&uri)
                     .map(|d| d.text())
                     .unwrap_or_default()
                     .into();
@@ -2766,14 +2790,16 @@ impl LanguageServer for Backend {
                     affected.insert(child);
                 }
             }
-            // When the roxygen namespace model changed, all open package R
+            // When the roxygen namespace model changed, all open package
             // files need revalidation so @import/@importFrom edits propagate.
+            // Both `R/` (two-way) and `tests/testthat/` (one-way) receive the
+            // contribution via `append_package_contribution`, so both need
+            // the affected-set.
             if package_namespace_changed {
                 if let Some(pkg) = state.package_workspace() {
-                    let r_dir = pkg.root.join("R");
                     for open_uri in state.documents.keys() {
                         if let Ok(p) = open_uri.to_file_path() {
-                            if p.starts_with(&r_dir) {
+                            if crate::package_state::is_r_source_path(&p, &pkg.root).is_some() {
                                 affected.insert(open_uri.clone());
                             }
                         }
@@ -2781,9 +2807,11 @@ impl LanguageServer for Backend {
                 }
             }
             // In package mode, when the exported interface of an R/*.R file
-            // changes, other open R/ files depend on it via mutual visibility
-            // (not the source() graph). Revalidate them so added/removed
-            // symbols propagate to undefined-variable diagnostics.
+            // changes, other open package files depend on it via mutual
+            // visibility (not the source() graph). Revalidate them so
+            // added/removed symbols propagate to undefined-variable
+            // diagnostics. `tests/testthat/` sees R/ symbols (one-way), so
+            // include test files in the affected set too.
             if interface_changed && !package_namespace_changed {
                 if let Some(pkg) = state.package_workspace() {
                     if let Ok(fp) = uri.to_file_path() {
@@ -2791,7 +2819,9 @@ impl LanguageServer for Backend {
                         if fp.starts_with(&r_dir) {
                             for open_uri in state.documents.keys() {
                                 if let Ok(p) = open_uri.to_file_path() {
-                                    if p.starts_with(&r_dir) {
+                                    if crate::package_state::is_r_source_path(&p, &pkg.root)
+                                        .is_some()
+                                    {
                                         affected.insert(open_uri.clone());
                                     }
                                 }
@@ -3024,13 +3054,22 @@ impl LanguageServer for Backend {
         // diagnostic cycle (edit or reopen). Eagerly republishing all siblings
         // on every close would be expensive and disruptive.
         {
-            // Use the file cache as the "disk" content for the closed file:
-            // it reflects the last known on-disk state and avoids blocking I/O
-            // under the write lock.
+            // Prefer the file cache (LRU, warm for recently-touched files)
+            // as the "disk" content for the closed file; fall back to the
+            // workspace index when the LRU has evicted this entry so a
+            // close in a large package (>LRU capacity of recently-touched
+            // files) doesn't treat the file as DELETED from `package_inputs`
+            // and vanish its symbols from `r_internal_symbols`.
             let on_disk_text: Option<std::sync::Arc<str>> = state
                 .cross_file_file_cache
                 .get(uri)
-                .map(|s| std::sync::Arc::from(s.as_str()));
+                .map(|s| std::sync::Arc::from(s.as_str()))
+                .or_else(|| {
+                    state
+                        .workspace_index_new
+                        .get(uri)
+                        .map(|entry| std::sync::Arc::from(entry.contents.to_string()))
+                });
             let event = crate::package_state::event::HandlerEvent::DidClose {
                 uri: uri.clone(),
                 on_disk_text,
@@ -3511,6 +3550,17 @@ impl LanguageServer for Backend {
             // watched-file changes can otherwise spend the lock-hold time
             // doing Vec::contains scans per dependent.
             let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+            // Track whether any deletion touched `package_inputs`, so that
+            // mixed batches (deletions + non-R creates/changes) still trigger
+            // a re-derive. Without this, a batch like
+            // `DELETE R/foo.R + CREATE inst/data.csv` skipped the sync
+            // `apply_package_event` (because `!to_update.is_empty()`) AND
+            // skipped the async path's `has_pkg_files` check (because
+            // `inst/data.csv` is not a package source file) — leaving
+            // symbols from the deleted R file stale in
+            // `scope_contribution.r_internal_symbols` until the next R/
+            // edit happened to trigger a derive.
+            let mut had_pkg_deletion = false;
 
             for change in &params.changes {
                 let uri = &change.uri;
@@ -3593,10 +3643,14 @@ impl LanguageServer for Backend {
                                 on_disk_text: None,
                                 deleted: true,
                             };
-                            crate::package_state::event::translate(
+                            if crate::package_state::event::translate(
                                 &mut state.package_inputs,
                                 event,
-                            );
+                            )
+                            .is_some()
+                            {
+                                had_pkg_deletion = true;
+                            }
                         }
 
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
@@ -3628,6 +3682,16 @@ impl LanguageServer for Backend {
                 state
                     .diagnostics_gate
                     .mark_force_republish_many(affected.iter());
+            } else if had_pkg_deletion && state.package_inputs.workspace_root.is_some() {
+                // Mixed batch: deletions of package source files were applied
+                // above but `to_update` is non-empty, so the DELETED-only
+                // branch doesn't run. The async block below gates its derive
+                // on `uris_to_update` containing a package source path, which
+                // doesn't cover deletion-only mutations to `package_inputs`.
+                // Run the derive eagerly here so sibling diagnostics don't
+                // see stale `r_internal_symbols` entries for the deleted
+                // files until some later edit happens to trigger a derive.
+                state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
             }
             // Watched-file deletions can drop edges that put a closed neighbor
             // outside the open-document neighborhood; refresh the pin set so
@@ -3907,15 +3971,20 @@ impl LanguageServer for Backend {
                 // checkout) propagate to the namespace model and internal symbols.
                 {
                     let mut state = state_arc.write().await;
-                    let r_dir_for_check = state.package_inputs.workspace_root
-                        .clone()
-                        .map(|root| root.join("R"));
-                    let has_r_files = r_dir_for_check.as_ref().is_some_and(|r_dir| {
+                    // Gate on any package source file — `is_r_source_path`
+                    // matches both `R/` and `tests/testthat/`. Without the
+                    // `tests/` branch, external edits that touch only test
+                    // files (e.g. `git checkout` on a topic branch) would
+                    // leave their RFileFacts stale in `package_state`.
+                    let root_for_check = state.package_inputs.workspace_root.clone();
+                    let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
                         uris_to_update.iter().any(|u| {
-                            u.to_file_path().ok().is_some_and(|p| p.starts_with(r_dir))
+                            u.to_file_path().ok().is_some_and(|p| {
+                                crate::package_state::is_r_source_path(&p, root).is_some()
+                            })
                         })
                     });
-                    if has_r_files {
+                    if has_pkg_files {
                         let mut deltas = Vec::new();
                         let mut ns_changed = false;
                         let old_ns_model = state.package_state.namespace_model.clone();
@@ -3947,13 +4016,16 @@ impl LanguageServer for Backend {
                         }
                         if ns_changed {
                             // Namespace model changed (e.g. roxygen tags changed in an
-                            // external edit). Add all open R/ files to affected set so
-                            // their @import diagnostics are refreshed.
+                            // external edit). Add all open package files (R/ and
+                            // tests/testthat/) to affected set so their @import
+                            // diagnostics are refreshed.
                             if let Some(ref root) = state.package_inputs.workspace_root.clone() {
-                                let r_dir = root.join("R");
                                 for open_uri in state.documents.keys() {
                                     if let Ok(p) = open_uri.to_file_path() {
-                                        if p.starts_with(&r_dir) && affected_for_async_set.insert(open_uri.clone()) {
+                                        if crate::package_state::is_r_source_path(&p, root)
+                                            .is_some()
+                                            && affected_for_async_set.insert(open_uri.clone())
+                                        {
                                             affected_for_async.push(open_uri.clone());
                                         }
                                     }
