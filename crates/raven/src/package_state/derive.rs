@@ -328,4 +328,43 @@ mod tests {
         assert!(pkgs.contains("dplyr"));
         assert!(pkgs.contains("stats"));
     }
+
+    /// Phase 5b behavior change: a workspace with NAMESPACE but no DESCRIPTION
+    /// does NOT activate package mode (Auto mode requires a valid `Package:` field
+    /// in DESCRIPTION). Consequently, `scope_contribution` is empty — no
+    /// importFrom symbols or internal symbols are injected, matching script-mode.
+    ///
+    /// This codifies spec §11.1 behavior: "package mode requires both DESCRIPTION
+    /// (with a Package: field) and NAMESPACE". Non-package workspaces run as
+    /// script mode regardless of NAMESPACE presence.
+    #[test]
+    fn non_package_namespace_does_not_produce_scope_contribution() {
+        // Auto mode with NAMESPACE but no DESCRIPTION.
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.namespace = Some(NamespaceInput {
+            path: "/work/pkg/NAMESPACE".into(),
+            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
+        });
+        // Add an R file with a top-level definition.
+        let r_path: PathBuf = "/work/pkg/R/utils.R".into();
+        let text: Arc<str> = "helper <- function() 1\n".into();
+        inputs.r_files.insert(r_path, RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: ContentDigest::of(&text),
+        });
+
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+
+        // No workspace → no package mode → empty scope contribution.
+        assert!(s.workspace.is_none(), "Auto mode without DESCRIPTION must not produce a workspace");
+        assert!(s.scope_contribution.workspace_root.is_none());
+        assert!(s.scope_contribution.r_internal_symbols.is_empty(),
+            "NAMESPACE without DESCRIPTION must not inject internal symbols");
+        assert!(s.scope_contribution.imported_symbols.is_empty(),
+            "NAMESPACE without DESCRIPTION must not inject importFrom symbols");
+        assert!(s.scope_contribution.full_imports.is_empty(),
+            "NAMESPACE without DESCRIPTION must not inject full imports");
+    }
 }
