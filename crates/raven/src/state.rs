@@ -748,8 +748,10 @@ impl WorldState {
         imports_changed || full_imports_changed
     }
 
-    /// Rebuild the cached package-internal symbols set from the workspace index.
-    /// Call after workspace index entries change in package mode.
+    /// Rebuild the cached package-internal symbols set from the workspace index
+    /// AND open documents. The workspace index only contains closed files'
+    /// exports; open files' current exports must be merged from `document_store`
+    /// so that newly-defined symbols propagate to sibling diagnostics/completions.
     pub fn rebuild_package_internal_symbols_cache(&mut self) {
         let Some(ref pkg) = self.package_workspace else {
             if !self.package_internal_symbols_cache.is_empty() {
@@ -758,7 +760,19 @@ impl WorldState {
             return;
         };
         let r_dir = pkg.root.join("R");
-        let symbols = self.cross_file_workspace_index.collect_exported_symbols(&r_dir);
+        let mut symbols = self.cross_file_workspace_index.collect_exported_symbols(&r_dir);
+        // Merge open documents' exports (authoritative over stale index entries).
+        for uri in self.document_store.uris() {
+            if let Ok(p) = uri.to_file_path() {
+                if p.starts_with(&r_dir) {
+                    if let Some(doc) = self.document_store.get_without_touch(&uri) {
+                        for name in doc.artifacts.exported_interface.keys() {
+                            symbols.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
         self.package_internal_symbols_cache = Arc::new(symbols);
     }
 
@@ -1508,8 +1522,9 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
                 (crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE")), HashMap::new())
             };
             // Merge namespace model imports into the workspace imports list
+            let existing: HashSet<(String, String)> = imports.iter().map(|(p, s)| (p.clone(), s.clone())).collect();
             for (pkg, sym) in &ns_model.imports {
-                if !imports.iter().any(|(p, s)| p == pkg && s == sym) {
+                if !existing.contains(&(pkg.clone(), sym.clone())) {
                     imports.push((pkg.clone(), sym.clone()));
                 }
             }

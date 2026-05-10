@@ -2563,10 +2563,20 @@ impl LanguageServer for Backend {
                             let content = state.documents.get(&uri).map(|d| d.text());
                             if let Some(content) = content {
                                 let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                state.roxygen_tags_cache.insert(file_path, ns);
+                                // Early-exit: skip the expensive full rebuild if this
+                                // file's namespace tags didn't actually change. This
+                                // makes the common case (editing function bodies) O(1).
+                                let tags_changed = state
+                                    .roxygen_tags_cache
+                                    .get(&file_path)
+                                    .map_or(true, |old| *old != ns);
+                                if tags_changed {
+                                    state.roxygen_tags_cache.insert(file_path, ns);
+                                    // Rebuild namespace model from the per-file cache (no I/O).
+                                    package_namespace_changed =
+                                        state.rebuild_namespace_model_from_cache();
+                                }
                             }
-                            // Rebuild namespace model from the per-file cache (no I/O).
-                            package_namespace_changed = state.rebuild_namespace_model_from_cache();
                         }
                     }
                 }

@@ -5317,7 +5317,7 @@ fn collect_undefined_variables_from_snapshot(
                 }
                 package_exists_memoized(pkg, &snapshot.package_library, &mut package_exists_memo)
             });
-            if (has_prior_library_call || has_cross_file_packages)
+            if (has_prior_library_call || has_cross_file_packages || !snapshot.package_full_imports.is_empty())
                 && package_cache_pending
                 && is_function_call_identifier_textually(usage_node, text)
             {
