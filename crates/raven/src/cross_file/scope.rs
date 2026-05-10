@@ -17252,3 +17252,289 @@ y <- filter(df)"#;
         );
     }
 }
+
+// ============================================================================
+// Phase 5a integration tests: PackageScopeContribution → scope injection
+// ============================================================================
+
+#[cfg(test)]
+mod package_contribution_tests {
+    use super::*;
+    use crate::package_state::PackageScopeContribution;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use tree_sitter::Parser;
+
+    fn parse_r(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    /// Build a minimal `PackageScopeContribution` with the given internal symbols
+    /// and imported symbols, rooted at `workspace_root_path`.
+    fn make_contribution(
+        workspace_root_path: &str,
+        internal: &[&str],
+        imported: &[&str],
+    ) -> PackageScopeContribution {
+        let r_internal_symbols: BTreeSet<String> =
+            internal.iter().map(|s| s.to_string()).collect();
+        let imported_symbols: BTreeMap<String, BTreeSet<String>> =
+            imported.iter().map(|s| (s.to_string(), BTreeSet::new())).collect();
+        PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from(workspace_root_path)),
+            r_internal_symbols: Arc::new(r_internal_symbols),
+            imported_symbols: Arc::new(imported_symbols),
+            full_imports: Arc::new(BTreeSet::new()),
+        }
+    }
+
+    /// Parse R code and return a `ScopeArtifacts` (no cross-file graph needed).
+    fn artifacts_for(uri: &Url, code: &str) -> Arc<ScopeArtifacts> {
+        let tree = parse_r(code);
+        Arc::new(compute_artifacts(uri, &tree, code))
+    }
+
+    // ------------------------------------------------------------------
+    // Test 1: package-internal symbol visible in file under R/
+    // ------------------------------------------------------------------
+
+    /// When `r_internal_symbols` carries `helper` and the queried file is
+    /// under `<root>/R/`, the scope result must list `helper` as visible even
+    /// though it is not defined in the queried file itself (simulating mutual
+    /// visibility across package files).
+    #[test]
+    fn package_internal_symbol_resolves_via_scope() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // main.R: calls helper() — the definition lives in another R/ file
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- helper()";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Without contribution, `helper` is NOT in scope.
+        let scope_no_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+        );
+        assert!(
+            !scope_no_contrib.symbols.contains_key("helper"),
+            "without contribution, helper must not be in scope"
+        );
+
+        // With contribution carrying `helper`, it MUST appear.
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope_with_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope_with_contrib.symbols.contains_key("helper"),
+            "with contribution, helper must be visible in R/ file. \
+             visible symbols: {:?}",
+            scope_with_contrib.symbols.keys().collect::<Vec<_>>()
+        );
+        let sym = scope_with_contrib.symbols.get("helper").unwrap();
+        assert_eq!(sym.kind, SymbolKind::Function);
+        assert!(
+            sym.source_uri.as_str().starts_with("package:"),
+            "synthetic symbol source_uri must use package: scheme, got {}",
+            sym.source_uri
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 2: NAMESPACE-imported symbol visible in file under R/
+    // ------------------------------------------------------------------
+
+    /// When `imported_symbols` carries `filter` (e.g. from a NAMESPACE
+    /// `importFrom(dplyr, filter)`) and the queried file is under `<root>/R/`,
+    /// the scope result must list `filter` as visible.
+    #[test]
+    fn imported_symbol_resolves_via_scope() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- filter(df, x > 0)";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri { Some(main_arts.clone()) } else { None }
+        };
+        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Without contribution, `filter` is not in scope (no library() call).
+        let scope_no_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+        );
+        assert!(
+            !scope_no_contrib.symbols.contains_key("filter"),
+            "without contribution, filter must not be in scope"
+        );
+
+        // With contribution, `filter` must appear.
+        let contrib = make_contribution("/work/pkg", &[], &["filter"]);
+        let scope_with_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope_with_contrib.symbols.contains_key("filter"),
+            "with contribution, filter must be visible in R/ file. \
+             visible symbols: {:?}",
+            scope_with_contrib.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 3: contribution does NOT inject into file outside R/
+    // ------------------------------------------------------------------
+
+    /// A file NOT under `<root>/R/` or `<root>/tests/testthat/` must NOT
+    /// receive the package contribution, even when `Some(&contrib)` is passed.
+    #[test]
+    fn contribution_not_injected_outside_r_dir() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // Script under inst/ — not a package source file.
+        let script_uri = Url::parse("file:///work/pkg/inst/script.R").unwrap();
+        let script_code = "result <- helper()";
+        let script_arts = artifacts_for(&script_uri, script_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &script_uri { Some(script_arts.clone()) } else { None }
+        };
+        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &script_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("helper"),
+            "files outside R/ must not receive package contribution; \
+             visible symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 4: local definition takes priority over contribution
+    // ------------------------------------------------------------------
+
+    /// If the file already defines a symbol with the same name as one in the
+    /// contribution, the local definition must win (contribution is additive-only).
+    #[test]
+    fn local_definition_takes_priority_over_contribution() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        // Local definition of `helper` as a variable assignment.
+        let main_code = "helper <- 42\nresult <- helper + 1";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri { Some(main_arts.clone()) } else { None }
+        };
+        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Contribution also carries `helper` as a Function-kind synthetic symbol.
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            1,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        let sym = scope.symbols.get("helper").expect("helper must be visible");
+        // Local definition wins: source_uri should be the file URI, not package:
+        assert_eq!(
+            sym.source_uri, main_uri,
+            "local definition must take precedence over package contribution"
+        );
+        // Local definition is Variable (assigned with `<-`), not Function.
+        assert_eq!(
+            sym.kind,
+            SymbolKind::Variable,
+            "local definition kind must be Variable, not the synthetic Function"
+        );
+    }
+}
