@@ -495,3 +495,198 @@ mod preservation {
     }
 }
 
+// ============================================================================
+// Package mode: tests/testthat one-way visibility integration tests (Phase 6.2)
+//
+// These tests drive the full pipeline:
+//   PackageInputs → WorldState::apply_package_event → scope_at_position_with_graph
+// to confirm end-to-end that test files see R/ symbols (one-way visibility) and
+// R/ files do NOT see test-only symbols.
+// ============================================================================
+
+#[cfg(test)]
+mod package_testthat_visibility_tests {
+    use super::super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::Url;
+
+    use crate::cross_file::dependency::DependencyGraph;
+    use crate::cross_file::scope::{
+        compute_artifacts, scope_at_position_with_graph, ScopeArtifacts,
+    };
+    use crate::cross_file::config::PackageMode;
+    use crate::package_state::{
+        ContentDigest, ContentOrigin, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+    };
+
+    /// Parse R source into `ScopeArtifacts` using tree-sitter-r.
+    fn make_artifacts(uri: &Url, code: &str) -> Arc<ScopeArtifacts> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        Arc::new(compute_artifacts(uri, &tree, code))
+    }
+
+    /// Resolve visible symbols at EOF in `uri` using the given contribution.
+    fn resolve_symbols(
+        uri: &Url,
+        artifacts: Arc<ScopeArtifacts>,
+        workspace_root: &Url,
+        contribution: &crate::package_state::PackageScopeContribution,
+    ) -> std::collections::HashMap<Arc<str>, crate::cross_file::scope::ScopedSymbol> {
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == uri { Some(artifacts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+        let graph = DependencyGraph::new();
+
+        let scope = scope_at_position_with_graph(
+            uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(contribution),
+        );
+        scope.symbols
+    }
+
+    /// Build a `WorldState` pre-populated with DESCRIPTION + the given R files,
+    /// then call `apply_package_event(Initial)` to drive full package-mode derivation.
+    fn build_state_with_files(
+        workspace_root_path: &str,
+        r_files: Vec<(PathBuf, RFileKind, &str)>,
+    ) -> WorldState {
+        let mut state = WorldState::new(vec![]);
+        state.package_inputs.workspace_root = Some(PathBuf::from(workspace_root_path));
+        state.package_inputs.package_mode = PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            path: PathBuf::from(format!("{}/DESCRIPTION", workspace_root_path)),
+            text: "Package: foo\n".into(),
+        });
+        for (path, kind, text) in r_files {
+            let text: Arc<str> = Arc::from(text);
+            let digest = ContentDigest::of(&text);
+            state.package_inputs.r_files.insert(
+                path,
+                RFileInput { kind, origin: ContentOrigin::Disk, text, content_digest: digest },
+            );
+        }
+        state.apply_package_event(&PackageInputDelta::Initial);
+        state
+    }
+
+    // ------------------------------------------------------------------
+    // Test A: test file sees R/ symbol (one-way: tests → R/)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: a symbol defined in R/utils.R is visible when resolving
+    /// scope inside tests/testthat/test-utils.R.
+    #[test]
+    fn test_file_sees_r_dir_symbol_end_to_end() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/R/utils.R", root)),
+                    RFileKind::Source,
+                    "helper <- function() 1\n",
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/test-utils.R", root)),
+                    RFileKind::Test,
+                    "result <- helper()\n",
+                ),
+            ],
+        );
+
+        // The derived contribution must carry `helper` from R/.
+        assert!(
+            state.package_state.scope_contribution.r_internal_symbols.contains("helper"),
+            "helper must appear in r_internal_symbols for injection into test files"
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-utils.R").unwrap();
+        let test_arts = make_artifacts(&test_uri, "result <- helper()\n");
+
+        let symbols = resolve_symbols(
+            &test_uri,
+            test_arts,
+            &workspace_root,
+            &state.package_state.scope_contribution,
+        );
+
+        assert!(
+            symbols.contains_key("helper"),
+            "helper must be visible in tests/testthat/ file after end-to-end package derivation. \
+             visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test B: R/ file does NOT see test-only symbol (asymmetry enforced)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: a symbol defined only in tests/testthat/ must NOT appear
+    /// in scope when resolving inside R/main.R — confirming the asymmetry.
+    #[test]
+    fn r_file_does_not_see_test_only_symbol_end_to_end() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/R/main.R", root)),
+                    RFileKind::Source,
+                    "result <- test_helper()\n",
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/test-utils.R", root)),
+                    RFileKind::Test,
+                    "test_helper <- function() 99\n",
+                ),
+            ],
+        );
+
+        // The derived contribution must NOT carry `test_helper` (test symbols
+        // are excluded from r_internal_symbols by build_scope_contribution).
+        assert!(
+            !state.package_state.scope_contribution.r_internal_symbols.contains("test_helper"),
+            "test_helper must NOT appear in r_internal_symbols"
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_arts = make_artifacts(&main_uri, "result <- test_helper()\n");
+
+        let symbols = resolve_symbols(
+            &main_uri,
+            main_arts,
+            &workspace_root,
+            &state.package_state.scope_contribution,
+        );
+
+        assert!(
+            !symbols.contains_key("test_helper"),
+            "test_helper must NOT be visible in R/main.R. \
+             visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
