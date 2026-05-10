@@ -2952,6 +2952,7 @@ impl LanguageServer for Backend {
             packages_enabled,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
+            pkg_mode_rebuild_info,
         ) = {
             let mut state = self.state.write().await;
 
@@ -3032,8 +3033,8 @@ impl LanguageServer for Backend {
                 state.cross_file_config = config;
             }
 
-            // If package_mode changed, rebuild package-related state
-            if package_mode_changed {
+            // If package_mode changed, gather info for rebuild outside the lock.
+            let pkg_mode_rebuild_info: Option<(std::path::PathBuf, crate::cross_file::config::PackageMode)> = if package_mode_changed {
                 use crate::cross_file::config::PackageMode;
                 let mode = state.cross_file_config.package_mode;
                 if mode == PackageMode::Disabled {
@@ -3041,56 +3042,13 @@ impl LanguageServer for Backend {
                     state.package_namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
                     state.package_internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
-                } else if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
-                    let new_ws = match mode {
-                        PackageMode::Auto => crate::package_namespace::detect_package_workspace(&root),
-                        PackageMode::Enabled => {
-                            crate::package_namespace::detect_package_workspace(&root).or_else(|| {
-                                Some(crate::package_namespace::PackageWorkspace {
-                                    name: "unknown".to_string(),
-                                    root: root.clone(),
-                                    roxygen_managed: false,
-                                })
-                            })
-                        }
-                        PackageMode::Disabled => unreachable!(),
-                    };
-                    if let Some(ref ws) = new_ws {
-                        let ns_model = if ws.roxygen_managed {
-                            let r_dir = root.join("R");
-                            let mut roxygen_files = Vec::new();
-                            state.roxygen_tags_cache.clear();
-                            if let Ok(entries) = std::fs::read_dir(&r_dir) {
-                                for entry in entries.flatten() {
-                                    let path = entry.path();
-                                    if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
-                                        // Prefer open document content
-                                        let content = Url::from_file_path(&path).ok()
-                                            .and_then(|u| state.documents.get(&u).map(|d| d.text()))
-                                            .or_else(|| std::fs::read_to_string(&path).ok());
-                                        if let Some(content) = content {
-                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                            roxygen_files.push((path.display().to_string(), ns.clone()));
-                                            state.roxygen_tags_cache.insert(path, ns);
-                                        }
-                                    }
-                                }
-                            }
-                            crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
-                        } else {
-                            crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE"))
-                        };
-                        state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
-                        state.package_namespace_model = Some(ns_model);
-                    } else {
-                        state.package_namespace_model = None;
-                        state.workspace_imports = std::sync::Arc::new(Vec::new());
-                    }
-                    state.package_workspace = new_ws;
-                    state.rebuild_package_internal_symbols_cache();
+                    None
+                } else {
+                    state.workspace_folders.first().and_then(|u| u.to_file_path().ok()).map(|root| (root, mode))
                 }
-                log::info!("Rebuilt package state after packageMode change to {:?}", mode);
-            }
+            } else {
+                None
+            };
 
             // Apply new symbol config if parsed
             // Requirement 11.2: Apply symbols.workspaceMaxResults from settings
@@ -3136,8 +3094,82 @@ impl LanguageServer for Backend {
                 packages_enabled,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
+                pkg_mode_rebuild_info,
             )
         };
+
+        // --- Package mode rebuild: file I/O outside the write lock ---
+        if let Some((root, mode)) = pkg_mode_rebuild_info {
+            use crate::cross_file::config::PackageMode;
+            let new_ws = match mode {
+                PackageMode::Auto => crate::package_namespace::detect_package_workspace(&root),
+                PackageMode::Enabled => {
+                    crate::package_namespace::detect_package_workspace(&root).or_else(|| {
+                        Some(crate::package_namespace::PackageWorkspace {
+                            name: "unknown".to_string(),
+                            root: root.clone(),
+                            roxygen_managed: false,
+                        })
+                    })
+                }
+                PackageMode::Disabled => unreachable!(),
+            };
+
+            // Pre-read disk content outside the lock
+            let disk_r_files: Vec<(std::path::PathBuf, Option<String>)> = if new_ws.as_ref().is_some_and(|ws| ws.roxygen_managed) {
+                let r_dir = root.join("R");
+                let mut files = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&r_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r")) {
+                            files.push((path.clone(), std::fs::read_to_string(&path).ok()));
+                        }
+                    }
+                }
+                files
+            } else {
+                Vec::new()
+            };
+            let namespace_content: Option<String> = if new_ws.as_ref().is_some_and(|ws| !ws.roxygen_managed) {
+                std::fs::read_to_string(root.join("NAMESPACE")).ok()
+            } else {
+                None
+            };
+
+            // Re-acquire lock to apply results
+            let mut state = self.state.write().await;
+            if let Some(ref ws) = new_ws {
+                let ns_model = if ws.roxygen_managed {
+                    let mut roxygen_files = Vec::new();
+                    state.roxygen_tags_cache.clear();
+                    for (path, disk_content) in &disk_r_files {
+                        let content = Url::from_file_path(path).ok()
+                            .and_then(|u| state.documents.get(&u).map(|d| d.text()))
+                            .or_else(|| disk_content.clone());
+                        if let Some(content) = content {
+                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                            roxygen_files.push((path.display().to_string(), ns.clone()));
+                            state.roxygen_tags_cache.insert(path.clone(), ns);
+                        }
+                    }
+                    crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
+                } else {
+                    match namespace_content {
+                        Some(ref content) => crate::package_namespace::namespace_model_from_content(content),
+                        None => crate::package_namespace::PackageNamespaceModel::default(),
+                    }
+                };
+                state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                state.package_namespace_model = Some(ns_model);
+            } else {
+                state.package_namespace_model = None;
+                state.workspace_imports = std::sync::Arc::new(Vec::new());
+            }
+            state.package_workspace = new_ws;
+            state.rebuild_package_internal_symbols_cache();
+            log::info!("Rebuilt package state after packageMode change to {:?}", mode);
+        }
 
         // Log diagnostics_enabled change - Requirement 5.2
         if diagnostics_enabled_changed {
@@ -3470,7 +3502,13 @@ impl LanguageServer for Backend {
                 if let Some(ref ws) = new_ws {
                     let ns_model = if ws.roxygen_managed {
                         let mut roxygen_files = Vec::new();
-                        state.roxygen_tags_cache.clear();
+                        // Rebuild cache without clearing — for open documents,
+                        // did_change may have inserted fresher entries while we
+                        // were doing I/O. Only overwrite entries for files whose
+                        // content we can authoritatively determine.
+                        let disk_paths: std::collections::HashSet<std::path::PathBuf> = disk_r_files.iter().map(|(p, _)| p.clone()).collect();
+                        // Remove entries for files no longer on disk
+                        state.roxygen_tags_cache.retain(|p, _| disk_paths.contains(p));
                         for (path, disk_content) in &disk_r_files {
                             // Prefer open document content over disk read
                             let content = Url::from_file_path(path).ok()

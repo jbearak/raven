@@ -1164,12 +1164,19 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
 
         // We're in a roxygen block — collect all contiguous #' lines
         let mut has_export = false;
+        let mut explicit_export_name: Option<String> = None;
         let block_start = i;
         while i < lines.len() && lines[i].trim_start().starts_with("#'") {
             let tag_line = lines[i].trim_start().strip_prefix("#'").unwrap_or("").trim();
 
-            if tag_line == "@export" || tag_line.starts_with("@export ") {
+            if tag_line == "@export" {
                 has_export = true;
+            } else if let Some(rest) = tag_line.strip_prefix("@export ") {
+                has_export = true;
+                let name = rest.trim();
+                if !name.is_empty() {
+                    explicit_export_name = Some(name.to_string());
+                }
             } else if let Some(rest) = tag_line.strip_prefix("@import ") {
                 // @import pkg1 pkg2 ...
                 for pkg in rest.split_whitespace() {
@@ -1196,18 +1203,23 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
 
         // If @export was found, extract the symbol name from the next definition
         if has_export {
-            // Skip blank lines and comments after the block
-            while i < lines.len() {
-                let next = lines[i].trim();
-                if next.is_empty() || (next.starts_with('#') && !next.starts_with("#'")) {
-                    i += 1;
-                } else {
-                    break;
+            if let Some(name) = explicit_export_name {
+                // Explicit @export name overrides auto-detection
+                ns.exports.push(name);
+            } else {
+                // Skip blank lines and comments after the block
+                while i < lines.len() {
+                    let next = lines[i].trim();
+                    if next.is_empty() || (next.starts_with('#') && !next.starts_with("#'")) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
                 }
-            }
-            if i < lines.len() {
-                if let Some(name) = extract_definition_name(lines[i]) {
-                    ns.exports.push(name);
+                if i < lines.len() {
+                    if let Some(name) = extract_definition_name(lines[i]) {
+                        ns.exports.push(name);
+                    }
                 }
             }
         }
@@ -1227,23 +1239,16 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
 fn extract_definition_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
 
-    // Try to find assignment operator (check <<- before <- to avoid mismatch)
-    let (name_part, _) = if let Some(pos) = trimmed.find("<<-") {
-        (&trimmed[..pos], &trimmed[pos + 3..])
-    } else if let Some(pos) = trimmed.find("<-") {
-        (&trimmed[..pos], &trimmed[pos + 2..])
+    // Find the assignment operator, skipping operators inside quotes.
+    let (name_part, _) = if let Some((pos, len)) = find_assignment_op(trimmed) {
+        (&trimmed[..pos], &trimmed[pos + len..])
     } else {
-        // Try `=` but only if it's not inside parens (not a function arg)
-        if let Some(pos) = find_toplevel_equals(trimmed) {
-            (&trimmed[..pos], &trimmed[pos + 1..])
-        } else {
-            // Could be setGeneric("name", ...), setMethod("name", ...), setClass("name", ...)
-            // Try to extract the first quoted string argument
-            if let Some(name) = extract_first_string_arg(trimmed) {
-                return Some(name);
-            }
-            return extract_first_identifier(trimmed);
+        // Could be setGeneric("name", ...), setMethod("name", ...), setClass("name", ...)
+        // Try to extract the first quoted string argument
+        if let Some(name) = extract_first_string_arg(trimmed) {
+            return Some(name);
         }
+        return extract_first_identifier(trimmed);
     };
 
     let name = name_part.trim();
@@ -1257,6 +1262,49 @@ fn extract_definition_name(line: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+/// Find the first top-level assignment operator (`<<-`, `<-`, or `=`) outside
+/// of quoted strings and balanced brackets. Returns `(byte_offset, op_len)`.
+fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_quote {
+            Some(q) if b == q => { in_quote = None; }
+            Some(_) => {}
+            None => match b {
+                b'"' | b'\'' | b'`' => { in_quote = Some(b); }
+                b'(' | b'[' | b'{' => { depth += 1; }
+                b')' | b']' | b'}' => { depth = depth.saturating_sub(1); }
+                b'<' if depth == 0 => {
+                    // Check for <<- first, then <-
+                    if i + 2 < bytes.len() && bytes[i + 1] == b'<' && bytes[i + 2] == b'-' {
+                        return Some((i, 3));
+                    }
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                        return Some((i, 2));
+                    }
+                }
+                b'=' if depth == 0 => {
+                    // Skip ==, !=, >=, <=
+                    if i > 0 && matches!(bytes.get(i - 1), Some(b'!') | Some(b'>') | Some(b'<')) {
+                        // skip
+                    } else if bytes.get(i + 1) == Some(&b'=') {
+                        // skip
+                    } else {
+                        return Some((i, 1));
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract the first quoted string argument from a function call like `setGeneric("foo", ...)`.
@@ -1278,11 +1326,19 @@ fn extract_first_string_arg(line: &str) -> Option<String> {
     }
 }
 
-/// Find `=` that's not inside parentheses (to distinguish assignment from function args).
+/// Find `=` that's not inside parentheses or string literals.
+#[cfg(test)]
 fn find_toplevel_equals(s: &str) -> Option<usize> {
     let mut depth: usize = 0;
+    let mut in_quote: Option<char> = None;
     for (i, c) in s.char_indices() {
+        match in_quote {
+            Some(q) if c == q => { in_quote = None; continue; }
+            Some(_) => { continue; }
+            None => {}
+        }
         match c {
+            '"' | '\'' | '`' => { in_quote = Some(c); }
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             '=' if depth == 0 => {
@@ -1417,5 +1473,42 @@ bar <- function() {}
         assert_eq!(find_toplevel_equals("y <= 3"), None);
         // Regular assignment still works
         assert_eq!(find_toplevel_equals("z = 1"), Some(2));
+    }
+
+    #[test]
+    fn find_toplevel_equals_skips_quoted_strings() {
+        // = inside a quoted string should not be found
+        assert_eq!(find_toplevel_equals(r#""a=b" = 1"#), Some(6));
+        assert_eq!(find_toplevel_equals(r#""x=y""#), None);
+    }
+
+    #[test]
+    fn export_explicit_name() {
+        // @export with explicit name should use that name, not the definition
+        let content = "#' @export myAlias\nfoo_internal <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["myAlias"]);
+    }
+
+    #[test]
+    fn replacement_function_names_arrow() {
+        // Replacement functions like `names<-` should be parsed correctly
+        let content = "#' @export\n`names<-` <- function(x, value) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["names<-"]);
+    }
+
+    #[test]
+    fn replacement_function_quoted() {
+        let content = "#' @export\n\"names<-\" <- function(x, value) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["names<-"]);
+    }
+
+    #[test]
+    fn bracket_replacement_function() {
+        let content = "#' @export\n\"[<-\" <- function(x, i, value) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["[<-"]);
     }
 }

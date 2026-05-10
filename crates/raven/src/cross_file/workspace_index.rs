@@ -250,6 +250,25 @@ impl CrossFileWorkspaceIndex {
         self.inner.read().ok().map(|g| g.cap().get()).unwrap_or(0)
     }
 
+    /// Collect exported symbol names from entries whose URI path starts with `prefix`.
+    /// Iterates in-place under a read lock without materializing a Vec of all URIs.
+    pub fn collect_exported_symbols(&self, prefix: &std::path::Path) -> HashSet<String> {
+        let mut symbols = HashSet::new();
+        let Ok(guard) = self.inner.read() else {
+            return symbols;
+        };
+        for (uri, entry) in guard.iter() {
+            if let Ok(p) = uri.to_file_path() {
+                if p.starts_with(prefix) {
+                    for name in entry.artifacts.exported_interface.keys() {
+                        symbols.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        symbols
+    }
+
     /// Iterate all entries (URI, IndexEntry) without LRU promotion.
     /// Used by package mode to collect symbols from all R/*.R files.
     pub fn entries(&self) -> Vec<(Url, IndexEntry)> {

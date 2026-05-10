@@ -66,6 +66,7 @@ pub fn detect_package_workspace(workspace_root: &Path) -> Option<PackageWorkspac
 /// Like [`detect_package_workspace`] but determines `roxygen_managed` from
 /// pre-loaded file contents rather than re-reading from disk. Use this when
 /// file content is already available (e.g. after a parallel workspace scan).
+#[allow(dead_code)]
 pub fn detect_package_workspace_with_content<'a>(
     workspace_root: &Path,
     r_file_contents: impl Iterator<Item = &'a str>,
@@ -204,6 +205,11 @@ pub fn namespace_model_from_roxygen(
 
 // --- helpers ---
 
+/// Parse a DCF field value from DESCRIPTION content. Public for use by scan_workspace.
+pub fn parse_dcf_field_pub(content: &str, field: &str) -> Option<String> {
+    parse_dcf_field(content, field)
+}
+
 fn parse_dcf_field(content: &str, field: &str) -> Option<String> {
     let prefix = format!("{}:", field);
     for line in content.lines() {
@@ -281,14 +287,21 @@ fn normalize_multiline(content: &str) -> String {
     out
 }
 
-/// Strip trailing `# comment` from a NAMESPACE line.
-/// Naive: doesn't handle `#` inside quoted strings, but NAMESPACE files
-/// rarely have quoted values containing `#`.
+/// Strip trailing `# comment` from a NAMESPACE line, respecting quoted strings.
 fn strip_trailing_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(pos) => line[..pos].trim_end(),
-        None => line,
+    let mut in_quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match in_quote {
+            Some(q) if c == q => { in_quote = None; }
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' => { in_quote = Some(c); }
+                '#' => return line[..i].trim_end(),
+                _ => {}
+            },
+        }
     }
+    line
 }
 
 fn strip_directive<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
@@ -430,5 +443,24 @@ S3method(print, myclass)
         let content = "exportPattern(\"^[^(]\")\nexport(foo)\n";
         let normalized = normalize_multiline(content);
         assert_eq!(normalized, "exportPattern(\"^[^(]\")\nexport(foo)\n");
+    }
+
+    #[test]
+    fn strip_trailing_comment_respects_quoted_hash() {
+        // # inside a quoted string should NOT be treated as a comment
+        assert_eq!(strip_trailing_comment(r#"exportPattern("^[^#].*")"#), r#"exportPattern("^[^#].*")"#);
+        assert_eq!(strip_trailing_comment(r#"export(foo) # comment"#), "export(foo)");
+        assert_eq!(strip_trailing_comment(r#"export("a#b")"#), r#"export("a#b")"#);
+        // Single-quoted
+        assert_eq!(strip_trailing_comment("export('a#b')"), "export('a#b')");
+    }
+
+    #[test]
+    fn namespace_export_pattern_with_hash_in_regex() {
+        // exportPattern with # in the regex should parse correctly
+        let content = "exportPattern(\"^[^#].*\")\nexport(foo)\n";
+        let model = namespace_model_from_content(content);
+        assert!(model.exports.contains("__PATTERN__:\"^[^#].*\""));
+        assert!(model.exports.contains("foo"));
     }
 }

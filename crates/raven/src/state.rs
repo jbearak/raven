@@ -758,22 +758,7 @@ impl WorldState {
             return;
         };
         let r_dir = pkg.root.join("R");
-        let content_provider = self.content_provider();
-        let mut symbols = HashSet::new();
-        for other_uri in self.cross_file_workspace_index.uris() {
-            if let Ok(p) = other_uri.to_file_path() {
-                if !p.starts_with(&r_dir) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-            if let Some(artifacts) = content_provider.get_artifacts(&other_uri) {
-                for name in artifacts.exported_interface.keys() {
-                    symbols.insert(name.to_string());
-                }
-            }
-        }
+        let symbols = self.cross_file_workspace_index.collect_exported_symbols(&r_dir);
         self.package_internal_symbols_cache = Arc::new(symbols);
     }
 
@@ -1475,46 +1460,48 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 
     // Detect R package workspace
     let (pkg_workspace, pkg_ns_model, roxygen_cache) = if let Some(root) = folders.first().and_then(|u| u.to_file_path().ok()) {
-        // Collect R/*.R file contents from the already-loaded index entries
-        // to avoid re-reading from disk for roxygen detection.
         let r_dir = root.join("R");
-        let r_file_contents: Vec<String> = new_index_entries
-            .iter()
-            .filter_map(|(uri, entry)| {
-                uri.to_file_path().ok().and_then(|p| {
-                    if p.starts_with(&r_dir)
-                        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                    {
-                        Some(entry.contents.to_string())
-                    } else {
-                        None
+
+        // Single pass: collect R/*.R file paths+content, detect roxygen usage,
+        // and extract roxygen tags in one iteration.
+        let mut r_files: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut has_roxygen = false;
+        for (uri, entry) in &new_index_entries {
+            if let Ok(p) = uri.to_file_path() {
+                if p.starts_with(&r_dir)
+                    && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
+                {
+                    let content = entry.contents.to_string();
+                    if !has_roxygen && content.contains("#' @export") {
+                        has_roxygen = true;
+                    }
+                    r_files.push((p, content));
+                }
+            }
+        }
+
+        let ws = {
+            let description_path = root.join("DESCRIPTION");
+            std::fs::read_to_string(&description_path).ok().and_then(|desc| {
+                crate::package_namespace::parse_dcf_field_pub(&desc, "Package").map(|name| {
+                    crate::package_namespace::PackageWorkspace {
+                        name,
+                        root: root.clone(),
+                        roxygen_managed: has_roxygen,
                     }
                 })
             })
-            .collect();
+        };
 
-        let ws = crate::package_namespace::detect_package_workspace_with_content(
-            &root,
-            r_file_contents.iter().map(|s| s.as_str()),
-        );
         if let Some(ws) = ws {
             log::info!("Package mode detected: {} (roxygen_managed={})", ws.name, ws.roxygen_managed);
             let (ns_model, cache) = if ws.roxygen_managed {
-                // Use content already loaded during the parallel scan instead of
-                // re-reading R/*.R files from disk.
                 let mut roxygen_files = Vec::new();
                 let mut cache = HashMap::new();
-                for (uri, entry) in &new_index_entries {
-                    if let Ok(path) = uri.to_file_path() {
-                        if path.starts_with(&r_dir)
-                            && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                        {
-                            let content = entry.contents.to_string();
-                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                            roxygen_files.push((path.display().to_string(), ns.clone()));
-                            cache.insert(path, ns);
-                        }
-                    }
+                for (path, content) in &r_files {
+                    let ns = crate::roxygen::extract_roxygen_namespace_tags(content);
+                    roxygen_files.push((path.display().to_string(), ns.clone()));
+                    cache.insert(path.clone(), ns);
                 }
                 (crate::package_namespace::namespace_model_from_roxygen(&roxygen_files), cache)
             } else {
