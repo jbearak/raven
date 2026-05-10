@@ -1817,6 +1817,22 @@ impl LanguageServer for Backend {
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
+            // Update package state via event-driven path when an R/*.R file opens.
+            {
+                let arc_text: std::sync::Arc<str> = text.as_str().into();
+                let event = crate::package_state::event::HandlerEvent::DidOpen {
+                    uri: uri.clone(),
+                    version,
+                    text: arc_text,
+                };
+                if let Some(delta) = crate::package_state::event::translate(
+                    &mut state.package_inputs,
+                    event,
+                ) {
+                    state.apply_package_event(&delta);
+                }
+            }
+
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
             let packages_enabled = state.cross_file_config.packages_enabled;
 
@@ -1963,15 +1979,9 @@ impl LanguageServer for Backend {
                     old_interface_hash,
                     new_interface_hash
                 );
-                // Rebuild package-internal symbols so sibling R/ files see the
-                // updated exports immediately (open doc is now authoritative).
-                // Only rebuild if the file is under R/ — files outside R/ don't
-                // contribute to the package-internal symbols cache.
-                if let Some(pkg) = state.package_workspace() {
-                    if uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R"))) {
-                        state.rebuild_package_internal_symbols_cache();
-                    }
-                }
+                // Package-internal symbols are now updated by apply_package_event
+                // above (via scope_contribution → internal_symbols_cache). No
+                // separate rebuild is needed here.
             }
 
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
