@@ -329,6 +329,71 @@ mod tests {
         assert!(pkgs.contains("stats"));
     }
 
+    #[test]
+    fn test_files_get_rfile_facts_but_dont_contribute_internal_symbols() {
+        let test_path: std::path::PathBuf = "/work/pkg/tests/testthat/test-utils.R".into();
+        let text: Arc<str> = "test_helper <- function() 99\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(test_path.clone(), RFileInput {
+            kind: RFileKind::Test,
+            origin: ContentOrigin::Disk,
+            text: text.clone(),
+            content_digest: ContentDigest::of(&text),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+
+        // The test file gets per-file facts (its top_level_defs ARE extracted).
+        assert!(s.r_file_facts.contains_key(&test_path));
+        let facts = s.r_file_facts.get(&test_path).unwrap();
+        assert!(
+            facts.top_level_defs.contains("test_helper"),
+            "expected test_helper to be in top_level_defs of the test file, got: {:?}",
+            facts.top_level_defs
+        );
+
+        // But it does NOT contribute to r_internal_symbols — test-file symbols
+        // are invisible to R/ files (one-way visibility: tests→R/, not R/→tests).
+        assert!(
+            !s.scope_contribution.r_internal_symbols.contains("test_helper"),
+            "test-file symbol should not appear in r_internal_symbols: {:?}",
+            s.scope_contribution.r_internal_symbols
+        );
+    }
+
+    #[test]
+    fn r_dir_files_contribute_internal_symbols_visible_to_test_files() {
+        // R/utils.R defines helper() — contributes to r_internal_symbols.
+        let r_path: std::path::PathBuf = "/work/pkg/R/utils.R".into();
+        let r_text: Arc<str> = "helper <- function() 1\n".into();
+        // tests/testthat/test-utils.R calls it (scope injection verified in scope.rs tests).
+        let test_path: std::path::PathBuf = "/work/pkg/tests/testthat/test-utils.R".into();
+        let test_text: Arc<str> = "result <- helper()\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(r_path, RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text: r_text.clone(),
+            content_digest: ContentDigest::of(&r_text),
+        });
+        inputs.r_files.insert(test_path, RFileInput {
+            kind: RFileKind::Test,
+            origin: ContentOrigin::Disk,
+            text: test_text.clone(),
+            content_digest: ContentDigest::of(&test_text),
+        });
+        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+
+        // helper appears in r_internal_symbols (contributed by R/utils.R).
+        assert!(
+            s.scope_contribution.r_internal_symbols.contains("helper"),
+            "R/ symbol must appear in r_internal_symbols: {:?}",
+            s.scope_contribution.r_internal_symbols
+        );
+        // test_helper is absent — the test file's top-level defs never pollute
+        // r_internal_symbols (confirmed by test_files_get_rfile_facts_but_dont_contribute_internal_symbols).
+    }
+
     /// Phase 5b behavior change: a workspace with NAMESPACE but no DESCRIPTION
     /// does NOT activate package mode (Auto mode requires a valid `Package:` field
     /// in DESCRIPTION). Consequently, `scope_contribution` is empty — no

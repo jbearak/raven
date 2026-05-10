@@ -17488,6 +17488,135 @@ mod package_contribution_tests {
     }
 
     // ------------------------------------------------------------------
+    // Test: package-internal symbol visible in tests/testthat/ file
+    // ------------------------------------------------------------------
+
+    /// Mirrors `package_internal_symbol_resolves_via_scope` but for a file under
+    /// `tests/testthat/`. The scope engine must inject the contribution into
+    /// test files (one-way visibility: test files see R/ symbols).
+    #[test]
+    fn package_contribution_visible_in_testthat_files() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // test-x.R: calls helper() — defined in R/ (not in this file).
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-x.R").unwrap();
+        let test_code = "result <- helper()";
+        let test_arts = artifacts_for(&test_uri, test_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &test_uri { Some(test_arts.clone()) } else { None }
+        };
+        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Without contribution, `helper` is NOT in scope.
+        let scope_no_contrib = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+        );
+        assert!(
+            !scope_no_contrib.symbols.contains_key("helper"),
+            "without contribution, helper must not be in scope for test file"
+        );
+
+        // With contribution carrying `helper` in r_internal_symbols, it MUST
+        // appear in the test file's scope (tests → R/ one-way visibility).
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope_with_contrib = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope_with_contrib.symbols.contains_key("helper"),
+            "with contribution, helper must be visible in tests/testthat/ file. \
+             visible symbols: {:?}",
+            scope_with_contrib.symbols.keys().collect::<Vec<_>>()
+        );
+        let sym = scope_with_contrib.symbols.get("helper").unwrap();
+        assert_eq!(sym.kind, SymbolKind::Function);
+        assert!(
+            sym.source_uri.as_str().starts_with("package:"),
+            "synthetic symbol source_uri must use package: scheme, got {}",
+            sym.source_uri
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: test-file symbols do NOT pollute contribution seen by R/ files
+    // ------------------------------------------------------------------
+
+    /// The `r_internal_symbols` set is built exclusively from R/ files; a symbol
+    /// that only appears in `tests/testthat/` must NOT be present in any
+    /// contribution. This verifies the asymmetric (one-way) nature of visibility:
+    /// test files see R/ symbols, but R/ files do NOT see test symbols.
+    ///
+    /// Here we confirm the scope side: even if a caller mistakenly passes a
+    /// contribution that omits the test-only symbol, the R/ file's scope stays clean.
+    /// The derive-side invariant (test symbols never enter `r_internal_symbols`) is
+    /// verified in `package_state::derive::tests`.
+    #[test]
+    fn r_file_does_not_see_test_only_symbol() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // R/main.R calls test_helper() — which only lives in tests/testthat/.
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- test_helper()";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri { Some(main_arts.clone()) } else { None }
+        };
+        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // A correctly-derived contribution will NOT carry `test_helper` (derive
+        // excludes test files from r_internal_symbols). We simulate this by
+        // passing a contribution with only `helper` (an R/ symbol).
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("test_helper"),
+            "test-only symbol must not be visible in R/ file. \
+             visible symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Test 4: local definition takes priority over contribution
     // ------------------------------------------------------------------
 
