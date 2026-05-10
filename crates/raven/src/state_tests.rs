@@ -518,7 +518,7 @@ mod package_testthat_visibility_tests {
     };
     use crate::cross_file::config::PackageMode;
     use crate::package_state::{
-        ContentDigest, ContentOrigin, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+        ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
     };
 
     // Match the depth used by the other test modules so future adjustments
@@ -577,7 +577,6 @@ mod package_testthat_visibility_tests {
         state.package_inputs.workspace_root = Some(PathBuf::from(workspace_root_path));
         state.package_inputs.package_mode = PackageMode::Auto;
         state.package_inputs.description = Some(DescriptionInput {
-            path: PathBuf::from(format!("{}/DESCRIPTION", workspace_root_path)),
             text: "Package: foo\n".into(),
         });
         for (path, kind, text) in r_files {
@@ -585,7 +584,7 @@ mod package_testthat_visibility_tests {
             let digest = ContentDigest::of(&text);
             state.package_inputs.r_files.insert(
                 path,
-                RFileInput { kind, origin: ContentOrigin::Disk, text, content_digest: digest },
+                RFileInput { kind, text, content_digest: digest },
             );
         }
         state.apply_package_event(&PackageInputDelta::Initial);

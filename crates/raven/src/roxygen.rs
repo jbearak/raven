@@ -1144,50 +1144,6 @@ pub struct RoxygenNamespace {
     pub import_from: Vec<(String, String)>,
 }
 
-/// Extract namespace-relevant roxygen tags (`@export`, `@import`, `@importFrom`)
-/// from all roxygen blocks in a file.
-///
-/// Quick check: does `content` contain any roxygen namespace tag (`@export`,
-/// `@import`, or `@importFrom`)?  This avoids a full parse when we only need
-/// a boolean "is this package roxygen-managed?" signal.
-///
-/// Uses a line-based check to avoid false positives from string literals
-/// (e.g. `msg <- "#' @export"`), and tolerates arbitrary whitespace between
-/// `#'` and the tag (e.g. `#'  @export` or `#'\t@import`).
-pub fn has_roxygen_namespace_tags(content: &str) -> bool {
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("#'") {
-            let tag = rest.trim_start();
-            // Only match tags that extract_roxygen_namespace_tags actually
-            // processes: @export (bare or with whitespace/names), @import
-            // (with whitespace + package names), and @importFrom.
-            // Excludes @exportPattern, @exportS3Method, @importClasses, etc.
-            // to avoid detection/extraction mismatch that causes
-            // roxygen_managed flag oscillation.
-            if tag.starts_with("@export") {
-                let after = &tag[7..];
-                if after.is_empty() || after.starts_with(char::is_whitespace) {
-                    return true;
-                }
-            } else if tag.starts_with("@importFrom") {
-                let after = &tag[11..];
-                if after.starts_with(char::is_whitespace) {
-                    return true;
-                }
-            } else if tag.starts_with("@import") {
-                let after = &tag[7..];
-                // Require whitespace after @import (bare @import with no
-                // package args is ignored by the extractor).
-                if after.starts_with(char::is_whitespace) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Process a single accumulated roxygen tag line (possibly with continuation
 /// content appended). Handles @export, @import, and @importFrom.
 fn process_roxygen_tag(
@@ -1730,33 +1686,6 @@ bar <- function() {}
     }
 
     #[test]
-    fn has_roxygen_tags_nonstandard_whitespace() {
-        // Multiple spaces between #' and tag
-        assert!(has_roxygen_namespace_tags("#'  @export\nfoo <- 1\n"));
-        // Tab between #' and tag
-        assert!(has_roxygen_namespace_tags("#'\t@import dplyr\nfoo <- 1\n"));
-        // Leading whitespace on the line
-        assert!(has_roxygen_namespace_tags("  #' @export\nfoo <- 1\n"));
-    }
-
-    #[test]
-    fn has_roxygen_tags_no_false_positive_from_strings() {
-        // Tag inside a string literal should NOT trigger detection
-        assert!(!has_roxygen_namespace_tags("msg <- \"#' @export\"\n"));
-        assert!(!has_roxygen_namespace_tags("x <- '#' @import dplyr'\n"));
-        // But a real tag on another line should still work
-        assert!(has_roxygen_namespace_tags("msg <- \"#' @export\"\n#' @export\nfoo <- 1\n"));
-    }
-
-    #[test]
-    fn has_roxygen_tags_no_false_positive_from_comments() {
-        // Regular comment (not roxygen) should not trigger
-        assert!(!has_roxygen_namespace_tags("# #' @export\nfoo <- 1\n"));
-        // But roxygen comment should
-        assert!(has_roxygen_namespace_tags("#' @export\nfoo <- 1\n"));
-    }
-
-    #[test]
     fn export_explicit_names_split_by_whitespace() {
         // @export with multiple names on one line should produce multiple exports
         // (roxygen2 uses tag_words which splits by whitespace)
@@ -1765,26 +1694,6 @@ bar <- function() {}
         assert!(ns.exports.contains(&"foo".to_string()));
         assert!(ns.exports.contains(&"bar".to_string()));
         assert_eq!(ns.exports.len(), 2);
-    }
-
-    #[test]
-    fn has_roxygen_tags_no_false_positive_on_exporting() {
-        // @exporting is not a real roxygen tag — should not trigger
-        assert!(!has_roxygen_namespace_tags("#' @exporting data\nfoo <- 1\n"));
-        // @importing is not a real roxygen tag
-        assert!(!has_roxygen_namespace_tags("#' @importing stuff\nfoo <- 1\n"));
-        // @exportPattern is NOT matched (extract_roxygen_namespace_tags doesn't
-        // process it, so matching it would cause roxygen_managed oscillation)
-        assert!(!has_roxygen_namespace_tags("#' @exportPattern ^[a-z]\nfoo <- 1\n"));
-        // @importClasses and @importMethods are also excluded for the same reason
-        assert!(!has_roxygen_namespace_tags("#' @importClasses Matrix\nfoo <- 1\n"));
-        assert!(!has_roxygen_namespace_tags("#' @importMethods show\nfoo <- 1\n"));
-        // @importFrom should trigger (it IS extracted)
-        assert!(has_roxygen_namespace_tags("#' @importFrom dplyr mutate\nfoo <- 1\n"));
-        // Bare @import (no args) should NOT trigger (extractor ignores it)
-        assert!(!has_roxygen_namespace_tags("#' @import\nfoo <- 1\n"));
-        // @import with package name should trigger
-        assert!(has_roxygen_namespace_tags("#' @import dplyr\nfoo <- 1\n"));
     }
 
     #[test]

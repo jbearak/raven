@@ -502,6 +502,11 @@ pub struct WorldState {
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
+    // Legacy package metadata store. Superseded by `package_library` below,
+    // but retained (gated by `#[allow(dead_code)]` here and on the struct)
+    // because an integration test still exercises it to verify R library
+    // discovery from `.libPaths()`.
+    #[allow(dead_code)]
     pub library: Library,
 
     // Package function awareness
@@ -551,13 +556,6 @@ impl WorldState {
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
         self.package_state.workspace.as_ref()
-    }
-
-    /// Passthrough for legacy `state.package_namespace_model` reads.
-    pub fn package_namespace_model(
-        &self,
-    ) -> Option<&crate::package_namespace::PackageNamespaceModel> {
-        self.package_state.namespace_model.as_ref()
     }
 
     /// Apply a `PackageInputDelta` produced by an event handler.
@@ -1327,8 +1325,8 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 
     // Package-mode detection is *not* done here. `scan_workspace` used to
     // construct `PackageWorkspace` and a `PackageNamespaceModel` inline —
-    // detecting roxygen, picking `namespace_model_from_roxygen` vs
-    // `namespace_model_from_file`, and caching per-file roxygen tags — but
+    // detecting roxygen, parsing NAMESPACE, aggregating roxygen tags per
+    // file, and caching per-file roxygen tags — but
     // that logic duplicated `derive_package_state` and the result was
     // unconditionally overwritten by the `apply_package_event(Initial)`
     // call that follows `apply_workspace_index` in `backend.rs`.

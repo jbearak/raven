@@ -64,11 +64,10 @@ fn apply(inputs: &mut PackageInputs, mutation: &Mutation) -> PackageInputDelta {
             let arc: Arc<str> = text.as_str().into();
             let digest = ContentDigest::of(&arc);
             inputs.r_files.insert(path.clone(), RFileInput {
-                kind: *kind,
-                origin: ContentOrigin::Disk,
-                text: arc,
-                content_digest: digest,
-            });
+                            kind: *kind,
+                            text: arc,
+                            content_digest: digest,
+                        });
             PackageInputDelta::RFileChanged { path: path.clone(), kind: *kind }
         }
         Mutation::DeleteRFile { path } => {
@@ -90,17 +89,15 @@ fn apply(inputs: &mut PackageInputs, mutation: &Mutation) -> PackageInputDelta {
                 None
             } else {
                 Some(NamespaceInput {
-                    path: "/work/pkg/NAMESPACE".into(),
-                    text: text.as_str().into(),
-                })
+                                    text: text.as_str().into(),
+                                })
             };
             PackageInputDelta::NamespaceChanged
         }
         Mutation::SetDescription { text } => {
             inputs.description = Some(DescriptionInput {
-                path: "/work/pkg/DESCRIPTION".into(),
-                text: text.as_str().into(),
-            });
+                            text: text.as_str().into(),
+                        });
             PackageInputDelta::DescriptionChanged
         }
         Mutation::SetMode { mode } => {
@@ -115,9 +112,8 @@ fn initial_inputs() -> PackageInputs {
         workspace_root: Some("/work/pkg".into()),
         package_mode: PackageMode::Auto,
         description: Some(DescriptionInput {
-            path: "/work/pkg/DESCRIPTION".into(),
-            text: "Package: foo\n".into(),
-        }),
+                        text: "Package: foo\n".into(),
+                    }),
         namespace: None,
         r_files: BTreeMap::new(),
     }

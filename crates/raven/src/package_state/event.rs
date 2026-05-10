@@ -9,8 +9,8 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub enum HandlerEvent {
-    DidOpen { uri: tower_lsp::lsp_types::Url, version: i32, text: Arc<str> },
-    DidChange { uri: tower_lsp::lsp_types::Url, version: i32, text: Arc<str> },
+    DidOpen { uri: tower_lsp::lsp_types::Url, text: Arc<str> },
+    DidChange { uri: tower_lsp::lsp_types::Url, text: Arc<str> },
     DidClose { uri: tower_lsp::lsp_types::Url, on_disk_text: Option<Arc<str>> },
     WatchedFileChanged {
         uri: tower_lsp::lsp_types::Url,
@@ -18,7 +18,6 @@ pub enum HandlerEvent {
         deleted: bool,
     },
     SettingChanged { new_mode: crate::cross_file::config::PackageMode },
-    Initial,
 }
 
 pub fn translate(
@@ -28,19 +27,15 @@ pub fn translate(
     // Events that can fire before a workspace root is known (or that don't
     // require one) are handled up front. Previously, the early
     // `let Some(root) = ... else { return None }` dropped these silently.
-    match event {
-        HandlerEvent::SettingChanged { new_mode } => {
-            inputs.package_mode = new_mode;
-            return Some(PackageInputDelta::SettingChanged);
-        }
-        HandlerEvent::Initial => return Some(PackageInputDelta::Initial),
-        _ => {}
+    if let HandlerEvent::SettingChanged { new_mode } = event {
+        inputs.package_mode = new_mode;
+        return Some(PackageInputDelta::SettingChanged);
     }
 
     let Some(root) = inputs.workspace_root.clone() else { return None };
     match event {
-        HandlerEvent::DidOpen { uri, version, text }
-        | HandlerEvent::DidChange { uri, version, text } => {
+        HandlerEvent::DidOpen { uri, text }
+        | HandlerEvent::DidChange { uri, text } => {
             let path = uri.to_file_path().ok()?;
             let kind = is_r_source_path(&path, &root)?;
             let digest = ContentDigest::of(&text);
@@ -48,7 +43,6 @@ pub fn translate(
                 path.clone(),
                 RFileInput {
                     kind,
-                    origin: ContentOrigin::Open { version },
                     text,
                     content_digest: digest,
                 },
@@ -65,7 +59,6 @@ pub fn translate(
                         path.clone(),
                         RFileInput {
                             kind,
-                            origin: ContentOrigin::Disk,
                             text,
                             content_digest: digest,
                         },
@@ -83,8 +76,8 @@ pub fn translate(
             on_disk_text,
             deleted,
         } => translate_watched(inputs, &root, uri, on_disk_text, deleted),
-        // SettingChanged/Initial handled above.
-        HandlerEvent::SettingChanged { .. } | HandlerEvent::Initial => None,
+        // SettingChanged handled above.
+        HandlerEvent::SettingChanged { .. } => None,
     }
 }
 
@@ -110,7 +103,7 @@ fn translate_watched(
         inputs.description = if deleted {
             None
         } else {
-            on_disk_text.map(|t| DescriptionInput { path: path.clone(), text: t })
+            on_disk_text.map(|t| DescriptionInput { text: t })
         };
         return Some(PackageInputDelta::DescriptionChanged);
     }
@@ -119,7 +112,7 @@ fn translate_watched(
         inputs.namespace = if deleted {
             None
         } else {
-            on_disk_text.map(|t| NamespaceInput { path: path.clone(), text: t })
+            on_disk_text.map(|t| NamespaceInput { text: t })
         };
         return Some(PackageInputDelta::NamespaceChanged);
     }
@@ -135,7 +128,6 @@ fn translate_watched(
                 path.clone(),
                 RFileInput {
                     kind,
-                    origin: ContentOrigin::Disk,
                     text,
                     content_digest: digest,
                 },
@@ -164,7 +156,7 @@ mod tests {
         let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/R/foo.R").unwrap();
         let delta = translate(
             &mut inputs,
-            HandlerEvent::DidChange { uri, version: 1, text: "x <- 1\n".into() },
+            HandlerEvent::DidChange { uri, text: "x <- 1\n".into() },
         );
         assert!(matches!(
             delta,
@@ -179,7 +171,7 @@ mod tests {
         let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/inst/data.R").unwrap();
         let delta = translate(
             &mut inputs,
-            HandlerEvent::DidChange { uri, version: 1, text: "x <- 1\n".into() },
+            HandlerEvent::DidChange { uri, text: "x <- 1\n".into() },
         );
         assert!(delta.is_none());
     }
@@ -204,7 +196,6 @@ mod tests {
     fn description_deletion_clears_input() {
         let mut inputs = root_inputs();
         inputs.description = Some(DescriptionInput {
-            path: "/work/pkg/DESCRIPTION".into(),
             text: "Package: foo\n".into(),
         });
         let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/DESCRIPTION").unwrap();
@@ -224,13 +215,12 @@ mod tests {
         let mut inputs = root_inputs();
         let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/R/foo.R").unwrap();
         let _ = translate(&mut inputs, HandlerEvent::DidOpen {
-            uri: uri.clone(), version: 1, text: "open\n".into(),
-        });
+                    uri: uri.clone(), text: "open\n".into(),
+                });
         let _ = translate(&mut inputs, HandlerEvent::DidClose {
             uri: uri.clone(), on_disk_text: Some("disk\n".into()),
         });
         let entry = inputs.r_files.get(&uri.to_file_path().unwrap()).unwrap();
-        assert!(matches!(entry.origin, ContentOrigin::Disk));
         assert_eq!(&*entry.text, "disk\n");
     }
 
@@ -239,8 +229,8 @@ mod tests {
         let mut inputs = root_inputs();
         let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/R/foo.R").unwrap();
         let _ = translate(&mut inputs, HandlerEvent::DidOpen {
-            uri: uri.clone(), version: 1, text: "open\n".into(),
-        });
+                    uri: uri.clone(), text: "open\n".into(),
+                });
         let _ = translate(&mut inputs, HandlerEvent::DidClose {
             uri: uri.clone(), on_disk_text: None,
         });
@@ -259,13 +249,5 @@ mod tests {
         );
         assert!(matches!(delta, Some(PackageInputDelta::SettingChanged)));
         assert_eq!(inputs.package_mode, PackageMode::Disabled);
-    }
-
-    #[test]
-    fn initial_without_workspace_root_emits_initial() {
-        let mut inputs = PackageInputs::default();
-        assert!(inputs.workspace_root.is_none());
-        let delta = translate(&mut inputs, HandlerEvent::Initial);
-        assert!(matches!(delta, Some(PackageInputDelta::Initial)));
     }
 }

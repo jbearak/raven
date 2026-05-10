@@ -1347,21 +1347,15 @@ impl LanguageServer for Backend {
                                 state.package_inputs.package_mode = state.cross_file_config.package_mode;
 
                                 state.package_inputs.description = desc_text.map(|text| {
-                                    crate::package_state::DescriptionInput {
-                                        path: root.join("DESCRIPTION"),
-                                        text,
-                                    }
+                                    crate::package_state::DescriptionInput { text }
                                 });
                                 state.package_inputs.namespace = ns_text.map(|text| {
-                                    crate::package_state::NamespaceInput {
-                                        path: root.join("NAMESPACE"),
-                                        text,
-                                    }
+                                    crate::package_state::NamespaceInput { text }
                                 });
 
                                 // Populate r_files from the workspace index (includes all scanned
-                                // R files with their content). For open documents, override the
-                                // disk entry with ContentOrigin::Open so the buffer is authoritative.
+                                // R files with their content). Open documents are authoritative
+                                // (unsaved edits), so override disk entries for any open files.
                                 let open_uris: std::collections::HashSet<Url> =
                                     state.documents.keys().cloned().collect();
                                 let open_versions: std::collections::HashMap<Url, (i32, String)> =
@@ -1387,7 +1381,6 @@ impl LanguageServer for Backend {
                                                 let digest = crate::package_state::ContentDigest::of(&text);
                                                 new_r_files.insert(path, crate::package_state::RFileInput {
                                                     kind,
-                                                    origin: crate::package_state::ContentOrigin::Disk,
                                                     text,
                                                     content_digest: digest,
                                                 });
@@ -1395,15 +1388,15 @@ impl LanguageServer for Backend {
                                         }
                                     }
                                 }
-                                // Override / add open documents as ContentOrigin::Open.
+                                // Override / add open documents (authoritative; unsaved edits).
                                 for (uri, (version, text_str)) in &open_versions {
                                     if let Ok(path) = uri.to_file_path() {
                                         if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                                            let _ = version; // version tracked upstream; no longer stored on RFileInput
                                             let text: std::sync::Arc<str> = text_str.as_str().into();
                                             let digest = crate::package_state::ContentDigest::of(&text);
                                             new_r_files.insert(path, crate::package_state::RFileInput {
                                                 kind,
-                                                origin: crate::package_state::ContentOrigin::Open { version: *version },
                                                 text,
                                                 content_digest: digest,
                                             });
@@ -1871,7 +1864,6 @@ impl LanguageServer for Backend {
                 let arc_text: std::sync::Arc<str> = text.as_str().into();
                 let event = crate::package_state::event::HandlerEvent::DidOpen {
                     uri: uri.clone(),
-                    version,
                     text: arc_text,
                 };
                 if let Some(delta) = crate::package_state::event::translate(
@@ -2760,7 +2752,6 @@ impl LanguageServer for Backend {
                 let old_ns_model = state.package_state.namespace_model.clone();
                 let event = crate::package_state::event::HandlerEvent::DidChange {
                     uri: uri.clone(),
-                    version,
                     text,
                 };
                 if let Some(delta) = crate::package_state::event::translate(
@@ -3426,17 +3417,18 @@ impl LanguageServer for Backend {
             // Repopulate description/namespace inputs with fresh disk content.
             state.package_inputs.workspace_root = Some(root.clone());
             state.package_inputs.description = desc_text.map(|text| {
-                crate::package_state::DescriptionInput { path: root.join("DESCRIPTION"), text }
+                crate::package_state::DescriptionInput { text }
             });
             state.package_inputs.namespace = ns_text.map(|text| {
-                crate::package_state::NamespaceInput { path: root.join("NAMESPACE"), text }
+                crate::package_state::NamespaceInput { text }
             });
             // Hydrate r_files from the workspace index first (includes closed
             // R/*.R siblings already scanned to disk) so a packageMode switch
             // doesn't leave closed files out of the derived package state.
-            // Then overlay open documents as ContentOrigin::Open. Mirrors the
-            // scan-completion hydration in the `Ok((index, ...))` branch
-            // above so both code paths produce the same set of inputs.
+            // Open documents are authoritative (unsaved edits), so overlay
+            // them after. Mirrors the scan-completion hydration in the
+            // `Ok((index, ...))` branch above so both code paths produce the
+            // same set of inputs.
             let open_uris_for_mode: Vec<Url> = state.documents.keys().cloned().collect();
             let open_uri_set: std::collections::HashSet<Url> =
                 open_uris_for_mode.iter().cloned().collect();
@@ -3454,7 +3446,6 @@ impl LanguageServer for Backend {
                             let digest = crate::package_state::ContentDigest::of(&text);
                             state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
                                 kind,
-                                origin: crate::package_state::ContentOrigin::Disk,
                                 text,
                                 content_digest: digest,
                             });
@@ -3471,13 +3462,9 @@ impl LanguageServer for Backend {
                             .map(|d| d.text())
                             .unwrap_or_default()
                             .into();
-                        let version = state.documents.get(uri)
-                            .and_then(|d| d.version)
-                            .unwrap_or(0);
                         let digest = crate::package_state::ContentDigest::of(&text);
                         state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
                             kind,
-                            origin: crate::package_state::ContentOrigin::Open { version },
                             text,
                             content_digest: digest,
                         });

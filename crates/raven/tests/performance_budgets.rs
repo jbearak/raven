@@ -557,7 +557,6 @@ fn derive_package_state_500_file_keystroke_budget() {
         workspace_root: Some(root.clone()),
         package_mode: PackageMode::Auto,
         description: Some(DescriptionInput {
-            path: root.join("DESCRIPTION"),
             text: "Package: foo\n".into(),
         }),
         namespace: None,
@@ -569,7 +568,6 @@ fn derive_package_state_500_file_keystroke_budget() {
         let digest = ContentDigest::of(&text);
         inputs.r_files.insert(p, RFileInput {
             kind: RFileKind::Source,
-            origin: ContentOrigin::Disk,
             text,
             content_digest: digest,
         });
@@ -582,7 +580,6 @@ fn derive_package_state_500_file_keystroke_budget() {
     let new_digest = ContentDigest::of(&new_text);
     inputs.r_files.insert(p.clone(), RFileInput {
         kind: RFileKind::Source,
-        origin: ContentOrigin::Disk,
         text: new_text,
         content_digest: new_digest,
     });

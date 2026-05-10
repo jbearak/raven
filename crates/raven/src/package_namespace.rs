@@ -113,18 +113,6 @@ fn detect_roxygen_usage(workspace_root: &Path) -> bool {
     false
 }
 
-/// Build a `PackageNamespaceModel` from the NAMESPACE file.
-///
-/// Parses `import(pkg)`, `importFrom(pkg, sym, ...)`, and `export(sym, ...)`
-/// directives. Used when the package is not roxygen-managed or as a fallback.
-pub fn namespace_model_from_file(namespace_path: &Path) -> PackageNamespaceModel {
-    let content = match std::fs::read_to_string(namespace_path) {
-        Ok(c) => c,
-        Err(_) => return PackageNamespaceModel::default(),
-    };
-    namespace_model_from_content(&content)
-}
-
 /// Parse NAMESPACE content into a `PackageNamespaceModel`.
 pub fn namespace_model_from_content(content: &str) -> PackageNamespaceModel {
     let mut model = PackageNamespaceModel::default();
@@ -190,32 +178,6 @@ pub fn namespace_model_from_content(content: &str) -> PackageNamespaceModel {
                 if !pkg.is_empty() {
                     model.full_imports.push(pkg);
                 }
-            }
-        }
-    }
-    model
-}
-
-/// Build a `PackageNamespaceModel` from aggregated roxygen namespace tags.
-pub fn namespace_model_from_roxygen(
-    files: &[(String, crate::roxygen::RoxygenNamespace)],
-) -> PackageNamespaceModel {
-    let mut model = PackageNamespaceModel::default();
-    let mut seen_imports: HashSet<(String, String)> = HashSet::new();
-    let mut seen_full: HashSet<String> = HashSet::new();
-
-    for (_path, ns) in files {
-        for sym in &ns.exports {
-            model.exports.insert(sym.clone());
-        }
-        for (pkg, sym) in &ns.import_from {
-            if seen_imports.insert((pkg.clone(), sym.clone())) {
-                model.imports.push((pkg.clone(), sym.clone()));
-            }
-        }
-        for pkg in &ns.imports {
-            if seen_full.insert(pkg.clone()) {
-                model.full_imports.push(pkg.clone());
             }
         }
     }
@@ -525,35 +487,6 @@ S3method(print, myclass)
         assert!(model.imports.contains(&("dplyr".into(), "mutate".into())));
         assert!(model.imports.contains(&("dplyr".into(), "filter".into())));
         assert!(model.exports.contains("foo"));
-    }
-
-    #[test]
-    fn namespace_model_from_roxygen_aggregates() {
-        use crate::roxygen::RoxygenNamespace;
-        let files = vec![
-            (
-                "R/a.R".to_string(),
-                RoxygenNamespace {
-                    exports: vec!["foo".into()],
-                    imports: vec!["ggplot2".into()],
-                    import_from: vec![("dplyr".into(), "mutate".into())],
-                },
-            ),
-            (
-                "R/b.R".to_string(),
-                RoxygenNamespace {
-                    exports: vec!["bar".into()],
-                    imports: vec![],
-                    import_from: vec![("dplyr".into(), "filter".into())],
-                },
-            ),
-        ];
-        let model = namespace_model_from_roxygen(&files);
-        assert!(model.exports.contains("foo"));
-        assert!(model.exports.contains("bar"));
-        assert_eq!(model.full_imports, vec!["ggplot2"]);
-        assert!(model.imports.contains(&("dplyr".into(), "mutate".into())));
-        assert!(model.imports.contains(&("dplyr".into(), "filter".into())));
     }
 
     #[test]

@@ -62,20 +62,17 @@ pub struct PackageInputs {
 
 #[derive(Clone, Debug)]
 pub struct DescriptionInput {
-    pub path: PathBuf,
     pub text: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceInput {
-    pub path: PathBuf,
     pub text: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RFileInput {
     pub kind: RFileKind,
-    pub origin: ContentOrigin,
     pub text: Arc<str>,
     pub content_digest: ContentDigest,
 }
@@ -84,12 +81,6 @@ pub struct RFileInput {
 pub enum RFileKind {
     Source,
     Test,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ContentOrigin {
-    Open { version: i32 },
-    Disk,
 }
 
 #[cfg(test)]
@@ -153,11 +144,6 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
         }
         _ => None,
     }
-}
-
-/// Returns true if `path` is anywhere inside the package workspace.
-pub fn is_inside_package(path: &Path, workspace_root: &Path) -> bool {
-    path.starts_with(workspace_root)
 }
 
 #[cfg(test)]
