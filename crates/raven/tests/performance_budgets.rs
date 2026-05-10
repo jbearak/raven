@@ -535,3 +535,71 @@ fn budget_single_file_completion() {
 
     assert_within_budget("single_file_completion", elapsed, 20);
 }
+
+// ---------------------------------------------------------------------------
+// derive_package_state budget
+// Requirements: 2.11 — single-file delta in 500-file workspace < 50ms median
+// ---------------------------------------------------------------------------
+
+#[test]
+fn derive_package_state_500_file_keystroke_budget() {
+    use raven::package_state::*;
+    use raven::cross_file::config::PackageMode;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let root: PathBuf = "/work/pkg".into();
+    let mut inputs = PackageInputs {
+        workspace_root: Some(root.clone()),
+        package_mode: PackageMode::Auto,
+        description: Some(DescriptionInput {
+            path: root.join("DESCRIPTION"),
+            text: "Package: foo\n".into(),
+        }),
+        namespace: None,
+        r_files: BTreeMap::new(),
+    };
+    for i in 0..500 {
+        let p = root.join("R").join(format!("file_{}.R", i));
+        let text: Arc<str> = format!("fn_{} <- function() {}\n", i, i).into();
+        let digest = ContentDigest::of(&text);
+        inputs.r_files.insert(p, RFileInput {
+            kind: RFileKind::Source,
+            origin: ContentOrigin::Disk,
+            text,
+            content_digest: digest,
+        });
+    }
+    let s0 = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+
+    // Single-file delta: change file_42
+    let p = root.join("R").join("file_42.R");
+    let new_text: Arc<str> = "fn_42 <- function() 99\n".into();
+    let new_digest = ContentDigest::of(&new_text);
+    inputs.r_files.insert(p.clone(), RFileInput {
+        kind: RFileKind::Source,
+        origin: ContentOrigin::Disk,
+        text: new_text,
+        content_digest: new_digest,
+    });
+
+    let mut times = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        let _s = derive_package_state(&s0, &inputs, &PackageInputDelta::RFileChanged {
+            path: p.clone(),
+            kind: RFileKind::Source,
+        });
+        times.push(start.elapsed());
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    let p99 = times[(times.len() * 99 / 100).min(times.len() - 1)];
+    eprintln!("derive_package_state 500-file: median={:?} p99={:?}", median, p99);
+    // Generous budget; tighten later. The point of the test is to catch
+    // pathological regressions.
+    assert!(median.as_millis() < 50, "median {:?} exceeds 50ms", median);
+    assert!(p99.as_millis() < 200, "p99 {:?} exceeds 200ms", p99);
+}
