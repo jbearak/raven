@@ -315,6 +315,9 @@ impl DiagnosticsSnapshot {
 /// which is rebuilt incrementally when file interfaces change. This avoids
 /// O(package_files) work on every diagnostic snapshot build.
 fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> Arc<HashSet<String>> {
+    // NOTE: empty_base_exports() returns an *empty* HashSet (the name is historical).
+    // This is correct — when not in package mode or outside R/, we want an empty set
+    // so no symbols are suppressed from diagnostics.
     let Some(ref pkg) = state.package_workspace else {
         return empty_base_exports().clone();
     };

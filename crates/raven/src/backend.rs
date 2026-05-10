@@ -2920,6 +2920,10 @@ impl LanguageServer for Backend {
         // In package mode, rebuild the internal symbols cache so stale
         // exports from the closed file's editing session are replaced by
         // the workspace index's on-disk snapshot.
+        // NOTE: We intentionally do NOT force-revalidate sibling R/*.R files here.
+        // The cache rebuild is sufficient: siblings pick up the updated cache on
+        // their next diagnostic cycle (edit or reopen). Eagerly republishing all
+        // siblings on every close would be expensive and disruptive.
         if let Some(ref pkg) = state.package_workspace {
             if let Ok(p) = uri.to_file_path() {
                 if p.starts_with(pkg.root.join("R")) {

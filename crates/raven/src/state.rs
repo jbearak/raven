@@ -1059,7 +1059,9 @@ impl WorldState {
             PackageMode::Disabled => {
                 self.package_workspace = None;
                 self.package_namespace_model = None;
-                // Don't use package-derived imports for diagnostic suppression
+                // Intentionally clear workspace_imports: "disabled" means full script-mode
+                // behavior — NAMESPACE-derived imports are a package concept and should not
+                // suppress diagnostics when the user has opted out of package mode.
                 self.workspace_imports = Arc::new(Vec::new());
             }
             PackageMode::Enabled => {
