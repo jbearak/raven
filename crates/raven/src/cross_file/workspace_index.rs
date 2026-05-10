@@ -250,11 +250,10 @@ impl CrossFileWorkspaceIndex {
         self.inner.read().ok().map(|g| g.cap().get()).unwrap_or(0)
     }
 
-    /// Collect exported symbol names from entries whose URI path starts with `prefix`.
-    /// Iterates in-place under a read lock without materializing a Vec of all URIs.
     /// Collect exported symbol names from entries whose URI path starts with `prefix`,
     /// excluding any URIs in `exclude` (typically open documents whose workspace index
-    /// entries may be stale).
+    /// entries may be stale). Iterates in-place under a read lock without materializing
+    /// a Vec of all URIs.
     pub fn collect_exported_symbols(
         &self,
         prefix: &std::path::Path,

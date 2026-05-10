@@ -1278,7 +1278,15 @@ impl LanguageServer for Backend {
                                 pkg_workspace,
                                 pkg_ns_model,
                             );
-                            state.roxygen_tags_cache = roxygen_cache;
+                            // Merge scan-time roxygen cache without overwriting entries
+                            // for currently-open files (their did_change updates are fresher).
+                            for (path, ns) in roxygen_cache {
+                                let is_open = Url::from_file_path(&path).ok()
+                                    .is_some_and(|u| state.documents.contains_key(&u));
+                                if !is_open {
+                                    state.roxygen_tags_cache.insert(path, ns);
+                                }
+                            }
                             state.rebuild_package_internal_symbols_cache();
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
@@ -1891,6 +1899,26 @@ impl LanguageServer for Backend {
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
+
+            // In package mode, when an R/*.R file's interface changed on open
+            // (e.g., external edit), revalidate sibling R/ files so they pick
+            // up added/removed symbols via mutual visibility.
+            if interface_changed {
+                if let Some(ref pkg) = state.package_workspace {
+                    if let Ok(fp) = uri.to_file_path() {
+                        let r_dir = pkg.root.join("R");
+                        if fp.starts_with(&r_dir) {
+                            for open_uri in state.documents.keys() {
+                                if let Ok(p) = open_uri.to_file_path() {
+                                    if p.starts_with(&r_dir) {
+                                        affected.insert(open_uri.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Invalidate cross-file scope neighbors if interface changed OR
             // dependency edges changed. See `compute_affected_dependents_after_edit`
@@ -2614,6 +2642,26 @@ impl LanguageServer for Backend {
                                                     }
                                                 }
                                             }
+                                            // Also populate from cross_file_file_cache for
+                                            // non-open R/*.R files so the namespace model
+                                            // includes @import/@importFrom from all files.
+                                            let cached_uris: Vec<Url> = state.cross_file_workspace_index.uris();
+                                            for cached_uri in &cached_uris {
+                                                if state.documents.contains_key(cached_uri) {
+                                                    continue; // open docs already handled above
+                                                }
+                                                if let Ok(p) = cached_uri.to_file_path() {
+                                                    if p.starts_with(&pkg_r_dir2)
+                                                        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
+                                                        && !state.roxygen_tags_cache.contains_key(&p)
+                                                    {
+                                                        if let Some(content) = state.cross_file_file_cache.get(cached_uri) {
+                                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
+                                                            state.roxygen_tags_cache.insert(p, ns);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     package_namespace_changed =
@@ -2621,8 +2669,15 @@ impl LanguageServer for Backend {
                                 } else if state.package_workspace.is_some() {
                                     // roxygen_managed transitioned to false: fall back to
                                     // NAMESPACE file for import information.
+                                    // Avoid blocking I/O under the write lock: try the file
+                                    // cache first, fall back to empty model (the watcher task
+                                    // will pick up the NAMESPACE file on next change).
                                     let ns_model = state.package_workspace.as_ref()
-                                        .map(|pkg| crate::package_namespace::namespace_model_from_file(&pkg.root.join("NAMESPACE")))
+                                        .and_then(|pkg| {
+                                            let ns_uri = Url::from_file_path(pkg.root.join("NAMESPACE")).ok()?;
+                                            state.cross_file_file_cache.get(&ns_uri)
+                                                .map(|content| crate::package_namespace::namespace_model_from_content(&content))
+                                        })
                                         .unwrap_or_default();
                                     state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
                                     state.package_namespace_model = Some(ns_model);
@@ -2967,11 +3022,12 @@ impl LanguageServer for Backend {
         if let Some(ref pkg) = state.package_workspace {
             if let Ok(p) = uri.to_file_path() {
                 if p.starts_with(pkg.root.join("R")) {
-                    // Invalidate the workspace index entry so the next rebuild
-                    // or access re-reads from disk (the entry may be stale from
-                    // the initial scan if the file was edited while open).
-                    state.cross_file_workspace_index.invalidate(uri);
+                    // Rebuild BEFORE invalidating: the workspace index entry
+                    // serves as the on-disk snapshot for the closed file's
+                    // exports. Invalidating first would lose those symbols.
                     state.rebuild_package_internal_symbols_cache();
+                    // Now invalidate so the next scan re-reads from disk.
+                    state.cross_file_workspace_index.invalidate(uri);
                 }
             }
         }
@@ -3250,6 +3306,25 @@ impl LanguageServer for Backend {
                             let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
                             roxygen_files.push((path.display().to_string(), ns.clone()));
                             state.roxygen_tags_cache.insert(path.clone(), ns);
+                        }
+                    }
+                    // Also include open-only R/*.R files not found on disk
+                    // (e.g., newly created unsaved buffers with roxygen tags).
+                    let r_dir = ws.root.join("R");
+                    let open_r_uris: Vec<Url> = state.documents.keys()
+                        .filter(|u| u.to_file_path().ok().is_some_and(|p|
+                            p.starts_with(&r_dir)
+                                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))))
+                        .cloned().collect();
+                    for open_uri in &open_r_uris {
+                        if let Ok(p) = open_uri.to_file_path() {
+                            if !state.roxygen_tags_cache.contains_key(&p) {
+                                if let Some(doc) = state.documents.get(open_uri) {
+                                    let ns = crate::roxygen::extract_roxygen_namespace_tags(&doc.text());
+                                    roxygen_files.push((p.display().to_string(), ns.clone()));
+                                    state.roxygen_tags_cache.insert(p, ns);
+                                }
+                            }
                         }
                     }
                     crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
@@ -3531,7 +3606,31 @@ impl LanguageServer for Backend {
                 // and imports from deleted R/*.R files are removed.
                 if state.package_workspace.is_some() {
                     if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
-                        state.rebuild_namespace_model_from_cache();
+                        // Check if roxygen_managed should transition to false
+                        // (last file with tags was deleted).
+                        let any_tags = state.roxygen_tags_cache.values().any(|ns| {
+                            !ns.exports.is_empty()
+                                || !ns.imports.is_empty()
+                                || !ns.import_from.is_empty()
+                        });
+                        if !any_tags {
+                            if let Some(ref mut pkg) = state.package_workspace {
+                                pkg.roxygen_managed = false;
+                                log::info!("roxygen_managed transitioned to false after file deletion");
+                            }
+                            // Fall back to NAMESPACE file (try file cache first)
+                            let ns_model = state.package_workspace.as_ref()
+                                .and_then(|pkg| {
+                                    let ns_uri = Url::from_file_path(pkg.root.join("NAMESPACE")).ok()?;
+                                    state.cross_file_file_cache.get(&ns_uri)
+                                        .map(|content| crate::package_namespace::namespace_model_from_content(&content))
+                                })
+                                .unwrap_or_default();
+                            state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                            state.package_namespace_model = Some(ns_model);
+                        } else {
+                            state.rebuild_namespace_model_from_cache();
+                        }
                     }
                     state.rebuild_package_internal_symbols_cache();
                 }
@@ -3713,6 +3812,7 @@ impl LanguageServer for Backend {
                 state.package_workspace = None;
                 state.package_namespace_model = None;
                 state.workspace_imports = std::sync::Arc::new(Vec::new());
+                state.rebuild_package_internal_symbols_cache();
             }
         }
 
@@ -3913,6 +4013,10 @@ impl LanguageServer for Backend {
                 {
                     let mut state = state_arc.write().await;
                     if let Some(ref pkg) = state.package_workspace {
+                        let r_dir_for_check = pkg.root.join("R");
+                        let has_r_files = uris_to_update.iter().any(|u| {
+                            u.to_file_path().ok().is_some_and(|p| p.starts_with(&r_dir_for_check))
+                        });
                         if pkg.roxygen_managed {
                             let r_dir = pkg.root.join("R");
                             let mut ns_changed = false;
@@ -3951,7 +4055,10 @@ impl LanguageServer for Backend {
                                 }
                             }
                         }
-                        state.rebuild_package_internal_symbols_cache();
+                        // Only rebuild if R/ files were in the batch
+                        if has_r_files {
+                            state.rebuild_package_internal_symbols_cache();
+                        }
                     }
                 }
 

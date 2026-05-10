@@ -1159,8 +1159,24 @@ pub fn has_roxygen_namespace_tags(content: &str) -> bool {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("#'") {
             let tag = rest.trim_start();
-            if tag.starts_with("@export") || tag.starts_with("@import") {
-                return true;
+            // Check for @export or @import with word boundary (end of string,
+            // whitespace, or known continuation like "From", "Pattern", etc.)
+            if tag.starts_with("@export") {
+                let after = &tag[7..];
+                if after.is_empty() || after.starts_with(char::is_whitespace)
+                    || after.starts_with("Pattern") || after.starts_with("S3")
+                    || after.starts_with("Class") || after.starts_with("Method")
+                {
+                    return true;
+                }
+            } else if tag.starts_with("@import") {
+                let after = &tag[7..];
+                if after.is_empty() || after.starts_with(char::is_whitespace)
+                    || after.starts_with("From") || after.starts_with("Classes")
+                    || after.starts_with("Methods")
+                {
+                    return true;
+                }
             }
         }
     }
@@ -1193,9 +1209,11 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
                 has_export = true;
             } else if tag_line.starts_with("@export") && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace()) {
                 has_export = true;
-                let name = tag_line[7..].trim();
-                if !name.is_empty() {
-                    explicit_export_names.push(name.to_string());
+                // roxygen2 splits @export values by whitespace (tag_words)
+                for name in tag_line[7..].split_whitespace() {
+                    if !name.is_empty() {
+                        explicit_export_names.push(name.to_string());
+                    }
                 }
             } else if tag_line.starts_with("@import") && !tag_line.starts_with("@importFrom") && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace()) {
                 // @import pkg1 pkg2 ...
@@ -1643,5 +1661,28 @@ bar <- function() {}
         assert!(!has_roxygen_namespace_tags("# #' @export\nfoo <- 1\n"));
         // But roxygen comment should
         assert!(has_roxygen_namespace_tags("#' @export\nfoo <- 1\n"));
+    }
+
+    #[test]
+    fn export_explicit_names_split_by_whitespace() {
+        // @export with multiple names on one line should produce multiple exports
+        // (roxygen2 uses tag_words which splits by whitespace)
+        let content = "#' @export foo bar\nbaz <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.exports.contains(&"foo".to_string()));
+        assert!(ns.exports.contains(&"bar".to_string()));
+        assert_eq!(ns.exports.len(), 2);
+    }
+
+    #[test]
+    fn has_roxygen_tags_no_false_positive_on_exporting() {
+        // @exporting is not a real roxygen tag — should not trigger
+        assert!(!has_roxygen_namespace_tags("#' @exporting data\nfoo <- 1\n"));
+        // @importing is not a real roxygen tag
+        assert!(!has_roxygen_namespace_tags("#' @importing stuff\nfoo <- 1\n"));
+        // But @exportPattern should trigger
+        assert!(has_roxygen_namespace_tags("#' @exportPattern ^[a-z]\nfoo <- 1\n"));
+        // And @importFrom should trigger
+        assert!(has_roxygen_namespace_tags("#' @importFrom dplyr mutate\nfoo <- 1\n"));
     }
 }

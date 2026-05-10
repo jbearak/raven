@@ -1085,10 +1085,20 @@ impl WorldState {
                         None
                     }
                 });
+                // Update workspace_imports from the namespace model so roxygen-derived
+                // imports take precedence over the legacy NAMESPACE-file parse.
+                if let Some(ref model) = self.package_namespace_model {
+                    self.workspace_imports = Arc::new(model.imports.clone());
+                }
             }
             PackageMode::Auto => {
                 self.package_workspace = pkg_workspace;
                 self.package_namespace_model = pkg_ns_model;
+                // Update workspace_imports from the namespace model so roxygen-derived
+                // imports take precedence over the legacy NAMESPACE-file parse.
+                if let Some(ref model) = self.package_namespace_model {
+                    self.workspace_imports = Arc::new(model.imports.clone());
+                }
             }
         }
 
@@ -1498,40 +1508,38 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 
     // Detect R package workspace
     let (pkg_workspace, pkg_ns_model, roxygen_cache) = if let Some(root) = folders.first().and_then(|u| u.to_file_path().ok()) {
-        let r_dir = root.join("R");
+        // Check DESCRIPTION first — if it doesn't exist or lacks a Package field,
+        // skip the expensive R/*.R content extraction entirely.
+        let description_path = root.join("DESCRIPTION");
+        let pkg_name = std::fs::read_to_string(&description_path).ok()
+            .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
 
-        // Single pass: collect R/*.R file paths+content, detect roxygen usage,
-        // and extract roxygen tags in one iteration.
-        let mut r_files: Vec<(std::path::PathBuf, String)> = Vec::new();
-        let mut has_roxygen = false;
-        for (uri, entry) in &new_index_entries {
-            if let Ok(p) = uri.to_file_path() {
-                if p.starts_with(&r_dir)
-                    && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                {
-                    let content = entry.contents.to_string();
-                    if !has_roxygen && crate::roxygen::has_roxygen_namespace_tags(&content) {
-                        has_roxygen = true;
+        if let Some(name) = pkg_name {
+            let r_dir = root.join("R");
+
+            // Only now iterate R/*.R files to detect roxygen and extract tags.
+            let mut r_files: Vec<(std::path::PathBuf, String)> = Vec::new();
+            let mut has_roxygen = false;
+            for (uri, entry) in &new_index_entries {
+                if let Ok(p) = uri.to_file_path() {
+                    if p.starts_with(&r_dir)
+                        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
+                    {
+                        let content = entry.contents.to_string();
+                        if !has_roxygen && crate::roxygen::has_roxygen_namespace_tags(&content) {
+                            has_roxygen = true;
+                        }
+                        r_files.push((p, content));
                     }
-                    r_files.push((p, content));
                 }
             }
-        }
 
-        let ws = {
-            let description_path = root.join("DESCRIPTION");
-            std::fs::read_to_string(&description_path).ok().and_then(|desc| {
-                crate::package_namespace::parse_dcf_field_pub(&desc, "Package").map(|name| {
-                    crate::package_namespace::PackageWorkspace {
-                        name,
-                        root: root.clone(),
-                        roxygen_managed: has_roxygen,
-                    }
-                })
-            })
-        };
+            let ws = crate::package_namespace::PackageWorkspace {
+                name,
+                root: root.clone(),
+                roxygen_managed: has_roxygen,
+            };
 
-        if let Some(ws) = ws {
             log::info!("Package mode detected: {} (roxygen_managed={})", ws.name, ws.roxygen_managed);
             let (ns_model, cache) = if ws.roxygen_managed {
                 let mut roxygen_files = Vec::new();

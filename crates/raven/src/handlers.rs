@@ -257,11 +257,20 @@ impl DiagnosticsSnapshot {
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             package_internal_symbols: collect_package_internal_symbols(state, uri).into(),
-            package_full_imports: state
-                .package_namespace_model
-                .as_ref()
-                .map(|m| m.full_imports.clone())
-                .unwrap_or_default(),
+            package_full_imports: {
+                // Only provide NAMESPACE imports for files under R/ — test files,
+                // vignettes, and scripts must use library() explicitly.
+                let in_r_dir = state.package_workspace.as_ref().is_some_and(|pkg| {
+                    uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
+                });
+                if in_r_dir {
+                    state.package_namespace_model.as_ref()
+                        .map(|m| m.full_imports.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            },
         })
     }
 

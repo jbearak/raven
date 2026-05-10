@@ -249,8 +249,14 @@ fn count_unquoted_parens(s: &str) -> (usize, usize) {
     let mut open = 0usize;
     let mut close = 0usize;
     let mut in_quote: Option<char> = None;
+    let mut escape_next = false;
     for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
         match in_quote {
+            Some(_) if c == '\\' => { escape_next = true; }
             Some(q) if c == q => { in_quote = None; }
             Some(_) => {}
             None => match c {
@@ -313,8 +319,14 @@ fn normalize_multiline(content: &str) -> String {
 /// Strip trailing `# comment` from a NAMESPACE line, respecting quoted strings.
 fn strip_trailing_comment(line: &str) -> &str {
     let mut in_quote: Option<char> = None;
+    let mut escape_next = false;
     for (i, c) in line.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
         match in_quote {
+            Some(_) if c == '\\' => { escape_next = true; }
             Some(q) if c == q => { in_quote = None; }
             Some(_) => {}
             None => match c {
@@ -337,7 +349,46 @@ fn strip_directive<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
 }
 
 fn split_args(args: &str) -> impl Iterator<Item = &str> {
-    args.split(',').map(|s| s.trim())
+    SplitArgs { s: args, pos: 0 }
+}
+
+/// Iterator that splits on commas outside of quoted strings.
+struct SplitArgs<'a> {
+    s: &'a str,
+    pos: usize,
+}
+
+impl<'a> Iterator for SplitArgs<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos > self.s.len() {
+            return None;
+        }
+        let bytes = self.s.as_bytes();
+        let start = self.pos;
+        let mut i = start;
+        let mut in_quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match in_quote {
+                Some(_q) if b == b'\\' => { i += 1; } // skip escaped char
+                Some(q) if b == q => { in_quote = None; }
+                Some(_) => {}
+                None => match b {
+                    b'"' | b'\'' => { in_quote = Some(b); }
+                    b',' => {
+                        let item = self.s[start..i].trim();
+                        self.pos = i + 1;
+                        return Some(item);
+                    }
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        self.pos = i + 1; // past end to signal done
+        Some(self.s[start..i].trim())
+    }
 }
 
 fn unquote(s: &str) -> String {
@@ -562,5 +613,48 @@ S3method(print, myclass)
     fn parse_dcf_field_tab_continuation() {
         let content = "Title:\n\tMy Package\nVersion: 1.0.0\n";
         assert_eq!(parse_dcf_field(content, "Title"), Some("My Package".into()));
+    }
+
+    #[test]
+    fn split_args_respects_quoted_commas() {
+        // Comma inside quotes should NOT split
+        let args = r#""a,b", foo, "c,d""#;
+        let result: Vec<&str> = split_args(args).collect();
+        assert_eq!(result, vec![r#""a,b""#, "foo", r#""c,d""#]);
+    }
+
+    #[test]
+    fn split_args_respects_escaped_quotes() {
+        // Escaped quote inside a string should not end the string
+        let args = r#""foo\"bar", baz"#;
+        let result: Vec<&str> = split_args(args).collect();
+        assert_eq!(result, vec![r#""foo\"bar""#, "baz"]);
+    }
+
+    #[test]
+    fn count_unquoted_parens_handles_escaped_quotes() {
+        // Escaped quote should not exit quote mode
+        assert_eq!(count_unquoted_parens(r#""foo\")" bar"#), (0, 0));
+        // Unescaped paren outside quotes
+        assert_eq!(count_unquoted_parens(r#""foo" (bar)"#), (1, 1));
+    }
+
+    #[test]
+    fn strip_trailing_comment_handles_escaped_quotes() {
+        // Escaped quote inside string should not end the string
+        assert_eq!(
+            strip_trailing_comment(r#"export("a\"b") # comment"#),
+            r#"export("a\"b")"#
+        );
+    }
+
+    #[test]
+    fn namespace_model_quoted_comma_in_export() {
+        // An export with a comma in the quoted name should parse as one symbol
+        let content = "export(\"a,b\")\nexport(foo)\n";
+        let model = namespace_model_from_content(content);
+        assert!(model.exports.contains("a,b"), "quoted comma should not split");
+        assert!(model.exports.contains("foo"));
+        assert_eq!(model.exports.len(), 2);
     }
 }

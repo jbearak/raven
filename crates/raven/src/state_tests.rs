@@ -550,4 +550,34 @@ mod package_cache_cleanup_tests {
         state.rebuild_package_internal_symbols_cache();
         assert!(state.package_internal_symbols_cache.is_empty());
     }
+
+    #[test]
+    fn apply_workspace_index_updates_workspace_imports_from_ns_model() {
+        let mut state = WorldState::new(Vec::new());
+        // Provide a namespace model with imports
+        let ns_model = crate::package_namespace::PackageNamespaceModel {
+            exports: std::collections::HashSet::new(),
+            imports: vec![("dplyr".into(), "mutate".into()), ("tidyr".into(), "pivot_longer".into())],
+            full_imports: vec!["ggplot2".into()],
+        };
+        let pkg_ws = crate::package_namespace::PackageWorkspace {
+            name: "testpkg".to_string(),
+            root: PathBuf::from("/tmp/testpkg"),
+            roxygen_managed: true,
+        };
+        // Pass legacy imports that differ from the namespace model
+        let legacy_imports = vec![("stats".into(), "lm".into())];
+        state.apply_workspace_index(
+            std::collections::HashMap::new(),
+            legacy_imports,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(pkg_ws),
+            Some(ns_model),
+        );
+        // workspace_imports should come from the namespace model, not legacy
+        assert!(state.workspace_imports.contains(&("dplyr".into(), "mutate".into())));
+        assert!(state.workspace_imports.contains(&("tidyr".into(), "pivot_longer".into())));
+        assert!(!state.workspace_imports.contains(&("stats".into(), "lm".into())));
+    }
 }
