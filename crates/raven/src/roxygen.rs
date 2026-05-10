@@ -1150,10 +1150,21 @@ pub struct RoxygenNamespace {
 /// Quick check: does `content` contain any roxygen namespace tag (`@export`,
 /// `@import`, or `@importFrom`)?  This avoids a full parse when we only need
 /// a boolean "is this package roxygen-managed?" signal.
+///
+/// Uses a line-based check to avoid false positives from string literals
+/// (e.g. `msg <- "#' @export"`), and tolerates arbitrary whitespace between
+/// `#'` and the tag (e.g. `#'  @export` or `#'\t@import`).
 pub fn has_roxygen_namespace_tags(content: &str) -> bool {
-    content.contains("#' @export")
-        || content.contains("#' @import")
-        || content.contains("#' @importFrom")
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("#'") {
+            let tag = rest.trim_start();
+            if tag.starts_with("@export") || tag.starts_with("@import") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// For `@export`, the exported symbol name is the identifier defined on the
@@ -1283,8 +1294,13 @@ fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
     while i < bytes.len() {
         let b = bytes[i];
         match in_quote {
-            Some(q) if b == q => { in_quote = None; }
-            Some(_) => {}
+            Some(q) => {
+                if b == b'\\' {
+                    i += 1; // skip escaped character
+                } else if b == q {
+                    in_quote = None;
+                }
+            }
             None => match b {
                 b'"' | b'\'' | b'`' => { in_quote = Some(b); }
                 b'(' | b'[' | b'{' => { depth += 1; }
@@ -1322,17 +1338,24 @@ fn extract_first_string_arg(line: &str) -> Option<String> {
     let after = &line[open + 1..];
     let after = after.trim_start();
     // Check for quoted string
-    let quote = after.chars().next()?;
-    if quote != '"' && quote != '\'' {
+    let quote = after.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
         return None;
     }
-    let end = after[1..].find(quote)?;
-    let name = &after[1..1 + end];
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+    // Scan for closing quote, respecting backslash escapes
+    let bytes = after.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escaped character
+        } else if bytes[i] == quote {
+            let name = &after[1..i];
+            return if name.is_empty() { None } else { Some(name.to_string()) };
+        } else {
+            i += 1;
+        }
     }
+    None
 }
 
 /// Find `=` that's not inside parentheses or string literals.
@@ -1477,6 +1500,15 @@ bar <- function() {}
     }
 
     #[test]
+    fn extract_first_string_arg_with_escape() {
+        // Escaped quote inside the string argument
+        assert_eq!(
+            extract_first_string_arg(r#"setGeneric("foo\"bar", function(x) x)"#),
+            Some(r#"foo\"bar"#.to_string())
+        );
+    }
+
+    #[test]
     fn find_assignment_op_skips_double_equals() {
         // The second '=' in '==' must not be returned as an assignment operator.
         assert_eq!(find_assignment_op("x == 5"), None);
@@ -1485,6 +1517,14 @@ bar <- function() {}
         assert_eq!(find_assignment_op("z = 1"), Some((2, 1)));
         // == followed by a later assignment
         assert_eq!(find_assignment_op("a == b; c <- 1"), Some((10, 2)));
+    }
+
+    #[test]
+    fn find_assignment_op_handles_escaped_quotes() {
+        // Escaped quote inside a string should not exit quote mode
+        assert_eq!(find_assignment_op(r#""foo\"bar" <- 1"#), Some((11, 2)));
+        // Escaped backslash before closing quote
+        assert_eq!(find_assignment_op(r#""foo\\" <- 1"#), Some((8, 2)));
     }
 
     #[test]
@@ -1576,5 +1616,32 @@ bar <- function() {}
         let ns = extract_roxygen_namespace_tags(content);
         assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
         assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
+    }
+
+    #[test]
+    fn has_roxygen_tags_nonstandard_whitespace() {
+        // Multiple spaces between #' and tag
+        assert!(has_roxygen_namespace_tags("#'  @export\nfoo <- 1\n"));
+        // Tab between #' and tag
+        assert!(has_roxygen_namespace_tags("#'\t@import dplyr\nfoo <- 1\n"));
+        // Leading whitespace on the line
+        assert!(has_roxygen_namespace_tags("  #' @export\nfoo <- 1\n"));
+    }
+
+    #[test]
+    fn has_roxygen_tags_no_false_positive_from_strings() {
+        // Tag inside a string literal should NOT trigger detection
+        assert!(!has_roxygen_namespace_tags("msg <- \"#' @export\"\n"));
+        assert!(!has_roxygen_namespace_tags("x <- '#' @import dplyr'\n"));
+        // But a real tag on another line should still work
+        assert!(has_roxygen_namespace_tags("msg <- \"#' @export\"\n#' @export\nfoo <- 1\n"));
+    }
+
+    #[test]
+    fn has_roxygen_tags_no_false_positive_from_comments() {
+        // Regular comment (not roxygen) should not trigger
+        assert!(!has_roxygen_namespace_tags("# #' @export\nfoo <- 1\n"));
+        // But roxygen comment should
+        assert!(has_roxygen_namespace_tags("#' @export\nfoo <- 1\n"));
     }
 }

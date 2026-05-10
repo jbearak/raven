@@ -2591,6 +2591,14 @@ impl LanguageServer for Backend {
                                 if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
                                     package_namespace_changed =
                                         state.rebuild_namespace_model_from_cache();
+                                } else if state.package_workspace.is_some() {
+                                    // roxygen_managed is false: clear stale roxygen-derived
+                                    // imports so they don't suppress diagnostics indefinitely.
+                                    state.workspace_imports = std::sync::Arc::new(Vec::new());
+                                    state.package_namespace_model = Some(
+                                        crate::package_namespace::PackageNamespaceModel::default(),
+                                    );
+                                    package_namespace_changed = true;
                                 }
                             }
                         }

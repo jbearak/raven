@@ -1545,13 +1545,6 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
             } else {
                 (crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE")), HashMap::new())
             };
-            // Merge namespace model imports into the workspace imports list
-            let existing: HashSet<(String, String)> = imports.iter().map(|(p, s)| (p.clone(), s.clone())).collect();
-            for (pkg, sym) in &ns_model.imports {
-                if !existing.contains(&(pkg.clone(), sym.clone())) {
-                    imports.push((pkg.clone(), sym.clone()));
-                }
-            }
             (Some(ws), Some(ns_model), cache)
         } else {
             (None, None, HashMap::new())

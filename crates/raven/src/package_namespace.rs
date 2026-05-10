@@ -215,11 +215,30 @@ pub fn parse_dcf_field_pub(content: &str, field: &str) -> Option<String> {
 
 fn parse_dcf_field(content: &str, field: &str) -> Option<String> {
     let prefix = format!("{}:", field);
-    for line in content.lines() {
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
         if let Some(rest) = line.strip_prefix(&prefix) {
-            let val = rest.trim();
+            // Collect the value, including any continuation lines (leading whitespace).
+            let mut val = rest.trim().to_string();
+            for cont in lines.by_ref() {
+                if cont.starts_with(' ') || cont.starts_with('\t') {
+                    let trimmed = cont.trim();
+                    if trimmed == "." {
+                        // DCF uses a lone "." for blank paragraph separators; skip.
+                        continue;
+                    }
+                    if val.is_empty() {
+                        val = trimmed.to_string();
+                    } else {
+                        val.push(' ');
+                        val.push_str(trimmed);
+                    }
+                } else {
+                    break;
+                }
+            }
             if !val.is_empty() {
-                return Some(val.to_string());
+                return Some(val);
             }
         }
     }
@@ -505,5 +524,35 @@ S3method(print, myclass)
         let content = "importFrom(dplyr,\n\n\n  mutate)\n";
         let model = namespace_model_from_content(content);
         assert!(model.imports.contains(&("dplyr".into(), "mutate".into())));
+    }
+
+    #[test]
+    fn parse_dcf_field_simple() {
+        let content = "Package: mypkg\nVersion: 1.0.0\n";
+        assert_eq!(parse_dcf_field(content, "Package"), Some("mypkg".into()));
+        assert_eq!(parse_dcf_field(content, "Version"), Some("1.0.0".into()));
+    }
+
+    #[test]
+    fn parse_dcf_field_continuation_lines() {
+        // Value entirely on continuation line
+        let content = "Title:\n    My Package Title\nVersion: 1.0.0\n";
+        assert_eq!(parse_dcf_field(content, "Title"), Some("My Package Title".into()));
+    }
+
+    #[test]
+    fn parse_dcf_field_multiline_value() {
+        // Value split across multiple continuation lines
+        let content = "Description: A package\n    that does things\n    and more things\nVersion: 1.0.0\n";
+        assert_eq!(
+            parse_dcf_field(content, "Description"),
+            Some("A package that does things and more things".into())
+        );
+    }
+
+    #[test]
+    fn parse_dcf_field_tab_continuation() {
+        let content = "Title:\n\tMy Package\nVersion: 1.0.0\n";
+        assert_eq!(parse_dcf_field(content, "Title"), Some("My Package".into()));
     }
 }
