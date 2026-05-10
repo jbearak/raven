@@ -98,7 +98,6 @@ pub(crate) struct DiagnosticsSnapshot {
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
-    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
@@ -129,16 +128,10 @@ pub(crate) struct DiagnosticsSnapshot {
     /// mutate the cache. The snapshot is owned by a single tokio task; no
     /// `Sync` bound is required.
     pub(crate) parent_prefix_cache: std::cell::RefCell<scope::ParentPrefixCache>,
-    /// In package mode: top-level symbol names from other R/*.R files.
-    /// These are available via mutual visibility (flat namespace) and suppress
-    /// undefined-variable diagnostics.
-    pub(crate) package_internal_symbols: Arc<HashSet<String>>,
-    /// In package mode: packages imported wholesale via `import(pkg)` in NAMESPACE
-    /// or `@import pkg` in roxygen. All exports of these packages are available.
-    pub(crate) package_full_imports: Vec<String>,
     /// Package-mode scope contribution snapshot. Passed to the scope engine
     /// (Phase 5a) so that `get_scope` can inject package-internal and imported
     /// symbols into resolution results for files under `R/` and `tests/testthat/`.
+    /// Also used in the diagnostic loop for full-import package checks.
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
@@ -252,20 +245,6 @@ impl DiagnosticsSnapshot {
             base_exports,
             package_library_ready: state.package_library_ready,
             workspace_scan_complete: state.workspace_scan_complete,
-            workspace_imports: {
-                // In package mode, workspace_imports (importFrom) should only
-                // suppress diagnostics for files under R/ — test files,
-                // vignettes, and scripts must use library() explicitly.
-                let suppress_for_this_file = state.package_workspace().map_or(
-                    true, // non-package mode: preserve legacy behavior (suppress for all)
-                    |pkg| uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
-                );
-                if suppress_for_this_file {
-                    state.workspace_imports().clone()
-                } else {
-                    Arc::new(Vec::new())
-                }
-            },
             artifacts_map,
             metadata_map,
             cycle_detection,
@@ -273,21 +252,6 @@ impl DiagnosticsSnapshot {
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
-            package_internal_symbols: collect_package_internal_symbols(state, uri).into(),
-            package_full_imports: {
-                // Only provide NAMESPACE imports for files under R/ — test files,
-                // vignettes, and scripts must use library() explicitly.
-                let in_r_dir = state.package_workspace().is_some_and(|pkg| {
-                    uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
-                });
-                if in_r_dir {
-                    state.package_namespace_model()
-                        .map(|m| m.full_imports.clone())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            },
             scope_contribution: state.package_state.scope_contribution.clone(),
         })
     }
@@ -332,37 +296,6 @@ impl DiagnosticsSnapshot {
             Some(&self.scope_contribution),
         )
     }
-}
-
-/// Collect top-level symbols from other `R/*.R` files when in package mode.
-///
-/// Returns an empty set if the workspace is not an R package or if the
-/// queried URI is not under the package's `R/` directory.
-///
-/// Uses the pre-computed `package_internal_symbols_cache` on WorldState,
-/// which is rebuilt incrementally when file interfaces change. This avoids
-/// O(package_files) work on every diagnostic snapshot build.
-fn collect_package_internal_symbols(state: &WorldState, uri: &Url) -> Arc<HashSet<String>> {
-    // NOTE: empty_base_exports() returns an *empty* HashSet (the name is historical).
-    // This is correct — when not in package mode or outside R/, we want an empty set
-    // so no symbols are suppressed from diagnostics.
-    let Some(pkg) = state.package_workspace() else {
-        return empty_base_exports().clone();
-    };
-
-    // Check if the queried URI is under the package's R/ directory
-    let Ok(file_path) = uri.to_file_path() else {
-        return empty_base_exports().clone();
-    };
-    let r_dir = pkg.root.join("R");
-    if !file_path.starts_with(&r_dir) {
-        return empty_base_exports().clone();
-    }
-
-    // Use the cached set. We could subtract the current file's own exports,
-    // but including them is harmless (they suppress false-positive diagnostics
-    // for symbols the file itself defines) and avoids an extra lookup.
-    Arc::clone(state.package_internal_symbols_cache())
 }
 
 /// Compute diagnostics from a pre-built snapshot (no lock held).
