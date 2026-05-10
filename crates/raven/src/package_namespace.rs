@@ -341,7 +341,15 @@ fn split_args(args: &str) -> impl Iterator<Item = &str> {
 }
 
 fn unquote(s: &str) -> String {
-    s.trim_matches('"').trim_matches('\'').to_string()
+    let s = s.trim();
+    if s.len() >= 2 {
+        if (s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\''))
+        {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
 }
 
 #[cfg(test)]

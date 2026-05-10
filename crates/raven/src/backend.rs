@@ -2593,15 +2593,39 @@ impl LanguageServer for Backend {
                                     }
                                 }
                                 if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
+                                    // If transitioning false→true, populate cache from
+                                    // all R/*.R files (open docs + file cache) so the
+                                    // model isn't built from just the one edited file.
+                                    if state.roxygen_tags_cache.len() <= 1 {
+                                        if let Some(ref pkg) = state.package_workspace {
+                                            let pkg_r_dir2 = pkg.root.join("R");
+                                            // Scan open documents for roxygen tags
+                                            let open_r_uris: Vec<Url> = state.documents.keys()
+                                                .filter(|u| u.to_file_path().ok().is_some_and(|p|
+                                                    p.starts_with(&pkg_r_dir2) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))))
+                                                .cloned().collect();
+                                            for open_uri in &open_r_uris {
+                                                if let Ok(p) = open_uri.to_file_path() {
+                                                    if !state.roxygen_tags_cache.contains_key(&p) {
+                                                        if let Some(doc) = state.documents.get(open_uri) {
+                                                            let ns = crate::roxygen::extract_roxygen_namespace_tags(&doc.text());
+                                                            state.roxygen_tags_cache.insert(p, ns);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     package_namespace_changed =
                                         state.rebuild_namespace_model_from_cache();
                                 } else if state.package_workspace.is_some() {
-                                    // roxygen_managed is false: clear stale roxygen-derived
-                                    // imports so they don't suppress diagnostics indefinitely.
-                                    state.workspace_imports = std::sync::Arc::new(Vec::new());
-                                    state.package_namespace_model = Some(
-                                        crate::package_namespace::PackageNamespaceModel::default(),
-                                    );
+                                    // roxygen_managed transitioned to false: fall back to
+                                    // NAMESPACE file for import information.
+                                    let ns_model = state.package_workspace.as_ref()
+                                        .map(|pkg| crate::package_namespace::namespace_model_from_file(&pkg.root.join("NAMESPACE")))
+                                        .unwrap_or_default();
+                                    state.workspace_imports = std::sync::Arc::new(ns_model.imports.clone());
+                                    state.package_namespace_model = Some(ns_model);
                                     package_namespace_changed = true;
                                 }
                             }
@@ -2943,6 +2967,10 @@ impl LanguageServer for Backend {
         if let Some(ref pkg) = state.package_workspace {
             if let Ok(p) = uri.to_file_path() {
                 if p.starts_with(pkg.root.join("R")) {
+                    // Invalidate the workspace index entry so the next rebuild
+                    // or access re-reads from disk (the entry may be stale from
+                    // the initial scan if the file was edited while open).
+                    state.cross_file_workspace_index.invalidate(uri);
                     state.rebuild_package_internal_symbols_cache();
                 }
             }
@@ -3606,9 +3634,27 @@ impl LanguageServer for Backend {
 
                 // Re-acquire write lock to apply results
                 let mut state = self.state.write().await;
+                // Supplement disk-only has_roxygen with open document content
+                // (an unsaved file may have the only roxygen tags).
+                let has_roxygen_from_open = if !has_roxygen {
+                    let r_dir_check = root.join("R");
+                    state.documents.keys().any(|u| {
+                        u.to_file_path().ok().is_some_and(|p| {
+                            p.starts_with(&r_dir_check)
+                                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
+                                && state.documents.get(u).is_some_and(|d| crate::roxygen::has_roxygen_namespace_tags(&d.text()))
+                        })
+                    })
+                } else {
+                    true
+                };
+                // Update roxygen_managed on the workspace if open docs changed it
+                let new_ws = new_ws.map(|mut ws| {
+                    ws.roxygen_managed = has_roxygen_from_open;
+                    ws
+                });
                 if let Some(ref ws) = new_ws {
                     let ns_model = if ws.roxygen_managed {
-                        let mut roxygen_files = Vec::new();
                         // Rebuild cache without clearing — for open documents,
                         // did_change may have inserted fresher entries while we
                         // were doing I/O. Only overwrite entries for files whose
@@ -3630,11 +3676,12 @@ impl LanguageServer for Backend {
                                 .or_else(|| disk_content.clone());
                             if let Some(content) = content {
                                 let ns = crate::roxygen::extract_roxygen_namespace_tags(&content);
-                                roxygen_files.push((path.display().to_string(), ns.clone()));
                                 state.roxygen_tags_cache.insert(path.clone(), ns);
                             }
                         }
-                        crate::package_namespace::namespace_model_from_roxygen(&roxygen_files)
+                        // Build model from the full cache (includes retained open-only entries)
+                        state.rebuild_namespace_model_from_cache();
+                        state.package_namespace_model.clone().unwrap_or_default()
                     } else {
                         match namespace_content {
                             Some(ref content) => crate::package_namespace::namespace_model_from_content(content),
