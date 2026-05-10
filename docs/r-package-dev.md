@@ -4,13 +4,13 @@ Raven automatically detects R package workspaces and provides enhanced code inte
 
 ## How It Works
 
-When Raven detects a `DESCRIPTION` file at the workspace root, it activates **package mode**:
+Raven activates **package mode** when the workspace root contains a `DESCRIPTION` file with a parseable, non-empty `Package:` field. Mere presence of `DESCRIPTION` is not sufficient — the file must carry a valid `Package:` entry. In package mode:
 
 1. **Mutual visibility** — All `R/*.R` files see each other's top-level symbols, matching `devtools::load_all()` semantics. A function defined in `R/utils.R` is available in `R/analysis.R` without any `source()` call.
 
 2. **Import resolution** — Symbols imported via `NAMESPACE` or roxygen annotations (`@import`, `@importFrom`) suppress undefined-variable diagnostics.
 
-3. **Roxygen awareness** — When any `R/*.R` file contains `#' @export`, Raven treats the package as roxygen-managed and parses namespace tags directly from source files rather than the generated `NAMESPACE` file.
+3. **Roxygen + NAMESPACE merge** — Raven unions imports and exports parsed from the generated `NAMESPACE` file with roxygen tags (`@import`, `@importFrom`, `@export`) parsed from `R/*.R` files. Imports visible to your code are the combined set from both sources, so you get correct import resolution whether you edit `NAMESPACE` directly, rely on `devtools::document()` to regenerate it from roxygen, or are mid-edit between the two.
 
 ## What's Supported
 
@@ -71,13 +71,21 @@ transform_data <- function(df) {
 }
 ```
 
-### NAMESPACE Fallback
+### NAMESPACE + roxygen merge
 
-If no roxygen blocks are detected (no `#' @export` in any `R/*.R` file), Raven falls back to parsing the `NAMESPACE` file directly. It recognizes:
+Raven always parses the generated `NAMESPACE` file (when present) and
+unions its entries with roxygen tags extracted from `R/*.R`:
 
 - `import(pkg)` — all exports of `pkg` are available
 - `importFrom(pkg, sym1, sym2)` — specific symbols are available
 - `export(sym)` — informational (mutual visibility makes all symbols available internally regardless)
+
+Roxygen `@import`, `@importFrom`, and `@export` in any `R/*.R` file
+contribute to the same merged model; duplicate entries across NAMESPACE
+and roxygen are deduped. This means roxygen-annotated imports are
+visible to diagnostics and completions even before you run
+`devtools::document()` to regenerate `NAMESPACE`, and NAMESPACE-only
+imports remain visible if some `R/*.R` files don't carry roxygen tags.
 
 ### Live Updates
 
@@ -91,7 +99,7 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 Values for `packageMode`:
 
-- **`auto`** (default) — Enable package mode when `DESCRIPTION` is found at the workspace root.
+- **`auto`** (default) — Enable package mode when a `DESCRIPTION` file with a parseable, non-empty `Package:` field is found at the workspace root.
 - **`enabled`** — Always enable package mode, even without a `DESCRIPTION` file. Useful for non-standard package layouts.
 - **`disabled`** — Never enable package mode, even if `DESCRIPTION` exists. Use this if you prefer script-mode behavior in a package workspace.
 
@@ -102,7 +110,7 @@ Values for `packageMode`:
 | Cross-file visibility | Via `source()` chains and directives | All `R/*.R` files mutually visible |
 | Package imports | Via `library()` calls | Via NAMESPACE/roxygen `@import`/`@importFrom` |
 | Diagnostics | Position-aware (after `source()`) | All package symbols available everywhere |
-| Detection | Default for non-package workspaces | Automatic when `DESCRIPTION` exists |
+| Detection | Default for non-package workspaces | Automatic when `DESCRIPTION` has a valid `Package:` field |
 
 ## Behavior: Non-Package NAMESPACE Files
 

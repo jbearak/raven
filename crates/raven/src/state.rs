@@ -969,9 +969,6 @@ impl WorldState {
             }
         }
         log::info!("Indexed {} workspace files", self.workspace_index.len());
-
-        // Load workspace NAMESPACE imports
-        self.load_workspace_namespace();
     }
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
@@ -1123,21 +1120,6 @@ impl WorldState {
             "Built dependency graph from {} workspace files",
             entries.len()
         );
-    }
-
-    #[allow(dead_code)]
-    fn load_workspace_namespace(&mut self) {
-        for folder_url in &self.workspace_folders {
-            if let Ok(folder_path) = folder_url.to_file_path() {
-                let namespace_path = folder_path.join("NAMESPACE");
-                if namespace_path.exists() {
-                    let imports = parse_namespace_imports(&namespace_path, &self.library);
-                    log::info!("Loaded {} workspace imports from NAMESPACE", imports.len());
-                    drop(imports); // workspace_imports field removed in Phase 5b.4
-                    break; // Only process first workspace folder with NAMESPACE
-                }
-            }
-        }
     }
 
     #[allow(dead_code)]
@@ -1430,60 +1412,18 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         new_index_entries.len()
     );
 
-    // Detect R package workspace
-    let (pkg_workspace, pkg_ns_model, roxygen_cache) = if let Some(root) = folders.first().and_then(|u| u.to_file_path().ok()) {
-        // Check DESCRIPTION first — if it doesn't exist or lacks a Package field,
-        // skip the expensive R/*.R content extraction entirely.
-        let description_path = root.join("DESCRIPTION");
-        let pkg_name = std::fs::read_to_string(&description_path).ok()
-            .and_then(|desc| crate::package_namespace::parse_dcf_field_pub(&desc, "Package"));
-
-        if let Some(name) = pkg_name {
-            let r_dir = root.join("R");
-
-            // Only now iterate R/*.R files to detect roxygen and extract tags.
-            let mut r_files: Vec<(std::path::PathBuf, String)> = Vec::new();
-            let mut has_roxygen = false;
-            for (uri, entry) in &new_index_entries {
-                if let Ok(p) = uri.to_file_path() {
-                    if p.starts_with(&r_dir)
-                        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("r"))
-                    {
-                        let content = entry.contents.to_string();
-                        if !has_roxygen && crate::roxygen::has_roxygen_namespace_tags(&content) {
-                            has_roxygen = true;
-                        }
-                        r_files.push((p, content));
-                    }
-                }
-            }
-
-            let ws = crate::package_namespace::PackageWorkspace {
-                name,
-                root: root.clone(),
-                roxygen_managed: has_roxygen,
-            };
-
-            log::info!("Package mode detected: {} (roxygen_managed={})", ws.name, ws.roxygen_managed);
-            let (ns_model, cache) = if ws.roxygen_managed {
-                let mut roxygen_files = Vec::new();
-                let mut cache = HashMap::new();
-                for (path, content) in &r_files {
-                    let ns = crate::roxygen::extract_roxygen_namespace_tags(content);
-                    roxygen_files.push((path.display().to_string(), ns.clone()));
-                    cache.insert(path.clone(), ns);
-                }
-                (crate::package_namespace::namespace_model_from_roxygen(&roxygen_files), cache)
-            } else {
-                (crate::package_namespace::namespace_model_from_file(&root.join("NAMESPACE")), HashMap::new())
-            };
-            (Some(ws), Some(ns_model), cache)
-        } else {
-            (None, None, HashMap::new())
-        }
-    } else {
-        (None, None, HashMap::new())
-    };
+    // Package-mode detection is *not* done here. `scan_workspace` used to
+    // construct `PackageWorkspace` and a `PackageNamespaceModel` inline —
+    // detecting roxygen, picking `namespace_model_from_roxygen` vs
+    // `namespace_model_from_file`, and caching per-file roxygen tags — but
+    // that logic duplicated `derive_package_state` and the result was
+    // unconditionally overwritten by the `apply_package_event(Initial)`
+    // call that follows `apply_workspace_index` in `backend.rs`.
+    // The canonical derivation is now single-sourced through the event path
+    // (`PackageInputs` → `derive_package_state`); this function just returns
+    // `None`/empty for the legacy tuple slots so callers need not change.
+    let (pkg_workspace, pkg_ns_model, roxygen_cache) =
+        (None, None, HashMap::new());
 
     (index, Vec::new(), cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)
 }

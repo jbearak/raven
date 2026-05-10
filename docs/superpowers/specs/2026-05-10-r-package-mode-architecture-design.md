@@ -169,9 +169,14 @@ pub struct PackageState {
     /// None when packageMode is Disabled, or auto+no DESCRIPTION,
     /// or detection failed. Otherwise Some.
     pub workspace: Option<PackageWorkspace>,
-    /// Merged from NAMESPACE + union of all R/ roxygen tags.
-    /// Empty when workspace.is_none().
-    pub namespace_model: PackageNamespaceModel,
+    /// `Option<PackageNamespaceModel>` — `None` exactly when
+    /// `workspace` is `None` (packageMode Disabled, auto with no
+    /// valid DESCRIPTION, or detection failed); cleared in lock-step
+    /// with `workspace` whenever a mode/input transition clears
+    /// package state. When `Some`, it is merged from `NAMESPACE` +
+    /// the union of all R/ roxygen tags (empty but still `Some`
+    /// when neither source contributes entries).
+    pub namespace_model: Option<PackageNamespaceModel>,
     /// Per-R-file derived facts. Keyed identically to PackageInputs.r_files.
     pub r_file_facts: BTreeMap<PathBuf, RFileFacts>,
     /// What scope/diagnostics/completion consume.

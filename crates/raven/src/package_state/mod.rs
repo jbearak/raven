@@ -211,6 +211,12 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RFileFacts {
+    /// Canonical `Source` vs `Test` classification for this file,
+    /// carried through from the corresponding `RFileInput`. Consumers
+    /// that need to partition facts by location (e.g. `build_scope_contribution`,
+    /// `merge_namespace_model`) MUST filter on `kind` rather than re-deriving
+    /// the classification from the path, so there is a single source of truth.
+    pub kind: RFileKind,
     pub roxygen_namespace: RoxygenNamespace,
     pub top_level_defs: Arc<BTreeSet<String>>,
     pub content_digest: ContentDigest,

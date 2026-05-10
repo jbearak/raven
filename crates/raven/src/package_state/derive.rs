@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::package_namespace::parse_dcf_field_pub;
-use std::path::Path;
 
 /// Pure derivation from `PackageInputs` to `PackageState`.
 ///
@@ -29,11 +28,10 @@ pub fn derive_package_state(
 ) -> PackageState {
     let workspace = effective_workspace(inputs);
     let r_file_facts = derive_r_file_facts(&prev.r_file_facts, &inputs.r_files);
-    let namespace_model = if let Some(ws) = workspace.as_ref() {
+    let namespace_model = if workspace.is_some() {
         Some(merge_namespace_model(
             inputs.namespace.as_ref(),
             &r_file_facts,
-            &ws.root,
         ))
     } else {
         None
@@ -56,12 +54,13 @@ fn build_scope_contribution(
     let Some(ws) = workspace else {
         return PackageScopeContribution::default();
     };
-    let r_dir = ws.root.join("R");
-    // r_internal_symbols: union of top_level_defs from files under R/ only
-    // (exclude tests/testthat/* — those are kind == Test).
+    // r_internal_symbols: union of top_level_defs from Source files only
+    // (exclude tests/testthat/* — those are kind == Test). Partition is
+    // driven by the canonical `RFileKind` classification carried in
+    // `RFileFacts`, not by a path-prefix check.
     let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
-    for (path, facts) in r_file_facts {
-        if !path.starts_with(&r_dir) {
+    for (_path, facts) in r_file_facts {
+        if facts.kind != RFileKind::Source {
             continue;
         }
         for def in facts.top_level_defs.iter() {
@@ -90,17 +89,15 @@ fn build_scope_contribution(
 fn merge_namespace_model(
     namespace: Option<&NamespaceInput>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
-    workspace_root: &Path,
 ) -> PackageNamespaceModel {
     let mut model = match namespace {
         Some(ns) => crate::package_namespace::namespace_model_from_content(&ns.text),
         None => PackageNamespaceModel::default(),
     };
-    // Union roxygen-derived imports/exports from R/ source files only.
+    // Union roxygen-derived imports/exports from Source files only.
     // Test files (tests/testthat/*) must never contribute @export/@importFrom
-    // tags to the package-wide namespace model — mirroring the path filter
-    // used by `build_scope_contribution`.
-    let r_dir = workspace_root.join("R");
+    // tags to the package-wide namespace model — matching the `RFileKind::Source`
+    // filter used by `build_scope_contribution`.
 
     // Dedup against a HashSet rather than scanning the accumulating Vec —
     // previously each insert did a linear scan of the growing `imports`
@@ -113,8 +110,8 @@ fn merge_namespace_model(
     let mut seen_full: std::collections::HashSet<String> =
         model.full_imports.iter().cloned().collect();
 
-    for (path, facts) in r_file_facts {
-        if !path.starts_with(&r_dir) {
+    for (_path, facts) in r_file_facts {
+        if facts.kind != RFileKind::Source {
             continue;
         }
         for sym in &facts.roxygen_namespace.exports {
@@ -144,12 +141,17 @@ fn derive_r_file_facts(
 ) -> BTreeMap<PathBuf, RFileFacts> {
     let mut out = BTreeMap::new();
     for (path, file) in inputs {
+        // Reuse only when both digest AND kind match. `kind` is derived
+        // from path shape, so in practice it never flips for a given path,
+        // but we still compare it so cached facts can never drift from
+        // the classification carried in `RFileInput`.
         let reuse = prev
             .get(path)
-            .filter(|cached| cached.content_digest == file.content_digest);
+            .filter(|cached| cached.content_digest == file.content_digest && cached.kind == file.kind);
         let facts = match reuse {
             Some(cached) => cached.clone(),
             None => RFileFacts {
+                kind: file.kind,
                 roxygen_namespace: crate::roxygen::extract_roxygen_namespace_tags(&file.text),
                 top_level_defs: Arc::new(crate::roxygen::extract_top_level_defs(&file.text)),
                 content_digest: file.content_digest,
