@@ -2890,9 +2890,8 @@ pub fn scope_at_position_with_graph<F, G>(
     // Package-mode contribution. When `Some`, provides the set of symbols
     // defined in `R/` files and imported via NAMESPACE so that package-internal
     // and imported symbols can be resolved via the standard scope engine
-    // (Phase 5 wires the actual injection; this parameter is plumbing only
-    // in Phase 4).
-    _package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // (Phase 5a wires the actual scope injection).
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -2927,7 +2926,7 @@ where
         is_cancelled,
         true,
         None,
-        None,
+        package_contribution,
     )
 }
 
@@ -2992,9 +2991,9 @@ pub fn scope_at_position_with_graph_cached<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &mut ParentPrefixCache,
-    // Package-mode contribution (plumbing only in Phase 4; Phase 5 wires
-    // the actual scope injection).
-    _package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // Package-mode contribution. When `Some`, synthetic package-internal and
+    // imported symbols are injected into the root-file scope (Phase 5a).
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -3082,7 +3081,7 @@ where
         is_cancelled,
         true,
         Some(&prefix_arc),
-        None,
+        package_contribution,
     )
 }
 
@@ -3496,9 +3495,15 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // 1 across snapshots' diagnostic passes. Internal recursion (parent walks
     // in `parent_prefix_at`, forward children in STEP 2) always passes `None`.
     pre_computed_prefix: Option<&Arc<ParentPrefix>>,
-    // Package-mode contribution (plumbing only in Phase 4; Phase 5 wires
-    // the actual scope injection). Reserved for future use — not consulted yet.
-    _package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // Package-mode contribution. Only consulted at depth 0 (the root query
+    // file). When `Some` and the queried file is under `<root>/R/` or
+    // `<root>/tests/testthat/`, synthetic `ScopedSymbol` entries for
+    // package-internal and NAMESPACE-imported symbols are appended to
+    // `scope.symbols` after all local timeline events have been processed,
+    // filling in any names not already resolved by the standard scope engine.
+    // Internal recursive calls (forward source children, parent walks) always
+    // receive `None` — the contribution applies only to the root query file.
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -4065,7 +4070,77 @@ where
         }
     }
 
+    // Phase 5a: inject package-mode contribution at depth 0 only.
+    // Appends synthetic ScopedSymbol entries for package-internal symbols and
+    // NAMESPACE-imported symbols that were not already resolved by the
+    // standard scope engine above. This ensures existing local definitions
+    // always take precedence (additive-only).
+    if current_depth == 0 {
+        if let Some(contrib) = package_contribution {
+            append_package_contribution(&mut scope.symbols, uri, contrib);
+        }
+    }
+
     scope
+}
+
+/// Inject package-mode symbols into a visible-symbol map for Phase 5a.
+///
+/// Called only at depth 0 from `scope_at_position_with_graph_recursive`.
+/// Inserts synthetic `ScopedSymbol` entries for:
+/// - Every name in `contrib.r_internal_symbols` (package-internal definitions)
+/// - Every key in `contrib.imported_symbols` (NAMESPACE `importFrom` targets)
+///
+/// Names already present in `symbols` are NOT overwritten — local and cross-file
+/// definitions always take precedence. `full_imports` entries are intentionally
+/// skipped: enumerating their symbols requires the package library, which is
+/// handled by the existing `pkg_resolver` / combined-exports path.
+fn append_package_contribution(
+    symbols: &mut HashMap<Arc<str>, ScopedSymbol>,
+    uri: &Url,
+    contrib: &crate::package_state::PackageScopeContribution,
+) {
+    let Some(root) = contrib.workspace_root.as_ref() else {
+        return;
+    };
+    let Ok(path) = uri.to_file_path() else {
+        return;
+    };
+    // Only inject for files under <root>/R/ or <root>/tests/testthat/.
+    if crate::package_state::is_r_source_path(&path, root).is_none() {
+        return;
+    }
+
+    // Use a synthetic URI scheme for package-internal symbols so consumers
+    // can distinguish them from real file-backed definitions.
+    let pkg_uri = Url::parse("package:///internal")
+        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
+
+    for sym in contrib.r_internal_symbols.iter() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+            name,
+            kind: SymbolKind::Function,
+            source_uri: pkg_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: false,
+        });
+    }
+
+    for sym in contrib.imported_symbols.keys() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+            name,
+            kind: SymbolKind::Function,
+            source_uri: pkg_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: false,
+        });
+    }
 }
 
 // ============================================================================

@@ -136,6 +136,10 @@ pub(crate) struct DiagnosticsSnapshot {
     /// In package mode: packages imported wholesale via `import(pkg)` in NAMESPACE
     /// or `@import pkg` in roxygen. All exports of these packages are available.
     pub(crate) package_full_imports: Vec<String>,
+    /// Package-mode scope contribution snapshot. Passed to the scope engine
+    /// (Phase 5a) so that `get_scope` can inject package-internal and imported
+    /// symbols into resolution results for files under `R/` and `tests/testthat/`.
+    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
 impl DiagnosticsSnapshot {
@@ -284,6 +288,7 @@ impl DiagnosticsSnapshot {
                     Vec::new()
                 }
             },
+            scope_contribution: state.package_state.scope_contribution.clone(),
         })
     }
 
@@ -324,7 +329,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
             &mut cache,
-            None,
+            Some(&self.scope_contribution),
         )
     }
 }
@@ -2960,7 +2965,7 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
-    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never(), None).symbols
+    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never(), Some(&state.package_state.scope_contribution)).symbols
 }
 
 /// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
@@ -4597,7 +4602,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         false,
         snapshot.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
-        None,
+        Some(&snapshot.scope_contribution),
     );
 
     {
@@ -9270,7 +9275,7 @@ pub fn completion(
         position.line,
         position.character,
         &DiagCancelToken::never(),
-        None,
+        Some(&state.package_state.scope_contribution),
     );
 
     // Add visible same-file symbols first so local definitions take precedence
@@ -10496,7 +10501,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             position.line,
             position.character,
             &DiagCancelToken::never(),
-            None,
+            Some(&state.package_state.scope_contribution),
         );
         let all_packages: Vec<String> = scope
             .inherited_packages
@@ -11088,7 +11093,7 @@ pub fn prepare_signature_help(
         position.line,
         position.character,
         &DiagCancelToken::never(),
-        None,
+        Some(&state.package_state.scope_contribution),
     );
 
     /// Try user signature, falling back to a minimal signature with source attribution.
@@ -11423,7 +11428,7 @@ pub fn goto_definition_with_cancel(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel, None);
+    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel, Some(&state.package_state.scope_contribution));
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
