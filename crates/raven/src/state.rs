@@ -428,56 +428,6 @@ fn parse_index(path: &PathBuf) -> Option<Vec<String>> {
     Some(symbols)
 }
 
-#[allow(dead_code)]
-fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<(String, String)> {
-    let mut imports = Vec::new();
-
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return imports,
-    };
-
-    for line in text.lines() {
-        let line = line.trim();
-
-        // import(pkg) - imports all exports from pkg
-        if line.starts_with("import(") {
-            if let Some(args) = line
-                .strip_prefix("import(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                for pkg_name in args.split(',') {
-                    let pkg_name = pkg_name.trim().trim_matches('"');
-                    if let Some(pkg) = library.get(pkg_name) {
-                        for sym in &pkg.exports {
-                            imports.push((pkg_name.to_string(), sym.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        // importFrom(pkg, sym1, sym2, ...)
-        else if line.starts_with("importFrom(") {
-            if let Some(args) = line
-                .strip_prefix("importFrom(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 2 {
-                    // First arg is package name, rest are symbols
-                    let pkg = parts[0].trim_matches('"').to_string();
-                    for sym in &parts[1..] {
-                        let sym = sym.trim_matches('"');
-                        imports.push((pkg.clone(), sym.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    imports
-}
-
 /// Library of installed packages
 #[allow(dead_code)]
 pub struct Library {
@@ -973,70 +923,35 @@ impl WorldState {
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
     ///
+    /// Package-mode state is *not* set from parameters: this function
+    /// resets `self.package_state` to its default (neutral) value, and
+    /// the caller is expected to follow with
+    /// `apply_package_event(PackageInputDelta::Initial)` — which in turn
+    /// derives `workspace` / `namespace_model` / `r_file_facts` /
+    /// `scope_contribution` from `self.package_inputs` via
+    /// `derive_package_state`. This keeps package derivation single-sourced.
+    ///
+    /// Tests and benchmarks that only exercise cross-file / workspace
+    /// scanning behavior (and don't care about package state) can rely on
+    /// the post-reset `PackageState::default()` — they don't need to call
+    /// `apply_package_event` themselves.
+    ///
     /// **Validates: Requirements 11.1, 13.1**
     pub fn apply_workspace_index(
         &mut self,
         index: HashMap<Url, Document>,
-        _imports: Vec<(String, String)>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
-        pkg_workspace: Option<crate::package_namespace::PackageWorkspace>,
-        pkg_ns_model: Option<crate::package_namespace::PackageNamespaceModel>,
     ) {
         self.workspace_index = index;
 
-        // Apply package_mode setting. We replace `self.package_state` atomically
-        // rather than mutating individual fields so that per-mode transitions
-        // never leave stale `r_file_facts` or `scope_contribution` from a
-        // prior mode. The workspace scan provides `pkg_workspace` /
-        // `pkg_ns_model`; other derived fields are rebuilt by
-        // `apply_package_event` (called by the scan completion path) from
-        // `self.package_inputs`.
-        use crate::cross_file::config::PackageMode;
-        let new_workspace;
-        let new_namespace_model;
-        match self.cross_file_config.package_mode {
-            PackageMode::Disabled => {
-                new_workspace = None;
-                new_namespace_model = None;
-            }
-            PackageMode::Enabled => {
-                // Force package mode even without detection.
-                new_workspace = pkg_workspace.or_else(|| {
-                    self.workspace_folders.first()
-                        .and_then(|u| u.to_file_path().ok())
-                        .map(|root| crate::package_namespace::PackageWorkspace {
-                            name: "unknown".to_string(),
-                            root,
-                            roxygen_managed: false,
-                        })
-                });
-                // Ensure namespace model is consistent: if we synthesized a
-                // fallback workspace, provide a default model so downstream
-                // code never sees Some(workspace) + None(model).
-                new_namespace_model = pkg_ns_model.or_else(|| {
-                    if new_workspace.is_some() {
-                        Some(crate::package_namespace::PackageNamespaceModel::default())
-                    } else {
-                        None
-                    }
-                });
-            }
-            PackageMode::Auto => {
-                new_workspace = pkg_workspace;
-                new_namespace_model = pkg_ns_model;
-            }
-        }
-        // Atomic replacement: all non-workspace/namespace fields reset to
-        // neutral defaults. The scan-completion caller follows this with
-        // `apply_package_event`, which repopulates `r_file_facts` and
-        // `scope_contribution` from `package_inputs` via `derive_package_state`.
-        self.package_state = crate::package_state::PackageState {
-            workspace: new_workspace,
-            namespace_model: new_namespace_model,
-            r_file_facts: std::collections::BTreeMap::new(),
-            scope_contribution: crate::package_state::PackageScopeContribution::default(),
-        };
+        // Atomic reset of package state. Per-mode transitions (e.g. toggling
+        // packageMode) must never leave stale `r_file_facts` or
+        // `scope_contribution` from a prior mode, so we always start from a
+        // neutral default here. The scan-completion caller follows this
+        // with `apply_package_event`, which repopulates every field from
+        // `package_inputs` via `derive_package_state`.
+        self.package_state = crate::package_state::PackageState::default();
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -1155,21 +1070,19 @@ impl WorldState {
 ///
 /// Returns:
 /// - `HashMap<Url, Document>` - Legacy index for backward compatibility
-/// - `Vec<(String, String)>` - Workspace imports from NAMESPACE
 /// - `HashMap<Url, crate::cross_file::workspace_index::IndexEntry>` - Cross-file entries (legacy)
 /// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
-/// - `Option<PackageWorkspace>` - Package workspace metadata (if DESCRIPTION found)
-/// - `Option<PackageNamespaceModel>` - Package namespace model (if package mode)
+///
+/// Package-mode state (workspace/namespace model, roxygen cache, NAMESPACE
+/// imports) is intentionally **not** produced here. The canonical derivation
+/// is `derive_package_state`, invoked through `apply_package_event` after
+/// the caller populates `WorldState::package_inputs`.
 ///
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
 pub type WorkspaceScanResult = (
     HashMap<Url, Document>,
-    Vec<(String, String)>,
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
-    Option<crate::package_namespace::PackageWorkspace>,
-    Option<crate::package_namespace::PackageNamespaceModel>,
-    HashMap<PathBuf, crate::roxygen::RoxygenNamespace>,
 );
 
 /// Result of processing a single workspace file (used by parallel scan).
@@ -1420,12 +1333,9 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     // unconditionally overwritten by the `apply_package_event(Initial)`
     // call that follows `apply_workspace_index` in `backend.rs`.
     // The canonical derivation is now single-sourced through the event path
-    // (`PackageInputs` → `derive_package_state`); this function just returns
-    // `None`/empty for the legacy tuple slots so callers need not change.
-    let (pkg_workspace, pkg_ns_model, roxygen_cache) =
-        (None, None, HashMap::new());
+    // (`PackageInputs` → `derive_package_state`).
 
-    (index, Vec::new(), cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)
+    (index, cross_file_entries, new_index_entries)
 }
 
 /// Directories to skip during workspace scanning.
@@ -1470,44 +1380,6 @@ fn is_stat_model_extension(path: &Path) -> bool {
 
 // `scan_directory` was replaced by `collect_file_paths` + `process_workspace_file`
 // for parallel scanning via rayon. See `scan_workspace`.
-
-/// Parse NAMESPACE imports without needing a `Library` reference.
-///
-/// Only handles `importFrom(pkg, sym, ...)`: it returns concrete `(package, symbol)`
-/// pairs. `import(pkg)` (whole-namespace import) is intentionally skipped here
-/// because expanding it requires reading `pkg`'s exports, which this parser has no
-/// access to during the initial workspace scan. The result is passed to
-/// `apply_workspace_index` (as `_imports`, now unused) for backward compatibility
-/// with callers; the canonical import data comes from `PackageScopeContribution`
-/// derived by `derive_package_state`.
-#[allow(dead_code)]
-fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
-    let mut imports = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-
-        // importFrom(pkg, sym1, sym2, ...)
-        // import(pkg) is not handled here — see function docs.
-        if line.starts_with("importFrom(") {
-            if let Some(args) = line
-                .strip_prefix("importFrom(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 2 {
-                    let pkg = parts[0].trim_matches('"').to_string();
-                    for sym in &parts[1..] {
-                        let sym = sym.trim_matches('"');
-                        imports.push((pkg.clone(), sym.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    imports
-}
 
 #[cfg(test)]
 mod tests {

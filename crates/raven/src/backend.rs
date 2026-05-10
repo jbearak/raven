@@ -1266,22 +1266,15 @@ impl LanguageServer for Backend {
 
                 // Apply results when scan completes
                 match scan_result {
-                    Ok((index, imports, cross_file_entries, new_index_entries, pkg_workspace, pkg_ns_model, roxygen_cache)) => {
+                    Ok((index, cross_file_entries, new_index_entries)) => {
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
                             let mut state = state_clone.write().await;
                             state.apply_workspace_index(
                                 index,
-                                imports,
                                 cross_file_entries,
                                 new_index_entries,
-                                pkg_workspace,
-                                pkg_ns_model,
                             );
-                            // roxygen_cache is unused: the event-driven path via
-                            // apply_package_event handles roxygen state derivation.
-                            drop(roxygen_cache);
-
                             // --- Phase 3.9: Populate package_inputs and derive ---
                             // Populate package_inputs from the now-applied workspace index
                             // so that apply_package_event derives correct package state.
@@ -7779,11 +7772,8 @@ mod refresh_packages_tests {
         new_entries.insert(parent_uri.clone(), parent_entry);
         world.apply_workspace_index(
             std::collections::HashMap::new(),
-            Vec::new(),
             std::collections::HashMap::new(),
             new_entries,
-            None,
-            None,
         );
 
         // Sanity: MASS uncached before any prefetch.
