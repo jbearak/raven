@@ -26,12 +26,12 @@ use crate::roxygen::RoxygenNamespace;
 /// Fully derive-based since Phase 5b: all fields are computed by `derive_package_state`.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct PackageState {
-    pub workspace: Option<PackageWorkspace>,
-    pub namespace_model: Option<PackageNamespaceModel>,
+    pub(super) workspace: Option<PackageWorkspace>,
+    pub(super) namespace_model: Option<PackageNamespaceModel>,
 
     // Populated by derive_package_state
-    pub r_file_facts: BTreeMap<PathBuf, RFileFacts>,
-    pub scope_contribution: PackageScopeContribution,
+    pub(super) r_file_facts: BTreeMap<PathBuf, RFileFacts>,
+    pub(super) scope_contribution: PackageScopeContribution,
 }
 
 impl PackageState {
@@ -44,6 +44,32 @@ impl PackageState {
         }
     }
 
+    pub fn workspace(&self) -> Option<&PackageWorkspace> {
+        self.workspace.as_ref()
+    }
+
+    pub fn namespace_model(&self) -> Option<&PackageNamespaceModel> {
+        self.namespace_model.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub fn r_file_facts(&self) -> &BTreeMap<PathBuf, RFileFacts> {
+        &self.r_file_facts
+    }
+
+    pub fn scope_contribution(&self) -> &PackageScopeContribution {
+        &self.scope_contribution
+    }
+
+    /// Replace all derived package-mode state in one step.
+    ///
+    /// `PackageState` fields stay non-public so consumers cannot update one
+    /// derived cache without the others. Event handlers update
+    /// `PackageInputs`, call `derive_package_state`, and then install the
+    /// complete result through this method.
+    pub(super) fn set_from(&mut self, new: PackageState) {
+        *self = new;
+    }
 }
 
 // ============== INPUTS ==============
@@ -124,10 +150,7 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
     let mut comps = rel.components();
     let first = comps.next()?.as_os_str().to_str()?;
 
-    let is_r_extension = matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("R" | "r"),
-    );
+    let is_r_extension = matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"),);
     if !is_r_extension {
         return None;
     }
@@ -161,7 +184,10 @@ mod path_tests {
     #[test]
     fn r_source_path_recognizes_testthat() {
         assert_eq!(
-            is_r_source_path(Path::new("/work/pkg/tests/testthat/test-utils.R"), Path::new("/work/pkg")),
+            is_r_source_path(
+                Path::new("/work/pkg/tests/testthat/test-utils.R"),
+                Path::new("/work/pkg")
+            ),
             Some(RFileKind::Test),
         );
     }
@@ -169,9 +195,18 @@ mod path_tests {
     #[test]
     fn r_source_path_rejects_non_R_files() {
         let root = Path::new("/work/pkg");
-        assert_eq!(is_r_source_path(Path::new("/work/pkg/R/utils.txt"), root), None);
-        assert_eq!(is_r_source_path(Path::new("/work/pkg/inst/data.R"), root), None);
-        assert_eq!(is_r_source_path(Path::new("/elsewhere/utils.R"), root), None);
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/R/utils.txt"), root),
+            None
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/data.R"), root),
+            None
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/elsewhere/utils.R"), root),
+            None
+        );
     }
 
     #[test]
@@ -185,7 +220,10 @@ mod path_tests {
     #[test]
     fn r_source_path_recognizes_subdirs_in_R() {
         assert_eq!(
-            is_r_source_path(Path::new("/work/pkg/R/unix/utils.R"), Path::new("/work/pkg")),
+            is_r_source_path(
+                Path::new("/work/pkg/R/unix/utils.R"),
+                Path::new("/work/pkg")
+            ),
             Some(RFileKind::Source),
         );
     }

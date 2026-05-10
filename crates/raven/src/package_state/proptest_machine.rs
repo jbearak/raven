@@ -11,17 +11,35 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 enum Mutation {
-    SetRFile { path: PathBuf, kind: RFileKind, text: String },
-    DeleteRFile { path: PathBuf },
-    SetNamespace { text: String },
-    SetDescription { text: String },
-    SetMode { mode: PackageMode },
+    SetRFile {
+        path: PathBuf,
+        kind: RFileKind,
+        text: String,
+    },
+    DeleteRFile {
+        path: PathBuf,
+    },
+    SetNamespace {
+        text: String,
+    },
+    SetDescription {
+        text: String,
+    },
+    SetMode {
+        mode: PackageMode,
+    },
 }
 
 fn arb_path() -> impl Strategy<Value = (PathBuf, RFileKind)> {
     prop_oneof![
-        "[a-z]{1,4}".prop_map(|n| (PathBuf::from(format!("/work/pkg/R/{}.R", n)), RFileKind::Source)),
-        "[a-z]{1,4}".prop_map(|n| (PathBuf::from(format!("/work/pkg/tests/testthat/test-{}.R", n)), RFileKind::Test)),
+        "[a-z]{1,4}".prop_map(|n| (
+            PathBuf::from(format!("/work/pkg/R/{}.R", n)),
+            RFileKind::Source
+        )),
+        "[a-z]{1,4}".prop_map(|n| (
+            PathBuf::from(format!("/work/pkg/tests/testthat/test-{}.R", n)),
+            RFileKind::Test
+        )),
     ]
 }
 
@@ -36,25 +54,27 @@ fn arb_r_text() -> impl Strategy<Value = String> {
 
 fn arb_mutation() -> impl Strategy<Value = Mutation> {
     prop_oneof![
-        (arb_path(), arb_r_text()).prop_map(|((path, kind), text)| {
-            Mutation::SetRFile { path, kind, text }
-        }),
+        (arb_path(), arb_r_text())
+            .prop_map(|((path, kind), text)| { Mutation::SetRFile { path, kind, text } }),
         arb_path().prop_map(|(path, _)| Mutation::DeleteRFile { path }),
         prop_oneof![
             Just("import(magrittr)\n".to_string()),
             Just("importFrom(dplyr, filter)\n".to_string()),
             Just("".to_string()),
-        ].prop_map(|text| Mutation::SetNamespace { text }),
+        ]
+        .prop_map(|text| Mutation::SetNamespace { text }),
         prop_oneof![
             Just("Package: foo\n".to_string()),
             Just("Package: bar\n".to_string()),
             Just("# no package\n".to_string()),
-        ].prop_map(|text| Mutation::SetDescription { text }),
+        ]
+        .prop_map(|text| Mutation::SetDescription { text }),
         prop_oneof![
             Just(PackageMode::Auto),
             Just(PackageMode::Enabled),
             Just(PackageMode::Disabled),
-        ].prop_map(|mode| Mutation::SetMode { mode }),
+        ]
+        .prop_map(|mode| Mutation::SetMode { mode }),
     ]
 }
 
@@ -63,16 +83,25 @@ fn apply(inputs: &mut PackageInputs, mutation: &Mutation) -> PackageInputDelta {
         Mutation::SetRFile { path, kind, text } => {
             let arc: Arc<str> = text.as_str().into();
             let digest = ContentDigest::of(&arc);
-            inputs.r_files.insert(path.clone(), RFileInput {
-                            kind: *kind,
-                            text: arc,
-                            content_digest: digest,
-                        });
-            PackageInputDelta::RFileChanged { path: path.clone(), kind: *kind }
+            inputs.r_files.insert(
+                path.clone(),
+                RFileInput {
+                    kind: *kind,
+                    text: arc,
+                    content_digest: digest,
+                },
+            );
+            PackageInputDelta::RFileChanged {
+                path: path.clone(),
+                kind: *kind,
+            }
         }
         Mutation::DeleteRFile { path } => {
             if let Some(prev) = inputs.r_files.remove(path) {
-                PackageInputDelta::RFileDeleted { path: path.clone(), kind: prev.kind }
+                PackageInputDelta::RFileDeleted {
+                    path: path.clone(),
+                    kind: prev.kind,
+                }
             } else {
                 // Absent-path deletion is a no-op: no inputs changed. An empty
                 // `Batch` expresses that exactly, without conflating the
@@ -89,15 +118,15 @@ fn apply(inputs: &mut PackageInputs, mutation: &Mutation) -> PackageInputDelta {
                 None
             } else {
                 Some(NamespaceInput {
-                                    text: text.as_str().into(),
-                                })
+                    text: text.as_str().into(),
+                })
             };
             PackageInputDelta::NamespaceChanged
         }
         Mutation::SetDescription { text } => {
             inputs.description = Some(DescriptionInput {
-                            text: text.as_str().into(),
-                        });
+                text: text.as_str().into(),
+            });
             PackageInputDelta::DescriptionChanged
         }
         Mutation::SetMode { mode } => {
@@ -112,8 +141,8 @@ fn initial_inputs() -> PackageInputs {
         workspace_root: Some("/work/pkg".into()),
         package_mode: PackageMode::Auto,
         description: Some(DescriptionInput {
-                        text: "Package: foo\n".into(),
-                    }),
+            text: "Package: foo\n".into(),
+        }),
         namespace: None,
         r_files: BTreeMap::new(),
     }

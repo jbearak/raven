@@ -545,8 +545,8 @@ fn budget_single_file_completion() {
 
 #[test]
 fn derive_package_state_500_file_keystroke_budget() {
-    use raven::package_state::*;
     use raven::cross_file::config::PackageMode;
+    use raven::package_state::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -566,38 +566,56 @@ fn derive_package_state_500_file_keystroke_budget() {
         let p = root.join("R").join(format!("file_{}.R", i));
         let text: Arc<str> = format!("fn_{} <- function() {}\n", i, i).into();
         let digest = ContentDigest::of(&text);
-        inputs.r_files.insert(p, RFileInput {
-            kind: RFileKind::Source,
-            text,
-            content_digest: digest,
-        });
+        inputs.r_files.insert(
+            p,
+            RFileInput {
+                kind: RFileKind::Source,
+                text,
+                content_digest: digest,
+            },
+        );
     }
-    let s0 = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+    let s0 = derive_package_state(
+        &PackageState::default(),
+        &inputs,
+        &PackageInputDelta::Initial,
+    );
 
     // Single-file delta: change file_42
     let p = root.join("R").join("file_42.R");
     let new_text: Arc<str> = "fn_42 <- function() 99\n".into();
     let new_digest = ContentDigest::of(&new_text);
-    inputs.r_files.insert(p.clone(), RFileInput {
-        kind: RFileKind::Source,
-        text: new_text,
-        content_digest: new_digest,
-    });
+    inputs.r_files.insert(
+        p.clone(),
+        RFileInput {
+            kind: RFileKind::Source,
+            text: new_text,
+            content_digest: new_digest,
+        },
+    );
 
     // Warm-up: JIT/cache priming so the first measured iteration doesn't
     // dominate the max sample.
-    let _ = derive_package_state(&s0, &inputs, &PackageInputDelta::RFileChanged {
-        path: p.clone(),
-        kind: RFileKind::Source,
-    });
+    let _ = derive_package_state(
+        &s0,
+        &inputs,
+        &PackageInputDelta::RFileChanged {
+            path: p.clone(),
+            kind: RFileKind::Source,
+        },
+    );
 
     let mut times = Vec::with_capacity(20);
     for _ in 0..20 {
         let start = Instant::now();
-        let _s = derive_package_state(&s0, &inputs, &PackageInputDelta::RFileChanged {
-            path: p.clone(),
-            kind: RFileKind::Source,
-        });
+        let _s = derive_package_state(
+            &s0,
+            &inputs,
+            &PackageInputDelta::RFileChanged {
+                path: p.clone(),
+                kind: RFileKind::Source,
+            },
+        );
         times.push(start.elapsed());
     }
     times.sort();
@@ -605,7 +623,10 @@ fn derive_package_state_500_file_keystroke_budget() {
     // With only 20 samples, (len * 99 / 100) always picks the last element,
     // so report it as `max` rather than misleadingly labeling it `p99`.
     let max = times.last().cloned().unwrap();
-    eprintln!("derive_package_state 500-file: median={:?} max={:?}", median, max);
+    eprintln!(
+        "derive_package_state 500-file: median={:?} max={:?}",
+        median, max
+    );
     // Generous budget; tighten later. The point of the test is to catch
     // pathological regressions. Use assert_within_budget so CI relaxation
     // (RAVEN_PERF_CI_FACTOR) applies uniformly with the rest of the file.

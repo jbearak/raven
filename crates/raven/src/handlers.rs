@@ -252,7 +252,7 @@ impl DiagnosticsSnapshot {
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
-            scope_contribution: state.package_state.scope_contribution.clone(),
+            scope_contribution: state.package_state.scope_contribution().clone(),
         })
     }
 
@@ -2898,7 +2898,15 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
-    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never(), Some(&state.package_state.scope_contribution)).symbols
+    get_cross_file_scope(
+        state,
+        uri,
+        line,
+        column,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    )
+    .symbols
 }
 
 /// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
@@ -2937,7 +2945,7 @@ pub(crate) fn get_cross_file_scope(
     column: u32,
     cancel: &DiagCancelToken,
     // Package-mode contribution: production LSP/diagnostics paths now pass
-    // `Some(&state.package_state.scope_contribution)` (see
+    // `Some(state.package_state.scope_contribution())` (see
     // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
     // internal and imported symbols are injected into the resolved scope.
     // `None` is an explicit opt-out used by tests and non-package-mode
@@ -2991,7 +2999,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
     cancel: &DiagCancelToken,
     prefix_cache: &mut scope::ParentPrefixCache,
     // Package-mode contribution: production LSP/diagnostics paths now pass
-    // `Some(&state.package_state.scope_contribution)` (see
+    // `Some(state.package_state.scope_contribution())` (see
     // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
     // internal and imported symbols are injected into the resolved scope.
     // `None` is an explicit opt-out used by tests and non-package-mode
@@ -5252,7 +5260,11 @@ fn collect_undefined_variables_from_snapshot(
                     .cloned(),
             );
 
-            if is_package_export(&name, &position_aware_packages_buf, &snapshot.package_library) {
+            if is_package_export(
+                &name,
+                &position_aware_packages_buf,
+                &snapshot.package_library,
+            ) {
                 continue;
             }
 
@@ -9051,8 +9063,7 @@ fn push_scoped_symbol_completion(
     // would fall through to "internal" (the last path segment of
     // `package:///internal`). Treat them like cross-file entries for sort
     // priority but render a package-attribution detail instead of a path.
-    let is_cross_file =
-        is_package_internal || symbol.source_uri.as_str() != request_uri.as_str();
+    let is_cross_file = is_package_internal || symbol.source_uri.as_str() != request_uri.as_str();
     let sort_prefix = if is_cross_file {
         SORT_PREFIX_WORKSPACE
     } else {
@@ -9216,7 +9227,7 @@ pub fn completion(
         position.line,
         position.character,
         &DiagCancelToken::never(),
-        Some(&state.package_state.scope_contribution),
+        Some(state.package_state.scope_contribution()),
     );
 
     // Add visible same-file symbols first so local definitions take precedence
@@ -9270,7 +9281,7 @@ pub fn completion(
         // references to those packages' exports while the completion list
         // doesn't offer them — an asymmetry that forces users to type
         // imported function names from memory.
-        for pkg in state.package_state.scope_contribution.full_imports.iter() {
+        for pkg in state.package_state.scope_contribution().full_imports.iter() {
             if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
             }
@@ -10425,7 +10436,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             position.line,
             position.character,
             &DiagCancelToken::never(),
-            Some(&state.package_state.scope_contribution),
+            Some(state.package_state.scope_contribution()),
         );
         let all_packages: Vec<String> = scope
             .inherited_packages
@@ -11017,7 +11028,7 @@ pub fn prepare_signature_help(
         position.line,
         position.character,
         &DiagCancelToken::never(),
-        Some(&state.package_state.scope_contribution),
+        Some(state.package_state.scope_contribution()),
     );
 
     /// Try user signature, falling back to a minimal signature with source attribution.
@@ -11352,7 +11363,14 @@ pub fn goto_definition_with_cancel(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel, Some(&state.package_state.scope_contribution));
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        cancel,
+        Some(state.package_state.scope_contribution()),
+    );
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
@@ -14211,12 +14229,17 @@ clean_data <- function(x) {
             // `helper_fn` and the scan has already derived the contribution.
             let mut internal = BTreeSet::new();
             internal.insert("helper_fn".to_string());
-            state.package_state.scope_contribution = PackageScopeContribution {
-                workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
-                r_internal_symbols: std::sync::Arc::new(internal),
-                imported_symbols: Default::default(),
-                full_imports: Default::default(),
-            };
+            state
+                .package_state
+                .set_from(crate::package_state::PackageState {
+                    scope_contribution: PackageScopeContribution {
+                        workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        r_internal_symbols: std::sync::Arc::new(internal),
+                        imported_symbols: Default::default(),
+                        full_imports: Default::default(),
+                    },
+                    ..Default::default()
+                });
 
             // Open `R/main.R` under the package.
             let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
@@ -14283,12 +14306,17 @@ clean_data <- function(x) {
                 .await;
             let mut full = BTreeSet::new();
             full.insert("ggplot2".to_string());
-            state.package_state.scope_contribution = PackageScopeContribution {
-                workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
-                r_internal_symbols: Default::default(),
-                imported_symbols: Default::default(),
-                full_imports: std::sync::Arc::new(full),
-            };
+            state
+                .package_state
+                .set_from(crate::package_state::PackageState {
+                    scope_contribution: PackageScopeContribution {
+                        workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        r_internal_symbols: Default::default(),
+                        imported_symbols: Default::default(),
+                        full_imports: std::sync::Arc::new(full),
+                    },
+                    ..Default::default()
+                });
 
             let uri = Url::parse("file:///work/pkg/R/plot.R").unwrap();
             let code = "p <- g";
@@ -14341,19 +14369,28 @@ clean_data <- function(x) {
         let mut pkgs = BTreeSet::new();
         pkgs.insert("tidyr".to_string());
         imported.insert("pivot_longer".to_string(), pkgs);
-        state.package_state.scope_contribution = PackageScopeContribution {
-            workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
-            r_internal_symbols: Default::default(),
-            imported_symbols: std::sync::Arc::new(imported),
-            full_imports: Default::default(),
-        };
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: std::sync::Arc::new(imported),
+                    full_imports: Default::default(),
+                },
+                ..Default::default()
+            });
 
         let code = "x <- pivot_longer(df)\ny <- totally_undefined_baseline()\n";
         let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
-        state.documents.insert(uri.clone(), Document::new(code, None));
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
         let tree = {
             let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
             parser.parse(code, None).unwrap()
         };
 
@@ -14377,7 +14414,10 @@ clean_data <- function(x) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. messages: {:?}",
-            diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
         );
         assert!(
             !diagnostics
@@ -14385,7 +14425,10 @@ clean_data <- function(x) {
                 .any(|d| d.message == "Undefined variable: pivot_longer"),
             "importFrom(tidyr, pivot_longer) in the package NAMESPACE must suppress \
              `Undefined variable: pivot_longer` for R/ files. messages: {:?}",
-            diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -14404,19 +14447,28 @@ clean_data <- function(x) {
 
         let mut internal = BTreeSet::new();
         internal.insert("helper_fn".to_string());
-        state.package_state.scope_contribution = PackageScopeContribution {
-            workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
-            r_internal_symbols: std::sync::Arc::new(internal),
-            imported_symbols: Default::default(),
-            full_imports: Default::default(),
-        };
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: std::sync::Arc::new(internal),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                },
+                ..Default::default()
+            });
 
         let code = "x <- helper_fn()\n";
         let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
-        state.documents.insert(uri.clone(), Document::new(code, None));
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
         let tree = {
             let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
             parser.parse(code, None).unwrap()
         };
 
@@ -14439,7 +14491,10 @@ clean_data <- function(x) {
                 .any(|d| d.message == "Undefined variable: helper_fn"),
             "r_internal_symbols must suppress undefined-variable for R/ files. \
              messages: {:?}",
-            diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
         );
     }
 

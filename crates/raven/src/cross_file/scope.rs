@@ -17307,10 +17307,11 @@ mod package_contribution_tests {
         internal: &[&str],
         imported: &[&str],
     ) -> PackageScopeContribution {
-        let r_internal_symbols: BTreeSet<String> =
-            internal.iter().map(|s| s.to_string()).collect();
-        let imported_symbols: BTreeMap<String, BTreeSet<String>> =
-            imported.iter().map(|s| (s.to_string(), BTreeSet::new())).collect();
+        let r_internal_symbols: BTreeSet<String> = internal.iter().map(|s| s.to_string()).collect();
+        let imported_symbols: BTreeMap<String, BTreeSet<String>> = imported
+            .iter()
+            .map(|s| (s.to_string(), BTreeSet::new()))
+            .collect();
         PackageScopeContribution {
             workspace_root: Some(std::path::PathBuf::from(workspace_root_path)),
             r_internal_symbols: Arc::new(r_internal_symbols),
@@ -17348,7 +17349,8 @@ mod package_contribution_tests {
                 None
             }
         };
-        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
         let graph = super::super::dependency::DependencyGraph::new();
 
         // Without contribution, `helper` is NOT in scope.
@@ -17421,9 +17423,14 @@ mod package_contribution_tests {
         let main_arts = artifacts_for(&main_uri, main_code);
 
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &main_uri { Some(main_arts.clone()) } else { None }
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
         };
-        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
         let graph = super::super::dependency::DependencyGraph::new();
 
         // Without contribution, `filter` is not in scope (no library() call).
@@ -17487,9 +17494,14 @@ mod package_contribution_tests {
         let script_arts = artifacts_for(&script_uri, script_code);
 
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &script_uri { Some(script_arts.clone()) } else { None }
+            if u == &script_uri {
+                Some(script_arts.clone())
+            } else {
+                None
+            }
         };
-        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
         let graph = super::super::dependency::DependencyGraph::new();
 
         let contrib = make_contribution("/work/pkg", &["helper"], &[]);
@@ -17532,9 +17544,14 @@ mod package_contribution_tests {
         let test_arts = artifacts_for(&test_uri, test_code);
 
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &test_uri { Some(test_arts.clone()) } else { None }
+            if u == &test_uri {
+                Some(test_arts.clone())
+            } else {
+                None
+            }
         };
-        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
         let graph = super::super::dependency::DependencyGraph::new();
 
         // Without contribution, `helper` is NOT in scope.
@@ -17615,9 +17632,14 @@ mod package_contribution_tests {
         let main_arts = artifacts_for(&main_uri, main_code);
 
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &main_uri { Some(main_arts.clone()) } else { None }
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
         };
-        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
         let graph = super::super::dependency::DependencyGraph::new();
 
         // A correctly-derived contribution will NOT carry `test_helper` (derive
@@ -17662,9 +17684,14 @@ mod package_contribution_tests {
         let main_arts = artifacts_for(&main_uri, main_code);
 
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &main_uri { Some(main_arts.clone()) } else { None }
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
         };
-        let get_metadata = |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
         let graph = super::super::dependency::DependencyGraph::new();
 
         // Contribution also carries `helper` as a Function-kind synthetic symbol.

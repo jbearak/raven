@@ -1,21 +1,19 @@
-//! R package workspace detection and namespace model.
+//! Namespace parsing for R package mode.
 //!
-//! When the workspace root contains a `DESCRIPTION` file, Raven activates
-//! "package mode": all `R/*.R` files are treated as mutually visible (flat
-//! namespace), and imports declared via roxygen annotations or the NAMESPACE
-//! file suppress undefined-variable diagnostics for external package symbols.
-//!
-//! Detection heuristic for roxygen-managed packages: if any `R/*.R` file
-//! contains `#' @export`, the package is considered roxygen-managed and
-//! namespace tags are parsed from source rather than the NAMESPACE file.
+//! Package-mode activation is derived in `package_state`: `Auto` mode requires
+//! a workspace root plus a DESCRIPTION `Package:` field, `Enabled` mode allows
+//! a workspace root without DESCRIPTION metadata, and `Disabled` mode never
+//! activates package semantics. Roxygen tags are not an activation heuristic.
+//! When package mode is active, namespace data is merged from NAMESPACE and
+//! roxygen tags on source files so both generated and hand-written namespace
+//! declarations contribute to diagnostic suppression and completion.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-static ROXYGEN_EXPORT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex")
-});
+static ROXYGEN_EXPORT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex"));
 
 /// Metadata about the detected R package workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,15 +22,21 @@ pub struct PackageWorkspace {
     pub name: String,
     /// Absolute path to the workspace root (where DESCRIPTION lives).
     pub root: PathBuf,
-    /// Whether the package uses roxygen2 (any R/*.R file has `#' @export`).
+    /// Legacy roxygen-management hint.
+    ///
+    /// The current derived package-state path merges roxygen tags with
+    /// NAMESPACE content unconditionally, so this flag is retained only for
+    /// compatibility with older test-only detection helpers in this module.
     pub roxygen_managed: bool,
 }
 
 /// Unified namespace model for an R package.
 ///
-/// Built from either roxygen annotations (when `roxygen_managed`) or the
-/// NAMESPACE file. Used to determine which symbols the package exports and
-/// which external package symbols are available without qualification.
+/// Built by reconciling the NAMESPACE file with roxygen namespace tags from
+/// package source files. Duplicate imports are deduplicated during the merge,
+/// while exports naturally collapse through the `HashSet`. Used to determine
+/// which symbols the package exports and which external package symbols are
+/// available without qualification.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackageNamespaceModel {
     /// Symbols this package exports (for informational purposes; mutual
@@ -44,11 +48,14 @@ pub struct PackageNamespaceModel {
     pub full_imports: Vec<String>,
 }
 
-/// Detect whether the workspace root is an R package.
+/// Test-only legacy detector for DESCRIPTION-based package workspaces.
 ///
 /// Returns `Some(PackageWorkspace)` if a valid DESCRIPTION file with a
 /// `Package:` field exists at `workspace_root`. The `roxygen_managed` flag
 /// is set by scanning `R/*.R` files for `#' @export`.
+///
+/// Production package-mode activation is handled by `package_state` and must
+/// not use this helper as a substitute for the `PackageMode`-aware criteria.
 #[cfg(test)]
 pub fn detect_package_workspace(workspace_root: &Path) -> Option<PackageWorkspace> {
     let description_path = workspace_root.join("DESCRIPTION");
@@ -76,7 +83,9 @@ pub fn detect_package_workspace_with_content<'a>(
     let content = std::fs::read_to_string(&description_path).ok()?;
     let name = parse_dcf_field(&content, "Package")?;
 
-    let roxygen_managed = r_file_contents.into_iter().any(|c| ROXYGEN_EXPORT_RE.is_match(c));
+    let roxygen_managed = r_file_contents
+        .into_iter()
+        .any(|c| ROXYGEN_EXPORT_RE.is_match(c));
 
     Some(PackageWorkspace {
         name,
@@ -235,17 +244,29 @@ fn count_unquoted_parens(s: &str) -> (usize, usize) {
         }
         match in_quote {
             // Backtick-quoted names don't support escape sequences in R
-            Some('`') if c == '`' => { in_quote = None; }
+            Some('`') if c == '`' => {
+                in_quote = None;
+            }
             Some('`') => {}
-            Some(_) if c == '\\' => { escape_next = true; }
-            Some(q) if c == q => { in_quote = None; }
+            Some(_) if c == '\\' => {
+                escape_next = true;
+            }
+            Some(q) if c == q => {
+                in_quote = None;
+            }
             Some(_) => {}
             None => match c {
-                '"' | '\'' | '`' => { in_quote = Some(c); }
-                '(' => { open += 1; }
-                ')' => { close += 1; }
+                '"' | '\'' | '`' => {
+                    in_quote = Some(c);
+                }
+                '(' => {
+                    open += 1;
+                }
+                ')' => {
+                    close += 1;
+                }
                 _ => {}
-            }
+            },
         }
     }
     (open, close)
@@ -376,10 +397,14 @@ impl<'a> Iterator for SplitArgs<'a> {
                         i += 1;
                     }
                 }
-                Some(q) if b == q => { in_quote = None; }
+                Some(q) if b == q => {
+                    in_quote = None;
+                }
                 Some(_) => {}
                 None => match b {
-                    b'"' | b'\'' => { in_quote = Some(b); }
+                    b'"' | b'\'' => {
+                        in_quote = Some(b);
+                    }
                     b',' => {
                         let item = self.s[start..i].trim();
                         self.pos = i + 1;
@@ -515,9 +540,18 @@ S3method(print, myclass)
     #[test]
     fn strip_trailing_comment_respects_quoted_hash() {
         // # inside a quoted string should NOT be treated as a comment
-        assert_eq!(strip_trailing_comment(r#"exportPattern("^[^#].*")"#), r#"exportPattern("^[^#].*")"#);
-        assert_eq!(strip_trailing_comment(r#"export(foo) # comment"#), "export(foo)");
-        assert_eq!(strip_trailing_comment(r#"export("a#b")"#), r#"export("a#b")"#);
+        assert_eq!(
+            strip_trailing_comment(r#"exportPattern("^[^#].*")"#),
+            r#"exportPattern("^[^#].*")"#
+        );
+        assert_eq!(
+            strip_trailing_comment(r#"export(foo) # comment"#),
+            "export(foo)"
+        );
+        assert_eq!(
+            strip_trailing_comment(r#"export("a#b")"#),
+            r#"export("a#b")"#
+        );
         // Single-quoted
         assert_eq!(strip_trailing_comment("export('a#b')"), "export('a#b')");
     }
@@ -536,10 +570,22 @@ S3method(print, myclass)
         // export() with quoted names should strip quotes
         let content = "export(\"%>%\")\nexport('my_func')\nexport(plain)\n";
         let model = namespace_model_from_content(content);
-        assert!(model.exports.contains("%>%"), "should unquote double-quoted export");
-        assert!(model.exports.contains("my_func"), "should unquote single-quoted export");
-        assert!(model.exports.contains("plain"), "should keep unquoted export");
-        assert!(!model.exports.contains("\"%>%\""), "should NOT contain quoted form");
+        assert!(
+            model.exports.contains("%>%"),
+            "should unquote double-quoted export"
+        );
+        assert!(
+            model.exports.contains("my_func"),
+            "should unquote single-quoted export"
+        );
+        assert!(
+            model.exports.contains("plain"),
+            "should keep unquoted export"
+        );
+        assert!(
+            !model.exports.contains("\"%>%\""),
+            "should NOT contain quoted form"
+        );
     }
 
     #[test]
@@ -547,8 +593,14 @@ S3method(print, myclass)
         // S3method() with quoted generic/class should strip quotes
         let content = "S3method(\"[\", myclass)\nS3method(print, \"my.class\")\n";
         let model = namespace_model_from_content(content);
-        assert!(model.exports.contains("[.myclass"), "should unquote generic in S3method");
-        assert!(model.exports.contains("print.my.class"), "should unquote class in S3method");
+        assert!(
+            model.exports.contains("[.myclass"),
+            "should unquote generic in S3method"
+        );
+        assert!(
+            model.exports.contains("print.my.class"),
+            "should unquote class in S3method"
+        );
     }
 
     #[test]
@@ -556,8 +608,10 @@ S3method(print, myclass)
         // Blank lines inside a multiline directive should not break joining
         let content = "importFrom(dplyr,\n\n  mutate,\n  filter)\nexport(foo)\n";
         let model = namespace_model_from_content(content);
-        assert!(model.imports.contains(&("dplyr".into(), "mutate".into())),
-            "blank line inside multiline directive should not break parsing");
+        assert!(
+            model.imports.contains(&("dplyr".into(), "mutate".into())),
+            "blank line inside multiline directive should not break parsing"
+        );
         assert!(model.imports.contains(&("dplyr".into(), "filter".into())));
         assert!(model.exports.contains("foo"));
     }
@@ -581,13 +635,17 @@ S3method(print, myclass)
     fn parse_dcf_field_continuation_lines() {
         // Value entirely on continuation line
         let content = "Title:\n    My Package Title\nVersion: 1.0.0\n";
-        assert_eq!(parse_dcf_field(content, "Title"), Some("My Package Title".into()));
+        assert_eq!(
+            parse_dcf_field(content, "Title"),
+            Some("My Package Title".into())
+        );
     }
 
     #[test]
     fn parse_dcf_field_multiline_value() {
         // Value split across multiple continuation lines
-        let content = "Description: A package\n    that does things\n    and more things\nVersion: 1.0.0\n";
+        let content =
+            "Description: A package\n    that does things\n    and more things\nVersion: 1.0.0\n";
         assert_eq!(
             parse_dcf_field(content, "Description"),
             Some("A package that does things and more things".into())
@@ -663,7 +721,10 @@ S3method(print, myclass)
         // An export with a comma in the quoted name should parse as one symbol
         let content = "export(\"a,b\")\nexport(foo)\n";
         let model = namespace_model_from_content(content);
-        assert!(model.exports.contains("a,b"), "quoted comma should not split");
+        assert!(
+            model.exports.contains("a,b"),
+            "quoted comma should not split"
+        );
         assert!(model.exports.contains("foo"));
         assert_eq!(model.exports.len(), 2);
     }
@@ -677,12 +738,16 @@ S3method(print, myclass)
         let content = "importClassesFrom(Matrix, dgCMatrix, dgTMatrix)\n";
         let model = namespace_model_from_content(content);
         assert!(
-            model.imports.contains(&("Matrix".to_string(), "dgCMatrix".to_string())),
+            model
+                .imports
+                .contains(&("Matrix".to_string(), "dgCMatrix".to_string())),
             "importClassesFrom must populate imports: {:?}",
             model.imports,
         );
         assert!(
-            model.imports.contains(&("Matrix".to_string(), "dgTMatrix".to_string())),
+            model
+                .imports
+                .contains(&("Matrix".to_string(), "dgTMatrix".to_string())),
             "multiple class args must all be added: {:?}",
             model.imports,
         );
@@ -694,12 +759,16 @@ S3method(print, myclass)
         let content = "importMethodsFrom(methods, show, initialize)\n";
         let model = namespace_model_from_content(content);
         assert!(
-            model.imports.contains(&("methods".to_string(), "show".to_string())),
+            model
+                .imports
+                .contains(&("methods".to_string(), "show".to_string())),
             "importMethodsFrom must populate imports: {:?}",
             model.imports,
         );
         assert!(
-            model.imports.contains(&("methods".to_string(), "initialize".to_string())),
+            model
+                .imports
+                .contains(&("methods".to_string(), "initialize".to_string())),
             "multiple method args must all be added: {:?}",
             model.imports,
         );
@@ -714,7 +783,9 @@ S3method(print, myclass)
         let content = "importFrom(magrittr, `%>%`)\n";
         let model = namespace_model_from_content(content);
         assert!(
-            model.imports.contains(&("magrittr".to_string(), "%>%".to_string())),
+            model
+                .imports
+                .contains(&("magrittr".to_string(), "%>%".to_string())),
             "backtick-quoted `%>%` must be unquoted in imports: {:?}",
             model.imports,
         );
@@ -730,10 +801,7 @@ S3method(print, myclass)
             strip_trailing_comment("export(`%#%`) # op export"),
             "export(`%#%`)"
         );
-        assert_eq!(
-            strip_trailing_comment("export(`%#%`)"),
-            "export(`%#%`)"
-        );
+        assert_eq!(strip_trailing_comment("export(`%#%`)"), "export(`%#%`)");
     }
 
     #[test]

@@ -545,7 +545,7 @@ pub struct WorldState {
     /// dependency mode, undefined variable diagnostics are deferred for files
     /// without explicit backward directives until this flag is true.
     pub workspace_scan_complete: bool,
-    /// Container for all derived R package mode state. See package_state.rs.
+    /// Container for all derived R package mode state. See package_state/mod.rs.
     pub package_state: crate::package_state::PackageState,
     /// Inputs to the package-mode `derive` function. Updated by event handlers
     /// before calling `apply_package_event`. See package_state::PackageInputs.
@@ -555,18 +555,19 @@ pub struct WorldState {
 impl WorldState {
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
-        self.package_state.workspace.as_ref()
+        self.package_state.workspace()
     }
 
     /// Apply a `PackageInputDelta` produced by an event handler.
     /// Caller has already mutated `self.package_inputs` to reflect the event.
     /// Recomputes `package_state` as a pure function of inputs.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
-        self.package_state = crate::package_state::derive_package_state(
+        let new_package_state = crate::package_state::derive_package_state(
             &self.package_state,
             &self.package_inputs,
             delta,
         );
+        self.package_state.set_from(new_package_state);
     }
 }
 
@@ -680,7 +681,6 @@ impl WorldState {
         self.help_cache.drain();
         self.html_help_cache.drain();
     }
-
 
     /// Create a content provider for this state
     ///

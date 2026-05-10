@@ -1344,14 +1344,13 @@ impl LanguageServer for Backend {
                             // so that apply_package_event derives correct package state.
                             if let Some(root) = root_for_pkg_inputs.clone() {
                                 state.package_inputs.workspace_root = Some(root.clone());
-                                state.package_inputs.package_mode = state.cross_file_config.package_mode;
+                                state.package_inputs.package_mode =
+                                    state.cross_file_config.package_mode;
 
-                                state.package_inputs.description = desc_text.map(|text| {
-                                    crate::package_state::DescriptionInput { text }
-                                });
-                                state.package_inputs.namespace = ns_text.map(|text| {
-                                    crate::package_state::NamespaceInput { text }
-                                });
+                                state.package_inputs.description = desc_text
+                                    .map(|text| crate::package_state::DescriptionInput { text });
+                                state.package_inputs.namespace = ns_text
+                                    .map(|text| crate::package_state::NamespaceInput { text });
 
                                 // Populate r_files from the workspace index (includes all scanned
                                 // R files with their content). Open documents are authoritative
@@ -1359,10 +1358,14 @@ impl LanguageServer for Backend {
                                 let open_uris: std::collections::HashSet<Url> =
                                     state.documents.keys().cloned().collect();
                                 let open_versions: std::collections::HashMap<Url, (i32, String)> =
-                                    open_uris.iter()
+                                    open_uris
+                                        .iter()
                                         .filter_map(|u| {
                                             let doc = state.documents.get(u)?;
-                                            Some((u.clone(), (doc.version.unwrap_or(0), doc.text())))
+                                            Some((
+                                                u.clone(),
+                                                (doc.version.unwrap_or(0), doc.text()),
+                                            ))
                                         })
                                         .collect();
 
@@ -1371,19 +1374,27 @@ impl LanguageServer for Backend {
                                 let ws_uris: Vec<Url> = state.workspace_index_new.uris();
                                 for uri in &ws_uris {
                                     if let Ok(path) = uri.to_file_path() {
-                                        if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                                        if let Some(kind) =
+                                            crate::package_state::is_r_source_path(&path, &root)
+                                        {
                                             // Skip open files — handle them separately below.
                                             if open_uris.contains(uri) {
                                                 continue;
                                             }
-                                            if let Some(entry) = state.workspace_index_new.get(uri) {
-                                                let text: std::sync::Arc<str> = entry.contents.to_string().into();
-                                                let digest = crate::package_state::ContentDigest::of(&text);
-                                                new_r_files.insert(path, crate::package_state::RFileInput {
-                                                    kind,
-                                                    text,
-                                                    content_digest: digest,
-                                                });
+                                            if let Some(entry) = state.workspace_index_new.get(uri)
+                                            {
+                                                let text: std::sync::Arc<str> =
+                                                    entry.contents.to_string().into();
+                                                let digest =
+                                                    crate::package_state::ContentDigest::of(&text);
+                                                new_r_files.insert(
+                                                    path,
+                                                    crate::package_state::RFileInput {
+                                                        kind,
+                                                        text,
+                                                        content_digest: digest,
+                                                    },
+                                                );
                                             }
                                         }
                                     }
@@ -1391,15 +1402,22 @@ impl LanguageServer for Backend {
                                 // Override / add open documents (authoritative; unsaved edits).
                                 for (uri, (version, text_str)) in &open_versions {
                                     if let Ok(path) = uri.to_file_path() {
-                                        if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
+                                        if let Some(kind) =
+                                            crate::package_state::is_r_source_path(&path, &root)
+                                        {
                                             let _ = version; // version tracked upstream; no longer stored on RFileInput
-                                            let text: std::sync::Arc<str> = text_str.as_str().into();
-                                            let digest = crate::package_state::ContentDigest::of(&text);
-                                            new_r_files.insert(path, crate::package_state::RFileInput {
-                                                kind,
-                                                text,
-                                                content_digest: digest,
-                                            });
+                                            let text: std::sync::Arc<str> =
+                                                text_str.as_str().into();
+                                            let digest =
+                                                crate::package_state::ContentDigest::of(&text);
+                                            new_r_files.insert(
+                                                path,
+                                                crate::package_state::RFileInput {
+                                                    kind,
+                                                    text,
+                                                    content_digest: digest,
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -1407,7 +1425,9 @@ impl LanguageServer for Backend {
                             }
 
                             // Derive package state from the populated inputs.
-                            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+                            state.apply_package_event(
+                                &crate::package_state::PackageInputDelta::Initial,
+                            );
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
                             // and snapshot trigger versions while we hold the lock.
@@ -1866,10 +1886,9 @@ impl LanguageServer for Backend {
                     uri: uri.clone(),
                     text: arc_text,
                 };
-                if let Some(delta) = crate::package_state::event::translate(
-                    &mut state.package_inputs,
-                    event,
-                ) {
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
                     state.apply_package_event(&delta);
                 }
             }
@@ -2749,17 +2768,17 @@ impl LanguageServer for Backend {
                     .map(|d| d.text())
                     .unwrap_or_default()
                     .into();
-                let old_ns_model = state.package_state.namespace_model.clone();
+                let old_ns_model = state.package_state.namespace_model().cloned();
                 let event = crate::package_state::event::HandlerEvent::DidChange {
                     uri: uri.clone(),
                     text,
                 };
-                if let Some(delta) = crate::package_state::event::translate(
-                    &mut state.package_inputs,
-                    event,
-                ) {
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
                     state.apply_package_event(&delta);
-                    package_namespace_changed = state.package_state.namespace_model != old_ns_model;
+                    package_namespace_changed =
+                        state.package_state.namespace_model() != old_ns_model.as_ref();
                 }
             }
 
@@ -3095,8 +3114,8 @@ impl LanguageServer for Backend {
             // resolved against the unsaved buffer must refresh their diagnostics
             // when the buffer-only symbols disappear; otherwise stale "no error"
             // diagnostics linger until the user touches each sibling.
-            let old_ns_model = state.package_state.namespace_model.clone();
-            let old_contribution = state.package_state.scope_contribution.clone();
+            let old_ns_model = state.package_state.namespace_model().cloned();
+            let old_contribution = state.package_state.scope_contribution().clone();
 
             // In package mode, update the package state when an R/*.R file
             // closes so stale exports from the editing session are replaced by
@@ -3122,10 +3141,9 @@ impl LanguageServer for Backend {
                     uri: uri.clone(),
                     on_disk_text,
                 };
-                if let Some(delta) = crate::package_state::event::translate(
-                    &mut state.package_inputs,
-                    event,
-                ) {
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
                     state.apply_package_event(&delta);
                 }
             }
@@ -3137,9 +3155,9 @@ impl LanguageServer for Backend {
             // recomputed. Mirrors the watched-file fanout above (including
             // `max_revalidations_per_trigger`).
             let mut sibling_fanout: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
-            let pkg_visibility_changed =
-                state.package_state.namespace_model != old_ns_model
-                    || state.package_state.scope_contribution != old_contribution;
+            let pkg_visibility_changed = state.package_state.namespace_model()
+                != old_ns_model.as_ref()
+                || state.package_state.scope_contribution() != &old_contribution;
             if pkg_visibility_changed {
                 if let Some(root) = state.package_inputs.workspace_root.clone() {
                     sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
@@ -3153,7 +3171,10 @@ impl LanguageServer for Backend {
 
             // Invalidate the workspace index entry so the next scan re-reads from disk.
             if let Ok(p) = uri.to_file_path() {
-                if state.package_workspace().is_some_and(|pkg| p.starts_with(pkg.root.join("R"))) {
+                if state
+                    .package_workspace()
+                    .is_some_and(|pkg| p.starts_with(pkg.root.join("R")))
+                {
                     state.cross_file_workspace_index.invalidate(uri);
                 }
             }
@@ -3327,11 +3348,11 @@ impl LanguageServer for Backend {
                 use crate::cross_file::config::PackageMode;
                 let mode = state.cross_file_config.package_mode;
                 // Translate the setting change — updates package_inputs.package_mode.
-                let event = crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
-                if let Some(delta) = crate::package_state::event::translate(
-                    &mut state.package_inputs,
-                    event,
-                ) {
+                let event =
+                    crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
                     if mode == PackageMode::Disabled {
                         // Derive immediately: effective_workspace returns None for Disabled.
                         state.apply_package_event(&delta);
@@ -3339,7 +3360,10 @@ impl LanguageServer for Backend {
                     } else {
                         // Need to repopulate description/namespace from disk outside the
                         // lock; capture root so caller can do the I/O.
-                        state.workspace_folders.first().and_then(|u| u.to_file_path().ok())
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|u| u.to_file_path().ok())
                     }
                 } else {
                     None
@@ -3403,9 +3427,11 @@ impl LanguageServer for Backend {
         if let Some(root) = pkg_mode_io_needed {
             let root_clone = root.clone();
             let (desc_text, ns_text) = tokio::task::spawn_blocking(move || {
-                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION")).ok()
+                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                    .ok()
                     .map(|s| std::sync::Arc::from(s.as_str()));
-                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE")).ok()
+                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                    .ok()
                     .map(|s| std::sync::Arc::from(s.as_str()));
                 (desc, ns)
             })
@@ -3416,12 +3442,10 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             // Repopulate description/namespace inputs with fresh disk content.
             state.package_inputs.workspace_root = Some(root.clone());
-            state.package_inputs.description = desc_text.map(|text| {
-                crate::package_state::DescriptionInput { text }
-            });
-            state.package_inputs.namespace = ns_text.map(|text| {
-                crate::package_state::NamespaceInput { text }
-            });
+            state.package_inputs.description =
+                desc_text.map(|text| crate::package_state::DescriptionInput { text });
+            state.package_inputs.namespace =
+                ns_text.map(|text| crate::package_state::NamespaceInput { text });
             // Hydrate r_files from the workspace index first (includes closed
             // R/*.R siblings already scanned to disk) so a packageMode switch
             // doesn't leave closed files out of the derived package state.
@@ -3444,11 +3468,14 @@ impl LanguageServer for Backend {
                         if let Some(entry) = state.workspace_index_new.get(uri) {
                             let text: std::sync::Arc<str> = entry.contents.to_string().into();
                             let digest = crate::package_state::ContentDigest::of(&text);
-                            state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
-                                kind,
-                                text,
-                                content_digest: digest,
-                            });
+                            state.package_inputs.r_files.insert(
+                                path,
+                                crate::package_state::RFileInput {
+                                    kind,
+                                    text,
+                                    content_digest: digest,
+                                },
+                            );
                         }
                     }
                 }
@@ -3458,16 +3485,21 @@ impl LanguageServer for Backend {
             for uri in &open_uris_for_mode {
                 if let Ok(path) = uri.to_file_path() {
                     if let Some(kind) = crate::package_state::is_r_source_path(&path, &root) {
-                        let text: std::sync::Arc<str> = state.documents.get(uri)
+                        let text: std::sync::Arc<str> = state
+                            .documents
+                            .get(uri)
                             .map(|d| d.text())
                             .unwrap_or_default()
                             .into();
                         let digest = crate::package_state::ContentDigest::of(&text);
-                        state.package_inputs.r_files.insert(path, crate::package_state::RFileInput {
-                            kind,
-                            text,
-                            content_digest: digest,
-                        });
+                        state.package_inputs.r_files.insert(
+                            path,
+                            crate::package_state::RFileInput {
+                                kind,
+                                text,
+                                content_digest: digest,
+                            },
+                        );
                     }
                 }
             }
@@ -3628,7 +3660,11 @@ impl LanguageServer for Backend {
         }
 
         // Collect URIs to update and affected open documents
-        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (Vec<Url>, Vec<Url>, Vec<(Url, bool)>) = {
+        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (
+            Vec<Url>,
+            Vec<Url>,
+            Vec<(Url, bool)>,
+        ) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
             let mut affected: Vec<Url> = Vec::new();
@@ -3724,11 +3760,12 @@ impl LanguageServer for Backend {
                         // The event-driven path in the post-loop block handles the derive.
                         // (Accumulated here; apply_package_event called once after the loop.)
                         {
-                            let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                                uri: uri.clone(),
-                                on_disk_text: None,
-                                deleted: true,
-                            };
+                            let event =
+                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                    uri: uri.clone(),
+                                    on_disk_text: None,
+                                    deleted: true,
+                                };
                             if crate::package_state::event::translate(
                                 &mut state.package_inputs,
                                 event,
@@ -3787,19 +3824,26 @@ impl LanguageServer for Backend {
             // Identify DESCRIPTION/NAMESPACE changes for the event-driven path.
             // Content is read outside the lock (spawn_blocking) below.
             let pkg_manifest_changes: Vec<(Url, bool)> = {
-                let workspace_root = state.workspace_folders.first().and_then(|u| u.to_file_path().ok());
-                workspace_root.map(|root| {
-                    params.changes.iter()
-                        .filter_map(|c| {
-                            let p = c.uri.to_file_path().ok()?;
-                            if p == root.join("DESCRIPTION") || p == root.join("NAMESPACE") {
-                                Some((c.uri.clone(), c.typ == FileChangeType::DELETED))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                }).unwrap_or_default()
+                let workspace_root = state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok());
+                workspace_root
+                    .map(|root| {
+                        params
+                            .changes
+                            .iter()
+                            .filter_map(|c| {
+                                let p = c.uri.to_file_path().ok()?;
+                                if p == root.join("DESCRIPTION") || p == root.join("NAMESPACE") {
+                                    Some((c.uri.clone(), c.typ == FileChangeType::DELETED))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
             };
 
             (to_update, affected, pkg_manifest_changes)
@@ -3818,7 +3862,8 @@ impl LanguageServer for Backend {
                     if let Some(path) = path {
                         let path_clone = path.clone();
                         tokio::task::spawn_blocking(move || {
-                            std::fs::read_to_string(path_clone).ok()
+                            std::fs::read_to_string(path_clone)
+                                .ok()
                                 .map(|s| std::sync::Arc::from(s.as_str()))
                         })
                         .await
@@ -3839,10 +3884,9 @@ impl LanguageServer for Backend {
                     on_disk_text,
                     deleted,
                 };
-                if let Some(delta) = crate::package_state::event::translate(
-                    &mut state.package_inputs,
-                    event,
-                ) {
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
                     deltas.push(delta);
                 }
             }
@@ -3854,12 +3898,13 @@ impl LanguageServer for Backend {
                 // changes propagate (they're not dependency-graph neighbors of
                 // DESCRIPTION/NAMESPACE so the sync pass didn't add them).
                 let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
-                state.diagnostics_gate.mark_force_republish_many(open_keys.iter());
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(open_keys.iter());
                 drop(state);
-                let existing: std::collections::HashSet<Url> = affected_open_docs.iter().cloned().collect();
-                affected_open_docs.extend(
-                    open_keys.into_iter().filter(|u| !existing.contains(u))
-                );
+                let existing: std::collections::HashSet<Url> =
+                    affected_open_docs.iter().cloned().collect();
+                affected_open_docs.extend(open_keys.into_iter().filter(|u| !existing.contains(u)));
             }
         }
 
@@ -4073,13 +4118,13 @@ impl LanguageServer for Backend {
                     if has_pkg_files {
                         let mut deltas = Vec::new();
                         let mut ns_changed = false;
-                        let old_ns_model = state.package_state.namespace_model.clone();
+                        let old_ns_model = state.package_state.namespace_model().cloned();
                         // Snapshot the package's visibility/contribution state
                         // (Arc-backed clones are cheap) so visibility-only
                         // changes — e.g. internal symbol or NAMESPACE-import
                         // edits that don't alter exports — also trigger the
                         // open-file fanout below.
-                        let old_contribution = state.package_state.scope_contribution.clone();
+                        let old_contribution = state.package_state.scope_contribution().clone();
                         for uri in &uris_to_update {
                             if state.documents.contains_key(uri) {
                                 continue; // open docs are authoritative; skip
@@ -4089,11 +4134,12 @@ impl LanguageServer for Backend {
                                 .cross_file_file_cache
                                 .get(uri)
                                 .map(|s| std::sync::Arc::from(s.as_str()));
-                            let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                                uri: uri.clone(),
-                                on_disk_text,
-                                deleted: false,
-                            };
+                            let event =
+                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                    uri: uri.clone(),
+                                    on_disk_text,
+                                    deleted: false,
+                                };
                             if let Some(delta) = crate::package_state::event::translate(
                                 &mut state.package_inputs,
                                 event,
@@ -4104,8 +4150,9 @@ impl LanguageServer for Backend {
                         if !deltas.is_empty() {
                             let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                             state.apply_package_event(&batch);
-                            ns_changed = state.package_state.namespace_model != old_ns_model
-                                || state.package_state.scope_contribution != old_contribution;
+                            ns_changed = state.package_state.namespace_model()
+                                != old_ns_model.as_ref()
+                                || state.package_state.scope_contribution() != &old_contribution;
                         }
                         if ns_changed {
                             // Namespace model changed (e.g. roxygen tags changed in an
@@ -6196,7 +6243,9 @@ mod tests {
 
         fn make_state_with_open_pkg_docs(names: &[&str]) -> WorldState {
             let mut state = WorldState::new(vec![]);
-            state.workspace_folders.push(Url::from_file_path(pkg_root()).unwrap());
+            state
+                .workspace_folders
+                .push(Url::from_file_path(pkg_root()).unwrap());
             // Deterministic cap for tests; explicit overrides come per-test.
             state.cross_file_config.max_revalidations_per_trigger = 10;
             for name in names {
@@ -6214,7 +6263,11 @@ mod tests {
 
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
 
-            assert_eq!(fanout.len(), 2, "should fan out to the two non-closing siblings");
+            assert_eq!(
+                fanout.len(),
+                2,
+                "should fan out to the two non-closing siblings"
+            );
             assert!(
                 fanout.iter().all(|(u, _, _)| u != &closing),
                 "fanout must not include the closing URI"
@@ -6241,7 +6294,9 @@ mod tests {
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
 
             assert!(
-                fanout.iter().all(|(u, _, _)| u != &scratch && u != &outside),
+                fanout
+                    .iter()
+                    .all(|(u, _, _)| u != &scratch && u != &outside),
                 "files outside R/ and tests/testthat/ must not appear in fanout"
             );
         }
@@ -6249,13 +6304,13 @@ mod tests {
         #[test]
         fn fanout_includes_testthat_siblings() {
             let mut state = make_state_with_open_pkg_docs(&["a.R"]);
-            let test_uri = Url::from_file_path(
-                pkg_root().join("tests").join("testthat").join("test-a.R"),
-            )
-            .unwrap();
-            state
-                .documents
-                .insert(test_uri.clone(), Document::new("expect_equal(1, 1)\n", Some(1)));
+            let test_uri =
+                Url::from_file_path(pkg_root().join("tests").join("testthat").join("test-a.R"))
+                    .unwrap();
+            state.documents.insert(
+                test_uri.clone(),
+                Document::new("expect_equal(1, 1)\n", Some(1)),
+            );
 
             let closing = r_uri("a.R");
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
@@ -6296,8 +6351,10 @@ mod tests {
             let closing = r_uri("a.R");
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
 
-            let (got_uri, got_version, got_revision) =
-                fanout.into_iter().find(|(u, _, _)| u == &b).expect("b.R in fanout");
+            let (got_uri, got_version, got_revision) = fanout
+                .into_iter()
+                .find(|(u, _, _)| u == &b)
+                .expect("b.R in fanout");
             assert_eq!(got_uri, b);
             assert_eq!(got_version, Some(7));
             assert_eq!(got_revision, Some(42));

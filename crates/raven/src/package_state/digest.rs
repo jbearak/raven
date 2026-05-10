@@ -26,12 +26,18 @@ mod tests {
 
     #[test]
     fn equal_text_yields_equal_digest() {
-        assert_eq!(ContentDigest::of("foo <- 1\n"), ContentDigest::of("foo <- 1\n"));
+        assert_eq!(
+            ContentDigest::of("foo <- 1\n"),
+            ContentDigest::of("foo <- 1\n")
+        );
     }
 
     #[test]
     fn different_text_yields_different_digest() {
-        assert_ne!(ContentDigest::of("foo <- 1\n"), ContentDigest::of("foo <- 2\n"));
+        assert_ne!(
+            ContentDigest::of("foo <- 1\n"),
+            ContentDigest::of("foo <- 2\n")
+        );
     }
 
     #[test]

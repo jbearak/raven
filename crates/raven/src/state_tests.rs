@@ -618,7 +618,7 @@ mod package_testthat_visibility_tests {
 
         // The derived contribution must carry `helper` from R/.
         assert!(
-            state.package_state.scope_contribution.r_internal_symbols.contains("helper"),
+            state.package_state.scope_contribution().r_internal_symbols.contains("helper"),
             "helper must appear in r_internal_symbols for injection into test files"
         );
 
@@ -630,7 +630,7 @@ mod package_testthat_visibility_tests {
             &test_uri,
             test_arts,
             &workspace_root,
-            &state.package_state.scope_contribution,
+            state.package_state.scope_contribution(),
         );
 
         assert!(
@@ -669,7 +669,7 @@ mod package_testthat_visibility_tests {
         // The derived contribution must NOT carry `test_helper` (test symbols
         // are excluded from r_internal_symbols by build_scope_contribution).
         assert!(
-            !state.package_state.scope_contribution.r_internal_symbols.contains("test_helper"),
+            !state.package_state.scope_contribution().r_internal_symbols.contains("test_helper"),
             "test_helper must NOT appear in r_internal_symbols"
         );
 
@@ -681,7 +681,7 @@ mod package_testthat_visibility_tests {
             &main_uri,
             main_arts,
             &workspace_root,
-            &state.package_state.scope_contribution,
+            state.package_state.scope_contribution(),
         );
 
         assert!(

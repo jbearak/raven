@@ -1155,7 +1155,10 @@ fn process_roxygen_tag(
     if tag_line == "@export" {
         *has_export = true;
     } else if tag_line.starts_with("@export")
-        && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace())
+        && tag_line
+            .as_bytes()
+            .get(7)
+            .map_or(false, |b| b.is_ascii_whitespace())
     {
         *has_export = true;
         for name in tag_line[7..].split_whitespace() {
@@ -1164,7 +1167,10 @@ fn process_roxygen_tag(
             }
         }
     } else if tag_line.starts_with("@importFrom")
-        && tag_line.as_bytes().get(11).map_or(false, |b| b.is_ascii_whitespace())
+        && tag_line
+            .as_bytes()
+            .get(11)
+            .map_or(false, |b| b.is_ascii_whitespace())
     {
         let mut parts = tag_line[11..].split_whitespace();
         if let Some(pkg) = parts.next() {
@@ -1176,7 +1182,10 @@ fn process_roxygen_tag(
         }
     } else if tag_line.starts_with("@import")
         && !tag_line.starts_with("@importFrom")
-        && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace())
+        && tag_line
+            .as_bytes()
+            .get(7)
+            .map_or(false, |b| b.is_ascii_whitespace())
     {
         for pkg in tag_line[7..].split_whitespace() {
             if !pkg.is_empty() {
@@ -1213,12 +1222,21 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
         let mut current_tag = String::new();
 
         while i < lines.len() && lines[i].trim_start().starts_with("#'") {
-            let tag_line = lines[i].trim_start().strip_prefix("#'").unwrap_or("").trim();
+            let tag_line = lines[i]
+                .trim_start()
+                .strip_prefix("#'")
+                .unwrap_or("")
+                .trim();
 
             if tag_line.starts_with('@') || tag_line.is_empty() {
                 // Process the previously accumulated tag (if any)
                 if !current_tag.is_empty() {
-                    process_roxygen_tag(&current_tag, &mut has_export, &mut explicit_export_names, &mut ns);
+                    process_roxygen_tag(
+                        &current_tag,
+                        &mut has_export,
+                        &mut explicit_export_names,
+                        &mut ns,
+                    );
                     current_tag.clear();
                 }
                 if !tag_line.is_empty() {
@@ -1235,7 +1253,12 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
         }
         // Process the last accumulated tag
         if !current_tag.is_empty() {
-            process_roxygen_tag(&current_tag, &mut has_export, &mut explicit_export_names, &mut ns);
+            process_roxygen_tag(
+                &current_tag,
+                &mut has_export,
+                &mut explicit_export_names,
+                &mut ns,
+            );
         }
         let _ = block_start; // suppress unused warning
 
@@ -1291,10 +1314,7 @@ fn extract_definition_name(line: &str) -> Option<String> {
 
     let name = name_part.trim();
     // Handle quoted names
-    let name = name
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim_matches('`');
+    let name = name.trim_matches('"').trim_matches('\'').trim_matches('`');
     if name.is_empty() {
         None
     } else {
@@ -1331,9 +1351,15 @@ fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
                 }
             }
             None => match b {
-                b'"' | b'\'' | b'`' => { in_quote = Some(b); }
-                b'(' | b'[' | b'{' => { depth += 1; }
-                b')' | b']' | b'}' => { depth = depth.saturating_sub(1); }
+                b'"' | b'\'' | b'`' => {
+                    in_quote = Some(b);
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                }
+                b')' | b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                }
                 b'<' if depth == 0 => {
                     // Check for <<- first, then <-
                     if i + 2 < bytes.len() && bytes[i + 1] == b'<' && bytes[i + 2] == b'-' {
@@ -1379,7 +1405,11 @@ fn extract_first_string_arg(line: &str) -> Option<String> {
             i += 2; // skip escaped character
         } else if bytes[i] == quote {
             let name = &after[1..i];
-            return if name.is_empty() { None } else { Some(name.to_string()) };
+            return if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            };
         } else {
             i += 1;
         }
@@ -1394,17 +1424,29 @@ fn find_toplevel_equals(s: &str) -> Option<usize> {
     let mut in_quote: Option<char> = None;
     for (i, c) in s.char_indices() {
         match in_quote {
-            Some(q) if c == q => { in_quote = None; continue; }
-            Some(_) => { continue; }
+            Some(q) if c == q => {
+                in_quote = None;
+                continue;
+            }
+            Some(_) => {
+                continue;
+            }
             None => {}
         }
         match c {
-            '"' | '\'' | '`' => { in_quote = Some(c); }
+            '"' | '\'' | '`' => {
+                in_quote = Some(c);
+            }
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             '=' if depth == 0 => {
                 // Make sure it's not ==, !=, >=, or <=
-                if i > 0 && matches!(s.as_bytes().get(i - 1), Some(b'!') | Some(b'>') | Some(b'<')) {
+                if i > 0
+                    && matches!(
+                        s.as_bytes().get(i - 1),
+                        Some(b'!') | Some(b'>') | Some(b'<')
+                    )
+                {
                     continue;
                 }
                 if s.as_bytes().get(i + 1) == Some(&b'=') {
@@ -1449,7 +1491,10 @@ fn extract_first_identifier(line: &str) -> Option<String> {
 pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> {
     use tree_sitter::Parser;
     let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
         return std::collections::BTreeSet::new();
     }
     let Some(tree) = parser.parse(text, None) else {
@@ -1513,7 +1558,10 @@ bar <- function() {}
 "#;
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["foo", "bar"]);
-        assert_eq!(ns.import_from, vec![("tidyr".into(), "pivot_longer".into())]);
+        assert_eq!(
+            ns.import_from,
+            vec![("tidyr".into(), "pivot_longer".into())]
+        );
     }
 
     #[test]
@@ -1541,14 +1589,16 @@ bar <- function() {}
 
     #[test]
     fn set_generic() {
-        let content = "#' @export\nsetGeneric(\"myGeneric\", function(x) standardGeneric(\"myGeneric\"))\n";
+        let content =
+            "#' @export\nsetGeneric(\"myGeneric\", function(x) standardGeneric(\"myGeneric\"))\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["myGeneric"]);
     }
 
     #[test]
     fn set_method_single_quotes() {
-        let content = "#' @export\nsetMethod('show', 'MyClass', function(object) cat(object@name))\n";
+        let content =
+            "#' @export\nsetMethod('show', 'MyClass', function(object) cat(object@name))\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["show"]);
     }
@@ -1644,8 +1694,14 @@ bar <- function() {}
         // Multiple @export tags with explicit names in one block should all be captured
         let content = "#' @export foo\n#' @export bar\nbaz <- function() {}\n";
         let ns = extract_roxygen_namespace_tags(content);
-        assert!(ns.exports.contains(&"foo".to_string()), "first explicit @export name should be kept");
-        assert!(ns.exports.contains(&"bar".to_string()), "second explicit @export name should be kept");
+        assert!(
+            ns.exports.contains(&"foo".to_string()),
+            "first explicit @export name should be kept"
+        );
+        assert!(
+            ns.exports.contains(&"bar".to_string()),
+            "second explicit @export name should be kept"
+        );
         assert_eq!(ns.exports.len(), 2);
     }
 
@@ -1699,7 +1755,8 @@ bar <- function() {}
     #[test]
     fn import_from_multiline_continuation() {
         // @importFrom with symbols on continuation lines
-        let content = "#' @importFrom dplyr\n#'   mutate filter\n#' @export\nfoo <- function() {}\n";
+        let content =
+            "#' @importFrom dplyr\n#'   mutate filter\n#' @export\nfoo <- function() {}\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
         assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));

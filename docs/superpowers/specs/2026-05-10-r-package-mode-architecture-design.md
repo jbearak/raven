@@ -322,20 +322,19 @@ Specification:
 
 ### 7.2 Centralized predicates
 
-Two helper functions in `package_state.rs` are the *only* places that classify paths:
+The helper function in the `package_state` module (`package_state/mod.rs`) is
+the *only* place that classifies package source/test paths:
 
 ```rust
 /// Returns Some(kind) if `path` is a package source file we track,
 /// based on the workspace root. Returns None for paths outside
 /// R/**/*.R and tests/testthat/**/*.R.
 pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>;
-
-/// Returns true if `path` is anywhere inside the package workspace
-/// (used for filtering watched-file events to relevant packages).
-pub fn is_inside_package(path: &Path, workspace_root: &Path) -> bool;
 ```
 
-Every handler that needs to ask "is this an R/ file?" or "is this part of my package?" calls these. The boundary-leak bug class (basename vs. full path; case sensitivity; missed extensions) is eliminated by deduplication.
+Every handler that needs to ask "is this an R/ or tests/testthat/ file tracked
+by package mode?" calls this helper. The boundary-leak bug class (basename vs.
+full path; case sensitivity; missed extensions) is eliminated by deduplication.
 
 ## 8. Scope integration
 

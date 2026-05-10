@@ -144,9 +144,9 @@ fn derive_r_file_facts(
         // from path shape, so in practice it never flips for a given path,
         // but we still compare it so cached facts can never drift from
         // the classification carried in `RFileInput`.
-        let reuse = prev
-            .get(path)
-            .filter(|cached| cached.content_digest == file.content_digest && cached.kind == file.kind);
+        let reuse = prev.get(path).filter(|cached| {
+            cached.content_digest == file.content_digest && cached.kind == file.kind
+        });
         let facts = match reuse {
             Some(cached) => cached.clone(),
             None => RFileFacts {
@@ -205,9 +205,7 @@ mod tests {
 
     fn with_description(mode: PackageMode, text: &str) -> PackageInputs {
         let mut i = empty_inputs(mode);
-        i.description = Some(DescriptionInput {
-                    text: text.into(),
-                });
+        i.description = Some(DescriptionInput { text: text.into() });
         i
     }
 
@@ -267,16 +265,26 @@ mod tests {
         let text: Arc<str> = "foo <- function() 1\n".into();
         let digest = ContentDigest::of(&text);
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(path.clone(), RFileInput {
-                    kind: RFileKind::Source,
-                    text: text.clone(),
-                    content_digest: digest,
-                });
-        let s1 = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        inputs.r_files.insert(
+            path.clone(),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: text.clone(),
+                content_digest: digest,
+            },
+        );
+        let s1 = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
         let s2 = derive_package_state(&s1, &inputs, &PackageInputDelta::Initial);
         let f1 = s1.r_file_facts.get(&path).unwrap();
         let f2 = s2.r_file_facts.get(&path).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&f1.top_level_defs, &f2.top_level_defs));
+        assert!(std::sync::Arc::ptr_eq(
+            &f1.top_level_defs,
+            &f2.top_level_defs
+        ));
     }
 
     #[test]
@@ -285,19 +293,29 @@ mod tests {
         let text1: Arc<str> = "foo <- function() 1\n".into();
         let text2: Arc<str> = "foo <- function() 2\n".into();
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(path.clone(), RFileInput {
-                    kind: RFileKind::Source,
-                    text: text1.clone(),
-                    content_digest: ContentDigest::of(&text1),
-                });
-        let s1 = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        inputs.r_files.insert(
+            path.clone(),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: text1.clone(),
+                content_digest: ContentDigest::of(&text1),
+            },
+        );
+        let s1 = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
         let entry = inputs.r_files.get_mut(&path).unwrap();
         entry.text = text2.clone();
         entry.content_digest = ContentDigest::of(&text2);
         let s2 = derive_package_state(&s1, &inputs, &PackageInputDelta::Initial);
         let f1 = s1.r_file_facts.get(&path).unwrap();
         let f2 = s2.r_file_facts.get(&path).unwrap();
-        assert!(!std::sync::Arc::ptr_eq(&f1.top_level_defs, &f2.top_level_defs));
+        assert!(!std::sync::Arc::ptr_eq(
+            &f1.top_level_defs,
+            &f2.top_level_defs
+        ));
     }
 
     #[test]
@@ -306,18 +324,37 @@ mod tests {
         let text: Arc<str> = "#' @importFrom dplyr filter\nfoo <- function() 1\n".into();
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
         inputs.namespace = Some(NamespaceInput {
-                    text: "importFrom(dplyr, mutate)\nimport(magrittr)\n".into(),
-                });
-        inputs.r_files.insert(path, RFileInput {
-                    kind: RFileKind::Source,
-                    text: text.clone(),
-                    content_digest: ContentDigest::of(&text),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+            text: "importFrom(dplyr, mutate)\nimport(magrittr)\n".into(),
+        });
+        inputs.r_files.insert(
+            path,
+            RFileInput {
+                kind: RFileKind::Source,
+                text: text.clone(),
+                content_digest: ContentDigest::of(&text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
         let m = s.namespace_model.unwrap();
-        assert!(m.imports.iter().any(|(p, n)| p == "dplyr" && n == "filter"), "missing roxygen filter: {:?}", m);
-        assert!(m.imports.iter().any(|(p, n)| p == "dplyr" && n == "mutate"), "missing NAMESPACE mutate: {:?}", m);
-        assert!(m.full_imports.iter().any(|p| p == "magrittr"), "missing magrittr: {:?}", m);
+        assert!(
+            m.imports.iter().any(|(p, n)| p == "dplyr" && n == "filter"),
+            "missing roxygen filter: {:?}",
+            m
+        );
+        assert!(
+            m.imports.iter().any(|(p, n)| p == "dplyr" && n == "mutate"),
+            "missing NAMESPACE mutate: {:?}",
+            m
+        );
+        assert!(
+            m.full_imports.iter().any(|p| p == "magrittr"),
+            "missing magrittr: {:?}",
+            m
+        );
     }
 
     #[test]
@@ -325,12 +362,19 @@ mod tests {
         let path: PathBuf = "/work/pkg/R/utils.R".into();
         let text: Arc<str> = "helper <- function() 1\n".into();
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(path, RFileInput {
-                    kind: RFileKind::Source,
-                    text: text.clone(),
-                    content_digest: ContentDigest::of(&text),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        inputs.r_files.insert(
+            path,
+            RFileInput {
+                kind: RFileKind::Source,
+                text: text.clone(),
+                content_digest: ContentDigest::of(&text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
         assert!(s.scope_contribution.r_internal_symbols.contains("helper"));
     }
 
@@ -339,13 +383,23 @@ mod tests {
         let test_path: PathBuf = "/work/pkg/tests/testthat/test-utils.R".into();
         let text: Arc<str> = "test_helper <- function() 1\n".into();
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(test_path, RFileInput {
-                    kind: RFileKind::Test,
-                    text: text.clone(),
-                    content_digest: ContentDigest::of(&text),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
-        assert!(!s.scope_contribution.r_internal_symbols.contains("test_helper"));
+        inputs.r_files.insert(
+            test_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text.clone(),
+                content_digest: ContentDigest::of(&text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert!(!s
+            .scope_contribution
+            .r_internal_symbols
+            .contains("test_helper"));
     }
 
     #[test]
@@ -362,14 +416,25 @@ mod tests {
         )
         .into();
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(test_path, RFileInput {
-                    kind: RFileKind::Test,
-                    text: text.clone(),
-                    content_digest: ContentDigest::of(&text),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        inputs.r_files.insert(
+            test_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text.clone(),
+                content_digest: ContentDigest::of(&text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
         let m = s.namespace_model.as_ref().unwrap();
-        assert!(!m.exports.contains("leaked"), "test-file @export leaked: {:?}", m.exports);
+        assert!(
+            !m.exports.contains("leaked"),
+            "test-file @export leaked: {:?}",
+            m.exports
+        );
         assert!(
             !m.imports.iter().any(|(p, s)| p == "dplyr" && s == "filter"),
             "test-file @importFrom leaked: {:?}",
@@ -386,9 +451,13 @@ mod tests {
     fn scope_contribution_carries_imports_from_namespace() {
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
         inputs.namespace = Some(NamespaceInput {
-                    text: "importFrom(dplyr, filter)\nimportFrom(stats, filter)\n".into(),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+            text: "importFrom(dplyr, filter)\nimportFrom(stats, filter)\n".into(),
+        });
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
         let pkgs = s.scope_contribution.imported_symbols.get("filter").unwrap();
         assert!(pkgs.contains("dplyr"));
         assert!(pkgs.contains("stats"));
@@ -399,12 +468,19 @@ mod tests {
         let test_path: std::path::PathBuf = "/work/pkg/tests/testthat/test-utils.R".into();
         let text: Arc<str> = "test_helper <- function() 99\n".into();
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(test_path.clone(), RFileInput {
-                    kind: RFileKind::Test,
-                    text: text.clone(),
-                    content_digest: ContentDigest::of(&text),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        inputs.r_files.insert(
+            test_path.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text.clone(),
+                content_digest: ContentDigest::of(&text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
 
         // The test file gets per-file facts (its top_level_defs ARE extracted).
         assert!(s.r_file_facts.contains_key(&test_path));
@@ -418,7 +494,9 @@ mod tests {
         // But it does NOT contribute to r_internal_symbols — test-file symbols
         // are invisible to R/ files (one-way visibility: tests→R/, not R/→tests).
         assert!(
-            !s.scope_contribution.r_internal_symbols.contains("test_helper"),
+            !s.scope_contribution
+                .r_internal_symbols
+                .contains("test_helper"),
             "test-file symbol should not appear in r_internal_symbols: {:?}",
             s.scope_contribution.r_internal_symbols
         );
@@ -434,17 +512,27 @@ mod tests {
         let test_text: Arc<str> = "result <- helper()\n".into();
 
         let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
-        inputs.r_files.insert(r_path, RFileInput {
-                    kind: RFileKind::Source,
-                    text: r_text.clone(),
-                    content_digest: ContentDigest::of(&r_text),
-                });
-        inputs.r_files.insert(test_path, RFileInput {
-                    kind: RFileKind::Test,
-                    text: test_text.clone(),
-                    content_digest: ContentDigest::of(&test_text),
-                });
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        inputs.r_files.insert(
+            r_path,
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        inputs.r_files.insert(
+            test_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: test_text.clone(),
+                content_digest: ContentDigest::of(&test_text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
 
         // helper appears in r_internal_symbols (contributed by R/utils.R).
         assert!(
@@ -469,28 +557,44 @@ mod tests {
         // Auto mode with NAMESPACE but no DESCRIPTION.
         let mut inputs = empty_inputs(PackageMode::Auto);
         inputs.namespace = Some(NamespaceInput {
-                    text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
-                });
+            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
+        });
         // Add an R file with a top-level definition.
         let r_path: PathBuf = "/work/pkg/R/utils.R".into();
         let text: Arc<str> = "helper <- function() 1\n".into();
-        inputs.r_files.insert(r_path, RFileInput {
-                    kind: RFileKind::Source,
-                    text: text.clone(),
-                    content_digest: ContentDigest::of(&text),
-                });
+        inputs.r_files.insert(
+            r_path,
+            RFileInput {
+                kind: RFileKind::Source,
+                text: text.clone(),
+                content_digest: ContentDigest::of(&text),
+            },
+        );
 
-        let s = derive_package_state(&PackageState::default(), &inputs, &PackageInputDelta::Initial);
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
 
         // No workspace → no package mode → empty scope contribution.
-        assert!(s.workspace.is_none(), "Auto mode without DESCRIPTION must not produce a workspace");
+        assert!(
+            s.workspace.is_none(),
+            "Auto mode without DESCRIPTION must not produce a workspace"
+        );
         assert!(s.scope_contribution.workspace_root.is_none());
-        assert!(s.scope_contribution.r_internal_symbols.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject internal symbols");
-        assert!(s.scope_contribution.imported_symbols.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject importFrom symbols");
-        assert!(s.scope_contribution.full_imports.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject full imports");
+        assert!(
+            s.scope_contribution.r_internal_symbols.is_empty(),
+            "NAMESPACE without DESCRIPTION must not inject internal symbols"
+        );
+        assert!(
+            s.scope_contribution.imported_symbols.is_empty(),
+            "NAMESPACE without DESCRIPTION must not inject importFrom symbols"
+        );
+        assert!(
+            s.scope_contribution.full_imports.is_empty(),
+            "NAMESPACE without DESCRIPTION must not inject full imports"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -506,8 +610,8 @@ mod tests {
 
         let mut inputs = with_description(PackageMode::Auto, "Package: pkg\n");
         inputs.namespace = Some(NamespaceInput {
-                    text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
-                });
+            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
+        });
         // Three R files each repeating the same @importFrom and @import
         // tags that NAMESPACE already provides.
         for n in 0..3 {
@@ -522,10 +626,10 @@ foo <- function() 1
             inputs.r_files.insert(
                 path,
                 RFileInput {
-                            kind: RFileKind::Source,
-                            text: text.clone(),
-                            content_digest: ContentDigest::of(&text),
-                        },
+                    kind: RFileKind::Source,
+                    text: text.clone(),
+                    content_digest: ContentDigest::of(&text),
+                },
             );
         }
 
@@ -547,7 +651,11 @@ foo <- function() 1
             ns.imports,
         );
 
-        let ggplot_count = ns.full_imports.iter().filter(|p| p.as_str() == "ggplot2").count();
+        let ggplot_count = ns
+            .full_imports
+            .iter()
+            .filter(|p| p.as_str() == "ggplot2")
+            .count();
         assert_eq!(
             ggplot_count, 1,
             "ggplot2 must appear exactly once in full_imports after dedupe; got: {:?}",
@@ -578,12 +686,7 @@ foo <- function() 1
             // dedupe path on the already-seen set).
             let mut body = String::new();
             for i in 0..imports_per_file {
-                body.push_str(&format!(
-                    "#' @importFrom pkg{}_of_{} sym{}\n",
-                    i % 20,
-                    f,
-                    i,
-                ));
+                body.push_str(&format!("#' @importFrom pkg{}_of_{} sym{}\n", i % 20, f, i,));
             }
             body.push_str("foo <- function() 1\n");
             let path: PathBuf = format!("/work/pkg/R/file{}.R", f).into();
@@ -591,10 +694,10 @@ foo <- function() 1
             inputs.r_files.insert(
                 path,
                 RFileInput {
-                            kind: RFileKind::Source,
-                            text: text.clone(),
-                            content_digest: ContentDigest::of(&text),
-                        },
+                    kind: RFileKind::Source,
+                    text: text.clone(),
+                    content_digest: ContentDigest::of(&text),
+                },
             );
         }
 
