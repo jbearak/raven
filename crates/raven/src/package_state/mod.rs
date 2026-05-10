@@ -25,19 +25,16 @@ use crate::roxygen::RoxygenNamespace;
 
 /// Derived state for R package mode. Owned by `WorldState`.
 ///
-/// Phase 1: holds the five fields previously on `WorldState` directly.
-/// Phase 2: gains `derive_package_state` derivation.
-/// Phase 5: drops legacy `workspace_imports` field.
+/// Phase 5b: workspace_imports removed (Phase 5b.4); internal_symbols_cache
+/// and roxygen_tags_cache will be removed in Phase 5b.5 and 5b.6.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct PackageState {
-    // Phase 1 fields (legacy; consumed by handlers via passthrough accessors)
     pub workspace: Option<PackageWorkspace>,
     pub namespace_model: Option<PackageNamespaceModel>,
     pub roxygen_tags_cache: HashMap<PathBuf, RoxygenNamespace>,
     pub internal_symbols_cache: Arc<HashSet<String>>,
-    pub workspace_imports: Arc<Vec<(String, String)>>,
 
-    // Phase 2 additions (populated by derive_package_state in later tasks)
+    // Phase 2 additions (populated by derive_package_state)
     pub r_file_facts: BTreeMap<PathBuf, RFileFacts>,
     pub scope_contribution: PackageScopeContribution,
 }
@@ -49,7 +46,6 @@ impl PackageState {
             namespace_model: None,
             roxygen_tags_cache: HashMap::new(),
             internal_symbols_cache: Arc::new(HashSet::new()),
-            workspace_imports: Arc::new(Vec::new()),
             r_file_facts: BTreeMap::new(),
             scope_contribution: PackageScopeContribution::default(),
         }

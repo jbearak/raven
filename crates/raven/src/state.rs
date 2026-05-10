@@ -615,11 +615,6 @@ impl WorldState {
         &self.package_state.internal_symbols_cache
     }
 
-    /// Passthrough for legacy `state.workspace_imports` reads.
-    pub fn workspace_imports(&self) -> &std::sync::Arc<Vec<(String, String)>> {
-        &self.package_state.workspace_imports
-    }
-
     /// Passthrough for legacy `state.roxygen_tags_cache` immutable reads.
     pub fn roxygen_tags_cache(
         &self,
@@ -637,9 +632,8 @@ impl WorldState {
     /// Apply a `PackageInputDelta` produced by an event handler.
     /// Caller has already mutated `self.package_inputs` to reflect the event.
     /// This method recomputes derived state via `derive_package_state` and
-    /// populates the legacy cache fields (`internal_symbols_cache`,
-    /// `workspace_imports`) from the new derive output so existing consumers
-    /// continue to see current data until Phase 5 deletes those fields.
+    /// populates `internal_symbols_cache` from the new derive output so existing
+    /// consumers continue to see current data until Phase 5b.5 deletes that field.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
         let new = crate::package_state::derive_package_state(
             &self.package_state,
@@ -647,8 +641,7 @@ impl WorldState {
             delta,
         );
 
-        // Project the new scope contribution onto the legacy field shapes
-        // so existing consumers (DiagnosticsSnapshot, completion blocks) work.
+        // Project the new scope contribution onto the legacy field shape.
         let internal_symbols_cache: std::sync::Arc<std::collections::HashSet<String>> =
             std::sync::Arc::new(
                 new.scope_contribution
@@ -657,33 +650,15 @@ impl WorldState {
                     .cloned()
                     .collect(),
             );
-        let workspace_imports: std::sync::Arc<Vec<(String, String)>> =
-            std::sync::Arc::new({
-                let mut v: Vec<(String, String)> = new
-                    .scope_contribution
-                    .imported_symbols
-                    .iter()
-                    .flat_map(|(sym, pkgs)| {
-                        pkgs.iter().map(move |pkg| (pkg.clone(), sym.clone()))
-                    })
-                    .collect();
-                // Deterministic ordering for any consumer that iterates
-                v.sort();
-                v.dedup();
-                v
-            });
 
         self.package_state = crate::package_state::PackageState {
             workspace: new.workspace,
             namespace_model: new.namespace_model,
             r_file_facts: new.r_file_facts,
             scope_contribution: new.scope_contribution,
-            // Legacy fields populated from new derive output.
-            // roxygen_tags_cache has no consumer outside rebuild_namespace_model_from_cache
-            // (which is being deleted in Phase 3.10); leave it empty.
+            // roxygen_tags_cache has no consumer; leave it empty.
             roxygen_tags_cache: std::collections::HashMap::new(),
             internal_symbols_cache,
-            workspace_imports,
         };
     }
 }
@@ -1050,14 +1025,13 @@ impl WorldState {
     pub fn apply_workspace_index(
         &mut self,
         index: HashMap<Url, Document>,
-        imports: Vec<(String, String)>,
+        _imports: Vec<(String, String)>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
         pkg_workspace: Option<crate::package_namespace::PackageWorkspace>,
         pkg_ns_model: Option<crate::package_namespace::PackageNamespaceModel>,
     ) {
         self.workspace_index = index;
-        self.package_state.workspace_imports = Arc::new(imports);
 
         // Apply package_mode setting
         use crate::cross_file::config::PackageMode;
@@ -1065,10 +1039,6 @@ impl WorldState {
             PackageMode::Disabled => {
                 self.package_state.workspace = None;
                 self.package_state.namespace_model = None;
-                // Intentionally clear workspace_imports: "disabled" means full script-mode
-                // behavior — NAMESPACE-derived imports are a package concept and should not
-                // suppress diagnostics when the user has opted out of package mode.
-                self.package_state.workspace_imports = Arc::new(Vec::new());
             }
             PackageMode::Enabled => {
                 // Force package mode even without detection
@@ -1091,20 +1061,10 @@ impl WorldState {
                         None
                     }
                 });
-                // Update workspace_imports from the namespace model so roxygen-derived
-                // imports take precedence over the legacy NAMESPACE-file parse.
-                if let Some(ref model) = self.package_state.namespace_model {
-                    self.package_state.workspace_imports = Arc::new(model.imports.clone());
-                }
             }
             PackageMode::Auto => {
                 self.package_state.workspace = pkg_workspace;
                 self.package_state.namespace_model = pkg_ns_model;
-                // Update workspace_imports from the namespace model so roxygen-derived
-                // imports take precedence over the legacy NAMESPACE-file parse.
-                if let Some(ref model) = self.package_state.namespace_model {
-                    self.package_state.workspace_imports = Arc::new(model.imports.clone());
-                }
             }
         }
 
@@ -1129,9 +1089,8 @@ impl WorldState {
         }
 
         log::info!(
-            "Applied {} workspace files, {} imports, {} cross-file entries, {} new index entries",
+            "Applied {} workspace files, {} cross-file entries, {} new index entries",
             self.workspace_index.len(),
-            self.workspace_imports().len(),
             self.cross_file_workspace_index.uris().len(),
             self.workspace_index_new.len()
         );
@@ -1199,12 +1158,9 @@ impl WorldState {
             if let Ok(folder_path) = folder_url.to_file_path() {
                 let namespace_path = folder_path.join("NAMESPACE");
                 if namespace_path.exists() {
-                    self.package_state.workspace_imports =
-                        Arc::new(parse_namespace_imports(&namespace_path, &self.library));
-                    log::info!(
-                        "Loaded {} workspace imports from NAMESPACE",
-                        self.workspace_imports().len()
-                    );
+                    let imports = parse_namespace_imports(&namespace_path, &self.library);
+                    log::info!("Loaded {} workspace imports from NAMESPACE", imports.len());
+                    drop(imports); // workspace_imports field removed in Phase 5b.4
                     break; // Only process first workspace folder with NAMESPACE
                 }
             }
@@ -1616,19 +1572,12 @@ fn is_stat_model_extension(path: &Path) -> bool {
 /// Parse NAMESPACE imports without needing a `Library` reference.
 ///
 /// Only handles `importFrom(pkg, sym, ...)`: it returns concrete `(package, symbol)`
-/// pairs that downstream diagnostic suppression can match by name. `import(pkg)`
-/// (whole-namespace import) is intentionally skipped here because expanding it
-/// requires reading `pkg`'s exports, which this parser has no access to during the
-/// initial workspace scan (the `PackageLibrary` may not be initialized yet, and
-/// even when it is, this function is called during the parallel workspace scan
-/// implemented by `collect_file_paths` + `process_workspace_file` / `scan_workspace`).
-///
-/// The Library-aware variant `parse_namespace_imports` (above) does expand
-/// `import(pkg)`. If a workspace package uses `import(pkg)` to re-export an
-/// entire namespace, symbols imported that way will not appear in
-/// `state.workspace_imports` and therefore will not silence undefined-variable
-/// diagnostics — users will see them flagged. This is a known limitation;
-/// `importFrom()` is the dominant pattern in practice (≥99% of CRAN packages).
+/// pairs. `import(pkg)` (whole-namespace import) is intentionally skipped here
+/// because expanding it requires reading `pkg`'s exports, which this parser has no
+/// access to during the initial workspace scan. The result is passed to
+/// `apply_workspace_index` (as `_imports`, now unused) for backward compatibility
+/// with callers; the canonical import data comes from `PackageScopeContribution`
+/// derived by `derive_package_state`.
 fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
     let mut imports = Vec::new();
 
@@ -1664,17 +1613,6 @@ mod tests {
 
     // Include workspace scanning tests
     include!("state_tests.rs");
-
-    #[test]
-    fn test_workspace_imports_is_arc_wrapped() {
-        // Locks in S5: WorldState.workspace_imports must be Arc<Vec<...>>
-        // so DiagnosticsSnapshot::build does a refcount bump rather than
-        // deep-cloning the (package, symbol) Vec on every snapshot build.
-        let state = WorldState::new(vec![]);
-        let arc1: Arc<Vec<(String, String)>> = state.workspace_imports().clone();
-        let arc2 = arc1.clone();
-        assert!(Arc::ptr_eq(&arc1, &arc2), "Arc clones must share storage");
-    }
 
     #[test]
     fn test_document_apply_change_ascii() {

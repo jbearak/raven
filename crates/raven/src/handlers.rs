@@ -38134,31 +38134,17 @@ my_func <- function(a = default_value) {
 
     #[tokio::test]
     async fn test_namespace_import_does_not_suppress_when_source_package_uninstalled() {
-        // Post-workspace-scan reproduction of "diagnostic appears then clears".
+        // Regression test: a NAMESPACE `importFrom(lme4, lmer)` must NOT suppress
+        // the "Undefined variable: lmer" diagnostic when lme4 is not actually installed.
         //
-        // If the workspace contains an R package with NAMESPACE that contains
-        // `importFrom(lme4, lmer)`, then `parse_namespace_imports_from_text`
-        // populates `state.workspace_imports` with `["lmer"]` after the scan
-        // completes. The undefined-variable check then suppresses `lmer` via
-        // `workspace_imports_set.contains(name)` — even though lme4 is not
-        // installed and the import is therefore broken.
-        //
-        // Cold-start sequence with this workspace:
-        // - 200ms publish: workspace_imports is empty (scan still running),
-        //   `lmer` is flagged → user sees diagnostic
-        // - apply_workspace_index runs, populates workspace_imports = ["lmer"]
-        // - post-scan republish: workspace_imports check fires → diagnostic
-        //   disappears
-        //
-        // Fix: the workspace_imports suppression must verify the import's
-        // source package is installed before suppressing.
+        // Previously this was tested via the workspace_imports suppression set (deleted
+        // in Phase 5b.1). Now the scope engine handles symbol visibility, and this test
+        // verifies the package-library export check does the right thing when the
+        // package is cached with empty exports and not installed on disk.
         let mut state = create_test_state();
         state.package_library_ready = true;
         state.cross_file_config.packages_enabled = true;
         state.workspace_scan_complete = true;
-        // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
-        state.package_state.workspace_imports =
-            std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
 
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();
         // lme4 cached with empty exports (prefetch saw R fail to load it).
