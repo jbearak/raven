@@ -1348,6 +1348,12 @@ fn extract_definition_name(line: &str) -> Option<String> {
 
 /// Find the first top-level assignment operator (`<<-`, `<-`, or `=`) outside
 /// of quoted strings and balanced brackets. Returns `(byte_offset, op_len)`.
+///
+/// R backticks open/close a non-syntactic-identifier literal and do NOT honor
+/// `\` as an escape, so a trailing `\` inside a backtick-quoted name (e.g.
+/// `` `foo\` ``) must not swallow the closing backtick. Mirrors R's own
+/// parser and `count_unquoted_parens` / `strip_trailing_comment` in
+/// `package_namespace.rs`.
 fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -1356,6 +1362,11 @@ fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
     while i < bytes.len() {
         let b = bytes[i];
         match in_quote {
+            Some(b'`') => {
+                if b == b'`' {
+                    in_quote = None;
+                }
+            }
             Some(q) => {
                 if b == b'\\' {
                     i += 1; // skip escaped character
@@ -1612,6 +1623,19 @@ bar <- function() {}
         assert_eq!(find_assignment_op(r#""foo\"bar" <- 1"#), Some((11, 2)));
         // Escaped backslash before closing quote
         assert_eq!(find_assignment_op(r#""foo\\" <- 1"#), Some((8, 2)));
+    }
+
+    #[test]
+    fn find_assignment_op_backtick_no_escape() {
+        // Backticks do NOT honor `\` as an escape. A trailing `\` inside a
+        // backtick-quoted name must not swallow the closing backtick (which
+        // would prevent the assignment from being detected at all).
+        // Example: the replacement function `foo\` (name ends in backslash).
+        // Previously the parser kept `in_quote` stuck open and returned None;
+        // now it correctly finds the `<-` at position 8.
+        assert_eq!(find_assignment_op("`foo\\` <- 1"), Some((7, 2)));
+        // A plain backtick-quoted replacement function.
+        assert_eq!(find_assignment_op("`names<-` <- 1"), Some((10, 2)));
     }
 
     #[test]

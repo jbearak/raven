@@ -168,6 +168,22 @@ pub fn namespace_model_from_content(content: &str) -> PackageNamespaceModel {
                     }
                 }
             }
+        } else if let Some(args) = strip_directive(line, "importClassesFrom")
+            .or_else(|| strip_directive(line, "importMethodsFrom"))
+        {
+            // S4 class / method imports — treated identically to `importFrom`
+            // for diagnostic suppression and completion. Affects S4-heavy
+            // packages (Matrix, methods, Biobase, most of Bioconductor).
+            let parts: Vec<&str> = split_args(args).collect();
+            if parts.len() >= 2 {
+                let pkg = unquote(parts[0]);
+                for sym in &parts[1..] {
+                    let sym = unquote(sym);
+                    if !sym.is_empty() {
+                        model.imports.push((pkg.clone(), sym));
+                    }
+                }
+            }
         } else if let Some(args) = strip_directive(line, "import") {
             for pkg in split_args(args) {
                 let pkg = unquote(pkg);
@@ -320,6 +336,12 @@ fn normalize_multiline(content: &str) -> String {
 }
 
 /// Strip trailing `# comment` from a NAMESPACE line, respecting quoted strings.
+///
+/// Backticks open/close a non-syntactic-identifier literal (e.g., `` `%>%` ``)
+/// and R does NOT recognize `\` as an escape inside them — mirrors the
+/// backtick handling in `count_unquoted_parens` and R's own parser, and
+/// prevents `#` inside a backtick-quoted name from being mistaken for a
+/// comment start.
 fn strip_trailing_comment(line: &str) -> &str {
     let mut in_quote: Option<char> = None;
     let mut escape_next = false;
@@ -329,11 +351,22 @@ fn strip_trailing_comment(line: &str) -> &str {
             continue;
         }
         match in_quote {
-            Some(_) if c == '\\' => { escape_next = true; }
-            Some(q) if c == q => { in_quote = None; }
+            // Backticks don't honor `\` escapes in R.
+            Some('`') if c == '`' => {
+                in_quote = None;
+            }
+            Some('`') => {}
+            Some(_) if c == '\\' => {
+                escape_next = true;
+            }
+            Some(q) if c == q => {
+                in_quote = None;
+            }
             Some(_) => {}
             None => match c {
-                '"' | '\'' => { in_quote = Some(c); }
+                '"' | '\'' | '`' => {
+                    in_quote = Some(c);
+                }
                 '#' => return line[..i].trim_end(),
                 _ => {}
             },
@@ -403,8 +436,18 @@ impl<'a> Iterator for SplitArgs<'a> {
 fn unquote(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2 {
-        if (s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\''))
+        // Handle ASCII double-, single-, and backtick-quoted names.
+        // Backticks are used for non-syntactic identifiers like `%>%` or
+        // `+.myclass` in NAMESPACE directives, e.g.
+        // `importFrom(magrittr, `%>%`)` — without stripping, the stored
+        // name would retain the backticks and fail to match bare tree-sitter
+        // identifiers.
+        let bytes = s.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"')
+            || (first == b'\'' && last == b'\'')
+            || (first == b'`' && last == b'`')
         {
             return s[1..s.len() - 1].to_string();
         }
@@ -690,5 +733,87 @@ S3method(print, myclass)
         assert!(model.exports.contains("a,b"), "quoted comma should not split");
         assert!(model.exports.contains("foo"));
         assert_eq!(model.exports.len(), 2);
+    }
+
+    #[test]
+    fn namespace_model_importClassesFrom_adds_to_imports() {
+        // S4 class imports are semantically equivalent to `importFrom` for
+        // diagnostic suppression and completion. Without this, S4-heavy
+        // packages (Matrix, methods, Bioconductor) get false-positive
+        // undefined-variable diagnostics for their imported classes.
+        let content = "importClassesFrom(Matrix, dgCMatrix, dgTMatrix)\n";
+        let model = namespace_model_from_content(content);
+        assert!(
+            model.imports.contains(&("Matrix".to_string(), "dgCMatrix".to_string())),
+            "importClassesFrom must populate imports: {:?}",
+            model.imports,
+        );
+        assert!(
+            model.imports.contains(&("Matrix".to_string(), "dgTMatrix".to_string())),
+            "multiple class args must all be added: {:?}",
+            model.imports,
+        );
+    }
+
+    #[test]
+    fn namespace_model_importMethodsFrom_adds_to_imports() {
+        // S4 method imports — same treatment as importFrom.
+        let content = "importMethodsFrom(methods, show, initialize)\n";
+        let model = namespace_model_from_content(content);
+        assert!(
+            model.imports.contains(&("methods".to_string(), "show".to_string())),
+            "importMethodsFrom must populate imports: {:?}",
+            model.imports,
+        );
+        assert!(
+            model.imports.contains(&("methods".to_string(), "initialize".to_string())),
+            "multiple method args must all be added: {:?}",
+            model.imports,
+        );
+    }
+
+    #[test]
+    fn namespace_model_importFrom_backtick_quoted_symbol() {
+        // Non-syntactic names in NAMESPACE are typically backtick-quoted,
+        // e.g. `importFrom(magrittr, \`%>%\`)`. Previously the backticks were
+        // retained in the imported symbol key, causing the stored name
+        // (`\`%>%\``) to never match the bare tree-sitter identifier (`%>%`).
+        let content = "importFrom(magrittr, `%>%`)\n";
+        let model = namespace_model_from_content(content);
+        assert!(
+            model.imports.contains(&("magrittr".to_string(), "%>%".to_string())),
+            "backtick-quoted `%>%` must be unquoted in imports: {:?}",
+            model.imports,
+        );
+    }
+
+    #[test]
+    fn strip_trailing_comment_handles_backtick_hash() {
+        // Backtick-quoted names may contain `#`. Without backtick tracking,
+        // the comment scanner truncates `export(\`%#%\`)` to `export(\`%`,
+        // which then fails `strip_directive` and silently drops the export,
+        // and also leaves `normalize_multiline`'s paren counter unbalanced.
+        assert_eq!(
+            strip_trailing_comment("export(`%#%`) # op export"),
+            "export(`%#%`)"
+        );
+        assert_eq!(
+            strip_trailing_comment("export(`%#%`)"),
+            "export(`%#%`)"
+        );
+    }
+
+    #[test]
+    fn namespace_model_backtick_name_with_hash_not_dropped() {
+        // End-to-end: a backtick-quoted name containing `#` must round-trip
+        // through the parser without being lost to the comment scanner.
+        let content = "export(`%#%`)\nexport(foo)\n";
+        let model = namespace_model_from_content(content);
+        assert!(
+            model.exports.contains("%#%"),
+            "backtick-quoted `%#%` must survive parse: {:?}",
+            model.exports,
+        );
+        assert!(model.exports.contains("foo"));
     }
 }
