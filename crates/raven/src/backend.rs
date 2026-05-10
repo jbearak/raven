@@ -1287,6 +1287,11 @@ impl LanguageServer for Backend {
                                     state.roxygen_tags_cache.insert(path, ns);
                                 }
                             }
+                            // Rebuild namespace model from the merged cache so open files'
+                            // fresher roxygen tags are reflected in workspace_imports.
+                            if state.package_workspace.as_ref().is_some_and(|p| p.roxygen_managed) {
+                                state.rebuild_namespace_model_from_cache();
+                            }
                             state.rebuild_package_internal_symbols_cache();
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
@@ -3046,6 +3051,10 @@ impl LanguageServer for Backend {
                 if p.starts_with(pkg.root.join("R")) {
                     // Refresh roxygen_tags_cache from the on-disk snapshot
                     // (file cache) so unsaved edits don't persist after close.
+                    // Gate: only relevant when roxygen_managed — if the package
+                    // uses a hand-written NAMESPACE, there are no roxygen tags
+                    // to reconcile. The roxygen_managed flag is flipped by
+                    // did_change and the watched-files handler, not by close.
                     if pkg.roxygen_managed {
                         let refreshed = state.cross_file_file_cache.get(uri)
                             .map(|content| crate::roxygen::extract_roxygen_namespace_tags(&content));
@@ -3227,6 +3236,7 @@ impl LanguageServer for Backend {
                     state.package_namespace_model = None;
                     state.workspace_imports = std::sync::Arc::new(Vec::new());
                     state.package_internal_symbols_cache = std::sync::Arc::new(std::collections::HashSet::new());
+                    state.roxygen_tags_cache.clear();
                     None
                 } else {
                     state.workspace_folders.first().and_then(|u| u.to_file_path().ok()).map(|root| (root, mode))
@@ -4063,7 +4073,10 @@ impl LanguageServer for Backend {
                         let has_r_files = uris_to_update.iter().any(|u| {
                             u.to_file_path().ok().is_some_and(|p| p.starts_with(&r_dir_for_check))
                         });
-                        if pkg.roxygen_managed {
+                        // Scan roxygen tags for non-open R/*.R files regardless of
+                        // roxygen_managed — external edits (e.g. git checkout) may
+                        // add/remove the first/last roxygen tags, flipping the flag.
+                        if has_r_files {
                             let r_dir = pkg.root.join("R");
                             let mut ns_changed = false;
                             for uri in &uris_to_update {
@@ -4086,6 +4099,23 @@ impl LanguageServer for Backend {
                                             }
                                         }
                                     }
+                                }
+                            }
+                            // Recompute roxygen_managed from the full cache
+                            let any_tags = state.roxygen_tags_cache.values().any(|ns| {
+                                !ns.exports.is_empty()
+                                    || !ns.imports.is_empty()
+                                    || !ns.import_from.is_empty()
+                            });
+                            if let Some(ref mut pkg) = state.package_workspace {
+                                if pkg.roxygen_managed != any_tags {
+                                    pkg.roxygen_managed = any_tags;
+                                    ns_changed = true;
+                                    log::info!(
+                                        "watched-files: roxygen_managed transitioned to {} for package {}",
+                                        any_tags,
+                                        pkg.name
+                                    );
                                 }
                             }
                             if ns_changed {

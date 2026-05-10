@@ -1052,6 +1052,10 @@ impl WorldState {
     /// Apply pre-scanned workspace index results (for non-blocking initialization)
     ///
     /// **Validates: Requirements 11.1, 13.1**
+    ///
+    /// Note: The per-file roxygen cache (`roxygen_tags_cache`) is merged by the
+    /// caller after this returns (still under the same write lock) so that open
+    /// files' fresher did_change entries aren't overwritten by scan-time data.
     pub fn apply_workspace_index(
         &mut self,
         index: HashMap<Url, Document>,
