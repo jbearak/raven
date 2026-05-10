@@ -18,7 +18,7 @@ static ROXYGEN_EXPORT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 
 /// Metadata about the detected R package workspace.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageWorkspace {
     /// Package name from DESCRIPTION `Package:` field.
     pub name: String,
@@ -33,7 +33,7 @@ pub struct PackageWorkspace {
 /// Built from either roxygen annotations (when `roxygen_managed`) or the
 /// NAMESPACE file. Used to determine which symbols the package exports and
 /// which external package symbols are available without qualification.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackageNamespaceModel {
     /// Symbols this package exports (for informational purposes; mutual
     /// visibility means ALL top-level symbols are visible internally regardless).

@@ -22,13 +22,18 @@ use crate::roxygen::RoxygenNamespace;
 /// Phase 1: holds the five fields previously on `WorldState` directly.
 /// Phase 2: gains `derive_package_state` derivation.
 /// Phase 5: drops legacy `workspace_imports` field.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct PackageState {
+    // Phase 1 fields (legacy; consumed by handlers via passthrough accessors)
     pub workspace: Option<PackageWorkspace>,
     pub namespace_model: Option<PackageNamespaceModel>,
     pub roxygen_tags_cache: HashMap<PathBuf, RoxygenNamespace>,
     pub internal_symbols_cache: Arc<HashSet<String>>,
     pub workspace_imports: Arc<Vec<(String, String)>>,
+
+    // Phase 2 additions (populated by derive_package_state in later tasks)
+    pub r_file_facts: BTreeMap<PathBuf, RFileFacts>,
+    pub scope_contribution: PackageScopeContribution,
 }
 
 impl PackageState {
@@ -39,6 +44,8 @@ impl PackageState {
             roxygen_tags_cache: HashMap::new(),
             internal_symbols_cache: Arc::new(HashSet::new()),
             workspace_imports: Arc::new(Vec::new()),
+            r_file_facts: BTreeMap::new(),
+            scope_contribution: PackageScopeContribution::default(),
         }
     }
 
@@ -290,4 +297,22 @@ mod path_tests {
             Some(RFileKind::Source),
         );
     }
+}
+
+// ============== OUTPUTS (continued) ==============
+
+use std::collections::BTreeSet;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RFileFacts {
+    pub roxygen_namespace: RoxygenNamespace,
+    pub top_level_defs: Arc<BTreeSet<String>>,
+    pub content_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageScopeContribution {
+    pub r_internal_symbols: Arc<BTreeSet<String>>,
+    pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
+    pub full_imports: Arc<BTreeSet<String>>,
 }

@@ -1133,7 +1133,7 @@ mod prop_tests {
 // ============================================================================
 
 /// Namespace-relevant information extracted from roxygen blocks in a single file.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoxygenNamespace {
     /// Symbols exported via `@export` (the name of the function/variable
     /// defined immediately after the roxygen block).
