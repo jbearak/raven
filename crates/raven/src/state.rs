@@ -757,8 +757,19 @@ impl WorldState {
         }
 
         let new_imports = Arc::new(model.imports.clone());
-        let imports_changed = *old_imports != *new_imports;
-        let full_imports_changed = old_full_imports.as_ref() != Some(&model.full_imports);
+        // Compare as sets to avoid false-positive change detection from
+        // non-deterministic HashMap iteration order.
+        let imports_changed = {
+            let old_set: HashSet<&(String, String)> = old_imports.iter().collect();
+            let new_set: HashSet<&(String, String)> = new_imports.iter().collect();
+            old_set != new_set
+        };
+        let full_imports_changed = {
+            let old_set: Option<HashSet<&String>> =
+                old_full_imports.as_ref().map(|v| v.iter().collect());
+            let new_set: HashSet<&String> = model.full_imports.iter().collect();
+            old_set.as_ref() != Some(&new_set)
+        };
         self.workspace_imports = new_imports;
         self.package_namespace_model = Some(model);
         imports_changed || full_imports_changed

@@ -256,11 +256,14 @@ fn count_unquoted_parens(s: &str) -> (usize, usize) {
             continue;
         }
         match in_quote {
+            // Backtick-quoted names don't support escape sequences in R
+            Some('`') if c == '`' => { in_quote = None; }
+            Some('`') => {}
             Some(_) if c == '\\' => { escape_next = true; }
             Some(q) if c == q => { in_quote = None; }
             Some(_) => {}
             None => match c {
-                '"' | '\'' => { in_quote = Some(c); }
+                '"' | '\'' | '`' => { in_quote = Some(c); }
                 '(' => { open += 1; }
                 ')' => { close += 1; }
                 _ => {}
@@ -371,7 +374,13 @@ impl<'a> Iterator for SplitArgs<'a> {
         while i < bytes.len() {
             let b = bytes[i];
             match in_quote {
-                Some(_q) if b == b'\\' => { i += 1; } // skip escaped char
+                Some(_q) if b == b'\\' => {
+                    // Skip escaped char; guard against trailing backslash
+                    // at end of input to avoid out-of-bounds access.
+                    if i + 1 < bytes.len() {
+                        i += 1;
+                    }
+                }
                 Some(q) if b == q => { in_quote = None; }
                 Some(_) => {}
                 None => match b {
@@ -640,12 +649,37 @@ S3method(print, myclass)
     }
 
     #[test]
+    fn count_unquoted_parens_handles_backtick_quoted() {
+        // Parens inside backtick-quoted names should not be counted
+        assert_eq!(count_unquoted_parens("`foo(`"), (0, 0));
+        assert_eq!(count_unquoted_parens("`[<-(`"), (0, 0));
+        // Backtick-quoted name followed by real paren
+        assert_eq!(count_unquoted_parens("export(`foo(`, bar)"), (1, 1));
+    }
+
+    #[test]
     fn strip_trailing_comment_handles_escaped_quotes() {
         // Escaped quote inside string should not end the string
         assert_eq!(
             strip_trailing_comment(r#"export("a\"b") # comment"#),
             r#"export("a\"b")"#
         );
+    }
+
+    #[test]
+    fn split_args_trailing_backslash_no_panic() {
+        // Trailing backslash inside an unterminated quote must not panic
+        let args = r#""foo\"#;
+        let result: Vec<&str> = split_args(args).collect();
+        assert_eq!(result, vec![r#""foo\"#]);
+    }
+
+    #[test]
+    fn split_args_trailing_backslash_in_terminated_quote() {
+        // Backslash as last char of a terminated quoted string (edge case)
+        let args = r#""foo\\", bar"#;
+        let result: Vec<&str> = split_args(args).collect();
+        assert_eq!(result, vec![r#""foo\\""#, "bar"]);
     }
 
     #[test]

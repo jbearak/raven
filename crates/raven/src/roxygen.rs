@@ -1159,28 +1159,76 @@ pub fn has_roxygen_namespace_tags(content: &str) -> bool {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("#'") {
             let tag = rest.trim_start();
-            // Check for @export or @import with word boundary (end of string,
-            // whitespace, or known continuation like "From", "Pattern", etc.)
+            // Only match tags that extract_roxygen_namespace_tags actually
+            // processes: @export (bare or with whitespace/names), @import
+            // (with whitespace + package names), and @importFrom.
+            // Excludes @exportPattern, @exportS3Method, @importClasses, etc.
+            // to avoid detection/extraction mismatch that causes
+            // roxygen_managed flag oscillation.
             if tag.starts_with("@export") {
                 let after = &tag[7..];
-                if after.is_empty() || after.starts_with(char::is_whitespace)
-                    || after.starts_with("Pattern") || after.starts_with("S3")
-                    || after.starts_with("Class") || after.starts_with("Method")
-                {
+                if after.is_empty() || after.starts_with(char::is_whitespace) {
+                    return true;
+                }
+            } else if tag.starts_with("@importFrom") {
+                let after = &tag[11..];
+                if after.starts_with(char::is_whitespace) {
                     return true;
                 }
             } else if tag.starts_with("@import") {
                 let after = &tag[7..];
-                if after.is_empty() || after.starts_with(char::is_whitespace)
-                    || after.starts_with("From") || after.starts_with("Classes")
-                    || after.starts_with("Methods")
-                {
+                // Require whitespace after @import (bare @import with no
+                // package args is ignored by the extractor).
+                if after.starts_with(char::is_whitespace) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Process a single accumulated roxygen tag line (possibly with continuation
+/// content appended). Handles @export, @import, and @importFrom.
+fn process_roxygen_tag(
+    tag_line: &str,
+    has_export: &mut bool,
+    explicit_export_names: &mut Vec<String>,
+    ns: &mut RoxygenNamespace,
+) {
+    if tag_line == "@export" {
+        *has_export = true;
+    } else if tag_line.starts_with("@export")
+        && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace())
+    {
+        *has_export = true;
+        for name in tag_line[7..].split_whitespace() {
+            if !name.is_empty() {
+                explicit_export_names.push(name.to_string());
+            }
+        }
+    } else if tag_line.starts_with("@importFrom")
+        && tag_line.as_bytes().get(11).map_or(false, |b| b.is_ascii_whitespace())
+    {
+        let mut parts = tag_line[11..].split_whitespace();
+        if let Some(pkg) = parts.next() {
+            for sym in parts {
+                if !sym.is_empty() {
+                    ns.import_from.push((pkg.to_string(), sym.to_string()));
+                }
+            }
+        }
+    } else if tag_line.starts_with("@import")
+        && !tag_line.starts_with("@importFrom")
+        && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace())
+    {
+        for pkg in tag_line[7..].split_whitespace() {
+            if !pkg.is_empty() {
+                ns.imports.push(pkg.to_string());
+            }
+        }
+    }
+    // bare @import with no args — ignore
 }
 
 /// For `@export`, the exported symbol name is the identifier defined on the
@@ -1202,40 +1250,36 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
         let mut has_export = false;
         let mut explicit_export_names: Vec<String> = Vec::new();
         let block_start = i;
+
+        // Accumulate tag lines with continuation support.
+        // In roxygen2, a #' line that doesn't start with @ continues the
+        // previous tag's content.
+        let mut current_tag = String::new();
+
         while i < lines.len() && lines[i].trim_start().starts_with("#'") {
             let tag_line = lines[i].trim_start().strip_prefix("#'").unwrap_or("").trim();
 
-            if tag_line == "@export" {
-                has_export = true;
-            } else if tag_line.starts_with("@export") && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace()) {
-                has_export = true;
-                // roxygen2 splits @export values by whitespace (tag_words)
-                for name in tag_line[7..].split_whitespace() {
-                    if !name.is_empty() {
-                        explicit_export_names.push(name.to_string());
-                    }
+            if tag_line.starts_with('@') || tag_line.is_empty() {
+                // Process the previously accumulated tag (if any)
+                if !current_tag.is_empty() {
+                    process_roxygen_tag(&current_tag, &mut has_export, &mut explicit_export_names, &mut ns);
+                    current_tag.clear();
                 }
-            } else if tag_line.starts_with("@import") && !tag_line.starts_with("@importFrom") && tag_line.as_bytes().get(7).map_or(false, |b| b.is_ascii_whitespace()) {
-                // @import pkg1 pkg2 ...
-                for pkg in tag_line[7..].split_whitespace() {
-                    if !pkg.is_empty() {
-                        ns.imports.push(pkg.to_string());
-                    }
+                if !tag_line.is_empty() {
+                    current_tag = tag_line.to_string();
                 }
-            } else if tag_line == "@import" {
-                // bare @import with no args — ignore
-            } else if tag_line.starts_with("@importFrom") && tag_line.as_bytes().get(11).map_or(false, |b| b.is_ascii_whitespace()) {
-                // @importFrom pkg sym1 sym2 ...
-                let mut parts = tag_line[11..].split_whitespace();
-                if let Some(pkg) = parts.next() {
-                    for sym in parts {
-                        if !sym.is_empty() {
-                            ns.import_from.push((pkg.to_string(), sym.to_string()));
-                        }
-                    }
-                }
+            } else if !current_tag.is_empty() {
+                // Continuation line — append to current tag
+                current_tag.push(' ');
+                current_tag.push_str(tag_line);
             }
+            // else: text before any tag (e.g. @title) — ignore
+
             i += 1;
+        }
+        // Process the last accumulated tag
+        if !current_tag.is_empty() {
+            process_roxygen_tag(&current_tag, &mut has_export, &mut explicit_export_names, &mut ns);
         }
         let _ = block_start; // suppress unused warning
 
@@ -1680,9 +1724,46 @@ bar <- function() {}
         assert!(!has_roxygen_namespace_tags("#' @exporting data\nfoo <- 1\n"));
         // @importing is not a real roxygen tag
         assert!(!has_roxygen_namespace_tags("#' @importing stuff\nfoo <- 1\n"));
-        // But @exportPattern should trigger
-        assert!(has_roxygen_namespace_tags("#' @exportPattern ^[a-z]\nfoo <- 1\n"));
-        // And @importFrom should trigger
+        // @exportPattern is NOT matched (extract_roxygen_namespace_tags doesn't
+        // process it, so matching it would cause roxygen_managed oscillation)
+        assert!(!has_roxygen_namespace_tags("#' @exportPattern ^[a-z]\nfoo <- 1\n"));
+        // @importClasses and @importMethods are also excluded for the same reason
+        assert!(!has_roxygen_namespace_tags("#' @importClasses Matrix\nfoo <- 1\n"));
+        assert!(!has_roxygen_namespace_tags("#' @importMethods show\nfoo <- 1\n"));
+        // @importFrom should trigger (it IS extracted)
         assert!(has_roxygen_namespace_tags("#' @importFrom dplyr mutate\nfoo <- 1\n"));
+        // Bare @import (no args) should NOT trigger (extractor ignores it)
+        assert!(!has_roxygen_namespace_tags("#' @import\nfoo <- 1\n"));
+        // @import with package name should trigger
+        assert!(has_roxygen_namespace_tags("#' @import dplyr\nfoo <- 1\n"));
+    }
+
+    #[test]
+    fn import_from_multiline_continuation() {
+        // @importFrom with symbols on continuation lines
+        let content = "#' @importFrom dplyr\n#'   mutate filter\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn import_multiline_continuation() {
+        // @import with packages on continuation line
+        let content = "#' @import dplyr\n#'   tidyr\n#' @export\nbar <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.imports.contains(&"dplyr".to_string()));
+        assert!(ns.imports.contains(&"tidyr".to_string()));
+    }
+
+    #[test]
+    fn continuation_stops_at_new_tag() {
+        // Continuation should stop when a new @tag is encountered
+        let content = "#' @importFrom dplyr\n#'   mutate\n#' @import ggplot2\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.imports.contains(&"ggplot2".to_string()));
+        assert_eq!(ns.exports, vec!["foo"]);
     }
 }

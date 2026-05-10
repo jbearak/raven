@@ -248,7 +248,20 @@ impl DiagnosticsSnapshot {
             base_exports,
             package_library_ready: state.package_library_ready,
             workspace_scan_complete: state.workspace_scan_complete,
-            workspace_imports: state.workspace_imports.clone(),
+            workspace_imports: {
+                // In package mode, workspace_imports (importFrom) should only
+                // suppress diagnostics for files under R/ — test files,
+                // vignettes, and scripts must use library() explicitly.
+                let suppress_for_this_file = state.package_workspace.as_ref().map_or(
+                    true, // non-package mode: preserve legacy behavior (suppress for all)
+                    |pkg| uri.to_file_path().ok().is_some_and(|p| p.starts_with(pkg.root.join("R")))
+                );
+                if suppress_for_this_file {
+                    state.workspace_imports.clone()
+                } else {
+                    Arc::new(Vec::new())
+                }
+            },
             artifacts_map,
             metadata_map,
             cycle_detection,
