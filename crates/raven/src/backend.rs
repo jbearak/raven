@@ -1245,6 +1245,10 @@ impl LanguageServer for Backend {
         // priority over the background scan.
         let state_clone = self.state.clone();
         let folders_clone = folders.clone();
+        // Capture the workspace root before spawning the blocking scan so we can
+        // read DESCRIPTION/NAMESPACE outside the WorldState write lock below.
+        let root_for_pkg_inputs: Option<std::path::PathBuf> =
+            folders.first().and_then(|u| u.to_file_path().ok());
         let client_clone = self.client.clone();
         if index_workspace {
             tokio::task::spawn(async move {
@@ -1267,6 +1271,24 @@ impl LanguageServer for Backend {
                 // Apply results when scan completes
                 match scan_result {
                     Ok((index, cross_file_entries, new_index_entries)) => {
+                        // Read DESCRIPTION and NAMESPACE BEFORE acquiring the
+                        // WorldState write lock — `std::fs::read_to_string` is
+                        // blocking and would stall any concurrent writer (e.g.
+                        // an in-flight `did_change`) for the duration of disk
+                        // I/O. Files were already touched during the blocking
+                        // scan above, so the read is typically a warm cache hit.
+                        let (desc_text, ns_text) = if let Some(ref root) = root_for_pkg_inputs {
+                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
+                                .ok()
+                                .map(|t| std::sync::Arc::from(t.as_str()));
+                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
+                                .ok()
+                                .map(|t| std::sync::Arc::from(t.as_str()));
+                            (desc, ns)
+                        } else {
+                            (None, None)
+                        };
+
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
                             let mut state = state_clone.write().await;
@@ -1278,16 +1300,9 @@ impl LanguageServer for Backend {
                             // --- Phase 3.9: Populate package_inputs and derive ---
                             // Populate package_inputs from the now-applied workspace index
                             // so that apply_package_event derives correct package state.
-                            if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
+                            if let Some(root) = root_for_pkg_inputs.clone() {
                                 state.package_inputs.workspace_root = Some(root.clone());
                                 state.package_inputs.package_mode = state.cross_file_config.package_mode;
-
-                                // Read DESCRIPTION and NAMESPACE synchronously (post-scan settle;
-                                // files were already read during the blocking scan above).
-                                let desc_text = std::fs::read_to_string(root.join("DESCRIPTION")).ok()
-                                    .map(|t| std::sync::Arc::from(t.as_str()));
-                                let ns_text = std::fs::read_to_string(root.join("NAMESPACE")).ok()
-                                    .map(|t| std::sync::Arc::from(t.as_str()));
 
                                 state.package_inputs.description = desc_text.map(|text| {
                                     crate::package_state::DescriptionInput {
@@ -3023,67 +3038,127 @@ impl LanguageServer for Backend {
         // Cancel pending background indexing for this URI
         self.background_indexer.cancel_uri(uri);
 
-        let mut state = self.state.write().await;
+        let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
+            let mut state = self.state.write().await;
 
-        // Close in new DocumentStore (Requirement 1.5)
-        state.document_store.close(uri);
+            // Close in new DocumentStore (Requirement 1.5)
+            state.document_store.close(uri);
 
-        // Clear diagnostics gate state
-        state.diagnostics_gate.clear(uri);
+            // Clear diagnostics gate state
+            state.diagnostics_gate.clear(uri);
 
-        // Cancel pending revalidation
-        state.cross_file_revalidation.cancel(uri);
+            // Cancel pending revalidation
+            state.cross_file_revalidation.cancel(uri);
 
-        // Remove from activity tracking
-        state.cross_file_activity.remove(uri);
+            // Remove from activity tracking
+            state.cross_file_activity.remove(uri);
 
-        // Close the document (legacy)
-        state.close_document(uri);
+            // Close the document (legacy)
+            state.close_document(uri);
 
-        // In package mode, update the package state when an R/*.R file closes
-        // so stale exports from the editing session are replaced by the
-        // on-disk snapshot. We intentionally do NOT force-revalidate sibling
-        // R/*.R files here; siblings pick up the updated state on their next
-        // diagnostic cycle (edit or reopen). Eagerly republishing all siblings
-        // on every close would be expensive and disruptive.
-        {
-            // Prefer the file cache (LRU, warm for recently-touched files)
-            // as the "disk" content for the closed file; fall back to the
-            // workspace index when the LRU has evicted this entry so a
-            // close in a large package (>LRU capacity of recently-touched
-            // files) doesn't treat the file as DELETED from `package_inputs`
-            // and vanish its symbols from `r_internal_symbols`.
-            let on_disk_text: Option<std::sync::Arc<str>> = state
-                .cross_file_file_cache
-                .get(uri)
-                .map(|s| std::sync::Arc::from(s.as_str()))
-                .or_else(|| {
+            // Snapshot package visibility before applying the close event, so we
+            // can detect symbol/import changes caused by switching the closed
+            // file's content from Open (unsaved buffer) to Disk. Open siblings
+            // resolved against the unsaved buffer must refresh their diagnostics
+            // when the buffer-only symbols disappear; otherwise stale "no error"
+            // diagnostics linger until the user touches each sibling.
+            let old_ns_model = state.package_state.namespace_model.clone();
+            let old_contribution = state.package_state.scope_contribution.clone();
+
+            // In package mode, update the package state when an R/*.R file
+            // closes so stale exports from the editing session are replaced by
+            // the on-disk snapshot.
+            {
+                // Prefer the file cache (LRU, warm for recently-touched files)
+                // as the "disk" content for the closed file; fall back to the
+                // workspace index when the LRU has evicted this entry so a
+                // close in a large package (>LRU capacity of recently-touched
+                // files) doesn't treat the file as DELETED from `package_inputs`
+                // and vanish its symbols from `r_internal_symbols`.
+                let on_disk_text: Option<std::sync::Arc<str>> = state
+                    .cross_file_file_cache
+                    .get(uri)
+                    .map(|s| std::sync::Arc::from(s.as_str()))
+                    .or_else(|| {
+                        state
+                            .workspace_index_new
+                            .get(uri)
+                            .map(|entry| std::sync::Arc::from(entry.contents.to_string()))
+                    });
+                let event = crate::package_state::event::HandlerEvent::DidClose {
+                    uri: uri.clone(),
+                    on_disk_text,
+                };
+                if let Some(delta) = crate::package_state::event::translate(
+                    &mut state.package_inputs,
+                    event,
+                ) {
+                    state.apply_package_event(&delta);
+                }
+            }
+
+            // Detect package-mode visibility changes triggered by the close.
+            // When an unsaved buffer with buffer-only symbols (e.g. a freshly
+            // added function) closes, those symbols leave `r_internal_symbols`
+            // and any open sibling that referenced them needs its diagnostics
+            // recomputed. Mirrors the watched-file fanout above.
+            let mut sibling_fanout: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
+            let pkg_visibility_changed =
+                state.package_state.namespace_model != old_ns_model
+                    || state.package_state.scope_contribution != old_contribution;
+            if pkg_visibility_changed {
+                if let Some(root) = state.package_inputs.workspace_root.clone() {
+                    for (open_uri, doc) in &state.documents {
+                        if open_uri == uri {
+                            continue;
+                        }
+                        let Ok(p) = open_uri.to_file_path() else { continue };
+                        if crate::package_state::is_r_source_path(&p, &root).is_some() {
+                            sibling_fanout.push((
+                                open_uri.clone(),
+                                doc.version,
+                                Some(doc.revision),
+                            ));
+                        }
+                    }
+                }
+                if !sibling_fanout.is_empty() {
                     state
-                        .workspace_index_new
-                        .get(uri)
-                        .map(|entry| std::sync::Arc::from(entry.contents.to_string()))
-                });
-            let event = crate::package_state::event::HandlerEvent::DidClose {
-                uri: uri.clone(),
-                on_disk_text,
-            };
-            if let Some(delta) = crate::package_state::event::translate(
-                &mut state.package_inputs,
-                event,
-            ) {
-                state.apply_package_event(&delta);
+                        .diagnostics_gate
+                        .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
+                }
             }
-        }
-        // Invalidate the workspace index entry so the next scan re-reads from disk.
-        if let Ok(p) = uri.to_file_path() {
-            if state.package_workspace().is_some_and(|pkg| p.starts_with(pkg.root.join("R"))) {
-                state.cross_file_workspace_index.invalidate(uri);
-            }
-        }
 
-        // Refresh the pin set now that the open set has shrunk; URIs reachable
-        // only from the closed file are no longer protected from eviction.
-        state.recompute_open_neighborhood_pins();
+            // Invalidate the workspace index entry so the next scan re-reads from disk.
+            if let Ok(p) = uri.to_file_path() {
+                if state.package_workspace().is_some_and(|pkg| p.starts_with(pkg.root.join("R"))) {
+                    state.cross_file_workspace_index.invalidate(uri);
+                }
+            }
+
+            // Refresh the pin set now that the open set has shrunk; URIs reachable
+            // only from the closed file are no longer protected from eviction.
+            state.recompute_open_neighborhood_pins();
+
+            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
+            (sibling_fanout, debounce_ms)
+        };
+
+        // Schedule revalidation for affected open siblings outside the write
+        // lock. The debounce window collapses bursts (e.g. "close all" closing
+        // many files in quick succession) into a single republish per sibling.
+        for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            tokio::spawn(run_debounced_diagnostics(
+                state_arc,
+                client,
+                sibling_uri,
+                debounce_ms,
+                trigger_version,
+                trigger_revision,
+            ));
+        }
     }
 
     /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
@@ -3981,6 +4056,12 @@ impl LanguageServer for Backend {
                         let mut deltas = Vec::new();
                         let mut ns_changed = false;
                         let old_ns_model = state.package_state.namespace_model.clone();
+                        // Snapshot the package's visibility/contribution state
+                        // (Arc-backed clones are cheap) so visibility-only
+                        // changes — e.g. internal symbol or NAMESPACE-import
+                        // edits that don't alter exports — also trigger the
+                        // open-file fanout below.
+                        let old_contribution = state.package_state.scope_contribution.clone();
                         for uri in &uris_to_update {
                             if state.documents.contains_key(uri) {
                                 continue; // open docs are authoritative; skip
@@ -4005,7 +4086,8 @@ impl LanguageServer for Backend {
                         if !deltas.is_empty() {
                             let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                             state.apply_package_event(&batch);
-                            ns_changed = state.package_state.namespace_model != old_ns_model;
+                            ns_changed = state.package_state.namespace_model != old_ns_model
+                                || state.package_state.scope_contribution != old_contribution;
                         }
                         if ns_changed {
                             // Namespace model changed (e.g. roxygen tags changed in an

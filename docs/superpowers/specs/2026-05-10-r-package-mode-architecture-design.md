@@ -9,7 +9,7 @@
 
 ## 1. Problem statement
 
-The `r-packages` branch (commit `be7b0d7..HEAD`) adds R package workspace support to Raven: when a workspace has a `DESCRIPTION` file, the LSP enables mutual visibility between `R/*.R` files, parses NAMESPACE/roxygen2 import directives, and suppresses undefined-variable diagnostics for imported symbols.
+The `r-packages` branch (commit `be7b0d7..HEAD`) adds R package workspace support to Raven: when a workspace contains a `DESCRIPTION` file with a parseable, non-empty `Package:` field — or when `packageMode` is forced to `enabled` — the LSP enables mutual visibility between `R/*.R` files, parses NAMESPACE/roxygen2 import directives, and suppresses undefined-variable diagnostics for imported symbols. A `DESCRIPTION` file alone, or `Auto` mode without a valid `Package:` field, does not activate package mode.
 
 After the initial implementation (1 feature commit), 17 successive "fix correctness/perf" commits have landed. Reading them in order, they don't read as normal post-feature polish — each one names a *new* failure mode in the same handful of areas: stale caches across event-handler paths, transitions of the `roxygen_managed` flag, parser edge cases, and locking-discipline regressions.
 
@@ -227,7 +227,7 @@ pub fn derive_package_state(
    - `package_mode == Enabled`: parse `Package:` from `description.text` if present; if parsing succeeds, use that name. If `description` is `None` or `Package:` parsing fails, synthesize `PackageWorkspace { name: "unknown", root: workspace_root, ... }` (requires `workspace_root.is_some()`; when also absent, fall back to `PackageState::empty()`).
 
    This matches existing logic at `state.rs:1524` (`scan_workspace`) and `state.rs:1071–1116` (`apply_workspace_index`), but states the parsing requirement explicitly so `derive` is fully a function of `description.text`.
-2. **Per-file facts (memoized).** For each entry in `inputs.r_files`, look up `prev.r_file_facts.get(&path)`. If `cached.content_digest == file.content_digest`, reuse the cached `RFileFacts` (`Arc` clone — cheap). Otherwise re-extract `RoxygenNamespace` and `top_level_defs` from `file.text`. The memoization is what preserves O(changed-file) keystroke cost.
+2. **Per-file facts (memoized).** For each entry in `inputs.r_files`, look up `prev.r_file_facts.get(&path)`. If `cached.content_digest == file.content_digest`, reuse the cached `RFileFacts` by cloning the entry — its `top_level_defs` is `Arc<BTreeSet<String>>` so the clone is a refcount bump, and the small struct fields are cheap to copy. Otherwise re-extract `RoxygenNamespace` and `top_level_defs` from `file.text`. The memoization is what preserves O(changed-file) keystroke cost.
 3. **Merge namespace model.** Union the parsed-NAMESPACE imports/exports with the unioned roxygen tags from all `kind == Source` files. **No precedence** between roxygen and NAMESPACE — both contribute. Aim 1 (always-merge) is implemented here.
 4. **Compute `scope_contribution`.** `r_internal_symbols` is the union of `top_level_defs` across files with `kind == Source` (test files do not contribute). `imported_symbols` and `full_imports` come straight from the merged `namespace_model`.
 5. **Return new state.** No I/O, no logging side effects beyond per-file parse warnings.
@@ -299,7 +299,7 @@ The package subsystem reacts to **two kinds of events**: external LSP events (ro
 | `did_change_watched_files` | a path that is a *directory* (e.g. `<root>/R/`) | scan the subtree under that directory, emit `Batch(vec![RFileChanged\|RFileDeleted, ...])` for every R/tests file the scan finds or that disappeared. Single non-package directories outside R/tests/ are ignored. (Today, `read_to_string` on a directory silently fails — see `backend.rs:3573, 3897` — that error path is replaced by this rule.) |
 | `did_change_configuration` | `packageMode` value changed | `SettingChanged` |
 | Initial workspace open / scan kickoff | first derivation | `Initial` (after populating all inputs in batch) |
-| `WorkspaceScanCompleted` (**internal**) | the cross-file workspace scan finishes, returning `(pkg_workspace, pkg_ns_model, roxygen_cache, ...)` from `state.rs::scan_workspace` | `Batch(vec![DescriptionChanged, NamespaceChanged, RFileChanged{...} for each scanned file])` then a force-republish of all open documents (mirrors today's `mark_force_republish_many` at `backend.rs:1289–1305`) |
+| `WorkspaceScanCompleted` (**internal**) | the cross-file workspace scan finishes, returning the raw scanned inputs (file contents, roxygen fragments, NAMESPACE hints) from `state.rs::scan_workspace` | scan output is passed to `apply_scan_results(scan_output)` to populate `package_inputs`; package state is then re-derived via `derive_package_state` / `apply_package_event` (which consumes `package_inputs` and replaces `package_state`); finally `mark_force_republish_many(open_uris)` schedules a republish of every open document (mirrors today's call at `backend.rs:1289–1305`) |
 
 ### 7.1 The `WorkspaceScanCompleted` internal event
 
@@ -411,7 +411,7 @@ All errors are recoverable. Package mode never crashes the LSP.
 
 ### 10.1 Three layers
 
-1. **Unit tests on `derive`.** Pure-function tests with hand-constructed `PackageInputs` and `PackageInputDelta`. Cover: detection across `(package_mode, description-present, workspace-root-present)`; merge semantics for NAMESPACE-only, roxygen-only, both, overlapping entries; per-file memoization (content hash unchanged ⇒ facts reused, verified with object-identity check on the inner `Arc`); test-file partition (`kind == Test` symbols never enter `r_internal_symbols`); empty-state idempotence.
+1. **Unit tests on `derive`.** Pure-function tests with hand-constructed `PackageInputs` and `PackageInputDelta`. Cover: detection across `(package_mode, description-present, workspace-root-present)`; merge semantics for NAMESPACE-only, roxygen-only, both, overlapping entries; per-file memoization (content hash unchanged ⇒ facts reused, verified by checking that the cached `RFileFacts` is reused — its inner `Arc<BTreeSet<String>>` `top_level_defs` should remain pointer-equal via `Arc::ptr_eq`); test-file partition (`kind == Test` symbols never enter `r_internal_symbols`); empty-state idempotence.
 2. **Property tests on the safety property** (`proptest` state machine). The naive form ("apply random deltas to random inputs") is trivially satisfiable. The test must instead generate *consistent* (input-mutation, delta) pairs to be meaningful.
 
    **Generator design** — a `proptest_state_machine::ReferenceStateMachine` over a synthetic `(PackageInputs, PackageState)` pair:
@@ -429,7 +429,7 @@ All errors are recoverable. Package mode never crashes the LSP.
    **Properties asserted at every step:**
    - **Diff-equals-recompute:** `derive(prev_state, current_inputs, advertised_delta) == derive(empty, current_inputs, Initial)`.
    - **Determinism:** Calling `derive` twice with the same inputs produces equal `PackageState` (no internal randomness; no order-dependence in the BTree-backed sets).
-   - **Memoization correctness:** When two consecutive `MutateRFile` calls with identical text are run, the inner `Arc<RFileFacts>` for that path must be pointer-equal across the two states (`Arc::ptr_eq`).
+   - **Memoization correctness:** When two consecutive `MutateRFile` calls with identical text are run, `derive_r_file_facts` must reuse the cached entry — verifiable by checking `content_digest` equality on the entries and `Arc::ptr_eq` on `top_level_defs` (the only `Arc`-backed field of `RFileFacts`).
    - **Test-file partition:** No `RFileFacts` for a `kind == Test` file ever contributes to `r_internal_symbols`.
 
    These properties together formalize the safety claim and make the architectural intent machine-checkable.

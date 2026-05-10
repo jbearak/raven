@@ -587,6 +587,13 @@ fn derive_package_state_500_file_keystroke_budget() {
         content_digest: new_digest,
     });
 
+    // Warm-up: JIT/cache priming so the first measured iteration doesn't
+    // dominate the max sample.
+    let _ = derive_package_state(&s0, &inputs, &PackageInputDelta::RFileChanged {
+        path: p.clone(),
+        kind: RFileKind::Source,
+    });
+
     let mut times = Vec::with_capacity(20);
     for _ in 0..20 {
         let start = Instant::now();
@@ -603,7 +610,8 @@ fn derive_package_state_500_file_keystroke_budget() {
     let max = times.last().cloned().unwrap();
     eprintln!("derive_package_state 500-file: median={:?} max={:?}", median, max);
     // Generous budget; tighten later. The point of the test is to catch
-    // pathological regressions.
-    assert!(median.as_millis() < 50, "median {:?} exceeds 50ms", median);
-    assert!(max.as_millis() < 200, "max {:?} exceeds 200ms", max);
+    // pathological regressions. Use assert_within_budget so CI relaxation
+    // (RAVEN_PERF_CI_FACTOR) applies uniformly with the rest of the file.
+    assert_within_budget("derive_package_state_500_file_keystroke_median", median, 50);
+    assert_within_budget("derive_package_state_500_file_keystroke_max", max, 200);
 }

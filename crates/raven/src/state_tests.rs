@@ -521,6 +521,10 @@ mod package_testthat_visibility_tests {
         ContentDigest, ContentOrigin, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
     };
 
+    // Match the depth used by the other test modules so future adjustments
+    // propagate uniformly.
+    const TEST_MAX_CHAIN_DEPTH: usize = 20;
+
     /// Parse R source into `ScopeArtifacts` using tree-sitter-r.
     fn make_artifacts(uri: &Url, code: &str) -> Arc<ScopeArtifacts> {
         let mut parser = tree_sitter::Parser::new();
@@ -553,7 +557,7 @@ mod package_testthat_visibility_tests {
             &get_metadata,
             &graph,
             Some(workspace_root),
-            10,
+            TEST_MAX_CHAIN_DEPTH,
             &HashSet::new(),
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
