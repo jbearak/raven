@@ -135,24 +135,26 @@ fn translate_watched(
     let canonical_ns = canonical_root.join("NAMESPACE");
 
     if canonical_path == canonical_desc || path == root.join("DESCRIPTION") {
-        inputs.description = if deleted {
-            None
-        } else {
-            on_disk_text
-                .or_else(|| fs::read_to_string(&path).ok().map(Arc::from))
-                .map(|t| DescriptionInput { text: t })
-        };
+        if deleted {
+            inputs.description = None;
+            return Some(PackageInputDelta::DescriptionChanged);
+        }
+        // Treat a failed read as "no signal" rather than a deletion: leave
+        // the existing input untouched and emit no delta. Otherwise a
+        // transient I/O error would wipe DESCRIPTION state and force
+        // downstream re-derives as if the file were gone.
+        let text = on_disk_text.or_else(|| fs::read_to_string(&path).ok().map(Arc::from))?;
+        inputs.description = Some(DescriptionInput { text });
         return Some(PackageInputDelta::DescriptionChanged);
     }
 
     if canonical_path == canonical_ns || path == root.join("NAMESPACE") {
-        inputs.namespace = if deleted {
-            None
-        } else {
-            on_disk_text
-                .or_else(|| fs::read_to_string(&path).ok().map(Arc::from))
-                .map(|t| NamespaceInput { text: t })
-        };
+        if deleted {
+            inputs.namespace = None;
+            return Some(PackageInputDelta::NamespaceChanged);
+        }
+        let text = on_disk_text.or_else(|| fs::read_to_string(&path).ok().map(Arc::from))?;
+        inputs.namespace = Some(NamespaceInput { text });
         return Some(PackageInputDelta::NamespaceChanged);
     }
 
@@ -381,6 +383,56 @@ mod tests {
             },
         );
         assert!(inputs.description.is_none());
+    }
+
+    #[test]
+    fn watched_manifest_read_failure_preserves_inputs() {
+        // Use a tempdir root so canonicalize succeeds for the root but the
+        // DESCRIPTION/NAMESPACE files never exist on disk. With `deleted=false`
+        // and no `on_disk_text`, the fallback read fails and the prior inputs
+        // must be left untouched (no spurious delta wiping the state).
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        inputs.description = Some(DescriptionInput {
+            text: "Package: foo\n".into(),
+        });
+        inputs.namespace = Some(NamespaceInput {
+            text: "export(foo)\n".into(),
+        });
+
+        let desc_uri =
+            tower_lsp::lsp_types::Url::from_file_path(root.join("DESCRIPTION")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: desc_uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        assert!(delta.is_none());
+        assert_eq!(
+            inputs.description.as_ref().map(|d| &*d.text),
+            Some("Package: foo\n")
+        );
+
+        let ns_uri = tower_lsp::lsp_types::Url::from_file_path(root.join("NAMESPACE")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: ns_uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        assert!(delta.is_none());
+        assert_eq!(
+            inputs.namespace.as_ref().map(|n| &*n.text),
+            Some("export(foo)\n")
+        );
     }
 
     #[test]
