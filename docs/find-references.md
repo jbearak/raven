@@ -40,6 +40,4 @@ The maximum number of results is configurable via `raven.symbols.workspaceMaxRes
 
 ## Go-to-Definition
 
-Go-to-definition (Cmd-click / F12) navigates to the symbol's definition, following `source()` chains across files. If a symbol is defined in a sourced file, Raven jumps directly to that file and line.
-
-For `$` member access (`foo$bar`), go-to-definition resolves `bar` as a member of `foo` — see [$ and @ Member Resolution](cross-file.md#-and--member-resolution).
+Go-to-definition is the reverse of find references — it navigates to a symbol's definition rather than listing its usages. See [Go-to-Definition](go-to-definition.md).
