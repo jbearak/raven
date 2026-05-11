@@ -30,7 +30,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **[Syntax Highlighting](docs/syntax_highlighting.md)** — LSP semantic tokens for R, plus JAGS and Stan grammars
+- **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
 ### R session integration
 
@@ -53,6 +53,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [Find References](docs/find-references.md) — Cross-file reference finding
 - [Document Outline](docs/document-outline.md) — Hierarchical symbol view
 - [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
+- [Syntax Highlighting](docs/syntax-highlighting.md) — LSP semantic tokens for R, plus JAGS and Stan grammars
 
 **R session integration:**
 

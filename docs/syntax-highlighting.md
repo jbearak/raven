@@ -1,6 +1,6 @@
 # Syntax Highlighting
 
-Raven contributes syntax highlighting in three distinct ways: LSP semantic tokens for R function names, plus TextMate grammars for JAGS and Stan. For R, Raven augments whatever TextMate grammar is already loaded rather than replacing it. For JAGS and Stan, Raven ships the grammar itself because VS Code doesn't bundle one.
+Raven contributes syntax highlighting in two ways: LSP semantic tokens for R function names, plus TextMate grammars for JAGS and Stan. For R, Raven augments whatever TextMate grammar is already loaded rather than replacing it. For JAGS and Stan, Raven ships the grammar itself because VS Code doesn't bundle one.
 
 ## R
 
@@ -19,7 +19,7 @@ VS Code ships a built-in R grammar. It covers roxygen comments, line comments, s
 
 That grammar isn't maintained by Microsoft directly. It's a periodic sync of [REditorSupport/vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax): VS Code's `extensions/r/package.json` has a single `update-grammar` script that runs `vscode-grammar-updater` against the REditorSupport source, and the generated file's header points readers back to the upstream repo for fixes. The two are the same grammar, with the built-in trailing upstream by however many commits have landed since the last sync.
 
-The one capability the upstream extension adds that VS Code doesn't bundle is **R Markdown**. [`REditorSupport.r-syntax`](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r-syntax) registers a separate `rmd` language with a markdown-aware grammar: `.Rmd` files are parsed as markdown with R code chunks, and 30+ embedded languages (Python, SQL, C, CSS, etc.) are recognized inside their respective fenced blocks. Without it, VS Code treats `.Rmd` as plain R source — you lose markdown headings, prose styling, and embedded-language highlighting inside code chunks.
+The one capability the upstream extension adds that VS Code doesn't bundle is **R Markdown**. [`REditorSupport.r-syntax`](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r-syntax) registers a separate `rmd` language with a Markdown-aware grammar: `.Rmd` files are parsed as Markdown with R code chunks, and 30+ embedded languages (Python, SQL, C, CSS, etc.) are recognized inside their respective fenced blocks. Without it, VS Code treats `.Rmd` as plain R source — you lose Markdown headings, prose styling, and embedded-language highlighting inside code chunks.
 
 ## JAGS and Stan
 
