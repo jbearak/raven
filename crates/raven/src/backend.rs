@@ -908,6 +908,24 @@ fn extend_with_open_package_docs(
     }
 }
 
+/// Whether the DELETED-only branch of `did_change_watched_files` should
+/// run `apply_package_event(Initial)` to re-derive package state.
+///
+/// `derive_package_state` walks every R file's roxygen tags and rebuilds
+/// the namespace model from inputs. Skip when no package-relevant
+/// deletions occurred in this batch — non-R deletions (e.g.
+/// `data/foo.csv`) leave `package_inputs` untouched, and re-deriving
+/// from unchanged inputs cannot change `package_state`.
+///
+/// Matches the gate in the parallel mixed-batch branch:
+/// `else if had_pkg_deletion && state.package_inputs.workspace_root.is_some()`.
+fn should_rederive_after_deletion_batch(
+    workspace_is_package: bool,
+    had_pkg_deletion: bool,
+) -> bool {
+    workspace_is_package && had_pkg_deletion
+}
+
 /// Extend `affected_open_docs` with URIs from `open_keys` not already
 /// present, conditionally marking the new URIs for force-republish.
 ///
@@ -942,6 +960,32 @@ fn extend_affected_for_manifest_change(
         gate.mark_force_republish_many(new_uris.iter());
     }
     affected_open_docs.extend(new_uris);
+}
+
+#[cfg(test)]
+mod deletion_rederive_decision_tests {
+    use super::*;
+
+    #[test]
+    fn rederive_after_pkg_deletion_in_package_workspace() {
+        assert!(should_rederive_after_deletion_batch(true, true));
+    }
+
+    #[test]
+    fn no_rederive_for_non_pkg_deletion_in_package_workspace() {
+        // Regression: previously the DELETED-only branch unconditionally
+        // re-derived whenever workspace_root.is_some(), even if no package
+        // source files were deleted. `derive_package_state` walks every R
+        // file's roxygen tags — wasted work per non-package deletion in a
+        // package workspace (e.g. deleting `data/foo.csv`).
+        assert!(!should_rederive_after_deletion_batch(true, false));
+    }
+
+    #[test]
+    fn no_rederive_outside_package_workspace() {
+        assert!(!should_rederive_after_deletion_batch(false, true));
+        assert!(!should_rederive_after_deletion_batch(false, false));
+    }
 }
 
 #[cfg(test)]
@@ -3952,8 +3996,15 @@ impl LanguageServer for Backend {
             if to_update.is_empty() {
                 // Derive package state after processing all deletions.
                 // The translate calls above accumulated input mutations; now
-                // derive the final state from the updated inputs.
-                if state.package_inputs.workspace_root.is_some() {
+                // derive the final state from the updated inputs. Skip the
+                // re-derive when no package source files were deleted —
+                // non-package deletions (e.g. `data/foo.csv`) leave
+                // `package_inputs` untouched, and a re-derive from
+                // unchanged inputs cannot change `package_state`.
+                if should_rederive_after_deletion_batch(
+                    state.package_inputs.workspace_root.is_some(),
+                    had_pkg_deletion,
+                ) {
                     let old_ns_model = state.package_state.namespace_model().cloned();
                     let old_contribution = state.package_state.scope_contribution().clone();
                     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
