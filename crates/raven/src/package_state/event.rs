@@ -201,19 +201,23 @@ fn translate_watched_directory(
         .collect();
     let mut seen = BTreeSet::new();
 
-    if !deleted {
-        collect_r_file_inputs_from_dir(inputs, root, path, &mut seen, &mut deltas);
-    }
+    let complete_scan = if deleted {
+        true
+    } else {
+        collect_r_file_inputs_from_dir(inputs, root, path, &mut seen, &mut deltas)
+    };
 
-    for existing in existing_under_path {
-        if seen.contains(&existing) {
-            continue;
-        }
-        if let Some(kind) = inputs.r_files.remove(&existing).map(|entry| entry.kind) {
-            deltas.push(PackageInputDelta::RFileDeleted {
-                path: existing,
-                kind,
-            });
+    if complete_scan {
+        for existing in existing_under_path {
+            if seen.contains(&existing) {
+                continue;
+            }
+            if let Some(kind) = inputs.r_files.remove(&existing).map(|entry| entry.kind) {
+                deltas.push(PackageInputDelta::RFileDeleted {
+                    path: existing,
+                    kind,
+                });
+            }
         }
     }
 
@@ -239,19 +243,39 @@ fn collect_r_file_inputs_from_dir(
     dir: &Path,
     seen: &mut BTreeSet<std::path::PathBuf>,
     deltas: &mut Vec<PackageInputDelta>,
-) {
-    for entry in walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-    {
+) -> bool {
+    let mut complete_scan = true;
+    for entry in walkdir::WalkDir::new(dir).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                complete_scan = false;
+                log::trace!(
+                    "Package R directory scan skipped entry in {}: {}",
+                    dir.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let path = entry.into_path();
         let Some(kind) = is_r_source_path(&path, root) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                complete_scan = false;
+                log::trace!(
+                    "Package R directory scan could not read {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
         };
         let text: Arc<str> = text.into();
         let digest = ContentDigest::of(&text);
@@ -266,6 +290,7 @@ fn collect_r_file_inputs_from_dir(
         );
         deltas.push(PackageInputDelta::RFileChanged { path, kind });
     }
+    complete_scan
 }
 
 #[cfg(test)]
@@ -403,8 +428,7 @@ mod tests {
             text: "export(foo)\n".into(),
         });
 
-        let desc_uri =
-            tower_lsp::lsp_types::Url::from_file_path(root.join("DESCRIPTION")).unwrap();
+        let desc_uri = tower_lsp::lsp_types::Url::from_file_path(root.join("DESCRIPTION")).unwrap();
         let delta = translate(
             &mut inputs,
             HandlerEvent::WatchedFileChanged {
@@ -516,6 +540,56 @@ mod tests {
 
         assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
         assert!(inputs.r_files.contains_key(&test_dir.join("test-foo.R")));
+    }
+
+    #[test]
+    fn watched_directory_partial_read_failure_preserves_existing_r_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let r_dir = root.join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        let good_path = r_dir.join("good.R");
+        let unreadable_path = r_dir.join("unreadable.R");
+        std::fs::write(&good_path, "good <- 1\n").unwrap();
+        std::fs::write(&unreadable_path, [0xff, 0xfe, b'\n']).unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        let old_text: Arc<str> = "old <- 1\n".into();
+        inputs.r_files.insert(
+            unreadable_path.clone(),
+            RFileInput {
+                kind: RFileKind::Source,
+                content_digest: ContentDigest::of(&old_text),
+                text: old_text,
+            },
+        );
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&r_dir).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        let Some(PackageInputDelta::Batch(deltas)) = delta else {
+            panic!("expected batch delta for readable sibling");
+        };
+        assert!(
+            deltas.iter().all(|delta| !matches!(
+                delta,
+                PackageInputDelta::RFileDeleted { path, .. } if path == &unreadable_path
+            )),
+            "partial scan must not emit deletion for an existing unreadable R file"
+        );
+        assert!(
+            inputs.r_files.contains_key(&unreadable_path),
+            "partial scan must preserve prior input for unreadable existing files"
+        );
+        assert!(inputs.r_files.contains_key(&good_path));
     }
 
     #[test]

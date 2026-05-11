@@ -950,8 +950,7 @@ fn extend_affected_for_manifest_change(
     sync_publish_path: bool,
     gate: &crate::cross_file::revalidation::CrossFileDiagnosticsGate,
 ) {
-    let existing: std::collections::HashSet<Url> =
-        affected_open_docs.iter().cloned().collect();
+    let existing: std::collections::HashSet<Url> = affected_open_docs.iter().cloned().collect();
     let new_uris: Vec<Url> = open_keys
         .into_iter()
         .filter(|u| !existing.contains(u))
@@ -1074,7 +1073,10 @@ mod manifest_extend_tests {
         affected_for_async.truncate(max_revalidations);
         gate.mark_force_republish_many(affected_for_async.iter());
         for u in &affected_for_async {
-            assert!(gate.try_consume_publish(u, 1), "force-marked URI must publish at v=1");
+            assert!(
+                gate.try_consume_publish(u, 1),
+                "force-marked URI must publish at v=1"
+            );
         }
 
         // URIs dropped by the cap must NOT have orphan force markers.
@@ -1094,6 +1096,17 @@ fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool
         || path.starts_with(&r_dir)
         || path == testthat_dir
         || path.starts_with(testthat_dir)
+}
+
+fn is_package_manifest_path(path: &std::path::Path, root: &std::path::Path) -> bool {
+    path == root.join("DESCRIPTION") || path == root.join("NAMESPACE")
+}
+
+fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
+    uri.to_file_path().ok().is_some_and(|path| {
+        crate::package_state::is_r_source_path(&path, root).is_some()
+            || is_package_manifest_path(&path, root)
+    })
 }
 
 fn collect_package_r_file_inputs_from_disk(
@@ -1184,6 +1197,26 @@ fn hydrate_package_r_files_from_state(
     }
 
     r_files
+}
+
+fn initialize_package_inputs_from_state(
+    state: &mut WorldState,
+    root: std::path::PathBuf,
+    desc_text: Option<Arc<str>>,
+    ns_text: Option<Arc<str>>,
+    disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+) {
+    state.package_inputs.workspace_root = Some(root.clone());
+    state.package_inputs.package_mode = state.cross_file_config.package_mode;
+
+    state.package_inputs.description =
+        desc_text.map(|text| crate::package_state::DescriptionInput { text });
+    state.package_inputs.namespace =
+        ns_text.map(|text| crate::package_state::NamespaceInput { text });
+
+    let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
+    state.package_inputs.r_files = new_r_files;
+    state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 }
 
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
@@ -1635,36 +1668,22 @@ impl LanguageServer for Backend {
                                 cross_file_entries,
                                 new_index_entries,
                             );
-                            // --- Phase 3.9: Populate package_inputs and derive ---
-                            // Populate package_inputs from the now-applied workspace index
-                            // so that apply_package_event derives correct package state.
                             if let Some(root) = root_for_pkg_inputs.clone() {
-                                state.package_inputs.workspace_root = Some(root.clone());
-                                state.package_inputs.package_mode =
-                                    state.cross_file_config.package_mode;
-
-                                state.package_inputs.description = desc_text
-                                    .map(|text| crate::package_state::DescriptionInput { text });
-                                state.package_inputs.namespace = ns_text
-                                    .map(|text| crate::package_state::NamespaceInput { text });
-
-                                // Populate r_files from the workspace index
-                                // and overlay open documents (authoritative
-                                // unsaved edits). The helper is also used by
-                                // packageMode rebuilds with a disk fallback
-                                // seed when the workspace index is empty.
-                                let new_r_files = hydrate_package_r_files_from_state(
-                                    &state,
-                                    &root,
+                                // Populate package_inputs from the now-applied
+                                // workspace index and overlay open documents
+                                // (authoritative unsaved edits).
+                                initialize_package_inputs_from_state(
+                                    &mut state,
+                                    root,
+                                    desc_text,
+                                    ns_text,
                                     Default::default(),
                                 );
-                                state.package_inputs.r_files = new_r_files;
+                            } else {
+                                state.apply_package_event(
+                                    &crate::package_state::PackageInputDelta::Initial,
+                                );
                             }
-
-                            // Derive package state from the populated inputs.
-                            state.apply_package_event(
-                                &crate::package_state::PackageInputDelta::Initial,
-                            );
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
                             // and snapshot trigger versions while we hold the lock.
@@ -1746,9 +1765,41 @@ impl LanguageServer for Backend {
                 }
             });
         } else {
-            // No workspace scan — mark complete immediately
+            let package_seed = if let Some(root) = root_for_pkg_inputs.clone() {
+                let root_clone = root.clone();
+                Some((
+                    root,
+                    tokio::task::spawn_blocking(move || {
+                        let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                            .ok()
+                            .map(|s| Arc::from(s.as_str()));
+                        let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                            .ok()
+                            .map(|s| Arc::from(s.as_str()));
+                        let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                        (desc, ns, disk_r_files)
+                    })
+                    .await
+                    .unwrap_or((None, None, Default::default())),
+                ))
+            } else {
+                None
+            };
+
+            // No workspace scan — mark complete immediately and still seed
+            // package inputs from disk/open documents so package mode starts
+            // with a derived state.
             let mut state = self.state.write().await;
             state.workspace_scan_complete = true;
+            if let Some((root, (desc_text, ns_text, disk_r_files))) = package_seed {
+                initialize_package_inputs_from_state(
+                    &mut state,
+                    root,
+                    desc_text,
+                    ns_text,
+                    disk_r_files,
+                );
+            }
         }
 
         // Task B: Initialize PackageLibrary (await this - diagnostics need it)
@@ -3343,6 +3394,42 @@ impl LanguageServer for Backend {
         // Cancel pending background indexing for this URI
         self.background_indexer.cancel_uri(uri);
 
+        let (package_close_path, close_text): (bool, Option<Arc<str>>) = {
+            let state = self.state.read().await;
+            let package_close_path = state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .zip(uri.to_file_path().ok())
+                .is_some_and(|(root, path)| {
+                    crate::package_state::is_r_source_path(&path, root).is_some()
+                        || is_package_manifest_path(&path, root)
+                });
+            let in_memory_text = if package_close_path {
+                state.documents.get(uri).map(|doc| Arc::from(doc.text()))
+            } else {
+                None
+            };
+            (package_close_path, in_memory_text)
+        };
+
+        let close_text = if package_close_path && close_text.is_none() {
+            let path = uri.to_file_path().ok();
+            if let Some(path) = path {
+                tokio::task::spawn_blocking(move || {
+                    std::fs::read_to_string(path)
+                        .ok()
+                        .map(|text| Arc::from(text.as_str()))
+                })
+                .await
+                .unwrap_or(None)
+            } else {
+                None
+            }
+        } else {
+            close_text
+        };
+
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
 
@@ -3370,33 +3457,14 @@ impl LanguageServer for Backend {
             let old_ns_model = state.package_state.namespace_model().cloned();
             let old_contribution = state.package_state.scope_contribution().clone();
 
-            // In package mode, update the package state when an R/*.R file
-            // closes so stale exports from the editing session are replaced by
-            // the on-disk snapshot.
-            {
-                // Prefer the file cache (LRU, warm for recently-touched files)
-                // as the "disk" content for the closed file; fall back to the
-                // workspace index when the LRU has evicted this entry so a
-                // close in a large package (>LRU capacity of recently-touched
-                // files) doesn't treat the file as DELETED from `package_inputs`
-                // and vanish its symbols from `r_internal_symbols`.
-                let on_disk_text: Option<std::sync::Arc<str>> = state
-                    .cross_file_file_cache
-                    .get(uri)
-                    .map(|s| std::sync::Arc::from(s.as_str()))
-                    .or_else(|| {
-                        state
-                            .workspace_index_new
-                            .get(uri)
-                            .map(|entry| std::sync::Arc::from(entry.contents.to_string()))
-                    });
+            // In package mode, update package inputs on close from the
+            // authoritative snapshot captured above: the last in-memory
+            // document text when available, otherwise a fresh filesystem read.
+            if package_close_path {
                 let event = crate::package_state::event::HandlerEvent::DidClose {
                     uri: uri.clone(),
-                    on_disk_text,
+                    on_disk_text: close_text,
                 };
-                // `DidClose` consumes the cached/indexed disk snapshot prepared
-                // above. It does not enter the watched-file translation branch
-                // that performs filesystem reads.
                 if let Some(delta) =
                     crate::package_state::event::translate(&mut state.package_inputs, event)
                 {
@@ -4145,11 +4213,23 @@ impl LanguageServer for Backend {
                 // applies `max_revalidations_per_trigger` and force-marks only
                 // the post-cap survivors, so marking everything here would
                 // leave orphan markers on cap-dropped URIs.
-                let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
+                let open_keys_filtered: Vec<Url> = state
+                    .package_inputs
+                    .workspace_root
+                    .as_ref()
+                    .map(|root| {
+                        state
+                            .documents
+                            .keys()
+                            .filter(|uri| is_package_relevant_open_uri(uri, root))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let sync_publish_path = uris_to_update.is_empty();
                 extend_affected_for_manifest_change(
                     &mut affected_open_docs,
-                    open_keys,
+                    open_keys_filtered,
                     sync_publish_path,
                     &state.diagnostics_gate,
                 );
@@ -6482,6 +6562,7 @@ mod tests {
         use super::super::{
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
             extend_with_open_package_docs, hydrate_package_r_files_from_state,
+            initialize_package_inputs_from_state, is_package_relevant_open_uri,
             is_package_source_dir,
         };
         use crate::state::{Document, WorldState};
@@ -6667,6 +6748,37 @@ mod tests {
         }
 
         #[test]
+        fn package_initialization_helper_populates_inputs_and_derives_state() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path();
+            let r_dir = root.join("R");
+            std::fs::create_dir_all(&r_dir).unwrap();
+            let helper_path = r_dir.join("helper.R");
+            std::fs::write(&helper_path, "helper <- function() 1\n").unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            let disk_seed = collect_package_r_file_inputs_from_disk(root);
+            initialize_package_inputs_from_state(
+                &mut state,
+                root.to_path_buf(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+            );
+
+            assert_eq!(state.package_inputs.workspace_root.as_deref(), Some(root));
+            assert!(state.package_inputs.r_files.contains_key(&helper_path));
+            assert!(
+                state
+                    .package_state
+                    .scope_contribution()
+                    .r_internal_symbols
+                    .contains("helper"),
+                "initial package input seeding must derive package state"
+            );
+        }
+
+        #[test]
         fn package_source_dir_matches_r_and_testthat_files() {
             let root = pkg_root();
             assert!(is_package_source_dir(&root.join("R").join("foo.R"), &root));
@@ -6679,6 +6791,25 @@ mod tests {
                 &root
             ));
             assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
+        }
+
+        #[test]
+        fn package_relevant_open_uri_filters_to_package_inputs() {
+            let root = pkg_root();
+            let source = Url::from_file_path(root.join("R").join("foo.R")).unwrap();
+            let test = Url::from_file_path(root.join("tests").join("testthat").join("test-foo.R"))
+                .unwrap();
+            let desc = Url::from_file_path(root.join("DESCRIPTION")).unwrap();
+            let namespace = Url::from_file_path(root.join("NAMESPACE")).unwrap();
+            let scratch = Url::from_file_path(root.join("scratch.R")).unwrap();
+            let data = Url::from_file_path(root.join("data").join("foo.R")).unwrap();
+
+            assert!(is_package_relevant_open_uri(&source, &root));
+            assert!(is_package_relevant_open_uri(&test, &root));
+            assert!(is_package_relevant_open_uri(&desc, &root));
+            assert!(is_package_relevant_open_uri(&namespace, &root));
+            assert!(!is_package_relevant_open_uri(&scratch, &root));
+            assert!(!is_package_relevant_open_uri(&data, &root));
         }
     }
 
