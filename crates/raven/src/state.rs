@@ -756,6 +756,7 @@ impl WorldState {
             workspace_folder: self.workspace_folders.first().cloned(),
             max_chain_depth: self.cross_file_config.max_chain_depth,
             backward_dependencies: self.cross_file_config.backward_dependencies,
+            scope_contribution: self.package_state.scope_contribution().clone(),
         }
     }
 

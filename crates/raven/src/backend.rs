@@ -1937,9 +1937,12 @@ impl LanguageServer for Backend {
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
-            // Update package state via event-driven path when an R/*.R file opens.
+            // Update package state via event-driven path when a package input opens.
+            let mut package_visibility_changed = false;
             {
                 let arc_text: std::sync::Arc<str> = text.as_str().into();
+                let old_ns_model = state.package_state.namespace_model().cloned();
+                let old_contribution = state.package_state.scope_contribution().clone();
                 let event = crate::package_state::event::HandlerEvent::DidOpen {
                     uri: uri.clone(),
                     text: arc_text,
@@ -1948,6 +1951,9 @@ impl LanguageServer for Backend {
                     crate::package_state::event::translate(&mut state.package_inputs, event)
                 {
                     state.apply_package_event(&delta);
+                    package_visibility_changed = state.package_state.namespace_model()
+                        != old_ns_model.as_ref()
+                        || state.package_state.scope_contribution() != &old_contribution;
                 }
             }
 
@@ -2114,11 +2120,11 @@ impl LanguageServer for Backend {
             // `append_package_contribution` injects package-internal symbols
             // into both kinds — so when an R/ interface changes, both kinds
             // of open files have potentially stale diagnostics.
-            if interface_changed {
+            if interface_changed || package_visibility_changed {
                 if let Some(pkg) = state.package_workspace() {
                     if let Ok(fp) = uri.to_file_path() {
                         let r_dir = pkg.root.join("R");
-                        if fp.starts_with(&r_dir) {
+                        if package_visibility_changed || fp.starts_with(&r_dir) {
                             for open_uri in state.documents.keys() {
                                 if let Ok(p) = open_uri.to_file_path() {
                                     if crate::package_state::is_r_source_path(&p, &pkg.root)
@@ -2566,7 +2572,7 @@ impl LanguageServer for Backend {
                     false,
                     probe.backward_dependencies,
                     &|| false,
-                    None,
+                    Some(&probe.scope_contribution),
                 );
 
                 let mut pkgs = scope.inherited_packages;
@@ -2810,16 +2816,18 @@ impl LanguageServer for Backend {
             // workspace (including non-package and scratch-file workflows)
             // paid two full-document heap allocations just to have
             // `translate()` short-circuit on `is_r_source_path == None`.
-            let mut package_namespace_changed = false;
-            let in_package_r_source_tree = state
+            let mut package_visibility_changed = false;
+            let in_package_input_path = state
                 .package_inputs
                 .workspace_root
                 .as_ref()
                 .zip(uri.to_file_path().ok())
                 .is_some_and(|(root, path)| {
                     crate::package_state::is_r_source_path(&path, root).is_some()
+                        || path == root.join("DESCRIPTION")
+                        || path == root.join("NAMESPACE")
                 });
-            if in_package_r_source_tree {
+            if in_package_input_path {
                 let text: std::sync::Arc<str> = state
                     .documents
                     .get(&uri)
@@ -2827,6 +2835,7 @@ impl LanguageServer for Backend {
                     .unwrap_or_default()
                     .into();
                 let old_ns_model = state.package_state.namespace_model().cloned();
+                let old_contribution = state.package_state.scope_contribution().clone();
                 let event = crate::package_state::event::HandlerEvent::DidChange {
                     uri: uri.clone(),
                     text,
@@ -2835,8 +2844,9 @@ impl LanguageServer for Backend {
                     crate::package_state::event::translate(&mut state.package_inputs, event)
                 {
                     state.apply_package_event(&delta);
-                    package_namespace_changed =
-                        state.package_state.namespace_model() != old_ns_model.as_ref();
+                    package_visibility_changed = state.package_state.namespace_model()
+                        != old_ns_model.as_ref()
+                        || state.package_state.scope_contribution() != &old_contribution;
                 }
             }
 
@@ -2908,12 +2918,12 @@ impl LanguageServer for Backend {
                     affected.insert(child);
                 }
             }
-            // When the roxygen namespace model changed, all open package
-            // files need revalidation so @import/@importFrom edits propagate.
+            // When package-mode visibility changed, all open package files
+            // need revalidation so imports and internal symbols propagate.
             // Both `R/` (two-way) and `tests/testthat/` (one-way) receive the
             // contribution via `append_package_contribution`, so both need
             // the affected-set.
-            if package_namespace_changed {
+            if package_visibility_changed {
                 if let Some(pkg) = state.package_workspace() {
                     for open_uri in state.documents.keys() {
                         if let Ok(p) = open_uri.to_file_path() {
@@ -2930,7 +2940,7 @@ impl LanguageServer for Backend {
             // added/removed symbols propagate to undefined-variable
             // diagnostics. `tests/testthat/` sees R/ symbols (one-way), so
             // include test files in the affected set too.
-            if interface_changed && !package_namespace_changed {
+            if interface_changed && !package_visibility_changed {
                 if let Some(pkg) = state.package_workspace() {
                     if let Ok(fp) = uri.to_file_path() {
                         let r_dir = pkg.root.join("R");
@@ -3067,7 +3077,7 @@ impl LanguageServer for Backend {
                         false,
                         probe.backward_dependencies,
                         &|| false,
-                        None,
+                        Some(&probe.scope_contribution),
                     );
                     all_packages.extend(scope.inherited_packages);
                     all_packages.extend(scope.loaded_packages);
@@ -3231,9 +3241,10 @@ impl LanguageServer for Backend {
             if let Ok(p) = uri.to_file_path() {
                 if state
                     .package_workspace()
-                    .is_some_and(|pkg| p.starts_with(pkg.root.join("R")))
+                    .is_some_and(|pkg| is_package_source_dir(&p, &pkg.root))
                 {
                     state.cross_file_workspace_index.invalidate(uri);
+                    state.workspace_index_new.invalidate(uri);
                 }
             }
 
@@ -5413,7 +5424,7 @@ pub(crate) async fn prefetch_packages_for_open_documents(
             false,
             probe.backward_dependencies,
             &|| false,
-            None,
+            Some(&probe.scope_contribution),
         );
         for p in scope.inherited_packages {
             all_pkgs.insert(p);
@@ -5606,6 +5617,7 @@ pub(crate) struct ScopeProbeSnapshot {
     pub(crate) workspace_folder: Option<Url>,
     pub(crate) max_chain_depth: usize,
     pub(crate) backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
 /// State-side preparation for a `LibpathEvent::Dropped`: clears the package
@@ -5768,7 +5780,7 @@ async fn run_libpath_consumer(
                             false,
                             probe.backward_dependencies,
                             &|| false,
-                            None,
+                            Some(&probe.scope_contribution),
                         );
                         // Scope probe captures inherited + global-scope packages.
                         // Also check the document's full loaded_packages which
@@ -6269,6 +6281,7 @@ mod tests {
         use super::super::{
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
             extend_with_open_package_docs, hydrate_package_r_files_from_state,
+            is_package_source_dir,
         };
         use crate::state::{Document, WorldState};
         use std::path::PathBuf;
@@ -6450,6 +6463,21 @@ mod tests {
             assert!(hydrated.contains_key(&disk_only));
             let open_entry = hydrated.get(&open_path).expect("open file hydrated");
             assert_eq!(&*open_entry.text, "open_value <- 'buffer'\n");
+        }
+
+        #[test]
+        fn package_source_dir_matches_r_and_testthat_files() {
+            let root = pkg_root();
+            assert!(is_package_source_dir(&root.join("R").join("foo.R"), &root));
+            assert!(is_package_source_dir(
+                &root.join("tests").join("testthat").join("test-foo.R"),
+                &root
+            ));
+            assert!(!is_package_source_dir(
+                &root.join("tests").join("helper.R"),
+                &root
+            ));
+            assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
         }
     }
 
@@ -7906,7 +7934,7 @@ mod refresh_packages_tests {
             false,
             snapshot.backward_dependencies,
             &|| false,
-            None,
+            Some(&snapshot.scope_contribution),
         );
         // dplyr appears in loaded_packages (from forward source() chain),
         // not inherited_packages (which come from backward/parent edges).
@@ -7921,6 +7949,46 @@ mod refresh_packages_tests {
              inherited={:?}, loaded={:?}",
             scope.inherited_packages,
             scope.loaded_packages
+        );
+    }
+
+    #[test]
+    fn package_scope_snapshot_carries_package_contribution() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+        use std::path::PathBuf;
+
+        let root = PathBuf::from("/work/pkg");
+        let uri = Url::from_file_path(root.join("R").join("main.R")).unwrap();
+        let mut world = WorldState::new(vec![]);
+        world
+            .documents
+            .insert(uri.clone(), Document::new("helper()\n", Some(1)));
+        world.package_inputs.workspace_root = Some(root.clone());
+        world.package_inputs.description = Some(DescriptionInput {
+            text: "Package: pkg\n".into(),
+        });
+        let text: Arc<str> = "helper <- function() 1\n".into();
+        world.package_inputs.r_files.insert(
+            root.join("R").join("helper.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                content_digest: ContentDigest::of(&text),
+                text,
+            },
+        );
+        world.apply_package_event(&PackageInputDelta::Initial);
+
+        let snapshot = world.build_package_scope_snapshot(&[(uri, 0)]);
+
+        assert!(
+            snapshot
+                .scope_contribution
+                .r_internal_symbols
+                .contains("helper"),
+            "background scope probes must carry package-internal symbols"
         );
     }
 

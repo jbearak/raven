@@ -48,6 +48,14 @@ pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<Pack
     match event {
         HandlerEvent::DidOpen { uri, text } | HandlerEvent::DidChange { uri, text } => {
             let path = uri.to_file_path().ok()?;
+            if path == root.join("DESCRIPTION") {
+                inputs.description = Some(DescriptionInput { text });
+                return Some(PackageInputDelta::DescriptionChanged);
+            }
+            if path == root.join("NAMESPACE") {
+                inputs.namespace = Some(NamespaceInput { text });
+                return Some(PackageInputDelta::NamespaceChanged);
+            }
             let kind = is_r_source_path(&path, &root)?;
             let digest = ContentDigest::of(&text);
             inputs.r_files.insert(
@@ -62,6 +70,14 @@ pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<Pack
         }
         HandlerEvent::DidClose { uri, on_disk_text } => {
             let path = uri.to_file_path().ok()?;
+            if path == root.join("DESCRIPTION") {
+                inputs.description = on_disk_text.map(|text| DescriptionInput { text });
+                return Some(PackageInputDelta::DescriptionChanged);
+            }
+            if path == root.join("NAMESPACE") {
+                inputs.namespace = on_disk_text.map(|text| NamespaceInput { text });
+                return Some(PackageInputDelta::NamespaceChanged);
+            }
             let kind = is_r_source_path(&path, &root)?;
             match on_disk_text {
                 Some(text) => {
@@ -114,7 +130,9 @@ fn translate_watched(
         inputs.description = if deleted {
             None
         } else {
-            on_disk_text.map(|t| DescriptionInput { text: t })
+            on_disk_text
+                .or_else(|| fs::read_to_string(&path).ok().map(Arc::from))
+                .map(|t| DescriptionInput { text: t })
         };
         return Some(PackageInputDelta::DescriptionChanged);
     }
@@ -123,7 +141,9 @@ fn translate_watched(
         inputs.namespace = if deleted {
             None
         } else {
-            on_disk_text.map(|t| NamespaceInput { text: t })
+            on_disk_text
+                .or_else(|| fs::read_to_string(&path).ok().map(Arc::from))
+                .map(|t| NamespaceInput { text: t })
         };
         return Some(PackageInputDelta::NamespaceChanged);
     }
@@ -133,18 +153,17 @@ fn translate_watched(
             inputs.r_files.remove(&path);
             return Some(PackageInputDelta::RFileDeleted { path, kind });
         }
-        if let Some(text) = on_disk_text {
-            let digest = ContentDigest::of(&text);
-            inputs.r_files.insert(
-                path.clone(),
-                RFileInput {
-                    kind,
-                    text,
-                    content_digest: digest,
-                },
-            );
-            return Some(PackageInputDelta::RFileChanged { path, kind });
-        }
+        let text = on_disk_text.or_else(|| fs::read_to_string(&path).ok().map(Arc::from))?;
+        let digest = ContentDigest::of(&text);
+        inputs.r_files.insert(
+            path.clone(),
+            RFileInput {
+                kind,
+                text,
+                content_digest: digest,
+            },
+        );
+        return Some(PackageInputDelta::RFileChanged { path, kind });
     }
 
     translate_watched_directory(inputs, root, &path, deleted)
@@ -284,6 +303,42 @@ mod tests {
             },
         );
         assert!(delta.is_none());
+    }
+
+    #[test]
+    fn did_change_for_description_updates_input() {
+        let mut inputs = root_inputs();
+        let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/DESCRIPTION").unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::DidChange {
+                uri,
+                text: "Package: foo\nImports: stats\n".into(),
+            },
+        );
+        assert!(matches!(delta, Some(PackageInputDelta::DescriptionChanged)));
+        assert_eq!(
+            inputs.description.as_ref().map(|d| &*d.text),
+            Some("Package: foo\nImports: stats\n")
+        );
+    }
+
+    #[test]
+    fn did_change_for_namespace_updates_input() {
+        let mut inputs = root_inputs();
+        let uri = tower_lsp::lsp_types::Url::from_file_path("/work/pkg/NAMESPACE").unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::DidChange {
+                uri,
+                text: "importFrom(stats, median)\n".into(),
+            },
+        );
+        assert!(matches!(delta, Some(PackageInputDelta::NamespaceChanged)));
+        assert_eq!(
+            inputs.namespace.as_ref().map(|d| &*d.text),
+            Some("importFrom(stats, median)\n")
+        );
     }
 
     #[test]
@@ -437,6 +492,36 @@ mod tests {
 
         assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
         assert!(inputs.r_files.is_empty());
+    }
+
+    #[test]
+    fn watched_file_change_without_text_reads_from_disk() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let r_dir = root.join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        let path = r_dir.join("foo.R");
+        std::fs::write(&path, "foo <- 2\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&path).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(matches!(
+            delta,
+            Some(PackageInputDelta::RFileChanged { .. })
+        ));
+        let entry = inputs.r_files.get(&path).expect("file input");
+        assert_eq!(&*entry.text, "foo <- 2\n");
     }
 
     #[test]
