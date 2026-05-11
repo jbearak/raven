@@ -22,7 +22,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Completions](docs/completion.md)** — Symbols, packages, and function parameters — across files
 - **[Go-to-definition](docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
-- **Hover** — Symbol info including source file and package origin
+- **[Hover](docs/hover.md)** — Symbol info including source file and package origin
 - **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
 - **[Document outline](docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
@@ -52,6 +52,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [Completions](docs/completion.md) — What's offered and scope rules
 - [Go-to-Definition](docs/go-to-definition.md) — Cross-file navigation, `$`/`@` members, declared symbols
 - [Find References](docs/find-references.md) — Cross-file reference finding
+- [Hover](docs/hover.md) — What the hover bubble shows and how it resolves package attribution
 - [Document Outline](docs/document-outline.md) — Hierarchical symbol view
 - [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
 - [Syntax Highlighting](docs/syntax-highlighting.md) — LSP semantic tokens for R, plus JAGS and Stan grammars
