@@ -5,6 +5,8 @@
 //! `WorldState::apply_package_event(delta)` to recompute derived state.
 
 use super::*;
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 
 #[derive(Debug)]
@@ -144,7 +146,97 @@ fn translate_watched(
             return Some(PackageInputDelta::RFileChanged { path, kind });
         }
     }
-    None
+
+    translate_watched_directory(inputs, root, &path, deleted)
+}
+
+fn translate_watched_directory(
+    inputs: &mut PackageInputs,
+    root: &Path,
+    path: &Path,
+    deleted: bool,
+) -> Option<PackageInputDelta> {
+    if !deleted && !path.is_dir() {
+        return None;
+    }
+    if !is_tracked_package_dir(path, root) {
+        return None;
+    }
+
+    let mut deltas = Vec::new();
+    let existing_under_path: Vec<_> = inputs
+        .r_files
+        .keys()
+        .filter(|candidate| candidate.starts_with(path))
+        .cloned()
+        .collect();
+    let mut seen = BTreeSet::new();
+
+    if !deleted {
+        collect_r_file_inputs_from_dir(inputs, root, path, &mut seen, &mut deltas);
+    }
+
+    for existing in existing_under_path {
+        if seen.contains(&existing) {
+            continue;
+        }
+        if let Some(kind) = inputs.r_files.remove(&existing).map(|entry| entry.kind) {
+            deltas.push(PackageInputDelta::RFileDeleted {
+                path: existing,
+                kind,
+            });
+        }
+    }
+
+    if deltas.is_empty() {
+        None
+    } else {
+        Some(PackageInputDelta::Batch(deltas))
+    }
+}
+
+fn is_tracked_package_dir(path: &Path, root: &Path) -> bool {
+    let r_dir = root.join("R");
+    let testthat_dir = root.join("tests").join("testthat");
+    path == r_dir
+        || path.starts_with(&r_dir)
+        || path == testthat_dir
+        || path.starts_with(testthat_dir)
+}
+
+fn collect_r_file_inputs_from_dir(
+    inputs: &mut PackageInputs,
+    root: &Path,
+    dir: &Path,
+    seen: &mut BTreeSet<std::path::PathBuf>,
+    deltas: &mut Vec<PackageInputDelta>,
+) {
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let path = entry.into_path();
+        let Some(kind) = is_r_source_path(&path, root) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let text: Arc<str> = text.into();
+        let digest = ContentDigest::of(&text);
+        seen.insert(path.clone());
+        inputs.r_files.insert(
+            path.clone(),
+            RFileInput {
+                kind,
+                text,
+                content_digest: digest,
+            },
+        );
+        deltas.push(PackageInputDelta::RFileChanged { path, kind });
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +360,82 @@ mod tests {
                 on_disk_text: None,
             },
         );
+        assert!(inputs.r_files.is_empty());
+    }
+
+    #[test]
+    fn watched_directory_change_hydrates_disk_r_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let r_dir = root.join("R");
+        let test_dir = root.join("tests").join("testthat");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(r_dir.join("foo.R"), "foo <- 1\n").unwrap();
+        std::fs::write(test_dir.join("test-foo.R"), "test_that('foo', foo)\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&r_dir).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
+        assert!(inputs.r_files.contains_key(&r_dir.join("foo.R")));
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&test_dir).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
+        assert!(inputs.r_files.contains_key(&test_dir.join("test-foo.R")));
+    }
+
+    #[test]
+    fn watched_directory_delete_removes_existing_subtree_inputs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let r_dir = root.join("R");
+        let nested = r_dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        for path in [r_dir.join("foo.R"), nested.join("bar.R")] {
+            let text: std::sync::Arc<str> = "x <- 1\n".into();
+            inputs.r_files.insert(
+                path,
+                RFileInput {
+                    kind: RFileKind::Source,
+                    content_digest: ContentDigest::of(&text),
+                    text,
+                },
+            );
+        }
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&r_dir).unwrap(),
+                on_disk_text: None,
+                deleted: true,
+            },
+        );
+
+        assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
         assert!(inputs.r_files.is_empty());
     }
 
