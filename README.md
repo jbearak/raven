@@ -82,6 +82,8 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 
 For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
 
+Raven takes a static-analysis approach rather than attaching to a live R session, so it can start answering questions the moment a file is opened, without running user code. See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
+
 ## Development
 
 See [Development Notes](docs/development.md) for build/test, profiling, and internal architecture.
