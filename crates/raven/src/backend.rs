@@ -1938,6 +1938,9 @@ impl LanguageServer for Backend {
             state.cross_file_activity.record_recent(uri.clone());
 
             // Update package state via event-driven path when a package input opens.
+            // This uses the `DidOpen` variant, which consumes caller-supplied
+            // buffer text only; the disk-reading `WatchedFileChanged` variant
+            // is handled by watched-file code paths instead.
             let mut package_visibility_changed = false;
             {
                 let arc_text: std::sync::Arc<str> = text.as_str().into();
@@ -2816,6 +2819,9 @@ impl LanguageServer for Backend {
             // workspace (including non-package and scratch-file workflows)
             // paid two full-document heap allocations just to have
             // `translate()` short-circuit on `is_r_source_path == None`.
+            // The `DidChange` variant uses only this in-memory buffer text;
+            // watched-file events are the only package events that may read
+            // from disk and are handled on their own code paths.
             let mut package_visibility_changed = false;
             let in_package_input_path = state
                 .package_inputs
@@ -3209,6 +3215,9 @@ impl LanguageServer for Backend {
                     uri: uri.clone(),
                     on_disk_text,
                 };
+                // `DidClose` consumes the cached/indexed disk snapshot prepared
+                // above. It does not enter the watched-file translation branch
+                // that performs filesystem reads.
                 if let Some(delta) =
                     crate::package_state::event::translate(&mut state.package_inputs, event)
                 {

@@ -33,6 +33,14 @@ pub enum HandlerEvent {
     },
 }
 
+/// Update package inputs for an LSP/package event and return the matching
+/// derive delta.
+///
+/// `WatchedFileChanged` is the only variant that may perform filesystem I/O
+/// (canonicalization, directory checks/scans, or fallback file reads). Open,
+/// change, close, and setting events operate only on caller-supplied text or
+/// mode data, so backend handlers may apply those variants while holding the
+/// `WorldState` write lock without introducing blocking disk work.
 pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<PackageInputDelta> {
     // Events that can fire before a workspace root is known (or that don't
     // require one) are handled up front. Previously, the early
