@@ -23,6 +23,16 @@ Compares Raven's language server against the language servers and code-intellige
 
 Among the R LSPs we've surveyed, Raven is the only one that traces `source()` chains across a project: it builds a dependency graph and resolves what's in scope at each cursor position based on the actual order of execution, rather than treating the workspace as one flat symbol set. That makes its completions, diagnostics, and navigation reflect actual execution order in multi-file scripted projects, including circular-dependency and scope-violation detection. The analysis is static; Raven does spawn R subprocesses on demand for package metadata (exports, NAMESPACE entries, function signatures), but it doesn't need a live R session to compute scope.
 
+### Why Raven exists
+
+Raven began as a port of [Sight](https://github.com/jbearak/sight), a similar tool I'd written for Stata to experiment with agentic coding workflows on a language without a language server. When I went back to writing R, I missed Sight's features and started porting its cross-file scope engine — which became Raven.
+
+The main way Raven's language server differs from [REditorSupport/languageserver](https://github.com/REditorSupport/languageserver) and [Ark](https://github.com/posit-dev/ark) is architectural: both of those projects answer LSP requests from the state of a live R session. languageserver is an R package the client launches as its own R process; Ark binds Positron's LSP handlers directly to R's C API via the R kernel. In both cases the source of truth for "what's in scope" is what the running session knows: which objects have been assigned in `globalenv()`, which packages have been attached, which columns a data frame has after the user executed some code.
+
+Raven takes the same approach as language servers for statically-typed languages like TypeScript or Rust — parse the file, build an AST, resolve scope statically, follow `source()` chains across files. That means Raven can start answering questions the moment a file is opened, without running any user code; it can run in CI or behind an agentic tool with no live R session; and scope at the cursor reflects the cursor's position in the file and its `source()` chain, rather than the state of whatever R session happens to be attached.
+
+Those two approaches aren't exclusive: you can install Raven alongside the REditorSupport (R) extension and run both language servers at once — their different models let them coexist, each contributing what it's best at. Raven also detects when REditorSupport is enabled and declines to register its own R console by default, so REditorSupport's R-session integration stays in charge of running code, rendering plots, and opening data frames. See [Coexistence](./coexistence.md) for details.
+
 ### What REditorSupport's language server offers that Raven doesn't
 
 - **lintr diagnostics** — Style checks and correctness linters (e.g. `object_usage_linter`, `line_length_linter`, `trailing_whitespace_linter`) via the [`lintr`](https://lintr.r-lib.org/) package. Raven has no style linting.
