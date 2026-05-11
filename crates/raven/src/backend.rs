@@ -908,6 +908,141 @@ fn extend_with_open_package_docs(
     }
 }
 
+/// Extend `affected_open_docs` with URIs from `open_keys` not already
+/// present, conditionally marking the new URIs for force-republish.
+///
+/// Called from the DESCRIPTION/NAMESPACE manifest event block in
+/// `did_change_watched_files`. Marking is gated on `sync_publish_path`
+/// because the manifest block runs before either the synchronous
+/// publish loop or the async cap+mark+publish block:
+///
+/// - **Sync path** (`uris_to_update.is_empty()`): every URI in
+///   `affected_open_docs` is published without an additional cap, so the
+///   newly added URIs must be marked here to allow the same-version
+///   forced republish through the gate.
+/// - **Async path** (`uris_to_update` non-empty): the spawned task caps
+///   `affected_for_async` to `max_revalidations_per_trigger` and only
+///   marks the post-cap survivors. Marking here would create orphan
+///   force-republish markers for URIs the cap drops, which would
+///   incorrectly allow a future same-version publish to succeed without
+///   an explicit mark.
+fn extend_affected_for_manifest_change(
+    affected_open_docs: &mut Vec<Url>,
+    open_keys: Vec<Url>,
+    sync_publish_path: bool,
+    gate: &crate::cross_file::revalidation::CrossFileDiagnosticsGate,
+) {
+    let existing: std::collections::HashSet<Url> =
+        affected_open_docs.iter().cloned().collect();
+    let new_uris: Vec<Url> = open_keys
+        .into_iter()
+        .filter(|u| !existing.contains(u))
+        .collect();
+    if sync_publish_path {
+        gate.mark_force_republish_many(new_uris.iter());
+    }
+    affected_open_docs.extend(new_uris);
+}
+
+#[cfg(test)]
+mod manifest_extend_tests {
+    use super::*;
+    use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
+
+    fn test_uri(name: &str) -> Url {
+        Url::parse(&format!("file:///{name}")).unwrap()
+    }
+
+    #[test]
+    fn sync_path_marks_new_uris_only() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let existing = test_uri("R/existing.R");
+        let new1 = test_uri("R/new1.R");
+        let new2 = test_uri("R/new2.R");
+        for u in &[&existing, &new1, &new2] {
+            gate.record_publish(u, 1);
+        }
+        let mut affected: Vec<Url> = vec![existing.clone()];
+        let open_keys = vec![existing.clone(), new1.clone(), new2.clone()];
+
+        extend_affected_for_manifest_change(&mut affected, open_keys, true, &gate);
+
+        assert_eq!(affected.len(), 3, "all unique open keys appended");
+        assert!(
+            gate.can_publish(&new1, 1),
+            "new URI {new1} must be force-marked in sync path"
+        );
+        assert!(
+            gate.can_publish(&new2, 1),
+            "new URI {new2} must be force-marked in sync path"
+        );
+        assert!(
+            !gate.can_publish(&existing, 1),
+            "pre-existing URI {existing} (already in affected) must not be re-marked by this helper"
+        );
+    }
+
+    #[test]
+    fn async_path_extends_without_marking() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let new1 = test_uri("R/new1.R");
+        let new2 = test_uri("R/new2.R");
+        for u in &[&new1, &new2] {
+            gate.record_publish(u, 1);
+        }
+        let mut affected: Vec<Url> = vec![];
+        let open_keys = vec![new1.clone(), new2.clone()];
+
+        extend_affected_for_manifest_change(&mut affected, open_keys.clone(), false, &gate);
+
+        assert_eq!(affected, open_keys, "affected extended with open_keys");
+        for u in &open_keys {
+            assert!(
+                !gate.can_publish(u, 1),
+                "URI {u} must NOT be force-marked in async path (post-cap mark owns marking)"
+            );
+        }
+    }
+
+    #[test]
+    fn async_path_followed_by_cap_publish_leaves_no_orphan_markers() {
+        // Regression: prior to this fix, the manifest event block in
+        // did_change_watched_files called mark_force_republish_many on
+        // ALL open documents unconditionally. The async block then
+        // applied max_revalidations_per_trigger and force-marked only
+        // the post-cap survivors, leaving URIs dropped by the cap with
+        // orphan force-republish markers. Those orphan markers would
+        // incorrectly allow a future same-version publish to succeed
+        // without an explicit mark for that publish.
+        let gate = CrossFileDiagnosticsGate::new();
+        let max_revalidations = 10usize;
+        let open_uris: Vec<Url> = (0..20).map(|i| test_uri(&format!("R/f{i}.R"))).collect();
+        for u in &open_uris {
+            gate.record_publish(u, 1);
+        }
+
+        // Manifest block (fixed pattern): extend, do NOT mark.
+        let mut affected: Vec<Url> = vec![];
+        extend_affected_for_manifest_change(&mut affected, open_uris.clone(), false, &gate);
+
+        // Async block: cap, mark, publish.
+        let mut affected_for_async = affected.clone();
+        affected_for_async.truncate(max_revalidations);
+        gate.mark_force_republish_many(affected_for_async.iter());
+        for u in &affected_for_async {
+            assert!(gate.try_consume_publish(u, 1), "force-marked URI must publish at v=1");
+        }
+
+        // URIs dropped by the cap must NOT have orphan force markers.
+        for u in &open_uris[max_revalidations..] {
+            assert!(
+                !gate.can_publish(u, 1),
+                "URI {u} dropped by cap retained an orphan force-republish marker"
+            );
+        }
+    }
+}
+
 fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool {
     let r_dir = root.join("R");
     let testthat_dir = root.join("tests").join("testthat");
@@ -3954,14 +4089,20 @@ impl LanguageServer for Backend {
                 // Force republish for all open R files so namespace model
                 // changes propagate (they're not dependency-graph neighbors of
                 // DESCRIPTION/NAMESPACE so the sync pass didn't add them).
+                // Marking is gated on the publish path: see
+                // `extend_affected_for_manifest_change`. The async block below
+                // applies `max_revalidations_per_trigger` and force-marks only
+                // the post-cap survivors, so marking everything here would
+                // leave orphan markers on cap-dropped URIs.
                 let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(open_keys.iter());
+                let sync_publish_path = uris_to_update.is_empty();
+                extend_affected_for_manifest_change(
+                    &mut affected_open_docs,
+                    open_keys,
+                    sync_publish_path,
+                    &state.diagnostics_gate,
+                );
                 drop(state);
-                let existing: std::collections::HashSet<Url> =
-                    affected_open_docs.iter().cloned().collect();
-                affected_open_docs.extend(open_keys.into_iter().filter(|u| !existing.contains(u)));
             }
         }
 
