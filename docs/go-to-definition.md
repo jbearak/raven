@@ -88,7 +88,7 @@ For `.stan`, `.jags`, and `.bugs` files, Raven provides best-effort go-to-defini
 - **Stan** — jumps to the declaration of a variable or function.
 - **JAGS** — jumps to the first assignment, or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. Built-in keywords, distributions, and functions are excluded from the fallback.
 
-Cross-file navigation is not supported for these languages.
+Identifier resolution is file-local — Raven doesn't build a cross-file scope graph for these languages. File-path navigation (e.g. cmd-click on a path in `@lsp-sourced-by`) still works normally.
 
 ## Related
 
